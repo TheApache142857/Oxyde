@@ -10,6 +10,8 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeShape.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -342,6 +344,38 @@ void record_profile_faces(BRepBuilderAPI_MakeShape& sweep, const TopoDS_Shape& b
     }
 }
 
+// Faces the sweep's history left without a source, matched to the profile edge lying on them.
+// OCCT 8 no longer reports the planar faces of a revolve through Generated(); a revolved
+// face still contains its profile edge (at angle zero), so the edge's middle lies on it.
+void record_unnamed_profile_faces(const TopoDS_Shape& base,
+                                  const std::vector<SegmentMark>& marks,
+                                  const TopTools_IndexedMapOfShape& result_faces,
+                                  OpResultData& out) {
+    TopTools_IndexedMapOfShape base_edges;
+    TopExp::MapShapes(base, TopAbs_EDGE, base_edges);
+    for (int f = 1; f <= result_faces.Extent(); ++f) {
+        if (!out.faces[static_cast<std::size_t>(f - 1)].sources.empty()) {
+            continue;
+        }
+        const TopoDS_Face& face = TopoDS::Face(result_faces(f));
+        for (int i = 1; i <= base_edges.Extent(); ++i) {
+            const TopoDS_Edge& edge = TopoDS::Edge(base_edges(i));
+            std::uint32_t id = 0;
+            if (!find_segment(edge, marks, id)) {
+                continue;
+            }
+            const BRepAdaptor_Curve curve(edge);
+            const gp_Pnt middle =
+                curve.Value((curve.FirstParameter() + curve.LastParameter()) / 2.0);
+            BRepExtrema_DistShapeShape distance(BRepBuilderAPI_MakeVertex(middle).Vertex(), face);
+            if (distance.IsDone() && distance.Value() < 1e-6) {
+                add_source(out, result_faces, face, SourceKind::ProfileSegment, 0, id);
+                break;
+            }
+        }
+    }
+}
+
 // ---- Topology helpers ----------------------------------------------------------------------
 
 AxisData axis_data(const gp_Ax1& axis) {
@@ -506,6 +540,7 @@ OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionDa
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
         OpResultData out = empty_result(result_faces);
         record_profile_faces(revol, base, marks, result_faces, out);
+        record_unnamed_profile_faces(base, marks, result_faces, out);
         if (!full) {
             for (TopExp_Explorer it(revol.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
                 add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
