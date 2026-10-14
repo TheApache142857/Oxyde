@@ -493,7 +493,13 @@ impl ConstrainedSketch {
     /// Deletes entities, along with the curves built on deleted points, the relations that
     /// refer to anything deleted, and end points no longer used by any curve.
     pub fn remove(&mut self, ids: &[EntityId]) {
-        let mut doomed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
+        // The origin stays, even when the curves standing on it go.
+        let origin = self.origin();
+        let mut doomed: std::collections::HashSet<EntityId> = ids
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != origin)
+            .collect();
         // Curves standing on a deleted point go too.
         for e in &self.entities {
             if curve_points(&e.geometry).iter().any(|p| doomed.contains(p)) {
@@ -512,7 +518,7 @@ impl ConstrainedSketch {
                 .entities
                 .iter()
                 .any(|e| !doomed.contains(&e.id) && curve_points(&e.geometry).contains(&p));
-            if !still_used {
+            if !still_used && Some(p) != origin {
                 doomed.insert(p);
             }
         }
@@ -523,6 +529,37 @@ impl ConstrainedSketch {
                 .iter()
                 .all(|id| !doomed.contains(id))
         });
+    }
+
+    /// The sketch origin: a construction point held by a `Fixed` relation, made by
+    /// [`ensure_origin`](Self::ensure_origin). It can be snapped to, dimensioned and related
+    /// like any point, but is never deleted with the geometry around it.
+    pub fn origin(&self) -> Option<EntityId> {
+        self.entities
+            .iter()
+            .find(|e| {
+                matches!(e.geometry, Geometry::Point(_)) && e.construction && self.is_fixed(e.id)
+            })
+            .map(|e| e.id)
+    }
+
+    /// The origin point, created if the sketch has none, and moved to `at` (where the model
+    /// origin falls in the sketch plane) if it is elsewhere.
+    pub fn ensure_origin(&mut self, at: Point2) -> EntityId {
+        match self.origin() {
+            Some(id) => {
+                if self.position(id).is_some_and(|p| p.distance(at) > 1e-9) {
+                    self.move_point(id, at);
+                }
+                id
+            }
+            None => {
+                let id = self.point(at);
+                self.set_construction(id, true);
+                self.constrain(Constraint::Fixed(id));
+                id
+            }
+        }
     }
 
     /// Whether a `Fixed` relation holds this point.

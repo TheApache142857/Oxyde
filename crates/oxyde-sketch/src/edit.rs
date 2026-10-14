@@ -456,9 +456,10 @@ impl ConstrainedSketch {
             .iter()
             .flat_map(|e| curve_points(&e.geometry))
             .collect();
+        let origin = self.origin();
         let orphans: Vec<EntityId> = curve_points(&before.geometry)
             .into_iter()
-            .filter(|p| !in_use.contains(p))
+            .filter(|p| !in_use.contains(p) && Some(*p) != origin)
             .collect();
         if !orphans.is_empty() {
             self.entities.retain(|e| !orphans.contains(&e.id));

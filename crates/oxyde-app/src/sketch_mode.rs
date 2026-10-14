@@ -4,8 +4,11 @@
 //! the user exits the sketch. Colours follow SolidWorks: blue geometry can still move,
 //! black is fully defined, red takes part in conflicting relations.
 //!
-//! While drawing, the cursor snaps to existing points, to the middle of lines, to crossings
-//! and onto curves; the new point keeps that relation (coincident, midpoint, on curve).
+//! While drawing, the cursor snaps to existing points (the origin among them), to the end
+//! points, middles and centres of the part's edges lying in the sketch plane, to the middle
+//! of lines, to crossings and onto curves; the new point keeps that relation (coincident,
+//! fixed on the part, midpoint, on curve). Convert Entities copies part edges into the
+//! sketch.
 
 use std::collections::HashSet;
 
@@ -18,6 +21,7 @@ use oxyde_sketch::{
 };
 
 use crate::icons::Icon;
+use crate::model_refs::{ModelCurve, ModelGeometry, ModelPointKind};
 use crate::viewport::{Viewport, ViewportOutput};
 
 /// The cursor snaps to a point or a crossing within this many points.
@@ -40,6 +44,7 @@ const PREVIEW: Color32 = Color32::from_rgb(120, 120, 120);
 const DIMENSION: Color32 = Color32::from_rgb(90, 90, 90);
 const SNAPPED: Color32 = Color32::from_rgb(230, 120, 0);
 const TRIMMED: Color32 = Color32::from_rgb(220, 40, 40);
+const MODEL: Color32 = Color32::from_rgb(130, 130, 130);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -48,29 +53,42 @@ pub enum Tool {
     Line,
     Centerline,
     Rectangle,
+    CenterRectangle,
     Circle,
     Arc,
     Trim,
+    Convert,
 }
 
 impl Tool {
     /// The tools of the Sketch tab, in order, with icon and label.
-    pub const ALL: [(Tool, Icon, &'static str); 8] = [
+    pub const ALL: [(Tool, Icon, &'static str); 10] = [
         (Tool::Select, Icon::Select, "Select"),
         (Tool::Dimension, Icon::SmartDimension, "Smart Dimension"),
         (Tool::Line, Icon::Line, "Line"),
         (Tool::Centerline, Icon::Centerline, "Centerline"),
-        (Tool::Rectangle, Icon::Rectangle, "Rectangle"),
+        (Tool::Rectangle, Icon::Rectangle, "Corner Rectangle"),
+        (
+            Tool::CenterRectangle,
+            Icon::CenterRectangle,
+            "Center Rectangle",
+        ),
         (Tool::Circle, Icon::Circle, "Circle"),
         (Tool::Arc, Icon::Arc, "Arc"),
         (Tool::Trim, Icon::Trim, "Trim"),
+        (Tool::Convert, Icon::Convert, "Convert Entities"),
     ];
 
     /// Tools that draw new geometry.
     pub fn draws(self) -> bool {
         matches!(
             self,
-            Tool::Line | Tool::Centerline | Tool::Rectangle | Tool::Circle | Tool::Arc
+            Tool::Line
+                | Tool::Centerline
+                | Tool::Rectangle
+                | Tool::CenterRectangle
+                | Tool::Circle
+                | Tool::Arc
         )
     }
 
@@ -84,9 +102,13 @@ impl Tool {
                 "Click points; click an existing point to close the contour"
             }
             Tool::Rectangle => "Click two opposite corners",
+            Tool::CenterRectangle => "Click the centre (e.g. the origin), then a corner",
             Tool::Circle => "Click the centre, then a point on the circle",
             Tool::Arc => "Click the centre, the start, then the end (counter-clockwise)",
             Tool::Trim => "Click the piece of a curve to remove, up to the nearest crossings",
+            Tool::Convert => {
+                "Click an edge of the part lying in the sketch plane to copy it into the sketch"
+            }
         }
     }
 }
@@ -101,6 +123,8 @@ enum Snap {
     Crossing(EntityId, EntityId),
     /// Somewhere on a curve.
     OnCurve(EntityId),
+    /// An end point, middle or centre of a part edge: the new point is fixed there.
+    Model,
 }
 
 /// A point placed by the current tool, created only when the shape is finished.
@@ -148,6 +172,10 @@ pub struct SketchSession {
     pub sketch: ConstrainedSketch,
     /// The sketch as it was when editing started.
     pub original: ConstrainedSketch,
+    /// It had no geometry (besides the origin) when editing started.
+    pub original_empty: bool,
+    /// The part's edges in the sketch plane, to snap to and convert.
+    pub model: ModelGeometry,
     pub report: Option<SolveReport>,
     pub tool: Tool,
     pub selection: Vec<EntityId>,
@@ -160,6 +188,8 @@ pub struct SketchSession {
     pub driven: HashSet<RelationId>,
     pending: Vec<Pending>,
     hover: Option<EntityId>,
+    /// Part edge under the cursor (Convert Entities), by index in `model.curves`.
+    model_hover: Option<usize>,
     drag: Option<Drag>,
     labels: Vec<(Rect, RelationId)>,
     history: Vec<ConstrainedSketch>,
@@ -174,11 +204,21 @@ impl SketchSession {
         new_sketch: bool,
         restore_rollback: Option<FeatureId>,
     ) -> Self {
+        let original_empty = sketch
+            .entities()
+            .iter()
+            .all(|e| Some(e.id) == sketch.origin());
+        // The origin point sits where the model origin falls in the sketch plane.
+        let mut sketch = sketch;
+        let v = oxyde_geom::Point3::ORIGIN - plane.origin;
+        sketch.ensure_origin(Point2::new(v.dot(plane.x_dir), v.dot(plane.y_dir())));
         let mut session = Self {
             feature,
             name,
             plane,
             original: sketch.clone(),
+            original_empty,
+            model: ModelGeometry::default(),
             sketch,
             report: None,
             tool: if new_sketch { Tool::Line } else { Tool::Select },
@@ -189,6 +229,7 @@ impl SketchSession {
             driven: HashSet::new(),
             pending: Vec::new(),
             hover: None,
+            model_hover: None,
             drag: None,
             labels: Vec::new(),
             history: Vec::new(),
@@ -529,6 +570,16 @@ impl SketchSession {
             );
         }
         let near = |p: Point2| (to_screen(p) - pos).length();
+        let on_model = self
+            .model
+            .points
+            .iter()
+            .map(|(p, _)| (*p, near(*p)))
+            .filter(|(_, d)| *d < SNAP)
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((p, _)) = on_model {
+            return (p, Some(Snap::Model));
+        }
         let middle = self
             .sketch
             .entities()
@@ -683,6 +734,7 @@ impl SketchSession {
             Some(Snap::Midpoint(line)) => vec![Constraint::Midpoint(point, line)],
             Some(Snap::Crossing(a, b)) => vec![on(&self.sketch, a), on(&self.sketch, b)],
             Some(Snap::OnCurve(curve)) => vec![on(&self.sketch, curve)],
+            Some(Snap::Model) => vec![Constraint::Fixed(point)],
         };
         for relation in relations {
             self.sketch.constrain(relation);
@@ -720,7 +772,43 @@ impl SketchSession {
     fn click_tool(&mut self, p: Pending) {
         let relations_before = self.sketch.relations().len();
         match self.tool {
-            Tool::Select | Tool::Dimension | Tool::Trim => {}
+            Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert => {}
+            Tool::CenterRectangle => match self.pending.first().copied() {
+                None => self.pending = vec![p],
+                Some(center) => {
+                    let (dx, dy) = ((p.at.x - center.at.x).abs(), (p.at.y - center.at.y).abs());
+                    if dx > 1e-6 && dy > 1e-6 {
+                        self.checkpoint();
+                        let lines = self.sketch.rectangle(
+                            Point2::new(center.at.x - dx, center.at.y - dy),
+                            2.0 * dx,
+                            2.0 * dy,
+                        );
+                        let corners: Vec<EntityId> = lines
+                            .iter()
+                            .filter_map(|l| self.sketch.endpoints(*l).map(|(a, _)| a))
+                            .collect();
+                        // Construction diagonals, crossing at the centre point.
+                        let d1 = self.sketch.line_between(corners[0], corners[2]);
+                        let d2 = self.sketch.line_between(corners[1], corners[3]);
+                        self.sketch.set_construction(d1, true);
+                        self.sketch.set_construction(d2, true);
+                        let c = self.realize(center);
+                        self.sketch.constrain(Constraint::Midpoint(c, d1));
+                        self.sketch.constrain(Constraint::Midpoint(c, d2));
+                        let corner = corners.iter().copied().find(|q| {
+                            self.sketch
+                                .position(*q)
+                                .is_some_and(|at| at.distance(p.at) < 1e-9)
+                        });
+                        if let Some(corner) = corner {
+                            self.attach(corner, p.snap);
+                        }
+                        self.solve_new_shape(relations_before);
+                    }
+                    self.pending.clear();
+                }
+            },
             Tool::Line | Tool::Centerline => match self.pending.first().copied() {
                 None => self.pending = vec![p],
                 Some(start) => {
@@ -834,6 +922,84 @@ impl SketchSession {
         }
     }
 
+    /// The part edge under a screen position.
+    fn model_hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<usize> {
+        self.model
+            .curves
+            .iter()
+            .enumerate()
+            .map(|(i, curve)| {
+                let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
+                let d = path
+                    .windows(2)
+                    .map(|w| segment_distance(pos, w[0], w[1]))
+                    .fold(f32::INFINITY, f32::min);
+                (i, d)
+            })
+            .filter(|(_, d)| *d < PICK)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
+    }
+
+    /// A point fixed at `at`: an existing one there, or a new one.
+    fn fixed_point_at(&mut self, at: Point2) -> EntityId {
+        let existing = self
+            .sketch
+            .entities()
+            .iter()
+            .find(|e| matches!(e.geometry, Geometry::Point(p) if p.distance(at) < 1e-9))
+            .map(|e| e.id);
+        match existing {
+            Some(id) => {
+                if !self.sketch.is_fixed(id) {
+                    self.sketch.constrain(Constraint::Fixed(id));
+                }
+                id
+            }
+            None => {
+                let id = self.sketch.point(at);
+                self.sketch.constrain(Constraint::Fixed(id));
+                id
+            }
+        }
+    }
+
+    /// Convert Entities: copies a part edge into the sketch, fixed where it is. Edges
+    /// converted one after the other share their end points.
+    fn convert(&mut self, index: usize) {
+        let Some(curve) = self.model.curves.get(index).copied() else {
+            return;
+        };
+        self.checkpoint();
+        match curve {
+            ModelCurve::Line(a, b) => {
+                let (pa, pb) = (self.fixed_point_at(a), self.fixed_point_at(b));
+                self.sketch.line_between(pa, pb);
+            }
+            ModelCurve::Circle(center, radius) => {
+                let c = self.fixed_point_at(center);
+                let circle = self.sketch.circle_around(c, radius);
+                // A fixed point on the rim holds the radius without a dimension.
+                let rim = self.fixed_point_at(Point2::new(center.x + radius, center.y));
+                self.sketch.set_construction(rim, true);
+                self.sketch
+                    .constrain(Constraint::PointOnCircle(rim, circle));
+            }
+            ModelCurve::Arc { center, start, end } => {
+                let (c, s, e) = (
+                    self.fixed_point_at(center),
+                    self.fixed_point_at(start),
+                    self.fixed_point_at(end),
+                );
+                self.sketch.arc_between(c, s, e);
+            }
+        }
+        if !self.solve() {
+            self.undo();
+            self.message = Some("That edge cannot be added with the existing relations".to_owned());
+        }
+    }
+
     /// Adds Horizontal or Vertical to a nearly horizontal or vertical new line.
     fn auto_relation(&mut self, line: EntityId, a: Point2, b: Point2) -> Option<RelationId> {
         let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
@@ -890,20 +1056,48 @@ impl SketchSession {
     ) {
         let conflicting = self.conflicting();
         let at = |id| self.sketch.position(id).unwrap_or_default();
+        let origin_id = self.sketch.origin();
 
-        // Sketch origin and axes.
-        let origin = to_screen(Point2::ORIGIN);
+        // Part edges: centre marks, and the edge Convert Entities would copy.
+        for (p, kind) in &self.model.points {
+            if *kind == ModelPointKind::Center {
+                let c = to_screen(*p);
+                let stroke = Stroke::new(1.0, MODEL);
+                painter.line_segment([c - Vec2::new(5.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
+                painter.line_segment([c - Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 5.0)], stroke);
+            }
+        }
+        if let Some(curve) = self.model_hover.and_then(|i| self.model.curves.get(i)) {
+            let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
+            painter.add(Shape::line(path, Stroke::new(3.0, HOVERED)));
+        }
+
+        // Sketch origin: a point that can be picked, with its axes.
+        let origin_at = origin_id
+            .and_then(|id| self.sketch.position(id))
+            .unwrap_or_default();
+        let origin = to_screen(origin_at);
         for (axis, color) in [
             (Point2::new(1.0, 0.0), Color32::from_rgb(210, 50, 50)),
             (Point2::new(0.0, 1.0), Color32::from_rgb(40, 150, 60)),
         ] {
-            let d = to_screen(axis) - origin;
+            let d = to_screen(Point2::new(origin_at.x + axis.x, origin_at.y + axis.y)) - origin;
             if d.length() > 1e-6 {
                 painter.line_segment(
                     [origin, origin + d.normalized() * 18.0],
                     Stroke::new(1.5, color),
                 );
             }
+        }
+        if let Some(id) = origin_id {
+            let color = if self.selection.contains(&id) {
+                SELECTED
+            } else if self.hover == Some(id) {
+                HOVERED
+            } else {
+                Color32::from_rgb(200, 60, 60)
+            };
+            painter.circle(origin, 3.5, color, Stroke::new(1.0, Color32::WHITE));
         }
 
         for e in self.sketch.entities() {
@@ -936,6 +1130,9 @@ impl SketchSession {
         }
 
         for e in self.sketch.entities() {
+            if Some(e.id) == origin_id {
+                continue;
+            }
             if let Geometry::Point(p) = e.geometry {
                 let color = self.color(e.id, false, &conflicting);
                 let size = if self.selection.contains(&e.id) || self.hover == Some(e.id) {
@@ -1041,6 +1238,25 @@ impl SketchSession {
                         3.0,
                     ));
                 }
+                Tool::CenterRectangle => {
+                    let (dx, dy) = (cursor.x - first.at.x, cursor.y - first.at.y);
+                    let c = first.at;
+                    let corners = [
+                        Point2::new(c.x - dx, c.y - dy),
+                        Point2::new(c.x + dx, c.y - dy),
+                        Point2::new(c.x + dx, c.y + dy),
+                        Point2::new(c.x - dx, c.y + dy),
+                        Point2::new(c.x - dx, c.y - dy),
+                    ];
+                    let path: Vec<Pos2> = corners.into_iter().map(to_screen).collect();
+                    painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
+                    painter.extend(Shape::dashed_line(
+                        &[path[0], path[2]],
+                        Stroke::new(1.0, CONSTRUCTION),
+                        4.0,
+                        3.0,
+                    ));
+                }
                 Tool::Rectangle => {
                     let corners = [
                         first.at,
@@ -1081,7 +1297,7 @@ impl SketchSession {
                     };
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                 }
-                Tool::Select | Tool::Dimension | Tool::Trim => {}
+                Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert => {}
             }
         }
 
@@ -1368,6 +1584,15 @@ fn perpendicular_foot(p: Point2, a: Point2, b: Point2) -> Point2 {
     Point2::new(a.x + dx * t, a.y + dy * t)
 }
 
+/// Points along a part edge, for drawing and picking.
+fn model_path(curve: &ModelCurve) -> Vec<Point2> {
+    match *curve {
+        ModelCurve::Line(a, b) => vec![a, b],
+        ModelCurve::Circle(c, r) => arc_points(c, r, 0.0, std::f64::consts::TAU, 72),
+        ModelCurve::Arc { center, start, end } => arc_path(center, start, end),
+    }
+}
+
 fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color32) {
     let back = tip - direction * 7.0;
     let side = Vec2::new(-direction.y, direction.x) * 2.8;
@@ -1403,6 +1628,19 @@ fn draw_snap(painter: &egui::Painter, at: Pos2, snap: Snap) {
         }
         Snap::OnCurve(_) => {
             painter.circle_stroke(at, 5.0, stroke);
+        }
+        Snap::Model => {
+            // A diamond: fixed on the part.
+            let r = 6.0;
+            painter.add(Shape::closed_line(
+                vec![
+                    at + Vec2::new(0.0, -r),
+                    at + Vec2::new(r, 0.0),
+                    at + Vec2::new(0.0, r),
+                    at + Vec2::new(-r, 0.0),
+                ],
+                stroke,
+            ));
         }
     }
 }
@@ -1489,7 +1727,12 @@ pub fn interact(
         }
     }
 
+    session.model_hover = match (session.tool, pointer) {
+        (Tool::Convert, Some(p)) => session.model_hit(p, &to_screen),
+        _ => None,
+    };
     session.hover = match (session.drag, pointer, session.tool) {
+        (_, _, Tool::Convert) => None,
         (None, Some(p), Tool::Trim) => session.curve_hit(p, &to_screen),
         (None, Some(p), tool) if !tool.draws() => session.hit(p, &to_screen),
         _ => None,
@@ -1530,6 +1773,11 @@ pub fn interact(
                 Tool::Trim => {
                     if let (Some(curve), Some(at)) = (session.hover, cursor) {
                         session.trim(curve, at);
+                    }
+                }
+                Tool::Convert => {
+                    if let Some(index) = session.model_hover {
+                        session.convert(index);
                     }
                 }
                 _ => {
@@ -1691,6 +1939,82 @@ mod tests {
             |c| matches!(c, Constraint::Coincident(_, p) if *p == corner)
         ));
         assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn the_origin_is_a_point_to_build_on() {
+        let mut session = session(ConstrainedSketch::new());
+        let origin = session.sketch.origin().expect("every sketch has an origin");
+        assert!(!session.changed(), "adding the origin is not an edit");
+        // A centre rectangle snapped to the origin is centred on it.
+        session.set_tool(Tool::CenterRectangle);
+        session.click_tool(Pending {
+            at: Point2::ORIGIN,
+            snap: Some(Snap::Point(origin)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(10.0, 5.0),
+            snap: None,
+        });
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::Midpoint(p, _) if *p == origin)
+        ));
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        // Two dimensions define it fully: width and height.
+        let lines: Vec<EntityId> = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }) && !e.construction)
+            .map(|e| e.id)
+            .collect();
+        assert!(session.add_dimension(Constraint::Length(lines[0], 30.0), 30.0));
+        assert!(session.add_dimension(Constraint::Length(lines[1], 12.0), 12.0));
+        assert_eq!(session.report.as_ref().unwrap().degrees_of_freedom, 0);
+        // It cannot be deleted.
+        session.selection = vec![origin];
+        session.delete_selection();
+        assert_eq!(session.sketch.origin(), Some(origin));
+    }
+
+    #[test]
+    fn part_edges_can_be_snapped_to_and_converted() {
+        use crate::model_refs::{ModelCurve, ModelGeometry, ModelPointKind};
+        let mut session = session(ConstrainedSketch::new());
+        session.model = ModelGeometry {
+            points: vec![(Point2::new(20.0, 10.0), ModelPointKind::Center)],
+            curves: vec![
+                ModelCurve::Circle(Point2::new(20.0, 10.0), 4.0),
+                ModelCurve::Line(Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)),
+            ],
+        };
+        // A circle centred on the hole: its centre is fixed there.
+        session.set_tool(Tool::Circle);
+        session.click_tool(Pending {
+            at: Point2::new(20.0, 10.0),
+            snap: Some(Snap::Model),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(22.0, 10.0),
+            snap: None,
+        });
+        assert!(has(&session, |c| matches!(c, Constraint::Fixed(_))));
+        // Convert the hole and the edge.
+        session.convert(0);
+        session.convert(1);
+        let circles = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Circle { .. }))
+            .count();
+        assert_eq!(circles, 2);
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        // The converted circle and line cannot move; only the drawn circle's radius can.
+        assert_eq!(report.degrees_of_freedom, 1);
     }
 
     #[test]

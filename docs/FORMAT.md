@@ -143,6 +143,8 @@ Every feature may also carry `dimension_names` (optional, default empty): custom
 | `circle` | `center`: point id, `radius` |
 | `arc` | `center`, `start`, `end`: point ids; counter-clockwise from `start` to `end` |
 
+The **sketch origin** is the construction point held by a `fixed` relation; Oxyde places it where the model origin falls in the sketch plane, and other geometry may share it or refer to it like any point. A sketch has at most one.
+
 Connected geometry shares point entities. The ids of lines, circles and arcs are the `segment` numbers in face references, so they must stay stable.
 
 `relations` (optional, default empty), each with a unique `id` (never reused within the sketch) and, for dimensions (the relations with a `value`), a `name` unique within the sketch; lengths in mm, angles in **radians**:

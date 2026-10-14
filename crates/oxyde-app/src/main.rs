@@ -13,6 +13,7 @@ mod equations_ui;
 mod evaluate;
 mod features_ui;
 mod icons;
+mod model_refs;
 mod property_manager;
 mod sketch_mode;
 mod timeline;

@@ -493,3 +493,31 @@ fn trimming_a_curve_nothing_crosses_deletes_it() {
     assert!(s.entity(lone).is_none());
     assert_eq!(s.entities().len(), 2, "the circle and its centre remain");
 }
+
+#[test]
+fn the_origin_is_a_fixed_point_that_survives_deletions() {
+    let mut s = ConstrainedSketch::new();
+    let origin = s.ensure_origin(Point2::ORIGIN);
+    assert_eq!(s.ensure_origin(Point2::ORIGIN), origin, "made once");
+    // A line from the origin, then deleted: the origin stays.
+    let end = s.point(Point2::new(10.0, 0.0));
+    let line = s.line_between(origin, end);
+    s.remove(&[line]);
+    assert_eq!(s.origin(), Some(origin));
+    s.remove(&[origin]);
+    assert_eq!(s.origin(), Some(origin), "cannot be deleted");
+    // A rectangle centred on it with a dimension from it.
+    let [bottom, right, ..] = s.rectangle(Point2::new(-4.0, -3.0), 9.0, 5.0);
+    let (corner, _) = s.endpoints(bottom).unwrap();
+    s.constrain(Length(bottom, 20.0));
+    s.constrain(Length(right, 10.0));
+    s.constrain(HorizontalDistance(origin, corner, 10.0));
+    s.constrain(VerticalDistance(origin, corner, 5.0));
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    assert!(close(s.position(corner).unwrap(), -10.0, -5.0));
+    assert!(close(s.position(origin).unwrap(), 0.0, 0.0));
+}

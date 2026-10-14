@@ -383,6 +383,9 @@ impl OxydeApp {
                 _ => None,
             })
             .collect();
+        if let Some(body) = self.doc.part.body() {
+            session.model = crate::model_refs::ModelGeometry::from_body(&body.topology, &plane);
+        }
         if let Some(tool) = self.pending_tool.take() {
             session.set_tool(tool);
         }
@@ -404,7 +407,7 @@ impl OxydeApp {
                 sketch.geometry = session.sketch.clone();
             }
         }
-        if !keep && session.new_sketch && session.original.is_empty() {
+        if !keep && session.new_sketch && session.original_empty {
             // Cancelling a brand-new sketch removes it, as SolidWorks does.
             let _ = self.doc.part.delete(id);
             self.selected_feature = None;

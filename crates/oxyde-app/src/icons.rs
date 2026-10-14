@@ -34,10 +34,12 @@ pub enum Icon {
     Line,
     Centerline,
     Rectangle,
+    CenterRectangle,
     Circle,
     Arc,
     SmartDimension,
     Trim,
+    Convert,
     Construction,
     ExitSketch,
     Discard,
@@ -539,6 +541,23 @@ fn draw(pen: &Pen, icon: Icon) {
                 pen.vertex(x, y, INK);
             }
         }
+        CenterRectangle => {
+            pen.dashed(&[(4.0, 6.0), (20.0, 18.0)], 1.0, INK, 2.0, 1.5);
+            pen.dashed(&[(20.0, 6.0), (4.0, 18.0)], 1.0, INK, 2.0, 1.5);
+            pen.closed(
+                &[(4.0, 6.0), (20.0, 6.0), (20.0, 18.0), (4.0, 18.0)],
+                2.0,
+                SKETCH,
+            );
+            pen.circle(12.0, 12.0, 2.0, AXIS_X, None);
+        }
+        Convert => {
+            // An edge of the part copied down into the sketch.
+            pen.solid(3.0, 6.0, 11.0, 7.0, 4.0);
+            pen.line(&[(3.0, 13.0), (14.0, 13.0)], 2.2, ACCENT);
+            pen.arrow((8.5, 14.5), (8.5, 19.0), 1.4, ACCENT);
+            pen.line(&[(3.0, 21.0), (21.0, 21.0)], 2.2, SKETCH);
+        }
         Circle => {
             pen.ring(12.0, 12.0, 8.5, 2.0, SKETCH);
             pen.vertex(12.0, 12.0, INK);
@@ -810,7 +829,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 45] = {
+pub const ALL: [Icon; 47] = {
     use Icon::*;
     [
         Sketch,
@@ -833,10 +852,12 @@ pub const ALL: [Icon; 45] = {
         Line,
         Centerline,
         Rectangle,
+        CenterRectangle,
         Circle,
         Arc,
         SmartDimension,
         Trim,
+        Convert,
         Construction,
         ExitSketch,
         Discard,
