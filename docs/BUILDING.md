@@ -6,7 +6,7 @@
 
 1. **Visual Studio 2022** (Community or Build Tools) with the **Desktop development with C++** workload.
 2. **Rust** via [rustup](https://rustup.rs), with the default host `x86_64-pc-windows-msvc`. Rust 1.85 or newer (edition 2024).
-3. **OpenCASCADE (OCCT)** 7.8 or newer recommended (7.7 also works). Choose one of the options below.
+3. **OpenCASCADE (OCCT)** 7.7 or newer. Tested with **8.0.1** (current vcpkg version); 7.7 and 7.8 should also work (the shim keeps their code paths) but are not regularly tested. Choose one of the options below.
 
 ### Option A — vcpkg (recommended)
 
@@ -16,7 +16,7 @@ C:\dev\vcpkg\bootstrap-vcpkg.bat
 C:\dev\vcpkg\vcpkg install opencascade:x64-windows
 ```
 
-Building OCCT through vcpkg takes a while (expect 30 minutes or more).
+Building OCCT through vcpkg takes a while (expect 30 minutes or more). vcpkg currently installs OCCT 8.0.x, which is what Oxyde is tested against.
 
 Then:
 
@@ -56,6 +56,8 @@ Always use the **release** OCCT libraries, even for `cargo build` in debug: Rust
 
 Open a new terminal afterwards.
 
+Cargo must be run from the repository folder (`cd C:\path\to\Oxyde`); a new terminal usually starts in your home folder, where Cargo reports *could not find `Cargo.toml`*.
+
 ## 2. Build and test
 
 ```powershell
@@ -78,5 +80,6 @@ In the application, **File › Open demo bracket** builds a part using every fea
 | Build script panics with "OpenCASCADE not configured" or "headers and libraries not found" | `OXYDE_OCCT_DIR` / `VCPKG_ROOT` unset or pointing at the wrong folder. The message lists every folder searched. |
 | `fatal error C1083: Cannot open include file: 'Standard.hxx'` | Include directory wrong — use Option C to set it explicitly. |
 | `LNK2019: unresolved external symbol` | Library directory from a different OCCT version than the headers, or a missing toolkit. Report the symbol name. |
+| `C1083` for a `*Iterator*.hxx` header, or `'DynamicType': is not a member of 'Standard_Failure'` | OCCT 8 removed legacy typedef headers and changed its exception class. The shim handles both 7.x and 8.x; if a new error of this kind appears, report it with the OCCT version. |
 | Tests exit with `0xc0000135` (`STATUS_DLL_NOT_FOUND`) | OCCT DLLs (or their third-party DLLs) are not on `PATH`. |
 | Build script says only Windows with MSVC is supported | You are on another OS, or using the `x86_64-pc-windows-gnu` toolchain. Run `rustup default stable-x86_64-pc-windows-msvc`. |

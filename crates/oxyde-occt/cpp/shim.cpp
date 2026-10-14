@@ -39,7 +39,6 @@
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
-#include <TopTools_ListIteratorOfListOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
@@ -67,14 +66,20 @@ namespace oxyde::occt {
 namespace {
 
 // Runs `body`, converting every exception into std::runtime_error prefixed with `op`.
-// OCCT's Standard_Failure does not derive from std::exception, so cxx would not catch it.
+// Before OCCT 8, Standard_Failure did not derive from std::exception, so cxx would not catch it.
 template <typename F>
 auto guarded(const char* op, F&& body) -> decltype(body()) {
     try {
         return body();
     } catch (const Standard_Failure& e) {
+#if OCC_VERSION_HEX >= 0x080000
+        // OCCT 8: exceptions derive from std::exception and are no longer Standard_Transient.
+        std::string message = std::string(op) + ": " + e.ExceptionType();
+        const char* detail = e.what();
+#else
         std::string message = std::string(op) + ": " + e.DynamicType()->Name();
         const char* detail = e.GetMessageString();
+#endif
         if (detail != nullptr && *detail != '\0') {
             message += ": ";
             message += detail;
@@ -130,7 +135,7 @@ void add_source(OpResultData& out, const TopTools_IndexedMapOfShape& result_face
 void add_sources(OpResultData& out, const TopTools_IndexedMapOfShape& result_faces,
                  const TopTools_ListOfShape& faces, SourceKind kind, std::uint32_t input,
                  std::uint32_t index) {
-    for (TopTools_ListIteratorOfListOfShape it(faces); it.More(); it.Next()) {
+    for (TopTools_ListOfShape::Iterator it(faces); it.More(); it.Next()) {
         add_source(out, result_faces, it.Value(), kind, input, index);
     }
 }
@@ -631,7 +636,7 @@ TopologyData Session::topology(std::uint64_t shape) const {
 
             if (edge_faces.Contains(edge)) {
                 const TopTools_ListOfShape& adjacent = edge_faces.FindFromKey(edge);
-                for (TopTools_ListIteratorOfListOfShape it(adjacent); it.More(); it.Next()) {
+                for (TopTools_ListOfShape::Iterator it(adjacent); it.More(); it.Next()) {
                     const int index = faces.FindIndex(it.Value());
                     if (index > 0) {
                         push_unique(data.faces, static_cast<std::uint32_t>(index - 1));

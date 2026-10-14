@@ -225,15 +225,7 @@ impl Part {
         self.next_id += 1;
         let name = self.next_name(kind.type_name());
         let at = self.active_end();
-        self.features.insert(
-            at,
-            Feature {
-                id,
-                name,
-                suppressed: false,
-                kind,
-            },
-        );
+        self.features.insert(at, Feature::new(id, name, false, kind));
         if let Some(active) = self.rollback.as_mut() {
             *active = at + 1;
         }

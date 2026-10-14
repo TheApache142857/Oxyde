@@ -46,7 +46,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/F
 
 ## Building
 
-**Windows (x64, MSVC) only for now.** You need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.8+ (vcpkg recommended). Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
+**Windows (x64, MSVC) only for now.** You need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.7+ (8.0 tested; vcpkg recommended). Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
 
 ```powershell
 cargo run --release -p oxyde-app              # the application (File › Open demo bracket)
