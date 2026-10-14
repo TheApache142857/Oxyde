@@ -7,13 +7,15 @@ use oxyde_model::{
     EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, SketchPlane,
     StandardPlane,
 };
-use oxyde_sketch::Constraint;
+use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
 
 pub struct ExtrudeDialog {
     /// The feature being edited, or `None` for a new one.
     pub editing: Option<FeatureId>,
+    /// Full name of the depth dimension ("D1@Boss-Extrude1"), when editing.
+    pub dimension: Option<String>,
     pub sketch: FeatureId,
     pub sketches: Vec<(FeatureId, String)>,
     pub op: ExtrudeOp,
@@ -24,6 +26,8 @@ pub struct ExtrudeDialog {
 
 pub struct BlendDialog {
     pub editing: Option<FeatureId>,
+    /// Full name of the radius or distance dimension, when editing.
+    pub dimension: Option<String>,
     pub fillet: bool,
     pub size: f64,
     pub edges: Vec<EdgeName>,
@@ -36,8 +40,8 @@ pub struct BlendDialog {
 pub enum DimensionTarget {
     /// A new dimension on the current sketch selection.
     New(Constraint),
-    /// The value of an existing relation, by index.
-    Existing(usize),
+    /// The value (and name) of an existing dimension.
+    Existing(RelationId),
 }
 
 pub enum Dialog {
@@ -47,7 +51,10 @@ pub enum Dialog {
     ChoosePlane,
     Dimension {
         target: DimensionTarget,
+        /// Window title: the dimension's full name ("D1@Sketch2"), or what is measured.
         label: String,
+        /// Editable name, for existing dimensions.
+        name: Option<String>,
         /// mm, or degrees for angles.
         value: f64,
         angle: bool,
@@ -156,6 +163,7 @@ impl OxydeApp {
             }
             Dialog::Dimension {
                 label,
+                name,
                 value,
                 angle,
                 ..
@@ -163,8 +171,23 @@ impl OxydeApp {
                 let mut answer = Answer::Open;
                 window(label).show(ctx, |ui| {
                     let suffix = if *angle { "°" } else { " mm" };
-                    let response = ui.add(egui::DragValue::new(value).speed(0.1).suffix(suffix));
-                    response.request_focus();
+                    egui::Grid::new("dimension_dialog")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Value");
+                            let response =
+                                ui.add(egui::DragValue::new(value).speed(0.1).suffix(suffix));
+                            if name.is_none() {
+                                response.request_focus();
+                            }
+                            ui.end_row();
+                            if let Some(name) = name {
+                                ui.label("Name");
+                                ui.text_edit_singleline(name)
+                                    .on_hover_text("Used in equations, e.g. Width@Sketch1");
+                                ui.end_row();
+                            }
+                        });
                     answer = ok_cancel(ui, "OK");
                 });
                 answer
@@ -282,6 +305,7 @@ impl OxydeApp {
             Dialog::ChoosePlane => {}
             Dialog::Dimension {
                 target,
+                name,
                 value,
                 angle,
                 ..
@@ -292,17 +316,19 @@ impl OxydeApp {
                         DimensionTarget::New(relation) => {
                             session.add_dimension(relation, value);
                         }
-                        DimensionTarget::Existing(index) => {
-                            session.set_dimension(index, value);
+                        DimensionTarget::Existing(id) => {
+                            if let Some(name) = name {
+                                session.rename_dimension(id, name.trim());
+                            }
+                            session.set_dimension(id, value);
                         }
                     }
                 }
             }
             Dialog::Rename { feature, name } => {
                 let name = name.trim().to_owned();
-                if !name.is_empty() {
-                    self.doc.checkpoint();
-                    let _ = self.doc.part.rename(feature, name);
+                if let Err(e) = self.rename_feature(feature, name) {
+                    self.status = e.to_string();
                 }
             }
             Dialog::PartProperties(properties) => {
@@ -357,7 +383,12 @@ fn extrude_window(ctx: &egui::Context, d: &mut ExtrudeDialog) -> Answer {
                 ui.end_row();
 
                 ui.label("Depth");
-                positive_length(ui, &mut d.depth);
+                ui.horizontal(|ui| {
+                    positive_length(ui, &mut d.depth);
+                    if let Some(name) = &d.dimension {
+                        ui.label(egui::RichText::new(name).small().weak());
+                    }
+                });
                 ui.end_row();
             });
         if !d.mid_plane {
@@ -396,6 +427,9 @@ fn blend_window(ctx: &egui::Context, d: &mut BlendDialog) -> Answer {
         ui.horizontal(|ui| {
             ui.label(label);
             positive_length(ui, &mut d.size);
+            if let Some(name) = &d.dimension {
+                ui.label(egui::RichText::new(name).small().weak());
+            }
         });
         answer = ok_cancel(ui, if d.editing.is_some() { "Apply" } else { title });
     });

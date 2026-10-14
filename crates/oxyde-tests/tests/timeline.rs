@@ -10,6 +10,7 @@ use oxyde_model::{
     FeatureStatus, Part, Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
+use oxyde_sketch::RelationId;
 
 // In a new sketch, `Sketch::rectangle` creates its four corner points first (ids 1–4),
 // then its bottom, right, top and left lines (ids 5–8).
@@ -290,8 +291,9 @@ fn reversed_and_midplane_extrusions_have_positive_volume() {
 }
 
 /// A 40 × 20 rectangle fully defined by a fixed corner and two dimensions. Returns the sketch,
-/// the line ids (bottom, right, top, left) and the indices of the width and height dimensions.
-fn dimensioned_rectangle() -> (Sketch, [u32; 4], usize, usize) {
+/// the line ids (bottom, right, top, left) and the ids of the width and height dimensions
+/// (named D1 and D2).
+fn dimensioned_rectangle() -> (Sketch, [u32; 4], RelationId, RelationId) {
     use oxyde_sketch::{Constraint, EntityId};
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
     let lines = sketch.rectangle(Point2::new(0.5, 0.5), 37.0, 18.0);
@@ -331,6 +333,16 @@ fn sketch_dimensions_drive_the_part() {
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
     assert_close(volume(&part, &kernel), 12000.0 - fillet_loss(2.0, 20.0));
+
+    // The same through SolidWorks-style names, as equations will: D1@Sketch1 is the width,
+    // D1@Boss-Extrude1 the depth.
+    let width = part.find_dimension("D1@Sketch1").unwrap();
+    let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
+    part.set_dimension(width, 50.0).unwrap();
+    part.set_dimension(depth, 5.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 5000.0 - fillet_loss(2.0, 20.0));
     part.release(&mut kernel);
 }
 

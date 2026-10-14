@@ -87,6 +87,8 @@ Implemented (M2, solver only):
   - relations are taken in order: one adding no independent equation is **redundant**, one left unsatisfied is **conflicting**. A failed solve leaves the geometry untouched.
 - `profile_segments()` turns the solved sketch into profile curves whose segment ids are the entity ids, so face names (`F2.side[7]`) follow sketch entities.
 
+Relations have a stable `RelationId`. Dimensions are named `D1`, `D2`… in creation order, as in SolidWorks, and can be renamed. Entity ids, relation ids and default-name numbers come from counters saved with the sketch, so nothing is ever reused after a deletion.
+
 In the model (M2b): a `Sketch` feature holds a `ConstrainedSketch`, solved during every rebuild. Conflicting relations put the sketch in error; redundant ones give a warning; an under-defined sketch is flagged in the timeline (`(-) Sketch1`, as in SolidWorks) but builds normally.
 
 ## 6. Feature tree and topological naming (`oxyde-model`)
@@ -96,7 +98,7 @@ In the model (M2b): a `Sketch` feature holds a `ConstrainedSketch`, solved durin
 - A part is an ordered list of features (sketch, extrude, revolve, cut, fillet, chamfer, shell, pattern, mirror, reference plane/axis…), each with typed parameters and references.
 - Features form a dependency DAG; editing one feature marks it and its dependants dirty, and only those are rebuilt.
 - A rollback bar and per-feature suppression are model concepts, not UI tricks.
-- Parameters can be expressions over named global variables (`width * 2 + 5 mm`).
+- Parameters can be expressions over named global variables (`width * 2 + 5 mm`) and other dimensions (see *Dimension names* below).
 
 ### Timeline (implemented in `part.rs`)
 
@@ -124,6 +126,15 @@ The problem: a fillet stores "edge #17"; after an upstream edit, numbering chang
 
 Known limits, to address later: unknown-origin faces (none expected from current operations) get index-based names; when pieces of a split face swap geometric order, their ordinals swap too.
 
+### Dimension names (implemented in `dimensions.rs`)
+
+The groundwork for equations, SolidWorks-style:
+
+- Every driving value has a **full name** `dimension@feature`: sketch dimensions (`D1@Sketch1`) and feature parameters (`D1@Boss-Extrude1` for the depth, `D1@Fillet1` for the radius). The name part can be changed (`Width@Sketch1`).
+- Internally a dimension is a `DimensionRef { feature: FeatureId, key: Sketch(RelationId) | Feature(FeatureParameter) }`: stable ids only. Renaming a feature or a dimension changes how it is shown, never what it points to; an equation will be stored with references and displayed with the current names.
+- `Part::dimensions()` lists every dimension in timeline order; `find_dimension("D1@Sketch1")` resolves a full name (quotes allowed, as typed in an equation); `set_dimension` and `rename_dimension` change one. Names are validated: unique feature names per part, unique dimension names per feature, no `@` or `"`.
+- **Tools › Dimensions…** in the app lists them all, with editable names and values: the future equations tab will sit next to it.
+
 ## 7. Units and tolerances
 
 - Internal length unit: **millimetre**, `f64`. Angles in radians internally, degrees in UI.
@@ -139,17 +150,17 @@ Known limits, to address later: unknown-origin faces (none expected from current
 
 ## 9. Application (`oxyde-app`) and viewport (`oxyde-render`)
 
-Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fillet, Chamfer, standard views, undo/redo), **timeline panel** on the left (reference planes, features with status colours and tooltips, rollback bar, context menu: rename, suppress, roll back, delete) with the **properties** of the selected feature below it, the **3D viewport** in the centre, a status bar.
+Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fillet, Chamfer, standard views, undo/redo), **timeline panel** on the left (reference planes, features with status colours and tooltips, rollback bar, context menu: rename, suppress, roll back, delete), the **3D viewport** in the centre, a status bar.
 
 - UI toolkit: `egui`/`eframe` 0.29, immediate mode. The app owns one `OcctKernel`; it is the only crate that chooses a backend.
 - **Rendering**: `oxyde-render` is a software rasterizer (orthographic, Y-up like SolidWorks). It draws shaded faces (normals smooth within a face, crisp between faces) and edges with a depth buffer, and fills **id buffers** in the same pass, so picking the face or edge under the mouse is exact; edges win within a few pixels. The image is shown as an egui texture and re-rendered only when the camera, size, highlight or scene changes. No GPU code means nothing driver-specific can break; a GPU backend can replace it behind the same `Scene`/`Camera`/`Frame` interface when parts get large.
 - Navigation: left-drag orbit, middle-drag or Shift+left-drag pan, wheel zoom at cursor, `F` zoom to fit; Front/Top/Right/Isometric views.
 - **Selection is held by persistent name** (`FaceName`/`EdgeName`), not index, so it survives rebuilds. Selected edges feed Fillet/Chamfer; a selected planar face becomes the sketch plane.
-- **Undo/redo** stores `PartDefinition` snapshots (the same data that is saved); consecutive edits of one feature in the properties panel coalesce into one step.
+- **Undo/redo** stores `PartDefinition` snapshots (the same data that is saved); one drag of a value (in a feature window or the Dimensions window) is one step.
 - No properties panel: features are edited SolidWorks-style, by double-click or right-click › Edit, which opens the feature's window (extrude, fillet, chamfer) or sketch mode.
 - Selecting a face or an edge highlights, in the timeline, the feature that created it (for an edge, the later of the two features that made its faces).
 - The rollback bar is a plain line with a round handle; drag it between features.
-- **Sketch mode** (`sketch_mode.rs`): editing a sketch rolls back the features after it, turns the view normal to the plane, and edits a working copy written back on exit (Escape or *Exit sketch*; *Discard* drops the changes, and a brand-new empty sketch is removed). Tools: select, line (chains; clicking an existing point closes the contour), rectangle, circle, arc. Clicks within 8 px of a point reuse it; nearly horizontal or vertical lines get the relation automatically. In select mode, dragging moves points, lines or circle radii live through the solver. Right-click offers the relations and dimensions that fit the selection; clicking a dimension label edits its value. Geometry is coloured blue (under-defined), black (fully defined) or red (in a conflicting relation). Undo inside the sketch is local to the session; the whole edit is one undo step in the part.
+- **Sketch mode** (`sketch_mode.rs`): editing a sketch rolls back the features after it, turns the view normal to the plane, and edits a working copy written back on exit (Escape or *Exit sketch*; *Discard* drops the changes, and a brand-new empty sketch is removed). Tools: select, line (chains; clicking an existing point closes the contour), rectangle, circle, arc. Clicks within 8 px of a point reuse it; nearly horizontal or vertical lines get the relation automatically. In select mode, dragging moves points, lines or circle radii live through the solver. Right-click offers the relations and dimensions that fit the selection; clicking a dimension label edits its value and name, and hovering it shows its full name (`D1@Sketch1`). Geometry is coloured blue (under-defined), black (fully defined) or red (in a conflicting relation). Undo inside the sketch is local to the session; the whole edit is one undo step in the part.
 
 ## 10. Roadmap
 
@@ -160,9 +171,10 @@ Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fill
 | **Engine** (code written, awaiting first Windows build) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
 | **M2** (code written, awaiting first build) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
 | **M2b** (code written, awaiting first build) | Solver in the model and the file format; interactive sketch mode; timeline without properties panel, draggable rollback bar, creator highlight |
-| **App** (code written, awaiting first Windows build) | Timeline panel, properties panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
+| **App** (code written, awaiting first Windows build) | Timeline panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
 | **M3** | Revolve, shell, patterns, interactive sketch mode |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |
-| **M5** | Patterns, mirror, shell, reference geometry, expressions |
+| **Naming** (code written, awaiting first build) | Stable relation ids, SolidWorks-style dimension names (`D1@Sketch1`), unique feature names, Dimensions window |
+| **M5** | Patterns, mirror, shell, reference geometry, equations tab |
 | **M6** | Assemblies with basic mates; BOM export |
 | **M7** | Drawings: views, dimensions, PDF/DXF |

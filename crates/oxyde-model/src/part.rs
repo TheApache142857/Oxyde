@@ -132,9 +132,34 @@ impl Part {
     pub fn from_definition(definition: PartDefinition) -> Result<Self, ModelError> {
         let invalid = |reason: String| Err(ModelError::InvalidDefinition(reason));
         let mut seen = HashSet::new();
+        let mut names = HashSet::new();
         for (index, feature) in definition.features.iter().enumerate() {
             if feature.id.raw() == 0 || !seen.insert(feature.id) {
                 return invalid(format!("duplicate or invalid feature id {}", feature.id));
+            }
+            if !oxyde_sketch::is_valid_name(&feature.name) || !names.insert(feature.name.as_str()) {
+                return invalid(format!(
+                    "invalid or duplicate feature name \"{}\"",
+                    feature.name
+                ));
+            }
+            let parameters: Vec<_> = feature.kind.parameters().iter().map(|(p, _)| *p).collect();
+            let mut dimension_names = HashSet::new();
+            for parameter in &parameters {
+                let name = feature.parameter_name(*parameter);
+                if !oxyde_sketch::is_valid_name(name) || !dimension_names.insert(name) {
+                    return invalid(format!(
+                        "invalid dimension name \"{name}\" in {}",
+                        feature.name
+                    ));
+                }
+            }
+            if let Some(stray) = feature
+                .parameter_names
+                .keys()
+                .find(|p| !parameters.contains(p))
+            {
+                return invalid(format!("{} has no {} dimension", feature.name, stray.key()));
             }
             for dependency in feature.kind.dependencies() {
                 if !definition.features[..index]
@@ -224,10 +249,25 @@ impl Part {
         Ok(&mut self.features[index].kind)
     }
 
+    /// Renames a feature. Names must be valid and unique in the part; dimension full names
+    /// ("D1@NewName") follow automatically.
     pub fn rename(&mut self, id: FeatureId, name: impl Into<String>) -> Result<(), ModelError> {
         let index = self.require(id)?;
-        self.features[index].name = name.into();
+        let name = name.into();
+        if !oxyde_sketch::is_valid_name(&name) {
+            return Err(ModelError::InvalidName(name));
+        }
+        if self.features.iter().any(|f| f.id != id && f.name == name) {
+            return Err(ModelError::DuplicateName(name));
+        }
+        self.features[index].name = name;
         Ok(())
+    }
+
+    /// Mutable access to a feature without marking anything for rebuild, for changes that
+    /// do not affect geometry (dimension names).
+    pub(crate) fn feature_mut_quietly(&mut self, id: FeatureId) -> Option<&mut Feature> {
+        self.features.iter_mut().find(|f| f.id == id)
     }
 
     pub fn set_suppressed(&mut self, id: FeatureId, suppressed: bool) -> Result<(), ModelError> {
@@ -501,14 +541,13 @@ fn build_sketch(
     };
     let mut solved = sketch.geometry.clone();
     let report = solved.solve().map_err(|e| e.to_string())?;
-    let count = |state| report.constraints.iter().filter(|c| **c == state).count();
     if !report.converged {
         return Err(format!(
             "the sketch is over-defined: {} conflicting relation(s)",
-            count(ConstraintState::Conflicting).max(1)
+            report.count(ConstraintState::Conflicting).max(1)
         ));
     }
-    let redundant = count(ConstraintState::Redundant);
+    let redundant = report.count(ConstraintState::Redundant);
     if redundant > 0 {
         warnings.push(format!("{redundant} redundant relation(s) in the sketch"));
     }

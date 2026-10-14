@@ -8,9 +8,11 @@ use std::collections::BTreeMap;
 use oxyde_geom::Point2;
 use oxyde_model::{
     EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
-    FeatureKind, PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
+    FeatureKind, FeatureParameter, PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
 };
-use oxyde_sketch::{ConstrainedSketch, Constraint, Entity, EntityId, Geometry};
+use oxyde_sketch::{
+    ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
+};
 use serde::{Deserialize, Serialize};
 
 // ---- manifest.json -------------------------------------------------------------------------
@@ -69,8 +71,29 @@ pub(crate) struct FeatureDto {
     pub name: String,
     #[serde(default)]
     pub suppressed: bool,
+    /// Renamed feature dimensions, by parameter ("depth": "Thickness").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dimension_names: BTreeMap<String, String>,
     #[serde(flatten)]
     pub kind: KindDto,
+}
+
+/// A sketch relation with its stable id and, for dimensions, its name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RelationEntryDto {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub relation: RelationDto,
+}
+
+/// Next ids to hand out in a sketch, so that ids are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CountersDto {
+    pub entity: u32,
+    pub relation: u32,
+    pub dimension: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,7 +103,9 @@ pub(crate) enum KindDto {
         plane: PlaneDto,
         entities: Vec<EntityDto>,
         #[serde(default)]
-        relations: Vec<RelationDto>,
+        relations: Vec<RelationEntryDto>,
+        #[serde(default)]
+        next_ids: Option<CountersDto>,
     },
     Extrude {
         sketch: u32,
@@ -253,10 +278,22 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             entities: sketch.geometry.entities().iter().map(entity_dto).collect(),
             relations: sketch
                 .geometry
-                .constraints()
+                .relations()
                 .iter()
-                .map(relation_dto)
+                .map(|r| RelationEntryDto {
+                    id: r.id.0,
+                    name: r.name.clone(),
+                    relation: relation_dto(&r.constraint),
+                })
                 .collect(),
+            next_ids: {
+                let c = sketch.geometry.counters();
+                Some(CountersDto {
+                    entity: c.entity,
+                    relation: c.relation,
+                    dimension: c.dimension,
+                })
+            },
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
@@ -283,6 +320,11 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         id: feature.id().raw(),
         name: feature.name().to_owned(),
         suppressed: feature.is_suppressed(),
+        dimension_names: feature
+            .parameter_names()
+            .iter()
+            .map(|(p, name)| (p.key().to_owned(), name.clone()))
+            .collect(),
         kind,
     }
 }
@@ -481,10 +523,24 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             plane,
             entities,
             relations,
+            next_ids,
         } => {
+            let counters = next_ids.map_or_else(Counters::default, |c| Counters {
+                entity: c.entity,
+                relation: c.relation,
+                dimension: c.dimension,
+            });
             let geometry = ConstrainedSketch::from_parts(
                 entities.into_iter().map(entity_from).collect(),
-                relations.into_iter().map(relation_from).collect(),
+                relations
+                    .into_iter()
+                    .map(|r| Relation {
+                        id: RelationId(r.id),
+                        name: r.name,
+                        constraint: relation_from(r.relation),
+                    })
+                    .collect(),
+                counters,
             )
             .map_err(|e| format!("{}: {e}", dto.name))?;
             FeatureKind::Sketch(Sketch {
@@ -529,12 +585,16 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             size: distance,
         }),
     };
-    Ok(Feature::new(
-        FeatureId::from_raw(dto.id),
-        dto.name,
-        dto.suppressed,
-        kind,
-    ))
+    let mut parameter_names = BTreeMap::new();
+    for (key, name) in dto.dimension_names {
+        let parameter = FeatureParameter::from_key(&key)
+            .ok_or_else(|| format!("{}: unknown dimension \"{key}\"", dto.name))?;
+        parameter_names.insert(parameter, name);
+    }
+    Ok(
+        Feature::new(FeatureId::from_raw(dto.id), dto.name, dto.suppressed, kind)
+            .with_parameter_names(parameter_names),
+    )
 }
 
 fn face_from(dto: FaceRefDto) -> FaceName {

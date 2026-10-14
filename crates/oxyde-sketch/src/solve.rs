@@ -8,7 +8,7 @@
 //! does not reduce the error, which also copes with redundant and conflicting relations.
 
 use crate::linalg::{null_space, rref, solve_linear};
-use crate::sketch::{ConstrainedSketch, EntityId, Layout, SketchError};
+use crate::sketch::{ConstrainedSketch, EntityId, Layout, RelationId, SketchError};
 
 /// State of one relation after solving, as colour-coded in SolidWorks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,8 +36,8 @@ pub struct SolveReport {
     pub iterations: usize,
     /// Independent ways the sketch can still move.
     pub degrees_of_freedom: usize,
-    /// Per relation, in the order of `ConstrainedSketch::constraints`.
-    pub constraints: Vec<ConstraintState>,
+    /// State of every relation, in the order of `ConstrainedSketch::relations`.
+    pub relations: Vec<(RelationId, ConstraintState)>,
     /// Per entity, in the order of `ConstrainedSketch::entities`.
     pub entities: Vec<(EntityId, Definition)>,
 }
@@ -45,6 +45,18 @@ pub struct SolveReport {
 impl SolveReport {
     pub fn is_fully_defined(&self) -> bool {
         self.converged && self.degrees_of_freedom == 0
+    }
+
+    pub fn state(&self, id: RelationId) -> Option<ConstraintState> {
+        self.relations
+            .iter()
+            .find(|(r, _)| *r == id)
+            .map(|(_, s)| *s)
+    }
+
+    /// Number of relations in a given state.
+    pub fn count(&self, state: ConstraintState) -> usize {
+        self.relations.iter().filter(|(_, s)| *s == state).count()
     }
 
     pub fn definition(&self, id: EntityId) -> Option<Definition> {
@@ -213,13 +225,13 @@ impl ConstrainedSketch {
             .map(|(_, row)| row.clone())
             .collect();
         let mut rank = rref(rows.clone(), n, tolerance).rank;
-        let mut constraints = Vec::with_capacity(self.constraints.len());
-        for index in 0..self.constraints.len() {
+        let mut relations = Vec::with_capacity(self.relations.len());
+        for (index, relation) in self.relations.iter().enumerate() {
             let own: Vec<usize> = (0..owners.len())
                 .filter(|&k| owners[k] == Some(index))
                 .collect();
             if own.is_empty() {
-                constraints.push(ConstraintState::Satisfied);
+                relations.push((relation.id, ConstraintState::Satisfied));
                 continue;
             }
             rows.extend(own.iter().map(|&k| j[k].clone()));
@@ -227,13 +239,14 @@ impl ConstrainedSketch {
             let independent = new_rank == rank + own.len();
             rank = new_rank;
             let unsatisfied = own.iter().any(|&k| r[k].abs() > SATISFIED);
-            constraints.push(if unsatisfied {
+            let state = if unsatisfied {
                 ConstraintState::Conflicting
             } else if independent {
                 ConstraintState::Satisfied
             } else {
                 ConstraintState::Redundant
-            });
+            };
+            relations.push((relation.id, state));
         }
 
         SolveReport {
@@ -241,7 +254,7 @@ impl ConstrainedSketch {
             residual: norm(&r),
             iterations,
             degrees_of_freedom: n - echelon.rank,
-            constraints,
+            relations,
             entities,
         }
     }

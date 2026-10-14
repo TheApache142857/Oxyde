@@ -13,6 +13,13 @@ pub enum ModelError {
     },
     /// A [`PartDefinition`](crate::PartDefinition) that cannot form a valid timeline.
     InvalidDefinition(String),
+    /// Feature and dimension names cannot be empty, start or end with a space, or contain
+    /// `@` or `"`.
+    InvalidName(String),
+    /// Another feature (or another dimension of the same feature) already has this name.
+    DuplicateName(String),
+    /// No dimension with this full name or reference.
+    UnknownDimension(String),
 }
 
 impl fmt::Display for ModelError {
@@ -30,6 +37,12 @@ impl fmt::Display for ModelError {
                 Ok(())
             }
             ModelError::InvalidDefinition(reason) => write!(f, "invalid part definition: {reason}"),
+            ModelError::InvalidName(name) => write!(
+                f,
+                "\"{name}\" is not a valid name (no @ or quotes, no leading or trailing spaces)"
+            ),
+            ModelError::DuplicateName(name) => write!(f, "the name \"{name}\" is already used"),
+            ModelError::UnknownDimension(name) => write!(f, "no dimension {name}"),
         }
     }
 }

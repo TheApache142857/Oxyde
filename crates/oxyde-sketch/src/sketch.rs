@@ -105,11 +105,87 @@ impl Constraint {
     }
 }
 
+/// Stable identity of a relation or dimension within its sketch. Never reused, so that
+/// references to a dimension (from equations, drawings) cannot silently move to another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelationId(pub u32);
+
+impl fmt::Display for RelationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "R{}", self.0)
+    }
+}
+
+impl Constraint {
+    /// The value of a dimension (mm, or radians for angles); `None` for plain relations.
+    pub fn value(&self) -> Option<f64> {
+        use Constraint::*;
+        match *self {
+            Distance(_, _, v)
+            | HorizontalDistance(_, _, v)
+            | VerticalDistance(_, _, v)
+            | Length(_, v)
+            | Radius(_, v)
+            | Angle(_, _, v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn is_dimension(&self) -> bool {
+        self.value().is_some()
+    }
+
+    pub fn is_angle(&self) -> bool {
+        matches!(self, Constraint::Angle(..))
+    }
+}
+
+/// A relation or dimension of a sketch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relation {
+    pub id: RelationId,
+    pub constraint: Constraint,
+    /// For dimensions: the name used in equations ("D1", or a user name such as "Width"),
+    /// unique within the sketch. `None` for relations without a value.
+    pub name: Option<String>,
+}
+
+/// Next ids to hand out. Stored with the sketch so ids stay unique across saves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Counters {
+    pub entity: u32,
+    pub relation: u32,
+    /// Number of the next default dimension name ("D3").
+    pub dimension: u32,
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            entity: 1,
+            relation: 1,
+            dimension: 1,
+        }
+    }
+}
+
+/// Whether `name` can name a feature or a dimension: not empty, no surrounding spaces, and
+/// none of the characters that structure full names (`@`) or equations (`"`).
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && !name.chars().any(|c| c == '@' || c == '"' || c.is_control())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SketchError {
     UnknownEntity(EntityId),
     DuplicateId(EntityId),
-    /// A constraint (by index) or entity refers to an entity of the wrong kind.
+    UnknownRelation(RelationId),
+    DuplicateRelation(RelationId),
+    /// A dimension name that is invalid or already used in the sketch.
+    BadName(String),
+    /// A relation (by index) or entity refers to an entity of the wrong kind.
     WrongKind {
         constraint: Option<usize>,
         entity: EntityId,
@@ -122,6 +198,13 @@ impl fmt::Display for SketchError {
         match self {
             SketchError::UnknownEntity(id) => write!(f, "no sketch entity {id}"),
             SketchError::DuplicateId(id) => write!(f, "sketch entity id {id} is used twice"),
+            SketchError::UnknownRelation(id) => write!(f, "no sketch relation {id}"),
+            SketchError::DuplicateRelation(id) => {
+                write!(f, "sketch relation id {id} is used twice")
+            }
+            SketchError::BadName(name) => {
+                write!(f, "\"{name}\" cannot be used as a dimension name here")
+            }
             SketchError::WrongKind {
                 constraint: Some(c),
                 entity,
@@ -142,7 +225,8 @@ impl std::error::Error for SketchError {}
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConstrainedSketch {
     pub(crate) entities: Vec<Entity>,
-    pub(crate) constraints: Vec<Constraint>,
+    pub(crate) relations: Vec<Relation>,
+    pub(crate) counters: Counters,
 }
 
 impl ConstrainedSketch {
@@ -150,10 +234,12 @@ impl ConstrainedSketch {
         Self::default()
     }
 
-    /// Builds a sketch from stored entities and relations, checking every reference.
+    /// Builds a sketch from stored entities and relations, checking every reference and
+    /// name. `counters` are raised if needed so that new ids never collide.
     pub fn from_parts(
         entities: Vec<Entity>,
-        constraints: Vec<Constraint>,
+        relations: Vec<Relation>,
+        counters: Counters,
     ) -> Result<Self, SketchError> {
         let mut seen = std::collections::HashSet::new();
         for e in &entities {
@@ -161,36 +247,91 @@ impl ConstrainedSketch {
                 return Err(SketchError::DuplicateId(e.id));
             }
         }
+        let mut seen = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        for r in &relations {
+            if !seen.insert(r.id) {
+                return Err(SketchError::DuplicateRelation(r.id));
+            }
+            match &r.name {
+                Some(name) if !r.constraint.is_dimension() || !is_valid_name(name) => {
+                    return Err(SketchError::BadName(name.clone()));
+                }
+                Some(name) if !names.insert(name.clone()) => {
+                    return Err(SketchError::BadName(name.clone()));
+                }
+                _ => {}
+            }
+        }
+        let highest_entity = entities.iter().map(|e| e.id.0).max().unwrap_or(0);
+        let highest_relation = relations.iter().map(|r| r.id.0).max().unwrap_or(0);
+        let highest_dimension = relations
+            .iter()
+            .filter_map(|r| default_number(r.name.as_deref()?))
+            .max()
+            .unwrap_or(0);
         let sketch = Self {
             entities,
-            constraints,
+            relations,
+            counters: Counters {
+                entity: counters.entity.max(highest_entity + 1),
+                relation: counters.relation.max(highest_relation + 1),
+                dimension: counters.dimension.max(highest_dimension + 1),
+            },
         };
         sketch.layout()?;
+        // Dimensions stored without a name get the next default one.
+        let mut sketch = sketch;
+        for index in 0..sketch.relations.len() {
+            if sketch.relations[index].constraint.is_dimension()
+                && sketch.relations[index].name.is_none()
+            {
+                let name = sketch.next_dimension_name();
+                sketch.relations[index].name = Some(name);
+            }
+        }
         Ok(sketch)
+    }
+
+    /// The next free default dimension name ("D4"), advancing the counter.
+    fn next_dimension_name(&mut self) -> String {
+        // Skip numbers a user may have taken by renaming another dimension "D7".
+        loop {
+            let candidate = format!("D{}", self.counters.dimension);
+            self.counters.dimension += 1;
+            if self.dimension_named(&candidate).is_none() {
+                return candidate;
+            }
+        }
     }
 
     pub fn entities(&self) -> &[Entity] {
         &self.entities
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entities.is_empty()
+    pub fn relations(&self) -> &[Relation] {
+        &self.relations
     }
 
-    pub fn constraints(&self) -> &[Constraint] {
-        &self.constraints
+    pub fn counters(&self) -> Counters {
+        self.counters
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
     }
 
     pub fn entity(&self, id: EntityId) -> Option<&Entity> {
         self.entities.iter().find(|e| e.id == id)
     }
 
-    fn next_id(&self) -> EntityId {
-        EntityId(self.entities.iter().map(|e| e.id.0).max().unwrap_or(0) + 1)
+    pub fn relation(&self, id: RelationId) -> Option<&Relation> {
+        self.relations.iter().find(|r| r.id == id)
     }
 
     fn push(&mut self, geometry: Geometry) -> EntityId {
-        let id = self.next_id();
+        let id = EntityId(self.counters.entity);
+        self.counters.entity += 1;
         self.entities.push(Entity {
             id,
             geometry,
@@ -264,20 +405,37 @@ impl ConstrainedSketch {
         lines
     }
 
-    /// Adds a relation or dimension and returns its index.
-    pub fn constrain(&mut self, constraint: Constraint) -> usize {
-        self.constraints.push(constraint);
-        self.constraints.len() - 1
+    /// Adds a relation or dimension. Dimensions get the next default name ("D1", "D2"…).
+    pub fn constrain(&mut self, constraint: Constraint) -> RelationId {
+        let id = RelationId(self.counters.relation);
+        self.counters.relation += 1;
+        let name = if constraint.is_dimension() {
+            Some(self.next_dimension_name())
+        } else {
+            None
+        };
+        self.relations.push(Relation {
+            id,
+            constraint,
+            name,
+        });
+        id
     }
 
-    pub fn remove_constraint(&mut self, index: usize) -> Option<Constraint> {
-        (index < self.constraints.len()).then(|| self.constraints.remove(index))
+    pub fn remove_relation(&mut self, id: RelationId) -> Option<Relation> {
+        let index = self.relations.iter().position(|r| r.id == id)?;
+        Some(self.relations.remove(index))
     }
 
     /// Replaces the value of a dimension; returns false for relations without a value.
-    pub fn set_dimension(&mut self, index: usize, value: f64) -> bool {
+    pub fn set_dimension(&mut self, id: RelationId, value: f64) -> bool {
         use Constraint::*;
-        match self.constraints.get_mut(index) {
+        match self
+            .relations
+            .iter_mut()
+            .find(|r| r.id == id)
+            .map(|r| &mut r.constraint)
+        {
             Some(
                 Distance(_, _, v)
                 | HorizontalDistance(_, _, v)
@@ -291,6 +449,34 @@ impl ConstrainedSketch {
             }
             _ => false,
         }
+    }
+
+    /// The dimensions of the sketch, in creation order.
+    pub fn dimensions(&self) -> impl Iterator<Item = &Relation> {
+        self.relations
+            .iter()
+            .filter(|r| r.constraint.is_dimension())
+    }
+
+    pub fn dimension_named(&self, name: &str) -> Option<&Relation> {
+        self.relations
+            .iter()
+            .find(|r| r.name.as_deref() == Some(name))
+    }
+
+    /// Renames a dimension; the name must be valid and unused in this sketch.
+    pub fn rename_dimension(&mut self, id: RelationId, name: &str) -> Result<(), SketchError> {
+        let relation = self.relation(id).ok_or(SketchError::UnknownRelation(id))?;
+        if !relation.constraint.is_dimension() || !is_valid_name(name) {
+            return Err(SketchError::BadName(name.to_owned()));
+        }
+        if self.dimension_named(name).is_some_and(|r| r.id != id) {
+            return Err(SketchError::BadName(name.to_owned()));
+        }
+        if let Some(r) = self.relations.iter_mut().find(|r| r.id == id) {
+            r.name = Some(name.to_owned());
+        }
+        Ok(())
     }
 
     /// Deletes entities, along with the curves built on deleted points, the relations that
@@ -320,15 +506,19 @@ impl ConstrainedSketch {
             }
         }
         self.entities.retain(|e| !doomed.contains(&e.id));
-        self.constraints
-            .retain(|c| c.entities().iter().all(|id| !doomed.contains(id)));
+        self.relations.retain(|r| {
+            r.constraint
+                .entities()
+                .iter()
+                .all(|id| !doomed.contains(id))
+        });
     }
 
     /// Whether a `Fixed` relation holds this point.
     pub fn is_fixed(&self, point: EntityId) -> bool {
-        self.constraints
+        self.relations
             .iter()
-            .any(|c| matches!(c, Constraint::Fixed(p) if *p == point))
+            .any(|r| matches!(r.constraint, Constraint::Fixed(p) if p == point))
     }
 
     /// Current length of a line.
@@ -462,7 +652,7 @@ impl ConstrainedSketch {
             }
         }
         // Constraint references.
-        for (index, c) in self.constraints.iter().enumerate() {
+        for (index, c) in self.relations.iter().map(|r| &r.constraint).enumerate() {
             use Constraint::*;
             let i = Some(index);
             match *c {
@@ -535,12 +725,17 @@ impl ConstrainedSketch {
                 owners.push(None);
             }
         }
-        for (index, c) in self.constraints.iter().enumerate() {
+        for (index, c) in self.relations.iter().map(|r| &r.constraint).enumerate() {
             let before = out.len();
             eval.constraint(c, out);
             owners.extend(std::iter::repeat_n(Some(index), out.len() - before));
         }
     }
+}
+
+/// The number in a default dimension name ("D12" → 12).
+fn default_number(name: &str) -> Option<u32> {
+    name.strip_prefix('D')?.parse().ok()
 }
 
 /// Points a curve stands on (none for a point).

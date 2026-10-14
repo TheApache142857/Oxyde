@@ -8,7 +8,8 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec
 use oxyde_geom::{Plane, Point2};
 use oxyde_model::FeatureId;
 use oxyde_sketch::{
-    ConstrainedSketch, Constraint, ConstraintState, Definition, EntityId, Geometry, SolveReport,
+    ConstrainedSketch, Constraint, ConstraintState, Definition, EntityId, Geometry, RelationId,
+    SolveReport,
 };
 
 use crate::viewport::{Viewport, ViewportOutput};
@@ -81,7 +82,7 @@ struct Drag {
 /// What the viewport asks of the application.
 pub enum SketchRequest {
     /// The user clicked a dimension label: edit that relation's value.
-    EditDimension(usize),
+    EditDimension(RelationId),
 }
 
 /// A dimension offered for the current selection.
@@ -112,7 +113,7 @@ pub struct SketchSession {
     pending: Vec<Pending>,
     hover: Option<EntityId>,
     drag: Option<Drag>,
-    labels: Vec<(Rect, usize)>,
+    labels: Vec<(Rect, RelationId)>,
     history: Vec<ConstrainedSketch>,
 }
 
@@ -229,11 +230,11 @@ impl SketchSession {
     /// Adds a relation, or refuses it when it conflicts with the existing ones.
     pub fn add_relation(&mut self, relation: Constraint) -> bool {
         self.checkpoint();
-        let index = self.sketch.constrain(relation);
+        let id = self.sketch.constrain(relation);
         if self.solve() {
             true
         } else {
-            self.sketch.remove_constraint(index);
+            self.sketch.remove_relation(id);
             self.history.pop();
             self.solve();
             self.message = Some("That relation conflicts with the existing ones".to_owned());
@@ -245,8 +246,8 @@ impl SketchSession {
     pub fn add_dimension(&mut self, relation: Constraint, value: f64) -> bool {
         self.checkpoint();
         let previous = self.history.last().cloned().unwrap_or_default();
-        let index = self.sketch.constrain(relation);
-        self.sketch.set_dimension(index, value);
+        let id = self.sketch.constrain(relation);
+        self.sketch.set_dimension(id, value);
         if self.solve() {
             true
         } else {
@@ -259,10 +260,10 @@ impl SketchSession {
     }
 
     /// Changes the value of an existing dimension.
-    pub fn set_dimension(&mut self, index: usize, value: f64) -> bool {
+    pub fn set_dimension(&mut self, id: RelationId, value: f64) -> bool {
         self.checkpoint();
         let previous = self.history.last().cloned().unwrap_or_default();
-        if !self.sketch.set_dimension(index, value) {
+        if !self.sketch.set_dimension(id, value) {
             self.history.pop();
             return false;
         }
@@ -276,6 +277,29 @@ impl SketchSession {
                 Some("That value cannot be reached with the existing relations".to_owned());
             false
         }
+    }
+
+    /// Renames a dimension of this sketch ("D1" → "Width").
+    pub fn rename_dimension(&mut self, id: RelationId, name: &str) -> bool {
+        let current = self.sketch.relation(id).and_then(|r| r.name.clone());
+        if current.as_deref() == Some(name) {
+            return true;
+        }
+        self.checkpoint();
+        match self.sketch.rename_dimension(id, name) {
+            Ok(()) => true,
+            Err(e) => {
+                self.history.pop();
+                self.message = Some(e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Full name of one of this sketch's dimensions, e.g. "D1@Sketch2".
+    pub fn dimension_full_name(&self, id: RelationId) -> Option<String> {
+        let name = self.sketch.relation(id)?.name.as_deref()?;
+        Some(oxyde_model::full_name(name, &self.name))
     }
 
     pub fn delete_selection(&mut self) {
@@ -554,8 +578,8 @@ impl SketchSession {
                     let line = self.sketch.line_between(a, b);
                     let auto = self.auto_relation(line, start.at, p.at);
                     if !self.solve() {
-                        if let Some(index) = auto {
-                            self.sketch.remove_constraint(index);
+                        if let Some(id) = auto {
+                            self.sketch.remove_relation(id);
                             self.solve();
                         }
                     }
@@ -629,7 +653,7 @@ impl SketchSession {
     }
 
     /// Adds Horizontal or Vertical to a nearly horizontal or vertical new line.
-    fn auto_relation(&mut self, line: EntityId, a: Point2, b: Point2) -> Option<usize> {
+    fn auto_relation(&mut self, line: EntityId, a: Point2, b: Point2) -> Option<RelationId> {
         let (dx, dy) = ((b.x - a.x).abs(), (b.y - a.y).abs());
         if dy <= AUTO_SLOPE * dx {
             Some(self.sketch.constrain(Constraint::Horizontal(line)))
@@ -646,12 +670,12 @@ impl SketchSession {
         let Some(report) = &self.report else {
             return Vec::new();
         };
-        self.sketch
-            .constraints()
+        report
+            .relations
             .iter()
-            .zip(&report.constraints)
-            .filter(|(_, state)| **state == ConstraintState::Conflicting)
-            .flat_map(|(c, _)| c.entities())
+            .filter(|(_, state)| *state == ConstraintState::Conflicting)
+            .filter_map(|(id, _)| self.sketch.relation(*id))
+            .flat_map(|r| r.constraint.entities())
             .collect()
     }
 
@@ -677,6 +701,7 @@ impl SketchSession {
         painter: &egui::Painter,
         to_screen: &dyn Fn(Point2) -> Pos2,
         cursor: Option<Point2>,
+        pointer: Option<Pos2>,
     ) {
         let conflicting = self.conflicting();
         let at = |id| self.sketch.position(id).unwrap_or_default();
@@ -748,8 +773,8 @@ impl SketchSession {
         }
 
         // Relation glyphs.
-        for c in self.sketch.constraints() {
-            let (line, glyph) = match *c {
+        for relation in self.sketch.relations() {
+            let (line, glyph) = match relation.constraint {
                 Constraint::Horizontal(l) => (l, "H"),
                 Constraint::Vertical(l) => (l, "V"),
                 _ => continue,
@@ -772,8 +797,9 @@ impl SketchSession {
         // Dimensions, clickable.
         self.labels.clear();
         let mut labels = Vec::new();
-        for (index, c) in self.sketch.constraints().iter().enumerate() {
-            if let Some((anchor, text)) = self.dimension_label(c, to_screen) {
+        let mut hovered_label = None;
+        for relation in self.sketch.relations() {
+            if let Some((anchor, text)) = self.dimension_label(&relation.constraint, to_screen) {
                 let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), FULLY);
                 let rect = Rect::from_center_size(anchor, galley.size() + Vec2::new(8.0, 4.0));
                 painter.rect_filled(
@@ -783,10 +809,25 @@ impl SketchSession {
                 );
                 painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(160)));
                 painter.galley(rect.center() - galley.size() / 2.0, galley, FULLY);
-                labels.push((rect, index));
+                if pointer.is_some_and(|p| rect.contains(p)) {
+                    hovered_label = Some((rect, relation.id));
+                }
+                labels.push((rect, relation.id));
             }
         }
         self.labels = labels;
+        // Hovering a dimension shows its full name, as used in equations.
+        if let Some((rect, id)) = hovered_label {
+            if let Some(name) = self.dimension_full_name(id) {
+                painter.text(
+                    rect.center_top() - Vec2::new(0.0, 3.0),
+                    Align2::CENTER_BOTTOM,
+                    name,
+                    FontId::proportional(11.0),
+                    UNDER,
+                );
+            }
+        }
 
         // The shape in progress.
         let dashed = Stroke::new(1.2, PREVIEW);
@@ -990,9 +1031,9 @@ pub fn interact(
                     .labels
                     .iter()
                     .find(|(r, _)| r.contains(pos))
-                    .map(|(_, i)| *i);
+                    .map(|(_, id)| *id);
                 match label {
-                    Some(index) => request = Some(SketchRequest::EditDimension(index)),
+                    Some(id) => request = Some(SketchRequest::EditDimension(id)),
                     None => {
                         let hit = session.hit(pos, &to_screen);
                         session.click_select(hit, additive);
@@ -1006,6 +1047,6 @@ pub fn interact(
     }
 
     let painter = ui.painter_at(out.rect);
-    session.draw(&painter, &to_screen, pointer.and_then(to_plane));
+    session.draw(&painter, &to_screen, pointer.and_then(to_plane), pointer);
     request
 }

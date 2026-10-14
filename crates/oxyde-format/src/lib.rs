@@ -276,7 +276,8 @@ mod tests {
             Point2::new(6.0, 1.0),
         );
         top.geometry.set_construction(guide, true);
-        top.geometry.constrain(Constraint::Radius(circle, 3.0));
+        let hole_radius = top.geometry.constrain(Constraint::Radius(circle, 3.0));
+        top.geometry.rename_dimension(hole_radius, "Hole").unwrap();
         top.geometry
             .constrain(Constraint::EqualRadius(circle, guide));
         let s2 = part.add_feature(FeatureKind::Sketch(top));
@@ -300,6 +301,8 @@ mod tests {
             size: 0.5,
         }));
         part.set_suppressed(bevel, true).unwrap();
+        let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
+        part.rename_dimension(depth, "Thickness").unwrap();
         part.roll_back_to(Some(bevel)).unwrap();
 
         let mut properties = Properties {
@@ -375,7 +378,7 @@ mod tests {
                   "entities": [
                     { "id": 1, "type": "point", "at": [0, 0] },
                     { "id": 2, "type": "circle", "center": 1, "radius": 5 } ],
-                  "relations": [ { "type": "radius", "curve": 2, "value": 5 } ] },
+                  "relations": [ { "id": 1, "type": "radius", "curve": 2, "value": 5 } ] },
                 { "id": 2, "name": "Boss-Extrude1", "type": "extrude", "sketch": 1,
                   "operation": "boss", "extent": { "type": "blind", "depth": 2 } }
             ]
@@ -383,6 +386,14 @@ mod tests {
         let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
         let part = read_part(Cursor::new(bytes)).unwrap();
         assert_eq!(part.definition.features.len(), 2);
+        // Without stored names or counters, dimensions get default names on load.
+        let loaded = Part::from_definition(part.definition.clone()).unwrap();
+        let names: Vec<String> = loaded
+            .dimensions()
+            .into_iter()
+            .map(|d| d.full_name)
+            .collect();
+        assert_eq!(names, ["D1@Sketch1", "D1@Boss-Extrude1"]);
         assert_eq!(part.properties, Properties::default());
     }
 

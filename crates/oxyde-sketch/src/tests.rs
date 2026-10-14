@@ -3,7 +3,8 @@ use std::f64::consts::PI;
 use oxyde_geom::{Curve2, Point2, Profile};
 
 use crate::{
-    ConstrainedSketch, Constraint::*, ConstraintState, Definition, EntityId, Geometry, SketchError,
+    ConstrainedSketch, Constraint::*, ConstraintState, Counters, Definition, EntityId, Geometry,
+    SketchError,
 };
 
 fn close(p: Point2, x: f64, y: f64) -> bool {
@@ -38,11 +39,9 @@ fn dimensioned_rectangle_is_fully_defined() {
     assert_eq!(report.degrees_of_freedom, 0);
     assert!(report.is_fully_defined());
     assert!(report.entities.iter().all(|(_, d)| *d == Definition::Fully));
-    assert!(
-        report
-            .constraints
-            .iter()
-            .all(|c| *c == ConstraintState::Satisfied)
+    assert_eq!(
+        report.count(ConstraintState::Satisfied),
+        report.relations.len()
     );
 
     let (_, top_right) = s.endpoints(right).unwrap();
@@ -79,7 +78,7 @@ fn implied_relations_are_redundant() {
     let parallel = s.constrain(Parallel(bottom, top));
     let report = s.solve().unwrap();
     assert!(report.converged);
-    assert_eq!(report.constraints[parallel], ConstraintState::Redundant);
+    assert_eq!(report.state(parallel), Some(ConstraintState::Redundant));
     assert_eq!(report.degrees_of_freedom, 4);
 }
 
@@ -95,7 +94,7 @@ fn contradictory_dimensions_conflict_and_leave_the_sketch_unchanged() {
 
     let report = s.solve().unwrap();
     assert!(!report.converged);
-    assert_eq!(report.constraints[wrong], ConstraintState::Conflicting);
+    assert_eq!(report.state(wrong), Some(ConstraintState::Conflicting));
     assert_eq!(s, before);
     let (_, top_right) = s.endpoints(right).unwrap();
     assert!(close(s.position(top_right).unwrap(), 40.0, 20.0));
@@ -287,7 +286,7 @@ fn deleting_a_line_removes_its_relations_and_orphan_points() {
     // the left and right lines, so they stay.
     assert_eq!(s.entities().len(), before - 1);
     assert!(s.entity(bottom).is_none());
-    assert_eq!(s.constraints().len(), 3);
+    assert_eq!(s.relations().len(), 3);
 
     // Removing a corner point takes the two lines standing on it.
     let (corner, _) = s.endpoints(top).unwrap();
@@ -301,13 +300,14 @@ fn stored_sketches_are_validated() {
     let mut s = ConstrainedSketch::new();
     s.rectangle(Point2::ORIGIN, 10.0, 5.0);
     let rebuilt =
-        ConstrainedSketch::from_parts(s.entities().to_vec(), s.constraints().to_vec()).unwrap();
+        ConstrainedSketch::from_parts(s.entities().to_vec(), s.relations().to_vec(), s.counters())
+            .unwrap();
     assert_eq!(rebuilt, s);
 
     let mut entities = s.entities().to_vec();
     entities.push(entities[0]);
     assert!(matches!(
-        ConstrainedSketch::from_parts(entities, Vec::new()),
+        ConstrainedSketch::from_parts(entities, Vec::new(), Counters::default()),
         Err(SketchError::DuplicateId(_))
     ));
 }
@@ -322,11 +322,54 @@ fn measurements_and_dimension_edits() {
     assert!((angle - (PI / 2.0 - (4.0f64).atan2(3.0))).abs() < 1e-12);
 
     let (origin, _) = s.endpoints(a).unwrap();
-    s.constrain(Fixed(origin));
+    let fixed = s.constrain(Fixed(origin));
     assert!(s.is_fixed(origin));
     let length = s.constrain(Length(a, 5.0));
     assert!(s.set_dimension(length, 8.0));
     s.solve().unwrap();
     assert!((s.line_length(a).unwrap() - 8.0).abs() < 1e-7);
-    assert!(!s.set_dimension(0, 1.0)); // Fixed has no value
+    assert!(!s.set_dimension(fixed, 1.0)); // Fixed has no value
+}
+
+#[test]
+fn dimensions_get_stable_names_and_ids() {
+    let mut s = ConstrainedSketch::new();
+    let [bottom, right, ..] = s.rectangle(Point2::ORIGIN, 10.0, 5.0);
+    let width = s.constrain(Length(bottom, 10.0));
+    let height = s.constrain(Length(right, 5.0));
+    assert_eq!(s.relation(width).unwrap().name.as_deref(), Some("D1"));
+    assert_eq!(s.relation(height).unwrap().name.as_deref(), Some("D2"));
+    // Plain relations have no name.
+    assert!(s.relations()[0].name.is_none());
+
+    s.rename_dimension(width, "Width").unwrap();
+    assert_eq!(s.dimension_named("Width").map(|r| r.id), Some(width));
+    // Names are unique within the sketch and cannot contain '@' or quotes.
+    assert!(s.rename_dimension(height, "Width").is_err());
+    assert!(s.rename_dimension(height, "a@b").is_err());
+    let horizontal = s.relations()[0].id;
+    assert!(s.rename_dimension(horizontal, "Flat").is_err());
+
+    // Deleting the newest dimension never lets its id or name be handed out again.
+    s.remove_relation(height);
+    let next = s.constrain(Length(right, 6.0));
+    assert_ne!(next, height);
+    assert_eq!(s.relation(next).unwrap().name.as_deref(), Some("D3"));
+}
+
+#[test]
+fn entity_ids_are_never_reused() {
+    let mut s = ConstrainedSketch::new();
+    let first = s.line(Point2::ORIGIN, Point2::new(1.0, 0.0));
+    s.remove(&[first]);
+    let second = s.line(Point2::ORIGIN, Point2::new(2.0, 0.0));
+    // A face named after the deleted line must not attach to the new one.
+    assert_ne!(first, second);
+
+    // Counters survive a save: rebuilding from parts keeps handing out fresh ids.
+    let mut reloaded =
+        ConstrainedSketch::from_parts(s.entities().to_vec(), s.relations().to_vec(), s.counters())
+            .unwrap();
+    let third = reloaded.point(Point2::ORIGIN);
+    assert!(third.0 > second.0);
 }

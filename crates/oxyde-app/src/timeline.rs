@@ -6,7 +6,9 @@
 //! that can be dragged between features.
 
 use eframe::egui::{self, Color32, CursorIcon, RichText, Sense, Stroke};
-use oxyde_model::{FeatureId, FeatureKind, FeatureStatus, StandardPlane, TimelineEntry};
+use oxyde_model::{
+    FeatureId, FeatureKind, FeatureParameter, FeatureStatus, StandardPlane, TimelineEntry,
+};
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
@@ -235,6 +237,17 @@ impl OxydeApp {
         }
     }
 
+    /// Full name of a feature's own dimension, e.g. "D1@Boss-Extrude1".
+    fn parameter_full_name(&self, id: FeatureId, parameter: FeatureParameter) -> Option<String> {
+        self.doc
+            .part
+            .dimension(oxyde_model::DimensionRef {
+                feature: id,
+                key: oxyde_model::DimensionKey::Feature(parameter),
+            })
+            .map(|d| d.full_name)
+    }
+
     /// Opens the right editor for a feature.
     pub(crate) fn edit_feature(&mut self, id: FeatureId) {
         let Some(kind) = self.doc.part.feature(id).map(|f| f.kind().clone()) else {
@@ -246,6 +259,7 @@ impl OxydeApp {
             FeatureKind::Extrude(e) => {
                 self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
                     editing: Some(id),
+                    dimension: self.parameter_full_name(id, FeatureParameter::Depth),
                     sketch: e.sketch,
                     sketches: self.sketches(),
                     op: e.op,
@@ -259,8 +273,14 @@ impl OxydeApp {
                     self.doc.part.feature(id).map(|f| f.kind()),
                     Some(FeatureKind::Fillet(_))
                 );
+                let parameter = if fillet {
+                    FeatureParameter::Radius
+                } else {
+                    FeatureParameter::Distance
+                };
                 self.dialog = Some(Dialog::Blend(crate::dialogs::BlendDialog {
                     editing: Some(id),
+                    dimension: self.parameter_full_name(id, parameter),
                     fillet,
                     size: b.size,
                     edges: b.edges,
