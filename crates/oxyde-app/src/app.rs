@@ -1,6 +1,5 @@
 //! Application state and the top-level layout: menus, command bar, panels, status bar.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -14,6 +13,8 @@ use oxyde_render::{Pick, Scene, StandardView};
 
 use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog};
 use crate::document::Document;
+use crate::equations_ui::{EquationsTab, EquationsWindow};
+use crate::features_ui::PatternKind;
 use crate::sketch_mode::{self, SketchRequest, SketchSession, Tool};
 use crate::viewport::{Viewport, ViewportOutput};
 
@@ -31,7 +32,22 @@ pub enum PendingAction {
     New,
     Open,
     Demo,
+    DemoFlange,
     Exit,
+}
+
+/// A feature command, from the command bar or the Insert menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Sketch,
+    Extrude(ExtrudeOp),
+    Revolve(ExtrudeOp),
+    /// Fillet (true) or chamfer (false).
+    Blend(bool),
+    Shell,
+    Pattern(PatternKind),
+    RefPlane,
+    RefAxis,
 }
 
 pub struct OxydeApp {
@@ -44,9 +60,8 @@ pub struct OxydeApp {
     pub(crate) dialog: Option<Dialog>,
     /// The sketch being edited, when in sketch mode.
     pub(crate) sketch: Option<SketchSession>,
-    /// Tools › Dimensions window, and the names being typed in it.
-    show_dimensions: bool,
-    dimension_names: HashMap<oxyde_model::DimensionRef, String>,
+    /// Tools › Equations window (equations, global variables and dimensions).
+    pub(crate) equations: EquationsWindow,
     pub(crate) status: String,
     /// Document revision the viewport currently shows.
     scene_revision: Option<u64>,
@@ -68,8 +83,7 @@ impl OxydeApp {
             selection: Vec::new(),
             dialog: None,
             sketch: None,
-            show_dimensions: false,
-            dimension_names: HashMap::new(),
+            equations: EquationsWindow::new(),
             status: "Ready".to_owned(),
             scene_revision: None,
             summary: None,
@@ -222,12 +236,21 @@ impl OxydeApp {
             .collect()
     }
 
-    /// "Sketch" command: on the selected flat face, else the selected plane, else ask.
+    /// "Sketch" command: on the selected flat face, else the selected plane (standard or
+    /// reference), else ask.
     fn begin_sketch(&mut self) {
+        let reference_plane = self.selected_feature.filter(|id| {
+            matches!(
+                self.doc.part.reference(*id),
+                Some(oxyde_model::ReferenceGeometry::Plane(_))
+            )
+        });
         if let Some(face) = self.selected_planar_face() {
             self.start_new_sketch(SketchPlane::Face(face));
         } else if let Some(plane) = self.selected_plane {
             self.start_new_sketch(SketchPlane::Standard(plane));
+        } else if let Some(id) = reference_plane {
+            self.start_new_sketch(SketchPlane::Reference(id));
         } else {
             self.dialog = Some(Dialog::ChoosePlane);
         }
@@ -267,14 +290,22 @@ impl OxydeApp {
         self.viewport.look_at_plane(&plane);
         self.selection.clear();
         self.selected_feature = Some(id);
-        self.sketch = Some(SketchSession::new(
-            id,
-            name,
-            plane,
-            sketch.geometry,
-            new_sketch,
-            restore,
-        ));
+        let mut session = SketchSession::new(id, name, plane, sketch.geometry, new_sketch, restore);
+        session.driven = self
+            .doc
+            .part
+            .equations()
+            .equations
+            .iter()
+            .filter_map(|e| match e.target {
+                Some(oxyde_model::DimensionRef {
+                    feature,
+                    key: oxyde_model::DimensionKey::Sketch(relation),
+                }) if feature == id => Some(relation),
+                _ => None,
+            })
+            .collect();
+        self.sketch = Some(session);
     }
 
     /// Leaves sketch mode, keeping or discarding the changes.
@@ -379,6 +410,19 @@ impl OxydeApp {
         }));
     }
 
+    pub(crate) fn run(&mut self, command: Command) {
+        match command {
+            Command::Sketch => self.begin_sketch(),
+            Command::Extrude(op) => self.begin_extrude(op),
+            Command::Revolve(op) => self.begin_revolve(op),
+            Command::Blend(fillet) => self.begin_blend(fillet),
+            Command::Shell => self.begin_shell(),
+            Command::Pattern(kind) => self.begin_pattern(kind),
+            Command::RefPlane => self.open_ref_plane(None, None),
+            Command::RefAxis => self.open_ref_axis(None, None),
+        }
+    }
+
     // ---- Files -------------------------------------------------------------------------------
 
     fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
@@ -402,6 +446,13 @@ impl OxydeApp {
                 {
                     self.open_path(&path);
                 }
+            }
+            PendingAction::DemoFlange => {
+                let mut doc = Document::new();
+                doc.part = crate::demo::flange();
+                self.replace_document(doc);
+                self.status = "Demo flange loaded".to_owned();
+                self.report_errors();
             }
             PendingAction::Demo => {
                 let mut doc = Document::new();
@@ -541,6 +592,10 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Demo, &ctx);
                 }
+                if ui.button("Open demo flange").clicked() {
+                    ui.close_menu();
+                    self.guard(PendingAction::DemoFlange, &ctx);
+                }
                 ui.separator();
                 if ui.button("Save").clicked() {
                     ui.close_menu();
@@ -599,6 +654,51 @@ impl OxydeApp {
                     self.rebuild();
                 }
             });
+            ui.menu_button("Insert", |ui| {
+                let has_sketch = !self.sketches().is_empty();
+                let has_body = self.doc.part.body().is_some();
+                let has_edges = !self.selected_edges().is_empty();
+                let commands: [(&str, bool, Command); 13] = [
+                    ("Sketch", true, Command::Sketch),
+                    (
+                        "Extruded Boss",
+                        has_sketch,
+                        Command::Extrude(ExtrudeOp::Boss),
+                    ),
+                    ("Extruded Cut", has_sketch, Command::Extrude(ExtrudeOp::Cut)),
+                    (
+                        "Revolved Boss",
+                        has_sketch,
+                        Command::Revolve(ExtrudeOp::Boss),
+                    ),
+                    ("Revolved Cut", has_sketch, Command::Revolve(ExtrudeOp::Cut)),
+                    ("Fillet", has_edges, Command::Blend(true)),
+                    ("Chamfer", has_edges, Command::Blend(false)),
+                    ("Shell", has_body, Command::Shell),
+                    (
+                        "Linear Pattern",
+                        has_body,
+                        Command::Pattern(PatternKind::Linear),
+                    ),
+                    (
+                        "Circular Pattern",
+                        has_body,
+                        Command::Pattern(PatternKind::Circular),
+                    ),
+                    ("Mirror", has_body, Command::Pattern(PatternKind::Mirror)),
+                    ("Reference Plane", true, Command::RefPlane),
+                    ("Reference Axis", true, Command::RefAxis),
+                ];
+                for (i, (label, enabled, command)) in commands.into_iter().enumerate() {
+                    if i == 1 || i == 5 || i == 11 {
+                        ui.separator();
+                    }
+                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                        ui.close_menu();
+                        self.run(command);
+                    }
+                }
+            });
             ui.menu_button("View", |ui| {
                 for (label, view) in VIEWS {
                     if ui.button(label).clicked() {
@@ -613,9 +713,13 @@ impl OxydeApp {
                 }
             });
             ui.menu_button("Tools", |ui| {
+                if ui.button("Equations…").clicked() {
+                    ui.close_menu();
+                    self.equations.show(EquationsTab::Equations);
+                }
                 if ui.button("Dimensions…").clicked() {
                     ui.close_menu();
-                    self.show_dimensions = true;
+                    self.equations.show(EquationsTab::Dimensions);
                 }
             });
             ui.menu_button("Help", |ui| {
@@ -632,7 +736,7 @@ impl OxydeApp {
             self.sketch_command_bar(ui);
             return;
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button("Sketch")
                 .on_hover_text("New sketch on a plane or on the selected face")
@@ -641,17 +745,18 @@ impl OxydeApp {
                 self.begin_sketch();
             }
             let has_sketch = !self.sketches().is_empty();
-            if ui
-                .add_enabled(has_sketch, egui::Button::new("Extruded Boss"))
-                .clicked()
-            {
-                self.begin_extrude(ExtrudeOp::Boss);
-            }
-            if ui
-                .add_enabled(has_sketch, egui::Button::new("Extruded Cut"))
-                .clicked()
-            {
-                self.begin_extrude(ExtrudeOp::Cut);
+            for (label, command) in [
+                ("Extruded Boss", Command::Extrude(ExtrudeOp::Boss)),
+                ("Revolved Boss", Command::Revolve(ExtrudeOp::Boss)),
+                ("Extruded Cut", Command::Extrude(ExtrudeOp::Cut)),
+                ("Revolved Cut", Command::Revolve(ExtrudeOp::Cut)),
+            ] {
+                if ui
+                    .add_enabled(has_sketch, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.run(command);
+                }
             }
             let has_edges = self
                 .selection
@@ -671,6 +776,43 @@ impl OxydeApp {
             {
                 self.begin_blend(false);
             }
+            let has_body = self.doc.part.body().is_some();
+            for (label, command, hint) in [
+                ("Shell", Command::Shell, "Select the faces to remove first"),
+                (
+                    "Linear Pattern",
+                    Command::Pattern(PatternKind::Linear),
+                    "Select an edge for the direction first",
+                ),
+                (
+                    "Circular Pattern",
+                    Command::Pattern(PatternKind::Circular),
+                    "Select a round edge, a cylindrical face or an axis first",
+                ),
+                (
+                    "Mirror",
+                    Command::Pattern(PatternKind::Mirror),
+                    "Select a flat face or a plane first",
+                ),
+            ] {
+                if ui
+                    .add_enabled(has_body, egui::Button::new(label))
+                    .on_hover_text(hint)
+                    .clicked()
+                {
+                    self.run(command);
+                }
+            }
+            ui.menu_button("Reference Geometry", |ui| {
+                if ui.button("Plane…").clicked() {
+                    ui.close_menu();
+                    self.run(Command::RefPlane);
+                }
+                if ui.button("Axis…").clicked() {
+                    ui.close_menu();
+                    self.run(Command::RefAxis);
+                }
+            });
             ui.separator();
             for (label, view) in VIEWS {
                 if ui.button(label).clicked() {
@@ -795,6 +937,7 @@ impl OxydeApp {
             .is_none()
             .then_some("Start with Sketch, then Extruded Boss — or File › Open demo bracket");
         let output = self.viewport.ui(ui, picks, hint, false);
+        self.draw_references(ui, &output);
         if let Some(pick) = output.clicked {
             self.click(pick, output.additive);
         }
@@ -843,6 +986,13 @@ impl OxydeApp {
         let Some((value, angle)) = sketch_mode::dimension_value(&relation.constraint) else {
             return;
         };
+        if session.driven.contains(&id) {
+            self.status = format!(
+                "{} is driven by an equation (Tools › Equations)",
+                session.dimension_full_name(id).unwrap_or_default()
+            );
+            return;
+        }
         self.dialog = Some(Dialog::Dimension {
             target: DimensionTarget::Existing(id),
             label: session
@@ -852,118 +1002,6 @@ impl OxydeApp {
             value,
             angle,
         });
-    }
-
-    /// Renames a dimension as one undo step; refused names leave everything unchanged.
-    fn rename_dimension(
-        &mut self,
-        reference: oxyde_model::DimensionRef,
-        name: &str,
-    ) -> Result<(), oxyde_model::ModelError> {
-        let mut trial = oxyde_model::Part::from_definition(self.doc.part.definition())?;
-        trial.rename_dimension(reference, name)?;
-        self.doc.checkpoint();
-        self.doc.part.rename_dimension(reference, name)
-    }
-
-    /// Tools › Dimensions: every dimension of the part under the name equations will use.
-    fn dimensions_window(&mut self, ctx: &egui::Context) {
-        if !self.show_dimensions {
-            return;
-        }
-        let mut open = true;
-        let sketching = self.sketch.is_some();
-        let dimensions = self.doc.part.dimensions();
-        let names = &mut self.dimension_names;
-        let mut rename = None;
-        let mut change = None;
-        let mut end_edit = false;
-        egui::Window::new("Dimensions")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(360.0)
-            .show(ctx, |ui| {
-                if sketching {
-                    ui.label("Exit the sketch to edit dimensions here.");
-                    return;
-                }
-                if dimensions.is_empty() {
-                    ui.label("No dimensions yet. Dimension a sketch, or add a feature.");
-                    return;
-                }
-                ui.label(
-                    egui::RichText::new("Names are used in equations, e.g. D1@Sketch1.")
-                        .small()
-                        .weak(),
-                );
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("dimensions")
-                        .num_columns(3)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Name");
-                            ui.strong("Feature");
-                            ui.strong("Value");
-                            ui.end_row();
-                            for d in &dimensions {
-                                // Only the field being typed in keeps its own text; the others
-                                // always show the current name (after an undo, for instance).
-                                let mut text = names
-                                    .get(&d.reference)
-                                    .cloned()
-                                    .unwrap_or_else(|| d.name.clone());
-                                let edit = ui
-                                    .add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
-                                if edit.lost_focus() {
-                                    names.remove(&d.reference);
-                                    if text != d.name {
-                                        rename = Some((d.reference, text));
-                                    }
-                                } else if edit.has_focus() {
-                                    names.insert(d.reference, text);
-                                }
-                                let feature = d.full_name.split_once('@').map_or("", |(_, f)| f);
-                                ui.label(format!("@{feature}"));
-                                let angle = d.unit == oxyde_model::DimensionUnit::Angle;
-                                let (mut shown, suffix) = if angle {
-                                    (d.value.to_degrees(), "°")
-                                } else {
-                                    (d.value, " mm")
-                                };
-                                let drag =
-                                    egui::DragValue::new(&mut shown).speed(0.1).suffix(suffix);
-                                let response = ui.add(drag);
-                                if response.changed() {
-                                    let value = if angle { shown.to_radians() } else { shown };
-                                    change = Some((d.reference, value));
-                                }
-                                // One drag or one typed value is one undo step.
-                                if response.drag_stopped() || response.lost_focus() {
-                                    end_edit = true;
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-            });
-        if !open {
-            self.show_dimensions = false;
-            self.dimension_names.clear();
-        }
-        if let Some((reference, name)) = rename {
-            if let Err(e) = self.rename_dimension(reference, &name) {
-                self.status = e.to_string();
-            }
-        }
-        if let Some((reference, value)) = change {
-            self.doc.checkpoint_edit(reference.feature);
-            if self.doc.part.set_dimension(reference, value).is_ok() {
-                self.rebuild();
-            }
-        }
-        if end_edit {
-            self.doc.end_edit();
-        }
     }
 
     /// Renames a feature as one undo step; refused names leave everything unchanged.
@@ -1038,6 +1076,101 @@ impl OxydeApp {
         }
         if exit {
             self.finish_sketch(true);
+        }
+    }
+
+    /// Reference planes (translucent squares) and axes (dash-dot lines) over the image, sized
+    /// to the part. The one selected in the timeline is highlighted.
+    fn draw_references(&self, ui: &egui::Ui, output: &ViewportOutput) {
+        use oxyde_geom::{Point3, Vec3};
+        use oxyde_model::ReferenceGeometry;
+        let references = self.doc.part.references();
+        if references.is_empty() {
+            return;
+        }
+        let (center, size) = match self.doc.part.body() {
+            Some(body) => {
+                let mut lo = [f64::INFINITY; 3];
+                let mut hi = [f64::NEG_INFINITY; 3];
+                for p in body.topology.vertices.iter().map(|v| v.point) {
+                    for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                        lo[k] = lo[k].min(value);
+                        hi[k] = hi[k].max(value);
+                    }
+                }
+                if lo[0].is_finite() {
+                    let c = Point3::new(
+                        (lo[0] + hi[0]) / 2.0,
+                        (lo[1] + hi[1]) / 2.0,
+                        (lo[2] + hi[2]) / 2.0,
+                    );
+                    let d = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+                    (c, (d * 0.6).max(10.0))
+                } else {
+                    (Point3::ORIGIN, 50.0)
+                }
+            }
+            None => (Point3::ORIGIN, 50.0),
+        };
+        let painter = ui.painter_at(output.rect);
+        let to_screen = |p: Point3| self.viewport.to_screen(p, output);
+        for (id, geometry) in references {
+            let selected = self.selected_feature == Some(id);
+            let color = if selected {
+                egui::Color32::from_rgb(230, 120, 0)
+            } else {
+                egui::Color32::from_rgb(60, 120, 200)
+            };
+            let name = self
+                .doc
+                .part
+                .feature(id)
+                .map(|f| f.name().to_owned())
+                .unwrap_or_default();
+            match geometry {
+                ReferenceGeometry::Plane(plane) => {
+                    let to_center = center - plane.origin;
+                    let c = center - plane.normal * to_center.dot(plane.normal);
+                    let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
+                    let corners: Vec<egui::Pos2> =
+                        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                            .into_iter()
+                            .map(|(a, b)| to_screen(c + u * a + v * b))
+                            .collect();
+                    let label_at = corners[3];
+                    painter.add(egui::Shape::convex_polygon(
+                        corners,
+                        color.gamma_multiply(0.12),
+                        egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color),
+                    ));
+                    painter.text(
+                        label_at,
+                        egui::Align2::LEFT_BOTTOM,
+                        name,
+                        egui::FontId::proportional(11.0),
+                        color,
+                    );
+                }
+                ReferenceGeometry::Axis(axis) => {
+                    let t = (center - axis.origin).dot(axis.direction);
+                    let c = axis.origin + axis.direction * t;
+                    let a = to_screen(c - axis.direction * size);
+                    let b = to_screen(c + axis.direction * size);
+                    painter.extend(egui::Shape::dashed_line(
+                        &[a, b],
+                        egui::Stroke::new(if selected { 2.0 } else { 1.2 }, color),
+                        10.0,
+                        4.0,
+                    ));
+                    painter.text(
+                        b,
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(11.0),
+                        color,
+                    );
+                }
+            }
         }
     }
 
@@ -1199,7 +1332,7 @@ impl eframe::App for OxydeApp {
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport_ui(ui));
 
-        self.dimensions_window(ctx);
+        self.equations_window(ctx);
         self.dialogs_ui(ctx);
         self.update_title(ctx);
     }

@@ -1,9 +1,10 @@
-//! A small bracket that exercises every feature type, to try the application quickly.
+//! Small demo parts to try the application quickly: a bracket (extrusions, fillet,
+//! chamfer) and a flange (revolve, circular pattern, equations).
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    EdgeBlend, EdgeName, Extrude, ExtrudeOp, FaceName, FeatureKind, Part, Sketch, SketchPlane,
-    StandardPlane,
+    AxisRef, CircularPattern, EdgeBlend, EdgeName, Extrude, ExtrudeOp, FaceName, FeatureKind, Part,
+    Revolve, RevolveAxis, Sketch, SketchPlane, StandardAxis, StandardPlane,
 };
 
 /// Id of the right line of a rectangle drawn first in a sketch (corner points are 1–4, then
@@ -65,6 +66,75 @@ pub fn bracket() -> Part {
     part
 }
 
+/// A flange: a hub and a disc revolved about a centerline, six bolt holes in a circular
+/// pattern whose count is a global variable.
+pub fn flange() -> Part {
+    let mut part = Part::new();
+
+    // Half cross-section on the Front plane, revolved about the Y axis.
+    let mut section = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let axis = section
+        .geometry
+        .line(Point2::new(0.0, -5.0), Point2::new(0.0, 30.0));
+    section.geometry.set_construction(axis, true);
+    let corners = [
+        (10.0, 0.0),
+        (40.0, 0.0),
+        (40.0, 6.0),
+        (16.0, 6.0),
+        (16.0, 25.0),
+        (10.0, 25.0),
+    ]
+    .map(|(x, y)| section.geometry.point(Point2::new(x, y)));
+    let mut lines = Vec::new();
+    for i in 0..corners.len() {
+        lines.push(
+            section
+                .geometry
+                .line_between(corners[i], corners[(i + 1) % corners.len()]),
+        );
+    }
+    let section_id = part.add_feature(FeatureKind::Sketch(section));
+    let body = part.add_feature(FeatureKind::Revolve(Revolve {
+        sketch: section_id,
+        op: ExtrudeOp::Boss,
+        axis: RevolveAxis::SketchLine(axis.0),
+        angle: std::f64::consts::TAU,
+        mid_plane: false,
+        reverse: false,
+    }));
+
+    // One bolt hole through the disc, sketched on its top face (swept from line 2).
+    let mut hole = Sketch::new(SketchPlane::Face(FaceName::profile(body, lines[2].0)));
+    hole.circle(Point2::new(28.0, 0.0), 3.0);
+    let hole_sketch = part.add_feature(FeatureKind::Sketch(hole));
+    let hole = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+        hole_sketch,
+        ExtrudeOp::Cut,
+        6.0,
+    )));
+
+    // Six of them around the axis; the count comes from the global variable "Bolts".
+    part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+        seeds: vec![hole],
+        axis: AxisRef::Standard(StandardAxis::Y),
+        angle: std::f64::consts::TAU,
+        count: 6,
+        equal_spacing: true,
+        reverse: false,
+    }));
+    if let Ok(bolts) = part.parse_expression("6") {
+        let _ = part.add_global("Bolts", bolts);
+    }
+    if let (Some(count), Ok(expr)) = (
+        part.find_dimension("D2@CirPattern1"),
+        part.parse_expression("\"Bolts\""),
+    ) {
+        let _ = part.add_equation(count, expr);
+    }
+    part
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -74,7 +144,7 @@ mod tests {
     use oxyde_model::{FeatureStatus, Part};
     use oxyde_occt::OcctKernel;
 
-    use super::bracket;
+    use super::{bracket, flange};
 
     fn volume(part: &mut Part, kernel: &mut OcctKernel) -> f64 {
         part.rebuild(kernel);
@@ -107,5 +177,20 @@ mod tests {
 
         part.release(&mut kernel);
         reloaded.release(&mut kernel);
+    }
+
+    #[test]
+    fn demo_flange_builds() {
+        let mut kernel = OcctKernel::new();
+        let mut part = flange();
+        let built = volume(&mut part, &mut kernel);
+        let pi = std::f64::consts::PI;
+        let revolved = pi * ((1600.0 - 100.0) * 6.0 + (256.0 - 100.0) * 19.0);
+        let holes = 6.0 * pi * 9.0 * 6.0;
+        assert!(
+            (built - (revolved - holes)).abs() < 1e-3 * revolved,
+            "volume {built}"
+        );
+        part.release(&mut kernel);
     }
 }

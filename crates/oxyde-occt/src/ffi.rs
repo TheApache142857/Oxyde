@@ -26,6 +26,16 @@ pub(crate) mod bridge {
         nz: f64,
     }
 
+    /// A line in space: origin and unit direction.
+    struct AxisData {
+        ox: f64,
+        oy: f64,
+        oz: f64,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+    }
+
     enum SegmentKind {
         /// (x0, y0) → (x1, y1)
         Line,
@@ -62,6 +72,7 @@ pub(crate) mod bridge {
         InputFace,
         InputEdge,
         InputVertex,
+        OffsetFace,
         ProfileSegment,
         StartCap,
         EndCap,
@@ -116,6 +127,9 @@ pub(crate) mod bridge {
         nx: f64,
         ny: f64,
         nz: f64,
+        /// Axis of a surface of revolution.
+        has_axis: bool,
+        axis: AxisData,
         edges: Vec<u32>,
     }
 
@@ -125,6 +139,9 @@ pub(crate) mod bridge {
         mx: f64,
         my: f64,
         mz: f64,
+        /// Line of a straight edge, or axis of a circular one.
+        has_axis: bool,
+        axis: AxisData,
         vertices: Vec<u32>,
         faces: Vec<u32>,
     }
@@ -189,6 +206,26 @@ pub(crate) mod bridge {
             dy: f64,
             dz: f64,
         ) -> Result<OpResultData>;
+
+        /// Revolves by `angle` radians about `axis` (right-hand rule).
+        fn revolve(
+            self: Pin<&mut Session>,
+            plane: &PlaneData,
+            regions: &[RegionData],
+            axis: &AxisData,
+            angle: f64,
+        ) -> Result<OpResultData>;
+
+        /// Thick solid: removes `faces`, offsets the rest by `offset` (negative = inward).
+        fn shell(
+            self: Pin<&mut Session>,
+            shape: u64,
+            faces: &[u32],
+            offset: f64,
+        ) -> Result<OpResultData>;
+
+        /// Copy moved by the 3 × 4 matrix `rows` (row-major), which may be a mirror.
+        fn transform(self: Pin<&mut Session>, shape: u64, rows: &[f64]) -> Result<OpResultData>;
 
         /// `kind`: 0 = fuse, 1 = cut, 2 = common.
         fn boolean_op(

@@ -88,7 +88,15 @@ Rules:
           "part": 0 }
       ]
     }
-  ]
+  ],
+  "global_variables": [
+    { "id": 1, "name": "Thick", "expression": "12" }
+  ],
+  "equations": [
+    { "dimension": "Thickness@Boss-Extrude1", "expression": "\"Thick\"" },
+    { "dimension": "D2@Sketch1", "expression": "\"Thickness@Boss-Extrude1\" / 4" }
+  ],
+  "next_global_id": 2
 }
 ```
 
@@ -103,12 +111,24 @@ Rules:
 
 | `type` | Fields |
 |---|---|
-| `sketch` | `plane`: `{"standard": "front" \| "top" \| "right"}` or `{"face": FaceRef}`; `entities` and `relations`, see below |
+| `sketch` | `plane` (PlaneRef); `entities` and `relations`, see below |
 | `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse` |
+| `revolve` | `sketch`, `operation`, `axis` (`{"sketch_line": entity id}` \| `{"axis": AxisRef}`), `angle` (radians, up to 2π), `mid_plane`, `reverse` |
 | `fillet` | `edges` (list of EdgeRef), `radius` |
 | `chamfer` | `edges` (list of EdgeRef), `distance` |
+| `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
+| `plane` | Reference plane: `base` (PlaneRef), `offset` (mm, along the base normal), `flip` |
+| `axis` | Reference axis: `axis`: `{"along": AxisRef}` \| `{"two_planes": [PlaneRef, PlaneRef]}` |
+| `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
+| `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
+| `mirror` | `seeds`, `plane` (PlaneRef) |
 
-Every feature may also carry `dimension_names` (optional, default empty): custom names of its own dimensions, keyed by parameter (`depth` for an extrude, `radius` for a fillet, `distance` for a chamfer). A parameter that is not listed has the default name `D1`.
+Counts include the seed. Seeds of patterns and mirrors are extrusions and revolves (their tool bodies are copied).
+
+**PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
+**AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
+
+Every feature may also carry `dimension_names` (optional, default empty): custom names of its own dimensions, keyed by parameter: `depth` (extrude), `angle` (revolve, circular pattern), `radius` (fillet), `distance` (chamfer), `thickness` (shell), `offset` (reference plane), `spacing`, `count`, `spacing2`, `count2` (patterns). Unlisted parameters have default names numbered in that order within the feature: `D1`, `D2`…
 
 ### Sketches
 
@@ -151,19 +171,31 @@ Sketch coordinates are in the sketch plane's frame. For standard planes: Front =
 References to geometry are never indices; they are the persistent names described in `ARCHITECTURE.md` §6, written as JSON:
 
 - **FaceRef** `{ "key": FaceKey, "part": n }`, where FaceKey is one of:
-  - `{"type": "profile", "feature": id, "segment": sketch_entity_id}`: side face swept by an extrusion
-  - `{"type": "start_cap", "feature": id}`, `{"type": "end_cap", "feature": id}`: ends of an extrusion
+  - `{"type": "profile", "feature": id, "segment": sketch_entity_id}`: side face swept by an extrusion or a revolve
+  - `{"type": "start_cap", "feature": id}`, `{"type": "end_cap", "feature": id}`: ends of an extrusion or of a revolve of less than a full turn
   - `{"type": "from_edge", "feature": id, "edge": EdgeRef}`: fillet/chamfer face
   - `{"type": "from_vertex", "feature": id, "vertex": VertexRef}`: corner blend
+  - `{"type": "offset", "feature": id, "face": FaceRef}`: inner wall of a shell, offset from that face
+  - `{"type": "instance", "feature": id, "instance": [i, j], "face": FaceRef}`: copy made by a pattern or a mirror of the seed's face `face`; `[i, j]` is the position in the pattern (`[1, 0]` for a mirror)
   - `{"type": "unknown", "feature": id, "index": n}`: origin not reported (unstable)
 - **EdgeRef** `{ "faces": [FaceRef, …], "part": n }`: the faces the edge separates.
 - **VertexRef** `{ "faces": [FaceRef, …], "part": n }`: the faces meeting at the vertex.
 
 `part` is 0 unless several entities share the same name; readers sort `faces` lists themselves.
 
+### Equations
+
+Optional, default empty, SolidWorks style:
+
+- `global_variables`: `id` (unique, never reused), `name` (unique, see *Names*) and `expression`.
+- `equations`: `dimension`, the full name of the dimension the equation drives (each dimension at most once), and `expression`.
+- `next_global_id`: id the next new global variable will get (default 1; readers raise it above every id).
+
+Expressions are text: numbers, names between double quotes (`"Width"` for a global variable, `"D1@Sketch1"` for a dimension), `+ - * / ^`, parentheses, `pi`, and the functions `sin cos tan asin acos atan` (in degrees), `sqrt abs exp log` (natural) `log10 int round sgn` (one argument) and `min max` (two). Values are in mm, angles in **degrees** (unlike the rest of the file, as in SolidWorks), instance counts are rounded. Names are written as they are at save time. A name that matches nothing on load is kept and reported as an error when the equations are evaluated (a broken equation, not a broken file); a syntax error refuses the file.
+
 ### Names
 
-Feature and dimension names follow SolidWorks: a dimension's full name is `dimension@feature`, e.g. `D1@Sketch1` or `Thickness@Boss-Extrude1`, which is how equations will refer to it. A name is valid when it is not empty, has no leading or trailing spaces, and contains no `@`, `"` or control character. Feature names are unique within the part, dimension names within their feature. Names are display only: every internal reference uses ids, so renaming never breaks anything.
+Feature and dimension names follow SolidWorks: a dimension's full name is `dimension@feature`, e.g. `D1@Sketch1` or `Thickness@Boss-Extrude1`, which is how equations refer to it. A name is valid when it is not empty, has no leading or trailing spaces, and contains no `@`, `"` or control character. Feature names are unique within the part, dimension names within their feature. Names are display only: every internal reference uses ids, so renaming never breaks anything.
 
 ## 4. `properties.json`
 

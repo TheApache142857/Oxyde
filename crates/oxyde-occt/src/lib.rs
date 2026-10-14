@@ -8,7 +8,7 @@ mod ffi;
 use std::fmt;
 use std::path::Path;
 
-use oxyde_geom::{Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Vec3};
+use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
     OpResult, ShapeHandle, SurfaceKind, Topology, TopologyCounts, VertexInfo,
@@ -90,6 +90,46 @@ impl Kernel for OcctKernel {
             vector.y,
             vector.z,
         )?;
+        Ok(op_result(data))
+    }
+
+    fn revolve(
+        &mut self,
+        plane: &Plane,
+        profile: &Profile,
+        axis: &Axis,
+        angle: f64,
+    ) -> Result<OpResult, OcctError> {
+        let regions = regions_data(profile);
+        let data = self.session.pin_mut().revolve(
+            &plane_data(plane),
+            &regions,
+            &axis_data(axis),
+            angle,
+        )?;
+        Ok(op_result(data))
+    }
+
+    fn shell(
+        &mut self,
+        shape: ShapeHandle,
+        removed_faces: &[u32],
+        offset: f64,
+    ) -> Result<OpResult, OcctError> {
+        let data = self
+            .session
+            .pin_mut()
+            .shell(shape.raw(), removed_faces, offset)?;
+        Ok(op_result(data))
+    }
+
+    fn transform(
+        &mut self,
+        shape: ShapeHandle,
+        transform: &Transform,
+    ) -> Result<OpResult, OcctError> {
+        let rows: Vec<f64> = transform.rows.iter().flatten().copied().collect();
+        let data = self.session.pin_mut().transform(shape.raw(), &rows)?;
         Ok(op_result(data))
     }
 
@@ -187,6 +227,17 @@ fn plane_data(p: &Plane) -> ffi::PlaneData {
     }
 }
 
+fn axis_data(a: &Axis) -> ffi::AxisData {
+    ffi::AxisData {
+        ox: a.origin.x,
+        oy: a.origin.y,
+        oz: a.origin.z,
+        dx: a.direction.x,
+        dy: a.direction.y,
+        dz: a.direction.z,
+    }
+}
+
 fn segment_data(segment: &ProfileSegment) -> ffi::SegmentData {
     let mut data = ffi::SegmentData {
         id: segment.id,
@@ -265,6 +316,10 @@ fn face_source(s: &ffi::FaceSourceData) -> Option<FaceSource> {
             input: s.input,
             vertex: s.index,
         },
+        ffi::SourceKind::OffsetFace => FaceSource::OffsetFace {
+            input: s.input,
+            face: s.index,
+        },
         ffi::SourceKind::ProfileSegment => FaceSource::ProfileSegment(s.index),
         ffi::SourceKind::StartCap => FaceSource::StartCap,
         ffi::SourceKind::EndCap => FaceSource::EndCap,
@@ -282,6 +337,7 @@ fn topology_from(data: ffi::TopologyData) -> Topology {
                 area: f.area,
                 centroid: Point3::new(f.cx, f.cy, f.cz),
                 normal: f.has_normal.then(|| Vec3::new(f.nx, f.ny, f.nz)),
+                axis: axis_from(f.has_axis, &f.axis),
                 edges: f.edges,
             })
             .collect(),
@@ -292,6 +348,7 @@ fn topology_from(data: ffi::TopologyData) -> Topology {
                 curve: curve_kind(e.curve),
                 length: e.length,
                 midpoint: Point3::new(e.mx, e.my, e.mz),
+                axis: axis_from(e.has_axis, &e.axis),
                 vertices: e.vertices,
                 faces: e.faces,
             })
@@ -304,6 +361,13 @@ fn topology_from(data: ffi::TopologyData) -> Topology {
             })
             .collect(),
     }
+}
+
+fn axis_from(present: bool, a: &ffi::AxisData) -> Option<Axis> {
+    if !present {
+        return None;
+    }
+    Axis::new(Point3::new(a.ox, a.oy, a.oz), Vec3::new(a.dx, a.dy, a.dz))
 }
 
 fn points3(flat: &[f32]) -> Vec<[f32; 3]> {

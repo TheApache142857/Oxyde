@@ -8,6 +8,8 @@ mod app;
 mod demo;
 mod dialogs;
 mod document;
+mod equations_ui;
+mod features_ui;
 mod sketch_mode;
 mod timeline;
 mod viewport;

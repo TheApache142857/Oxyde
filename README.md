@@ -2,7 +2,7 @@
 
 An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
 
-> **Status: pre-alpha.** A first desktop application is written: timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, dimensions, fully/under-defined colouring), boss/cut extrude, fillet, chamfer, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`) ready for equations, a 3D viewport with picking, `.oxy` save/load and STEP export. Everything awaits its first Windows build.
+> **Status: pre-alpha.** A first desktop application is written: timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, dimensions, fully/under-defined colouring), boss/cut extrude and revolve, fillet, chamfer, shell, reference planes and axes, linear and circular patterns, mirror, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`), global variables and equations, a 3D viewport with picking, `.oxy` save/load and STEP export. Everything awaits its first Windows build.
 
 ## Goals
 

@@ -12,6 +12,7 @@ use oxyde_model::{
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
+use crate::features_ui::PatternKind;
 
 const ERROR: Color32 = Color32::from_rgb(200, 40, 40);
 const WARNING: Color32 = Color32::from_rgb(210, 120, 0);
@@ -238,14 +239,24 @@ impl OxydeApp {
     }
 
     /// Full name of a feature's own dimension, e.g. "D1@Boss-Extrude1".
-    fn parameter_full_name(&self, id: FeatureId, parameter: FeatureParameter) -> Option<String> {
+    pub(crate) fn parameter_full_name(
+        &self,
+        id: FeatureId,
+        parameter: FeatureParameter,
+    ) -> Option<String> {
         self.doc
             .part
             .dimension(oxyde_model::DimensionRef {
                 feature: id,
                 key: oxyde_model::DimensionKey::Feature(parameter),
             })
-            .map(|d| d.full_name)
+            .map(|d| {
+                if d.driven {
+                    format!("Σ {} (driven by an equation)", d.full_name)
+                } else {
+                    d.full_name
+                }
+            })
     }
 
     /// Opens the right editor for a feature.
@@ -254,7 +265,7 @@ impl OxydeApp {
             return;
         };
         self.selected_feature = Some(id);
-        match kind {
+        match kind.clone() {
             FeatureKind::Sketch(_) => self.edit_sketch(id, false),
             FeatureKind::Extrude(e) => {
                 self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
@@ -288,6 +299,17 @@ impl OxydeApp {
                     use_selection: false,
                 }));
             }
+            FeatureKind::Revolve(r) => self.open_revolve(Some(id), r.sketch, r.op, Some(&r)),
+            FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
+            FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),
+            FeatureKind::Axis(axis) => self.open_ref_axis(Some(id), Some(&axis)),
+            FeatureKind::LinearPattern(_) => {
+                self.open_pattern(Some(id), PatternKind::Linear, Some(&kind))
+            }
+            FeatureKind::CircularPattern(_) => {
+                self.open_pattern(Some(id), PatternKind::Circular, Some(&kind))
+            }
+            FeatureKind::Mirror(_) => self.open_pattern(Some(id), PatternKind::Mirror, Some(&kind)),
         }
     }
 }

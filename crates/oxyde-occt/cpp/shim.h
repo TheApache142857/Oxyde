@@ -19,6 +19,7 @@
 namespace oxyde::occt {
 
 // Shared structs, defined by the cxx-generated header.
+struct AxisData;
 struct MeshData;
 struct OpResultData;
 struct PlaneData;
@@ -31,6 +32,11 @@ public:
     std::uint64_t make_box(double x, double y, double z, double dx, double dy, double dz);
     OpResultData extrude(const PlaneData& plane, rust::Slice<const RegionData> regions,
                          double dx, double dy, double dz);
+    OpResultData revolve(const PlaneData& plane, rust::Slice<const RegionData> regions,
+                         const AxisData& axis, double angle);
+    OpResultData shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
+                       double offset);
+    OpResultData transform(std::uint64_t shape, rust::Slice<const double> rows);
     OpResultData boolean_op(std::uint8_t kind, std::uint64_t target, std::uint64_t tool);
     OpResultData fillet(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
                         double radius);
