@@ -62,9 +62,11 @@ pub enum Dialog {
         label: String,
         /// Editable name, for existing dimensions.
         name: Option<String>,
-        /// mm, or degrees for angles.
-        value: f64,
+        /// The value as typed: mm, or degrees for angles.
+        text: String,
         angle: bool,
+        /// First frame: focus the value with its text selected, ready to type over.
+        fresh: bool,
     },
     Rename {
         feature: FeatureId,
@@ -127,6 +129,44 @@ pub(crate) fn ok_cancel(ui: &mut egui::Ui, ok_label: &str) -> Answer {
     answer
 }
 
+/// A number typed by the user; a decimal comma is accepted.
+pub(crate) fn parse_value(text: &str) -> Option<f64> {
+    text.trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+}
+
+/// A value shown for editing: up to four decimals, without trailing zeros.
+pub(crate) fn format_value(value: f64) -> String {
+    let text = format!("{value:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// The text field of a value. On its first frame it takes the focus with its text
+/// selected, so typing replaces it.
+fn value_field(ui: &mut egui::Ui, text: &mut String, fresh: &mut bool) {
+    let id = ui.make_persistent_id("dimension_value");
+    let output = egui::TextEdit::singleline(text)
+        .id(id)
+        .desired_width(110.0)
+        .show(ui);
+    if *fresh {
+        output.response.request_focus();
+        let mut state = output.state;
+        let end = egui::text::CCursor::new(text.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                end,
+            )));
+        state.store(ui.ctx(), id);
+        *fresh = false;
+    }
+}
+
 pub(crate) fn positive_length(ui: &mut egui::Ui, value: &mut f64) {
     ui.add(egui::DragValue::new(value).speed(0.1).suffix(" mm"));
     if *value < 0.001 {
@@ -163,22 +203,22 @@ impl OxydeApp {
             Dialog::Dimension {
                 label,
                 name,
-                value,
+                text,
                 angle,
+                fresh,
                 ..
             } => {
                 let mut answer = Answer::Open;
                 window(label).show(ctx, |ui| {
-                    let suffix = if *angle { "°" } else { " mm" };
+                    let suffix = if *angle { "°" } else { "mm" };
                     egui::Grid::new("dimension_dialog")
                         .num_columns(2)
                         .show(ui, |ui| {
                             ui.label("Value");
-                            let response =
-                                ui.add(egui::DragValue::new(value).speed(0.1).suffix(suffix));
-                            if name.is_none() {
-                                response.request_focus();
-                            }
+                            ui.horizontal(|ui| {
+                                value_field(ui, text, fresh);
+                                ui.label(suffix);
+                            });
                             ui.end_row();
                             if let Some(name) = name {
                                 ui.label("Name");
@@ -187,7 +227,17 @@ impl OxydeApp {
                                 ui.end_row();
                             }
                         });
+                    if parse_value(text).is_none() {
+                        ui.label(
+                            egui::RichText::new("Type a number")
+                                .small()
+                                .color(egui::Color32::from_rgb(200, 40, 40)),
+                        );
+                    }
                     answer = ok_cancel(ui, "OK");
+                    if matches!(answer, Answer::Ok) && parse_value(text).is_none() {
+                        answer = Answer::Open;
+                    }
                 });
                 answer
             }
@@ -308,10 +358,13 @@ impl OxydeApp {
             Dialog::Dimension {
                 target,
                 name,
-                value,
+                text,
                 angle,
                 ..
             } => {
+                let Some(value) = parse_value(&text) else {
+                    return;
+                };
                 let value = if angle { value.to_radians() } else { value };
                 if let Some(session) = self.sketch.as_mut() {
                     match target {

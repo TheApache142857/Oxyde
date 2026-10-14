@@ -1,6 +1,7 @@
 //! Editing helpers on solved geometry: where curves cross, the closest point on a curve, and
 //! trimming a curve back to its nearest crossings (SolidWorks' "Trim Entities", power trim).
 
+use std::collections::HashMap;
 use std::f64::consts::TAU;
 
 use oxyde_geom::Point2;
@@ -508,5 +509,83 @@ fn set_end(geometry: &mut Geometry, q: EntityId) {
     match geometry {
         Geometry::Line { end, .. } | Geometry::Arc { end, .. } => *end = q,
         _ => {}
+    }
+}
+
+impl ConstrainedSketch {
+    /// Mirrors `entities` (curves and points) about `line`, as SolidWorks' Mirror Entities:
+    /// each copied point is tied to its original by a symmetric relation, so the copy
+    /// follows later edits. Points on the mirror line are shared. Returns the new curves and
+    /// points, or `None` if `line` is not a line.
+    pub fn mirror(&mut self, entities: &[EntityId], line: EntityId) -> Option<Vec<EntityId>> {
+        let (a, b) = self.endpoints(line)?;
+        let (a, b) = (self.position(a)?, self.position(b)?);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let length2 = dx * dx + dy * dy;
+        if length2 < 1e-24 {
+            return None;
+        }
+        let reflect = |p: Point2| {
+            let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / length2;
+            let foot = Point2::new(a.x + dx * t, a.y + dy * t);
+            Point2::new(2.0 * foot.x - p.x, 2.0 * foot.y - p.y)
+        };
+        let on_line = |p: Point2| reflect(p).distance(p) < 1e-9;
+
+        let mut copies: HashMap<EntityId, EntityId> = HashMap::new();
+        let mut created = Vec::new();
+        let mut copy_point = |sketch: &mut Self, p: EntityId, created: &mut Vec<EntityId>| {
+            if let Some(q) = copies.get(&p) {
+                return *q;
+            }
+            let at = sketch.position(p).unwrap_or_default();
+            let q = if on_line(at) {
+                p
+            } else {
+                let q = sketch.point(reflect(at));
+                sketch.constrain(Constraint::Symmetric(p, q, line));
+                created.push(q);
+                q
+            };
+            copies.insert(p, q);
+            q
+        };
+
+        let originals: Vec<Entity> = entities
+            .iter()
+            .filter(|id| **id != line)
+            .filter_map(|id| self.entity(*id).copied())
+            .collect();
+        for e in originals {
+            let new = match e.geometry {
+                Geometry::Point(_) => {
+                    copy_point(self, e.id, &mut created);
+                    continue;
+                }
+                Geometry::Line { start, end } => {
+                    let (s, f) = (
+                        copy_point(self, start, &mut created),
+                        copy_point(self, end, &mut created),
+                    );
+                    self.line_between(s, f)
+                }
+                Geometry::Circle { center, radius } => {
+                    let c = copy_point(self, center, &mut created);
+                    let id = self.circle_around(c, radius);
+                    self.constrain(Constraint::EqualRadius(e.id, id));
+                    id
+                }
+                Geometry::Arc { center, start, end } => {
+                    // A mirror turns counter-clockwise into clockwise: swap the ends.
+                    let c = copy_point(self, center, &mut created);
+                    let s = copy_point(self, start, &mut created);
+                    let f = copy_point(self, end, &mut created);
+                    self.arc_between(c, f, s)
+                }
+            };
+            self.set_construction(new, e.construction);
+            created.push(new);
+        }
+        Some(created)
     }
 }

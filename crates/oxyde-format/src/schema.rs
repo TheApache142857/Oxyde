@@ -312,6 +312,7 @@ pub(crate) enum RelationDto {
     Tangent { line: u32, curve: u32 },
     PointLineDistance { point: u32, line: u32, value: f64 },
     LineDistance { a: u32, b: u32, value: f64 },
+    Symmetric { a: u32, b: u32, line: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -655,6 +656,11 @@ fn relation_dto(c: &Constraint) -> RelationDto {
             b: b.0,
             value,
         },
+        C::Symmetric(a, b, line) => R::Symmetric {
+            a: a.0,
+            b: b.0,
+            line: line.0,
+        },
     }
 }
 
@@ -816,6 +822,7 @@ fn relation_from(dto: RelationDto) -> Constraint {
             C::PointLineDistance(id(point), id(line), value)
         }
         R::LineDistance { a, b, value } => C::LineDistance(id(a), id(b), value),
+        R::Symmetric { a, b, line } => C::Symmetric(id(a), id(b), id(line)),
     }
 }
 

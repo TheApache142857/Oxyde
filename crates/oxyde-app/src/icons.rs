@@ -57,6 +57,8 @@ pub enum Icon {
     NormalTo,
     Undo,
     Redo,
+    Eye,
+    EyeClosed,
     // Badges
     Add,
     Remove,
@@ -687,6 +689,20 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.circle(10.0, 13.0, 1.4, ACCENT, None);
             pen.arrow((15.0, 9.0), (22.0, 2.0), 1.6, ACCENT);
         }
+        Eye => {
+            let upper = Pen::arc_points(12.0, 17.0, 10.0, 8.0, -0.85 * PI, -0.15 * PI);
+            let lower = Pen::arc_points(12.0, 7.0, 10.0, 8.0, 0.15 * PI, 0.85 * PI);
+            pen.line(&upper, 1.8, INK);
+            pen.line(&lower, 1.8, INK);
+            pen.circle(12.0, 12.0, 3.4, SKETCH, Some((1.0, INK)));
+        }
+        EyeClosed => {
+            let lower = Pen::arc_points(12.0, 6.0, 10.0, 8.0, 0.2 * PI, 0.8 * PI);
+            pen.line(&lower, 1.8, INK);
+            for x in [6.0, 12.0, 18.0] {
+                pen.line(&[(x, 13.8), (x + (x - 12.0) * 0.15, 17.0)], 1.4, INK);
+            }
+        }
         Undo => {
             pen.arc(13.0, 14.0, 7.0, -FRAC_PI_2, 0.6 * PI, 2.2, INK);
             pen.line(&[(13.0, 7.0), (8.0, 7.0)], 2.2, INK);
@@ -829,7 +845,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 47] = {
+pub const ALL: [Icon; 49] = {
     use Icon::*;
     [
         Sketch,
@@ -873,6 +889,8 @@ pub const ALL: [Icon; 47] = {
         NormalTo,
         Undo,
         Redo,
+        Eye,
+        EyeClosed,
         Add,
         Remove,
         Ok,

@@ -8,6 +8,7 @@ mod app;
 mod command_bar;
 mod demo;
 mod dialogs;
+mod display;
 mod document;
 mod equations_ui;
 mod evaluate;

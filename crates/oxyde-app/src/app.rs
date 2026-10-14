@@ -78,6 +78,8 @@ enum Overlay {
 enum OverlayShape {
     Quad([egui::Pos2; 4]),
     Segment(egui::Pos2, egui::Pos2),
+    /// Curves of a sketch.
+    Polylines(Vec<Vec<egui::Pos2>>),
 }
 
 pub struct OxydeApp {
@@ -98,6 +100,10 @@ pub struct OxydeApp {
     pub(crate) pending_tool: Option<Tool>,
     pub(crate) show_mass_properties: bool,
     pub(crate) show_measure: bool,
+    /// Which planes, axes, sketches and origins are drawn.
+    pub(crate) visibility: crate::display::Visibility,
+    /// Features expanded in the timeline (showing the sketch they absorb).
+    pub(crate) expanded: std::collections::HashSet<FeatureId>,
     /// Document revision the viewport currently shows.
     scene_revision: Option<u64>,
     /// Status-bar summary, cached per document revision.
@@ -124,6 +130,8 @@ impl OxydeApp {
             pending_tool: None,
             show_mass_properties: false,
             show_measure: false,
+            visibility: Default::default(),
+            expanded: Default::default(),
             scene_revision: None,
             summary: None,
             window_title: String::new(),
@@ -363,7 +371,26 @@ impl OxydeApp {
             self.status = format!("Cannot edit {name}: its plane is missing");
             return;
         };
-        self.viewport.look_at_plane(&plane);
+        // Turn to the sketch and centre it, as SolidWorks does; an empty sketch frames the part.
+        let points: Vec<oxyde_geom::Point3> = sketch
+            .geometry
+            .entities()
+            .iter()
+            .filter_map(|e| match e.geometry {
+                oxyde_sketch::Geometry::Point(p) if !e.construction => Some(plane.to_world(p)),
+                _ => None,
+            })
+            .collect();
+        let bounds = (points.len() >= 2).then(|| {
+            let mut lo = points[0];
+            let mut hi = points[0];
+            for p in &points {
+                lo = oxyde_geom::Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = oxyde_geom::Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+            }
+            (lo, hi)
+        });
+        self.viewport.look_at_plane_framing(&plane, bounds);
         self.selection.clear();
         self.selected_plane = None;
         self.selected_feature = Some(id);
@@ -762,8 +789,9 @@ impl OxydeApp {
                         target: DimensionTarget::New(option.relation),
                         label: option.label.trim_end_matches('…').to_owned(),
                         name: None,
-                        value: option.shown,
+                        text: crate::dialogs::format_value(option.shown),
                         angle: option.angle,
+                        fresh: true,
                     });
                 }
                 None => {}
@@ -867,8 +895,9 @@ impl OxydeApp {
                 .dimension_full_name(id)
                 .unwrap_or_else(|| "Dimension".to_owned()),
             name: relation.name.clone(),
-            value,
+            text: crate::dialogs::format_value(value),
             angle,
+            fresh: true,
         });
     }
 
@@ -916,8 +945,9 @@ impl OxydeApp {
                         target: DimensionTarget::New(option.relation),
                         label: option.label.trim_end_matches('…').to_owned(),
                         name: None,
-                        value: option.shown,
+                        text: crate::dialogs::format_value(option.shown),
                         angle: option.angle,
+                        fresh: true,
                     });
                     ui.close_menu();
                 }
@@ -926,6 +956,17 @@ impl OxydeApp {
                 ui.separator();
                 if ui.button("Construction geometry on/off").clicked() {
                     session.toggle_construction();
+                    ui.close_menu();
+                }
+            }
+            if !session.selected_dimensions.is_empty() {
+                let label = if session.selected_dimensions.len() == 1 {
+                    "Delete dimension"
+                } else {
+                    "Delete dimensions"
+                };
+                if ui.button(label).clicked() {
+                    session.delete_selection();
                     ui.close_menu();
                 }
             }
@@ -1035,7 +1076,8 @@ impl OxydeApp {
             StandardPlane::Right,
         ] {
             let selected = self.selected_plane == Some(standard);
-            if all_planes || selected {
+            let shown = self.item_visible(crate::display::Item::Plane(standard));
+            if all_planes || selected || shown {
                 let shape = draw_plane(
                     standard.plane(),
                     format!("{} Plane", plane_name(standard)),
@@ -1047,6 +1089,11 @@ impl OxydeApp {
         let highlighted = self.panel_features();
         for (id, geometry) in self.doc.part.references() {
             let selected = self.selected_feature == Some(id) || highlighted.contains(&id);
+            let shown = self.item_visible(crate::display::Item::Feature(id));
+            let wanted = matches!(geometry, ReferenceGeometry::Plane(_)) && all_planes;
+            if !(selected || shown || wanted) {
+                continue;
+            }
             let name = self
                 .doc
                 .part
@@ -1084,6 +1131,64 @@ impl OxydeApp {
                     overlays.push((Overlay::Reference(id), OverlayShape::Segment(a, b)));
                 }
             }
+        }
+
+        // Sketches: shown ones, the selected one and those the open command uses.
+        for feature in self.doc.part.features() {
+            let id = feature.id();
+            if !matches!(feature.kind(), FeatureKind::Sketch(_)) {
+                continue;
+            }
+            let selected = self.selected_feature == Some(id) || highlighted.contains(&id);
+            if !(selected || self.item_visible(crate::display::Item::Feature(id))) {
+                continue;
+            }
+            let Some(result) = self.doc.part.sketch_result(id) else {
+                continue;
+            };
+            let hovered_color = egui::Color32::from_rgb(230, 120, 0);
+            let mut lines = Vec::new();
+            for (points, construction) in crate::display::sketch_polylines(&result.solved) {
+                let path: Vec<egui::Pos2> = points
+                    .into_iter()
+                    .map(|p| to_screen(result.plane.to_world(p)))
+                    .collect();
+                let color = if selected {
+                    hovered_color
+                } else {
+                    egui::Color32::from_rgb(40, 70, 150)
+                };
+                let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.3 }, color);
+                if construction {
+                    painter.extend(egui::Shape::dashed_line(&path, stroke, 6.0, 4.0));
+                } else {
+                    painter.add(egui::Shape::line(path.clone(), stroke));
+                }
+                lines.push(path);
+            }
+            overlays.push((Overlay::Reference(id), OverlayShape::Polylines(lines)));
+        }
+
+        // The origin: three short axes of fixed screen length.
+        if self.item_visible(crate::display::Item::Origin) {
+            let o = to_screen(Point3::ORIGIN);
+            for (axis, color) in [
+                (Vec3::X, egui::Color32::from_rgb(210, 50, 50)),
+                (Vec3::Y, egui::Color32::from_rgb(40, 150, 60)),
+                (Vec3::Z, egui::Color32::from_rgb(50, 90, 220)),
+            ] {
+                let d = to_screen(Point3::ORIGIN + axis) - o;
+                if d.length() > 1e-6 {
+                    let tip = o + d.normalized() * 22.0;
+                    painter.line_segment([o, tip], egui::Stroke::new(1.6, color));
+                }
+            }
+            painter.circle(
+                o,
+                3.0,
+                egui::Color32::from_rgb(200, 60, 60),
+                egui::Stroke::new(1.0, egui::Color32::WHITE),
+            );
         }
         overlays
     }
@@ -1294,6 +1399,10 @@ fn overlay_at(
     let near = overlays.iter().find(|(_, shape)| match shape {
         OverlayShape::Quad(q) => near_outline(q, p),
         OverlayShape::Segment(a, b) => segment_distance(p, *a, *b) < 6.0,
+        OverlayShape::Polylines(lines) => lines.iter().any(|line| {
+            line.windows(2)
+                .any(|w| segment_distance(p, w[0], w[1]) < 5.0)
+        }),
     });
     if let Some((overlay, _)) = near {
         return Some(*overlay);
