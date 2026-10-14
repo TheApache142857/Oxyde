@@ -10,8 +10,8 @@ use eframe::egui;
 use oxyde_geom::{Plane, Point3, Vec3};
 use oxyde_kernel::{Kernel, SurfaceKind, Topology};
 use oxyde_model::{
-    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry,
-    Sketch, SketchPlane, StandardPlane,
+    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, FileData, Import,
+    ReferenceGeometry, Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Pick, Scene};
@@ -37,6 +37,8 @@ pub enum Selected {
 pub enum PendingAction {
     New,
     Open,
+    /// A new part from a STEP file.
+    OpenStep,
     Demo,
     DemoFlange,
     Exit,
@@ -509,10 +511,17 @@ impl OxydeApp {
             }
             PendingAction::Open => {
                 if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Oxyde part or STEP", &["oxy", "step", "stp"])
                     .add_filter("Oxyde part", &["oxy"])
+                    .add_filter("STEP", &["step", "stp"])
                     .pick_file()
                 {
                     self.open_path(&path);
+                }
+            }
+            PendingAction::OpenStep => {
+                if let Some(path) = pick_step() {
+                    self.open_step_as_part(&path);
                 }
             }
             PendingAction::DemoFlange => {
@@ -551,6 +560,10 @@ impl OxydeApp {
     }
 
     pub(crate) fn open_path(&mut self, path: &Path) {
+        if is_step(path) {
+            self.open_step_as_part(path);
+            return;
+        }
         let loaded = oxyde_format::load_part(path)
             .map_err(|e| e.to_string())
             .and_then(|file| Document::from_file(file, Some(path.to_path_buf())));
@@ -561,6 +574,57 @@ impl OxydeApp {
                 self.report_errors();
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+        }
+    }
+
+    /// A new part whose first feature imports `path`.
+    fn open_step_as_part(&mut self, path: &Path) {
+        let mut doc = Document::new();
+        doc.untitled_name = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        self.replace_document(doc);
+        if self.import_step_file(path) {
+            // Opening is not an edit: nothing to undo, nothing unsaved yet.
+            self.doc.modified = false;
+            self.doc.clear_history();
+        }
+    }
+
+    /// File › Import STEP: adds the file's solids to the part as an "Imported" feature.
+    pub(crate) fn import_step(&mut self) {
+        if let Some(path) = pick_step() {
+            self.finish_sketch(true);
+            self.import_step_file(&path);
+        }
+    }
+
+    /// Reads `path` into an "Imported" feature at the rollback bar. Returns whether the
+    /// geometry could be read.
+    fn import_step_file(&mut self, path: &Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e}", path.display());
+                return false;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import.step".to_owned());
+        let id = self.add_feature(FeatureKind::Import(Import {
+            file_name: file_name.clone(),
+            data: FileData::new(bytes),
+        }));
+        self.viewport.request_fit();
+        match self.doc.part.status(id) {
+            Some(FeatureStatus::Error(message)) => {
+                self.status = format!("Import failed: {message}");
+                false
+            }
+            _ => {
+                self.status = format!("Imported {file_name}");
+                true
+            }
         }
     }
 
@@ -1171,6 +1235,18 @@ impl OxydeApp {
             self.window_title = title;
         }
     }
+}
+
+fn is_step(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("step") || e.eq_ignore_ascii_case("stp"))
+}
+
+fn pick_step() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("STEP", &["step", "stp"])
+        .pick_file()
 }
 
 /// Whether `p` is inside a convex quad.

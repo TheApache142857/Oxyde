@@ -260,6 +260,9 @@ pub(crate) mod bridge {
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
 
         fn export_step(self: &Session, shapes: &[u64], path: &str) -> Result<()>;
+
+        /// Reads the solids of a STEP file held in memory, in millimetres.
+        fn import_step(self: Pin<&mut Session>, data: &[u8]) -> Result<u64>;
     }
 }
 

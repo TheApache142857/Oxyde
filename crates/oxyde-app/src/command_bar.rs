@@ -55,6 +55,10 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
                 }
+                if ui.button("New part from STEP…").clicked() {
+                    ui.close_menu();
+                    self.guard(PendingAction::OpenStep, &ctx);
+                }
                 if ui.button("Open demo bracket").clicked() {
                     ui.close_menu();
                     self.guard(PendingAction::Demo, &ctx);
@@ -71,6 +75,10 @@ impl OxydeApp {
                 if ui.button("Save as…").clicked() {
                     ui.close_menu();
                     self.save_as();
+                }
+                if ui.button("Import STEP…").clicked() {
+                    ui.close_menu();
+                    self.import_step();
                 }
                 if ui.button("Export STEP…").clicked() {
                     ui.close_menu();
@@ -416,6 +424,13 @@ impl OxydeApp {
         );
         if let Some(command) = chosen {
             self.run(command);
+        }
+        group_separator(ui);
+        if command_button(ui, Icon::Imported, "Import STEP", true, false)
+            .on_hover_text("Add the solids of a STEP file to the part, as an Imported feature")
+            .clicked()
+        {
+            self.import_step();
         }
     }
 

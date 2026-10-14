@@ -1,8 +1,9 @@
 //! Reading and writing `.oxy` files.
 //!
 //! An `.oxy` file is a ZIP archive holding `manifest.json`, `model.json` (the feature
-//! timeline, the source of truth) and `properties.json` (BOM-ready metadata). Geometry is
-//! never stored as the source of truth: it is rebuilt from the timeline on load.
+//! timeline, the source of truth), `properties.json` (BOM-ready metadata) and, for import
+//! features, the imported files under `imports/`. Geometry is never stored as the source of
+//! truth: it is rebuilt from the timeline on load.
 //!
 //! See `docs/FORMAT.md` for the specification.
 
@@ -13,12 +14,14 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
-use oxyde_model::{ModelError, Part, PartDefinition};
+use std::collections::HashMap;
+
+use oxyde_model::{FeatureKind, ModelError, Part, PartDefinition};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub use schema::Properties;
-use schema::{Manifest, PartModel, Units};
+use schema::{Manifest, PartModel, Units, import_entry};
 
 /// The `format_version` written by this crate, and the newest it can read.
 pub const FORMAT_VERSION: u32 = 1;
@@ -162,6 +165,13 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
         zip.start_file(entry, options)?;
         zip.write_all(&bytes)?;
     }
+    // Imported files, as they were read.
+    for feature in &part.definition.features {
+        if let FeatureKind::Import(import) = feature.kind() {
+            zip.start_file(import_entry(feature.id()), options)?;
+            zip.write_all(import.data.bytes())?;
+        }
+    }
     Ok(zip.finish()?)
 }
 
@@ -190,9 +200,20 @@ pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
 
     let model: PartModel = from_json(MODEL, &read_entry(&mut archive, MODEL)?)?;
     let properties: Properties = from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?;
+    let mut files = HashMap::new();
+    let imports: Vec<String> = archive
+        .file_names()
+        .filter(|name| name.starts_with("imports/"))
+        .map(str::to_owned)
+        .collect();
+    for name in imports {
+        let mut bytes = Vec::new();
+        archive.by_name(&name)?.read_to_end(&mut bytes)?;
+        files.insert(name, bytes);
+    }
 
     let definition = model
-        .into_definition()
+        .into_definition(&files)
         .map_err(|e| FormatError::InvalidModel(ModelError::InvalidDefinition(e)))?;
     // Validate now, so a broken file is reported at open time.
     let definition = Part::from_definition(definition)

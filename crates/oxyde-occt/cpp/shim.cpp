@@ -37,7 +37,13 @@
 #include <IFSelect_ReturnStatus.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
+#include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
+#include <ShapeFix_Shape.hxx>
+#include <TopoDS_Shell.hxx>
+#include <sstream>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -990,6 +996,68 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes, rust::Str pat
         if (writer.Write(file.c_str()) != IFSelect_RetDone) {
             throw std::runtime_error("could not write " + file);
         }
+    });
+}
+
+std::uint64_t Session::import_step(rust::Slice<const std::uint8_t> data) {
+    return guarded("import_step", [&] {
+        std::istringstream stream(
+            std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+        STEPControl_Reader reader;
+        if (reader.ReadStream("import.step", stream) != IFSelect_RetDone) {
+            throw std::runtime_error("not a readable STEP file");
+        }
+        reader.TransferRoots();
+        const TopoDS_Shape all = reader.OneShape();
+        if (all.IsNull()) {
+            throw std::runtime_error("the STEP file holds no geometry");
+        }
+
+        TopTools_IndexedMapOfShape solids;
+        TopExp::MapShapes(all, TopAbs_SOLID, solids);
+        if (solids.Extent() == 0) {
+            // Surfaces only: sew them, and keep the closed shells as solids.
+            BRepBuilderAPI_Sewing sewing(1.0e-3);
+            sewing.Add(all);
+            sewing.Perform();
+            TopTools_IndexedMapOfShape shells;
+            TopExp::MapShapes(sewing.SewedShape(), TopAbs_SHELL, shells);
+            for (int i = 1; i <= shells.Extent(); ++i) {
+                const TopoDS_Shell& shell = TopoDS::Shell(shells(i));
+                if (BRep_Tool::IsClosed(shell)) {
+                    BRepBuilderAPI_MakeSolid solid(shell);
+                    if (solid.IsDone()) {
+                        solids.Add(solid.Solid());
+                    }
+                }
+            }
+        }
+        if (solids.Extent() == 0) {
+            throw std::runtime_error("the STEP file has no solid body (open surfaces only)");
+        }
+
+        TopoDS_Shape result;
+        if (solids.Extent() == 1) {
+            result = solids(1);
+        } else {
+            TopoDS_Compound compound;
+            BRep_Builder builder;
+            builder.MakeCompound(compound);
+            for (int i = 1; i <= solids.Extent(); ++i) {
+                builder.Add(compound, solids(i));
+            }
+            result = compound;
+        }
+        ShapeFix_Shape fix(result);
+        fix.Perform();
+        result = fix.Shape();
+        // Some exporters write solids inside out.
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+        return insert(result);
     });
 }
 

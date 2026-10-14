@@ -10,14 +10,15 @@ An `.oxy` file is a **ZIP archive** (deflate or stored):
 part.oxy
 ├── manifest.json        required  — format identity and version (first entry)
 ├── model.json           required  — the feature timeline: the source of truth
-└── properties.json      required  — part metadata, BOM-ready
+├── properties.json      required  — part metadata, BOM-ready
+└── imports/<id>.step    one per import feature — the imported file, byte for byte
 ```
 
 Rules:
 
 - `manifest.json` is written first so readers can identify a file cheaply.
 - All JSON is UTF-8, written with stable key order and indentation so files diff cleanly.
-- Geometry is **not stored**: Oxyde rebuilds the part from `model.json` on load. A later version may add an optional `geometry/` cache (BREP/STEP) for tools that cannot rebuild; readers must ignore entries they do not know.
+- Geometry is **not stored**: Oxyde rebuilds the part from `model.json` on load. The one exception is imported geometry: an `import` feature's STEP file is kept as it was read, under `imports/`, so the part does not depend on the original file. A later version may add an optional `geometry/` cache (BREP/STEP) for tools that cannot rebuild; readers must ignore entries they do not know.
 - Oxyde saves by writing `<name>.oxy.tmp` and renaming it over the target, so a failed save never destroys the previous file.
 
 ## 2. `manifest.json`
@@ -122,6 +123,7 @@ Rules:
 | `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
 | `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
 | `mirror` | `seeds`, `plane` (PlaneRef) |
+| `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are added to the body. |
 
 Counts include the seed. Seeds of patterns and mirrors are extrusions and revolves (their tool bodies are copied).
 
@@ -179,6 +181,7 @@ References to geometry are never indices; they are the persistent names describe
   - `{"type": "from_vertex", "feature": id, "vertex": VertexRef}`: corner blend
   - `{"type": "offset", "feature": id, "face": FaceRef}`: inner wall of a shell, offset from that face
   - `{"type": "instance", "feature": id, "instance": [i, j], "face": FaceRef}`: copy made by a pattern or a mirror of the seed's face `face`; `[i, j]` is the position in the pattern (`[1, 0]` for a mirror)
+  - `{"type": "imported", "feature": id, "index": n}`: face `n` of the shape read from an import feature's file (stable, since the stored file does not change)
   - `{"type": "unknown", "feature": id, "index": n}`: origin not reported (unstable)
 - **EdgeRef** `{ "faces": [FaceRef, …], "part": n }`: the faces the edge separates.
 - **VertexRef** `{ "faces": [FaceRef, …], "part": n }`: the faces meeting at the vertex.

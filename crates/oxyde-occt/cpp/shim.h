@@ -50,6 +50,7 @@ public:
     TopologyCounts topology_counts(std::uint64_t shape) const;
 
     void export_step(rust::Slice<const std::uint64_t> shapes, rust::Str path) const;
+    std::uint64_t import_step(rust::Slice<const std::uint8_t> data);
 
 private:
     std::uint64_t insert(const TopoDS_Shape& shape);
