@@ -108,6 +108,7 @@ impl Constraint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SketchError {
     UnknownEntity(EntityId),
+    DuplicateId(EntityId),
     /// A constraint (by index) or entity refers to an entity of the wrong kind.
     WrongKind {
         constraint: Option<usize>,
@@ -120,6 +121,7 @@ impl fmt::Display for SketchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SketchError::UnknownEntity(id) => write!(f, "no sketch entity {id}"),
+            SketchError::DuplicateId(id) => write!(f, "sketch entity id {id} is used twice"),
             SketchError::WrongKind {
                 constraint: Some(c),
                 entity,
@@ -148,8 +150,31 @@ impl ConstrainedSketch {
         Self::default()
     }
 
+    /// Builds a sketch from stored entities and relations, checking every reference.
+    pub fn from_parts(
+        entities: Vec<Entity>,
+        constraints: Vec<Constraint>,
+    ) -> Result<Self, SketchError> {
+        let mut seen = std::collections::HashSet::new();
+        for e in &entities {
+            if !seen.insert(e.id) {
+                return Err(SketchError::DuplicateId(e.id));
+            }
+        }
+        let sketch = Self {
+            entities,
+            constraints,
+        };
+        sketch.layout()?;
+        Ok(sketch)
+    }
+
     pub fn entities(&self) -> &[Entity] {
         &self.entities
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
     }
 
     pub fn constraints(&self) -> &[Constraint] {
@@ -193,6 +218,16 @@ impl ConstrainedSketch {
     pub fn circle(&mut self, center: Point2, radius: f64) -> EntityId {
         let center = self.point(center);
         self.push(Geometry::Circle { center, radius })
+    }
+
+    /// A circle around an existing centre point.
+    pub fn circle_around(&mut self, center: EntityId, radius: f64) -> EntityId {
+        self.push(Geometry::Circle { center, radius })
+    }
+
+    /// A counter-clockwise arc on existing centre, start and end points.
+    pub fn arc_between(&mut self, center: EntityId, start: EntityId, end: EntityId) -> EntityId {
+        self.push(Geometry::Arc { center, start, end })
     }
 
     /// A counter-clockwise arc with new centre, start and end points.
@@ -239,6 +274,91 @@ impl ConstrainedSketch {
         (index < self.constraints.len()).then(|| self.constraints.remove(index))
     }
 
+    /// Replaces the value of a dimension; returns false for relations without a value.
+    pub fn set_dimension(&mut self, index: usize, value: f64) -> bool {
+        use Constraint::*;
+        match self.constraints.get_mut(index) {
+            Some(
+                Distance(_, _, v)
+                | HorizontalDistance(_, _, v)
+                | VerticalDistance(_, _, v)
+                | Length(_, v)
+                | Radius(_, v)
+                | Angle(_, _, v),
+            ) => {
+                *v = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Deletes entities, along with the curves built on deleted points, the relations that
+    /// refer to anything deleted, and end points no longer used by any curve.
+    pub fn remove(&mut self, ids: &[EntityId]) {
+        let mut doomed: std::collections::HashSet<EntityId> = ids.iter().copied().collect();
+        // Curves standing on a deleted point go too.
+        for e in &self.entities {
+            if curve_points(&e.geometry).iter().any(|p| doomed.contains(p)) {
+                doomed.insert(e.id);
+            }
+        }
+        // Points that only served deleted curves go too.
+        let candidates: Vec<EntityId> = self
+            .entities
+            .iter()
+            .filter(|e| doomed.contains(&e.id))
+            .flat_map(|e| curve_points(&e.geometry))
+            .collect();
+        for p in candidates {
+            let still_used = self
+                .entities
+                .iter()
+                .any(|e| !doomed.contains(&e.id) && curve_points(&e.geometry).contains(&p));
+            if !still_used {
+                doomed.insert(p);
+            }
+        }
+        self.entities.retain(|e| !doomed.contains(&e.id));
+        self.constraints
+            .retain(|c| c.entities().iter().all(|id| !doomed.contains(id)));
+    }
+
+    /// Whether a `Fixed` relation holds this point.
+    pub fn is_fixed(&self, point: EntityId) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, Constraint::Fixed(p) if *p == point))
+    }
+
+    /// Current length of a line.
+    pub fn line_length(&self, line: EntityId) -> Option<f64> {
+        let (a, b) = self.endpoints(line)?;
+        Some(self.position(a)?.distance(self.position(b)?))
+    }
+
+    /// Current radius of a circle or arc.
+    pub fn radius_of(&self, round: EntityId) -> Option<f64> {
+        match self.entity(round)?.geometry {
+            Geometry::Circle { radius, .. } => Some(radius),
+            Geometry::Arc { center, start, .. } => {
+                Some(self.position(center)?.distance(self.position(start)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// Current counter-clockwise angle from one line to another, in radians, in (−π, π].
+    pub fn angle_between(&self, first: EntityId, second: EntityId) -> Option<f64> {
+        let direction = |l| {
+            let (a, b) = self.endpoints(l)?;
+            let (a, b) = (self.position(a)?, self.position(b)?);
+            Some((b.y - a.y).atan2(b.x - a.x))
+        };
+        let between = direction(second)? - direction(first)?;
+        Some(-((PI - between).rem_euclid(TAU) - PI))
+    }
+
     pub fn set_construction(&mut self, id: EntityId, construction: bool) {
         if let Some(e) = self.entities.iter_mut().find(|e| e.id == id) {
             e.construction = construction;
@@ -261,6 +381,20 @@ impl ConstrainedSketch {
                 ..
             }) => {
                 *p = to;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Changes a circle's radius, e.g. while dragging its edge; solve afterwards.
+    pub fn set_circle_radius(&mut self, circle: EntityId, value: f64) -> bool {
+        match self.entities.iter_mut().find(|e| e.id == circle) {
+            Some(Entity {
+                geometry: Geometry::Circle { radius, .. },
+                ..
+            }) => {
+                *radius = value;
                 true
             }
             _ => false,
@@ -323,13 +457,7 @@ impl ConstrainedSketch {
         }
         // Entity references.
         for e in &self.entities {
-            let points: Vec<EntityId> = match e.geometry {
-                Geometry::Point(_) => Vec::new(),
-                Geometry::Line { start, end } => vec![start, end],
-                Geometry::Circle { center, .. } => vec![center],
-                Geometry::Arc { center, start, end } => vec![center, start, end],
-            };
-            for p in points {
+            for p in curve_points(&e.geometry) {
                 layout.expect(p, Kind::Point, None)?;
             }
         }
@@ -412,6 +540,16 @@ impl ConstrainedSketch {
             eval.constraint(c, out);
             owners.extend(std::iter::repeat_n(Some(index), out.len() - before));
         }
+    }
+}
+
+/// Points a curve stands on (none for a point).
+pub(crate) fn curve_points(geometry: &Geometry) -> Vec<EntityId> {
+    match *geometry {
+        Geometry::Point(_) => Vec::new(),
+        Geometry::Line { start, end } => vec![start, end],
+        Geometry::Circle { center, .. } => vec![center],
+        Geometry::Arc { center, start, end } => vec![center, start, end],
     }
 }
 

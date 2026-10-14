@@ -9,8 +9,9 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use oxyde_geom::{Plane, Profile, ProfileError, ProfileSegment};
+use oxyde_geom::{Plane, Profile, ProfileError};
 use oxyde_kernel::{BooleanOp, FaceSource, Kernel, ShapeHandle, SurfaceKind, Topology};
+use oxyde_sketch::{ConstrainedSketch, ConstraintState};
 
 use crate::error::ModelError;
 use crate::feature::{
@@ -41,6 +42,8 @@ pub struct TimelineEntry {
     pub name: String,
     pub type_name: &'static str,
     pub status: FeatureStatus,
+    /// A sketch that can still move (shown "(-)" in front of its name, as in SolidWorks).
+    pub under_defined: bool,
 }
 
 /// A solid produced by the timeline, with the persistent names of everything in it.
@@ -51,10 +54,14 @@ pub struct Body {
     pub naming: BodyNaming,
 }
 
-/// A sketch resolved in model space.
+/// A sketch solved and resolved in model space.
 #[derive(Debug, Clone)]
 pub struct SketchResult {
     pub plane: Plane,
+    /// The geometry after solving its relations.
+    pub solved: ConstrainedSketch,
+    /// Independent ways the sketch can still move; 0 = fully defined.
+    pub degrees_of_freedom: usize,
     /// Closed regions, or why the sketch cannot be extruded (an open sketch is not an error
     /// in itself, only for features that need a closed contour).
     pub profile: Result<Profile, ProfileError>,
@@ -327,6 +334,11 @@ impl Part {
                 } else {
                     FeatureStatus::Pending
                 },
+                under_defined: i < built.min(end)
+                    && self.results[i]
+                        .sketch
+                        .as_ref()
+                        .is_some_and(|s| s.degrees_of_freedom > 0),
             })
             .collect()
     }
@@ -487,18 +499,24 @@ fn build_sketch(
             face_plane(body, index).ok_or_else(|| format!("face {name} is not planar"))?
         }
     };
-    let curves: Vec<ProfileSegment> = sketch
-        .entities
-        .iter()
-        .filter(|e| !e.construction)
-        .map(|e| ProfileSegment {
-            id: e.id,
-            curve: e.curve,
-        })
-        .collect();
+    let mut solved = sketch.geometry.clone();
+    let report = solved.solve().map_err(|e| e.to_string())?;
+    let count = |state| report.constraints.iter().filter(|c| **c == state).count();
+    if !report.converged {
+        return Err(format!(
+            "the sketch is over-defined: {} conflicting relation(s)",
+            count(ConstraintState::Conflicting).max(1)
+        ));
+    }
+    let redundant = count(ConstraintState::Redundant);
+    if redundant > 0 {
+        warnings.push(format!("{redundant} redundant relation(s) in the sketch"));
+    }
     Ok(SketchResult {
         plane,
-        profile: Profile::from_curves(&curves),
+        profile: Profile::from_curves(&solved.profile_segments()),
+        degrees_of_freedom: report.degrees_of_freedom,
+        solved,
     })
 }
 

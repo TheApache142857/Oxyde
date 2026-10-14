@@ -12,3 +12,4 @@ oxyde-geom = { workspace = true }
 oxyde-kernel = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-occt = { workspace = true }
+oxyde-sketch = { workspace = true }

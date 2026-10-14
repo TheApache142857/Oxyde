@@ -56,6 +56,32 @@ impl Camera {
         self.pitch = pitch;
     }
 
+    /// Turns the camera to look against `normal` (the viewer ends up on the side `normal`
+    /// points to), as SolidWorks' "Normal To".
+    pub fn look_along(&mut self, normal: V3) {
+        let len = length(normal);
+        if len < 1e-12 {
+            return;
+        }
+        let n = scale(normal, 1.0 / len);
+        self.pitch = n[1].clamp(-1.0, 1.0).asin();
+        self.yaw = n[0].atan2(n[2]);
+    }
+
+    /// The viewing ray through pixel (`x`, `y`): a point on it and its direction (away from
+    /// the viewer).
+    pub fn ray(&self, x: f64, y: f64, width: f64, height: f64) -> (V3, V3) {
+        let s = self.pixels_per_mm(height);
+        let point = add(
+            self.target,
+            add(
+                scale(self.right(), (x - width / 2.0) / s),
+                scale(self.up(), -(y - height / 2.0) / s),
+            ),
+        );
+        (point, scale(self.eye_direction(), -1.0))
+    }
+
     /// Unit vector from the target towards the viewer.
     pub fn eye_direction(&self) -> V3 {
         let (sy, cy) = self.yaw.sin_cos();
@@ -216,6 +242,21 @@ mod tests {
         let after = camera.project([1.0, 2.0, 3.0], 100.0, 100.0);
         assert!((after[0] - before[0] - 10.0).abs() < 1e-9);
         assert!((after[1] - before[1] + 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn looking_along_a_normal_and_casting_rays() {
+        let mut camera = Camera::default();
+        camera.look_along([0.0, 0.0, 5.0]);
+        assert!(close(camera.eye_direction(), [0.0, 0.0, 1.0]));
+        let (w, h) = (200.0, 100.0);
+        let p = [3.0, -2.0, 7.0];
+        let screen = camera.project(p, w, h);
+        let (origin, direction) = camera.ray(screen[0], screen[1], w, h);
+        // The ray passes through the point: same position across the view.
+        let to_p = sub(p, origin);
+        let along = dot(to_p, direction);
+        assert!(length(sub(to_p, scale(direction, along))) < 1e-9);
     }
 
     #[test]

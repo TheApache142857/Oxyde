@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use oxyde_kernel::{Kernel, SurfaceKind, Topology};
 use oxyde_model::{
-    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, StandardPlane,
+    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, Sketch, SketchPlane,
+    StandardPlane,
 };
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Pick, Scene, StandardView};
 
-use crate::dialogs::{BlendDialog, Dialog, ExtrudeDialog, PlaneChoice, SketchDialog, SketchShape};
+use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog};
 use crate::document::Document;
-use crate::viewport::Viewport;
+use crate::sketch_mode::{self, SketchRequest, SketchSession, Tool};
+use crate::viewport::{Viewport, ViewportOutput};
 
 /// A face or edge selected in the viewport, held by persistent name so that the selection
 /// survives rebuilds.
@@ -39,6 +41,8 @@ pub struct OxydeApp {
     pub(crate) selected_plane: Option<StandardPlane>,
     pub(crate) selection: Vec<Selected>,
     pub(crate) dialog: Option<Dialog>,
+    /// The sketch being edited, when in sketch mode.
+    pub(crate) sketch: Option<SketchSession>,
     pub(crate) status: String,
     /// Document revision the viewport currently shows.
     scene_revision: Option<u64>,
@@ -59,6 +63,7 @@ impl OxydeApp {
             selected_plane: None,
             selection: Vec::new(),
             dialog: None,
+            sketch: None,
             status: "Ready".to_owned(),
             scene_revision: None,
             summary: None,
@@ -198,7 +203,7 @@ impl OxydeApp {
 
     // ---- Commands ----------------------------------------------------------------------------
 
-    fn sketches(&self) -> Vec<(FeatureId, String)> {
+    pub(crate) fn sketches(&self) -> Vec<(FeatureId, String)> {
         let active = self
             .doc
             .part
@@ -211,23 +216,117 @@ impl OxydeApp {
             .collect()
     }
 
+    /// "Sketch" command: on the selected flat face, else the selected plane, else ask.
     fn begin_sketch(&mut self) {
-        let face = self.selected_planar_face();
-        let plane = match (&face, self.selected_plane) {
-            (Some(face), _) => PlaneChoice::Face(face.clone()),
-            (None, Some(plane)) => PlaneChoice::Standard(plane),
-            (None, None) => PlaneChoice::Standard(StandardPlane::Front),
+        if let Some(face) = self.selected_planar_face() {
+            self.start_new_sketch(SketchPlane::Face(face));
+        } else if let Some(plane) = self.selected_plane {
+            self.start_new_sketch(SketchPlane::Standard(plane));
+        } else {
+            self.dialog = Some(Dialog::ChoosePlane);
+        }
+    }
+
+    pub(crate) fn start_new_sketch(&mut self, plane: SketchPlane) {
+        let id = self.add_feature(FeatureKind::Sketch(Sketch::new(plane)));
+        self.edit_sketch(id, true);
+    }
+
+    /// Enters sketch mode on a sketch feature. Later features are rolled back while editing.
+    pub(crate) fn edit_sketch(&mut self, id: FeatureId, new_sketch: bool) {
+        let part = &self.doc.part;
+        let Some(index) = part.index_of(id) else {
+            return;
         };
-        self.dialog = Some(Dialog::Sketch(SketchDialog {
+        let Some(FeatureKind::Sketch(sketch)) = part.feature(id).map(|f| f.kind().clone()) else {
+            return;
+        };
+        let name = part
+            .feature(id)
+            .map(|f| f.name().to_owned())
+            .unwrap_or_default();
+        let restore = part
+            .rollback_position()
+            .and_then(|active| part.features().get(active).map(|f| f.id()));
+        let after = part.features().get(index + 1).map(|f| f.id());
+
+        let _ = self.doc.part.roll_back_to(after);
+        self.rebuild();
+        let Some(plane) = self.doc.part.sketch_result(id).map(|r| r.plane) else {
+            let _ = self.doc.part.roll_back_to(restore);
+            self.rebuild();
+            self.status = format!("Cannot edit {name}: its plane is missing");
+            return;
+        };
+        self.viewport.look_at_plane(&plane);
+        self.selection.clear();
+        self.selected_feature = Some(id);
+        self.sketch = Some(SketchSession::new(
+            id,
+            name,
             plane,
-            face,
-            shape: SketchShape::Rectangle,
-            x: 0.0,
-            y: 0.0,
-            width: 40.0,
-            height: 20.0,
-            radius: 5.0,
-        }));
+            sketch.geometry,
+            new_sketch,
+            restore,
+        ));
+    }
+
+    /// Leaves sketch mode, keeping or discarding the changes.
+    pub(crate) fn finish_sketch(&mut self, keep: bool) {
+        let Some(session) = self.sketch.take() else {
+            return;
+        };
+        let _ = self.doc.part.roll_back_to(session.restore_rollback);
+        let id = session.feature;
+        if keep && session.changed() {
+            self.doc.checkpoint();
+            if let Ok(FeatureKind::Sketch(sketch)) = self.doc.part.edit(id) {
+                sketch.geometry = session.sketch.clone();
+            }
+        }
+        if !keep && session.new_sketch && session.original.is_empty() {
+            // Cancelling a brand-new sketch removes it, as SolidWorks does.
+            let _ = self.doc.part.delete(id);
+            self.selected_feature = None;
+        }
+        self.rebuild();
+        self.viewport.request_fit();
+        self.status = format!(
+            "{} {}",
+            if keep {
+                "Closed"
+            } else {
+                "Discarded changes to"
+            },
+            session.name
+        );
+        let extrudable = self
+            .doc
+            .part
+            .sketch_result(id)
+            .is_some_and(|r| r.profile.as_ref().is_ok_and(|p| !p.is_empty()));
+        if keep && session.new_sketch && extrudable {
+            self.begin_extrude_of(id, ExtrudeOp::Boss);
+        }
+    }
+
+    /// Replaces a feature's definition as one undo step and rebuilds.
+    pub(crate) fn replace_feature(&mut self, id: FeatureId, kind: FeatureKind) {
+        self.doc.checkpoint();
+        if let Ok(definition) = self.doc.part.edit(id) {
+            *definition = kind;
+        }
+        self.rebuild();
+        let name = self
+            .doc
+            .part
+            .feature(id)
+            .map(|f| f.name().to_owned())
+            .unwrap_or_default();
+        self.status = match self.doc.part.status(id) {
+            Some(FeatureStatus::Error(message)) => format!("{name} failed: {message}"),
+            _ => format!("Updated {name}"),
+        };
     }
 
     fn begin_extrude(&mut self, op: ExtrudeOp) {
@@ -246,6 +345,7 @@ impl OxydeApp {
 
     pub(crate) fn begin_extrude_of(&mut self, sketch: FeatureId, op: ExtrudeOp) {
         self.dialog = Some(Dialog::Extrude(ExtrudeDialog {
+            editing: None,
             sketch,
             sketches: self.sketches(),
             op,
@@ -262,9 +362,12 @@ impl OxydeApp {
             return;
         }
         self.dialog = Some(Dialog::Blend(BlendDialog {
+            editing: None,
             fillet,
             size: if fillet { 2.0 } else { 1.0 },
             edges,
+            selected_edges: Vec::new(),
+            use_selection: false,
         }));
     }
 
@@ -309,6 +412,7 @@ impl OxydeApp {
     fn replace_document(&mut self, doc: Document) {
         self.doc.release(&mut self.kernel);
         self.doc = doc;
+        self.sketch = None;
         self.selection.clear();
         self.selected_feature = None;
         self.scene_revision = None;
@@ -345,6 +449,8 @@ impl OxydeApp {
 
     /// Saves to the current file, or asks for one. Returns whether the part was saved.
     pub(crate) fn save(&mut self) -> bool {
+        // A sketch being edited is closed (kept) first, so the file has it.
+        self.finish_sketch(true);
         match self.doc.path.clone() {
             Some(path) => self.save_to(&path),
             None => self.save_as(),
@@ -508,6 +614,10 @@ impl OxydeApp {
     }
 
     fn command_bar(&mut self, ui: &mut egui::Ui) {
+        if self.sketch.is_some() {
+            self.sketch_command_bar(ui);
+            return;
+        }
         ui.horizontal(|ui| {
             if ui
                 .button("Sketch")
@@ -572,6 +682,50 @@ impl OxydeApp {
         });
     }
 
+    fn sketch_command_bar(&mut self, ui: &mut egui::Ui) {
+        let mut finish = None;
+        let Some(session) = self.sketch.as_mut() else {
+            return;
+        };
+        let viewport = &mut self.viewport;
+        ui.horizontal(|ui| {
+            if ui
+                .button("Exit sketch")
+                .on_hover_text("Keep the changes (Esc)")
+                .clicked()
+            {
+                finish = Some(true);
+            }
+            if ui
+                .button("Discard")
+                .on_hover_text("Leave the sketch without keeping the changes")
+                .clicked()
+            {
+                finish = Some(false);
+            }
+            ui.separator();
+            for (tool, label) in Tool::ALL {
+                if ui.selectable_label(session.tool == tool, label).clicked() {
+                    session.set_tool(tool);
+                }
+            }
+            ui.separator();
+            if ui.button("Normal to").clicked() {
+                viewport.look_at_plane(&session.plane);
+            }
+            if ui.button("Fit").clicked() {
+                viewport.request_fit();
+            }
+            ui.separator();
+            if ui.button("Undo").on_hover_text("Ctrl+Z").clicked() {
+                session.undo();
+            }
+        });
+        if let Some(keep) = finish {
+            self.finish_sketch(keep);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let revision = self.doc.revision;
         if self.summary.as_ref().map(|(r, _)| *r) != Some(revision) {
@@ -591,8 +745,12 @@ impl OxydeApp {
             };
             self.summary = Some((revision, text));
         }
+        let status = match &self.sketch {
+            Some(session) => session.status(),
+            None => self.status.clone(),
+        };
         ui.horizontal(|ui| {
-            ui.label(&self.status);
+            ui.label(status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some((_, text)) = &self.summary {
                     ui.label(text);
@@ -603,6 +761,18 @@ impl OxydeApp {
 
     fn viewport_ui(&mut self, ui: &mut egui::Ui) {
         self.refresh_scene();
+        if self.sketch.is_some() {
+            let output = self.viewport.ui(ui, Vec::new(), None, true);
+            let request = match self.sketch.as_mut() {
+                Some(session) => sketch_mode::interact(session, &self.viewport, ui, &output),
+                None => None,
+            };
+            if let Some(SketchRequest::EditDimension(index)) = request {
+                self.open_dimension_editor(index);
+            }
+            self.sketch_context_menu(&output);
+            return;
+        }
         let picks = self.selection_picks();
         let hint = self
             .doc
@@ -610,7 +780,7 @@ impl OxydeApp {
             .body()
             .is_none()
             .then_some("Start with Sketch, then Extruded Boss — or File › Open demo bracket");
-        let output = self.viewport.ui(ui, picks, hint);
+        let output = self.viewport.ui(ui, picks, hint, false);
         if let Some(pick) = output.clicked {
             self.click(pick, output.additive);
         }
@@ -649,6 +819,85 @@ impl OxydeApp {
         });
     }
 
+    fn open_dimension_editor(&mut self, index: usize) {
+        let Some(session) = &self.sketch else {
+            return;
+        };
+        let Some((value, angle)) = session
+            .sketch
+            .constraints()
+            .get(index)
+            .and_then(sketch_mode::dimension_value)
+        else {
+            return;
+        };
+        self.dialog = Some(Dialog::Dimension {
+            target: DimensionTarget::Existing(index),
+            label: "Dimension".to_owned(),
+            value,
+            angle,
+        });
+    }
+
+    /// Right-click in sketch mode: relations and dimensions for the selection.
+    fn sketch_context_menu(&mut self, output: &ViewportOutput) {
+        let mut exit = false;
+        let mut dialog = None;
+        let sketch = &mut self.sketch;
+        output.response.context_menu(|ui| {
+            let Some(session) = sketch.as_mut() else {
+                return;
+            };
+            let relations = session.relation_options();
+            let dimensions = session.dimension_options();
+            if session.selection.is_empty() {
+                ui.label(egui::RichText::new("Select geometry to add relations").weak());
+            }
+            for (label, relation) in relations {
+                if ui.button(label).clicked() {
+                    session.add_relation(relation);
+                    ui.close_menu();
+                }
+            }
+            if !dimensions.is_empty() {
+                ui.separator();
+            }
+            for option in dimensions {
+                if ui.button(option.label).clicked() {
+                    dialog = Some(Dialog::Dimension {
+                        target: DimensionTarget::New(option.relation),
+                        label: option.label.trim_end_matches('…').to_owned(),
+                        value: option.shown,
+                        angle: option.angle,
+                    });
+                    ui.close_menu();
+                }
+            }
+            if session.has_curve_selected() {
+                ui.separator();
+                if ui.button("Construction geometry on/off").clicked() {
+                    session.toggle_construction();
+                    ui.close_menu();
+                }
+            }
+            if !session.selection.is_empty() && ui.button("Delete").clicked() {
+                session.delete_selection();
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button("Exit sketch").clicked() {
+                exit = true;
+                ui.close_menu();
+            }
+        });
+        if dialog.is_some() {
+            self.dialog = dialog;
+        }
+        if exit {
+            self.finish_sketch(true);
+        }
+    }
+
     /// Re-tessellates the body after each rebuild.
     fn refresh_scene(&mut self) {
         if self.scene_revision == Some(self.doc.revision) {
@@ -685,11 +934,18 @@ impl OxydeApp {
                 i.consume_shortcut(&command(Key::N)),
             )
         });
-        if undo {
-            self.undo();
-        }
-        if redo || redo_shift {
-            self.redo();
+        if let Some(session) = self.sketch.as_mut() {
+            // In sketch mode, undo works inside the sketch.
+            if undo {
+                session.undo();
+            }
+        } else {
+            if undo {
+                self.undo();
+            }
+            if redo || redo_shift {
+                self.redo();
+            }
         }
         if save {
             self.save();
@@ -712,6 +968,15 @@ impl OxydeApp {
             });
             if fit {
                 self.viewport.request_fit();
+            }
+            if let Some(session) = self.sketch.as_mut() {
+                if delete {
+                    session.delete_selection();
+                }
+                if escape && !session.cancel_operation() {
+                    self.finish_sketch(true);
+                }
+                return;
             }
             if delete {
                 if let Some(id) = self.selected_feature {
@@ -786,11 +1051,7 @@ impl eframe::App for OxydeApp {
             .resizable(true)
             .default_width(290.0)
             .min_width(200.0)
-            .show(ctx, |ui| {
-                self.timeline_ui(ui);
-                ui.separator();
-                self.properties_ui(ui);
-            });
+            .show(ctx, |ui| self.timeline_ui(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport_ui(ui));

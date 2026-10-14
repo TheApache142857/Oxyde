@@ -87,7 +87,7 @@ Implemented (M2, solver only):
   - relations are taken in order: one adding no independent equation is **redundant**, one left unsatisfied is **conflicting**. A failed solve leaves the geometry untouched.
 - `profile_segments()` turns the solved sketch into profile curves whose segment ids are the entity ids, so face names (`F2.side[7]`) follow sketch entities.
 
-Next (M2b): make the model's `Sketch` a `ConstrainedSketch` (solved during rebuild, status shown in the timeline), extend `.oxy` with entities and relations, and add an interactive sketch mode in the app (draw, drag, dimension, colour by definition).
+In the model (M2b): a `Sketch` feature holds a `ConstrainedSketch`, solved during every rebuild. Conflicting relations put the sketch in error; redundant ones give a warning; an under-defined sketch is flagged in the timeline (`(-) Sketch1`, as in SolidWorks) but builds normally.
 
 ## 6. Feature tree and topological naming (`oxyde-model`)
 
@@ -146,7 +146,10 @@ Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fill
 - Navigation: left-drag orbit, middle-drag or Shift+left-drag pan, wheel zoom at cursor, `F` zoom to fit; Front/Top/Right/Isometric views.
 - **Selection is held by persistent name** (`FaceName`/`EdgeName`), not index, so it survives rebuilds. Selected edges feed Fillet/Chamfer; a selected planar face becomes the sketch plane.
 - **Undo/redo** stores `PartDefinition` snapshots (the same data that is saved); consecutive edits of one feature in the properties panel coalesce into one step.
-- Sketching is numeric for now (rectangle/circle dialogs, editable coordinates in the properties panel) until the solver and a sketch mode arrive (M2).
+- No properties panel: features are edited SolidWorks-style, by double-click or right-click › Edit, which opens the feature's window (extrude, fillet, chamfer) or sketch mode.
+- Selecting a face or an edge highlights, in the timeline, the feature that created it (for an edge, the later of the two features that made its faces).
+- The rollback bar is a plain line with a round handle; drag it between features.
+- **Sketch mode** (`sketch_mode.rs`): editing a sketch rolls back the features after it, turns the view normal to the plane, and edits a working copy written back on exit (Escape or *Exit sketch*; *Discard* drops the changes, and a brand-new empty sketch is removed). Tools: select, line (chains; clicking an existing point closes the contour), rectangle, circle, arc. Clicks within 8 px of a point reuse it; nearly horizontal or vertical lines get the relation automatically. In select mode, dragging moves points, lines or circle radii live through the solver. Right-click offers the relations and dimensions that fit the selection; clicking a dimension label edits its value. Geometry is coloured blue (under-defined), black (fully defined) or red (in a conflicting relation). Undo inside the sketch is local to the session; the whole edit is one undo step in the part.
 
 ## 10. Roadmap
 
@@ -156,7 +159,7 @@ Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fill
 | **M1** (code written, awaiting first Windows build) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **Engine** (code written, awaiting first Windows build) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
 | **M2** (code written, awaiting first build) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
-| **M2b** | Solver in the model and the file format; interactive sketch mode |
+| **M2b** (code written, awaiting first build) | Solver in the model and the file format; interactive sketch mode; timeline without properties panel, draggable rollback bar, creator highlight |
 | **App** (code written, awaiting first Windows build) | Timeline panel, properties panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
 | **M3** | Revolve, shell, patterns, interactive sketch mode |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |

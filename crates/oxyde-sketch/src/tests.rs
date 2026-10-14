@@ -276,3 +276,57 @@ fn bad_references_are_reported() {
     s.constrain(Distance(p, EntityId(99), 1.0));
     assert_eq!(s.solve(), Err(SketchError::UnknownEntity(EntityId(99))));
 }
+
+#[test]
+fn deleting_a_line_removes_its_relations_and_orphan_points() {
+    let mut s = ConstrainedSketch::new();
+    let [bottom, right, top, left] = s.rectangle(Point2::ORIGIN, 10.0, 5.0);
+    let before = s.entities().len();
+    s.remove(&[bottom]);
+    // The bottom line and its horizontal relation go; its end points are still used by
+    // the left and right lines, so they stay.
+    assert_eq!(s.entities().len(), before - 1);
+    assert!(s.entity(bottom).is_none());
+    assert_eq!(s.constraints().len(), 3);
+
+    // Removing a corner point takes the two lines standing on it.
+    let (corner, _) = s.endpoints(top).unwrap();
+    s.remove(&[corner]);
+    assert!(s.entity(right).is_none() && s.entity(top).is_none());
+    assert!(s.entity(left).is_some());
+}
+
+#[test]
+fn stored_sketches_are_validated() {
+    let mut s = ConstrainedSketch::new();
+    s.rectangle(Point2::ORIGIN, 10.0, 5.0);
+    let rebuilt =
+        ConstrainedSketch::from_parts(s.entities().to_vec(), s.constraints().to_vec()).unwrap();
+    assert_eq!(rebuilt, s);
+
+    let mut entities = s.entities().to_vec();
+    entities.push(entities[0]);
+    assert!(matches!(
+        ConstrainedSketch::from_parts(entities, Vec::new()),
+        Err(SketchError::DuplicateId(_))
+    ));
+}
+
+#[test]
+fn measurements_and_dimension_edits() {
+    let mut s = ConstrainedSketch::new();
+    let a = s.line(Point2::ORIGIN, Point2::new(3.0, 4.0));
+    let b = s.line(Point2::ORIGIN, Point2::new(0.0, 2.0));
+    assert!((s.line_length(a).unwrap() - 5.0).abs() < 1e-12);
+    let angle = s.angle_between(a, b).unwrap();
+    assert!((angle - (PI / 2.0 - (4.0f64).atan2(3.0))).abs() < 1e-12);
+
+    let (origin, _) = s.endpoints(a).unwrap();
+    s.constrain(Fixed(origin));
+    assert!(s.is_fixed(origin));
+    let length = s.constrain(Length(a, 5.0));
+    assert!(s.set_dimension(length, 8.0));
+    s.solve().unwrap();
+    assert!((s.line_length(a).unwrap() - 8.0).abs() < 1e-7);
+    assert!(!s.set_dimension(0, 1.0)); // Fixed has no value
+}

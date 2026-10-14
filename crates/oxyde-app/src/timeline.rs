@@ -1,12 +1,12 @@
-//! The left panel: the feature timeline (with reference planes and the rollback bar) and,
-//! below it, the properties of the selected feature.
+//! The left panel: reference planes, the feature timeline and the rollback bar.
+//!
+//! Features are edited the SolidWorks way: double-click (or right-click › Edit) opens the
+//! feature's own window, or sketch mode for a sketch. Selecting a face or an edge in the
+//! viewport highlights the feature that created it. The rollback bar is a line with a handle
+//! that can be dragged between features.
 
-use eframe::egui::{self, Color32, RichText};
-use oxyde_geom::{Curve2, Point2};
-use oxyde_model::{
-    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, FeatureStatus,
-    Sketch, SketchPlane, StandardPlane, TimelineEntry,
-};
+use eframe::egui::{self, Color32, CursorIcon, RichText, Sense, Stroke};
+use oxyde_model::{FeatureId, FeatureKind, FeatureStatus, StandardPlane, TimelineEntry};
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
@@ -20,11 +20,11 @@ const ROLLBACK: Color32 = Color32::from_rgb(0, 110, 255);
 enum Action {
     SelectPlane(StandardPlane),
     Select(FeatureId),
+    Edit(FeatureId),
     Rename(FeatureId),
     Suppress(FeatureId, bool),
-    RollBackTo(FeatureId),
-    RollForward,
-    RollToEnd,
+    /// Move the rollback bar so that this many features are active.
+    RollTo(usize),
     Delete(FeatureId),
 }
 
@@ -35,11 +35,11 @@ impl OxydeApp {
         ui.add_space(2.0);
 
         let mut action = None;
-        let max_height = ui.available_height() * 0.55;
-        ui.push_id("timeline", |ui| {
+        let creator = self.selection_creator();
+        let enabled = self.sketch.is_none();
+        ui.add_enabled_ui(enabled, |ui| {
             egui::ScrollArea::vertical()
-                .max_height(max_height)
-                .auto_shrink([false, true])
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for plane in [
                         StandardPlane::Front,
@@ -62,14 +62,40 @@ impl OxydeApp {
                         .rollback_position()
                         .unwrap_or(entries.len())
                         .min(entries.len());
+                    let mut rows = Vec::with_capacity(entries.len());
+                    let mut bar = None;
                     for (index, entry) in entries.iter().enumerate() {
                         if index == active {
-                            rollback_bar(ui, true, &mut action);
+                            bar = Some(rollback_bar(ui));
                         }
-                        self.timeline_row(ui, entry, &mut action);
+                        let highlighted =
+                            self.selected_feature == Some(entry.id) || creator == Some(entry.id);
+                        rows.push(self.timeline_row(ui, entry, highlighted, &mut action));
                     }
                     if active == entries.len() {
-                        rollback_bar(ui, false, &mut action);
+                        bar = Some(rollback_bar(ui));
+                    }
+
+                    // Dragging the bar: show where it will land, move it on release.
+                    if let Some(bar) = bar {
+                        let pointer = ui.input(|i| i.pointer.interact_pos());
+                        if bar.dragged() {
+                            if let Some(pos) = pointer {
+                                ui.painter().hline(
+                                    bar.rect.x_range(),
+                                    pos.y,
+                                    Stroke::new(2.0, ROLLBACK.gamma_multiply(0.5)),
+                                );
+                            }
+                        }
+                        if bar.drag_stopped() {
+                            if let Some(pos) = pointer {
+                                let target = rows.iter().filter(|r| r.center().y < pos.y).count();
+                                if target != active {
+                                    action = Some(Action::RollTo(target));
+                                }
+                            }
+                        }
                     }
                 });
         });
@@ -79,36 +105,63 @@ impl OxydeApp {
         }
     }
 
-    fn timeline_row(&self, ui: &mut egui::Ui, entry: &TimelineEntry, action: &mut Option<Action>) {
+    /// Draws one feature row and returns its rectangle.
+    fn timeline_row(
+        &self,
+        ui: &mut egui::Ui,
+        entry: &TimelineEntry,
+        highlighted: bool,
+        action: &mut Option<Action>,
+    ) -> egui::Rect {
         let suppressed = self
             .doc
             .part
             .feature(entry.id)
             .is_some_and(|f| f.is_suppressed());
+        let label = if entry.under_defined {
+            format!("(-) {}", entry.name)
+        } else {
+            entry.name.clone()
+        };
         let mut text = match &entry.status {
-            FeatureStatus::Error(_) => RichText::new(format!("⚠ {}", entry.name)).color(ERROR),
-            FeatureStatus::Warning(_) => RichText::new(format!("⚠ {}", entry.name)).color(WARNING),
-            FeatureStatus::Ok => RichText::new(&entry.name),
+            FeatureStatus::Error(_) => RichText::new(format!("⚠ {label}")).color(ERROR),
+            FeatureStatus::Warning(_) => RichText::new(format!("⚠ {label}")).color(WARNING),
+            FeatureStatus::Ok => RichText::new(label),
             FeatureStatus::Suppressed | FeatureStatus::RolledBack | FeatureStatus::Pending => {
-                RichText::new(&entry.name).color(INACTIVE)
+                RichText::new(label).color(INACTIVE)
             }
         };
         if suppressed {
             text = text.strikethrough();
         }
 
-        let selected = self.selected_feature == Some(entry.id);
-        let mut response = ui.selectable_label(selected, text);
-        if let FeatureStatus::Error(message) | FeatureStatus::Warning(message) = &entry.status {
-            response = response.on_hover_text(message.as_str());
-        } else {
-            response = response.on_hover_text(entry.type_name);
-        }
-        if response.clicked() {
+        let mut response = ui.selectable_label(highlighted, text);
+        response = match &entry.status {
+            FeatureStatus::Error(message) | FeatureStatus::Warning(message) => {
+                response.on_hover_text(message.as_str())
+            }
+            _ if entry.under_defined => {
+                response.on_hover_text("Under defined: the sketch can still move")
+            }
+            _ => response.on_hover_text(entry.type_name),
+        };
+        if response.double_clicked() {
+            *action = Some(Action::Edit(entry.id));
+        } else if response.clicked() {
             *action = Some(Action::Select(entry.id));
         }
         let id = entry.id;
+        let is_sketch = entry.type_name == "Sketch";
         response.context_menu(|ui| {
+            let edit = if is_sketch {
+                "Edit sketch"
+            } else {
+                "Edit feature"
+            };
+            if ui.button(edit).clicked() {
+                *action = Some(Action::Edit(id));
+                ui.close_menu();
+            }
             if ui.button("Rename…").clicked() {
                 *action = Some(Action::Rename(id));
                 ui.close_menu();
@@ -118,16 +171,13 @@ impl OxydeApp {
                 *action = Some(Action::Suppress(id, !suppressed));
                 ui.close_menu();
             }
-            if ui.button("Roll back above this").clicked() {
-                *action = Some(Action::RollBackTo(id));
-                ui.close_menu();
-            }
             ui.separator();
             if ui.button("Delete").clicked() {
                 *action = Some(Action::Delete(id));
                 ui.close_menu();
             }
         });
+        response.rect
     }
 
     fn apply_action(&mut self, action: Action) {
@@ -139,8 +189,10 @@ impl OxydeApp {
             }
             Action::Select(id) => {
                 self.selected_feature = Some(id);
+                self.selected_plane = None;
                 self.doc.end_edit();
             }
+            Action::Edit(id) => self.edit_feature(id),
             Action::Rename(feature) => {
                 let name = self
                     .doc
@@ -156,211 +208,82 @@ impl OxydeApp {
                     self.rebuild();
                 }
             }
-            Action::RollBackTo(id) => {
+            Action::RollTo(active) => {
+                let before = self.doc.part.features().get(active).map(|f| f.id());
                 self.doc.checkpoint();
-                if self.doc.part.roll_back_to(Some(id)).is_ok() {
+                if self.doc.part.roll_back_to(before).is_ok() {
                     self.rebuild();
                 }
-            }
-            Action::RollForward => {
-                let features = self.doc.part.features();
-                let next = self
-                    .doc
-                    .part
-                    .rollback_position()
-                    .and_then(|active| features.get(active + 1))
-                    .map(|f| f.id());
-                self.doc.checkpoint();
-                let _ = self.doc.part.roll_back_to(next);
-                self.rebuild();
-            }
-            Action::RollToEnd => {
-                self.doc.checkpoint();
-                let _ = self.doc.part.roll_back_to(None);
-                self.rebuild();
             }
             Action::Delete(id) => self.delete_feature(id),
         }
     }
 
-    pub(crate) fn properties_ui(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Properties");
-        let Some(id) = self.selected_feature else {
-            ui.label(RichText::new("Select a feature in the timeline to edit it.").color(INACTIVE));
+    /// The feature that created the most recently selected face or edge. An edge appears
+    /// with the later of the faces it separates.
+    pub(crate) fn selection_creator(&self) -> Option<FeatureId> {
+        use crate::app::Selected;
+        let features = self.doc.part.features();
+        let position = |id: FeatureId| features.iter().position(|f| f.id() == id);
+        match self.selection.last()? {
+            Selected::Face(face) => Some(face.key.feature()),
+            Selected::Edge(edge) => edge
+                .faces
+                .iter()
+                .map(|f| f.key.feature())
+                .max_by_key(|id| position(*id)),
+        }
+    }
+
+    /// Opens the right editor for a feature.
+    pub(crate) fn edit_feature(&mut self, id: FeatureId) {
+        let Some(kind) = self.doc.part.feature(id).map(|f| f.kind().clone()) else {
             return;
         };
-        let Some(feature) = self.doc.part.feature(id) else {
-            self.selected_feature = None;
-            return;
-        };
-        let name = feature.name().to_owned();
-        let original = feature.kind().clone();
-        let mut kind = original.clone();
-
-        ui.label(RichText::new(name).strong());
-        if let Some(FeatureStatus::Error(message) | FeatureStatus::Warning(message)) =
-            self.doc.part.status(id)
-        {
-            ui.colored_label(ERROR, message);
-        }
-
-        let selected_edges = self.selected_edges();
-        ui.push_id("properties", |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| match &mut kind {
-                    FeatureKind::Sketch(sketch) => sketch_editor(ui, sketch),
-                    FeatureKind::Extrude(extrude) => extrude_editor(ui, extrude),
-                    FeatureKind::Fillet(blend) => {
-                        blend_editor(ui, blend, "Radius", &selected_edges)
-                    }
-                    FeatureKind::Chamfer(blend) => {
-                        blend_editor(ui, blend, "Distance", &selected_edges)
-                    }
-                });
-        });
-
-        if kind != original {
-            self.doc.checkpoint_edit(id);
-            if let Ok(definition) = self.doc.part.edit(id) {
-                *definition = kind;
+        self.selected_feature = Some(id);
+        match kind {
+            FeatureKind::Sketch(_) => self.edit_sketch(id, false),
+            FeatureKind::Extrude(e) => {
+                self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
+                    editing: Some(id),
+                    sketch: e.sketch,
+                    sketches: self.sketches(),
+                    op: e.op,
+                    depth: e.extent.depth(),
+                    mid_plane: matches!(e.extent, oxyde_model::ExtrudeExtent::MidPlane { .. }),
+                    reverse: e.reverse,
+                }));
             }
-            self.rebuild();
+            FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
+                let fillet = matches!(
+                    self.doc.part.feature(id).map(|f| f.kind()),
+                    Some(FeatureKind::Fillet(_))
+                );
+                self.dialog = Some(Dialog::Blend(crate::dialogs::BlendDialog {
+                    editing: Some(id),
+                    fillet,
+                    size: b.size,
+                    edges: b.edges,
+                    selected_edges: self.selected_edges(),
+                    use_selection: false,
+                }));
+            }
         }
     }
 }
 
-fn rollback_bar(ui: &mut egui::Ui, rolled_back: bool, action: &mut Option<Action>) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("— Rollback —").color(ROLLBACK).strong());
-        if rolled_back {
-            if ui.small_button("Forward").clicked() {
-                *action = Some(Action::RollForward);
-            }
-            if ui.small_button("To end").clicked() {
-                *action = Some(Action::RollToEnd);
-            }
-        }
-    });
-}
-
-fn drag(ui: &mut egui::Ui, value: &mut f64, prefix: &str) {
-    ui.add(egui::DragValue::new(value).speed(0.1).prefix(prefix));
-}
-
-fn point(ui: &mut egui::Ui, p: &mut Point2) {
-    drag(ui, &mut p.x, "x ");
-    drag(ui, &mut p.y, "y ");
-}
-
-fn positive(ui: &mut egui::Ui, value: &mut f64) {
-    ui.add(egui::DragValue::new(value).speed(0.05).suffix(" mm"));
-    if *value < 0.001 {
-        *value = 0.001;
-    }
-}
-
-fn sketch_editor(ui: &mut egui::Ui, sketch: &mut Sketch) {
-    let plane = match &sketch.plane {
-        SketchPlane::Standard(p) => format!("{} Plane", plane_name(*p)),
-        SketchPlane::Face(face) => format!("face {face}"),
-    };
-    ui.label(RichText::new(format!("On {plane}")).small().color(INACTIVE));
-
-    let mut remove = None;
-    egui::Grid::new("sketch_entities")
-        .num_columns(2)
-        .striped(true)
-        .show(ui, |ui| {
-            for (index, entity) in sketch.entities.iter_mut().enumerate() {
-                let kind = match entity.curve {
-                    Curve2::Line { .. } => "Line",
-                    Curve2::Arc { .. } => "Arc",
-                    Curve2::Circle { .. } => "Circle",
-                };
-                ui.label(format!("{kind} {}", entity.id));
-                ui.vertical(|ui| {
-                    match &mut entity.curve {
-                        Curve2::Line { start, end } => {
-                            ui.horizontal(|ui| point(ui, start));
-                            ui.horizontal(|ui| point(ui, end));
-                        }
-                        Curve2::Arc { start, mid, end } => {
-                            ui.horizontal(|ui| point(ui, start));
-                            ui.horizontal(|ui| point(ui, mid));
-                            ui.horizontal(|ui| point(ui, end));
-                        }
-                        Curve2::Circle { center, radius } => {
-                            ui.horizontal(|ui| point(ui, center));
-                            ui.horizontal(|ui| {
-                                ui.label("r");
-                                positive(ui, radius);
-                            });
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut entity.construction, "Construction");
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(index);
-                        }
-                    });
-                });
-                ui.end_row();
-            }
-        });
-    if let Some(index) = remove {
-        sketch.entities.remove(index);
-    }
-    ui.horizontal(|ui| {
-        if ui.button("Add rectangle").clicked() {
-            sketch.rectangle(Point2::ORIGIN, 10.0, 10.0);
-        }
-        if ui.button("Add circle").clicked() {
-            sketch.circle(Point2::ORIGIN, 5.0);
-        }
-    });
-}
-
-fn extrude_editor(ui: &mut egui::Ui, extrude: &mut Extrude) {
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut extrude.op, ExtrudeOp::Boss, "Boss");
-        ui.radio_value(&mut extrude.op, ExtrudeOp::Cut, "Cut");
-    });
-    let mut mid_plane = matches!(extrude.extent, ExtrudeExtent::MidPlane { .. });
-    let mut depth = extrude.extent.depth();
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut mid_plane, false, "Blind");
-        ui.radio_value(&mut mid_plane, true, "Mid-plane");
-    });
-    ui.horizontal(|ui| {
-        ui.label("Depth");
-        positive(ui, &mut depth);
-    });
-    extrude.extent = if mid_plane {
-        ExtrudeExtent::MidPlane { depth }
+/// The rollback bar: a line with a round handle, dragged vertically between features.
+fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 12.0), Sense::drag());
+    let y = rect.center().y;
+    let painter = ui.painter();
+    painter.hline(rect.x_range(), y, Stroke::new(2.0, ROLLBACK));
+    painter.circle_filled(egui::pos2(rect.left() + 6.0, y), 4.5, ROLLBACK);
+    let cursor = if response.dragged() {
+        CursorIcon::Grabbing
     } else {
-        ExtrudeExtent::Blind { depth }
+        CursorIcon::ResizeVertical
     };
-    if !mid_plane {
-        ui.checkbox(&mut extrude.reverse, "Reverse direction");
-    }
-}
-
-fn blend_editor(ui: &mut egui::Ui, blend: &mut EdgeBlend, label: &str, selected: &[EdgeName]) {
-    ui.horizontal(|ui| {
-        ui.label(label);
-        positive(ui, &mut blend.size);
-    });
-    ui.label(format!("{} edge(s):", blend.edges.len()));
-    for edge in &blend.edges {
-        ui.label(RichText::new(edge.to_string()).small().color(INACTIVE));
-    }
-    let button = egui::Button::new(format!("Use the {} selected edge(s)", selected.len()));
-    if ui
-        .add_enabled(!selected.is_empty(), button)
-        .on_hover_text("Edges selected in the viewport replace this feature's edges")
-        .clicked()
-    {
-        blend.edges = selected.to_vec();
-    }
+    response.on_hover_cursor(cursor)
 }

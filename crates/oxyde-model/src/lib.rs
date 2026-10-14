@@ -16,7 +16,7 @@ mod part;
 pub use error::ModelError;
 pub use feature::{
     EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Sketch,
-    SketchEntity, SketchPlane, StandardPlane,
+    SketchPlane, StandardPlane,
 };
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{Body, FeatureStatus, Part, PartDefinition, SketchResult, TimelineEntry};

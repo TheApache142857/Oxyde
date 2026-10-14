@@ -6,8 +6,9 @@ use oxyde_model::{
     StandardPlane,
 };
 
-/// Ids of the lines of a rectangle drawn with `Sketch::rectangle`.
-const RIGHT: u32 = 2;
+/// Id of the right line of a rectangle drawn first in a sketch (corner points are 1–4, then
+/// the bottom, right, top and left lines are 5–8).
+const RIGHT: u32 = 6;
 
 pub fn bracket() -> Part {
     let mut part = Part::new();
