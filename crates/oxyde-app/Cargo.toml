@@ -1,5 +1,6 @@
 [package]
 name = "oxyde-app"
+description = "The Oxyde desktop application."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,3 +17,6 @@ oxyde-kernel = { workspace = true }
 oxyde-occt = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-format = { workspace = true }
+oxyde-render = { workspace = true }
+eframe = { workspace = true }
+rfd = { workspace = true }

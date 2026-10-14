@@ -9,3 +9,7 @@ publish.workspace = true
 [dependencies]
 oxyde-geom = { workspace = true }
 oxyde-kernel = { workspace = true }
+cxx = { workspace = true }
+
+[build-dependencies]
+cxx-build = { workspace = true }

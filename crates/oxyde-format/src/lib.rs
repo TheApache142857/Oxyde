@@ -1,3 +1,427 @@
 //! Reading and writing `.oxy` files.
 //!
+//! An `.oxy` file is a ZIP archive holding `manifest.json`, `model.json` (the feature
+//! timeline, the source of truth) and `properties.json` (BOM-ready metadata). Geometry is
+//! never stored as the source of truth: it is rebuilt from the timeline on load.
+//!
 //! See `docs/FORMAT.md` for the specification.
+
+mod schema;
+
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::path::Path;
+
+use oxyde_model::{ModelError, Part, PartDefinition};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+pub use schema::Properties;
+use schema::{Manifest, PartModel, Units};
+
+/// The `format_version` written by this crate, and the newest it can read.
+pub const FORMAT_VERSION: u32 = 1;
+
+const FORMAT_NAME: &str = "oxyde";
+const MANIFEST: &str = "manifest.json";
+const MODEL: &str = "model.json";
+const PROPERTIES: &str = "properties.json";
+
+/// A part document as stored on disk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartFile {
+    /// Never changes for the life of the document; assemblies find parts by it.
+    pub document_id: String,
+    pub definition: PartDefinition,
+    pub properties: Properties,
+}
+
+impl PartFile {
+    /// A new, empty part with a fresh document id.
+    pub fn new() -> Self {
+        Self {
+            document_id: new_document_id(),
+            definition: Part::new().definition(),
+            properties: Properties::default(),
+        }
+    }
+}
+
+impl Default for PartFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A fresh random document id (UUID v4).
+pub fn new_document_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+#[derive(Debug)]
+pub enum FormatError {
+    Io(io::Error),
+    /// Not a readable ZIP archive, or an entry is missing.
+    Archive(zip::result::ZipError),
+    /// An entry is not valid JSON for this format.
+    Json {
+        entry: &'static str,
+        source: serde_json::Error,
+    },
+    /// The archive is not an Oxyde document.
+    NotOxyde,
+    /// Written by a newer version of Oxyde.
+    UnsupportedVersion {
+        found: u32,
+        supported: u32,
+    },
+    /// An Oxyde document of another kind (assembly, drawing).
+    WrongKind(String),
+    /// The timeline in the file is inconsistent.
+    InvalidModel(ModelError),
+}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FormatError::Io(e) => write!(f, "{e}"),
+            FormatError::Archive(e) => write!(f, "not a valid .oxy archive: {e}"),
+            FormatError::Json { entry, source } => write!(f, "{entry}: {source}"),
+            FormatError::NotOxyde => write!(f, "not an Oxyde document"),
+            FormatError::UnsupportedVersion { found, supported } => write!(
+                f,
+                "this file uses format version {found}; this version of Oxyde reads up to {supported}"
+            ),
+            FormatError::WrongKind(kind) => write!(f, "expected a part, found a {kind} document"),
+            FormatError::InvalidModel(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for FormatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FormatError::Io(e) => Some(e),
+            FormatError::Archive(e) => Some(e),
+            FormatError::Json { source, .. } => Some(source),
+            FormatError::InvalidModel(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for FormatError {
+    fn from(e: io::Error) -> Self {
+        FormatError::Io(e)
+    }
+}
+
+impl From<zip::result::ZipError> for FormatError {
+    fn from(e: zip::result::ZipError) -> Self {
+        FormatError::Archive(e)
+    }
+}
+
+fn to_json<T: serde::Serialize>(entry: &'static str, value: &T) -> Result<Vec<u8>, FormatError> {
+    serde_json::to_vec_pretty(value).map_err(|source| FormatError::Json { entry, source })
+}
+
+fn from_json<T: serde::de::DeserializeOwned>(
+    entry: &'static str,
+    bytes: &[u8],
+) -> Result<T, FormatError> {
+    serde_json::from_slice(bytes).map_err(|source| FormatError::Json { entry, source })
+}
+
+/// Writes a part document as an `.oxy` archive.
+pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, FormatError> {
+    let manifest = Manifest {
+        format: FORMAT_NAME.to_owned(),
+        format_version: FORMAT_VERSION,
+        kind: "part".to_owned(),
+        document_id: part.document_id.clone(),
+        units: Units {
+            length: "mm".to_owned(),
+            angle: "deg".to_owned(),
+        },
+        created_by: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
+    };
+
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut zip = ZipWriter::new(writer);
+    // The manifest goes first so readers can identify the file cheaply.
+    for (entry, bytes) in [
+        (MANIFEST, to_json(MANIFEST, &manifest)?),
+        (
+            MODEL,
+            to_json(MODEL, &PartModel::from_definition(&part.definition))?,
+        ),
+        (PROPERTIES, to_json(PROPERTIES, &part.properties)?),
+    ] {
+        zip.start_file(entry, options)?;
+        zip.write_all(&bytes)?;
+    }
+    Ok(zip.finish()?)
+}
+
+/// Reads a part document from an `.oxy` archive and checks that its timeline is valid.
+pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
+    let mut archive = ZipArchive::new(reader)?;
+
+    let manifest: Manifest =
+        from_json(MANIFEST, &read_entry(&mut archive, MANIFEST)?).map_err(|e| match e {
+            // Something that is not even shaped like our manifest is not an Oxyde file.
+            FormatError::Json { .. } => FormatError::NotOxyde,
+            other => other,
+        })?;
+    if manifest.format != FORMAT_NAME {
+        return Err(FormatError::NotOxyde);
+    }
+    if manifest.format_version > FORMAT_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            found: manifest.format_version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    if manifest.kind != "part" {
+        return Err(FormatError::WrongKind(manifest.kind));
+    }
+
+    let model: PartModel = from_json(MODEL, &read_entry(&mut archive, MODEL)?)?;
+    let properties: Properties = from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?;
+
+    let definition = model.into_definition();
+    // Validate now, so a broken file is reported at open time.
+    let definition = Part::from_definition(definition)
+        .map_err(FormatError::InvalidModel)?
+        .definition();
+
+    Ok(PartFile {
+        document_id: manifest.document_id,
+        definition,
+        properties,
+    })
+}
+
+fn read_entry<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &'static str,
+) -> Result<Vec<u8>, FormatError> {
+    let mut entry = archive.by_name(name)?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Saves a part to `path`. The file is written next to the target first and then moved
+/// into place, so a failed save never destroys the previous version.
+pub fn save_part(path: &Path, part: &PartFile) -> Result<(), FormatError> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = std::path::PathBuf::from(temporary);
+
+    let result = write_then_move(&temporary, path, part);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_then_move(temporary: &Path, path: &Path, part: &PartFile) -> Result<(), FormatError> {
+    let file = BufWriter::new(File::create(temporary)?);
+    let mut file = write_part(file, part)?;
+    file.flush()?;
+    drop(file);
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+/// Loads a part from `path`.
+pub fn load_part(path: &Path) -> Result<PartFile, FormatError> {
+    read_part(BufReader::new(File::open(path)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use oxyde_geom::{Curve2, Point2};
+    use oxyde_model::{
+        EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureKind, Sketch,
+        SketchPlane, StandardPlane,
+    };
+
+    use super::*;
+
+    fn sample() -> PartFile {
+        let mut part = Part::new();
+        let mut base = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        base.rectangle(Point2::new(-20.0, -10.0), 40.0, 20.0);
+        let s1 = part.add_feature(FeatureKind::Sketch(base));
+        let boss = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            10.0,
+        )));
+
+        let mut top = Sketch::new(SketchPlane::Face(FaceName::end_cap(boss)));
+        top.circle(Point2::new(0.0, 0.0), 3.0);
+        top.add(Curve2::Arc {
+            start: Point2::new(5.0, 0.0),
+            mid: Point2::new(6.0, 1.0),
+            end: Point2::new(7.0, 0.0),
+        });
+        top.entities[1].construction = true;
+        let s2 = part.add_feature(FeatureKind::Sketch(top));
+        let hole = part.add_feature(FeatureKind::Extrude(Extrude {
+            sketch: s2,
+            op: ExtrudeOp::Cut,
+            extent: ExtrudeExtent::MidPlane { depth: 4.0 },
+            reverse: true,
+        }));
+
+        let edge = EdgeName::between(FaceName::profile(boss, 2), FaceName::end_cap(boss));
+        let round = part.add_feature(FeatureKind::Fillet(EdgeBlend {
+            edges: vec![edge.clone()],
+            size: 1.5,
+        }));
+        // A chamfer on an edge of the fillet face: nested names.
+        let nested =
+            EdgeName::between(FaceName::from_edge(round, edge), FaceName::profile(hole, 1));
+        let bevel = part.add_feature(FeatureKind::Chamfer(EdgeBlend {
+            edges: vec![nested],
+            size: 0.5,
+        }));
+        part.set_suppressed(bevel, true).unwrap();
+        part.roll_back_to(Some(bevel)).unwrap();
+
+        let mut properties = Properties {
+            part_number: "OXY-0001".to_owned(),
+            description: "Bracket".to_owned(),
+            material: "Aluminium 6061-T6".to_owned(),
+            volume_mm3: Some(7859.25),
+            ..Properties::default()
+        };
+        properties
+            .custom
+            .insert("finish".to_owned(), "anodized".to_owned());
+
+        PartFile {
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties,
+        }
+    }
+
+    fn round_trip(part: &PartFile) -> PartFile {
+        let bytes = write_part(Cursor::new(Vec::new()), part)
+            .unwrap()
+            .into_inner();
+        read_part(Cursor::new(bytes)).unwrap()
+    }
+
+    #[test]
+    fn part_round_trips_exactly() {
+        let part = sample();
+        assert_eq!(round_trip(&part), part);
+    }
+
+    #[test]
+    fn empty_part_round_trips() {
+        let part = PartFile::new();
+        assert_eq!(round_trip(&part), part);
+    }
+
+    #[test]
+    fn manifest_comes_first_and_is_readable() {
+        let bytes = write_part(Cursor::new(Vec::new()), &sample())
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert_eq!(archive.by_index(0).unwrap().name(), MANIFEST);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format"], "oxyde");
+        assert_eq!(manifest["format_version"], FORMAT_VERSION);
+        assert_eq!(manifest["kind"], "part");
+    }
+
+    fn archive_with(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    const MANIFEST_V1: &str = r#"{"format":"oxyde","format_version":1,"kind":"part",
+        "document_id":"x","units":{"length":"mm","angle":"deg"},"created_by":"hand"}"#;
+
+    #[test]
+    fn hand_written_file_with_defaults_is_accepted() {
+        let model = r#"{
+            "next_feature_id": 3,
+            "features": [
+                { "id": 1, "name": "Sketch1", "type": "sketch",
+                  "plane": { "standard": "top" },
+                  "entities": [ { "id": 1, "type": "circle", "center": [0, 0], "radius": 5 } ] },
+                { "id": 2, "name": "Boss-Extrude1", "type": "extrude", "sketch": 1,
+                  "operation": "boss", "extent": { "type": "blind", "depth": 2 } }
+            ]
+        }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        let part = read_part(Cursor::new(bytes)).unwrap();
+        assert_eq!(part.definition.features.len(), 2);
+        assert_eq!(part.properties, Properties::default());
+    }
+
+    #[test]
+    fn newer_versions_are_refused() {
+        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":2");
+        let bytes = archive_with(&[(MANIFEST, &manifest)]);
+        assert!(matches!(
+            read_part(Cursor::new(bytes)),
+            Err(FormatError::UnsupportedVersion {
+                found: 2,
+                supported: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn foreign_archives_are_refused() {
+        let bytes = archive_with(&[(MANIFEST, r#"{"hello":"world"}"#)]);
+        assert!(matches!(
+            read_part(Cursor::new(bytes)),
+            Err(FormatError::NotOxyde)
+        ));
+        assert!(matches!(
+            read_part(Cursor::new(b"not a zip".to_vec())),
+            Err(FormatError::Archive(_))
+        ));
+    }
+
+    #[test]
+    fn inconsistent_timelines_are_refused() {
+        let model = r#"{ "next_feature_id": 2, "features": [
+            { "id": 1, "name": "Boss-Extrude1", "type": "extrude", "sketch": 9,
+              "operation": "boss", "extent": { "type": "blind", "depth": 2 } } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        assert!(matches!(
+            read_part(Cursor::new(bytes)),
+            Err(FormatError::InvalidModel(_))
+        ));
+    }
+
+    #[test]
+    fn save_and_load_through_the_file_system() {
+        let path = std::env::temp_dir().join(format!("oxyde-format-{}.oxy", std::process::id()));
+        let part = sample();
+        save_part(&path, &part).unwrap();
+        let loaded = load_part(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded, part);
+    }
+}

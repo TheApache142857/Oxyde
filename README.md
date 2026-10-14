@@ -2,7 +2,7 @@
 
 An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
 
-> **Status: pre-alpha.** The repository currently contains the design documents and empty crate skeletons. Nothing is usable yet.
+> **Status: pre-alpha.** A first desktop application is written — timeline panel, properties, 3D viewport with face/edge picking, `.oxy` save/load, STEP export — on top of the headless modeling engine (sketch, boss/cut extrude, fillet, chamfer, persistent naming). Everything awaits its first Windows build.
 
 ## Goals
 
@@ -38,17 +38,20 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | `oxyde-occt` | `Kernel` implementation backed by OpenCASCADE through a small C++ shim (`cxx`) |
 | `oxyde-model` | Feature tree, dependency graph, rebuild, persistent topological naming |
 | `oxyde-format` | Reading and writing `.oxy` files |
+| `oxyde-render` | Software renderer for the viewport, with pixel-exact picking |
 | `oxyde-app` | Desktop application (UI and viewport) |
+| `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/FORMAT.md).
 
 ## Building
 
-Not meaningful yet — the crates are empty. Once the OCCT backend lands, building will require:
+**Windows (x64, MSVC) only for now.** You need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.8+ (vcpkg recommended). Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
 
-- Rust (stable, edition 2024)
-- A C++17 compiler
-- OpenCASCADE 7.8 or newer, discoverable via CMake or `pkg-config`
+```powershell
+cargo run --release -p oxyde-app              # the application (File › Open demo bracket)
+cargo test --workspace                        # unit + end-to-end tests
+```
 
 ## License
 

@@ -1,29 +1,24 @@
 # The `.oxy` file format
 
-Status: **draft, version 1**. The format is open: anyone may read and write it, with or without Oxyde.
+Status: **version 1, implemented** in `crates/oxyde-format`. The format is open: anyone may read and write it, with or without Oxyde.
 
 ## 1. Container
 
-An `.oxy` file is a **ZIP archive** (deflate or stored). Required and optional entries:
+An `.oxy` file is a **ZIP archive** (deflate or stored):
 
 ```
 part.oxy
-├── manifest.json        required  — format identity and version
-├── model.json           required  — the feature tree (the source of truth)
-├── properties.json      required  — part metadata, BOM-ready
-├── geometry/            optional  — cached results of the last rebuild
-│   ├── body-<n>.brep    OCCT BREP text format
-│   └── body-<n>.step    optional STEP AP242 copy for kernel-less consumers
-├── thumbnail.png        optional  — 256×256 preview
-└── attachments/         optional  — embedded images, notes, etc.
+├── manifest.json        required  — format identity and version (first entry)
+├── model.json           required  — the feature timeline: the source of truth
+└── properties.json      required  — part metadata, BOM-ready
 ```
 
 Rules:
 
-- `manifest.json` should be the first entry so readers can identify the file cheaply.
-- All JSON is UTF-8, no BOM, and is written with **stable key order and indentation** so that files diff cleanly under version control.
-- Paths inside the archive use `/` and are case-sensitive.
-- Everything under `geometry/` is a **cache**: a reader may ignore it and rebuild from `model.json`; a writer may omit it. If the cache's `model_hash` (see manifest) does not match `model.json`, the cache is stale and must not be trusted.
+- `manifest.json` is written first so readers can identify a file cheaply.
+- All JSON is UTF-8, written with stable key order and indentation so files diff cleanly.
+- Geometry is **not stored**: Oxyde rebuilds the part from `model.json` on load. A later version may add an optional `geometry/` cache (BREP/STEP) for tools that cannot rebuild; readers must ignore entries they do not know.
+- Oxyde saves by writing `<name>.oxy.tmp` and renaming it over the target, so a failed save never destroys the previous file.
 
 ## 2. `manifest.json`
 
@@ -34,69 +29,91 @@ Rules:
   "kind": "part",
   "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
   "units": { "length": "mm", "angle": "deg" },
-  "created_by": "oxyde 0.1.0",
-  "model_hash": "sha256:…",
-  "kernel": { "name": "occt", "version": "7.8.1" }
+  "created_by": "oxyde 0.0.1"
 }
 ```
 
-- `kind`: `"part" | "assembly" | "drawing"`.
-- `document_id`: a UUID that never changes for the life of the document; used by assemblies and drawings to find their references even after a rename.
-- `units` are the **display** units; numeric values in `model.json` are always stored in internal units (mm, radians).
+- `kind`: `"part"` (assemblies and drawings later).
+- `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
+- `units` are display units. Values in `model.json` are always millimetres.
 
-## 3. `model.json` (part)
+## 3. `model.json`
 
 ```json
 {
-  "variables": [
-    { "name": "width", "expr": "40" },
-    { "name": "depth", "expr": "width / 2" }
-  ],
+  "next_feature_id": 6,
+  "rollback": null,
   "features": [
     {
-      "id": "f1",
-      "type": "sketch",
-      "name": "Base sketch",
-      "plane": { "ref": "origin/XY" },
+      "id": 1, "name": "Sketch1", "suppressed": false, "type": "sketch",
+      "plane": { "standard": "front" },
       "entities": [
-        { "id": "p1", "type": "point", "x": 0.0, "y": 0.0 },
-        { "id": "p2", "type": "point", "x": 40.0, "y": 0.0 },
-        { "id": "l1", "type": "line", "start": "p1", "end": "p2" }
-      ],
-      "constraints": [
-        { "type": "horizontal", "entities": ["l1"] },
-        { "type": "distance", "entities": ["p1", "p2"], "value": { "expr": "width" } }
+        { "id": 1, "construction": false, "type": "line", "start": [0, 0], "end": [40, 0] },
+        { "id": 5, "type": "arc", "start": [40, 0], "mid": [45, 5], "end": [40, 10] },
+        { "id": 6, "type": "circle", "center": [20, 10], "radius": 3 }
       ]
     },
     {
-      "id": "f2",
-      "type": "extrude",
-      "name": "Boss",
-      "profile": { "ref": "f1" },
-      "extent": { "type": "blind", "distance": { "expr": "depth" } },
-      "operation": "new_body"
+      "id": 2, "name": "Boss-Extrude1", "type": "extrude",
+      "sketch": 1, "operation": "boss",
+      "extent": { "type": "blind", "depth": 10 },
+      "reverse": false
     },
     {
-      "id": "f3",
-      "type": "fillet",
-      "name": "Edge fillet",
-      "edges": [{ "ref": "f2/lateral/f1:l1/end" }],
-      "radius": { "expr": "2" },
-      "suppressed": false
+      "id": 3, "name": "Sketch2", "type": "sketch",
+      "plane": { "face": { "key": { "type": "end_cap", "feature": 2 }, "part": 0 } },
+      "entities": [ { "id": 1, "type": "circle", "center": [20, 10], "radius": 3 } ]
+    },
+    {
+      "id": 5, "name": "Fillet1", "type": "fillet", "radius": 2,
+      "edges": [
+        { "faces": [
+            { "key": { "type": "profile", "feature": 2, "segment": 2 } },
+            { "key": { "type": "end_cap", "feature": 2 } }
+          ],
+          "part": 0 }
+      ]
     }
-  ],
-  "rollback_index": null
+  ]
 }
 ```
 
-- Feature `id`s are unique within the document and never reused.
-- `ref` strings are **persistent topological names** (see `ARCHITECTURE.md` §6), never kernel indices.
-- Numeric parameters are either a number or `{ "expr": "…" }` referencing `variables`.
-- Unknown feature types must be preserved on round-trip by readers that cannot interpret them.
+### Timeline
+
+- `features` is the timeline, in order. `id`s are unique, never reused, and features refer to each other by id only; `name` is cosmetic.
+- `rollback`: number of active features, or `null` for all.
+- `next_feature_id`: id the next new feature will get (readers raise it if it is not above every id).
+- `suppressed` defaults to `false`, `construction` and `reverse` too, and `part` defaults to `0`.
+
+### Feature types
+
+| `type` | Fields |
+|---|---|
+| `sketch` | `plane`: `{"standard": "front" \| "top" \| "right"}` or `{"face": FaceRef}`; `entities`: list of `line` (`start`, `end`), `arc` (`start`, `mid`, `end`, through three points) or `circle` (`center`, `radius`), each with a unique `id` and optional `construction` |
+| `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse` |
+| `fillet` | `edges` (list of EdgeRef), `radius` |
+| `chamfer` | `edges` (list of EdgeRef), `distance` |
+
+Sketch coordinates are in the sketch plane's frame. For standard planes: Front = XY, Top = XZ (sketch Y towards −Z), Right = YZ (sketch X towards −Z). On a face, the origin is the model origin projected onto the face and the X axis is the model axis least aligned with the face normal, projected.
+
+### References: persistent names
+
+References to geometry are never indices; they are the persistent names described in `ARCHITECTURE.md` §6, written as JSON:
+
+- **FaceRef** `{ "key": FaceKey, "part": n }`, where FaceKey is one of:
+  - `{"type": "profile", "feature": id, "segment": sketch_entity_id}`: side face swept by an extrusion
+  - `{"type": "start_cap", "feature": id}`, `{"type": "end_cap", "feature": id}`: ends of an extrusion
+  - `{"type": "from_edge", "feature": id, "edge": EdgeRef}`: fillet/chamfer face
+  - `{"type": "from_vertex", "feature": id, "vertex": VertexRef}`: corner blend
+  - `{"type": "unknown", "feature": id, "index": n}`: origin not reported (unstable)
+- **EdgeRef** `{ "faces": [FaceRef, …], "part": n }`: the faces the edge separates.
+- **VertexRef** `{ "faces": [FaceRef, …], "part": n }`: the faces meeting at the vertex.
+
+`part` is 0 unless several entities share the same name; readers sort `faces` lists themselves.
 
 ## 4. `properties.json`
 
-Designed so that BOM tools can read a part without understanding geometry:
+Readable by BOM tools without understanding geometry:
 
 ```json
 {
@@ -104,42 +121,16 @@ Designed so that BOM tools can read a part without understanding geometry:
   "description": "Mounting bracket",
   "revision": "A",
   "material": "Aluminium 6061-T6",
-  "mass_kg": 0.0421,
-  "custom": {
-    "supplier": "",
-    "finish": "anodized"
-  }
+  "custom": { "finish": "anodized" },
+  "volume_mm3": 7859.3
 }
 ```
 
-- `mass_kg` is computed at save time from the last successful rebuild; it is informational.
-- `custom` is a free-form string-to-string map.
+All fields are optional when reading. `volume_mm3` is computed at save time and informational only.
 
-## 5. Assemblies (`kind: "assembly"`)
+## 5. Reading rules
 
-`model.json` lists component instances instead of features:
-
-```json
-{
-  "components": [
-    {
-      "id": "c1",
-      "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
-      "path": "parts/bracket.oxy",
-      "transform": [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
-      "configuration": null
-    }
-  ],
-  "mates": []
-}
-```
-
-- Readers resolve components by `path` first, then by searching nearby files for a matching `document_id`.
-- A BOM is the count of component instances grouped by `document_id` (and configuration), joined with each part's `properties.json`.
-
-## 6. Versioning
-
-- `format_version` is an integer, incremented on any incompatible change.
-- Readers **must** refuse files with a higher `format_version` than they support, with a clear message.
-- Readers **must** upgrade older versions through explicit, tested migration steps (v1 → v2 → …), never by guessing.
-- Additive changes (new optional fields, new feature types) do not bump the version.
+- Refuse files whose `format` is not `"oxyde"`, whose `kind` is not supported, or whose `format_version` is higher than supported, with a clear message.
+- Older versions are upgraded through explicit, tested migrations (v1 → v2 → …), never by guessing.
+- Validate the timeline on open: unique ids, and every feature refers only to features before it. An unknown feature `type` is an error in version 1.
+- Additive changes (new optional fields, new entries) do not bump the version; anything else does.
