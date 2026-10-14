@@ -300,6 +300,8 @@ pub(crate) enum RelationDto {
     PointOnCircle { point: u32, curve: u32 },
     Midpoint { point: u32, line: u32 },
     Tangent { line: u32, curve: u32 },
+    PointLineDistance { point: u32, line: u32, value: f64 },
+    LineDistance { a: u32, b: u32, value: f64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -625,6 +627,16 @@ fn relation_dto(c: &Constraint) -> RelationDto {
             line: l.0,
             curve: r.0,
         },
+        C::PointLineDistance(p, l, value) => R::PointLineDistance {
+            point: p.0,
+            line: l.0,
+            value,
+        },
+        C::LineDistance(a, b, value) => R::LineDistance {
+            a: a.0,
+            b: b.0,
+            value,
+        },
     }
 }
 
@@ -774,6 +786,10 @@ fn relation_from(dto: RelationDto) -> Constraint {
         R::PointOnCircle { point, curve } => C::PointOnCircle(id(point), id(curve)),
         R::Midpoint { point, line } => C::Midpoint(id(point), id(line)),
         R::Tangent { line, curve } => C::Tangent(id(line), id(curve)),
+        R::PointLineDistance { point, line, value } => {
+            C::PointLineDistance(id(point), id(line), value)
+        }
+        R::LineDistance { a, b, value } => C::LineDistance(id(a), id(b), value),
     }
 }
 

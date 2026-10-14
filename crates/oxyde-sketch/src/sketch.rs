@@ -80,6 +80,11 @@ pub enum Constraint {
     Midpoint(EntityId, EntityId),
     /// A line tangent to a circle or arc.
     Tangent(EntityId, EntityId),
+    /// Distance from a point to the infinite extension of a line.
+    PointLineDistance(EntityId, EntityId, f64),
+    /// Distance between two lines, measured from the middle of the first to the infinite
+    /// extension of the second; meant for parallel lines.
+    LineDistance(EntityId, EntityId, f64),
 }
 
 impl Constraint {
@@ -100,7 +105,9 @@ impl Constraint {
             | PointOnLine(a, b)
             | PointOnCircle(a, b)
             | Midpoint(a, b)
-            | Tangent(a, b) => vec![a, b],
+            | Tangent(a, b)
+            | PointLineDistance(a, b, _)
+            | LineDistance(a, b, _) => vec![a, b],
         }
     }
 }
@@ -126,7 +133,9 @@ impl Constraint {
             | VerticalDistance(_, _, v)
             | Length(_, v)
             | Radius(_, v)
-            | Angle(_, _, v) => Some(v),
+            | Angle(_, _, v)
+            | PointLineDistance(_, _, v)
+            | LineDistance(_, _, v) => Some(v),
             _ => None,
         }
     }
@@ -442,7 +451,9 @@ impl ConstrainedSketch {
                 | VerticalDistance(_, _, v)
                 | Length(_, v)
                 | Radius(_, v)
-                | Angle(_, _, v),
+                | Angle(_, _, v)
+                | PointLineDistance(_, _, v)
+                | LineDistance(_, _, v),
             ) => {
                 *v = value;
                 true
@@ -665,7 +676,11 @@ impl ConstrainedSketch {
                     layout.expect(b, Kind::Point, i)?;
                 }
                 Horizontal(l) | Vertical(l) | Length(l, _) => layout.expect(l, Kind::Line, i)?,
-                Parallel(a, b) | Perpendicular(a, b) | EqualLength(a, b) | Angle(a, b, _) => {
+                Parallel(a, b)
+                | Perpendicular(a, b)
+                | EqualLength(a, b)
+                | Angle(a, b, _)
+                | LineDistance(a, b, _) => {
                     layout.expect(a, Kind::Line, i)?;
                     layout.expect(b, Kind::Line, i)?;
                 }
@@ -674,7 +689,7 @@ impl ConstrainedSketch {
                     layout.expect(b, Kind::Round, i)?;
                 }
                 Radius(r, _) => layout.expect(r, Kind::Round, i)?,
-                PointOnLine(p, l) | Midpoint(p, l) => {
+                PointOnLine(p, l) | Midpoint(p, l) | PointLineDistance(p, l, _) => {
                     layout.expect(p, Kind::Point, i)?;
                     layout.expect(l, Kind::Line, i)?;
                 }
@@ -950,6 +965,21 @@ impl Eval<'_> {
                 let d = (e.x - s.x, e.y - s.y);
                 let distance = (d.0 * (c.y - s.y) - d.1 * (c.x - s.x)).abs() / length(d);
                 out.push(distance - radius);
+            }
+            PointLineDistance(p, l, value) => {
+                let (s, e) = self.line(l);
+                let p = self.point(p);
+                let d = (e.x - s.x, e.y - s.y);
+                let distance = (d.0 * (p.y - s.y) - d.1 * (p.x - s.x)).abs() / length(d);
+                out.push(distance - value);
+            }
+            LineDistance(a, b, value) => {
+                let (a0, a1) = self.line(a);
+                let m = Point2::new((a0.x + a1.x) / 2.0, (a0.y + a1.y) / 2.0);
+                let (s, e) = self.line(b);
+                let d = (e.x - s.x, e.y - s.y);
+                let distance = (d.0 * (m.y - s.y) - d.1 * (m.x - s.x)).abs() / length(d);
+                out.push(distance - value);
             }
         }
     }

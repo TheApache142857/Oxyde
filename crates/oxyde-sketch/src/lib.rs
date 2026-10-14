@@ -9,6 +9,7 @@
 //!
 //! Pure Rust and kernel-independent. See `docs/ARCHITECTURE.md` §5.
 
+mod edit;
 mod linalg;
 mod sketch;
 mod solve;
