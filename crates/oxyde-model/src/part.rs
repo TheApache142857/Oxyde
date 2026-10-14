@@ -19,8 +19,8 @@ use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
     AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
-    FeatureKind, LinearPattern, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
-    Sketch, SketchPlane,
+    FeatureKind, Import, LinearPattern, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis,
+    Shell, Sketch, SketchPlane,
 };
 use crate::naming::{BodyNaming, FaceKey, FaceName, Resolution};
 
@@ -680,6 +680,9 @@ fn build_feature<K: Kernel>(
                 let instances = mirror_instances(&ctx, mirror, &mut warnings)?;
                 result.produced = Some(build_instances(&ctx, &mirror.seeds, &instances, kernel)?);
             }
+            FeatureKind::Import(import) => {
+                result.produced = Some(build_import(&ctx, import, kernel)?);
+            }
         }
         Ok(())
     })();
@@ -913,6 +916,36 @@ fn apply_tool<K: Kernel>(
             Err(e)
         }
     }
+}
+
+/// Reads the stored STEP file and adds its solids to the body.
+fn build_import<K: Kernel>(
+    ctx: &Context<'_>,
+    import: &Import,
+    kernel: &mut K,
+) -> Result<Body, String> {
+    let id = ctx.feature().id;
+    let shape = kernel
+        .import_step(import.data.bytes())
+        .map_err(|e| format!("{}: {e}", import.file_name))?;
+    let faces = match kernel.topology(shape) {
+        Ok(topology) => topology.faces.len() as u32,
+        Err(e) => {
+            kernel.release(shape);
+            return Err(e.to_string());
+        }
+    };
+    let names: Vec<Option<FaceName>> = (0..faces)
+        .map(|index| Some(FaceName::new(FaceKey::Imported { feature: id, index })))
+        .collect();
+    let Some(body) = ctx.body else {
+        return finish(id, shape, names, kernel);
+    };
+    let combined = kernel.boolean(BooleanOp::Fuse, body.shape, shape);
+    kernel.release(shape);
+    let combined = combined.map_err(|e| e.to_string())?;
+    let names = boolean_names(&combined.history, body, &names);
+    finish(id, combined.shape, names, kernel)
 }
 
 fn build_extrude<K: Kernel>(

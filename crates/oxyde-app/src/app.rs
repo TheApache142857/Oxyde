@@ -1,20 +1,26 @@
 //! Application state and the top-level layout: menus, command bar, panels, status bar.
+//!
+//! Commands work the SolidWorks way: select first (a sketch in the timeline, edges in the
+//! viewport…), then click the command; it opens in the PropertyManager with that selection,
+//! and further clicks add to it.
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use oxyde_geom::{Plane, Point3, Vec3};
 use oxyde_kernel::{Kernel, SurfaceKind, Topology};
 use oxyde_model::{
-    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, Sketch, SketchPlane,
-    StandardPlane,
+    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, FileData, Import,
+    ReferenceGeometry, Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
-use oxyde_render::{Pick, Scene, StandardView};
+use oxyde_render::{Pick, Scene};
 
-use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog};
+use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog, plane_name};
 use crate::document::Document;
-use crate::equations_ui::{EquationsTab, EquationsWindow};
+use crate::equations_ui::EquationsWindow;
 use crate::features_ui::PatternKind;
+use crate::property_manager::PanelPick;
 use crate::sketch_mode::{self, SketchRequest, SketchSession, Tool};
 use crate::viewport::{Viewport, ViewportOutput};
 
@@ -31,6 +37,8 @@ pub enum Selected {
 pub enum PendingAction {
     New,
     Open,
+    /// A new part from a STEP file.
+    OpenStep,
     Demo,
     DemoFlange,
     Exit,
@@ -40,14 +48,36 @@ pub enum PendingAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Sketch,
-    Extrude(ExtrudeOp),
-    Revolve(ExtrudeOp),
+    /// Adds or removes material; chosen in the PropertyManager.
+    Extrude,
+    Revolve,
     /// Fillet (true) or chamfer (false).
     Blend(bool),
     Shell,
     Pattern(PatternKind),
     RefPlane,
     RefAxis,
+}
+
+/// The tabs of the command bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTab {
+    Features,
+    Sketch,
+    Evaluate,
+}
+
+/// A plane or axis drawn over the viewport, which can be clicked.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Overlay {
+    Plane(StandardPlane),
+    Reference(FeatureId),
+}
+
+/// Where an overlay is on screen.
+enum OverlayShape {
+    Quad([egui::Pos2; 4]),
+    Segment(egui::Pos2, egui::Pos2),
 }
 
 pub struct OxydeApp {
@@ -63,6 +93,11 @@ pub struct OxydeApp {
     /// Tools › Equations window (equations, global variables and dimensions).
     pub(crate) equations: EquationsWindow,
     pub(crate) status: String,
+    pub(crate) tab: CommandTab,
+    /// A sketch tool clicked outside sketch mode: picked once the new sketch opens.
+    pub(crate) pending_tool: Option<Tool>,
+    pub(crate) show_mass_properties: bool,
+    pub(crate) show_measure: bool,
     /// Document revision the viewport currently shows.
     scene_revision: Option<u64>,
     /// Status-bar summary, cached per document revision.
@@ -85,6 +120,10 @@ impl OxydeApp {
             sketch: None,
             equations: EquationsWindow::new(),
             status: "Ready".to_owned(),
+            tab: CommandTab::Features,
+            pending_tool: None,
+            show_mass_properties: false,
+            show_measure: false,
             scene_revision: None,
             summary: None,
             window_title: String::new(),
@@ -108,6 +147,7 @@ impl OxydeApp {
         let id = self.doc.part.add_feature(kind);
         self.rebuild();
         self.selected_feature = Some(id);
+        self.selection.clear();
         let name = self
             .doc
             .part
@@ -141,13 +181,13 @@ impl OxydeApp {
         }
     }
 
-    fn undo(&mut self) {
+    pub(crate) fn undo(&mut self) {
         if self.doc.undo(&mut self.kernel) {
             self.status = "Undone".to_owned();
         }
     }
 
-    fn redo(&mut self) {
+    pub(crate) fn redo(&mut self) {
         if self.doc.redo(&mut self.kernel) {
             self.status = "Redone".to_owned();
         }
@@ -201,6 +241,7 @@ impl OxydeApp {
             None => {
                 if !additive {
                     self.selection.clear();
+                    self.selected_plane = None;
                 }
             }
             Some(item) => {
@@ -216,8 +257,18 @@ impl OxydeApp {
                     }
                 } else {
                     self.selection = vec![item];
+                    self.selected_plane = None;
                 }
             }
+        }
+    }
+
+    /// A face or edge clicked in the viewport, as offered to an open command.
+    fn panel_pick(&self, pick: Option<Pick>) -> Option<PanelPick> {
+        let body = self.doc.part.body()?;
+        match pick? {
+            Pick::Face(i) => body.naming.face(i).cloned().map(PanelPick::Face),
+            Pick::Edge(i) => body.naming.edge(i).cloned().map(PanelPick::Edge),
         }
     }
 
@@ -236,13 +287,37 @@ impl OxydeApp {
             .collect()
     }
 
+    /// The sketch an extrude or revolve starts with: the one selected in the timeline, else
+    /// the latest sketch nothing uses yet. `None` leaves the PropertyManager waiting for one.
+    pub(crate) fn sketch_to_use(&self) -> Option<FeatureId> {
+        let sketches = self.sketches();
+        if let Some(id) = self.selected_feature {
+            if sketches.iter().any(|(s, _)| *s == id) {
+                return Some(id);
+            }
+        }
+        let used = |id: FeatureId| {
+            self.doc.part.features().iter().any(|f| match f.kind() {
+                FeatureKind::Extrude(e) => e.sketch == id,
+                FeatureKind::Revolve(r) => r.sketch == id,
+                _ => false,
+            })
+        };
+        sketches
+            .iter()
+            .rev()
+            .map(|(id, _)| *id)
+            .find(|id| !used(*id))
+    }
+
     /// "Sketch" command: on the selected flat face, else the selected plane (standard or
-    /// reference), else ask.
-    fn begin_sketch(&mut self) {
+    /// reference), else the PropertyManager asks for one.
+    pub(crate) fn begin_sketch(&mut self, tool: Option<Tool>) {
+        self.pending_tool = tool;
         let reference_plane = self.selected_feature.filter(|id| {
             matches!(
                 self.doc.part.reference(*id),
-                Some(oxyde_model::ReferenceGeometry::Plane(_))
+                Some(ReferenceGeometry::Plane(_))
             )
         });
         if let Some(face) = self.selected_planar_face() {
@@ -253,6 +328,7 @@ impl OxydeApp {
             self.start_new_sketch(SketchPlane::Reference(id));
         } else {
             self.dialog = Some(Dialog::ChoosePlane);
+            self.status = "Select a plane or a flat face for the sketch".to_owned();
         }
     }
 
@@ -289,7 +365,9 @@ impl OxydeApp {
         };
         self.viewport.look_at_plane(&plane);
         self.selection.clear();
+        self.selected_plane = None;
         self.selected_feature = Some(id);
+        self.dialog = None;
         let mut session = SketchSession::new(id, name, plane, sketch.geometry, new_sketch, restore);
         session.driven = self
             .doc
@@ -305,10 +383,18 @@ impl OxydeApp {
                 _ => None,
             })
             .collect();
+        if let Some(body) = self.doc.part.body() {
+            session.model = crate::model_refs::ModelGeometry::from_body(&body.topology, &plane);
+        }
+        if let Some(tool) = self.pending_tool.take() {
+            session.set_tool(tool);
+        }
         self.sketch = Some(session);
+        self.tab = CommandTab::Sketch;
     }
 
-    /// Leaves sketch mode, keeping or discarding the changes.
+    /// Leaves sketch mode, keeping or discarding the changes. The sketch stays selected, so
+    /// that Extrude or Revolve picks it up.
     pub(crate) fn finish_sketch(&mut self, keep: bool) {
         let Some(session) = self.sketch.take() else {
             return;
@@ -321,30 +407,22 @@ impl OxydeApp {
                 sketch.geometry = session.sketch.clone();
             }
         }
-        if !keep && session.new_sketch && session.original.is_empty() {
+        if !keep && session.new_sketch && session.original_empty {
             // Cancelling a brand-new sketch removes it, as SolidWorks does.
             let _ = self.doc.part.delete(id);
             self.selected_feature = None;
         }
         self.rebuild();
         self.viewport.request_fit();
-        self.status = format!(
-            "{} {}",
-            if keep {
-                "Closed"
-            } else {
-                "Discarded changes to"
-            },
-            session.name
-        );
-        let extrudable = self
-            .doc
-            .part
-            .sketch_result(id)
-            .is_some_and(|r| r.profile.as_ref().is_ok_and(|p| !p.is_empty()));
-        if keep && session.new_sketch && extrudable {
-            self.begin_extrude_of(id, ExtrudeOp::Boss);
-        }
+        self.tab = CommandTab::Features;
+        self.status = if keep {
+            format!(
+                "Closed {}. With it selected, click Extrude or Revolve to make a solid",
+                session.name
+            )
+        } else {
+            format!("Discarded changes to {}", session.name)
+        };
     }
 
     /// Replaces a feature's definition as one undo step and rebuilds.
@@ -366,38 +444,26 @@ impl OxydeApp {
         };
     }
 
-    fn begin_extrude(&mut self, op: ExtrudeOp) {
-        let selected_sketch = self.selected_feature.filter(|id| {
-            self.doc
-                .part
-                .feature(*id)
-                .is_some_and(|f| matches!(f.kind(), FeatureKind::Sketch(_)))
-        });
-        let sketch = selected_sketch.or_else(|| self.sketches().last().map(|(id, _)| *id));
-        match sketch {
-            Some(sketch) => self.begin_extrude_of(sketch, op),
-            None => self.status = "Create a sketch first".to_owned(),
-        }
-    }
-
-    pub(crate) fn begin_extrude_of(&mut self, sketch: FeatureId, op: ExtrudeOp) {
+    fn begin_extrude(&mut self) {
+        let sketch = self.sketch_to_use();
         self.dialog = Some(Dialog::Extrude(ExtrudeDialog {
             editing: None,
             dimension: None,
             sketch,
-            sketches: self.sketches(),
-            op,
+            op: ExtrudeOp::Boss,
             depth: 10.0,
             mid_plane: false,
             reverse: false,
         }));
+        if sketch.is_none() {
+            self.status = "Select the sketch to extrude in the tree".to_owned();
+        }
     }
 
     fn begin_blend(&mut self, fillet: bool) {
         let edges = self.selected_edges();
         if edges.is_empty() {
-            self.status = "Select edges in the viewport first".to_owned();
-            return;
+            self.status = "Click the edges to round in the graphics area".to_owned();
         }
         self.dialog = Some(Dialog::Blend(BlendDialog {
             editing: None,
@@ -405,16 +471,23 @@ impl OxydeApp {
             fillet,
             size: if fillet { 2.0 } else { 1.0 },
             edges,
-            selected_edges: Vec::new(),
-            use_selection: false,
         }));
     }
 
     pub(crate) fn run(&mut self, command: Command) {
+        if self.sketch.is_some() && command != Command::Sketch {
+            self.finish_sketch(true);
+        }
+        self.selected_plane = self.selected_plane.filter(|_| {
+            matches!(
+                command,
+                Command::Sketch | Command::RefPlane | Command::Pattern(PatternKind::Mirror)
+            )
+        });
         match command {
-            Command::Sketch => self.begin_sketch(),
-            Command::Extrude(op) => self.begin_extrude(op),
-            Command::Revolve(op) => self.begin_revolve(op),
+            Command::Sketch => self.begin_sketch(None),
+            Command::Extrude => self.begin_extrude(),
+            Command::Revolve => self.begin_revolve(),
             Command::Blend(fillet) => self.begin_blend(fillet),
             Command::Shell => self.begin_shell(),
             Command::Pattern(kind) => self.begin_pattern(kind),
@@ -425,7 +498,7 @@ impl OxydeApp {
 
     // ---- Files -------------------------------------------------------------------------------
 
-    fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
+    pub(crate) fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
         if self.doc.modified {
             self.dialog = Some(Dialog::Discard(action));
         } else {
@@ -441,10 +514,17 @@ impl OxydeApp {
             }
             PendingAction::Open => {
                 if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Oxyde part or STEP", &["oxy", "step", "stp"])
                     .add_filter("Oxyde part", &["oxy"])
+                    .add_filter("STEP", &["step", "stp"])
                     .pick_file()
                 {
                     self.open_path(&path);
+                }
+            }
+            PendingAction::OpenStep => {
+                if let Some(path) = pick_step() {
+                    self.open_step_as_part(&path);
                 }
             }
             PendingAction::DemoFlange => {
@@ -472,14 +552,21 @@ impl OxydeApp {
         self.doc.release(&mut self.kernel);
         self.doc = doc;
         self.sketch = None;
+        self.dialog = None;
         self.selection.clear();
         self.selected_feature = None;
+        self.selected_plane = None;
         self.scene_revision = None;
+        self.tab = CommandTab::Features;
         self.viewport.request_fit();
         self.rebuild();
     }
 
     pub(crate) fn open_path(&mut self, path: &Path) {
+        if is_step(path) {
+            self.open_step_as_part(path);
+            return;
+        }
         let loaded = oxyde_format::load_part(path)
             .map_err(|e| e.to_string())
             .and_then(|file| Document::from_file(file, Some(path.to_path_buf())));
@@ -490,6 +577,57 @@ impl OxydeApp {
                 self.report_errors();
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+        }
+    }
+
+    /// A new part whose first feature imports `path`.
+    fn open_step_as_part(&mut self, path: &Path) {
+        let mut doc = Document::new();
+        doc.untitled_name = path.file_stem().map(|s| s.to_string_lossy().into_owned());
+        self.replace_document(doc);
+        if self.import_step_file(path) {
+            // Opening is not an edit: nothing to undo, nothing unsaved yet.
+            self.doc.modified = false;
+            self.doc.clear_history();
+        }
+    }
+
+    /// File › Import STEP: adds the file's solids to the part as an "Imported" feature.
+    pub(crate) fn import_step(&mut self) {
+        if let Some(path) = pick_step() {
+            self.finish_sketch(true);
+            self.import_step_file(&path);
+        }
+    }
+
+    /// Reads `path` into an "Imported" feature at the rollback bar. Returns whether the
+    /// geometry could be read.
+    fn import_step_file(&mut self, path: &Path) -> bool {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e}", path.display());
+                return false;
+            }
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import.step".to_owned());
+        let id = self.add_feature(FeatureKind::Import(Import {
+            file_name: file_name.clone(),
+            data: FileData::new(bytes),
+        }));
+        self.viewport.request_fit();
+        match self.doc.part.status(id) {
+            Some(FeatureStatus::Error(message)) => {
+                self.status = format!("Import failed: {message}");
+                false
+            }
+            _ => {
+                self.status = format!("Imported {file_name}");
+                true
+            }
         }
     }
 
@@ -516,7 +654,7 @@ impl OxydeApp {
         }
     }
 
-    fn save_as(&mut self) -> bool {
+    pub(crate) fn save_as(&mut self) -> bool {
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("Oxyde part", &["oxy"])
             .set_file_name(format!("{}.oxy", self.doc.display_name()))
@@ -556,7 +694,7 @@ impl OxydeApp {
         }
     }
 
-    fn export_step(&mut self) {
+    pub(crate) fn export_step(&mut self) {
         let Some(shape) = self.doc.part.body().map(|b| b.shape) else {
             self.status = "Nothing to export".to_owned();
             return;
@@ -575,312 +713,6 @@ impl OxydeApp {
     }
 
     // ---- Layout ------------------------------------------------------------------------------
-
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
-                    ui.close_menu();
-                    self.guard(PendingAction::New, &ctx);
-                }
-                if ui.button("Open…").clicked() {
-                    ui.close_menu();
-                    self.guard(PendingAction::Open, &ctx);
-                }
-                if ui.button("Open demo bracket").clicked() {
-                    ui.close_menu();
-                    self.guard(PendingAction::Demo, &ctx);
-                }
-                if ui.button("Open demo flange").clicked() {
-                    ui.close_menu();
-                    self.guard(PendingAction::DemoFlange, &ctx);
-                }
-                ui.separator();
-                if ui.button("Save").clicked() {
-                    ui.close_menu();
-                    self.save();
-                }
-                if ui.button("Save as…").clicked() {
-                    ui.close_menu();
-                    self.save_as();
-                }
-                if ui.button("Export STEP…").clicked() {
-                    ui.close_menu();
-                    self.export_step();
-                }
-                ui.separator();
-                if ui.button("Part properties…").clicked() {
-                    ui.close_menu();
-                    self.dialog = Some(Dialog::PartProperties(self.doc.properties.clone()));
-                }
-                ui.separator();
-                if ui.button("Exit").clicked() {
-                    ui.close_menu();
-                    self.guard(PendingAction::Exit, &ctx);
-                }
-            });
-            ui.menu_button("Edit", |ui| {
-                if ui
-                    .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.undo();
-                }
-                if ui
-                    .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.redo();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        self.selected_feature.is_some(),
-                        egui::Button::new("Delete feature"),
-                    )
-                    .clicked()
-                {
-                    ui.close_menu();
-                    if let Some(id) = self.selected_feature {
-                        self.delete_feature(id);
-                    }
-                }
-                if ui.button("Rebuild all").clicked() {
-                    ui.close_menu();
-                    self.doc.release(&mut self.kernel);
-                    self.rebuild();
-                }
-            });
-            ui.menu_button("Insert", |ui| {
-                let has_sketch = !self.sketches().is_empty();
-                let has_body = self.doc.part.body().is_some();
-                let has_edges = !self.selected_edges().is_empty();
-                let commands: [(&str, bool, Command); 13] = [
-                    ("Sketch", true, Command::Sketch),
-                    (
-                        "Extruded Boss",
-                        has_sketch,
-                        Command::Extrude(ExtrudeOp::Boss),
-                    ),
-                    ("Extruded Cut", has_sketch, Command::Extrude(ExtrudeOp::Cut)),
-                    (
-                        "Revolved Boss",
-                        has_sketch,
-                        Command::Revolve(ExtrudeOp::Boss),
-                    ),
-                    ("Revolved Cut", has_sketch, Command::Revolve(ExtrudeOp::Cut)),
-                    ("Fillet", has_edges, Command::Blend(true)),
-                    ("Chamfer", has_edges, Command::Blend(false)),
-                    ("Shell", has_body, Command::Shell),
-                    (
-                        "Linear Pattern",
-                        has_body,
-                        Command::Pattern(PatternKind::Linear),
-                    ),
-                    (
-                        "Circular Pattern",
-                        has_body,
-                        Command::Pattern(PatternKind::Circular),
-                    ),
-                    ("Mirror", has_body, Command::Pattern(PatternKind::Mirror)),
-                    ("Reference Plane", true, Command::RefPlane),
-                    ("Reference Axis", true, Command::RefAxis),
-                ];
-                for (i, (label, enabled, command)) in commands.into_iter().enumerate() {
-                    if i == 1 || i == 5 || i == 11 {
-                        ui.separator();
-                    }
-                    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
-                        ui.close_menu();
-                        self.run(command);
-                    }
-                }
-            });
-            ui.menu_button("View", |ui| {
-                for (label, view) in VIEWS {
-                    if ui.button(label).clicked() {
-                        ui.close_menu();
-                        self.viewport.set_view(view);
-                    }
-                }
-                ui.separator();
-                if ui.button("Zoom to fit (F)").clicked() {
-                    ui.close_menu();
-                    self.viewport.request_fit();
-                }
-            });
-            ui.menu_button("Tools", |ui| {
-                if ui.button("Equations…").clicked() {
-                    ui.close_menu();
-                    self.equations.show(EquationsTab::Equations);
-                }
-                if ui.button("Dimensions…").clicked() {
-                    ui.close_menu();
-                    self.equations.show(EquationsTab::Dimensions);
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("About Oxyde").clicked() {
-                    ui.close_menu();
-                    self.dialog = Some(Dialog::About);
-                }
-            });
-        });
-    }
-
-    fn command_bar(&mut self, ui: &mut egui::Ui) {
-        if self.sketch.is_some() {
-            self.sketch_command_bar(ui);
-            return;
-        }
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .button("Sketch")
-                .on_hover_text("New sketch on a plane or on the selected face")
-                .clicked()
-            {
-                self.begin_sketch();
-            }
-            let has_sketch = !self.sketches().is_empty();
-            for (label, command) in [
-                ("Extruded Boss", Command::Extrude(ExtrudeOp::Boss)),
-                ("Revolved Boss", Command::Revolve(ExtrudeOp::Boss)),
-                ("Extruded Cut", Command::Extrude(ExtrudeOp::Cut)),
-                ("Revolved Cut", Command::Revolve(ExtrudeOp::Cut)),
-            ] {
-                if ui
-                    .add_enabled(has_sketch, egui::Button::new(label))
-                    .clicked()
-                {
-                    self.run(command);
-                }
-            }
-            let has_edges = self
-                .selection
-                .iter()
-                .any(|s| matches!(s, Selected::Edge(_)));
-            if ui
-                .add_enabled(has_edges, egui::Button::new("Fillet"))
-                .on_disabled_hover_text("Select edges in the viewport first")
-                .clicked()
-            {
-                self.begin_blend(true);
-            }
-            if ui
-                .add_enabled(has_edges, egui::Button::new("Chamfer"))
-                .on_disabled_hover_text("Select edges in the viewport first")
-                .clicked()
-            {
-                self.begin_blend(false);
-            }
-            let has_body = self.doc.part.body().is_some();
-            for (label, command, hint) in [
-                ("Shell", Command::Shell, "Select the faces to remove first"),
-                (
-                    "Linear Pattern",
-                    Command::Pattern(PatternKind::Linear),
-                    "Select an edge for the direction first",
-                ),
-                (
-                    "Circular Pattern",
-                    Command::Pattern(PatternKind::Circular),
-                    "Select a round edge, a cylindrical face or an axis first",
-                ),
-                (
-                    "Mirror",
-                    Command::Pattern(PatternKind::Mirror),
-                    "Select a flat face or a plane first",
-                ),
-            ] {
-                if ui
-                    .add_enabled(has_body, egui::Button::new(label))
-                    .on_hover_text(hint)
-                    .clicked()
-                {
-                    self.run(command);
-                }
-            }
-            ui.menu_button("Reference Geometry", |ui| {
-                if ui.button("Plane…").clicked() {
-                    ui.close_menu();
-                    self.run(Command::RefPlane);
-                }
-                if ui.button("Axis…").clicked() {
-                    ui.close_menu();
-                    self.run(Command::RefAxis);
-                }
-            });
-            ui.separator();
-            for (label, view) in VIEWS {
-                if ui.button(label).clicked() {
-                    self.viewport.set_view(view);
-                }
-            }
-            if ui.button("Fit").clicked() {
-                self.viewport.request_fit();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(self.doc.can_undo(), egui::Button::new("Undo"))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(self.doc.can_redo(), egui::Button::new("Redo"))
-                .clicked()
-            {
-                self.redo();
-            }
-        });
-    }
-
-    fn sketch_command_bar(&mut self, ui: &mut egui::Ui) {
-        let mut finish = None;
-        let Some(session) = self.sketch.as_mut() else {
-            return;
-        };
-        let viewport = &mut self.viewport;
-        ui.horizontal(|ui| {
-            if ui
-                .button("Exit sketch")
-                .on_hover_text("Keep the changes (Esc)")
-                .clicked()
-            {
-                finish = Some(true);
-            }
-            if ui
-                .button("Discard")
-                .on_hover_text("Leave the sketch without keeping the changes")
-                .clicked()
-            {
-                finish = Some(false);
-            }
-            ui.separator();
-            for (tool, label) in Tool::ALL {
-                if ui.selectable_label(session.tool == tool, label).clicked() {
-                    session.set_tool(tool);
-                }
-            }
-            ui.separator();
-            if ui.button("Normal to").clicked() {
-                viewport.look_at_plane(&session.plane);
-            }
-            if ui.button("Fit").clicked() {
-                viewport.request_fit();
-            }
-            ui.separator();
-            if ui.button("Undo").on_hover_text("Ctrl+Z").clicked() {
-                session.undo();
-            }
-        });
-        if let Some(keep) = finish {
-            self.finish_sketch(keep);
-        }
-    }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let revision = self.doc.revision;
@@ -923,28 +755,62 @@ impl OxydeApp {
                 Some(session) => sketch_mode::interact(session, &self.viewport, ui, &output),
                 None => None,
             };
-            if let Some(SketchRequest::EditDimension(index)) = request {
-                self.open_dimension_editor(index);
+            match request {
+                Some(SketchRequest::EditDimension(index)) => self.open_dimension_editor(index),
+                Some(SketchRequest::NewDimension(option)) => {
+                    self.dialog = Some(Dialog::Dimension {
+                        target: DimensionTarget::New(option.relation),
+                        label: option.label.trim_end_matches('…').to_owned(),
+                        name: None,
+                        value: option.shown,
+                        angle: option.angle,
+                    });
+                }
+                None => {}
             }
             self.sketch_context_menu(&output);
+            self.heads_up_toolbar(ui.ctx(), output.rect);
             return;
         }
-        let picks = self.selection_picks();
-        let hint = self
-            .doc
-            .part
-            .body()
-            .is_none()
-            .then_some("Start with Sketch, then Extruded Boss — or File › Open demo bracket");
+        let picks = self.panel_picks().unwrap_or_else(|| self.selection_picks());
+        let hint = (self.doc.part.body().is_none() && self.dialog.is_none()).then_some(
+            "Start with a sketch (Sketch tab), then Extrude it — or File › Open demo bracket",
+        );
         let output = self.viewport.ui(ui, picks, hint, false);
-        self.draw_references(ui, &output);
+        let overlays = self.draw_references(ui, &output);
         if let Some(pick) = output.clicked {
-            self.click(pick, output.additive);
+            let position = output.response.interact_pointer_pos();
+            let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some()));
+            match overlay {
+                Some(Overlay::Plane(plane)) => {
+                    if !self.offer_to_panel(PanelPick::Plane(plane)) {
+                        self.selected_plane = Some(plane);
+                        self.selected_feature = None;
+                        self.selection.clear();
+                    }
+                }
+                Some(Overlay::Reference(id)) => {
+                    if !self.offer_to_panel(PanelPick::Feature(id)) {
+                        self.selected_feature = Some(id);
+                        self.selected_plane = None;
+                    }
+                }
+                None => {
+                    let taken = match self.panel_pick(pick) {
+                        Some(panel_pick) => self.offer_to_panel(panel_pick),
+                        None => false,
+                    };
+                    let panel_open = self.dialog.as_ref().is_some_and(|d| d.is_panel());
+                    if !taken && !panel_open {
+                        self.click(pick, output.additive);
+                    }
+                }
+            }
         }
         output.response.context_menu(|ui| {
             if ui.button("Sketch").clicked() {
                 ui.close_menu();
-                self.begin_sketch();
+                self.run(Command::Sketch);
             }
             let has_edges = self
                 .selection
@@ -955,14 +821,14 @@ impl OxydeApp {
                 .clicked()
             {
                 ui.close_menu();
-                self.begin_blend(true);
+                self.run(Command::Blend(true));
             }
             if ui
                 .add_enabled(has_edges, egui::Button::new("Chamfer"))
                 .clicked()
             {
                 ui.close_menu();
-                self.begin_blend(false);
+                self.run(Command::Blend(false));
             }
             ui.separator();
             if ui.button("Zoom to fit").clicked() {
@@ -972,8 +838,10 @@ impl OxydeApp {
             if ui.button("Clear selection").clicked() {
                 ui.close_menu();
                 self.selection.clear();
+                self.selected_plane = None;
             }
         });
+        self.heads_up_toolbar(ui.ctx(), output.rect);
     }
 
     fn open_dimension_editor(&mut self, id: oxyde_sketch::RelationId) {
@@ -1079,48 +947,106 @@ impl OxydeApp {
         }
     }
 
-    /// Reference planes (translucent squares) and axes (dash-dot lines) over the image, sized
-    /// to the part. The one selected in the timeline is highlighted.
-    fn draw_references(&self, ui: &egui::Ui, output: &ViewportOutput) {
-        use oxyde_geom::{Point3, Vec3};
-        use oxyde_model::ReferenceGeometry;
-        let references = self.doc.part.references();
-        if references.is_empty() {
-            return;
-        }
-        let (center, size) = match self.doc.part.body() {
-            Some(body) => {
-                let mut lo = [f64::INFINITY; 3];
-                let mut hi = [f64::NEG_INFINITY; 3];
-                for p in body.topology.vertices.iter().map(|v| v.point) {
-                    for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
-                        lo[k] = lo[k].min(value);
-                        hi[k] = hi[k].max(value);
-                    }
-                }
-                if lo[0].is_finite() {
-                    let c = Point3::new(
-                        (lo[0] + hi[0]) / 2.0,
-                        (lo[1] + hi[1]) / 2.0,
-                        (lo[2] + hi[2]) / 2.0,
-                    );
-                    let d = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
-                    (c, (d * 0.6).max(10.0))
-                } else {
-                    (Point3::ORIGIN, 50.0)
-                }
-            }
-            None => (Point3::ORIGIN, 50.0),
+    /// Centre and size of the part, for sizing planes and axes drawn over it.
+    fn display_extent(&self) -> (Point3, f64) {
+        let Some(body) = self.doc.part.body() else {
+            return (Point3::ORIGIN, 50.0);
         };
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in body.topology.vertices.iter().map(|v| v.point) {
+            for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(value);
+                hi[k] = hi[k].max(value);
+            }
+        }
+        if !lo[0].is_finite() {
+            return (Point3::ORIGIN, 50.0);
+        }
+        let c = Point3::new(
+            (lo[0] + hi[0]) / 2.0,
+            (lo[1] + hi[1]) / 2.0,
+            (lo[2] + hi[2]) / 2.0,
+        );
+        let d = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+        (c, (d * 0.6).max(10.0))
+    }
+
+    /// Whether the open command can use a plane clicked in the viewport.
+    fn wants_planes(&self) -> bool {
+        match &self.dialog {
+            Some(Dialog::ChoosePlane | Dialog::RefPlane(_)) => true,
+            Some(Dialog::Pattern(d)) => d.kind == PatternKind::Mirror,
+            Some(Dialog::RefAxis(d)) => d.two_planes,
+            _ => false,
+        }
+    }
+
+    /// Draws the standard planes (when one is selected or the open command wants a plane),
+    /// the reference planes (translucent squares) and axes (dash-dot lines) over the image,
+    /// sized to the part. Returns them for clicking.
+    fn draw_references(
+        &self,
+        ui: &egui::Ui,
+        output: &ViewportOutput,
+    ) -> Vec<(Overlay, OverlayShape)> {
+        let mut overlays = Vec::new();
+        let (center, size) = self.display_extent();
         let painter = ui.painter_at(output.rect);
         let to_screen = |p: Point3| self.viewport.to_screen(p, output);
-        for (id, geometry) in references {
-            let selected = self.selected_feature == Some(id);
-            let color = if selected {
+        let pointer = output.response.hover_pos();
+        let label_font = egui::FontId::proportional(11.0);
+
+        let draw_plane = |plane: Plane, name: String, selected: bool| -> OverlayShape {
+            let to_center = center - plane.origin;
+            let c = center - plane.normal * to_center.dot(plane.normal);
+            let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
+            let corners: Vec<egui::Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+                .into_iter()
+                .map(|(a, b)| to_screen(c + u * a + v * b))
+                .collect();
+            let quad = [corners[0], corners[1], corners[2], corners[3]];
+            let hovered = pointer.is_some_and(|p| near_outline(&quad, p) || inside(&quad, p))
+                && self.wants_planes();
+            let color = if selected || hovered {
                 egui::Color32::from_rgb(230, 120, 0)
             } else {
                 egui::Color32::from_rgb(60, 120, 200)
             };
+            painter.add(egui::Shape::convex_polygon(
+                corners,
+                color.gamma_multiply(0.12),
+                egui::Stroke::new(if selected || hovered { 2.0 } else { 1.0 }, color),
+            ));
+            painter.text(
+                quad[3],
+                egui::Align2::LEFT_BOTTOM,
+                name,
+                label_font.clone(),
+                color,
+            );
+            OverlayShape::Quad(quad)
+        };
+
+        let all_planes = self.wants_planes();
+        for standard in [
+            StandardPlane::Front,
+            StandardPlane::Top,
+            StandardPlane::Right,
+        ] {
+            let selected = self.selected_plane == Some(standard);
+            if all_planes || selected {
+                let shape = draw_plane(
+                    standard.plane(),
+                    format!("{} Plane", plane_name(standard)),
+                    selected,
+                );
+                overlays.push((Overlay::Plane(standard), shape));
+            }
+        }
+        let highlighted = self.panel_features();
+        for (id, geometry) in self.doc.part.references() {
+            let selected = self.selected_feature == Some(id) || highlighted.contains(&id);
             let name = self
                 .doc
                 .part
@@ -1128,30 +1054,16 @@ impl OxydeApp {
                 .map(|f| f.name().to_owned())
                 .unwrap_or_default();
             match geometry {
-                ReferenceGeometry::Plane(plane) => {
-                    let to_center = center - plane.origin;
-                    let c = center - plane.normal * to_center.dot(plane.normal);
-                    let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
-                    let corners: Vec<egui::Pos2> =
-                        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                            .into_iter()
-                            .map(|(a, b)| to_screen(c + u * a + v * b))
-                            .collect();
-                    let label_at = corners[3];
-                    painter.add(egui::Shape::convex_polygon(
-                        corners,
-                        color.gamma_multiply(0.12),
-                        egui::Stroke::new(if selected { 2.0 } else { 1.0 }, color),
-                    ));
-                    painter.text(
-                        label_at,
-                        egui::Align2::LEFT_BOTTOM,
-                        name,
-                        egui::FontId::proportional(11.0),
-                        color,
-                    );
+                ReferenceGeometry::Plane(p) => {
+                    let shape = draw_plane(p, name, selected);
+                    overlays.push((Overlay::Reference(id), shape));
                 }
                 ReferenceGeometry::Axis(axis) => {
+                    let color = if selected {
+                        egui::Color32::from_rgb(230, 120, 0)
+                    } else {
+                        egui::Color32::from_rgb(60, 120, 200)
+                    };
                     let t = (center - axis.origin).dot(axis.direction);
                     let c = axis.origin + axis.direction * t;
                     let a = to_screen(c - axis.direction * size);
@@ -1166,12 +1078,14 @@ impl OxydeApp {
                         b,
                         egui::Align2::LEFT_CENTER,
                         name,
-                        egui::FontId::proportional(11.0),
+                        label_font.clone(),
                         color,
                     );
+                    overlays.push((Overlay::Reference(id), OverlayShape::Segment(a, b)));
                 }
             }
         }
+        overlays
     }
 
     /// Re-tessellates the body after each rebuild.
@@ -1194,10 +1108,45 @@ impl OxydeApp {
         }
     }
 
+    /// The plane "Normal To" turns the view to: the sketch's, else the selected plane or
+    /// flat face.
+    pub(crate) fn normal_to_target(&self) -> Option<Plane> {
+        if let Some(session) = &self.sketch {
+            return Some(session.plane);
+        }
+        if let Some(plane) = self.selected_plane {
+            return Some(plane.plane());
+        }
+        if let Some(Some(ReferenceGeometry::Plane(p))) =
+            self.selected_feature.map(|id| self.doc.part.reference(id))
+        {
+            return Some(p);
+        }
+        let face = self.selected_planar_face()?;
+        let body = self.doc.part.body()?;
+        let info = body
+            .topology
+            .faces
+            .get(body.naming.find_face(&face)? as usize)?;
+        let normal = info.normal?;
+        let helper = if normal.x.abs() < 0.9 {
+            Vec3::X
+        } else {
+            Vec3::Y
+        };
+        let x_dir = helper - normal * helper.dot(normal);
+        let length = x_dir.dot(x_dir).sqrt();
+        Some(Plane {
+            origin: info.centroid,
+            x_dir: x_dir * (1.0 / length),
+            normal,
+        })
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
         let command = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
-        let (redo_shift, undo, redo, save, open, new) = ctx.input_mut(|i| {
+        let (redo_shift, undo, redo, save, open, new, rebuild) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(
                     Modifiers::COMMAND | Modifiers::SHIFT,
@@ -1208,6 +1157,7 @@ impl OxydeApp {
                 i.consume_shortcut(&command(Key::S)),
                 i.consume_shortcut(&command(Key::O)),
                 i.consume_shortcut(&command(Key::N)),
+                i.consume_shortcut(&command(Key::B)),
             )
         });
         if let Some(session) = self.sketch.as_mut() {
@@ -1231,6 +1181,10 @@ impl OxydeApp {
         }
         if new {
             self.guard(PendingAction::New, ctx);
+        }
+        if rebuild {
+            self.doc.release(&mut self.kernel);
+            self.rebuild();
         }
 
         // Plain keys only when no text field has the focus.
@@ -1261,6 +1215,7 @@ impl OxydeApp {
             }
             if escape {
                 self.selection.clear();
+                self.selected_plane = None;
             }
         }
     }
@@ -1285,12 +1240,72 @@ impl OxydeApp {
     }
 }
 
-const VIEWS: [(&str, StandardView); 4] = [
-    ("Front", StandardView::Front),
-    ("Top", StandardView::Top),
-    ("Right", StandardView::Right),
-    ("Isometric", StandardView::Isometric),
-];
+fn is_step(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("step") || e.eq_ignore_ascii_case("stp"))
+}
+
+fn pick_step() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("STEP", &["step", "stp"])
+        .pick_file()
+}
+
+/// Whether `p` is inside a convex quad.
+fn inside(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
+    let mut sign = 0.0f32;
+    for k in 0..4 {
+        let (a, b) = (quad[k], quad[(k + 1) % 4]);
+        let cross = (b - a).x * (p - a).y - (b - a).y * (p - a).x;
+        if cross.abs() < 1e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 {
+        ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p - (a + ab * t)).length()
+}
+
+fn near_outline(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
+    (0..4).any(|k| segment_distance(p, quad[k], quad[(k + 1) % 4]) < 6.0)
+}
+
+/// The overlay clicked at `p`: an outline or axis near the pointer first; inside a plane
+/// only when the click did not land on the part.
+fn overlay_at(
+    overlays: &[(Overlay, OverlayShape)],
+    p: egui::Pos2,
+    on_part: bool,
+) -> Option<Overlay> {
+    let near = overlays.iter().find(|(_, shape)| match shape {
+        OverlayShape::Quad(q) => near_outline(q, p),
+        OverlayShape::Segment(a, b) => segment_distance(p, *a, *b) < 6.0,
+    });
+    if let Some((overlay, _)) = near {
+        return Some(*overlay);
+    }
+    if on_part {
+        return None;
+    }
+    overlays.iter().find_map(|(overlay, shape)| match shape {
+        OverlayShape::Quad(q) if inside(q, p) => Some(*overlay),
+        _ => None,
+    })
+}
 
 /// Mesh precision: about a thousandth of the part size.
 fn deflection(topology: &Topology) -> f64 {
@@ -1326,13 +1341,17 @@ impl eframe::App for OxydeApp {
         egui::SidePanel::left("feature_manager")
             .resizable(true)
             .default_width(290.0)
-            .min_width(200.0)
-            .show(ctx, |ui| self.timeline_ui(ui));
+            .min_width(220.0)
+            .show(ctx, |ui| {
+                self.property_manager(ui);
+                self.timeline_ui(ui);
+            });
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport_ui(ui));
 
         self.equations_window(ctx);
+        self.evaluate_windows(ctx);
         self.dialogs_ui(ctx);
         self.update_title(ctx);
     }

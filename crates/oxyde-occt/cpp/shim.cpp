@@ -10,6 +10,8 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeShape.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
@@ -35,7 +37,13 @@
 #include <IFSelect_ReturnStatus.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
+#include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_Sewing.hxx>
+#include <ShapeFix_Shape.hxx>
+#include <TopoDS_Shell.hxx>
+#include <sstream>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -342,6 +350,38 @@ void record_profile_faces(BRepBuilderAPI_MakeShape& sweep, const TopoDS_Shape& b
     }
 }
 
+// Faces the sweep's history left without a source, matched to the profile edge lying on them.
+// OCCT 8 no longer reports the planar faces of a revolve through Generated(); a revolved
+// face still contains its profile edge (at angle zero), so the edge's middle lies on it.
+void record_unnamed_profile_faces(const TopoDS_Shape& base,
+                                  const std::vector<SegmentMark>& marks,
+                                  const TopTools_IndexedMapOfShape& result_faces,
+                                  OpResultData& out) {
+    TopTools_IndexedMapOfShape base_edges;
+    TopExp::MapShapes(base, TopAbs_EDGE, base_edges);
+    for (int f = 1; f <= result_faces.Extent(); ++f) {
+        if (!out.faces[static_cast<std::size_t>(f - 1)].sources.empty()) {
+            continue;
+        }
+        const TopoDS_Face& face = TopoDS::Face(result_faces(f));
+        for (int i = 1; i <= base_edges.Extent(); ++i) {
+            const TopoDS_Edge& edge = TopoDS::Edge(base_edges(i));
+            std::uint32_t id = 0;
+            if (!find_segment(edge, marks, id)) {
+                continue;
+            }
+            const BRepAdaptor_Curve curve(edge);
+            const gp_Pnt middle =
+                curve.Value((curve.FirstParameter() + curve.LastParameter()) / 2.0);
+            BRepExtrema_DistShapeShape distance(BRepBuilderAPI_MakeVertex(middle).Vertex(), face);
+            if (distance.IsDone() && distance.Value() < 1e-6) {
+                add_source(out, result_faces, face, SourceKind::ProfileSegment, 0, id);
+                break;
+            }
+        }
+    }
+}
+
 // ---- Topology helpers ----------------------------------------------------------------------
 
 AxisData axis_data(const gp_Ax1& axis) {
@@ -506,6 +546,7 @@ OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionDa
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
         OpResultData out = empty_result(result_faces);
         record_profile_faces(revol, base, marks, result_faces, out);
+        record_unnamed_profile_faces(base, marks, result_faces, out);
         if (!full) {
             for (TopExp_Explorer it(revol.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
                 add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
@@ -955,6 +996,68 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes, rust::Str pat
         if (writer.Write(file.c_str()) != IFSelect_RetDone) {
             throw std::runtime_error("could not write " + file);
         }
+    });
+}
+
+std::uint64_t Session::import_step(rust::Slice<const std::uint8_t> data) {
+    return guarded("import_step", [&] {
+        std::istringstream stream(
+            std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+        STEPControl_Reader reader;
+        if (reader.ReadStream("import.step", stream) != IFSelect_RetDone) {
+            throw std::runtime_error("not a readable STEP file");
+        }
+        reader.TransferRoots();
+        const TopoDS_Shape all = reader.OneShape();
+        if (all.IsNull()) {
+            throw std::runtime_error("the STEP file holds no geometry");
+        }
+
+        TopTools_IndexedMapOfShape solids;
+        TopExp::MapShapes(all, TopAbs_SOLID, solids);
+        if (solids.Extent() == 0) {
+            // Surfaces only: sew them, and keep the closed shells as solids.
+            BRepBuilderAPI_Sewing sewing(1.0e-3);
+            sewing.Add(all);
+            sewing.Perform();
+            TopTools_IndexedMapOfShape shells;
+            TopExp::MapShapes(sewing.SewedShape(), TopAbs_SHELL, shells);
+            for (int i = 1; i <= shells.Extent(); ++i) {
+                const TopoDS_Shell& shell = TopoDS::Shell(shells(i));
+                if (BRep_Tool::IsClosed(shell)) {
+                    BRepBuilderAPI_MakeSolid solid(shell);
+                    if (solid.IsDone()) {
+                        solids.Add(solid.Solid());
+                    }
+                }
+            }
+        }
+        if (solids.Extent() == 0) {
+            throw std::runtime_error("the STEP file has no solid body (open surfaces only)");
+        }
+
+        TopoDS_Shape result;
+        if (solids.Extent() == 1) {
+            result = solids(1);
+        } else {
+            TopoDS_Compound compound;
+            BRep_Builder builder;
+            builder.MakeCompound(compound);
+            for (int i = 1; i <= solids.Extent(); ++i) {
+                builder.Add(compound, solids(i));
+            }
+            result = compound;
+        }
+        ShapeFix_Shape fix(result);
+        fix.Perform();
+        result = fix.Shape();
+        // Some exporters write solids inside out.
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+        return insert(result);
     });
 }
 

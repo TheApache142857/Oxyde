@@ -1,12 +1,11 @@
-//! Windows of the features added in M3–M5: revolve, shell, reference plane and axis,
-//! linear and circular patterns, mirror. Each opens for a new feature (from the command
-//! bar) or for an existing one (double-click in the timeline).
+//! Commands of the features added in M3–M5: revolve, shell, reference plane and axis,
+//! linear and circular patterns, mirror. Each opens in the PropertyManager for a new feature
+//! (from the command bar) or for an existing one (double-click in the timeline).
 //!
-//! Planes, axes and directions are picked from lists: the standard planes and axes, the
-//! reference planes and axes before the feature, and whatever suitable faces and edges are
-//! selected in the viewport.
+//! Planes, axes and directions start from what is selected and are listed with the
+//! standard planes and axes and the reference geometry before the feature; clicking in the
+//! viewport or the timeline while the command is open adds to the lists.
 
-use eframe::egui;
 use oxyde_model::{
     AxisRef, CircularPattern, ExtrudeOp, FaceName, Feature, FeatureId, FeatureKind,
     FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane,
@@ -15,7 +14,7 @@ use oxyde_model::{
 use oxyde_sketch::Geometry;
 
 use crate::app::{OxydeApp, Selected};
-use crate::dialogs::{Answer, Dialog, ok_cancel, plane_name, positive_length, window};
+use crate::dialogs::{Dialog, plane_name};
 
 /// Labelled choices for a combo box.
 pub type Choices<T> = Vec<(String, T)>;
@@ -24,13 +23,13 @@ pub struct RevolveDialog {
     pub editing: Option<FeatureId>,
     /// Full name of the angle dimension, when editing.
     pub dimension: Option<String>,
-    pub sketch: FeatureId,
-    pub sketches: Vec<(FeatureId, String)>,
+    /// The sketch to revolve; picked in the timeline.
+    pub sketch: Option<FeatureId>,
     pub op: ExtrudeOp,
     pub axes: Choices<RevolveAxis>,
     pub axis: usize,
     /// The sketch `axes` were listed for.
-    pub axes_for: FeatureId,
+    pub axes_for: Option<FeatureId>,
     /// Degrees.
     pub angle: f64,
     pub mid_plane: bool,
@@ -40,10 +39,8 @@ pub struct RevolveDialog {
 pub struct ShellDialog {
     pub editing: Option<FeatureId>,
     pub dimension: Option<String>,
+    /// Faces to remove, picked in the viewport.
     pub faces: Vec<FaceName>,
-    /// Faces selected in the viewport when the window opened (editing only).
-    pub selected_faces: Vec<FaceName>,
-    pub use_selection: bool,
     pub thickness: f64,
     pub outward: bool,
 }
@@ -73,6 +70,8 @@ pub struct PatternDialog {
     pub spacing2: f64,
     pub count2: u32,
     pub reverse2: bool,
+    /// Whether clicked edges set direction 2 rather than direction 1.
+    pub second_next: bool,
     /// Degrees.
     pub angle: f64,
     pub equal_spacing: bool,
@@ -97,36 +96,8 @@ pub struct AxisDialog {
     pub planes: Choices<PlaneRef>,
     pub plane_a: usize,
     pub plane_b: usize,
-}
-
-fn combo<T>(ui: &mut egui::Ui, id: &str, choices: &[(String, T)], selected: &mut usize) {
-    let text = choices
-        .get(*selected)
-        .map_or("(none available)", |(label, _)| label.as_str());
-    egui::ComboBox::from_id_source(id)
-        .selected_text(text)
-        .width(200.0)
-        .show_ui(ui, |ui| {
-            for (i, (label, _)) in choices.iter().enumerate() {
-                ui.selectable_value(selected, i, label);
-            }
-        });
-}
-
-fn degrees(ui: &mut egui::Ui, value: &mut f64) {
-    ui.add(egui::DragValue::new(value).speed(1.0).suffix("°"));
-    *value = value.clamp(0.01, 360.0);
-}
-
-fn count(ui: &mut egui::Ui, value: &mut u32) {
-    ui.add(egui::DragValue::new(value).speed(0.1));
-    *value = (*value).clamp(1, 1000);
-}
-
-fn dimension_note(ui: &mut egui::Ui, name: Option<&String>) {
-    if let Some(name) = name {
-        ui.label(egui::RichText::new(name).small().weak());
-    }
+    /// The next clicked plane sets the second plane.
+    pub next_b: bool,
 }
 
 /// Position of `value` in `choices`, or 0.
@@ -249,11 +220,14 @@ impl OxydeApp {
     /// then the other axes.
     fn revolve_axis_choices(
         &self,
-        sketch: FeatureId,
+        sketch: Option<FeatureId>,
         editing: Option<FeatureId>,
     ) -> Choices<RevolveAxis> {
         let mut out = Vec::new();
-        if let Some(FeatureKind::Sketch(s)) = self.doc.part.feature(sketch).map(|f| f.kind()) {
+        let kind = sketch
+            .and_then(|id| self.doc.part.feature(id))
+            .map(|f| f.kind());
+        if let Some(FeatureKind::Sketch(s)) = kind {
             let mut lines: Vec<(bool, u32)> = s
                 .geometry
                 .entities()
@@ -314,7 +288,7 @@ impl OxydeApp {
     pub(crate) fn open_revolve(
         &mut self,
         editing: Option<FeatureId>,
-        sketch: FeatureId,
+        sketch: Option<FeatureId>,
         op: ExtrudeOp,
         existing: Option<&Revolve>,
     ) {
@@ -325,7 +299,6 @@ impl OxydeApp {
             editing,
             dimension: editing.and_then(|id| self.parameter_full_name(id, FeatureParameter::Angle)),
             sketch,
-            sketches: self.sketches(),
             op,
             axes,
             axis,
@@ -336,32 +309,21 @@ impl OxydeApp {
         }));
     }
 
-    pub(crate) fn begin_revolve(&mut self, op: ExtrudeOp) {
-        let selected = self.selected_feature.filter(|id| {
-            self.doc
-                .part
-                .feature(*id)
-                .is_some_and(|f| matches!(f.kind(), FeatureKind::Sketch(_)))
-        });
-        match selected.or_else(|| self.sketches().last().map(|(id, _)| *id)) {
-            Some(sketch) => self.open_revolve(None, sketch, op, None),
-            None => self.status = "Create a sketch first".to_owned(),
-        }
+    pub(crate) fn begin_revolve(&mut self) {
+        let sketch = self.sketch_to_use();
+        self.open_revolve(None, sketch, ExtrudeOp::Boss, None);
     }
 
     pub(crate) fn open_shell(&mut self, editing: Option<FeatureId>, existing: Option<&Shell>) {
-        let selected = self.selected_faces();
-        let (faces, selected_faces) = match existing {
-            Some(shell) => (shell.faces.clone(), selected),
-            None => (selected, Vec::new()),
+        let faces = match existing {
+            Some(shell) => shell.faces.clone(),
+            None => self.selected_faces(),
         };
         self.dialog = Some(Dialog::Shell(ShellDialog {
             editing,
             dimension: editing
                 .and_then(|id| self.parameter_full_name(id, FeatureParameter::Thickness)),
             faces,
-            selected_faces,
-            use_selection: false,
             thickness: existing.map_or(2.0, |s| s.thickness),
             outward: existing.is_some_and(|s| s.outward),
         }));
@@ -407,6 +369,7 @@ impl OxydeApp {
             spacing2: 20.0,
             count2: 2,
             reverse2: false,
+            second_next: false,
             angle: 360.0,
             equal_spacing: true,
             plane: 0,
@@ -548,6 +511,7 @@ impl OxydeApp {
             planes,
             plane_a,
             plane_b,
+            next_b: false,
         }));
     }
 
@@ -563,12 +527,15 @@ impl OxydeApp {
     }
 
     pub(crate) fn apply_revolve(&mut self, d: RevolveDialog) {
+        let Some(sketch) = d.sketch else {
+            return;
+        };
         let Some((_, axis)) = d.axes.get(d.axis) else {
             self.status = "Choose an axis to revolve about".to_owned();
             return;
         };
         let kind = FeatureKind::Revolve(Revolve {
-            sketch: d.sketch,
+            sketch,
             op: d.op,
             axis: axis.clone(),
             angle: d.angle.to_radians(),
@@ -579,13 +546,8 @@ impl OxydeApp {
     }
 
     pub(crate) fn apply_shell(&mut self, d: ShellDialog) {
-        let faces = if d.use_selection && !d.selected_faces.is_empty() {
-            d.selected_faces
-        } else {
-            d.faces
-        };
         let kind = FeatureKind::Shell(Shell {
-            faces,
+            faces: d.faces,
             thickness: d.thickness,
             outward: d.outward,
         });
@@ -695,245 +657,4 @@ impl OxydeApp {
             d.axes_for = d.sketch;
         }
     }
-}
-
-// ---- Windows ---------------------------------------------------------------------------------
-
-fn apply_label(editing: Option<FeatureId>, new: &'static str) -> &'static str {
-    if editing.is_some() { "Apply" } else { new }
-}
-
-pub(crate) fn revolve_window(ctx: &egui::Context, d: &mut RevolveDialog) -> Answer {
-    let mut answer = Answer::Open;
-    let title = match d.op {
-        ExtrudeOp::Boss => "Revolved Boss",
-        ExtrudeOp::Cut => "Revolved Cut",
-    };
-    window(title).show(ctx, |ui| {
-        egui::Grid::new("revolve_dialog")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Sketch");
-                let current = d
-                    .sketches
-                    .iter()
-                    .find(|(id, _)| *id == d.sketch)
-                    .map_or_else(String::new, |(_, name)| name.clone());
-                egui::ComboBox::from_id_source("revolve_sketch")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &d.sketches {
-                            ui.selectable_value(&mut d.sketch, *id, name);
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Operation");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.op, ExtrudeOp::Boss, "Boss");
-                    ui.radio_value(&mut d.op, ExtrudeOp::Cut, "Cut");
-                });
-                ui.end_row();
-
-                ui.label("Axis");
-                combo(ui, "revolve_axis", &d.axes, &mut d.axis);
-                ui.end_row();
-
-                ui.label("Angle");
-                ui.horizontal(|ui| {
-                    degrees(ui, &mut d.angle);
-                    dimension_note(ui, d.dimension.as_ref());
-                });
-                ui.end_row();
-            });
-        ui.checkbox(&mut d.mid_plane, "Mid-plane (half on each side)");
-        if !d.mid_plane {
-            ui.checkbox(&mut d.reverse, "Reverse direction");
-        }
-        ui.label(
-            egui::RichText::new("Tip: draw a construction centerline in the sketch as the axis.")
-                .small()
-                .weak(),
-        );
-        answer = ok_cancel(ui, apply_label(d.editing, "Revolve"));
-    });
-    answer
-}
-
-pub(crate) fn shell_window(ctx: &egui::Context, d: &mut ShellDialog) -> Answer {
-    let mut answer = Answer::Open;
-    window("Shell").show(ctx, |ui| {
-        if d.faces.is_empty() {
-            ui.label("No face removed: the part becomes a closed hollow body.");
-        } else {
-            ui.label(format!("{} face(s) removed", d.faces.len()));
-        }
-        if d.editing.is_some() && !d.selected_faces.is_empty() {
-            ui.checkbox(
-                &mut d.use_selection,
-                format!(
-                    "Remove the {} face(s) selected now instead",
-                    d.selected_faces.len()
-                ),
-            );
-        }
-        ui.horizontal(|ui| {
-            ui.label("Thickness");
-            positive_length(ui, &mut d.thickness);
-            dimension_note(ui, d.dimension.as_ref());
-        });
-        ui.checkbox(&mut d.outward, "Shell outward");
-        answer = ok_cancel(ui, apply_label(d.editing, "Shell"));
-    });
-    answer
-}
-
-pub(crate) fn pattern_window(ctx: &egui::Context, d: &mut PatternDialog) -> Answer {
-    let mut answer = Answer::Open;
-    let title = match d.kind {
-        PatternKind::Linear => "Linear Pattern",
-        PatternKind::Circular => "Circular Pattern",
-        PatternKind::Mirror => "Mirror",
-    };
-    window(title).show(ctx, |ui| {
-        ui.label("Features to copy");
-        egui::ScrollArea::vertical()
-            .max_height(120.0)
-            .show(ui, |ui| {
-                for (id, name) in &d.candidates {
-                    let mut checked = d.seeds.contains(id);
-                    if ui.checkbox(&mut checked, name).changed() {
-                        if checked {
-                            d.seeds.push(*id);
-                        } else {
-                            d.seeds.retain(|s| s != id);
-                        }
-                    }
-                }
-            });
-        ui.separator();
-        egui::Grid::new("pattern_dialog")
-            .num_columns(2)
-            .show(ui, |ui| match d.kind {
-                PatternKind::Linear => {
-                    ui.label("Direction");
-                    combo(ui, "pattern_axis", &d.axes, &mut d.axis);
-                    ui.end_row();
-                    ui.label("Spacing");
-                    positive_length(ui, &mut d.spacing);
-                    ui.end_row();
-                    ui.label("Instances");
-                    count(ui, &mut d.count);
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut d.reverse, "Reverse direction");
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut d.second, "Direction 2");
-                    ui.end_row();
-                    if d.second {
-                        ui.label("Direction 2");
-                        combo(ui, "pattern_axis2", &d.axes, &mut d.axis2);
-                        ui.end_row();
-                        ui.label("Spacing");
-                        positive_length(ui, &mut d.spacing2);
-                        ui.end_row();
-                        ui.label("Instances");
-                        count(ui, &mut d.count2);
-                        ui.end_row();
-                        ui.label("");
-                        ui.checkbox(&mut d.reverse2, "Reverse direction 2");
-                        ui.end_row();
-                    }
-                }
-                PatternKind::Circular => {
-                    ui.label("Axis");
-                    combo(ui, "pattern_axis", &d.axes, &mut d.axis);
-                    ui.end_row();
-                    ui.label(if d.equal_spacing {
-                        "Total angle"
-                    } else {
-                        "Angle between"
-                    });
-                    degrees(ui, &mut d.angle);
-                    ui.end_row();
-                    ui.label("Instances");
-                    count(ui, &mut d.count);
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut d.equal_spacing, "Equal spacing");
-                    ui.end_row();
-                    ui.label("");
-                    ui.checkbox(&mut d.reverse, "Reverse direction");
-                    ui.end_row();
-                }
-                PatternKind::Mirror => {
-                    ui.label("Mirror plane");
-                    combo(ui, "mirror_plane", &d.planes, &mut d.plane);
-                    ui.end_row();
-                }
-            });
-        if !d.dimensions.is_empty() {
-            ui.label(egui::RichText::new(d.dimensions.join(", ")).small().weak());
-        }
-        ui.label(
-            egui::RichText::new(
-                "Tip: select an edge, a face or an axis before opening this window.",
-            )
-            .small()
-            .weak(),
-        );
-        answer = ok_cancel(ui, apply_label(d.editing, "OK"));
-    });
-    answer
-}
-
-pub(crate) fn ref_plane_window(ctx: &egui::Context, d: &mut PlaneDialog) -> Answer {
-    let mut answer = Answer::Open;
-    window("Reference Plane").show(ctx, |ui| {
-        egui::Grid::new("plane_dialog")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Offset from");
-                combo(ui, "plane_base", &d.planes, &mut d.base);
-                ui.end_row();
-                ui.label("Distance");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut d.offset).speed(0.1).suffix(" mm"));
-                    dimension_note(ui, d.dimension.as_ref());
-                });
-                ui.end_row();
-            });
-        ui.checkbox(&mut d.flip, "Flip offset");
-        answer = ok_cancel(ui, apply_label(d.editing, "OK"));
-    });
-    answer
-}
-
-pub(crate) fn ref_axis_window(ctx: &egui::Context, d: &mut AxisDialog) -> Answer {
-    let mut answer = Answer::Open;
-    window("Reference Axis").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut d.two_planes, false, "Along an edge, face or axis");
-            ui.radio_value(&mut d.two_planes, true, "Two planes");
-        });
-        egui::Grid::new("axis_dialog")
-            .num_columns(2)
-            .show(ui, |ui| {
-                if d.two_planes {
-                    ui.label("First plane");
-                    combo(ui, "axis_plane_a", &d.planes, &mut d.plane_a);
-                    ui.end_row();
-                    ui.label("Second plane");
-                    combo(ui, "axis_plane_b", &d.planes, &mut d.plane_b);
-                    ui.end_row();
-                } else {
-                    ui.label("Along");
-                    combo(ui, "axis_along", &d.axes, &mut d.axis);
-                    ui.end_row();
-                }
-            });
-        answer = ok_cancel(ui, apply_label(d.editing, "OK"));
-    });
-    answer
 }

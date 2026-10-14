@@ -373,3 +373,151 @@ fn entity_ids_are_never_reused() {
     let third = reloaded.point(Point2::ORIGIN);
     assert!(third.0 > second.0);
 }
+
+// ---- Dimensions between entities, crossings and trimming -----------------------------------
+
+#[test]
+fn point_to_line_and_line_to_line_distances_solve() {
+    let mut s = ConstrainedSketch::new();
+    let base = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+    let top = s.line(Point2::new(1.0, 3.0), Point2::new(9.0, 3.2));
+    let p = s.point(Point2::new(4.0, -2.0));
+    s.constrain(Horizontal(base));
+    s.constrain(Horizontal(top));
+    s.constrain(LineDistance(top, base, 7.5));
+    s.constrain(PointLineDistance(p, base, 4.0));
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    let (a, _) = s.endpoints(base).unwrap();
+    let (b, _) = s.endpoints(top).unwrap();
+    let y0 = s.position(a).unwrap().y;
+    assert!(((s.position(b).unwrap().y - y0).abs() - 7.5).abs() < 1e-7);
+    assert!(((s.position(p).unwrap().y - y0).abs() - 4.0).abs() < 1e-7);
+}
+
+#[test]
+fn connected_curves_do_not_count_as_crossing() {
+    let mut s = ConstrainedSketch::new();
+    s.rectangle(Point2::new(0.0, 0.0), 10.0, 5.0);
+    assert!(s.intersections().is_empty());
+    s.line(Point2::new(5.0, -1.0), Point2::new(5.0, 6.0));
+    let crossings = s.intersections();
+    assert_eq!(crossings.len(), 2);
+    assert!(crossings.iter().any(|(_, _, p)| close(*p, 5.0, 0.0)));
+    assert!(crossings.iter().any(|(_, _, p)| close(*p, 5.0, 5.0)));
+}
+
+#[test]
+fn trimming_an_end_cuts_back_to_the_crossing() {
+    let mut s = ConstrainedSketch::new();
+    let h = s.line(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
+    let v = s.line(Point2::new(0.0, -10.0), Point2::new(0.0, 10.0));
+    let (_, old_end) = s.endpoints(h).unwrap();
+    assert!(s.trim(h, Point2::new(6.0, 0.3)));
+    let (start, end) = s.endpoints(h).unwrap();
+    assert!(close(s.position(start).unwrap(), -10.0, 0.0));
+    assert!(close(s.position(end).unwrap(), 0.0, 0.0));
+    assert!(s.entity(old_end).is_none(), "the cut-off end point is gone");
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == PointOnLine(end, v))
+    );
+    assert!(s.solve().unwrap().converged);
+}
+
+#[test]
+fn trimming_the_middle_splits_a_line() {
+    let mut s = ConstrainedSketch::new();
+    let h = s.line(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
+    s.constrain(Horizontal(h));
+    s.line(Point2::new(-5.0, -3.0), Point2::new(-5.0, 3.0));
+    s.line(Point2::new(5.0, -3.0), Point2::new(5.0, 3.0));
+    let preview = s.trim_preview(h, Point2::new(1.0, 0.0)).unwrap();
+    assert!(close(preview[0], -5.0, 0.0) && close(*preview.last().unwrap(), 5.0, 0.0));
+
+    let before = s.entities().len();
+    assert!(s.trim(h, Point2::new(1.0, 0.0)));
+    assert_eq!(
+        s.entities().len(),
+        before + 3,
+        "two cut points and a second line"
+    );
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    let lines: Vec<(Point2, Point2)> = s
+        .entities()
+        .iter()
+        .filter_map(|e| match e.geometry {
+            Geometry::Line { start, end } => {
+                Some((s.position(start).unwrap(), s.position(end).unwrap()))
+            }
+            _ => None,
+        })
+        .filter(|(a, b)| a.y.abs() < 1e-9 && b.y.abs() < 1e-9)
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines
+            .iter()
+            .any(|(a, b)| close(*a, -10.0, 0.0) && close(*b, -5.0, 0.0))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|(a, b)| close(*a, 5.0, 0.0) && close(*b, 10.0, 0.0))
+    );
+}
+
+#[test]
+fn trimming_a_circle_leaves_an_arc() {
+    let mut s = ConstrainedSketch::new();
+    let circle = s.circle(Point2::ORIGIN, 5.0);
+    s.line(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
+    assert!(s.trim(circle, Point2::new(0.4, 5.1)));
+    let Geometry::Arc { start, end, .. } = s.entity(circle).unwrap().geometry else {
+        panic!("still a circle");
+    };
+    // The lower half remains: counter-clockwise from (-5, 0) to (5, 0).
+    assert!(close(s.position(start).unwrap(), -5.0, 0.0));
+    assert!(close(s.position(end).unwrap(), 5.0, 0.0));
+    assert!(s.solve().unwrap().converged);
+}
+
+#[test]
+fn trimming_a_curve_nothing_crosses_deletes_it() {
+    let mut s = ConstrainedSketch::new();
+    let lone = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+    s.circle(Point2::new(0.0, 20.0), 3.0);
+    assert!(s.trim(lone, Point2::new(5.0, 0.0)));
+    assert!(s.entity(lone).is_none());
+    assert_eq!(s.entities().len(), 2, "the circle and its centre remain");
+}
+
+#[test]
+fn the_origin_is_a_fixed_point_that_survives_deletions() {
+    let mut s = ConstrainedSketch::new();
+    let origin = s.ensure_origin(Point2::ORIGIN);
+    assert_eq!(s.ensure_origin(Point2::ORIGIN), origin, "made once");
+    // A line from the origin, then deleted: the origin stays.
+    let end = s.point(Point2::new(10.0, 0.0));
+    let line = s.line_between(origin, end);
+    s.remove(&[line]);
+    assert_eq!(s.origin(), Some(origin));
+    s.remove(&[origin]);
+    assert_eq!(s.origin(), Some(origin), "cannot be deleted");
+    // A rectangle centred on it with a dimension from it.
+    let [bottom, right, ..] = s.rectangle(Point2::new(-4.0, -3.0), 9.0, 5.0);
+    let (corner, _) = s.endpoints(bottom).unwrap();
+    s.constrain(Length(bottom, 20.0));
+    s.constrain(Length(right, 10.0));
+    s.constrain(HorizontalDistance(origin, corner, 10.0));
+    s.constrain(VerticalDistance(origin, corner, 5.0));
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    assert!(close(s.position(corner).unwrap(), -10.0, -5.0));
+    assert!(close(s.position(origin).unwrap(), 0.0, 0.0));
+}

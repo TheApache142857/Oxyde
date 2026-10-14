@@ -13,3 +13,4 @@ oxyde-kernel = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-occt = { workspace = true }
 oxyde-sketch = { workspace = true }
+oxyde-format = { workspace = true }

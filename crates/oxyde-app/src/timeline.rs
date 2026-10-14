@@ -1,18 +1,23 @@
 //! The left panel: reference planes, the feature timeline and the rollback bar.
 //!
 //! Features are edited the SolidWorks way: double-click (or right-click › Edit) opens the
-//! feature's own window, or sketch mode for a sketch. Selecting a face or an edge in the
-//! viewport highlights the feature that created it. The rollback bar is a line with a handle
-//! that can be dragged between features.
+//! feature in the PropertyManager, or sketch mode for a sketch. Clicking a feature selects
+//! it for the next command; while a command is open, clicking hands the feature (a sketch
+//! to extrude, a feature to pattern, a plane…) to that command. Selecting a face or an edge
+//! in the viewport highlights the feature that created it. The rollback bar is a line with
+//! a handle that can be dragged between features.
 
 use eframe::egui::{self, Color32, CursorIcon, RichText, Sense, Stroke};
 use oxyde_model::{
-    FeatureId, FeatureKind, FeatureParameter, FeatureStatus, StandardPlane, TimelineEntry,
+    ExtrudeOp, FeatureId, FeatureKind, FeatureParameter, FeatureStatus, StandardPlane,
+    TimelineEntry,
 };
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
 use crate::features_ui::PatternKind;
+use crate::icons::{self, Icon};
+use crate::property_manager::PanelPick;
 
 const ERROR: Color32 = Color32::from_rgb(200, 40, 40);
 const WARNING: Color32 = Color32::from_rgb(210, 120, 0);
@@ -31,19 +36,90 @@ enum Action {
     Delete(FeatureId),
 }
 
+pub fn feature_icon(kind: &FeatureKind) -> Icon {
+    match kind {
+        FeatureKind::Sketch(_) => Icon::Sketch,
+        FeatureKind::Extrude(_) => Icon::Extrude,
+        FeatureKind::Revolve(_) => Icon::Revolve,
+        FeatureKind::Fillet(_) => Icon::Fillet,
+        FeatureKind::Chamfer(_) => Icon::Chamfer,
+        FeatureKind::Shell(_) => Icon::Shell,
+        FeatureKind::LinearPattern(_) => Icon::LinearPattern,
+        FeatureKind::CircularPattern(_) => Icon::CircularPattern,
+        FeatureKind::Mirror(_) => Icon::Mirror,
+        FeatureKind::Plane(_) => Icon::RefPlane,
+        FeatureKind::Axis(_) => Icon::RefAxis,
+        FeatureKind::Import(_) => Icon::Imported,
+    }
+}
+
+/// One row of the tree: icon, name, an optional status badge on the right.
+fn tree_row(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    cut: bool,
+    text: RichText,
+    highlighted: bool,
+    badge: Option<Icon>,
+) -> egui::Response {
+    let height = 22.0;
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        if highlighted {
+            ui.painter()
+                .rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
+        } else if response.hovered() {
+            ui.painter()
+                .rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let icon_rect =
+            egui::Rect::from_min_size(rect.min + egui::vec2(2.0, 2.0), egui::Vec2::splat(18.0));
+        icons::paint(ui.painter(), icon_rect, icon, true);
+        if cut {
+            icons::cut_badge(ui.painter(), icon_rect);
+        }
+        let galley = egui::WidgetText::from(text).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            width - 50.0,
+            egui::TextStyle::Body,
+        );
+        let text_pos = egui::pos2(
+            icon_rect.right() + 6.0,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(text_pos, galley, visuals.text_color());
+        if let Some(badge) = badge {
+            let badge_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.right() - 11.0, rect.center().y),
+                egui::Vec2::splat(15.0),
+            );
+            icons::paint(ui.painter(), badge_rect, badge, true);
+        }
+    }
+    response
+}
+
 impl OxydeApp {
     pub(crate) fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        ui.heading(self.doc.display_name());
+        ui.horizontal(|ui| {
+            icons::small(ui, Icon::Part, 22.0);
+            ui.heading(self.doc.display_name());
+        });
         ui.add_space(2.0);
 
         let mut action = None;
         let creator = self.selection_creator();
+        let referenced = self.panel_features();
         let enabled = self.sketch.is_none();
         ui.add_enabled_ui(enabled, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
                     for plane in [
                         StandardPlane::Front,
                         StandardPlane::Top,
@@ -51,11 +127,21 @@ impl OxydeApp {
                     ] {
                         let selected = self.selected_plane == Some(plane);
                         let label = format!("{} Plane", plane_name(plane));
-                        if ui.selectable_label(selected, label).clicked() {
+                        if tree_row(ui, Icon::Plane, false, RichText::new(label), selected, None)
+                            .clicked()
+                        {
                             action = Some(Action::SelectPlane(plane));
                         }
                     }
-                    ui.label(RichText::new("Origin").color(INACTIVE));
+                    tree_row(
+                        ui,
+                        Icon::Origin,
+                        false,
+                        RichText::new("Origin").color(INACTIVE),
+                        false,
+                        None,
+                    );
+                    ui.add_space(3.0);
                     ui.separator();
 
                     let entries = self.doc.part.timeline();
@@ -71,8 +157,9 @@ impl OxydeApp {
                         if index == active {
                             bar = Some(rollback_bar(ui));
                         }
-                        let highlighted =
-                            self.selected_feature == Some(entry.id) || creator == Some(entry.id);
+                        let highlighted = self.selected_feature == Some(entry.id)
+                            || creator == Some(entry.id)
+                            || referenced.contains(&entry.id);
                         rows.push(self.timeline_row(ui, entry, highlighted, &mut action));
                     }
                     if active == entries.len() {
@@ -116,29 +203,32 @@ impl OxydeApp {
         highlighted: bool,
         action: &mut Option<Action>,
     ) -> egui::Rect {
-        let suppressed = self
-            .doc
-            .part
-            .feature(entry.id)
-            .is_some_and(|f| f.is_suppressed());
+        let feature = self.doc.part.feature(entry.id);
+        let suppressed = feature.is_some_and(|f| f.is_suppressed());
+        let icon = feature.map_or(Icon::Part, |f| feature_icon(f.kind()));
+        let cut = feature.is_some_and(|f| match f.kind() {
+            FeatureKind::Extrude(e) => e.op == ExtrudeOp::Cut,
+            FeatureKind::Revolve(r) => r.op == ExtrudeOp::Cut,
+            _ => false,
+        });
         let label = if entry.under_defined {
             format!("(-) {}", entry.name)
         } else {
             entry.name.clone()
         };
-        let mut text = match &entry.status {
-            FeatureStatus::Error(_) => RichText::new(format!("⚠ {label}")).color(ERROR),
-            FeatureStatus::Warning(_) => RichText::new(format!("⚠ {label}")).color(WARNING),
-            FeatureStatus::Ok => RichText::new(label),
+        let (mut text, badge) = match &entry.status {
+            FeatureStatus::Error(_) => (RichText::new(label).color(ERROR), Some(Icon::Error)),
+            FeatureStatus::Warning(_) => (RichText::new(label).color(WARNING), Some(Icon::Warning)),
+            FeatureStatus::Ok => (RichText::new(label), None),
             FeatureStatus::Suppressed | FeatureStatus::RolledBack | FeatureStatus::Pending => {
-                RichText::new(label).color(INACTIVE)
+                (RichText::new(label).color(INACTIVE), None)
             }
         };
         if suppressed {
             text = text.strikethrough();
         }
 
-        let mut response = ui.selectable_label(highlighted, text);
+        let mut response = tree_row(ui, icon, cut, text, highlighted, badge);
         response = match &entry.status {
             FeatureStatus::Error(message) | FeatureStatus::Warning(message) => {
                 response.on_hover_text(message.as_str())
@@ -146,7 +236,12 @@ impl OxydeApp {
             _ if entry.under_defined => {
                 response.on_hover_text("Under defined: the sketch can still move")
             }
-            _ => response.on_hover_text(entry.type_name),
+            _ => match feature.map(|f| f.kind()) {
+                Some(FeatureKind::Import(import)) => {
+                    response.on_hover_text(format!("Imported from {}", import.file_name))
+                }
+                _ => response.on_hover_text(entry.type_name),
+            },
         };
         if response.double_clicked() {
             *action = Some(Action::Edit(entry.id));
@@ -186,11 +281,18 @@ impl OxydeApp {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::SelectPlane(plane) => {
+                if self.offer_to_panel(PanelPick::Plane(plane)) {
+                    return;
+                }
                 self.selected_plane = Some(plane);
                 self.selected_feature = None;
+                self.selection.clear();
                 self.doc.end_edit();
             }
             Action::Select(id) => {
+                if self.offer_to_panel(PanelPick::Feature(id)) {
+                    return;
+                }
                 self.selected_feature = Some(id);
                 self.selected_plane = None;
                 self.doc.end_edit();
@@ -264,6 +366,9 @@ impl OxydeApp {
         let Some(kind) = self.doc.part.feature(id).map(|f| f.kind().clone()) else {
             return;
         };
+        if self.sketch.is_some() {
+            self.finish_sketch(true);
+        }
         self.selected_feature = Some(id);
         match kind.clone() {
             FeatureKind::Sketch(_) => self.edit_sketch(id, false),
@@ -271,8 +376,7 @@ impl OxydeApp {
                 self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
                     editing: Some(id),
                     dimension: self.parameter_full_name(id, FeatureParameter::Depth),
-                    sketch: e.sketch,
-                    sketches: self.sketches(),
+                    sketch: Some(e.sketch),
                     op: e.op,
                     depth: e.extent.depth(),
                     mid_plane: matches!(e.extent, oxyde_model::ExtrudeExtent::MidPlane { .. }),
@@ -280,10 +384,7 @@ impl OxydeApp {
                 }));
             }
             FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
-                let fillet = matches!(
-                    self.doc.part.feature(id).map(|f| f.kind()),
-                    Some(FeatureKind::Fillet(_))
-                );
+                let fillet = matches!(kind, FeatureKind::Fillet(_));
                 let parameter = if fillet {
                     FeatureParameter::Radius
                 } else {
@@ -295,11 +396,9 @@ impl OxydeApp {
                     fillet,
                     size: b.size,
                     edges: b.edges,
-                    selected_edges: self.selected_edges(),
-                    use_selection: false,
                 }));
             }
-            FeatureKind::Revolve(r) => self.open_revolve(Some(id), r.sketch, r.op, Some(&r)),
+            FeatureKind::Revolve(r) => self.open_revolve(Some(id), Some(r.sketch), r.op, Some(&r)),
             FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
             FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),
             FeatureKind::Axis(axis) => self.open_ref_axis(Some(id), Some(&axis)),
@@ -310,6 +409,17 @@ impl OxydeApp {
                 self.open_pattern(Some(id), PatternKind::Circular, Some(&kind))
             }
             FeatureKind::Mirror(_) => self.open_pattern(Some(id), PatternKind::Mirror, Some(&kind)),
+            FeatureKind::Import(import) => {
+                self.status = format!(
+                    "{} holds the geometry of {}; it has nothing to edit",
+                    self.doc
+                        .part
+                        .feature(id)
+                        .map(|f| f.name().to_owned())
+                        .unwrap_or_default(),
+                    import.file_name
+                );
+            }
         }
     }
 }

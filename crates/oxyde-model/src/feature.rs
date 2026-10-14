@@ -179,6 +179,36 @@ impl Feature {
     }
 }
 
+/// The contents of an imported file. Copies share the bytes, so that undo snapshots of the
+/// timeline stay cheap.
+#[derive(Clone, PartialEq)]
+pub struct FileData(std::sync::Arc<Vec<u8>>);
+
+impl FileData {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(bytes))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for FileData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FileData({} bytes)", self.0.len())
+    }
+}
+
+/// Solid geometry imported from a STEP file ("Imported1"). The file's contents are kept in
+/// the part, so the part no longer needs the original file. Added to the body like a boss.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Import {
+    /// Name of the original file, for display.
+    pub file_name: String,
+    pub data: FileData,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FeatureKind {
     Sketch(Sketch),
@@ -194,6 +224,7 @@ pub enum FeatureKind {
     LinearPattern(LinearPattern),
     CircularPattern(CircularPattern),
     Mirror(Mirror),
+    Import(Import),
 }
 
 impl FeatureKind {
@@ -217,6 +248,7 @@ impl FeatureKind {
             FeatureKind::LinearPattern(_) => "LPattern",
             FeatureKind::CircularPattern(_) => "CirPattern",
             FeatureKind::Mirror(_) => "Mirror",
+            FeatureKind::Import(_) => "Imported",
         }
     }
 
@@ -225,7 +257,10 @@ impl FeatureKind {
     pub fn parameters(&self) -> Vec<(FeatureParameter, f64)> {
         use FeatureParameter as P;
         match self {
-            FeatureKind::Sketch(_) | FeatureKind::Axis(_) | FeatureKind::Mirror(_) => Vec::new(),
+            FeatureKind::Sketch(_)
+            | FeatureKind::Axis(_)
+            | FeatureKind::Mirror(_)
+            | FeatureKind::Import(_) => Vec::new(),
             FeatureKind::Extrude(e) => vec![(P::Depth, e.extent.depth())],
             FeatureKind::Revolve(r) => vec![(P::Angle, r.angle)],
             FeatureKind::Fillet(b) => vec![(P::Radius, b.size)],
@@ -343,6 +378,7 @@ impl FeatureKind {
                 out.extend(&m.seeds);
                 m.plane.collect_features(&mut out);
             }
+            FeatureKind::Import(_) => {}
         }
         out.sort();
         out.dedup();

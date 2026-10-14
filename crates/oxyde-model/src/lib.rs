@@ -31,8 +31,9 @@ pub use error::ModelError;
 pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};
 pub use feature::{
     AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
-    FeatureKind, FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
+    FeatureKind, FeatureParameter, FileData, Import, LinearPattern, Mirror, PatternDirection,
+    PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
+    StandardPlane,
 };
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
