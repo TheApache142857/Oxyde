@@ -12,6 +12,7 @@ use oxyde_model::{
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
+use crate::features_ui::PatternKind;
 
 const ERROR: Color32 = Color32::from_rgb(200, 40, 40);
 const WARNING: Color32 = Color32::from_rgb(210, 120, 0);
@@ -264,7 +265,7 @@ impl OxydeApp {
             return;
         };
         self.selected_feature = Some(id);
-        match kind {
+        match kind.clone() {
             FeatureKind::Sketch(_) => self.edit_sketch(id, false),
             FeatureKind::Extrude(e) => {
                 self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
@@ -298,6 +299,17 @@ impl OxydeApp {
                     use_selection: false,
                 }));
             }
+            FeatureKind::Revolve(r) => self.open_revolve(Some(id), r.sketch, r.op, Some(&r)),
+            FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
+            FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),
+            FeatureKind::Axis(axis) => self.open_ref_axis(Some(id), Some(&axis)),
+            FeatureKind::LinearPattern(_) => {
+                self.open_pattern(Some(id), PatternKind::Linear, Some(&kind))
+            }
+            FeatureKind::CircularPattern(_) => {
+                self.open_pattern(Some(id), PatternKind::Circular, Some(&kind))
+            }
+            FeatureKind::Mirror(_) => self.open_pattern(Some(id), PatternKind::Mirror, Some(&kind)),
         }
     }
 }

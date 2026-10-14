@@ -9,15 +9,18 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use oxyde_geom::{Plane, Profile, ProfileError};
-use oxyde_kernel::{BooleanOp, FaceSource, Kernel, ShapeHandle, SurfaceKind, Topology};
-use oxyde_sketch::{ConstrainedSketch, ConstraintState};
+use oxyde_geom::{Axis, Plane, Profile, ProfileError, Transform};
+use oxyde_kernel::{
+    BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind, Topology,
+};
+use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
-    EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Sketch,
-    SketchPlane,
+    AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
+    FeatureKind, LinearPattern, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
+    Sketch, SketchPlane,
 };
 use crate::naming::{BodyNaming, FaceKey, FaceName, Resolution};
 
@@ -69,11 +72,33 @@ pub struct SketchResult {
 }
 
 #[derive(Debug)]
+/// Geometry of a reference feature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReferenceGeometry {
+    Plane(Plane),
+    Axis(Axis),
+}
+
+/// The solid an extrusion or a revolve added or removed, kept so that patterns and mirrors
+/// can copy it.
+#[derive(Debug)]
+struct ToolBody {
+    shape: ShapeHandle,
+    /// False when the tool is the feature's body itself (the first boss of a part).
+    owned: bool,
+    /// Name of each face of the tool.
+    names: Vec<Option<FaceName>>,
+    op: BooleanOp,
+}
+
+#[derive(Debug)]
 struct FeatureResult {
     status: FeatureStatus,
     /// The body after this feature, if the feature changed it.
     produced: Option<Body>,
     sketch: Option<SketchResult>,
+    tool: Option<ToolBody>,
+    reference: Option<ReferenceGeometry>,
 }
 
 impl FeatureResult {
@@ -82,6 +107,19 @@ impl FeatureResult {
             status,
             produced: None,
             sketch: None,
+            tool: None,
+            reference: None,
+        }
+    }
+
+    fn release<K: Kernel>(self, kernel: &mut K) {
+        if let Some(body) = self.produced {
+            kernel.release(body.shape);
+        }
+        if let Some(tool) = self.tool {
+            if tool.owned {
+                kernel.release(tool.shape);
+            }
         }
     }
 }
@@ -336,9 +374,7 @@ impl Part {
         let end = self.active_end();
         let start = self.dirty_from.min(self.results.len()).min(end);
         for stale in self.results.drain(start..) {
-            if let Some(body) = stale.produced {
-                kernel.release(body.shape);
-            }
+            stale.release(kernel);
         }
         for index in start..end {
             let result = if self.features[index].suppressed {
@@ -354,9 +390,7 @@ impl Part {
     /// Frees every cached kernel shape. The next rebuild starts from scratch.
     pub fn release<K: Kernel>(&mut self, kernel: &mut K) {
         for result in self.results.drain(..) {
-            if let Some(body) = result.produced {
-                kernel.release(body.shape);
-            }
+            result.release(kernel);
         }
         self.dirty_from = 0;
     }
@@ -409,6 +443,25 @@ impl Part {
         current_body(&self.results[..index.min(self.built())])
     }
 
+    /// Geometry of a built reference plane or axis.
+    pub fn reference(&self, id: FeatureId) -> Option<ReferenceGeometry> {
+        let index = self.index_of(id)?;
+        if index >= self.built().min(self.active_end()) {
+            return None;
+        }
+        self.results[index].reference
+    }
+
+    /// Every built reference plane and axis, for display.
+    pub fn references(&self) -> Vec<(FeatureId, ReferenceGeometry)> {
+        let built = self.built().min(self.active_end());
+        self.features[..built]
+            .iter()
+            .zip(&self.results)
+            .filter_map(|(f, r)| r.reference.map(|g| (f.id, g)))
+            .collect()
+    }
+
     pub fn sketch_result(&self, id: FeatureId) -> Option<&SketchResult> {
         let index = self.index_of(id)?;
         if index >= self.built() {
@@ -454,55 +507,196 @@ fn current_body(results: &[FeatureResult]) -> Option<&Body> {
     results.iter().rev().find_map(|r| r.produced.as_ref())
 }
 
+/// What a feature being built can see: the features before it, their results, and the body
+/// as it is just before it.
+struct Context<'a> {
+    features: &'a [Feature],
+    previous: &'a [FeatureResult],
+    index: usize,
+    body: Option<&'a Body>,
+}
+
+/// Pattern instances above this count are refused, to keep a typo from freezing the
+/// application.
+const MAX_INSTANCES: u64 = 1000;
+
+impl<'a> Context<'a> {
+    fn feature(&self) -> &'a Feature {
+        &self.features[self.index]
+    }
+
+    /// An earlier feature and its result.
+    fn earlier(&self, id: FeatureId) -> Result<(&'a Feature, &'a FeatureResult), String> {
+        let index = self.features[..self.index]
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or_else(|| format!("{id} must come before this feature"))?;
+        Ok((&self.features[index], &self.previous[index]))
+    }
+
+    fn body(&self) -> Result<&'a Body, String> {
+        self.body.ok_or_else(|| "there is no body yet".to_owned())
+    }
+
+    fn plane(&self, plane: &PlaneRef, warnings: &mut Vec<String>) -> Result<Plane, String> {
+        match plane {
+            PlaneRef::Standard(standard) => Ok(standard.plane()),
+            PlaneRef::Face(name) => {
+                let body = self
+                    .body
+                    .ok_or_else(|| format!("face {name} not found: no body yet"))?;
+                let index = resolve(body.naming.resolve_face(name), "face", name, warnings)?;
+                face_plane(body, index).ok_or_else(|| format!("face {name} is not planar"))
+            }
+            PlaneRef::Reference(id) => {
+                let (feature, result) = self.earlier(*id)?;
+                match result.reference {
+                    Some(ReferenceGeometry::Plane(plane)) => Ok(plane),
+                    Some(ReferenceGeometry::Axis(_)) => {
+                        Err(format!("{} is an axis, not a plane", feature.name))
+                    }
+                    None => Err(format!("{} is suppressed or has errors", feature.name)),
+                }
+            }
+        }
+    }
+
+    fn axis(&self, axis: &AxisRef, warnings: &mut Vec<String>) -> Result<Axis, String> {
+        match axis {
+            AxisRef::Standard(standard) => Ok(standard.axis()),
+            AxisRef::Reference(id) => {
+                let (feature, result) = self.earlier(*id)?;
+                match result.reference {
+                    Some(ReferenceGeometry::Axis(axis)) => Ok(axis),
+                    Some(ReferenceGeometry::Plane(_)) => {
+                        Err(format!("{} is a plane, not an axis", feature.name))
+                    }
+                    None => Err(format!("{} is suppressed or has errors", feature.name)),
+                }
+            }
+            AxisRef::Edge(name) => {
+                let body = self.body()?;
+                let index = resolve(body.naming.resolve_edge(name), "edge", name, warnings)?;
+                body.topology.edges[index as usize]
+                    .axis
+                    .ok_or_else(|| format!("edge {name} is neither straight nor circular"))
+            }
+            AxisRef::Face(name) => {
+                let body = self.body()?;
+                let index = resolve(body.naming.resolve_face(name), "face", name, warnings)?;
+                let face = &body.topology.faces[index as usize];
+                face.axis
+                    .or_else(|| face.normal.and_then(|n| Axis::new(face.centroid, n)))
+                    .ok_or_else(|| format!("face {name} has no axis"))
+            }
+        }
+    }
+
+    /// The solved sketch an extrusion or a revolve uses, with a closed profile.
+    fn profile_sketch(&self, sketch: FeatureId) -> Result<(&'a SketchResult, &'a Profile), String> {
+        let (feature, result) = self.earlier(sketch)?;
+        let name = &feature.name;
+        let solved = result
+            .sketch
+            .as_ref()
+            .ok_or_else(|| format!("{name} is suppressed or has errors"))?;
+        let profile = solved
+            .profile
+            .as_ref()
+            .map_err(|e| format!("{name}: {e}"))?;
+        if profile.is_empty() {
+            return Err(format!("{name} has no closed contour"));
+        }
+        Ok((solved, profile))
+    }
+}
+
 fn build_feature<K: Kernel>(
     features: &[Feature],
     previous: &[FeatureResult],
     index: usize,
     kernel: &mut K,
 ) -> FeatureResult {
-    let feature = &features[index];
-    let body = current_body(previous);
-    let mut warnings = Vec::new();
-
-    let outcome = match &feature.kind {
-        FeatureKind::Sketch(sketch) => {
-            build_sketch(sketch, body, &mut warnings).map(|s| (None, Some(s)))
-        }
-        FeatureKind::Extrude(extrude) => {
-            build_extrude(feature.id, extrude, features, previous, index, body, kernel)
-                .map(|b| (Some(b), None))
-        }
-        FeatureKind::Fillet(blend) => build_blend(
-            feature.id,
-            blend,
-            Blend::Fillet,
-            body,
-            kernel,
-            &mut warnings,
-        )
-        .map(|b| (Some(b), None)),
-        FeatureKind::Chamfer(blend) => build_blend(
-            feature.id,
-            blend,
-            Blend::Chamfer,
-            body,
-            kernel,
-            &mut warnings,
-        )
-        .map(|b| (Some(b), None)),
+    let ctx = Context {
+        features,
+        previous,
+        index,
+        body: current_body(previous),
     };
+    let feature = ctx.feature();
+    let mut warnings = Vec::new();
+    let mut result = FeatureResult::with_status(FeatureStatus::Ok);
+
+    let outcome = (|| -> Result<(), String> {
+        match &feature.kind {
+            FeatureKind::Sketch(sketch) => {
+                result.sketch = Some(build_sketch(&ctx, sketch, &mut warnings)?);
+            }
+            FeatureKind::Extrude(extrude) => {
+                let (body, tool) = build_extrude(&ctx, extrude, kernel)?;
+                result.produced = Some(body);
+                result.tool = Some(tool);
+            }
+            FeatureKind::Revolve(revolve) => {
+                let (body, tool) = build_revolve(&ctx, revolve, kernel, &mut warnings)?;
+                result.produced = Some(body);
+                result.tool = Some(tool);
+            }
+            FeatureKind::Fillet(blend) => {
+                result.produced = Some(build_blend(
+                    &ctx,
+                    blend,
+                    Blend::Fillet,
+                    kernel,
+                    &mut warnings,
+                )?);
+            }
+            FeatureKind::Chamfer(blend) => {
+                result.produced = Some(build_blend(
+                    &ctx,
+                    blend,
+                    Blend::Chamfer,
+                    kernel,
+                    &mut warnings,
+                )?);
+            }
+            FeatureKind::Shell(shell) => {
+                result.produced = Some(build_shell(&ctx, shell, kernel, &mut warnings)?);
+            }
+            FeatureKind::Plane(plane) => {
+                result.reference = Some(build_ref_plane(&ctx, plane, &mut warnings)?);
+            }
+            FeatureKind::Axis(axis) => {
+                result.reference = Some(build_ref_axis(&ctx, axis, &mut warnings)?);
+            }
+            FeatureKind::LinearPattern(pattern) => {
+                let instances = linear_instances(&ctx, pattern, &mut warnings)?;
+                result.produced = Some(build_instances(&ctx, &pattern.seeds, &instances, kernel)?);
+            }
+            FeatureKind::CircularPattern(pattern) => {
+                let instances = circular_instances(&ctx, pattern, &mut warnings)?;
+                result.produced = Some(build_instances(&ctx, &pattern.seeds, &instances, kernel)?);
+            }
+            FeatureKind::Mirror(mirror) => {
+                let instances = mirror_instances(&ctx, mirror, &mut warnings)?;
+                result.produced = Some(build_instances(&ctx, &mirror.seeds, &instances, kernel)?);
+            }
+        }
+        Ok(())
+    })();
 
     match outcome {
-        Ok((produced, sketch)) => FeatureResult {
-            status: if warnings.is_empty() {
-                FeatureStatus::Ok
-            } else {
-                FeatureStatus::Warning(warnings.join("; "))
-            },
-            produced,
-            sketch,
-        },
-        Err(message) => FeatureResult::with_status(FeatureStatus::Error(message)),
+        Ok(()) => {
+            if !warnings.is_empty() {
+                result.status = FeatureStatus::Warning(warnings.join("; "));
+            }
+            result
+        }
+        Err(message) => {
+            // Nothing is kept from a failed feature.
+            result.release(kernel);
+            FeatureResult::with_status(FeatureStatus::Error(message))
+        }
     }
 }
 
@@ -534,17 +728,14 @@ fn face_plane(body: &Body, index: u32) -> Option<Plane> {
 }
 
 fn build_sketch(
+    ctx: &Context<'_>,
     sketch: &Sketch,
-    body: Option<&Body>,
     warnings: &mut Vec<String>,
 ) -> Result<SketchResult, String> {
     let plane = match &sketch.plane {
         SketchPlane::Standard(standard) => standard.plane(),
-        SketchPlane::Face(name) => {
-            let body = body.ok_or_else(|| format!("face {name} not found: no body yet"))?;
-            let index = resolve(body.naming.resolve_face(name), "face", name, warnings)?;
-            face_plane(body, index).ok_or_else(|| format!("face {name} is not planar"))?
-        }
+        SketchPlane::Face(name) => ctx.plane(&PlaneRef::Face(name.clone()), warnings)?,
+        SketchPlane::Reference(id) => ctx.plane(&PlaneRef::Reference(*id), warnings)?,
     };
     let mut solved = sketch.geometry.clone();
     let report = solved.solve().map_err(|e| e.to_string())?;
@@ -594,31 +785,143 @@ fn finish<K: Kernel>(
     }
 }
 
-fn build_extrude<K: Kernel>(
+/// Names of a swept tool's faces (extrusion or revolve).
+fn sweep_names(id: FeatureId, history: &OpHistory) -> Vec<Option<FaceName>> {
+    history
+        .faces
+        .iter()
+        .map(|sources| {
+            oldest(sources.iter().filter_map(|source| match *source {
+                FaceSource::ProfileSegment(segment) => Some(FaceName::profile(id, segment)),
+                FaceSource::StartCap => Some(FaceName::start_cap(id)),
+                FaceSource::EndCap => Some(FaceName::end_cap(id)),
+                _ => None,
+            }))
+        })
+        .collect()
+}
+
+/// Names after a boolean of `body` (input 0) with a tool (input 1) named `tool_names`.
+fn boolean_names(
+    history: &OpHistory,
+    body: &Body,
+    tool_names: &[Option<FaceName>],
+) -> Vec<Option<FaceName>> {
+    history
+        .faces
+        .iter()
+        .map(|sources| {
+            oldest(sources.iter().filter_map(|source| match *source {
+                FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
+                FaceSource::InputFace { input: 1, face } => {
+                    tool_names.get(face as usize).cloned().flatten()
+                }
+                _ => None,
+            }))
+        })
+        .collect()
+}
+
+/// Names after an operation on one body (fillet, chamfer, shell): faces kept from the body,
+/// faces made from its edges and vertices, and offset copies of its faces.
+fn derived_names(id: FeatureId, history: &OpHistory, body: &Body) -> Vec<Option<FaceName>> {
+    history
+        .faces
+        .iter()
+        .map(|sources| {
+            oldest(sources.iter().filter_map(|source| {
+                match *source {
+                    FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
+                    FaceSource::InputEdge { input: 0, edge } => body
+                        .naming
+                        .edge(edge)
+                        .map(|e| FaceName::from_edge(id, e.clone())),
+                    FaceSource::InputVertex { input: 0, vertex } => {
+                        body.naming.vertex(vertex).map(|v| {
+                            FaceName::new(FaceKey::FromVertex {
+                                feature: id,
+                                vertex: v.clone(),
+                            })
+                        })
+                    }
+                    FaceSource::OffsetFace { input: 0, face } => body.naming.face(face).map(|f| {
+                        FaceName::new(FaceKey::Offset {
+                            feature: id,
+                            face: Box::new(f.clone()),
+                        })
+                    }),
+                    _ => None,
+                }
+            }))
+        })
+        .collect()
+}
+
+/// Adds or removes a swept tool: the body after the feature, and the tool kept for
+/// patterns.
+fn apply_tool<K: Kernel>(
     id: FeatureId,
-    extrude: &Extrude,
-    features: &[Feature],
-    previous: &[FeatureResult],
-    index: usize,
+    op: ExtrudeOp,
+    tool: OpResult,
     body: Option<&Body>,
     kernel: &mut K,
-) -> Result<Body, String> {
-    let sketch_index = features[..index]
-        .iter()
-        .position(|f| f.id == extrude.sketch)
-        .ok_or_else(|| format!("sketch {} must come before this feature", extrude.sketch))?;
-    let sketch_name = &features[sketch_index].name;
-    let sketch = previous[sketch_index]
-        .sketch
-        .as_ref()
-        .ok_or_else(|| format!("{sketch_name} is suppressed or has errors"))?;
-    let profile = sketch
-        .profile
-        .as_ref()
-        .map_err(|e| format!("{sketch_name}: {e}"))?;
-    if profile.is_empty() {
-        return Err(format!("{sketch_name} has no closed contour"));
+) -> Result<(Body, ToolBody), String> {
+    let tool_names = sweep_names(id, &tool.history);
+    let boolean = match op {
+        ExtrudeOp::Boss => BooleanOp::Fuse,
+        ExtrudeOp::Cut => BooleanOp::Cut,
+    };
+    let Some(body) = body else {
+        return match op {
+            ExtrudeOp::Boss => {
+                let built = finish(id, tool.shape, tool_names.clone(), kernel)?;
+                Ok((
+                    built,
+                    ToolBody {
+                        shape: tool.shape,
+                        owned: false,
+                        names: tool_names,
+                        op: boolean,
+                    },
+                ))
+            }
+            ExtrudeOp::Cut => {
+                kernel.release(tool.shape);
+                Err("nothing to cut: the part has no body yet".to_owned())
+            }
+        };
+    };
+    let combined = match kernel.boolean(boolean, body.shape, tool.shape) {
+        Ok(combined) => combined,
+        Err(e) => {
+            kernel.release(tool.shape);
+            return Err(e.to_string());
+        }
+    };
+    let names = boolean_names(&combined.history, body, &tool_names);
+    match finish(id, combined.shape, names, kernel) {
+        Ok(built) => Ok((
+            built,
+            ToolBody {
+                shape: tool.shape,
+                owned: true,
+                names: tool_names,
+                op: boolean,
+            },
+        )),
+        Err(e) => {
+            kernel.release(tool.shape);
+            Err(e)
+        }
     }
+}
+
+fn build_extrude<K: Kernel>(
+    ctx: &Context<'_>,
+    extrude: &Extrude,
+    kernel: &mut K,
+) -> Result<(Body, ToolBody), String> {
+    let (sketch, profile) = ctx.profile_sketch(extrude.sketch)?;
     let depth = extrude.extent.depth();
     if !(depth > 0.0) {
         return Err("depth must be positive".to_owned());
@@ -642,52 +945,57 @@ fn build_extrude<K: Kernel>(
     let tool = kernel
         .extrude(&plane, profile, vector)
         .map_err(|e| e.to_string())?;
-    let tool_names: Vec<Option<FaceName>> = tool
-        .history
-        .faces
-        .iter()
-        .map(|sources| {
-            oldest(sources.iter().filter_map(|source| match *source {
-                FaceSource::ProfileSegment(segment) => Some(FaceName::profile(id, segment)),
-                FaceSource::StartCap => Some(FaceName::start_cap(id)),
-                FaceSource::EndCap => Some(FaceName::end_cap(id)),
-                _ => None,
-            }))
-        })
-        .collect();
+    apply_tool(ctx.feature().id, extrude.op, tool, ctx.body, kernel)
+}
 
-    let Some(body) = body else {
-        return match extrude.op {
-            ExtrudeOp::Boss => finish(id, tool.shape, tool_names, kernel),
-            ExtrudeOp::Cut => {
-                kernel.release(tool.shape);
-                Err("nothing to cut: the part has no body yet".to_owned())
-            }
-        };
+fn build_revolve<K: Kernel>(
+    ctx: &Context<'_>,
+    revolve: &Revolve,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<(Body, ToolBody), String> {
+    let (sketch, profile) = ctx.profile_sketch(revolve.sketch)?;
+    let full_turn = std::f64::consts::TAU;
+    if !(revolve.angle > 0.0) || revolve.angle > full_turn + 1e-9 {
+        return Err("the angle must be more than 0° and at most 360°".to_owned());
+    }
+    let angle = revolve.angle.min(full_turn);
+
+    let mut axis = match &revolve.axis {
+        RevolveAxis::SketchLine(line) => {
+            let id = EntityId(*line);
+            let is_line = matches!(
+                sketch.solved.entity(id).map(|e| &e.geometry),
+                Some(Geometry::Line { .. })
+            );
+            let points = sketch.solved.endpoints(id).filter(|_| is_line);
+            let (a, b) = points
+                .and_then(|(a, b)| Some((sketch.solved.position(a)?, sketch.solved.position(b)?)))
+                .ok_or_else(|| format!("the axis (line {line}) is not a line of the sketch"))?;
+            let (a, b) = (sketch.plane.to_world(a), sketch.plane.to_world(b));
+            Axis::new(a, b - a).ok_or_else(|| "the axis line has no length".to_owned())?
+        }
+        RevolveAxis::Axis(axis) => ctx.axis(axis, warnings)?,
+    };
+    let plane = sketch.plane;
+    let off_plane = (axis.origin - plane.origin).dot(plane.normal).abs();
+    if axis.direction.dot(plane.normal).abs() > 1e-6 || off_plane > 1e-6 {
+        return Err("the axis must lie in the sketch plane".to_owned());
+    }
+    if revolve.reverse {
+        axis = axis.reversed();
+    }
+    // Mid-plane: start half the angle before the sketch plane.
+    let plane = if revolve.mid_plane && angle < full_turn {
+        plane.transformed(&Transform::rotation(&axis, -angle / 2.0))
+    } else {
+        plane
     };
 
-    let op = match extrude.op {
-        ExtrudeOp::Boss => BooleanOp::Fuse,
-        ExtrudeOp::Cut => BooleanOp::Cut,
-    };
-    let combined = kernel.boolean(op, body.shape, tool.shape);
-    kernel.release(tool.shape);
-    let combined = combined.map_err(|e| e.to_string())?;
-    let names = combined
-        .history
-        .faces
-        .iter()
-        .map(|sources| {
-            oldest(sources.iter().filter_map(|source| match *source {
-                FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
-                FaceSource::InputFace { input: 1, face } => {
-                    tool_names.get(face as usize).cloned().flatten()
-                }
-                _ => None,
-            }))
-        })
-        .collect();
-    finish(id, combined.shape, names, kernel)
+    let tool = kernel
+        .revolve(&plane, profile, &axis, angle)
+        .map_err(|e| e.to_string())?;
+    apply_tool(ctx.feature().id, revolve.op, tool, ctx.body, kernel)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -697,14 +1005,13 @@ enum Blend {
 }
 
 fn build_blend<K: Kernel>(
-    id: FeatureId,
+    ctx: &Context<'_>,
     blend: &EdgeBlend,
     kind: Blend,
-    body: Option<&Body>,
     kernel: &mut K,
     warnings: &mut Vec<String>,
 ) -> Result<Body, String> {
-    let body = body.ok_or_else(|| "there is no body yet".to_owned())?;
+    let body = ctx.body()?;
     if blend.edges.is_empty() {
         return Err("no edges selected".to_owned());
     }
@@ -729,33 +1036,235 @@ fn build_blend<K: Kernel>(
         Blend::Chamfer => kernel.chamfer(body.shape, &edges, blend.size),
     }
     .map_err(|e| e.to_string())?;
+    let id = ctx.feature().id;
+    let names = derived_names(id, &result.history, body);
+    finish(id, result.shape, names, kernel)
+}
 
-    let names = result
-        .history
-        .faces
-        .iter()
-        .map(|sources| {
-            oldest(sources.iter().filter_map(|source| {
-                match *source {
-                    FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
-                    FaceSource::InputEdge { input: 0, edge } => body
-                        .naming
-                        .edge(edge)
-                        .map(|e| FaceName::from_edge(id, e.clone())),
-                    FaceSource::InputVertex { input: 0, vertex } => {
-                        body.naming.vertex(vertex).map(|v| {
-                            FaceName::new(FaceKey::FromVertex {
-                                feature: id,
-                                vertex: v.clone(),
+fn build_shell<K: Kernel>(
+    ctx: &Context<'_>,
+    shell: &Shell,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<Body, String> {
+    let body = ctx.body()?;
+    if !(shell.thickness > 0.0) {
+        return Err("the thickness must be positive".to_owned());
+    }
+    let mut faces = Vec::with_capacity(shell.faces.len());
+    for name in &shell.faces {
+        faces.push(resolve(
+            body.naming.resolve_face(name),
+            "face",
+            name,
+            warnings,
+        )?);
+    }
+    faces.sort_unstable();
+    faces.dedup();
+    let offset = if shell.outward {
+        shell.thickness
+    } else {
+        -shell.thickness
+    };
+    let result = kernel
+        .shell(body.shape, &faces, offset)
+        .map_err(|e| e.to_string())?;
+    let id = ctx.feature().id;
+    let names = derived_names(id, &result.history, body);
+    finish(id, result.shape, names, kernel)
+}
+
+fn build_ref_plane(
+    ctx: &Context<'_>,
+    plane: &RefPlane,
+    warnings: &mut Vec<String>,
+) -> Result<ReferenceGeometry, String> {
+    let base = ctx.plane(&plane.base, warnings)?;
+    let offset = if plane.flip {
+        -plane.offset
+    } else {
+        plane.offset
+    };
+    Ok(ReferenceGeometry::Plane(base.offset(offset)))
+}
+
+fn build_ref_axis(
+    ctx: &Context<'_>,
+    axis: &RefAxis,
+    warnings: &mut Vec<String>,
+) -> Result<ReferenceGeometry, String> {
+    let axis = match axis {
+        RefAxis::Along(axis) => ctx.axis(axis, warnings)?,
+        RefAxis::TwoPlanes(a, b) => {
+            let (a, b) = (ctx.plane(a, warnings)?, ctx.plane(b, warnings)?);
+            Axis::intersection(&a, &b).ok_or_else(|| "the two planes are parallel".to_owned())?
+        }
+    };
+    Ok(ReferenceGeometry::Axis(axis))
+}
+
+/// One copy of the seeds: its position in the pattern and how it is placed.
+type Instance = ([u32; 2], Transform);
+
+fn check_count(total: u64) -> Result<(), String> {
+    if total > MAX_INSTANCES {
+        Err(format!(
+            "{total} instances is too many (at most {MAX_INSTANCES})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn linear_instances(
+    ctx: &Context<'_>,
+    pattern: &LinearPattern,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Instance>, String> {
+    let step = |direction: &crate::feature::PatternDirection,
+                warnings: &mut Vec<String>|
+     -> Result<oxyde_geom::Vec3, String> {
+        let axis = ctx.axis(&direction.axis, warnings)?;
+        let sign = if direction.reverse { -1.0 } else { 1.0 };
+        Ok(axis.direction * (direction.spacing * sign))
+    };
+    let first = step(&pattern.first, warnings)?;
+    let count1 = pattern.first.count.max(1);
+    let (second, count2) = match &pattern.second {
+        Some(direction) => (step(direction, warnings)?, direction.count.max(1)),
+        None => (oxyde_geom::Vec3::ZERO, 1),
+    };
+    check_count(u64::from(count1) * u64::from(count2))?;
+    let mut out = Vec::new();
+    for j in 0..count2 {
+        for i in 0..count1 {
+            if i == 0 && j == 0 {
+                continue;
+            }
+            let shift = first * f64::from(i) + second * f64::from(j);
+            out.push(([i, j], Transform::translation(shift)));
+        }
+    }
+    Ok(out)
+}
+
+fn circular_instances(
+    ctx: &Context<'_>,
+    pattern: &CircularPattern,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Instance>, String> {
+    let mut axis = ctx.axis(&pattern.axis, warnings)?;
+    if pattern.reverse {
+        axis = axis.reversed();
+    }
+    let count = pattern.count.max(1);
+    check_count(u64::from(count))?;
+    let full_turn = std::f64::consts::TAU;
+    let step = if !pattern.equal_spacing {
+        pattern.angle
+    } else if (pattern.angle - full_turn).abs() < 1e-9 {
+        // All the way round: the last instance must not land on the seed.
+        pattern.angle / f64::from(count)
+    } else if count > 1 {
+        pattern.angle / f64::from(count - 1)
+    } else {
+        0.0
+    };
+    Ok((1..count)
+        .map(|i| ([i, 0], Transform::rotation(&axis, step * f64::from(i))))
+        .collect())
+}
+
+fn mirror_instances(
+    ctx: &Context<'_>,
+    mirror: &Mirror,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<Instance>, String> {
+    let plane = ctx.plane(&mirror.plane, warnings)?;
+    Ok(vec![([1, 0], Transform::mirror(&plane))])
+}
+
+/// Copies the tools of `seeds` to every instance and adds or removes each copy, seed by
+/// seed. Faces of a copy are named after the seed's face and the instance.
+fn build_instances<K: Kernel>(
+    ctx: &Context<'_>,
+    seeds: &[FeatureId],
+    instances: &[Instance],
+    kernel: &mut K,
+) -> Result<Body, String> {
+    let id = ctx.feature().id;
+    let body = ctx.body()?;
+    if seeds.is_empty() {
+        return Err("no features to copy".to_owned());
+    }
+    let mut tools = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let (feature, result) = ctx.earlier(*seed)?;
+        if !feature.kind.is_patternable() {
+            return Err(format!(
+                "{} cannot be copied: only extrusions and revolves can, for now",
+                feature.name
+            ));
+        }
+        let tool = result
+            .tool
+            .as_ref()
+            .ok_or_else(|| format!("{} is suppressed or has errors", feature.name))?;
+        tools.push(tool);
+    }
+
+    // The body being built, once it differs from the one before this feature.
+    let mut current: Option<Body> = None;
+    let outcome = (|| -> Result<(), String> {
+        for tool in &tools {
+            for (key, transform) in instances {
+                let copy = kernel
+                    .transform(tool.shape, transform)
+                    .map_err(|e| e.to_string())?;
+                let copy_names: Vec<Option<FaceName>> =
+                    copy.history
+                        .faces
+                        .iter()
+                        .map(|sources| {
+                            sources.iter().find_map(|source| match *source {
+                                FaceSource::InputFace { input: 0, face } => {
+                                    tool.names.get(face as usize).cloned().flatten().map(
+                                        |seed_face| {
+                                            FaceName::new(FaceKey::Instance {
+                                                feature: id,
+                                                instance: *key,
+                                                face: Box::new(seed_face),
+                                            })
+                                        },
+                                    )
+                                }
+                                _ => None,
                             })
                         })
-                    }
-                    _ => None,
+                        .collect();
+                let base = current.as_ref().unwrap_or(body);
+                let combined = kernel.boolean(tool.op, base.shape, copy.shape);
+                kernel.release(copy.shape);
+                let combined = combined.map_err(|e| e.to_string())?;
+                let names = boolean_names(&combined.history, base, &copy_names);
+                let built = finish(id, combined.shape, names, kernel)?;
+                if let Some(old) = current.replace(built) {
+                    kernel.release(old.shape);
                 }
-            }))
-        })
-        .collect();
-    finish(id, result.shape, names, kernel)
+            }
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => current.ok_or_else(|| "the pattern has a single instance".to_owned()),
+        Err(e) => {
+            if let Some(partial) = current {
+                kernel.release(partial.shape);
+            }
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

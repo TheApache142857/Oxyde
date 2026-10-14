@@ -7,9 +7,11 @@ use std::collections::BTreeMap;
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    EdgeBlend, EdgeName, EquationText, Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp,
-    FaceKey, FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, GlobalText,
-    PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
+    AxisRef, CircularPattern, EdgeBlend, EdgeName, EquationText, Equations, EquationsText, Extrude,
+    ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId, FeatureKind, FeatureParameter,
+    GlobalText, LinearPattern, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis,
+    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
+    VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -137,6 +139,17 @@ pub(crate) enum KindDto {
         #[serde(default)]
         reverse: bool,
     },
+    Revolve {
+        sketch: u32,
+        operation: OperationDto,
+        axis: RevolveAxisDto,
+        /// Radians.
+        angle: f64,
+        #[serde(default)]
+        mid_plane: bool,
+        #[serde(default)]
+        reverse: bool,
+    },
     Fillet {
         edges: Vec<EdgeRefDto>,
         radius: f64,
@@ -145,13 +158,97 @@ pub(crate) enum KindDto {
         edges: Vec<EdgeRefDto>,
         distance: f64,
     },
+    Shell {
+        #[serde(default)]
+        faces: Vec<FaceRefDto>,
+        thickness: f64,
+        #[serde(default)]
+        outward: bool,
+    },
+    /// Reference plane.
+    Plane {
+        base: PlaneDto,
+        offset: f64,
+        #[serde(default)]
+        flip: bool,
+    },
+    /// Reference axis.
+    Axis {
+        axis: RefAxisDto,
+    },
+    LinearPattern {
+        seeds: Vec<u32>,
+        direction: DirectionDto,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction2: Option<DirectionDto>,
+    },
+    CircularPattern {
+        seeds: Vec<u32>,
+        axis: AxisRefDto,
+        /// Radians.
+        angle: f64,
+        count: u32,
+        #[serde(default)]
+        equal_spacing: bool,
+        #[serde(default)]
+        reverse: bool,
+    },
+    Mirror {
+        seeds: Vec<u32>,
+        plane: PlaneDto,
+    },
 }
 
+/// A sketch plane, or any plane a feature refers to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PlaneDto {
     Standard(StandardPlaneDto),
     Face(FaceRefDto),
+    /// A reference plane feature, by id.
+    Reference(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StandardAxisDto {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AxisRefDto {
+    Standard(StandardAxisDto),
+    /// A reference axis feature, by id.
+    Reference(u32),
+    Edge(EdgeRefDto),
+    Face(FaceRefDto),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RevolveAxisDto {
+    /// A line of the revolve's sketch, by entity id.
+    SketchLine(u32),
+    Axis(AxisRefDto),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RefAxisDto {
+    Along(AxisRefDto),
+    TwoPlanes([PlaneDto; 2]),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DirectionDto {
+    pub axis: AxisRefDto,
+    pub spacing: f64,
+    pub count: u32,
+    #[serde(default)]
+    pub reverse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -247,6 +344,15 @@ pub(crate) enum FaceKeyDto {
         feature: u32,
         vertex: Box<VertexRefDto>,
     },
+    Offset {
+        feature: u32,
+        face: Box<FaceRefDto>,
+    },
+    Instance {
+        feature: u32,
+        instance: [u32; 2],
+        face: Box<FaceRefDto>,
+    },
     Unknown {
         feature: u32,
         index: u32,
@@ -305,18 +411,11 @@ fn point(p: Point2) -> [f64; 2] {
 fn feature_dto(feature: &Feature) -> FeatureDto {
     let kind = match feature.kind() {
         FeatureKind::Sketch(sketch) => KindDto::Sketch {
-            plane: match &sketch.plane {
-                SketchPlane::Standard(StandardPlane::Front) => {
-                    PlaneDto::Standard(StandardPlaneDto::Front)
-                }
-                SketchPlane::Standard(StandardPlane::Top) => {
-                    PlaneDto::Standard(StandardPlaneDto::Top)
-                }
-                SketchPlane::Standard(StandardPlane::Right) => {
-                    PlaneDto::Standard(StandardPlaneDto::Right)
-                }
-                SketchPlane::Face(face) => PlaneDto::Face(face_dto(face)),
-            },
+            plane: plane_dto(&match &sketch.plane {
+                SketchPlane::Standard(standard) => PlaneRef::Standard(*standard),
+                SketchPlane::Face(face) => PlaneRef::Face(face.clone()),
+                SketchPlane::Reference(id) => PlaneRef::Reference(*id),
+            }),
             entities: sketch.geometry.entities().iter().map(entity_dto).collect(),
             relations: sketch
                 .geometry
@@ -339,15 +438,23 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
-            operation: match extrude.op {
-                ExtrudeOp::Boss => OperationDto::Boss,
-                ExtrudeOp::Cut => OperationDto::Cut,
-            },
+            operation: operation_dto(extrude.op),
             extent: match extrude.extent {
                 ExtrudeExtent::Blind { depth } => ExtentDto::Blind { depth },
                 ExtrudeExtent::MidPlane { depth } => ExtentDto::MidPlane { depth },
             },
             reverse: extrude.reverse,
+        },
+        FeatureKind::Revolve(revolve) => KindDto::Revolve {
+            sketch: revolve.sketch.raw(),
+            operation: operation_dto(revolve.op),
+            axis: match &revolve.axis {
+                RevolveAxis::SketchLine(line) => RevolveAxisDto::SketchLine(*line),
+                RevolveAxis::Axis(axis) => RevolveAxisDto::Axis(axis_dto(axis)),
+            },
+            angle: revolve.angle,
+            mid_plane: revolve.mid_plane,
+            reverse: revolve.reverse,
         },
         FeatureKind::Fillet(blend) => KindDto::Fillet {
             edges: blend.edges.iter().map(edge_dto).collect(),
@@ -356,6 +463,39 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Chamfer(blend) => KindDto::Chamfer {
             edges: blend.edges.iter().map(edge_dto).collect(),
             distance: blend.size,
+        },
+        FeatureKind::Shell(shell) => KindDto::Shell {
+            faces: shell.faces.iter().map(face_dto).collect(),
+            thickness: shell.thickness,
+            outward: shell.outward,
+        },
+        FeatureKind::Plane(plane) => KindDto::Plane {
+            base: plane_dto(&plane.base),
+            offset: plane.offset,
+            flip: plane.flip,
+        },
+        FeatureKind::Axis(axis) => KindDto::Axis {
+            axis: match axis {
+                RefAxis::Along(axis) => RefAxisDto::Along(axis_dto(axis)),
+                RefAxis::TwoPlanes(a, b) => RefAxisDto::TwoPlanes([plane_dto(a), plane_dto(b)]),
+            },
+        },
+        FeatureKind::LinearPattern(pattern) => KindDto::LinearPattern {
+            seeds: ids(&pattern.seeds),
+            direction: direction_dto(&pattern.first),
+            direction2: pattern.second.as_ref().map(direction_dto),
+        },
+        FeatureKind::CircularPattern(pattern) => KindDto::CircularPattern {
+            seeds: ids(&pattern.seeds),
+            axis: axis_dto(&pattern.axis),
+            angle: pattern.angle,
+            count: pattern.count,
+            equal_spacing: pattern.equal_spacing,
+            reverse: pattern.reverse,
+        },
+        FeatureKind::Mirror(mirror) => KindDto::Mirror {
+            seeds: ids(&mirror.seeds),
+            plane: plane_dto(&mirror.plane),
         },
     };
     FeatureDto {
@@ -368,6 +508,47 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             .map(|(p, name)| (p.key().to_owned(), name.clone()))
             .collect(),
         kind,
+    }
+}
+
+fn ids(features: &[FeatureId]) -> Vec<u32> {
+    features.iter().map(|f| f.raw()).collect()
+}
+
+fn operation_dto(op: ExtrudeOp) -> OperationDto {
+    match op {
+        ExtrudeOp::Boss => OperationDto::Boss,
+        ExtrudeOp::Cut => OperationDto::Cut,
+    }
+}
+
+fn plane_dto(plane: &PlaneRef) -> PlaneDto {
+    match plane {
+        PlaneRef::Standard(StandardPlane::Front) => PlaneDto::Standard(StandardPlaneDto::Front),
+        PlaneRef::Standard(StandardPlane::Top) => PlaneDto::Standard(StandardPlaneDto::Top),
+        PlaneRef::Standard(StandardPlane::Right) => PlaneDto::Standard(StandardPlaneDto::Right),
+        PlaneRef::Face(face) => PlaneDto::Face(face_dto(face)),
+        PlaneRef::Reference(id) => PlaneDto::Reference(id.raw()),
+    }
+}
+
+fn axis_dto(axis: &AxisRef) -> AxisRefDto {
+    match axis {
+        AxisRef::Standard(StandardAxis::X) => AxisRefDto::Standard(StandardAxisDto::X),
+        AxisRef::Standard(StandardAxis::Y) => AxisRefDto::Standard(StandardAxisDto::Y),
+        AxisRef::Standard(StandardAxis::Z) => AxisRefDto::Standard(StandardAxisDto::Z),
+        AxisRef::Reference(id) => AxisRefDto::Reference(id.raw()),
+        AxisRef::Edge(edge) => AxisRefDto::Edge(edge_dto(edge)),
+        AxisRef::Face(face) => AxisRefDto::Face(face_dto(face)),
+    }
+}
+
+fn direction_dto(direction: &PatternDirection) -> DirectionDto {
+    DirectionDto {
+        axis: axis_dto(&direction.axis),
+        spacing: direction.spacing,
+        count: direction.count,
+        reverse: direction.reverse,
     }
 }
 
@@ -469,6 +650,19 @@ fn face_dto(face: &FaceName) -> FaceRefDto {
                 faces: vertex.faces.iter().map(face_dto).collect(),
                 part: vertex.part,
             }),
+        },
+        FaceKey::Offset { feature, face } => FaceKeyDto::Offset {
+            feature: feature.raw(),
+            face: Box::new(face_dto(face)),
+        },
+        FaceKey::Instance {
+            feature,
+            instance,
+            face,
+        } => FaceKeyDto::Instance {
+            feature: feature.raw(),
+            instance: *instance,
+            face: Box::new(face_dto(face)),
         },
         FaceKey::Unknown { feature, index } => FaceKeyDto::Unknown {
             feature: feature.raw(),
@@ -610,17 +804,10 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             )
             .map_err(|e| format!("{}: {e}", dto.name))?;
             FeatureKind::Sketch(Sketch {
-                plane: match plane {
-                    PlaneDto::Standard(StandardPlaneDto::Front) => {
-                        SketchPlane::Standard(StandardPlane::Front)
-                    }
-                    PlaneDto::Standard(StandardPlaneDto::Top) => {
-                        SketchPlane::Standard(StandardPlane::Top)
-                    }
-                    PlaneDto::Standard(StandardPlaneDto::Right) => {
-                        SketchPlane::Standard(StandardPlane::Right)
-                    }
-                    PlaneDto::Face(face) => SketchPlane::Face(face_from(face)),
+                plane: match plane_from(plane) {
+                    PlaneRef::Standard(standard) => SketchPlane::Standard(standard),
+                    PlaneRef::Face(face) => SketchPlane::Face(face),
+                    PlaneRef::Reference(id) => SketchPlane::Reference(id),
                 },
                 geometry,
             })
@@ -632,10 +819,7 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             reverse,
         } => FeatureKind::Extrude(Extrude {
             sketch: FeatureId::from_raw(sketch),
-            op: match operation {
-                OperationDto::Boss => ExtrudeOp::Boss,
-                OperationDto::Cut => ExtrudeOp::Cut,
-            },
+            op: operation_from(operation),
             extent: match extent {
                 ExtentDto::Blind { depth } => ExtrudeExtent::Blind { depth },
                 ExtentDto::MidPlane { depth } => ExtrudeExtent::MidPlane { depth },
@@ -650,6 +834,70 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             edges: edges.into_iter().map(edge_from).collect(),
             size: distance,
         }),
+        KindDto::Revolve {
+            sketch,
+            operation,
+            axis,
+            angle,
+            mid_plane,
+            reverse,
+        } => FeatureKind::Revolve(Revolve {
+            sketch: FeatureId::from_raw(sketch),
+            op: operation_from(operation),
+            axis: match axis {
+                RevolveAxisDto::SketchLine(line) => RevolveAxis::SketchLine(line),
+                RevolveAxisDto::Axis(axis) => RevolveAxis::Axis(axis_from(axis)),
+            },
+            angle,
+            mid_plane,
+            reverse,
+        }),
+        KindDto::Shell {
+            faces,
+            thickness,
+            outward,
+        } => FeatureKind::Shell(Shell {
+            faces: faces.into_iter().map(face_from).collect(),
+            thickness,
+            outward,
+        }),
+        KindDto::Plane { base, offset, flip } => FeatureKind::Plane(RefPlane {
+            base: plane_from(base),
+            offset,
+            flip,
+        }),
+        KindDto::Axis { axis } => FeatureKind::Axis(match axis {
+            RefAxisDto::Along(axis) => RefAxis::Along(axis_from(axis)),
+            RefAxisDto::TwoPlanes([a, b]) => RefAxis::TwoPlanes(plane_from(a), plane_from(b)),
+        }),
+        KindDto::LinearPattern {
+            seeds,
+            direction,
+            direction2,
+        } => FeatureKind::LinearPattern(LinearPattern {
+            seeds: ids_from(seeds),
+            first: direction_from(direction),
+            second: direction2.map(direction_from),
+        }),
+        KindDto::CircularPattern {
+            seeds,
+            axis,
+            angle,
+            count,
+            equal_spacing,
+            reverse,
+        } => FeatureKind::CircularPattern(CircularPattern {
+            seeds: ids_from(seeds),
+            axis: axis_from(axis),
+            angle,
+            count,
+            equal_spacing,
+            reverse,
+        }),
+        KindDto::Mirror { seeds, plane } => FeatureKind::Mirror(Mirror {
+            seeds: ids_from(seeds),
+            plane: plane_from(plane),
+        }),
     };
     let mut parameter_names = BTreeMap::new();
     for (key, name) in dto.dimension_names {
@@ -661,6 +909,47 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
         Feature::new(FeatureId::from_raw(dto.id), dto.name, dto.suppressed, kind)
             .with_parameter_names(parameter_names),
     )
+}
+
+fn ids_from(ids: Vec<u32>) -> Vec<FeatureId> {
+    ids.into_iter().map(FeatureId::from_raw).collect()
+}
+
+fn operation_from(operation: OperationDto) -> ExtrudeOp {
+    match operation {
+        OperationDto::Boss => ExtrudeOp::Boss,
+        OperationDto::Cut => ExtrudeOp::Cut,
+    }
+}
+
+fn plane_from(dto: PlaneDto) -> PlaneRef {
+    match dto {
+        PlaneDto::Standard(StandardPlaneDto::Front) => PlaneRef::Standard(StandardPlane::Front),
+        PlaneDto::Standard(StandardPlaneDto::Top) => PlaneRef::Standard(StandardPlane::Top),
+        PlaneDto::Standard(StandardPlaneDto::Right) => PlaneRef::Standard(StandardPlane::Right),
+        PlaneDto::Face(face) => PlaneRef::Face(face_from(face)),
+        PlaneDto::Reference(id) => PlaneRef::Reference(FeatureId::from_raw(id)),
+    }
+}
+
+fn axis_from(dto: AxisRefDto) -> AxisRef {
+    match dto {
+        AxisRefDto::Standard(StandardAxisDto::X) => AxisRef::Standard(StandardAxis::X),
+        AxisRefDto::Standard(StandardAxisDto::Y) => AxisRef::Standard(StandardAxis::Y),
+        AxisRefDto::Standard(StandardAxisDto::Z) => AxisRef::Standard(StandardAxis::Z),
+        AxisRefDto::Reference(id) => AxisRef::Reference(FeatureId::from_raw(id)),
+        AxisRefDto::Edge(edge) => AxisRef::Edge(edge_from(edge)),
+        AxisRefDto::Face(face) => AxisRef::Face(face_from(face)),
+    }
+}
+
+fn direction_from(dto: DirectionDto) -> PatternDirection {
+    PatternDirection {
+        axis: axis_from(dto.axis),
+        spacing: dto.spacing,
+        count: dto.count,
+        reverse: dto.reverse,
+    }
 }
 
 fn face_from(dto: FaceRefDto) -> FaceName {
@@ -685,6 +974,19 @@ fn face_from(dto: FaceRefDto) -> FaceName {
                 faces: sorted(vertex.faces.into_iter().map(face_from).collect()),
                 part: vertex.part,
             },
+        },
+        FaceKeyDto::Offset { feature, face } => FaceKey::Offset {
+            feature: FeatureId::from_raw(feature),
+            face: Box::new(face_from(*face)),
+        },
+        FaceKeyDto::Instance {
+            feature,
+            instance,
+            face,
+        } => FaceKey::Instance {
+            feature: FeatureId::from_raw(feature),
+            instance,
+            face: Box::new(face_from(*face)),
         },
         FaceKeyDto::Unknown { feature, index } => FaceKey::Unknown {
             feature: FeatureId::from_raw(feature),

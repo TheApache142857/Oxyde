@@ -249,9 +249,12 @@ mod tests {
     use std::io::Cursor;
 
     use oxyde_geom::Point2;
+    use std::f64::consts::{PI, TAU};
+
     use oxyde_model::{
-        EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureKind, Sketch,
-        SketchPlane, StandardPlane,
+        AxisRef, CircularPattern, EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
+        FaceName, FeatureKind, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
+        RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
     };
     use oxyde_sketch::Constraint;
 
@@ -301,6 +304,81 @@ mod tests {
             size: 0.5,
         }));
         part.set_suppressed(bevel, true).unwrap();
+
+        // Reference geometry, a revolve, patterns, a mirror and a shell.
+        let plane = part.add_feature(FeatureKind::Plane(RefPlane {
+            base: PlaneRef::Standard(StandardPlane::Top),
+            offset: 25.0,
+            flip: false,
+        }));
+        let axis = part.add_feature(FeatureKind::Axis(RefAxis::TwoPlanes(
+            PlaneRef::Standard(StandardPlane::Front),
+            PlaneRef::Reference(plane),
+        )));
+        let mut profile = Sketch::new(SketchPlane::Reference(plane));
+        let centerline = profile
+            .geometry
+            .line(Point2::new(0.0, -5.0), Point2::new(0.0, 5.0));
+        profile.geometry.set_construction(centerline, true);
+        profile.rectangle(Point2::new(2.0, -1.0), 3.0, 2.0);
+        let s3 = part.add_feature(FeatureKind::Sketch(profile));
+        let ring = part.add_feature(FeatureKind::Revolve(Revolve {
+            sketch: s3,
+            op: ExtrudeOp::Boss,
+            axis: RevolveAxis::SketchLine(centerline.0),
+            angle: PI,
+            mid_plane: true,
+            reverse: false,
+        }));
+        let row = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![hole],
+            first: PatternDirection {
+                axis: AxisRef::Edge(EdgeName::between(
+                    FaceName::profile(boss, 1),
+                    FaceName::end_cap(boss),
+                )),
+                spacing: 8.0,
+                count: 3,
+                reverse: false,
+            },
+            second: Some(PatternDirection {
+                axis: AxisRef::Standard(StandardAxis::Y),
+                spacing: 5.0,
+                count: 2,
+                reverse: true,
+            }),
+        }));
+        part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+            seeds: vec![ring],
+            axis: AxisRef::Reference(axis),
+            angle: TAU,
+            count: 4,
+            equal_spacing: true,
+            reverse: false,
+        }));
+        part.add_feature(FeatureKind::Mirror(Mirror {
+            seeds: vec![hole, ring],
+            plane: PlaneRef::Face(FaceName::start_cap(boss)),
+        }));
+        let shell = part.add_feature(FeatureKind::Shell(Shell {
+            faces: vec![FaceName::new(FaceKey::Instance {
+                feature: row,
+                instance: [1, 0],
+                face: Box::new(FaceName::profile(hole, 1)),
+            })],
+            thickness: 1.0,
+            outward: false,
+        }));
+        part.add_feature(FeatureKind::Fillet(EdgeBlend {
+            edges: vec![EdgeName::between(
+                FaceName::new(FaceKey::Offset {
+                    feature: shell,
+                    face: Box::new(FaceName::end_cap(boss)),
+                }),
+                FaceName::profile(boss, 2),
+            )],
+            size: 0.3,
+        }));
         let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
         part.rename_dimension(depth, "Thickness").unwrap();
         // Equations, stored by name.

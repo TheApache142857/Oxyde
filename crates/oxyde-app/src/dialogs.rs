@@ -10,6 +10,9 @@ use oxyde_model::{
 use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
+use crate::features_ui::{
+    self, AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog,
+};
 
 pub struct ExtrudeDialog {
     /// The feature being edited, or `None` for a new one.
@@ -46,7 +49,13 @@ pub enum DimensionTarget {
 
 pub enum Dialog {
     Extrude(ExtrudeDialog),
+    Revolve(RevolveDialog),
     Blend(BlendDialog),
+    Shell(ShellDialog),
+    /// Linear pattern, circular pattern or mirror.
+    Pattern(PatternDialog),
+    RefPlane(PlaneDialog),
+    RefAxis(AxisDialog),
     /// Pick the plane of a new sketch.
     ChoosePlane,
     Dimension {
@@ -69,20 +78,20 @@ pub enum Dialog {
 }
 
 /// User's answer to a dialog this frame.
-enum Answer {
+pub(crate) enum Answer {
     Open,
     Ok,
     Cancel,
 }
 
-fn window(title: &str) -> egui::Window<'static> {
+pub(crate) fn window(title: &str) -> egui::Window<'static> {
     egui::Window::new(title.to_owned())
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
 }
 
-fn ok_cancel(ui: &mut egui::Ui, ok_label: &str) -> Answer {
+pub(crate) fn ok_cancel(ui: &mut egui::Ui, ok_label: &str) -> Answer {
     let mut answer = Answer::Open;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -103,7 +112,7 @@ fn ok_cancel(ui: &mut egui::Ui, ok_label: &str) -> Answer {
     answer
 }
 
-fn positive_length(ui: &mut egui::Ui, value: &mut f64) {
+pub(crate) fn positive_length(ui: &mut egui::Ui, value: &mut f64) {
     ui.add(egui::DragValue::new(value).speed(0.1).suffix(" mm"));
     if *value < 0.001 {
         *value = 0.001;
@@ -125,10 +134,27 @@ impl OxydeApp {
         };
         let answer = match &mut dialog {
             Dialog::Extrude(d) => extrude_window(ctx, d),
+            Dialog::Revolve(d) => {
+                let answer = features_ui::revolve_window(ctx, d);
+                self.refresh_revolve_axes(d);
+                answer
+            }
             Dialog::Blend(d) => blend_window(ctx, d),
+            Dialog::Shell(d) => features_ui::shell_window(ctx, d),
+            Dialog::Pattern(d) => features_ui::pattern_window(ctx, d),
+            Dialog::RefPlane(d) => features_ui::ref_plane_window(ctx, d),
+            Dialog::RefAxis(d) => features_ui::ref_axis_window(ctx, d),
             Dialog::ChoosePlane => {
                 let mut answer = Answer::Open;
                 let mut chosen = None;
+                let references: Vec<(FeatureId, String)> = self
+                    .plane_choices(None)
+                    .into_iter()
+                    .filter_map(|(label, plane)| match plane {
+                        oxyde_model::PlaneRef::Reference(id) => Some((id, label)),
+                        _ => None,
+                    })
+                    .collect();
                 window("New sketch").show(ctx, |ui| {
                     ui.label("Sketch on which plane?");
                     ui.label(
@@ -144,10 +170,19 @@ impl OxydeApp {
                             StandardPlane::Right,
                         ] {
                             if ui.button(format!("{} Plane", plane_name(plane))).clicked() {
-                                chosen = Some(plane);
+                                chosen = Some(SketchPlane::Standard(plane));
                             }
                         }
                     });
+                    if !references.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for (id, name) in &references {
+                                if ui.button(name).clicked() {
+                                    chosen = Some(SketchPlane::Reference(*id));
+                                }
+                            }
+                        });
+                    }
                     ui.add_space(4.0);
                     if ui.button("Cancel").clicked()
                         || ui.input(|i| i.key_pressed(egui::Key::Escape))
@@ -156,7 +191,7 @@ impl OxydeApp {
                     }
                 });
                 if let Some(plane) = chosen {
-                    self.start_new_sketch(SketchPlane::Standard(plane));
+                    self.start_new_sketch(plane);
                     answer = Answer::Cancel; // already handled
                 }
                 answer
@@ -302,6 +337,11 @@ impl OxydeApp {
                     }
                 }
             }
+            Dialog::Revolve(d) => self.apply_revolve(d),
+            Dialog::Shell(d) => self.apply_shell(d),
+            Dialog::Pattern(d) => self.apply_pattern(d),
+            Dialog::RefPlane(d) => self.apply_ref_plane(d),
+            Dialog::RefAxis(d) => self.apply_ref_axis(d),
             Dialog::ChoosePlane => {}
             Dialog::Dimension {
                 target,

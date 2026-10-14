@@ -11,12 +11,16 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeShape.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepOffsetAPI_MakeThickSolid.hxx>
+#include <BRepOffset_Mode.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
+#include <BRepPrimAPI_MakeRevol.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
@@ -24,6 +28,7 @@
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
+#include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_TrimmedCurve.hxx>
@@ -47,16 +52,23 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <TopoDS_Wire.hxx>
+#include <gp_Ax1.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Ax3.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Torus.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -286,7 +298,56 @@ TopoDS_Face make_region_face(const RegionData& region, const Frame& frame,
     return face.Face();
 }
 
+// The profile as one face per region (a compound when there are several), lying on the
+// plane and facing along its normal.
+TopoDS_Shape make_profile_base(rust::Slice<const RegionData> regions, const Frame& frame,
+                               std::vector<SegmentMark>& marks) {
+    if (regions.empty()) {
+        throw std::invalid_argument("profile has no closed region");
+    }
+    std::vector<TopoDS_Face> faces;
+    for (const RegionData& region : regions) {
+        faces.push_back(make_region_face(region, frame, marks));
+    }
+    if (faces.size() == 1) {
+        return faces[0];
+    }
+    BRep_Builder builder;
+    TopoDS_Compound compound;
+    builder.MakeCompound(compound);
+    for (const TopoDS_Face& face : faces) {
+        builder.Add(compound, face);
+    }
+    return compound;
+}
+
+// Side faces swept from the profile's edges, named by segment id.
+void record_profile_faces(BRepBuilderAPI_MakeShape& sweep, const TopoDS_Shape& base,
+                          const std::vector<SegmentMark>& marks,
+                          const TopTools_IndexedMapOfShape& result_faces, OpResultData& out) {
+    TopTools_IndexedMapOfShape base_edges;
+    TopExp::MapShapes(base, TopAbs_EDGE, base_edges);
+    for (int i = 1; i <= base_edges.Extent(); ++i) {
+        std::uint32_t id = 0;
+        if (find_segment(TopoDS::Edge(base_edges(i)), marks, id)) {
+            add_sources(out, result_faces, sweep.Generated(base_edges(i)),
+                        SourceKind::ProfileSegment, 0, id);
+        }
+    }
+}
+
 // ---- Topology helpers ----------------------------------------------------------------------
+
+AxisData axis_data(const gp_Ax1& axis) {
+    AxisData data{};
+    data.ox = axis.Location().X();
+    data.oy = axis.Location().Y();
+    data.oz = axis.Location().Z();
+    data.dx = axis.Direction().X();
+    data.dy = axis.Direction().Y();
+    data.dz = axis.Direction().Z();
+    return data;
+}
 
 SurfaceKind surface_kind(GeomAbs_SurfaceType type) {
     switch (type) {
@@ -367,9 +428,6 @@ std::uint64_t Session::make_box(double x, double y, double z, double dx, double 
 OpResultData Session::extrude(const PlaneData& plane, rust::Slice<const RegionData> regions,
                               double dx, double dy, double dz) {
     return guarded("extrude", [&] {
-        if (regions.empty()) {
-            throw std::invalid_argument("profile has no closed region");
-        }
         const Frame frame(plane);
         const gp_Vec direction(dx, dy, dz);
         if (direction.Magnitude() <= 1e-9) {
@@ -377,23 +435,7 @@ OpResultData Session::extrude(const PlaneData& plane, rust::Slice<const RegionDa
         }
 
         std::vector<SegmentMark> marks;
-        std::vector<TopoDS_Face> faces;
-        for (const RegionData& region : regions) {
-            faces.push_back(make_region_face(region, frame, marks));
-        }
-
-        TopoDS_Shape base;
-        if (faces.size() == 1) {
-            base = faces[0];
-        } else {
-            BRep_Builder builder;
-            TopoDS_Compound compound;
-            builder.MakeCompound(compound);
-            for (const TopoDS_Face& face : faces) {
-                builder.Add(compound, face);
-            }
-            base = compound;
-        }
+        TopoDS_Shape base = make_profile_base(regions, frame, marks);
         // Profile faces point along the plane normal; sweep along the face normal so the
         // solid is never built inside out.
         if (direction.Dot(gp_Vec(frame.axes.Direction())) < 0.0) {
@@ -411,15 +453,7 @@ OpResultData Session::extrude(const PlaneData& plane, rust::Slice<const RegionDa
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
         OpResultData out = empty_result(result_faces);
 
-        TopTools_IndexedMapOfShape base_edges;
-        TopExp::MapShapes(base, TopAbs_EDGE, base_edges);
-        for (int i = 1; i <= base_edges.Extent(); ++i) {
-            std::uint32_t id = 0;
-            if (find_segment(TopoDS::Edge(base_edges(i)), marks, id)) {
-                add_sources(out, result_faces, prism.Generated(base_edges(i)),
-                            SourceKind::ProfileSegment, 0, id);
-            }
-        }
+        record_profile_faces(prism, base, marks, result_faces, out);
         const TopoDS_Shape start_cap = prism.FirstShape();
         const TopoDS_Shape end_cap = prism.LastShape();
         for (TopExp_Explorer it(start_cap, TopAbs_FACE); it.More(); it.Next()) {
@@ -427,6 +461,133 @@ OpResultData Session::extrude(const PlaneData& plane, rust::Slice<const RegionDa
         }
         for (TopExp_Explorer it(end_cap, TopAbs_FACE); it.More(); it.Next()) {
             add_source(out, result_faces, it.Current(), SourceKind::EndCap, 0, 0);
+        }
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
+OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionData> regions,
+                              const AxisData& axis, double angle) {
+    return guarded("revolve", [&] {
+        const double full_turn = 6.283185307179586;
+        if (!(angle > 1e-9) || angle > full_turn + 1e-9) {
+            throw std::invalid_argument("the angle must be more than 0 and at most 360 degrees");
+        }
+        const bool full = angle >= full_turn - 1e-9;
+        const Frame frame(plane);
+        std::vector<SegmentMark> marks;
+        const TopoDS_Shape base = make_profile_base(regions, frame, marks);
+        const gp_Ax1 ax(gp_Pnt(axis.ox, axis.oy, axis.oz), gp_Dir(axis.dx, axis.dy, axis.dz));
+
+        // No copy of the base, so that Generated() answers for the base's own edges.
+        BRepPrimAPI_MakeRevol revol(base, ax, full ? full_turn : angle, Standard_False);
+        revol.Build();
+        if (!revol.IsDone()) {
+            throw std::runtime_error(
+                "BRepPrimAPI_MakeRevol did not complete (does the profile cross the axis?)");
+        }
+        TopoDS_Shape result = revol.Shape();
+        // Depending on the turning direction the solid may come out inside out.
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        record_profile_faces(revol, base, marks, result_faces, out);
+        if (!full) {
+            for (TopExp_Explorer it(revol.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
+                add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
+            }
+            for (TopExp_Explorer it(revol.LastShape(), TopAbs_FACE); it.More(); it.Next()) {
+                add_source(out, result_faces, it.Current(), SourceKind::EndCap, 0, 0);
+            }
+        }
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
+OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
+                            double offset) {
+    return guarded("shell", [&] {
+        if (!(std::abs(offset) > 1e-9)) {
+            throw std::invalid_argument("the wall thickness is zero");
+        }
+        const TopoDS_Shape& input = get(shape);
+        TopTools_IndexedMapOfShape input_faces;
+        TopExp::MapShapes(input, TopAbs_FACE, input_faces);
+        TopTools_ListOfShape removed;
+        for (const std::uint32_t index : faces) {
+            if (index >= static_cast<std::uint32_t>(input_faces.Extent())) {
+                throw std::out_of_range("face index " + std::to_string(index) + " out of range");
+            }
+            removed.Append(input_faces(static_cast<int>(index) + 1));
+        }
+
+        BRepOffsetAPI_MakeThickSolid maker;
+        maker.MakeThickSolidByJoin(input, removed, offset, 1.0e-6, BRepOffset_Skin,
+                                   Standard_False, Standard_False, GeomAbs_Intersection);
+        maker.Build();
+        if (!maker.IsDone()) {
+            throw std::runtime_error("shell failed (walls too thick for the part?)");
+        }
+        const TopoDS_Shape result = maker.Shape();
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        for (int j = 1; j <= input_faces.Extent(); ++j) {
+            const TopoDS_Shape& face = input_faces(j);
+            const auto index = static_cast<std::uint32_t>(j - 1);
+            // The original faces stay as the skin; Modified() gives their offset copies.
+            add_source(out, result_faces, face, SourceKind::InputFace, 0, index);
+            const TopTools_ListOfShape& modified = maker.Modified(face);
+            for (TopTools_ListIteratorOfListOfShape it(modified); it.More(); it.Next()) {
+                const SourceKind kind =
+                    it.Value().IsSame(face) ? SourceKind::InputFace : SourceKind::OffsetFace;
+                add_source(out, result_faces, it.Value(), kind, 0, index);
+            }
+        }
+        record_generated_faces(maker, input, 0, TopAbs_EDGE, SourceKind::InputEdge,
+                               result_faces, out);
+        record_generated_faces(maker, input, 0, TopAbs_VERTEX, SourceKind::InputVertex,
+                               result_faces, out);
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
+OpResultData Session::transform(std::uint64_t shape, rust::Slice<const double> rows) {
+    return guarded("transform", [&] {
+        if (rows.size() != 12) {
+            throw std::invalid_argument("a transform needs 12 values");
+        }
+        const TopoDS_Shape& input = get(shape);
+        gp_Trsf trsf;
+        trsf.SetValues(rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
+                       rows[8], rows[9], rows[10], rows[11]);
+        BRepBuilderAPI_Transform maker(input, trsf, Standard_True);
+        if (!maker.IsDone()) {
+            throw std::runtime_error("transform failed");
+        }
+        const TopoDS_Shape result = maker.Shape();
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        TopTools_IndexedMapOfShape input_faces;
+        TopExp::MapShapes(input, TopAbs_FACE, input_faces);
+        for (int j = 1; j <= input_faces.Extent(); ++j) {
+            add_source(out, result_faces, maker.ModifiedShape(input_faces(j)),
+                       SourceKind::InputFace, 0, static_cast<std::uint32_t>(j - 1));
         }
 
         out.shape = insert(result);
@@ -582,6 +743,26 @@ TopologyData Session::topology(std::uint64_t shape) const {
                 data.ny = normal.Y();
                 data.nz = normal.Z();
             }
+            switch (surface.GetType()) {
+            case GeomAbs_Cylinder:
+                data.has_axis = true;
+                data.axis = axis_data(surface.Cylinder().Axis());
+                break;
+            case GeomAbs_Cone:
+                data.has_axis = true;
+                data.axis = axis_data(surface.Cone().Axis());
+                break;
+            case GeomAbs_Sphere:
+                data.has_axis = true;
+                data.axis = axis_data(surface.Sphere().Position().Axis());
+                break;
+            case GeomAbs_Torus:
+                data.has_axis = true;
+                data.axis = axis_data(surface.Torus().Axis());
+                break;
+            default:
+                break;
+            }
 
             TopTools_IndexedMapOfShape face_edges;
             TopExp::MapShapes(face, TopAbs_EDGE, face_edges);
@@ -624,6 +805,14 @@ TopologyData Session::topology(std::uint64_t shape) const {
                 BRepGProp::LinearProperties(edge, props);
                 data.length = props.Mass();
                 mid = curve.Value(0.5 * (curve.FirstParameter() + curve.LastParameter()));
+                if (curve.GetType() == GeomAbs_Line) {
+                    data.has_axis = true;
+                    data.axis = axis_data(
+                        gp_Ax1(curve.Value(curve.FirstParameter()), curve.Line().Direction()));
+                } else if (curve.GetType() == GeomAbs_Circle) {
+                    data.has_axis = true;
+                    data.axis = axis_data(curve.Circle().Axis());
+                }
             }
             data.mx = mid.X();
             data.my = mid.Y();

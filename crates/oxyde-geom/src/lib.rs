@@ -1,5 +1,5 @@
-//! Geometric primitives for Oxyde: points, vectors, planes, sketch profiles and the central
-//! tolerance policy.
+//! Geometric primitives for Oxyde: points, vectors, planes, axes, transforms, sketch profiles
+//! and the central tolerance policy.
 //!
 //! This crate has no dependencies on the rest of the workspace.
 //!
@@ -7,10 +7,12 @@
 
 mod plane;
 mod profile;
+mod transform;
 mod vector;
 
 pub use plane::Plane;
 pub use profile::{Curve2, Loop, Profile, ProfileError, ProfileSegment, Region};
+pub use transform::{Axis, Transform};
 pub use vector::{Point2, Point3, Vec3};
 
 /// Two points closer than this are the same point, in millimetres.

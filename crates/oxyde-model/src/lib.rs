@@ -1,7 +1,8 @@
 //! The parametric model: feature timeline, rebuild and persistent topological naming.
 //!
-//! - [`Part`] holds the timeline (sketches, extrusions, fillets, …), the rollback bar and
-//!   suppression, and rebuilds it through any [`oxyde_kernel::Kernel`].
+//! - [`Part`] holds the timeline (sketches, extrusions, revolves, fillets, shells, reference
+//!   planes and axes, patterns, mirrors…), the rollback bar and suppression, and rebuilds it
+//!   through any [`oxyde_kernel::Kernel`].
 //! - [`FaceName`], [`EdgeName`] and [`VertexName`] identify geometry in a way that survives
 //!   upstream edits, so features keep pointing at the right faces and edges.
 //! - [`Part::dimensions`] lists every dimension with its SolidWorks-style full name
@@ -29,8 +30,11 @@ pub use equations::{
 pub use error::ModelError;
 pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};
 pub use feature::{
-    EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind,
-    FeatureParameter, Sketch, SketchPlane, StandardPlane,
+    AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
+    FeatureKind, FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
+    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
 };
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
-pub use part::{Body, FeatureStatus, Part, PartDefinition, SketchResult, TimelineEntry};
+pub use part::{
+    Body, FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,
+};

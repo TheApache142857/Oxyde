@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use oxyde_geom::{Plane, Point2};
+use oxyde_geom::{Axis, Plane, Point2};
 use oxyde_sketch::ConstrainedSketch;
 
 use crate::dimensions::DimensionUnit;
@@ -40,43 +40,74 @@ pub enum FeatureParameter {
     Radius,
     /// Chamfer distance.
     Distance,
+    /// Revolve angle, or total angle of a circular pattern.
+    Angle,
+    /// Shell wall thickness.
+    Thickness,
+    /// Distance of a reference plane from its base.
+    Offset,
+    /// Spacing of a linear pattern, first direction.
+    Spacing,
+    /// Number of instances of a pattern (first direction), the seed included.
+    Count,
+    /// Spacing of a linear pattern, second direction.
+    Spacing2,
+    /// Number of instances in the second direction of a linear pattern.
+    Count2,
 }
+
+const PARAMETERS: [(FeatureParameter, &str, &str); 10] = [
+    (FeatureParameter::Depth, "depth", "Depth"),
+    (FeatureParameter::Radius, "radius", "Radius"),
+    (FeatureParameter::Distance, "distance", "Distance"),
+    (FeatureParameter::Angle, "angle", "Angle"),
+    (FeatureParameter::Thickness, "thickness", "Thickness"),
+    (FeatureParameter::Offset, "offset", "Offset"),
+    (FeatureParameter::Spacing, "spacing", "Spacing"),
+    (FeatureParameter::Count, "count", "Instances"),
+    (
+        FeatureParameter::Spacing2,
+        "spacing2",
+        "Spacing (direction 2)",
+    ),
+    (
+        FeatureParameter::Count2,
+        "count2",
+        "Instances (direction 2)",
+    ),
+];
 
 impl FeatureParameter {
     /// Key used in files.
     pub fn key(self) -> &'static str {
-        match self {
-            FeatureParameter::Depth => "depth",
-            FeatureParameter::Radius => "radius",
-            FeatureParameter::Distance => "distance",
-        }
+        PARAMETERS
+            .iter()
+            .find(|(p, ..)| *p == self)
+            .map_or("", |(_, key, _)| key)
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
-        match key {
-            "depth" => Some(FeatureParameter::Depth),
-            "radius" => Some(FeatureParameter::Radius),
-            "distance" => Some(FeatureParameter::Distance),
-            _ => None,
-        }
+        PARAMETERS
+            .iter()
+            .find(|(_, k, _)| *k == key)
+            .map(|(p, ..)| *p)
     }
 
     /// Whether the value is a length, an angle or a number of instances.
     pub fn unit(self) -> DimensionUnit {
         match self {
-            FeatureParameter::Depth | FeatureParameter::Radius | FeatureParameter::Distance => {
-                DimensionUnit::Length
-            }
+            FeatureParameter::Angle => DimensionUnit::Angle,
+            FeatureParameter::Count | FeatureParameter::Count2 => DimensionUnit::Count,
+            _ => DimensionUnit::Length,
         }
     }
 
     /// What the parameter is called in the user interface.
     pub fn label(self) -> &'static str {
-        match self {
-            FeatureParameter::Depth => "Depth",
-            FeatureParameter::Radius => "Radius",
-            FeatureParameter::Distance => "Distance",
-        }
+        PARAMETERS
+            .iter()
+            .find(|(p, ..)| *p == self)
+            .map_or("", |(.., label)| label)
     }
 }
 
@@ -152,8 +183,17 @@ impl Feature {
 pub enum FeatureKind {
     Sketch(Sketch),
     Extrude(Extrude),
+    Revolve(Revolve),
     Fillet(EdgeBlend),
     Chamfer(EdgeBlend),
+    Shell(Shell),
+    /// Reference plane.
+    Plane(RefPlane),
+    /// Reference axis.
+    Axis(RefAxis),
+    LinearPattern(LinearPattern),
+    CircularPattern(CircularPattern),
+    Mirror(Mirror),
 }
 
 impl FeatureKind {
@@ -165,18 +205,47 @@ impl FeatureKind {
                 ExtrudeOp::Boss => "Boss-Extrude",
                 ExtrudeOp::Cut => "Cut-Extrude",
             },
+            FeatureKind::Revolve(r) => match r.op {
+                ExtrudeOp::Boss => "Revolve",
+                ExtrudeOp::Cut => "Cut-Revolve",
+            },
             FeatureKind::Fillet(_) => "Fillet",
             FeatureKind::Chamfer(_) => "Chamfer",
+            FeatureKind::Shell(_) => "Shell",
+            FeatureKind::Plane(_) => "Plane",
+            FeatureKind::Axis(_) => "Axis",
+            FeatureKind::LinearPattern(_) => "LPattern",
+            FeatureKind::CircularPattern(_) => "CirPattern",
+            FeatureKind::Mirror(_) => "Mirror",
         }
     }
 
-    /// The feature's own dimensions and their values (mm).
+    /// The feature's own dimensions and their values (mm, radians, or counts). Optional
+    /// parameters come last, so that default names ("D1", "D2"…) never shift.
     pub fn parameters(&self) -> Vec<(FeatureParameter, f64)> {
+        use FeatureParameter as P;
         match self {
-            FeatureKind::Sketch(_) => Vec::new(),
-            FeatureKind::Extrude(e) => vec![(FeatureParameter::Depth, e.extent.depth())],
-            FeatureKind::Fillet(b) => vec![(FeatureParameter::Radius, b.size)],
-            FeatureKind::Chamfer(b) => vec![(FeatureParameter::Distance, b.size)],
+            FeatureKind::Sketch(_) | FeatureKind::Axis(_) | FeatureKind::Mirror(_) => Vec::new(),
+            FeatureKind::Extrude(e) => vec![(P::Depth, e.extent.depth())],
+            FeatureKind::Revolve(r) => vec![(P::Angle, r.angle)],
+            FeatureKind::Fillet(b) => vec![(P::Radius, b.size)],
+            FeatureKind::Chamfer(b) => vec![(P::Distance, b.size)],
+            FeatureKind::Shell(s) => vec![(P::Thickness, s.thickness)],
+            FeatureKind::Plane(p) => vec![(P::Offset, p.offset)],
+            FeatureKind::LinearPattern(l) => {
+                let mut out = vec![
+                    (P::Spacing, l.first.spacing),
+                    (P::Count, f64::from(l.first.count)),
+                ];
+                if let Some(second) = &l.second {
+                    out.push((P::Spacing2, second.spacing));
+                    out.push((P::Count2, f64::from(second.count)));
+                }
+                out
+            }
+            FeatureKind::CircularPattern(c) => {
+                vec![(P::Angle, c.angle), (P::Count, f64::from(c.count))]
+            }
         }
     }
 
@@ -192,46 +261,98 @@ impl FeatureKind {
     }
 
     /// Changes one of the feature's dimensions; false if the feature has no such parameter.
+    /// Counts are rounded, and at least 1.
     pub fn set_parameter(&mut self, parameter: FeatureParameter, value: f64) -> bool {
+        use FeatureParameter as P;
+        let count = || value.round().max(1.0).min(f64::from(u32::MAX)) as u32;
         match (self, parameter) {
-            (FeatureKind::Extrude(e), FeatureParameter::Depth) => {
+            (FeatureKind::Extrude(e), P::Depth) => {
                 e.extent = match e.extent {
                     ExtrudeExtent::Blind { .. } => ExtrudeExtent::Blind { depth: value },
                     ExtrudeExtent::MidPlane { .. } => ExtrudeExtent::MidPlane { depth: value },
                 };
-                true
             }
-            (FeatureKind::Fillet(b), FeatureParameter::Radius)
-            | (FeatureKind::Chamfer(b), FeatureParameter::Distance) => {
+            (FeatureKind::Revolve(r), P::Angle) => r.angle = value,
+            (FeatureKind::Fillet(b), P::Radius) | (FeatureKind::Chamfer(b), P::Distance) => {
                 b.size = value;
-                true
             }
-            _ => false,
+            (FeatureKind::Shell(s), P::Thickness) => s.thickness = value,
+            (FeatureKind::Plane(p), P::Offset) => p.offset = value,
+            (FeatureKind::LinearPattern(l), P::Spacing) => l.first.spacing = value,
+            (FeatureKind::LinearPattern(l), P::Count) => l.first.count = count(),
+            (FeatureKind::LinearPattern(l), P::Spacing2) => match &mut l.second {
+                Some(second) => second.spacing = value,
+                None => return false,
+            },
+            (FeatureKind::LinearPattern(l), P::Count2) => match &mut l.second {
+                Some(second) => second.count = count(),
+                None => return false,
+            },
+            (FeatureKind::CircularPattern(c), P::Angle) => c.angle = value,
+            (FeatureKind::CircularPattern(c), P::Count) => c.count = count(),
+            _ => return false,
         }
+        true
     }
 
-    /// Features this one refers to: its sketch, or the features that created the faces and
-    /// edges it is attached to. Sorted, without duplicates.
+    /// Features this one refers to: its sketch, its seeds, its reference geometry, or the
+    /// features that created the faces and edges it is attached to. Sorted, without
+    /// duplicates.
     pub fn dependencies(&self) -> Vec<FeatureId> {
         let mut out = Vec::new();
+        let faces = |faces: &[FaceName], out: &mut Vec<FeatureId>| {
+            faces.iter().for_each(|f| f.key.collect_features(out));
+        };
         match self {
-            FeatureKind::Sketch(s) => {
-                if let SketchPlane::Face(face) = &s.plane {
-                    face.key.collect_features(&mut out);
+            FeatureKind::Sketch(s) => match &s.plane {
+                SketchPlane::Standard(_) => {}
+                SketchPlane::Face(face) => face.key.collect_features(&mut out),
+                SketchPlane::Reference(plane) => out.push(*plane),
+            },
+            FeatureKind::Extrude(e) => out.push(e.sketch),
+            FeatureKind::Revolve(r) => {
+                out.push(r.sketch);
+                if let RevolveAxis::Axis(axis) = &r.axis {
+                    axis.collect_features(&mut out);
                 }
             }
-            FeatureKind::Extrude(e) => out.push(e.sketch),
             FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
                 for edge in &b.edges {
-                    edge.faces
-                        .iter()
-                        .for_each(|f| f.key.collect_features(&mut out));
+                    faces(&edge.faces, &mut out);
                 }
+            }
+            FeatureKind::Shell(s) => faces(&s.faces, &mut out),
+            FeatureKind::Plane(p) => p.base.collect_features(&mut out),
+            FeatureKind::Axis(RefAxis::Along(axis)) => axis.collect_features(&mut out),
+            FeatureKind::Axis(RefAxis::TwoPlanes(a, b)) => {
+                a.collect_features(&mut out);
+                b.collect_features(&mut out);
+            }
+            FeatureKind::LinearPattern(l) => {
+                out.extend(&l.seeds);
+                l.first.axis.collect_features(&mut out);
+                if let Some(second) = &l.second {
+                    second.axis.collect_features(&mut out);
+                }
+            }
+            FeatureKind::CircularPattern(c) => {
+                out.extend(&c.seeds);
+                c.axis.collect_features(&mut out);
+            }
+            FeatureKind::Mirror(m) => {
+                out.extend(&m.seeds);
+                m.plane.collect_features(&mut out);
             }
         }
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Whether the feature can be the seed of a pattern or a mirror: it adds or removes
+    /// material with a tool body.
+    pub fn is_patternable(&self) -> bool {
+        matches!(self, FeatureKind::Extrude(_) | FeatureKind::Revolve(_))
     }
 }
 
@@ -253,12 +374,75 @@ impl StandardPlane {
     }
 }
 
+/// The three model axes (SolidWorks shows them as temporary axes through the origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandardAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl StandardAxis {
+    pub fn axis(self) -> Axis {
+        match self {
+            StandardAxis::X => Axis::X,
+            StandardAxis::Y => Axis::Y,
+            StandardAxis::Z => Axis::Z,
+        }
+    }
+}
+
 /// Where a sketch is drawn.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SketchPlane {
     Standard(StandardPlane),
     /// A planar face of the body as it is just before the sketch in the timeline.
     Face(FaceName),
+    /// A reference plane feature.
+    Reference(FeatureId),
+}
+
+/// A plane picked for a feature: mirror plane, base of a reference plane…
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlaneRef {
+    Standard(StandardPlane),
+    /// A planar face of the body.
+    Face(FaceName),
+    /// A reference plane feature.
+    Reference(FeatureId),
+}
+
+impl PlaneRef {
+    pub fn collect_features(&self, out: &mut Vec<FeatureId>) {
+        match self {
+            PlaneRef::Standard(_) => {}
+            PlaneRef::Face(face) => face.key.collect_features(out),
+            PlaneRef::Reference(id) => out.push(*id),
+        }
+    }
+}
+
+/// An axis or a direction picked for a feature: revolve axis, pattern direction…
+#[derive(Debug, Clone, PartialEq)]
+pub enum AxisRef {
+    Standard(StandardAxis),
+    /// A reference axis feature.
+    Reference(FeatureId),
+    /// A straight edge (its line) or a circular edge (its axis).
+    Edge(EdgeName),
+    /// The axis of a cylindrical or conical face, or the normal of a planar face.
+    Face(FaceName),
+}
+
+impl AxisRef {
+    pub fn collect_features(&self, out: &mut Vec<FeatureId>) {
+        match self {
+            AxisRef::Standard(_) => {}
+            AxisRef::Reference(id) => out.push(*id),
+            AxisRef::Edge(edge) => edge.faces.iter().for_each(|f| f.key.collect_features(out)),
+            AxisRef::Face(face) => face.key.collect_features(out),
+        }
+    }
 }
 
 /// A 2D sketch: geometry with relations and dimensions, on a plane or a face.
@@ -297,6 +481,7 @@ impl Sketch {
     }
 }
 
+/// Whether an extrusion or a revolve adds or removes material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtrudeOp {
     /// Adds material, merged with the existing body.
@@ -347,4 +532,95 @@ impl Extrude {
 pub struct EdgeBlend {
     pub edges: Vec<EdgeName>,
     pub size: f64,
+}
+
+/// What a revolve turns about.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RevolveAxis {
+    /// A line of the revolve's own sketch (usually a construction centerline), by entity id.
+    SketchLine(u32),
+    Axis(AxisRef),
+}
+
+/// Revolved boss or cut: the sketch's closed regions turned about an axis in its plane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revolve {
+    pub sketch: FeatureId,
+    pub op: ExtrudeOp,
+    pub axis: RevolveAxis,
+    /// Radians, more than 0 and at most 2π.
+    pub angle: f64,
+    /// Half the angle on each side of the sketch plane.
+    pub mid_plane: bool,
+    /// Turn the other way.
+    pub reverse: bool,
+}
+
+/// Hollows the part: removes the selected faces and leaves walls of the given thickness.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shell {
+    /// Faces to remove (open). None makes a closed hollow part.
+    pub faces: Vec<FaceName>,
+    pub thickness: f64,
+    /// Walls outside the original faces instead of inside.
+    pub outward: bool,
+}
+
+/// Reference plane at a distance from another plane or a planar face.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefPlane {
+    pub base: PlaneRef,
+    /// Distance along the base normal (mm).
+    pub offset: f64,
+    /// Offset to the other side.
+    pub flip: bool,
+}
+
+/// Reference axis.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefAxis {
+    /// Along an edge, a face's axis, a model axis…
+    Along(AxisRef),
+    /// Where two planes meet.
+    TwoPlanes(PlaneRef, PlaneRef),
+}
+
+/// One direction of a linear pattern.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatternDirection {
+    pub axis: AxisRef,
+    /// Distance between instances (mm).
+    pub spacing: f64,
+    /// Number of instances in this direction, the seed included.
+    pub count: u32,
+    pub reverse: bool,
+}
+
+/// Copies of features along one or two directions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearPattern {
+    /// Extrusions and revolves to copy.
+    pub seeds: Vec<FeatureId>,
+    pub first: PatternDirection,
+    pub second: Option<PatternDirection>,
+}
+
+/// Copies of features around an axis.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CircularPattern {
+    pub seeds: Vec<FeatureId>,
+    pub axis: AxisRef,
+    /// Radians: the total angle with equal spacing, else the angle between instances.
+    pub angle: f64,
+    /// Number of instances, the seed included.
+    pub count: u32,
+    pub equal_spacing: bool,
+    pub reverse: bool,
+}
+
+/// Mirror image of features through a plane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mirror {
+    pub seeds: Vec<FeatureId>,
+    pub plane: PlaneRef,
 }
