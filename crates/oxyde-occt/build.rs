@@ -22,6 +22,9 @@ const CORE_TOOLKITS: &[&str] = &[
     "TKGeomAlgo",
     "TKTopAlgo",
     "TKPrim",
+    "TKBO",
+    "TKBool",
+    "TKFillet",
     "TKShHealing",
     "TKXSBase",
 ];
@@ -58,6 +61,9 @@ fn main() {
         .file("cpp/shim.cpp")
         .include(&occt.include_dir)
         .std("c++17")
+        // Keep <windows.h>, if an OCCT header pulls it in, from defining min/max macros.
+        .define("NOMINMAX", None)
+        .define("WIN32_LEAN_AND_MEAN", None)
         // OCCT headers are noisy at high warning levels.
         .warnings(false)
         .compile("oxyde_occt_shim");

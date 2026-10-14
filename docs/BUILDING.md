@@ -59,7 +59,9 @@ Open a new terminal afterwards.
 ## 2. Build and test
 
 ```powershell
-cargo test -p oxyde-occt                       # M1 acceptance tests
+cargo test --workspace                         # everything
+cargo test -p oxyde-geom -p oxyde-model        # pure-Rust tests only (no OCCT needed at run time)
+cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end tests
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```
 
