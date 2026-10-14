@@ -74,6 +74,17 @@ impl Camera {
         crate::vec3::cross(self.eye_direction(), self.right())
     }
 
+    /// Direction towards the key light: above and to the left of the viewer, so that the
+    /// faces of a part get different shades (with a headlight alone, the three visible faces
+    /// of a box in the isometric view look identical).
+    pub fn key_light(&self) -> V3 {
+        let raw = add(
+            add(scale(self.eye_direction(), 0.6), scale(self.up(), 0.6)),
+            scale(self.right(), -0.5),
+        );
+        scale(raw, 1.0 / length(raw))
+    }
+
     /// Pixels per millimetre for a viewport `viewport_height` pixels tall.
     pub fn pixels_per_mm(&self, viewport_height: f64) -> f64 {
         viewport_height / self.height
