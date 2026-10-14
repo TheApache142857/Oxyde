@@ -2,7 +2,7 @@
 
 An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
 
-> **Status: pre-alpha.** A first desktop application is written — timeline panel, properties, 3D viewport with face/edge picking, `.oxy` save/load, STEP export — on top of the headless modeling engine (sketch, boss/cut extrude, fillet, chamfer, persistent naming). Everything awaits its first Windows build.
+> **Status: pre-alpha.** A first desktop application is written: timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, dimensions, fully/under-defined colouring), boss/cut extrude, fillet, chamfer, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`) ready for equations, a 3D viewport with picking, `.oxy` save/load and STEP export. Everything awaits its first Windows build.
 
 ## Goals
 
@@ -33,7 +33,7 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | Crate | Role |
 |---|---|
 | `oxyde-geom` | Math primitives: points, vectors, planes, transforms, tolerances |
-| `oxyde-sketch` | 2D sketch entities and the geometric constraint solver |
+| `oxyde-sketch` | 2D sketch entities and the geometric constraint solver (degrees of freedom, fully defined, redundant/conflicting) |
 | `oxyde-kernel` | The `Kernel` trait: solid operations, topology queries, operation history, STEP I/O |
 | `oxyde-occt` | `Kernel` implementation backed by OpenCASCADE through a small C++ shim (`cxx`) |
 | `oxyde-model` | Feature tree, dependency graph, rebuild, persistent topological naming |

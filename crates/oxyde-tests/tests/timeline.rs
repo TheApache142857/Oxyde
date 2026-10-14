@@ -10,11 +10,13 @@ use oxyde_model::{
     FeatureStatus, Part, Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
+use oxyde_sketch::RelationId;
 
-// Rectangle sketches drawn with `Sketch::rectangle` have these entity ids.
-const BOTTOM: u32 = 1;
-const RIGHT: u32 = 2;
-const LEFT: u32 = 4;
+// In a new sketch, `Sketch::rectangle` creates its four corner points first (ids 1–4),
+// then its bottom, right, top and left lines (ids 5–8).
+const BOTTOM: u32 = 5;
+const RIGHT: u32 = 6;
+const LEFT: u32 = 8;
 
 fn rectangle_on_front(width: f64, height: f64) -> FeatureKind {
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
@@ -285,5 +287,90 @@ fn reversed_and_midplane_extrusions_have_positive_volume() {
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
     assert_close(volume(&part, &kernel), 600.0);
+    part.release(&mut kernel);
+}
+
+/// A 40 × 20 rectangle fully defined by a fixed corner and two dimensions. Returns the sketch,
+/// the line ids (bottom, right, top, left) and the ids of the width and height dimensions
+/// (named D1 and D2).
+fn dimensioned_rectangle() -> (Sketch, [u32; 4], RelationId, RelationId) {
+    use oxyde_sketch::{Constraint, EntityId};
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let lines = sketch.rectangle(Point2::new(0.5, 0.5), 37.0, 18.0);
+    let corner = sketch.geometry.endpoints(EntityId(lines[0])).unwrap().0;
+    sketch.geometry.move_point(corner, Point2::ORIGIN);
+    sketch.geometry.constrain(Constraint::Fixed(corner));
+    let width = sketch
+        .geometry
+        .constrain(Constraint::Length(EntityId(lines[0]), 40.0));
+    let height = sketch
+        .geometry
+        .constrain(Constraint::Length(EntityId(lines[1]), 20.0));
+    (sketch, lines, width, height)
+}
+
+#[test]
+fn sketch_dimensions_drive_the_part() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+
+    let (sketch, lines, width, _) = dimensioned_rectangle();
+    let s1 = part.add_feature(FeatureKind::Sketch(sketch));
+    let base = part.add_feature(boss(s1, 10.0));
+    let edge = EdgeName::between(FaceName::profile(base, lines[1]), FaceName::end_cap(base));
+    part.add_feature(fillet(vec![edge], 2.0));
+
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    // Fully defined: no "(-)" in the timeline.
+    assert!(!part.timeline()[0].under_defined);
+    assert_close(volume(&part, &kernel), 8000.0 - fillet_loss(2.0, 20.0));
+
+    // Change the width dimension: the solver moves the right side, the fillet follows.
+    if let FeatureKind::Sketch(s) = part.edit(s1).unwrap() {
+        assert!(s.geometry.set_dimension(width, 60.0));
+    }
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 12000.0 - fillet_loss(2.0, 20.0));
+
+    // The same through SolidWorks-style names, as equations will: D1@Sketch1 is the width,
+    // D1@Boss-Extrude1 the depth.
+    let width = part.find_dimension("D1@Sketch1").unwrap();
+    let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
+    part.set_dimension(width, 50.0).unwrap();
+    part.set_dimension(depth, 5.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 5000.0 - fillet_loss(2.0, 20.0));
+    part.release(&mut kernel);
+}
+
+#[test]
+fn under_and_over_defined_sketches() {
+    use oxyde_sketch::{Constraint, EntityId};
+    let mut kernel = OcctKernel::new();
+
+    // Without dimensions the rectangle can still move and stretch.
+    let mut part = Part::new();
+    let s1 = part.add_feature(rectangle_on_front(40.0, 20.0));
+    part.add_feature(boss(s1, 10.0));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert!(part.timeline()[0].under_defined);
+    part.release(&mut kernel);
+
+    // Two contradictory widths: the sketch fails, and so does the extrusion that uses it.
+    let mut part = Part::new();
+    let (mut sketch, lines, _, _) = dimensioned_rectangle();
+    sketch
+        .geometry
+        .constrain(Constraint::Length(EntityId(lines[2]), 55.0));
+    let s1 = part.add_feature(FeatureKind::Sketch(sketch));
+    let base = part.add_feature(boss(s1, 10.0));
+    part.rebuild(&mut kernel);
+    assert!(matches!(part.status(s1), Some(FeatureStatus::Error(_))));
+    assert!(matches!(part.status(base), Some(FeatureStatus::Error(_))));
+    assert!(part.body().is_none());
     part.release(&mut kernel);
 }

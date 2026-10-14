@@ -191,7 +191,9 @@ pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
     let model: PartModel = from_json(MODEL, &read_entry(&mut archive, MODEL)?)?;
     let properties: Properties = from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?;
 
-    let definition = model.into_definition();
+    let definition = model
+        .into_definition()
+        .map_err(|e| FormatError::InvalidModel(ModelError::InvalidDefinition(e)))?;
     // Validate now, so a broken file is reported at open time.
     let definition = Part::from_definition(definition)
         .map_err(FormatError::InvalidModel)?
@@ -246,11 +248,12 @@ pub fn load_part(path: &Path) -> Result<PartFile, FormatError> {
 mod tests {
     use std::io::Cursor;
 
-    use oxyde_geom::{Curve2, Point2};
+    use oxyde_geom::Point2;
     use oxyde_model::{
         EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureKind, Sketch,
         SketchPlane, StandardPlane,
     };
+    use oxyde_sketch::Constraint;
 
     use super::*;
 
@@ -266,13 +269,17 @@ mod tests {
         )));
 
         let mut top = Sketch::new(SketchPlane::Face(FaceName::end_cap(boss)));
-        top.circle(Point2::new(0.0, 0.0), 3.0);
-        top.add(Curve2::Arc {
-            start: Point2::new(5.0, 0.0),
-            mid: Point2::new(6.0, 1.0),
-            end: Point2::new(7.0, 0.0),
-        });
-        top.entities[1].construction = true;
+        let circle = top.geometry.circle(Point2::new(0.0, 0.0), 3.0);
+        let guide = top.geometry.arc(
+            Point2::new(6.0, 0.0),
+            Point2::new(7.0, 0.0),
+            Point2::new(6.0, 1.0),
+        );
+        top.geometry.set_construction(guide, true);
+        let hole_radius = top.geometry.constrain(Constraint::Radius(circle, 3.0));
+        top.geometry.rename_dimension(hole_radius, "Hole").unwrap();
+        top.geometry
+            .constrain(Constraint::EqualRadius(circle, guide));
         let s2 = part.add_feature(FeatureKind::Sketch(top));
         let hole = part.add_feature(FeatureKind::Extrude(Extrude {
             sketch: s2,
@@ -294,6 +301,8 @@ mod tests {
             size: 0.5,
         }));
         part.set_suppressed(bevel, true).unwrap();
+        let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
+        part.rename_dimension(depth, "Thickness").unwrap();
         part.roll_back_to(Some(bevel)).unwrap();
 
         let mut properties = Properties {
@@ -366,7 +375,10 @@ mod tests {
             "features": [
                 { "id": 1, "name": "Sketch1", "type": "sketch",
                   "plane": { "standard": "top" },
-                  "entities": [ { "id": 1, "type": "circle", "center": [0, 0], "radius": 5 } ] },
+                  "entities": [
+                    { "id": 1, "type": "point", "at": [0, 0] },
+                    { "id": 2, "type": "circle", "center": 1, "radius": 5 } ],
+                  "relations": [ { "id": 1, "type": "radius", "curve": 2, "value": 5 } ] },
                 { "id": 2, "name": "Boss-Extrude1", "type": "extrude", "sketch": 1,
                   "operation": "boss", "extent": { "type": "blind", "depth": 2 } }
             ]
@@ -374,6 +386,14 @@ mod tests {
         let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
         let part = read_part(Cursor::new(bytes)).unwrap();
         assert_eq!(part.definition.features.len(), 2);
+        // Without stored names or counters, dimensions get default names on load.
+        let loaded = Part::from_definition(part.definition.clone()).unwrap();
+        let names: Vec<String> = loaded
+            .dimensions()
+            .into_iter()
+            .map(|d| d.full_name)
+            .collect();
+        assert_eq!(names, ["D1@Sketch1", "D1@Boss-Extrude1"]);
         assert_eq!(part.properties, Properties::default());
     }
 
@@ -413,6 +433,18 @@ mod tests {
             read_part(Cursor::new(bytes)),
             Err(FormatError::InvalidModel(_))
         ));
+    }
+
+    #[test]
+    fn sketches_with_bad_references_are_refused() {
+        let model = r#"{ "next_feature_id": 2, "features": [
+            { "id": 1, "name": "Sketch1", "type": "sketch", "plane": { "standard": "front" },
+              "entities": [ { "id": 1, "type": "line", "start": 7, "end": 8 } ] } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        match read_part(Cursor::new(bytes)) {
+            Err(FormatError::InvalidModel(e)) => assert!(e.to_string().contains("Sketch1")),
+            other => panic!("expected an invalid model, got {other:?}"),
+        }
     }
 
     #[test]

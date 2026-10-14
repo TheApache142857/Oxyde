@@ -1,9 +1,13 @@
 //! The 3D viewport: shows the part, handles camera navigation and picking.
 //!
-//! Mouse: left-drag orbits, middle-drag or Shift+left-drag pans, the wheel zooms at the
-//! cursor, left-click selects (Ctrl+click adds to the selection).
+//! Mouse, part mode: left-drag orbits, middle-drag or Shift+left-drag pans, the wheel zooms
+//! at the cursor, left-click selects (Ctrl+click adds to the selection).
+//!
+//! Sketch mode keeps the left button for drawing: middle-drag pans, Ctrl+middle-drag orbits,
+//! and picking of the 3D model is off.
 
 use eframe::egui;
+use oxyde_geom::{Plane, Point2, Point3};
 use oxyde_render::{Camera, Frame, Highlight, Pick, Scene, StandardView, render};
 
 /// What happened in the viewport this frame.
@@ -13,6 +17,19 @@ pub struct ViewportOutput {
     pub clicked: Option<Option<Pick>>,
     /// Ctrl was held during the click.
     pub additive: bool,
+    /// Where the viewport is on screen, and the screen scale, for overlays.
+    pub rect: egui::Rect,
+    pub pixels_per_point: f32,
+}
+
+impl ViewportOutput {
+    fn size_px(&self) -> (f64, f64) {
+        let ppp = self.pixels_per_point as f64;
+        (
+            self.rect.width() as f64 * ppp,
+            self.rect.height() as f64 * ppp,
+        )
+    }
 }
 
 /// Everything the current image depends on: re-render only when this changes.
@@ -71,11 +88,52 @@ impl Viewport {
         self.fit_pending = true;
     }
 
+    /// Looks straight at a plane (SolidWorks' "Normal To").
+    pub fn look_at_plane(&mut self, plane: &Plane) {
+        let n = plane.normal;
+        self.camera.look_along([n.x, n.y, n.z]);
+        self.fit_pending = true;
+    }
+
+    /// Screen position of a model-space point.
+    pub fn to_screen(&self, p: Point3, out: &ViewportOutput) -> egui::Pos2 {
+        let (w, h) = out.size_px();
+        let q = self.camera.project([p.x, p.y, p.z], w, h);
+        let ppp = out.pixels_per_point;
+        out.rect.min + egui::vec2(q[0] as f32 / ppp, q[1] as f32 / ppp)
+    }
+
+    /// Where the viewing ray under a screen position meets `plane`, in plane coordinates.
+    pub fn to_plane(&self, pos: egui::Pos2, out: &ViewportOutput, plane: &Plane) -> Option<Point2> {
+        let (w, h) = out.size_px();
+        let ppp = out.pixels_per_point as f64;
+        let local = pos - out.rect.min;
+        let (origin, direction) = self
+            .camera
+            .ray(local.x as f64 * ppp, local.y as f64 * ppp, w, h);
+        let n = [plane.normal.x, plane.normal.y, plane.normal.z];
+        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let facing = dot(direction, n);
+        if facing.abs() < 1e-9 {
+            return None;
+        }
+        let o = [plane.origin.x, plane.origin.y, plane.origin.z];
+        let t = dot([o[0] - origin[0], o[1] - origin[1], o[2] - origin[2]], n) / facing;
+        let hit = Point3::new(
+            origin[0] + direction[0] * t,
+            origin[1] + direction[1] * t,
+            origin[2] + direction[2] * t,
+        );
+        let v = hit - plane.origin;
+        Some(Point2::new(v.dot(plane.x_dir), v.dot(plane.y_dir())))
+    }
+
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         selected: Vec<Pick>,
         hint: Option<&str>,
+        sketching: bool,
     ) -> ViewportOutput {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -92,11 +150,16 @@ impl Viewport {
         }
 
         // Navigation.
-        let shift = ui.input(|i| i.modifiers.shift);
+        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl));
         let delta = response.drag_delta();
-        let panning = response.dragged_by(egui::PointerButton::Middle)
-            || (shift && response.dragged_by(egui::PointerButton::Primary));
-        let orbiting = !panning && response.dragged_by(egui::PointerButton::Primary);
+        let middle = response.dragged_by(egui::PointerButton::Middle);
+        let primary = response.dragged_by(egui::PointerButton::Primary);
+        let (panning, orbiting) = if sketching {
+            (middle && !ctrl, middle && ctrl)
+        } else {
+            let panning = middle || (shift && primary);
+            (panning, !panning && primary)
+        };
         if panning {
             self.camera
                 .pan(delta.x as f64 * ppp as f64, delta.y as f64 * ppp as f64, h);
@@ -119,7 +182,7 @@ impl Viewport {
         }
 
         // Picking uses the previous image, which is what the user is looking at.
-        self.hovered = match (&self.frame, pointer, panning || orbiting) {
+        self.hovered = match (&self.frame, pointer, panning || orbiting || sketching) {
             (Some(frame), Some(cursor), false)
                 if frame.width == width && frame.height == height =>
             {
@@ -127,7 +190,7 @@ impl Viewport {
             }
             _ => None,
         };
-        let clicked = response.clicked().then_some(self.hovered);
+        let clicked = (response.clicked() && !sketching).then_some(self.hovered);
         let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
 
         let key = RenderKey {
@@ -179,6 +242,8 @@ impl Viewport {
             response,
             clicked,
             additive,
+            rect,
+            pixels_per_point: ppp,
         }
     }
 

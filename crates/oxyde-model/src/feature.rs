@@ -1,8 +1,10 @@
 //! Features: the entries of a part's timeline.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
-use oxyde_geom::{Curve2, Plane, Point2};
+use oxyde_geom::{Plane, Point2};
+use oxyde_sketch::ConstrainedSketch;
 
 use crate::naming::{EdgeName, FaceName};
 
@@ -27,6 +29,52 @@ impl fmt::Display for FeatureId {
     }
 }
 
+/// A numeric parameter of a feature that is a dimension in its own right, e.g. the depth
+/// of an extrusion ("D1@Boss-Extrude1").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FeatureParameter {
+    /// Extrusion depth.
+    Depth,
+    /// Fillet radius.
+    Radius,
+    /// Chamfer distance.
+    Distance,
+}
+
+impl FeatureParameter {
+    /// Key used in files.
+    pub fn key(self) -> &'static str {
+        match self {
+            FeatureParameter::Depth => "depth",
+            FeatureParameter::Radius => "radius",
+            FeatureParameter::Distance => "distance",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "depth" => Some(FeatureParameter::Depth),
+            "radius" => Some(FeatureParameter::Radius),
+            "distance" => Some(FeatureParameter::Distance),
+            _ => None,
+        }
+    }
+
+    /// Default dimension name, numbered per feature as in SolidWorks.
+    pub fn default_name(self) -> &'static str {
+        "D1"
+    }
+
+    /// What the parameter is called in the user interface.
+    pub fn label(self) -> &'static str {
+        match self {
+            FeatureParameter::Depth => "Depth",
+            FeatureParameter::Radius => "Radius",
+            FeatureParameter::Distance => "Distance",
+        }
+    }
+}
+
 /// One entry of the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Feature {
@@ -34,6 +82,8 @@ pub struct Feature {
     pub(crate) name: String,
     pub(crate) suppressed: bool,
     pub(crate) kind: FeatureKind,
+    /// User names of feature dimensions; absent = default name ("D1").
+    pub(crate) parameter_names: BTreeMap<FeatureParameter, String>,
 }
 
 impl Feature {
@@ -50,14 +100,35 @@ impl Feature {
             name: name.into(),
             suppressed,
             kind,
+            parameter_names: BTreeMap::new(),
         }
+    }
+
+    /// Sets the user names of feature dimensions (e.g. when loading a file).
+    pub fn with_parameter_names(mut self, names: BTreeMap<FeatureParameter, String>) -> Self {
+        self.parameter_names = names;
+        self
+    }
+
+    /// User names of feature dimensions that differ from the default.
+    pub fn parameter_names(&self) -> &BTreeMap<FeatureParameter, String> {
+        &self.parameter_names
+    }
+
+    /// The name of one of the feature's dimensions ("D1" unless renamed).
+    pub fn parameter_name(&self, parameter: FeatureParameter) -> &str {
+        self.parameter_names
+            .get(&parameter)
+            .map_or(parameter.default_name(), String::as_str)
     }
 
     pub fn id(&self) -> FeatureId {
         self.id
     }
 
-    /// Display name, e.g. "Boss-Extrude1". Purely cosmetic: references use [`FeatureId`].
+    /// Display name, e.g. "Boss-Extrude1". Unique within the part; it appears in dimension
+    /// names ("D1@Boss-Extrude1"), but references are always stored by [`FeatureId`], so
+    /// renaming a feature never breaks anything.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -90,6 +161,35 @@ impl FeatureKind {
             },
             FeatureKind::Fillet(_) => "Fillet",
             FeatureKind::Chamfer(_) => "Chamfer",
+        }
+    }
+
+    /// The feature's own dimensions and their values (mm).
+    pub fn parameters(&self) -> Vec<(FeatureParameter, f64)> {
+        match self {
+            FeatureKind::Sketch(_) => Vec::new(),
+            FeatureKind::Extrude(e) => vec![(FeatureParameter::Depth, e.extent.depth())],
+            FeatureKind::Fillet(b) => vec![(FeatureParameter::Radius, b.size)],
+            FeatureKind::Chamfer(b) => vec![(FeatureParameter::Distance, b.size)],
+        }
+    }
+
+    /// Changes one of the feature's dimensions; false if the feature has no such parameter.
+    pub fn set_parameter(&mut self, parameter: FeatureParameter, value: f64) -> bool {
+        match (self, parameter) {
+            (FeatureKind::Extrude(e), FeatureParameter::Depth) => {
+                e.extent = match e.extent {
+                    ExtrudeExtent::Blind { .. } => ExtrudeExtent::Blind { depth: value },
+                    ExtrudeExtent::MidPlane { .. } => ExtrudeExtent::MidPlane { depth: value },
+                };
+                true
+            }
+            (FeatureKind::Fillet(b), FeatureParameter::Radius)
+            | (FeatureKind::Chamfer(b), FeatureParameter::Distance) => {
+                b.size = value;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -144,68 +244,39 @@ pub enum SketchPlane {
     Face(FaceName),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SketchEntity {
-    /// Unique within the sketch; names the faces an extrusion sweeps from this entity.
-    pub id: u32,
-    pub curve: Curve2,
-    /// Construction geometry is ignored when building profiles.
-    pub construction: bool,
-}
-
-/// A 2D sketch. Geometry is explicit for now; the constraint solver (M2) will compute it
-/// from dimensions and relations.
+/// A 2D sketch: geometry with relations and dimensions, on a plane or a face.
+///
+/// The ids of its lines, arcs and circles name the faces that extrusions sweep from them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sketch {
     pub plane: SketchPlane,
-    pub entities: Vec<SketchEntity>,
+    pub geometry: ConstrainedSketch,
 }
 
 impl Sketch {
     pub fn new(plane: SketchPlane) -> Self {
         Self {
             plane,
-            entities: Vec::new(),
+            geometry: ConstrainedSketch::new(),
         }
     }
 
-    fn next_id(&self) -> u32 {
-        self.entities.iter().map(|e| e.id).max().unwrap_or(0) + 1
-    }
-
-    /// Adds a curve and returns its entity id.
-    pub fn add(&mut self, curve: Curve2) -> u32 {
-        let id = self.next_id();
-        self.entities.push(SketchEntity {
-            id,
-            curve,
-            construction: false,
-        });
-        id
-    }
-
+    /// A line with two new end points; returns the line's id.
     pub fn line(&mut self, start: Point2, end: Point2) -> u32 {
-        self.add(Curve2::Line { start, end })
+        self.geometry.line(start, end).0
     }
 
+    /// A circle with a new centre point; returns the circle's id.
     pub fn circle(&mut self, center: Point2, radius: f64) -> u32 {
-        self.add(Curve2::Circle { center, radius })
+        self.geometry.circle(center, radius).0
     }
 
-    /// Axis-aligned rectangle; returns the ids of its bottom, right, top and left lines.
+    /// An axis-aligned rectangle with its horizontal and vertical relations. Returns the
+    /// ids of its bottom, right, top and left lines.
     pub fn rectangle(&mut self, corner: Point2, width: f64, height: f64) -> [u32; 4] {
-        let (x0, y0) = (corner.x, corner.y);
-        let (x1, y1) = (x0 + width, y0 + height);
-        [
-            self.line(Point2::new(x0, y0), Point2::new(x1, y0)),
-            self.line(Point2::new(x1, y0), Point2::new(x1, y1)),
-            self.line(Point2::new(x1, y1), Point2::new(x0, y1)),
-            self.line(Point2::new(x0, y1), Point2::new(x0, y0)),
-        ]
-    }
-
-    pub fn entity_mut(&mut self, id: u32) -> Option<&mut SketchEntity> {
-        self.entities.iter_mut().find(|e| e.id == id)
+        self.geometry
+            .rectangle(corner, width, height)
+            .map(|id| id.0)
     }
 }
 

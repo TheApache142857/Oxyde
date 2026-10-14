@@ -5,10 +5,13 @@
 
 use std::collections::BTreeMap;
 
-use oxyde_geom::{Curve2, Point2};
+use oxyde_geom::Point2;
 use oxyde_model::{
     EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
-    FeatureKind, PartDefinition, Sketch, SketchEntity, SketchPlane, StandardPlane, VertexName,
+    FeatureKind, FeatureParameter, PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
+};
+use oxyde_sketch::{
+    ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,8 +71,29 @@ pub(crate) struct FeatureDto {
     pub name: String,
     #[serde(default)]
     pub suppressed: bool,
+    /// Renamed feature dimensions, by parameter ("depth": "Thickness").
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dimension_names: BTreeMap<String, String>,
     #[serde(flatten)]
     pub kind: KindDto,
+}
+
+/// A sketch relation with its stable id and, for dimensions, its name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RelationEntryDto {
+    pub id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(flatten)]
+    pub relation: RelationDto,
+}
+
+/// Next ids to hand out in a sketch, so that ids are never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CountersDto {
+    pub entity: u32,
+    pub relation: u32,
+    pub dimension: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,6 +102,10 @@ pub(crate) enum KindDto {
     Sketch {
         plane: PlaneDto,
         entities: Vec<EntityDto>,
+        #[serde(default)]
+        relations: Vec<RelationEntryDto>,
+        #[serde(default)]
+        next_ids: Option<CountersDto>,
     },
     Extrude {
         sketch: u32,
@@ -117,25 +145,41 @@ pub(crate) struct EntityDto {
     #[serde(default)]
     pub construction: bool,
     #[serde(flatten)]
-    pub curve: CurveDto,
+    pub geometry: GeometryDto,
 }
 
+/// Lines, circles and arcs refer to point entities by id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum CurveDto {
-    Line {
-        start: [f64; 2],
-        end: [f64; 2],
-    },
-    Arc {
-        start: [f64; 2],
-        mid: [f64; 2],
-        end: [f64; 2],
-    },
-    Circle {
-        center: [f64; 2],
-        radius: f64,
-    },
+pub(crate) enum GeometryDto {
+    Point { at: [f64; 2] },
+    Line { start: u32, end: u32 },
+    Circle { center: u32, radius: f64 },
+    Arc { center: u32, start: u32, end: u32 },
+}
+
+/// Relations and dimensions. Lengths in mm, angles in radians.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum RelationDto {
+    Fixed { point: u32 },
+    Coincident { a: u32, b: u32 },
+    Horizontal { line: u32 },
+    Vertical { line: u32 },
+    Parallel { a: u32, b: u32 },
+    Perpendicular { a: u32, b: u32 },
+    EqualLength { a: u32, b: u32 },
+    EqualRadius { a: u32, b: u32 },
+    Distance { a: u32, b: u32, value: f64 },
+    HorizontalDistance { a: u32, b: u32, value: f64 },
+    VerticalDistance { a: u32, b: u32, value: f64 },
+    Length { line: u32, value: f64 },
+    Radius { curve: u32, value: f64 },
+    Angle { a: u32, b: u32, value: f64 },
+    PointOnLine { point: u32, line: u32 },
+    PointOnCircle { point: u32, curve: u32 },
+    Midpoint { point: u32, line: u32 },
+    Tangent { line: u32, curve: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -231,29 +275,25 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                 }
                 SketchPlane::Face(face) => PlaneDto::Face(face_dto(face)),
             },
-            entities: sketch
-                .entities
+            entities: sketch.geometry.entities().iter().map(entity_dto).collect(),
+            relations: sketch
+                .geometry
+                .relations()
                 .iter()
-                .map(|e| EntityDto {
-                    id: e.id,
-                    construction: e.construction,
-                    curve: match e.curve {
-                        Curve2::Line { start, end } => CurveDto::Line {
-                            start: point(start),
-                            end: point(end),
-                        },
-                        Curve2::Arc { start, mid, end } => CurveDto::Arc {
-                            start: point(start),
-                            mid: point(mid),
-                            end: point(end),
-                        },
-                        Curve2::Circle { center, radius } => CurveDto::Circle {
-                            center: point(center),
-                            radius,
-                        },
-                    },
+                .map(|r| RelationEntryDto {
+                    id: r.id.0,
+                    name: r.name.clone(),
+                    relation: relation_dto(&r.constraint),
                 })
                 .collect(),
+            next_ids: {
+                let c = sketch.geometry.counters();
+                Some(CountersDto {
+                    entity: c.entity,
+                    relation: c.relation,
+                    dimension: c.dimension,
+                })
+            },
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
@@ -280,7 +320,88 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         id: feature.id().raw(),
         name: feature.name().to_owned(),
         suppressed: feature.is_suppressed(),
+        dimension_names: feature
+            .parameter_names()
+            .iter()
+            .map(|(p, name)| (p.key().to_owned(), name.clone()))
+            .collect(),
         kind,
+    }
+}
+
+fn entity_dto(e: &Entity) -> EntityDto {
+    EntityDto {
+        id: e.id.0,
+        construction: e.construction,
+        geometry: match e.geometry {
+            Geometry::Point(p) => GeometryDto::Point { at: point(p) },
+            Geometry::Line { start, end } => GeometryDto::Line {
+                start: start.0,
+                end: end.0,
+            },
+            Geometry::Circle { center, radius } => GeometryDto::Circle {
+                center: center.0,
+                radius,
+            },
+            Geometry::Arc { center, start, end } => GeometryDto::Arc {
+                center: center.0,
+                start: start.0,
+                end: end.0,
+            },
+        },
+    }
+}
+
+fn relation_dto(c: &Constraint) -> RelationDto {
+    use Constraint as C;
+    use RelationDto as R;
+    match *c {
+        C::Fixed(p) => R::Fixed { point: p.0 },
+        C::Coincident(a, b) => R::Coincident { a: a.0, b: b.0 },
+        C::Horizontal(l) => R::Horizontal { line: l.0 },
+        C::Vertical(l) => R::Vertical { line: l.0 },
+        C::Parallel(a, b) => R::Parallel { a: a.0, b: b.0 },
+        C::Perpendicular(a, b) => R::Perpendicular { a: a.0, b: b.0 },
+        C::EqualLength(a, b) => R::EqualLength { a: a.0, b: b.0 },
+        C::EqualRadius(a, b) => R::EqualRadius { a: a.0, b: b.0 },
+        C::Distance(a, b, value) => R::Distance {
+            a: a.0,
+            b: b.0,
+            value,
+        },
+        C::HorizontalDistance(a, b, value) => R::HorizontalDistance {
+            a: a.0,
+            b: b.0,
+            value,
+        },
+        C::VerticalDistance(a, b, value) => R::VerticalDistance {
+            a: a.0,
+            b: b.0,
+            value,
+        },
+        C::Length(l, value) => R::Length { line: l.0, value },
+        C::Radius(r, value) => R::Radius { curve: r.0, value },
+        C::Angle(a, b, value) => R::Angle {
+            a: a.0,
+            b: b.0,
+            value,
+        },
+        C::PointOnLine(p, l) => R::PointOnLine {
+            point: p.0,
+            line: l.0,
+        },
+        C::PointOnCircle(p, r) => R::PointOnCircle {
+            point: p.0,
+            curve: r.0,
+        },
+        C::Midpoint(p, l) => R::Midpoint {
+            point: p.0,
+            line: l.0,
+        },
+        C::Tangent(l, r) => R::Tangent {
+            line: l.0,
+            curve: r.0,
+        },
     }
 }
 
@@ -328,12 +449,17 @@ fn edge_dto(edge: &EdgeName) -> EdgeRefDto {
 // ---- File → model --------------------------------------------------------------------------
 
 impl PartModel {
-    pub fn into_definition(self) -> PartDefinition {
-        PartDefinition {
-            features: self.features.into_iter().map(feature_from).collect(),
+    /// Converts to a model definition; fails on an inconsistent sketch.
+    pub fn into_definition(self) -> Result<PartDefinition, String> {
+        Ok(PartDefinition {
+            features: self
+                .features
+                .into_iter()
+                .map(feature_from)
+                .collect::<Result<_, _>>()?,
             rollback: self.rollback,
             next_id: self.next_feature_id,
-        }
+        })
     }
 }
 
@@ -341,44 +467,98 @@ fn point_from(p: [f64; 2]) -> Point2 {
     Point2::new(p[0], p[1])
 }
 
-fn feature_from(dto: FeatureDto) -> Feature {
-    let kind = match dto.kind {
-        KindDto::Sketch { plane, entities } => FeatureKind::Sketch(Sketch {
-            plane: match plane {
-                PlaneDto::Standard(StandardPlaneDto::Front) => {
-                    SketchPlane::Standard(StandardPlane::Front)
-                }
-                PlaneDto::Standard(StandardPlaneDto::Top) => {
-                    SketchPlane::Standard(StandardPlane::Top)
-                }
-                PlaneDto::Standard(StandardPlaneDto::Right) => {
-                    SketchPlane::Standard(StandardPlane::Right)
-                }
-                PlaneDto::Face(face) => SketchPlane::Face(face_from(face)),
+fn entity_from(dto: EntityDto) -> Entity {
+    let id = EntityId;
+    Entity {
+        id: id(dto.id),
+        construction: dto.construction,
+        geometry: match dto.geometry {
+            GeometryDto::Point { at } => Geometry::Point(point_from(at)),
+            GeometryDto::Line { start, end } => Geometry::Line {
+                start: id(start),
+                end: id(end),
             },
-            entities: entities
-                .into_iter()
-                .map(|e| SketchEntity {
-                    id: e.id,
-                    construction: e.construction,
-                    curve: match e.curve {
-                        CurveDto::Line { start, end } => Curve2::Line {
-                            start: point_from(start),
-                            end: point_from(end),
-                        },
-                        CurveDto::Arc { start, mid, end } => Curve2::Arc {
-                            start: point_from(start),
-                            mid: point_from(mid),
-                            end: point_from(end),
-                        },
-                        CurveDto::Circle { center, radius } => Curve2::Circle {
-                            center: point_from(center),
-                            radius,
-                        },
-                    },
-                })
-                .collect(),
-        }),
+            GeometryDto::Circle { center, radius } => Geometry::Circle {
+                center: id(center),
+                radius,
+            },
+            GeometryDto::Arc { center, start, end } => Geometry::Arc {
+                center: id(center),
+                start: id(start),
+                end: id(end),
+            },
+        },
+    }
+}
+
+fn relation_from(dto: RelationDto) -> Constraint {
+    use Constraint as C;
+    use RelationDto as R;
+    let id = EntityId;
+    match dto {
+        R::Fixed { point } => C::Fixed(id(point)),
+        R::Coincident { a, b } => C::Coincident(id(a), id(b)),
+        R::Horizontal { line } => C::Horizontal(id(line)),
+        R::Vertical { line } => C::Vertical(id(line)),
+        R::Parallel { a, b } => C::Parallel(id(a), id(b)),
+        R::Perpendicular { a, b } => C::Perpendicular(id(a), id(b)),
+        R::EqualLength { a, b } => C::EqualLength(id(a), id(b)),
+        R::EqualRadius { a, b } => C::EqualRadius(id(a), id(b)),
+        R::Distance { a, b, value } => C::Distance(id(a), id(b), value),
+        R::HorizontalDistance { a, b, value } => C::HorizontalDistance(id(a), id(b), value),
+        R::VerticalDistance { a, b, value } => C::VerticalDistance(id(a), id(b), value),
+        R::Length { line, value } => C::Length(id(line), value),
+        R::Radius { curve, value } => C::Radius(id(curve), value),
+        R::Angle { a, b, value } => C::Angle(id(a), id(b), value),
+        R::PointOnLine { point, line } => C::PointOnLine(id(point), id(line)),
+        R::PointOnCircle { point, curve } => C::PointOnCircle(id(point), id(curve)),
+        R::Midpoint { point, line } => C::Midpoint(id(point), id(line)),
+        R::Tangent { line, curve } => C::Tangent(id(line), id(curve)),
+    }
+}
+
+fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
+    let kind = match dto.kind {
+        KindDto::Sketch {
+            plane,
+            entities,
+            relations,
+            next_ids,
+        } => {
+            let counters = next_ids.map_or_else(Counters::default, |c| Counters {
+                entity: c.entity,
+                relation: c.relation,
+                dimension: c.dimension,
+            });
+            let geometry = ConstrainedSketch::from_parts(
+                entities.into_iter().map(entity_from).collect(),
+                relations
+                    .into_iter()
+                    .map(|r| Relation {
+                        id: RelationId(r.id),
+                        name: r.name,
+                        constraint: relation_from(r.relation),
+                    })
+                    .collect(),
+                counters,
+            )
+            .map_err(|e| format!("{}: {e}", dto.name))?;
+            FeatureKind::Sketch(Sketch {
+                plane: match plane {
+                    PlaneDto::Standard(StandardPlaneDto::Front) => {
+                        SketchPlane::Standard(StandardPlane::Front)
+                    }
+                    PlaneDto::Standard(StandardPlaneDto::Top) => {
+                        SketchPlane::Standard(StandardPlane::Top)
+                    }
+                    PlaneDto::Standard(StandardPlaneDto::Right) => {
+                        SketchPlane::Standard(StandardPlane::Right)
+                    }
+                    PlaneDto::Face(face) => SketchPlane::Face(face_from(face)),
+                },
+                geometry,
+            })
+        }
         KindDto::Extrude {
             sketch,
             operation,
@@ -405,7 +585,16 @@ fn feature_from(dto: FeatureDto) -> Feature {
             size: distance,
         }),
     };
-    Feature::new(FeatureId::from_raw(dto.id), dto.name, dto.suppressed, kind)
+    let mut parameter_names = BTreeMap::new();
+    for (key, name) in dto.dimension_names {
+        let parameter = FeatureParameter::from_key(&key)
+            .ok_or_else(|| format!("{}: unknown dimension \"{key}\"", dto.name))?;
+        parameter_names.insert(parameter, name);
+    }
+    Ok(
+        Feature::new(FeatureId::from_raw(dto.id), dto.name, dto.suppressed, kind)
+            .with_parameter_names(parameter_names),
+    )
 }
 
 fn face_from(dto: FaceRefDto) -> FaceName {

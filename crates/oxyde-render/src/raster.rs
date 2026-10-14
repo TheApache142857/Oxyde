@@ -182,6 +182,30 @@ fn edge_style(edge: u32, highlight: &Highlight) -> ([u8; 3], i64) {
     }
 }
 
+/// Light directions, in model space, fixed relative to the camera.
+#[derive(Debug, Clone, Copy)]
+struct Lights {
+    /// Towards the viewer.
+    eye: V3,
+    /// Towards the key light.
+    key: V3,
+}
+
+/// Brightness factor for a surface with unit normal `n`: ambient, plus a headlight so no
+/// face goes black, plus a key light so differently oriented faces get different shades.
+fn shade(n: V3, lights: &Lights) -> f32 {
+    // Closed solids are seen from outside: orient the normal towards the viewer, which also
+    // tolerates meshes with inconsistent winding.
+    let n = if dot(n, lights.eye) < 0.0 {
+        scale(n, -1.0)
+    } else {
+        n
+    };
+    let facing = dot(n, lights.eye);
+    let key = dot(n, lights.key).max(0.0);
+    (0.38 + 0.37 * facing + 0.40 * key) as f32
+}
+
 /// Renders `scene` seen through `camera` into a `width` × `height` pixel frame.
 pub fn render(
     scene: &Scene,
@@ -211,7 +235,10 @@ pub fn render(
     }
 
     let (w, h) = (width as f64, height as f64);
-    let view = camera.eye_direction();
+    let lights = Lights {
+        eye: camera.eye_direction(),
+        key: camera.key_light(),
+    };
 
     for (index, face) in scene.faces.iter().enumerate() {
         let base = face_color(index as u32, highlight);
@@ -225,7 +252,7 @@ pub fn render(
                 &mut frame,
                 t.map(|i| projected[i]),
                 t.map(|i| face.normals[i]),
-                view,
+                &lights,
                 base,
                 index as u32 + 1,
             );
@@ -261,7 +288,7 @@ fn raster_triangle(
     frame: &mut Frame,
     p: [V3; 3],
     normals: [V3; 3],
-    view: V3,
+    lights: &Lights,
     base: [f32; 3],
     id: u32,
 ) {
@@ -299,8 +326,7 @@ fn raster_triangle(
                 add(scale(normals[0], w0), scale(normals[1], w1)),
                 scale(normals[2], w2),
             );
-            let facing = normalize(n).map_or(1.0, |n| dot(n, view).abs()) as f32;
-            let light = 0.32 + 0.68 * facing;
+            let light = normalize(n).map_or(1.0, |n| shade(n, lights));
             frame.put(index, base.map(|c| (c * light).min(255.0) as u8));
         }
     }
@@ -448,6 +474,23 @@ mod tests {
         camera.set_view(StandardView::Back);
         let frame = render(&scene, &camera, 100, 100, &Highlight::default());
         assert_eq!(frame.pick(75.5, 50.5, 3.0), Some(Pick::Face(1)));
+    }
+
+    #[test]
+    fn faces_of_a_box_get_distinct_shades_in_the_isometric_view() {
+        let camera = Camera::default(); // isometric
+        let lights = Lights {
+            eye: camera.eye_direction(),
+            key: camera.key_light(),
+        };
+        let x = shade([1.0, 0.0, 0.0], &lights);
+        let y = shade([0.0, 1.0, 0.0], &lights);
+        let z = shade([0.0, 0.0, 1.0], &lights);
+        // Top brightest, front next, right side darkest, as in SolidWorks.
+        assert!(y > z && z > x, "x {x}, y {y}, z {z}");
+        assert!(z - x > 0.1 && y - z > 0.1);
+        // Flipped normals shade the same.
+        assert_eq!(shade([-1.0, 0.0, 0.0], &lights), x);
     }
 
     #[test]
