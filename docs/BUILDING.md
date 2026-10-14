@@ -62,7 +62,7 @@ Open a new terminal afterwards.
 cargo run --release -p oxyde-app               # the application
 cargo run --release -p oxyde-app -- part.oxy   # ... opening a file
 cargo test --workspace                         # everything
-cargo test -p oxyde-geom -p oxyde-model -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
+cargo test -p oxyde-geom -p oxyde-sketch -p oxyde-model -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
 cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end tests
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```

@@ -76,11 +76,18 @@ A second, trivial backend (`NullKernel` / mock) lives in tests so that `oxyde-mo
 
 ## 5. Sketches and the constraint solver (`oxyde-sketch`)
 
-- Entities: point, line, arc, circle, ellipse, B-spline; construction flag per entity.
-- Constraints: coincident, horizontal, vertical, parallel, perpendicular, tangent, equal, symmetric, distance, angle, radius/diameter, fixed, point-on-curve, midpoint.
-- Solver: assemble residuals into a nonlinear system and solve with damped Newton / Levenberg–Marquardt; decompose into independent clusters first so large sketches stay fast.
-- Report **degrees of freedom** per entity (under / fully / over-constrained) and identify the conflicting constraints when over-constrained — this drives the sketch colouring in the UI.
-- The sketcher is pure Rust and kernel-independent; it outputs closed profiles (`Profile`) consumed by the kernel.
+Implemented (M2, solver only):
+
+- **Entities**: points, lines, circles and counter-clockwise arcs. Lines and arcs refer to point entities, so connected geometry shares its points as in SolidWorks. Construction geometry is solved but left out of profiles.
+- **Relations and dimensions**: fixed, coincident, horizontal, vertical, parallel, perpendicular, equal length, equal radius, point–point distance (true, horizontal, vertical), length, radius, angle, point on line, point on circle, midpoint, tangent (line–circle/arc). `rectangle()` adds its horizontal/vertical relations automatically.
+- **Solver**: unknowns are point coordinates and circle radii (fixed points are not unknowns; arc radii are implied). Each relation contributes equations `r(x) = 0`. Steps are minimum-norm Gauss–Newton steps `Δ = −Jᵀ(JJᵀ + μI)⁻¹r`, so an under-defined sketch moves as little as possible (the right behaviour when dragging), with `μ` raised towards gradient descent when a step does not reduce the error, and a backtracking line search. The Jacobian is numerical (central differences), ample for sketch-sized systems.
+- **Analysis**, from the Jacobian at the solution:
+  - **degrees of freedom** = unknowns − rank;
+  - an entity is **fully defined** (black) when no remaining motion (null space of the Jacobian) moves any of its parameters, otherwise under-defined (blue);
+  - relations are taken in order: one adding no independent equation is **redundant**, one left unsatisfied is **conflicting**. A failed solve leaves the geometry untouched.
+- `profile_segments()` turns the solved sketch into profile curves whose segment ids are the entity ids, so face names (`F2.side[7]`) follow sketch entities.
+
+Next (M2b): make the model's `Sketch` a `ConstrainedSketch` (solved during rebuild, status shown in the timeline), extend `.oxy` with entities and relations, and add an interactive sketch mode in the app (draw, drag, dimension, colour by definition).
 
 ## 6. Feature tree and topological naming (`oxyde-model`)
 
@@ -148,7 +155,8 @@ Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fill
 | **M0** | Workspace, docs, CI (format, clippy, tests) |
 | **M1** (code written, awaiting first Windows build) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **Engine** (code written, awaiting first Windows build) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
-| **M2** | Sketch entities + solver with DOF reporting (pure Rust, no UI) |
+| **M2** (code written, awaiting first build) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
+| **M2b** | Solver in the model and the file format; interactive sketch mode |
 | **App** (code written, awaiting first Windows build) | Timeline panel, properties panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
 | **M3** | Revolve, shell, patterns, interactive sketch mode |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |

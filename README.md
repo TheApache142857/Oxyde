@@ -33,7 +33,7 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | Crate | Role |
 |---|---|
 | `oxyde-geom` | Math primitives: points, vectors, planes, transforms, tolerances |
-| `oxyde-sketch` | 2D sketch entities and the geometric constraint solver |
+| `oxyde-sketch` | 2D sketch entities and the geometric constraint solver (degrees of freedom, fully defined, redundant/conflicting) |
 | `oxyde-kernel` | The `Kernel` trait: solid operations, topology queries, operation history, STEP I/O |
 | `oxyde-occt` | `Kernel` implementation backed by OpenCASCADE through a small C++ shim (`cxx`) |
 | `oxyde-model` | Feature tree, dependency graph, rebuild, persistent topological naming |
