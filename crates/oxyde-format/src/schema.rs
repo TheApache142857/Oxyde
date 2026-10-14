@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
-    FeatureKind, FeatureParameter, PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
+    EdgeBlend, EdgeName, EquationText, Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp,
+    FaceKey, FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, GlobalText,
+    PartDefinition, Sketch, SketchPlane, StandardPlane, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -63,6 +64,28 @@ pub(crate) struct PartModel {
     #[serde(default)]
     pub rollback: Option<usize>,
     pub features: Vec<FeatureDto>,
+    /// `"Width" = 50`: names are unique, ids never reused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub global_variables: Vec<GlobalDto>,
+    /// `"D1@Sketch1" = "Width" * 2`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub equations: Vec<EquationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_global_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GlobalDto {
+    pub id: u32,
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct EquationDto {
+    /// Full name of the driven dimension.
+    pub dimension: String,
+    pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -248,10 +271,29 @@ pub(crate) struct VertexRefDto {
 
 impl PartModel {
     pub fn from_definition(definition: &PartDefinition) -> Self {
+        let text = definition.equations_text();
         Self {
             next_feature_id: definition.next_id,
             rollback: definition.rollback,
             features: definition.features.iter().map(feature_dto).collect(),
+            next_global_id: (text.next_global_id > 1).then_some(text.next_global_id),
+            global_variables: text
+                .globals
+                .into_iter()
+                .map(|g| GlobalDto {
+                    id: g.id,
+                    name: g.name,
+                    expression: g.expression,
+                })
+                .collect(),
+            equations: text
+                .equations
+                .into_iter()
+                .map(|e| EquationDto {
+                    dimension: e.dimension,
+                    expression: e.expression,
+                })
+                .collect(),
         }
     }
 }
@@ -451,7 +493,7 @@ fn edge_dto(edge: &EdgeName) -> EdgeRefDto {
 impl PartModel {
     /// Converts to a model definition; fails on an inconsistent sketch.
     pub fn into_definition(self) -> Result<PartDefinition, String> {
-        Ok(PartDefinition {
+        let mut definition = PartDefinition {
             features: self
                 .features
                 .into_iter()
@@ -459,7 +501,31 @@ impl PartModel {
                 .collect::<Result<_, _>>()?,
             rollback: self.rollback,
             next_id: self.next_feature_id,
-        })
+            equations: Equations::default(),
+        };
+        definition
+            .set_equations_text(EquationsText {
+                globals: self
+                    .global_variables
+                    .into_iter()
+                    .map(|g| GlobalText {
+                        id: g.id,
+                        name: g.name,
+                        expression: g.expression,
+                    })
+                    .collect(),
+                equations: self
+                    .equations
+                    .into_iter()
+                    .map(|e| EquationText {
+                        dimension: e.dimension,
+                        expression: e.expression,
+                    })
+                    .collect(),
+                next_global_id: self.next_global_id.unwrap_or(1),
+            })
+            .map_err(|e| format!("equations: {e}"))?;
+        Ok(definition)
     }
 }
 

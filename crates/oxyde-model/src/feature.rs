@@ -6,6 +6,7 @@ use std::fmt;
 use oxyde_geom::{Plane, Point2};
 use oxyde_sketch::ConstrainedSketch;
 
+use crate::dimensions::DimensionUnit;
 use crate::naming::{EdgeName, FaceName};
 
 /// Stable identity of a feature within a part. Never reused, even after deletion, and
@@ -60,9 +61,13 @@ impl FeatureParameter {
         }
     }
 
-    /// Default dimension name, numbered per feature as in SolidWorks.
-    pub fn default_name(self) -> &'static str {
-        "D1"
+    /// Whether the value is a length, an angle or a number of instances.
+    pub fn unit(self) -> DimensionUnit {
+        match self {
+            FeatureParameter::Depth | FeatureParameter::Radius | FeatureParameter::Distance => {
+                DimensionUnit::Length
+            }
+        }
     }
 
     /// What the parameter is called in the user interface.
@@ -115,11 +120,12 @@ impl Feature {
         &self.parameter_names
     }
 
-    /// The name of one of the feature's dimensions ("D1" unless renamed).
-    pub fn parameter_name(&self, parameter: FeatureParameter) -> &str {
+    /// The name of one of the feature's dimensions ("D1", "D2"… unless renamed).
+    pub fn parameter_name(&self, parameter: FeatureParameter) -> String {
         self.parameter_names
             .get(&parameter)
-            .map_or(parameter.default_name(), String::as_str)
+            .cloned()
+            .unwrap_or_else(|| self.kind.default_parameter_name(parameter))
     }
 
     pub fn id(&self) -> FeatureId {
@@ -172,6 +178,17 @@ impl FeatureKind {
             FeatureKind::Fillet(b) => vec![(FeatureParameter::Radius, b.size)],
             FeatureKind::Chamfer(b) => vec![(FeatureParameter::Distance, b.size)],
         }
+    }
+
+    /// Default name of one of the feature's dimensions, numbered in the order of
+    /// [`FeatureKind::parameters`] as in SolidWorks: "D1", "D2"…
+    pub fn default_parameter_name(&self, parameter: FeatureParameter) -> String {
+        let index = self
+            .parameters()
+            .iter()
+            .position(|(p, _)| *p == parameter)
+            .unwrap_or(0);
+        format!("D{}", index + 1)
     }
 
     /// Changes one of the feature's dimensions; false if the feature has no such parameter.

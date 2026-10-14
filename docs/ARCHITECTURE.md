@@ -98,7 +98,7 @@ In the model (M2b): a `Sketch` feature holds a `ConstrainedSketch`, solved durin
 - A part is an ordered list of features (sketch, extrude, revolve, cut, fillet, chamfer, shell, pattern, mirror, reference plane/axis…), each with typed parameters and references.
 - Features form a dependency DAG; editing one feature marks it and its dependants dirty, and only those are rebuilt.
 - A rollback bar and per-feature suppression are model concepts, not UI tricks.
-- Parameters can be expressions over named global variables (`width * 2 + 5 mm`) and other dimensions (see *Dimension names* below).
+- Dimensions can be driven by equations over global variables and other dimensions (see *Equations* below).
 
 ### Timeline (implemented in `part.rs`)
 
@@ -133,7 +133,16 @@ The groundwork for equations, SolidWorks-style:
 - Every driving value has a **full name** `dimension@feature`: sketch dimensions (`D1@Sketch1`) and feature parameters (`D1@Boss-Extrude1` for the depth, `D1@Fillet1` for the radius). The name part can be changed (`Width@Sketch1`).
 - Internally a dimension is a `DimensionRef { feature: FeatureId, key: Sketch(RelationId) | Feature(FeatureParameter) }`: stable ids only. Renaming a feature or a dimension changes how it is shown, never what it points to; an equation will be stored with references and displayed with the current names.
 - `Part::dimensions()` lists every dimension in timeline order; `find_dimension("D1@Sketch1")` resolves a full name (quotes allowed, as typed in an equation); `set_dimension` and `rename_dimension` change one. Names are validated: unique feature names per part, unique dimension names per feature, no `@` or `"`.
-- **Tools › Dimensions…** in the app lists them all, with editable names and values: the future equations tab will sit next to it.
+- Feature dimensions are numbered per feature in the order of `FeatureKind::parameters()` (`D1`, `D2`…); optional parameters come last so existing names never shift.
+
+### Equations (implemented in `expression.rs` and `equations.rs`)
+
+- **Global variables** (`"Width" = 50`) and **equations** driving dimensions (`"D1@Sketch1" = "Width" * 2`), as in the SolidWorks Equations window. Syntax: numbers, quoted names, `+ - * / ^`, parentheses, `pi`, trigonometry in degrees, `sqrt abs exp log log10 int round sgn min max`. Values are in display units: mm, degrees, counts.
+- Parsed expressions hold `Operand::Global(GlobalId)` or `Operand::Dimension(DimensionRef)`: stable ids again. They are printed with current names; each name reference also remembers its last known name, so an equation pointing at something deleted is still shown, saved and reported ("\"D3@Sketch1\" does not exist") instead of vanishing.
+- `Part::rebuild` first evaluates everything in **dependency order** (topological sort, whatever the order of the lists), sets the driven dimensions, and only dimensions whose value really changed mark features for rebuild. A circular reference is an error on each equation involved; an error propagates to whatever uses the failed value. `Part::equation_results()` holds each value or error for the UI.
+- A driven dimension is flagged (`Dimension::driven`): read-only in the Dimensions tab, shown with Σ in sketch mode, and not editable from its sketch.
+- In files, expressions are stored as text with names (readable by other tools), see `FORMAT.md`.
+- **Tools › Equations…** opens the window: an *Equations* tab (global variables and equations, with the value each evaluates to or its error) and a *Dimensions* tab (every dimension, rename and edit values).
 
 ## 7. Units and tolerances
 
@@ -175,6 +184,7 @@ Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fill
 | **M3** | Revolve, shell, patterns, interactive sketch mode |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |
 | **Naming** (code written, awaiting first build) | Stable relation ids, SolidWorks-style dimension names (`D1@Sketch1`), unique feature names, Dimensions window |
-| **M5** | Patterns, mirror, shell, reference geometry, equations tab |
+| **Equations** (code written, awaiting first build) | Global variables and equations, evaluated in dependency order before every rebuild; Equations window |
+| **M5** | Patterns, mirror, shell, reference geometry |
 | **M6** | Assemblies with basic mates; BOM export |
 | **M7** | Drawings: views, dimensions, PDF/DXF |

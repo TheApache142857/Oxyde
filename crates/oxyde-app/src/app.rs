@@ -1,6 +1,5 @@
 //! Application state and the top-level layout: menus, command bar, panels, status bar.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -14,6 +13,7 @@ use oxyde_render::{Pick, Scene, StandardView};
 
 use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog};
 use crate::document::Document;
+use crate::equations_ui::{EquationsTab, EquationsWindow};
 use crate::sketch_mode::{self, SketchRequest, SketchSession, Tool};
 use crate::viewport::{Viewport, ViewportOutput};
 
@@ -44,9 +44,8 @@ pub struct OxydeApp {
     pub(crate) dialog: Option<Dialog>,
     /// The sketch being edited, when in sketch mode.
     pub(crate) sketch: Option<SketchSession>,
-    /// Tools › Dimensions window, and the names being typed in it.
-    show_dimensions: bool,
-    dimension_names: HashMap<oxyde_model::DimensionRef, String>,
+    /// Tools › Equations window (equations, global variables and dimensions).
+    pub(crate) equations: EquationsWindow,
     pub(crate) status: String,
     /// Document revision the viewport currently shows.
     scene_revision: Option<u64>,
@@ -68,8 +67,7 @@ impl OxydeApp {
             selection: Vec::new(),
             dialog: None,
             sketch: None,
-            show_dimensions: false,
-            dimension_names: HashMap::new(),
+            equations: EquationsWindow::new(),
             status: "Ready".to_owned(),
             scene_revision: None,
             summary: None,
@@ -267,14 +265,22 @@ impl OxydeApp {
         self.viewport.look_at_plane(&plane);
         self.selection.clear();
         self.selected_feature = Some(id);
-        self.sketch = Some(SketchSession::new(
-            id,
-            name,
-            plane,
-            sketch.geometry,
-            new_sketch,
-            restore,
-        ));
+        let mut session = SketchSession::new(id, name, plane, sketch.geometry, new_sketch, restore);
+        session.driven = self
+            .doc
+            .part
+            .equations()
+            .equations
+            .iter()
+            .filter_map(|e| match e.target {
+                Some(oxyde_model::DimensionRef {
+                    feature,
+                    key: oxyde_model::DimensionKey::Sketch(relation),
+                }) if feature == id => Some(relation),
+                _ => None,
+            })
+            .collect();
+        self.sketch = Some(session);
     }
 
     /// Leaves sketch mode, keeping or discarding the changes.
@@ -613,9 +619,13 @@ impl OxydeApp {
                 }
             });
             ui.menu_button("Tools", |ui| {
+                if ui.button("Equations…").clicked() {
+                    ui.close_menu();
+                    self.equations.show(EquationsTab::Equations);
+                }
                 if ui.button("Dimensions…").clicked() {
                     ui.close_menu();
-                    self.show_dimensions = true;
+                    self.equations.show(EquationsTab::Dimensions);
                 }
             });
             ui.menu_button("Help", |ui| {
@@ -843,6 +853,13 @@ impl OxydeApp {
         let Some((value, angle)) = sketch_mode::dimension_value(&relation.constraint) else {
             return;
         };
+        if session.driven.contains(&id) {
+            self.status = format!(
+                "{} is driven by an equation (Tools › Equations)",
+                session.dimension_full_name(id).unwrap_or_default()
+            );
+            return;
+        }
         self.dialog = Some(Dialog::Dimension {
             target: DimensionTarget::Existing(id),
             label: session
@@ -852,118 +869,6 @@ impl OxydeApp {
             value,
             angle,
         });
-    }
-
-    /// Renames a dimension as one undo step; refused names leave everything unchanged.
-    fn rename_dimension(
-        &mut self,
-        reference: oxyde_model::DimensionRef,
-        name: &str,
-    ) -> Result<(), oxyde_model::ModelError> {
-        let mut trial = oxyde_model::Part::from_definition(self.doc.part.definition())?;
-        trial.rename_dimension(reference, name)?;
-        self.doc.checkpoint();
-        self.doc.part.rename_dimension(reference, name)
-    }
-
-    /// Tools › Dimensions: every dimension of the part under the name equations will use.
-    fn dimensions_window(&mut self, ctx: &egui::Context) {
-        if !self.show_dimensions {
-            return;
-        }
-        let mut open = true;
-        let sketching = self.sketch.is_some();
-        let dimensions = self.doc.part.dimensions();
-        let names = &mut self.dimension_names;
-        let mut rename = None;
-        let mut change = None;
-        let mut end_edit = false;
-        egui::Window::new("Dimensions")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(360.0)
-            .show(ctx, |ui| {
-                if sketching {
-                    ui.label("Exit the sketch to edit dimensions here.");
-                    return;
-                }
-                if dimensions.is_empty() {
-                    ui.label("No dimensions yet. Dimension a sketch, or add a feature.");
-                    return;
-                }
-                ui.label(
-                    egui::RichText::new("Names are used in equations, e.g. D1@Sketch1.")
-                        .small()
-                        .weak(),
-                );
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::Grid::new("dimensions")
-                        .num_columns(3)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Name");
-                            ui.strong("Feature");
-                            ui.strong("Value");
-                            ui.end_row();
-                            for d in &dimensions {
-                                // Only the field being typed in keeps its own text; the others
-                                // always show the current name (after an undo, for instance).
-                                let mut text = names
-                                    .get(&d.reference)
-                                    .cloned()
-                                    .unwrap_or_else(|| d.name.clone());
-                                let edit = ui
-                                    .add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
-                                if edit.lost_focus() {
-                                    names.remove(&d.reference);
-                                    if text != d.name {
-                                        rename = Some((d.reference, text));
-                                    }
-                                } else if edit.has_focus() {
-                                    names.insert(d.reference, text);
-                                }
-                                let feature = d.full_name.split_once('@').map_or("", |(_, f)| f);
-                                ui.label(format!("@{feature}"));
-                                let angle = d.unit == oxyde_model::DimensionUnit::Angle;
-                                let (mut shown, suffix) = if angle {
-                                    (d.value.to_degrees(), "°")
-                                } else {
-                                    (d.value, " mm")
-                                };
-                                let drag =
-                                    egui::DragValue::new(&mut shown).speed(0.1).suffix(suffix);
-                                let response = ui.add(drag);
-                                if response.changed() {
-                                    let value = if angle { shown.to_radians() } else { shown };
-                                    change = Some((d.reference, value));
-                                }
-                                // One drag or one typed value is one undo step.
-                                if response.drag_stopped() || response.lost_focus() {
-                                    end_edit = true;
-                                }
-                                ui.end_row();
-                            }
-                        });
-                });
-            });
-        if !open {
-            self.show_dimensions = false;
-            self.dimension_names.clear();
-        }
-        if let Some((reference, name)) = rename {
-            if let Err(e) = self.rename_dimension(reference, &name) {
-                self.status = e.to_string();
-            }
-        }
-        if let Some((reference, value)) = change {
-            self.doc.checkpoint_edit(reference.feature);
-            if self.doc.part.set_dimension(reference, value).is_ok() {
-                self.rebuild();
-            }
-        }
-        if end_edit {
-            self.doc.end_edit();
-        }
     }
 
     /// Renames a feature as one undo step; refused names leave everything unchanged.
@@ -1199,7 +1104,7 @@ impl eframe::App for OxydeApp {
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport_ui(ui));
 
-        self.dimensions_window(ctx);
+        self.equations_window(ctx);
         self.dialogs_ui(ctx);
         self.update_title(ctx);
     }

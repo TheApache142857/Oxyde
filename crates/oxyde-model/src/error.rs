@@ -20,6 +20,8 @@ pub enum ModelError {
     DuplicateName(String),
     /// No dimension with this full name or reference.
     UnknownDimension(String),
+    /// An expression that cannot be read, or an invalid change to the equations.
+    Expression(String),
 }
 
 impl fmt::Display for ModelError {
@@ -43,6 +45,7 @@ impl fmt::Display for ModelError {
             ),
             ModelError::DuplicateName(name) => write!(f, "the name \"{name}\" is already used"),
             ModelError::UnknownDimension(name) => write!(f, "no dimension {name}"),
+            ModelError::Expression(message) => write!(f, "{message}"),
         }
     }
 }

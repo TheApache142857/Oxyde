@@ -88,7 +88,15 @@ Rules:
           "part": 0 }
       ]
     }
-  ]
+  ],
+  "global_variables": [
+    { "id": 1, "name": "Thick", "expression": "12" }
+  ],
+  "equations": [
+    { "dimension": "Thickness@Boss-Extrude1", "expression": "\"Thick\"" },
+    { "dimension": "D2@Sketch1", "expression": "\"Thickness@Boss-Extrude1\" / 4" }
+  ],
+  "next_global_id": 2
 }
 ```
 
@@ -161,9 +169,19 @@ References to geometry are never indices; they are the persistent names describe
 
 `part` is 0 unless several entities share the same name; readers sort `faces` lists themselves.
 
+### Equations
+
+Optional, default empty, SolidWorks style:
+
+- `global_variables`: `id` (unique, never reused), `name` (unique, see *Names*) and `expression`.
+- `equations`: `dimension`, the full name of the dimension the equation drives (each dimension at most once), and `expression`.
+- `next_global_id`: id the next new global variable will get (default 1; readers raise it above every id).
+
+Expressions are text: numbers, names between double quotes (`"Width"` for a global variable, `"D1@Sketch1"` for a dimension), `+ - * / ^`, parentheses, `pi`, and the functions `sin cos tan asin acos atan` (in degrees), `sqrt abs exp log` (natural) `log10 int round sgn` (one argument) and `min max` (two). Values are in mm, angles in **degrees** (unlike the rest of the file, as in SolidWorks), instance counts are rounded. Names are written as they are at save time. A name that matches nothing on load is kept and reported as an error when the equations are evaluated (a broken equation, not a broken file); a syntax error refuses the file.
+
 ### Names
 
-Feature and dimension names follow SolidWorks: a dimension's full name is `dimension@feature`, e.g. `D1@Sketch1` or `Thickness@Boss-Extrude1`, which is how equations will refer to it. A name is valid when it is not empty, has no leading or trailing spaces, and contains no `@`, `"` or control character. Feature names are unique within the part, dimension names within their feature. Names are display only: every internal reference uses ids, so renaming never breaks anything.
+Feature and dimension names follow SolidWorks: a dimension's full name is `dimension@feature`, e.g. `D1@Sketch1` or `Thickness@Boss-Extrude1`, which is how equations refer to it. A name is valid when it is not empty, has no leading or trailing spaces, and contains no `@`, `"` or control character. Feature names are unique within the part, dimension names within their feature. Names are display only: every internal reference uses ids, so renaming never breaks anything.
 
 ## 4. `properties.json`
 

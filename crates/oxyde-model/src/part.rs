@@ -13,6 +13,7 @@ use oxyde_geom::{Plane, Profile, ProfileError};
 use oxyde_kernel::{BooleanOp, FaceSource, Kernel, ShapeHandle, SurfaceKind, Topology};
 use oxyde_sketch::{ConstrainedSketch, ConstraintState};
 
+use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
     EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Sketch,
@@ -94,6 +95,8 @@ pub struct PartDefinition {
     pub rollback: Option<usize>,
     /// Id the next new feature will get.
     pub next_id: u32,
+    /// Global variables and equations.
+    pub equations: Equations,
 }
 
 /// A part document: its timeline and the cached results of the last rebuild.
@@ -106,6 +109,8 @@ pub struct Part {
     /// Number of active features; `None` = all.
     rollback: Option<usize>,
     next_id: u32,
+    pub(crate) equations: Equations,
+    pub(crate) equation_results: EquationResults,
     results: Vec<FeatureResult>,
     /// Results from this index on are stale.
     dirty_from: usize,
@@ -123,13 +128,15 @@ impl Part {
             features: Vec::new(),
             rollback: None,
             next_id: 1,
+            equations: Equations::default(),
+            equation_results: EquationResults::default(),
             results: Vec::new(),
             dirty_from: 0,
         }
     }
 
     /// Rebuilds a part from its definition (nothing is computed until [`Part::rebuild`]).
-    pub fn from_definition(definition: PartDefinition) -> Result<Self, ModelError> {
+    pub fn from_definition(mut definition: PartDefinition) -> Result<Self, ModelError> {
         let invalid = |reason: String| Err(ModelError::InvalidDefinition(reason));
         let mut seen = HashSet::new();
         let mut names = HashSet::new();
@@ -147,7 +154,7 @@ impl Part {
             let mut dimension_names = HashSet::new();
             for parameter in &parameters {
                 let name = feature.parameter_name(*parameter);
-                if !oxyde_sketch::is_valid_name(name) || !dimension_names.insert(name) {
+                if !oxyde_sketch::is_valid_name(&name) || !dimension_names.insert(name.clone()) {
                     return invalid(format!(
                         "invalid dimension name \"{name}\" in {}",
                         feature.name
@@ -180,6 +187,7 @@ impl Part {
                 ));
             }
         }
+        definition.equations.validate()?;
         let highest = definition
             .features
             .iter()
@@ -190,6 +198,8 @@ impl Part {
             next_id: definition.next_id.max(highest + 1),
             features: definition.features,
             rollback: definition.rollback,
+            equations: definition.equations,
+            equation_results: EquationResults::default(),
             results: Vec::new(),
             dirty_from: 0,
         })
@@ -201,6 +211,7 @@ impl Part {
             features: self.features.clone(),
             rollback: self.rollback,
             next_id: self.next_id,
+            equations: self.equations.clone(),
         }
     }
 
@@ -225,15 +236,8 @@ impl Part {
         self.next_id += 1;
         let name = self.next_name(kind.type_name());
         let at = self.active_end();
-        self.features.insert(
-            at,
-            Feature {
-                id,
-                name,
-                suppressed: false,
-                kind,
-            },
-        );
+        self.features
+            .insert(at, Feature::new(id, name, false, kind));
         if let Some(active) = self.rollback.as_mut() {
             *active = at + 1;
         }
@@ -261,6 +265,7 @@ impl Part {
             return Err(ModelError::DuplicateName(name));
         }
         self.features[index].name = name;
+        self.refresh_equation_names();
         Ok(())
     }
 
@@ -324,8 +329,10 @@ impl Part {
 
     // ---- Rebuild -----------------------------------------------------------------------------
 
-    /// Replays the timeline from the first edited feature up to the rollback bar.
+    /// Evaluates the equations, then replays the timeline from the first edited feature up
+    /// to the rollback bar.
     pub fn rebuild<K: Kernel>(&mut self, kernel: &mut K) {
+        self.evaluate_equations();
         let end = self.active_end();
         let start = self.dirty_from.min(self.results.len()).min(end);
         for stale in self.results.drain(start..) {

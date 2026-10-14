@@ -303,6 +303,16 @@ mod tests {
         part.set_suppressed(bevel, true).unwrap();
         let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
         part.rename_dimension(depth, "Thickness").unwrap();
+        // Equations, stored by name.
+        let thick = part.parse_expression("12").unwrap();
+        part.add_global("Thick", thick).unwrap();
+        let expr = part.parse_expression("\"Thick\"").unwrap();
+        part.add_equation(depth, expr).unwrap();
+        let hole = part.find_dimension("Hole@Sketch2").unwrap();
+        let expr = part
+            .parse_expression("\"Thickness@Boss-Extrude1\" / 4")
+            .unwrap();
+        part.add_equation(hole, expr).unwrap();
         part.roll_back_to(Some(bevel)).unwrap();
 
         let mut properties = Properties {
@@ -395,6 +405,38 @@ mod tests {
             .collect();
         assert_eq!(names, ["D1@Sketch1", "D1@Boss-Extrude1"]);
         assert_eq!(part.properties, Properties::default());
+    }
+
+    #[test]
+    fn equations_are_stored_as_text() {
+        let bytes = write_part(Cursor::new(Vec::new()), &sample())
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert_eq!(model["global_variables"][0]["name"], "Thick");
+        assert_eq!(model["global_variables"][0]["expression"], "12");
+        assert_eq!(
+            model["equations"][0]["dimension"],
+            "Thickness@Boss-Extrude1"
+        );
+        assert_eq!(model["equations"][0]["expression"], "\"Thick\"");
+        assert_eq!(
+            model["equations"][1]["expression"],
+            "\"Thickness@Boss-Extrude1\" / 4"
+        );
+    }
+
+    #[test]
+    fn equations_with_syntax_errors_are_refused() {
+        let model = r#"{ "next_feature_id": 1, "features": [],
+            "equations": [ { "dimension": "D1@Sketch1", "expression": "2 *" } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        assert!(matches!(
+            read_part(Cursor::new(bytes)),
+            Err(FormatError::InvalidModel(_))
+        ));
     }
 
     #[test]

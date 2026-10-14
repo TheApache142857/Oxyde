@@ -238,14 +238,24 @@ impl OxydeApp {
     }
 
     /// Full name of a feature's own dimension, e.g. "D1@Boss-Extrude1".
-    fn parameter_full_name(&self, id: FeatureId, parameter: FeatureParameter) -> Option<String> {
+    pub(crate) fn parameter_full_name(
+        &self,
+        id: FeatureId,
+        parameter: FeatureParameter,
+    ) -> Option<String> {
         self.doc
             .part
             .dimension(oxyde_model::DimensionRef {
                 feature: id,
                 key: oxyde_model::DimensionKey::Feature(parameter),
             })
-            .map(|d| d.full_name)
+            .map(|d| {
+                if d.driven {
+                    format!("Σ {} (driven by an equation)", d.full_name)
+                } else {
+                    d.full_name
+                }
+            })
     }
 
     /// Opens the right editor for a feature.
