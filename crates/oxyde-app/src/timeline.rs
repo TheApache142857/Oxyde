@@ -15,6 +15,7 @@ use oxyde_model::{
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
+use crate::display::Item;
 use crate::features_ui::PatternKind;
 use crate::icons::{self, Icon};
 use crate::property_manager::PanelPick;
@@ -34,6 +35,10 @@ enum Action {
     /// Move the rollback bar so that this many features are active.
     RollTo(usize),
     Delete(FeatureId),
+    /// Show or hide the sketch a feature absorbs.
+    ToggleExpand(FeatureId),
+    /// Show or hide an item in the viewport.
+    ToggleItem(Item),
 }
 
 pub fn feature_icon(kind: &FeatureKind) -> Icon {
@@ -53,53 +58,114 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
     }
 }
 
-/// One row of the tree: icon, name, an optional status badge on the right.
-fn tree_row(
-    ui: &mut egui::Ui,
+/// One row of the tree.
+struct Row {
     icon: Icon,
+    /// A cut extrusion or revolve: red badge on the icon.
     cut: bool,
     text: RichText,
     highlighted: bool,
+    /// Error or warning, on the right.
     badge: Option<Icon>,
-) -> egui::Response {
+    /// Children are indented.
+    indent: f32,
+    /// `Some(expanded)` for a row that absorbs a sketch.
+    expander: Option<bool>,
+    /// `Some(shown)` for an item that can be hidden.
+    eye: Option<bool>,
+}
+
+struct RowResponse {
+    response: egui::Response,
+    expand_clicked: bool,
+    eye_clicked: bool,
+}
+
+fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
     let height = 22.0;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
+    let left = rect.left() + row.indent;
+    let expander_rect =
+        egui::Rect::from_min_size(egui::pos2(left, rect.top()), egui::vec2(12.0, height));
+    let badge_width = if row.badge.is_some() { 18.0 } else { 0.0 };
+    let eye_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 11.0 - badge_width, rect.center().y),
+        egui::Vec2::splat(16.0),
+    );
+    let click = response
+        .clicked()
+        .then(|| response.interact_pointer_pos())
+        .flatten();
+    let expand_clicked = row.expander.is_some() && click.is_some_and(|p| expander_rect.contains(p));
+    let eye_clicked = row.eye.is_some() && click.is_some_and(|p| eye_rect.contains(p));
+
     if ui.is_rect_visible(rect) {
         let visuals = ui.visuals();
-        if highlighted {
-            ui.painter()
-                .rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
+        let painter = ui.painter();
+        if row.highlighted {
+            painter.rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
         } else if response.hovered() {
-            ui.painter()
-                .rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+            painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
         }
-        let icon_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(2.0, 2.0), egui::Vec2::splat(18.0));
-        icons::paint(ui.painter(), icon_rect, icon, true);
-        if cut {
-            icons::cut_badge(ui.painter(), icon_rect);
+        if let Some(expanded) = row.expander {
+            let c = expander_rect.center();
+            let color = visuals.text_color();
+            let points = if expanded {
+                vec![
+                    c + egui::vec2(-4.0, -2.0),
+                    c + egui::vec2(4.0, -2.0),
+                    c + egui::vec2(0.0, 3.0),
+                ]
+            } else {
+                vec![
+                    c + egui::vec2(-2.0, -4.0),
+                    c + egui::vec2(3.0, 0.0),
+                    c + egui::vec2(-2.0, 4.0),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
         }
-        let galley = egui::WidgetText::from(text).into_galley(
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(left + 13.0, rect.top() + 2.0),
+            egui::Vec2::splat(18.0),
+        );
+        icons::paint(painter, icon_rect, row.icon, true);
+        if row.cut {
+            icons::cut_badge(painter, icon_rect);
+        }
+        let galley = egui::WidgetText::from(row.text).into_galley(
             ui,
             Some(egui::TextWrapMode::Truncate),
-            width - 50.0,
+            (eye_rect.left() - icon_rect.right() - 10.0).max(20.0),
             egui::TextStyle::Body,
         );
         let text_pos = egui::pos2(
             icon_rect.right() + 6.0,
             rect.center().y - galley.size().y / 2.0,
         );
-        ui.painter().galley(text_pos, galley, visuals.text_color());
-        if let Some(badge) = badge {
+        painter.galley(text_pos, galley, visuals.text_color());
+        if let Some(shown) = row.eye {
+            // A closed eye stays visible; the open one appears on hover.
+            if !shown {
+                icons::paint(painter, eye_rect, Icon::EyeClosed, true);
+            } else if response.hovered() {
+                icons::paint(painter, eye_rect, Icon::Eye, true);
+            }
+        }
+        if let Some(badge) = row.badge {
             let badge_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.right() - 11.0, rect.center().y),
                 egui::Vec2::splat(15.0),
             );
-            icons::paint(ui.painter(), badge_rect, badge, true);
+            icons::paint(painter, badge_rect, badge, true);
         }
     }
-    response
+    RowResponse {
+        response,
+        expand_clicked,
+        eye_clicked,
+    }
 }
 
 impl OxydeApp {
@@ -125,22 +191,42 @@ impl OxydeApp {
                         StandardPlane::Top,
                         StandardPlane::Right,
                     ] {
-                        let selected = self.selected_plane == Some(plane);
-                        let label = format!("{} Plane", plane_name(plane));
-                        if tree_row(ui, Icon::Plane, false, RichText::new(label), selected, None)
-                            .clicked()
-                        {
+                        let item = Item::Plane(plane);
+                        let row = tree_row(
+                            ui,
+                            Row {
+                                icon: Icon::Plane,
+                                cut: false,
+                                text: RichText::new(format!("{} Plane", plane_name(plane))),
+                                highlighted: self.selected_plane == Some(plane),
+                                badge: None,
+                                indent: 0.0,
+                                expander: None,
+                                eye: Some(self.item_shown(item)),
+                            },
+                        );
+                        if row.eye_clicked {
+                            action = Some(Action::ToggleItem(item));
+                        } else if row.response.clicked() {
                             action = Some(Action::SelectPlane(plane));
                         }
                     }
-                    tree_row(
+                    let origin = tree_row(
                         ui,
-                        Icon::Origin,
-                        false,
-                        RichText::new("Origin").color(INACTIVE),
-                        false,
-                        None,
+                        Row {
+                            icon: Icon::Origin,
+                            cut: false,
+                            text: RichText::new("Origin"),
+                            highlighted: false,
+                            badge: None,
+                            indent: 0.0,
+                            expander: None,
+                            eye: Some(self.item_shown(Item::Origin)),
+                        },
                     );
+                    if origin.eye_clicked {
+                        action = Some(Action::ToggleItem(Item::Origin));
+                    }
                     ui.add_space(3.0);
                     ui.separator();
 
@@ -151,18 +237,52 @@ impl OxydeApp {
                         .rollback_position()
                         .unwrap_or(entries.len())
                         .min(entries.len());
-                    let mut rows = Vec::with_capacity(entries.len());
+                    let absorbed = self.absorbed_sketches();
+                    let index_of = |id: FeatureId| entries.iter().position(|e| e.id == id);
+                    let highlighted = |id: FeatureId| {
+                        self.selected_feature == Some(id)
+                            || creator == Some(id)
+                            || referenced.contains(&id)
+                    };
+                    // Rows in display order, with the timeline index of their feature.
+                    let mut rows: Vec<(egui::Rect, usize)> = Vec::with_capacity(entries.len());
                     let mut bar = None;
                     for (index, entry) in entries.iter().enumerate() {
-                        if index == active {
+                        if absorbed.contains_key(&entry.id) {
+                            continue; // shown under the feature that uses it
+                        }
+                        if bar.is_none() && index >= active {
                             bar = Some(rollback_bar(ui));
                         }
-                        let highlighted = self.selected_feature == Some(entry.id)
-                            || creator == Some(entry.id)
-                            || referenced.contains(&entry.id);
-                        rows.push(self.timeline_row(ui, entry, highlighted, &mut action));
+                        let child = absorbed
+                            .iter()
+                            .find(|(_, parent)| **parent == entry.id)
+                            .map(|(sketch, _)| *sketch);
+                        let expanded = self.expanded.contains(&entry.id);
+                        let rect = self.timeline_row(
+                            ui,
+                            entry,
+                            highlighted(entry.id),
+                            0.0,
+                            child.map(|_| expanded),
+                            &mut action,
+                        );
+                        rows.push((rect, index));
+                        if let (Some(sketch), true) = (child, expanded) {
+                            if let Some(child_index) = index_of(sketch) {
+                                let rect = self.timeline_row(
+                                    ui,
+                                    &entries[child_index],
+                                    highlighted(sketch),
+                                    16.0,
+                                    None,
+                                    &mut action,
+                                );
+                                rows.push((rect, child_index));
+                            }
+                        }
                     }
-                    if active == entries.len() {
+                    if bar.is_none() {
                         bar = Some(rollback_bar(ui));
                     }
 
@@ -180,7 +300,10 @@ impl OxydeApp {
                         }
                         if bar.drag_stopped() {
                             if let Some(pos) = pointer {
-                                let target = rows.iter().filter(|r| r.center().y < pos.y).count();
+                                let target = rows
+                                    .iter()
+                                    .find(|(r, _)| r.center().y > pos.y)
+                                    .map_or(entries.len(), |(_, index)| *index);
                                 if target != active {
                                     action = Some(Action::RollTo(target));
                                 }
@@ -201,6 +324,8 @@ impl OxydeApp {
         ui: &mut egui::Ui,
         entry: &TimelineEntry,
         highlighted: bool,
+        indent: f32,
+        expander: Option<bool>,
         action: &mut Option<Action>,
     ) -> egui::Rect {
         let feature = self.doc.part.feature(entry.id);
@@ -227,8 +352,23 @@ impl OxydeApp {
         if suppressed {
             text = text.strikethrough();
         }
+        let item = Item::Feature(entry.id);
+        let eye = self.has_visibility(entry.id).then(|| self.item_shown(item));
 
-        let mut response = tree_row(ui, icon, cut, text, highlighted, badge);
+        let row = tree_row(
+            ui,
+            Row {
+                icon,
+                cut,
+                text,
+                highlighted,
+                badge,
+                indent,
+                expander,
+                eye,
+            },
+        );
+        let mut response = row.response;
         response = match &entry.status {
             FeatureStatus::Error(message) | FeatureStatus::Warning(message) => {
                 response.on_hover_text(message.as_str())
@@ -243,7 +383,11 @@ impl OxydeApp {
                 _ => response.on_hover_text(entry.type_name),
             },
         };
-        if response.double_clicked() {
+        if row.expand_clicked {
+            *action = Some(Action::ToggleExpand(entry.id));
+        } else if row.eye_clicked {
+            *action = Some(Action::ToggleItem(item));
+        } else if response.double_clicked() {
             *action = Some(Action::Edit(entry.id));
         } else if response.clicked() {
             *action = Some(Action::Select(entry.id));
@@ -263,6 +407,12 @@ impl OxydeApp {
             if ui.button("Rename…").clicked() {
                 *action = Some(Action::Rename(id));
                 ui.close_menu();
+            }
+            if let Some(shown) = eye {
+                if ui.button(if shown { "Hide" } else { "Show" }).clicked() {
+                    *action = Some(Action::ToggleItem(item));
+                    ui.close_menu();
+                }
             }
             let label = if suppressed { "Unsuppress" } else { "Suppress" };
             if ui.button(label).clicked() {
@@ -321,6 +471,12 @@ impl OxydeApp {
                 }
             }
             Action::Delete(id) => self.delete_feature(id),
+            Action::ToggleExpand(id) => {
+                if !self.expanded.remove(&id) {
+                    self.expanded.insert(id);
+                }
+            }
+            Action::ToggleItem(item) => self.toggle_item(item),
         }
     }
 

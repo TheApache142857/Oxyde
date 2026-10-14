@@ -58,11 +58,12 @@ pub enum Tool {
     Arc,
     Trim,
     Convert,
+    Mirror,
 }
 
 impl Tool {
     /// The tools of the Sketch tab, in order, with icon and label.
-    pub const ALL: [(Tool, Icon, &'static str); 10] = [
+    pub const ALL: [(Tool, Icon, &'static str); 11] = [
         (Tool::Select, Icon::Select, "Select"),
         (Tool::Dimension, Icon::SmartDimension, "Smart Dimension"),
         (Tool::Line, Icon::Line, "Line"),
@@ -77,6 +78,7 @@ impl Tool {
         (Tool::Arc, Icon::Arc, "Arc"),
         (Tool::Trim, Icon::Trim, "Trim"),
         (Tool::Convert, Icon::Convert, "Convert Entities"),
+        (Tool::Mirror, Icon::Mirror, "Mirror Entities"),
     ];
 
     /// Tools that draw new geometry.
@@ -108,6 +110,9 @@ impl Tool {
             Tool::Trim => "Click the piece of a curve to remove, up to the nearest crossings",
             Tool::Convert => {
                 "Click an edge of the part lying in the sketch plane to copy it into the sketch"
+            }
+            Tool::Mirror => {
+                "Select what to mirror (Ctrl+click), then click the line or centerline to mirror about"
             }
         }
     }
@@ -179,6 +184,8 @@ pub struct SketchSession {
     pub report: Option<SolveReport>,
     pub tool: Tool,
     pub selection: Vec<EntityId>,
+    /// Dimensions selected by clicking their label (Delete removes them).
+    pub selected_dimensions: Vec<RelationId>,
     /// Created by the "Sketch" command (as opposed to editing an existing sketch).
     pub new_sketch: bool,
     /// Where the rollback bar was before editing started.
@@ -223,6 +230,7 @@ impl SketchSession {
             report: None,
             tool: if new_sketch { Tool::Line } else { Tool::Select },
             selection: Vec::new(),
+            selected_dimensions: Vec::new(),
             new_sketch,
             restore_rollback,
             message: None,
@@ -279,8 +287,44 @@ impl SketchSession {
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending.clear();
+        // Mirror keeps the selection: it is what gets mirrored.
         if tool == Tool::Dimension || tool.draws() || tool == Tool::Trim {
             self.selection.clear();
+        }
+    }
+
+    /// Mirror Entities: a click on a line mirrors the selection about it; other clicks (and
+    /// Ctrl+clicks) build the selection.
+    fn click_mirror(&mut self, hit: Option<EntityId>, additive: bool) {
+        let is_line = |id: EntityId| {
+            matches!(
+                self.sketch.entity(id).map(|e| e.geometry),
+                Some(Geometry::Line { .. })
+            )
+        };
+        let others = self.selection.iter().any(|s| Some(*s) != hit);
+        match hit {
+            Some(line) if !additive && is_line(line) && others => {
+                let entities: Vec<EntityId> = self
+                    .selection
+                    .iter()
+                    .copied()
+                    .filter(|s| *s != line)
+                    .collect();
+                self.checkpoint();
+                match self.sketch.mirror(&entities, line) {
+                    Some(_) if self.solve() => {
+                        self.selection.clear();
+                        self.message = Some(format!("Mirrored {} entities", entities.len()));
+                    }
+                    _ => {
+                        self.undo();
+                        self.message =
+                            Some("That mirror conflicts with the existing relations".to_owned());
+                    }
+                }
+            }
+            _ => self.click_select(hit, true),
         }
     }
 
@@ -294,8 +338,9 @@ impl SketchSession {
             self.tool = Tool::Select;
             self.selection.clear();
             true
-        } else if !self.selection.is_empty() {
+        } else if !self.selection.is_empty() || !self.selected_dimensions.is_empty() {
             self.selection.clear();
+            self.selected_dimensions.clear();
             true
         } else {
             false
@@ -396,14 +441,33 @@ impl SketchSession {
         Some(oxyde_model::full_name(name, &self.name))
     }
 
+    /// Deletes the selected geometry and dimensions.
     pub fn delete_selection(&mut self) {
-        if self.selection.is_empty() {
+        if self.selection.is_empty() && self.selected_dimensions.is_empty() {
             return;
         }
         self.checkpoint();
+        for id in std::mem::take(&mut self.selected_dimensions) {
+            self.sketch.remove_relation(id);
+        }
         let doomed = std::mem::take(&mut self.selection);
         self.sketch.remove(&doomed);
         self.solve();
+    }
+
+    /// Selects a dimension by its label (Ctrl adds to the selection).
+    fn click_dimension_label(&mut self, id: RelationId, additive: bool) {
+        self.selection.clear();
+        if additive {
+            match self.selected_dimensions.iter().position(|d| *d == id) {
+                Some(i) => {
+                    self.selected_dimensions.remove(i);
+                }
+                None => self.selected_dimensions.push(id),
+            }
+        } else {
+            self.selected_dimensions = vec![id];
+        }
     }
 
     pub fn toggle_construction(&mut self) {
@@ -483,6 +547,7 @@ impl SketchSession {
                 ("Midpoint", Midpoint(p[0], l[0])),
             ],
             (1, 0, 1) => vec![("On circle", PointOnCircle(p[0], r[0]))],
+            (2, 1, 0) => vec![("Symmetric", Symmetric(p[0], p[1], l[0]))],
             _ => Vec::new(),
         }
     }
@@ -611,6 +676,9 @@ impl SketchSession {
     }
 
     fn click_select(&mut self, hit: Option<EntityId>, additive: bool) {
+        if !additive {
+            self.selected_dimensions.clear();
+        }
         match hit {
             Some(id) if additive => {
                 if let Some(i) = self.selection.iter().position(|s| *s == id) {
@@ -772,7 +840,7 @@ impl SketchSession {
     fn click_tool(&mut self, p: Pending) {
         let relations_before = self.sketch.relations().len();
         match self.tool {
-            Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert => {}
+            Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert | Tool::Mirror => {}
             Tool::CenterRectangle => match self.pending.first().copied() {
                 None => self.pending = vec![p],
                 Some(center) => {
@@ -794,8 +862,8 @@ impl SketchSession {
                         self.sketch.set_construction(d1, true);
                         self.sketch.set_construction(d2, true);
                         let c = self.realize(center);
+                        // With the sides horizontal and vertical, one diagonal is enough.
                         self.sketch.constrain(Constraint::Midpoint(c, d1));
-                        self.sketch.constrain(Constraint::Midpoint(c, d2));
                         let corner = corners.iter().copied().find(|q| {
                             self.sketch
                                 .position(*q)
@@ -1186,15 +1254,22 @@ impl SketchSession {
             } else {
                 graphics.text
             };
-            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), FULLY);
+            let selected = self.selected_dimensions.contains(&relation.id);
+            let ink = if selected { SELECTED } else { FULLY };
+            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), ink);
             let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
             painter.rect_filled(
                 rect,
                 3.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 220),
             );
-            painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(160)));
-            painter.galley(rect.center() - galley.size() / 2.0, galley, FULLY);
+            let border = if selected {
+                Stroke::new(2.0, SELECTED)
+            } else {
+                Stroke::new(1.0, Color32::from_gray(160))
+            };
+            painter.rect_stroke(rect, 3.0, border);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
             if pointer.is_some_and(|p| rect.contains(p)) {
                 hovered_label = Some((rect, relation.id));
             }
@@ -1297,7 +1372,7 @@ impl SketchSession {
                     };
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                 }
-                Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert => {}
+                Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert | Tool::Mirror => {}
             }
         }
 
@@ -1749,16 +1824,29 @@ pub fn interact(
         _ => None,
     };
 
-    if response.clicked() {
+    // Dimension labels: a click selects, a double click edits the value.
+    let label_at = |pos: Pos2| {
+        session
+            .labels
+            .iter()
+            .find(|(r, _)| r.contains(pos))
+            .map(|(_, id)| *id)
+    };
+    if response.double_clicked() {
+        if let Some(id) = pointer.and_then(label_at) {
+            if matches!(session.tool, Tool::Select | Tool::Dimension) {
+                request = Some(SketchRequest::EditDimension(id));
+            }
+        }
+    }
+    if response.clicked() && request.is_none() {
         if let Some(pos) = pointer {
-            let label = session
-                .labels
-                .iter()
-                .find(|(r, _)| r.contains(pos))
-                .map(|(_, id)| *id);
+            let label = label_at(pos);
             match session.tool {
                 Tool::Select | Tool::Dimension if label.is_some() => {
-                    request = label.map(SketchRequest::EditDimension);
+                    if let Some(id) = label {
+                        session.click_dimension_label(id, additive);
+                    }
                 }
                 Tool::Select => {
                     let hit = session.hit(pos, &to_screen);
@@ -1779,6 +1867,10 @@ pub fn interact(
                     if let Some(index) = session.model_hover {
                         session.convert(index);
                     }
+                }
+                Tool::Mirror => {
+                    let hit = session.hit(pos, &to_screen);
+                    session.click_mirror(hit, additive);
                 }
                 _ => {
                     if let Some((at, snap)) = snapped {
@@ -2015,6 +2107,31 @@ mod tests {
         assert!(report.converged);
         // The converted circle and line cannot move; only the drawn circle's radius can.
         assert_eq!(report.degrees_of_freedom, 1);
+    }
+
+    #[test]
+    fn mirror_tool_mirrors_the_selection_about_the_clicked_line() {
+        let mut s = ConstrainedSketch::new();
+        let axis = s.line(Point2::new(0.0, -5.0), Point2::new(0.0, 5.0));
+        let circle = s.circle(Point2::new(4.0, 0.0), 1.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Mirror);
+        session.click_mirror(Some(circle), false);
+        assert_eq!(session.selection, vec![circle]);
+        session.click_mirror(Some(axis), false);
+        assert!(session.selection.is_empty());
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::Symmetric(_, _, l) if *l == axis)
+        ));
+        let circles = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Circle { .. }))
+            .count();
+        assert_eq!(circles, 2);
+        assert!(session.report.as_ref().unwrap().converged);
     }
 
     #[test]

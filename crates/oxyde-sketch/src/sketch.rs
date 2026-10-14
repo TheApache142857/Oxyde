@@ -85,6 +85,8 @@ pub enum Constraint {
     /// Distance between two lines, measured from the middle of the first to the infinite
     /// extension of the second; meant for parallel lines.
     LineDistance(EntityId, EntityId, f64),
+    /// Two points mirror images of each other about a line (its infinite extension).
+    Symmetric(EntityId, EntityId, EntityId),
 }
 
 impl Constraint {
@@ -108,6 +110,7 @@ impl Constraint {
             | Tangent(a, b)
             | PointLineDistance(a, b, _)
             | LineDistance(a, b, _) => vec![a, b],
+            Symmetric(a, b, line) => vec![a, b, line],
         }
     }
 }
@@ -726,6 +729,11 @@ impl ConstrainedSketch {
                     layout.expect(b, Kind::Round, i)?;
                 }
                 Radius(r, _) => layout.expect(r, Kind::Round, i)?,
+                Symmetric(a, b, l) => {
+                    layout.expect(a, Kind::Point, i)?;
+                    layout.expect(b, Kind::Point, i)?;
+                    layout.expect(l, Kind::Line, i)?;
+                }
                 PointOnLine(p, l) | Midpoint(p, l) | PointLineDistance(p, l, _) => {
                     layout.expect(p, Kind::Point, i)?;
                     layout.expect(l, Kind::Line, i)?;
@@ -1009,6 +1017,15 @@ impl Eval<'_> {
                 let d = (e.x - s.x, e.y - s.y);
                 let distance = (d.0 * (p.y - s.y) - d.1 * (p.x - s.x)).abs() / length(d);
                 out.push(distance - value);
+            }
+            Symmetric(a, b, l) => {
+                // The middle on the line, and the segment between them across it.
+                let (s, e) = self.line(l);
+                let (a, b) = (self.point(a), self.point(b));
+                let d = (e.x - s.x, e.y - s.y);
+                let m = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+                out.push((d.0 * (m.1 - s.y) - d.1 * (m.0 - s.x)) / length(d));
+                out.push(((b.x - a.x) * d.0 + (b.y - a.y) * d.1) / length(d));
             }
             LineDistance(a, b, value) => {
                 let (a0, a1) = self.line(a);

@@ -521,3 +521,40 @@ fn the_origin_is_a_fixed_point_that_survives_deletions() {
     assert!(close(s.position(corner).unwrap(), -10.0, -5.0));
     assert!(close(s.position(origin).unwrap(), 0.0, 0.0));
 }
+
+#[test]
+fn mirrored_geometry_follows_the_original() {
+    let mut s = ConstrainedSketch::new();
+    let axis = s.line(Point2::new(0.0, -10.0), Point2::new(0.0, 10.0));
+    s.set_construction(axis, true);
+    s.constrain(Vertical(axis));
+    let (bottom, _) = s.endpoints(axis).unwrap();
+    s.constrain(Fixed(bottom));
+    // A line touching the axis and an arc, mirrored.
+    let line = s.line(Point2::new(0.0, 5.0), Point2::new(6.0, 2.0));
+    let arc = s.arc(
+        Point2::new(4.0, -3.0),
+        Point2::new(6.0, -3.0),
+        Point2::new(4.0, -1.0),
+    );
+    let before = s.entities().len();
+    let created = s.mirror(&[line, arc, axis], axis).unwrap();
+    // The line's point on the axis is shared: 1 + 3 new points, a line and an arc.
+    assert_eq!(s.entities().len(), before + created.len());
+    assert_eq!(created.len(), 6);
+    assert!(s.solve().unwrap().converged);
+    let (_, end) = s.endpoints(line).unwrap();
+    let mirrored_end = s
+        .entities()
+        .iter()
+        .find(|e| matches!(e.geometry, Geometry::Point(p) if close(p, -6.0, 2.0)))
+        .map(|e| e.id)
+        .expect("mirrored end point");
+    // Move the original: the copy follows.
+    s.constrain(Distance(end, mirrored_end, 20.0));
+    assert!(s.solve().unwrap().converged);
+    let p = s.position(end).unwrap();
+    let q = s.position(mirrored_end).unwrap();
+    assert!((p.x + q.x).abs() < 1e-7 && (p.y - q.y).abs() < 1e-7);
+    assert!(((p.x - q.x).abs() - 20.0).abs() < 1e-7);
+}

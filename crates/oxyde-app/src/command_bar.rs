@@ -197,6 +197,8 @@ impl OxydeApp {
                     ui.close_menu();
                     self.viewport.request_fit();
                 }
+                ui.separator();
+                ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
                 if ui.button("Equations…").clicked() {
@@ -559,6 +561,20 @@ impl OxydeApp {
         }
     }
 
+    /// View › Hide/Show: whole kinds of items.
+    fn visibility_menu(&mut self, ui: &mut egui::Ui) {
+        let v = &mut self.visibility;
+        ui.checkbox(&mut v.planes, "Planes");
+        ui.checkbox(&mut v.axes, "Axes");
+        ui.checkbox(&mut v.sketches, "Sketches");
+        ui.checkbox(&mut v.origins, "Origins");
+        ui.label(
+            egui::RichText::new("Single items: the eye in the tree")
+                .small()
+                .weak(),
+        );
+    }
+
     /// Standard views, zoom to fit and Normal To, floating at the top of the viewport.
     pub(crate) fn heads_up_toolbar(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
         egui::Area::new(egui::Id::new("heads_up_toolbar"))
@@ -586,6 +602,23 @@ impl OxydeApp {
                             {
                                 self.viewport.request_fit();
                             }
+                            ui.separator();
+                            let eye = icons::icon_button(ui, Icon::Eye, 26.0, true)
+                                .on_hover_text("Hide/Show planes, axes, sketches, origins");
+                            let popup = ui.make_persistent_id("hide_show_menu");
+                            if eye.clicked() {
+                                ui.memory_mut(|m| m.toggle_popup(popup));
+                            }
+                            egui::popup::popup_below_widget(
+                                ui,
+                                popup,
+                                &eye,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(150.0);
+                                    self.visibility_menu(ui);
+                                },
+                            );
                             let target = self.normal_to_target();
                             if icons::icon_button(ui, Icon::NormalTo, 26.0, target.is_some())
                                 .on_hover_text(

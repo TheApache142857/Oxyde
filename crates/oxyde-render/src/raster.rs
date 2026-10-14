@@ -92,6 +92,30 @@ impl Scene {
         }
     }
 
+    /// The scene as flat arrays for a GPU: indexed triangles with per-vertex normals and
+    /// face indices, and edge segments with their edge index.
+    pub fn gpu_mesh(&self) -> GpuMesh {
+        let f = |v: V3| [v[0] as f32, v[1] as f32, v[2] as f32];
+        let mut mesh = GpuMesh::default();
+        for (index, face) in self.faces.iter().enumerate() {
+            let base = mesh.positions.len() as u32;
+            for (p, n) in face.positions.iter().zip(&face.normals) {
+                mesh.positions.push(f(*p));
+                mesh.normals.push(f(*n));
+                mesh.faces.push(index as u32);
+            }
+            for t in &face.triangles {
+                mesh.indices.extend(t.iter().map(|&i| base + i as u32));
+            }
+        }
+        for (index, edge) in self.edges.iter().enumerate() {
+            for w in edge.windows(2) {
+                mesh.segments.push((f(w[0]), f(w[1]), index as u32));
+            }
+        }
+        mesh
+    }
+
     /// Axis-aligned bounding box, or `None` for an empty scene.
     pub fn bounds(&self) -> Option<(V3, V3)> {
         self.bounds
@@ -100,6 +124,20 @@ impl Scene {
     pub fn is_empty(&self) -> bool {
         self.faces.is_empty() && self.edges.is_empty()
     }
+}
+
+/// A [`Scene`] as flat arrays, ready to upload to a GPU.
+#[derive(Debug, Clone, Default)]
+pub struct GpuMesh {
+    pub positions: Vec<[f32; 3]>,
+    /// Smooth within each face, as in the software renderer.
+    pub normals: Vec<[f32; 3]>,
+    /// Face index of each vertex.
+    pub faces: Vec<u32>,
+    /// Triangles, three vertex indices each.
+    pub indices: Vec<u32>,
+    /// Edge segments: start, end, edge index.
+    pub segments: Vec<([f32; 3], [f32; 3], u32)>,
 }
 
 /// A rendered image with its depth and id buffers.

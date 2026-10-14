@@ -393,7 +393,7 @@ impl FeatureKind {
 }
 
 /// The three reference planes every part starts with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardPlane {
     Front,
     Top,

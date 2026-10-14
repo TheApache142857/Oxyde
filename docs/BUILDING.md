@@ -73,6 +73,12 @@ Open `box.step` in SolidWorks, FreeCAD or eDrawings: you should see a 40 × 20 �
 
 In the application, **File › Open demo bracket** builds a part using every feature type. The viewport is software-rendered: use `--release` for smooth navigation (the renderer crate is optimized even in debug builds, the rest is not).
 
+The viewport draws with the GPU (wgpu). If it shows nothing or crashes on startup on your machine, run with the software renderer and report the GPU and driver:
+
+```powershell
+$env:OXYDE_RENDERER = "cpu"; cargo run --release -p oxyde-app
+```
+
 ## 3. Troubleshooting
 
 | Symptom | Cause / fix |

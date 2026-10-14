@@ -32,6 +32,51 @@ impl ViewportOutput {
     }
 }
 
+/// Where an animated view change ends.
+#[derive(Clone, Copy)]
+enum Orientation {
+    View(StandardView),
+    /// Looking against this direction (Normal To).
+    Normal([f64; 3]),
+}
+
+/// A view change waiting for the viewport size, which the end camera depends on.
+#[derive(Clone, Copy)]
+struct ViewRequest {
+    orientation: Orientation,
+    /// What to frame; the whole part when `None`.
+    bounds: Option<([f64; 3], [f64; 3])>,
+}
+
+/// A camera move in progress.
+#[derive(Clone, Copy)]
+struct Animation {
+    from: Camera,
+    to: Camera,
+    start: f64,
+}
+
+/// How long view changes take, in seconds.
+const ANIMATION: f64 = 0.45;
+
+/// The camera between `from` (t = 0) and `to` (t = 1): the shorter way round, zooming
+/// geometrically.
+fn interpolate(from: &Camera, to: &Camera, t: f64) -> Camera {
+    use std::f64::consts::{PI, TAU};
+    let turn = (to.yaw - from.yaw + PI).rem_euclid(TAU) - PI;
+    let lerp = |a: f64, b: f64| a + (b - a) * t;
+    Camera {
+        target: [
+            lerp(from.target[0], to.target[0]),
+            lerp(from.target[1], to.target[1]),
+            lerp(from.target[2], to.target[2]),
+        ],
+        yaw: from.yaw + turn * t,
+        pitch: lerp(from.pitch, to.pitch),
+        height: (lerp(from.height.ln(), to.height.ln())).exp(),
+    }
+}
+
 /// Everything the current image depends on: re-render only when this changes.
 #[derive(Clone, PartialEq)]
 struct RenderKey {
@@ -50,6 +95,15 @@ pub struct Viewport {
     rendered: Option<RenderKey>,
     hovered: Option<Pick>,
     fit_pending: bool,
+    view_request: Option<ViewRequest>,
+    animation: Option<Animation>,
+    /// GPU renderer; the software renderer draws when there is none.
+    gpu: Option<crate::gpu::GpuViewport>,
+    gpu_texture: Option<egui::TextureId>,
+    /// Last pick, reused while neither the pointer nor the image changed.
+    last_pick: Option<([f64; 2], Option<Pick>)>,
+    /// "GPU (adapter)" or "software", for the About window.
+    renderer: String,
 }
 
 impl Viewport {
@@ -63,10 +117,37 @@ impl Viewport {
             rendered: None,
             hovered: None,
             fit_pending: true,
+            view_request: None,
+            animation: None,
+            gpu: None,
+            gpu_texture: None,
+            last_pick: None,
+            renderer: "software".to_owned(),
         }
     }
 
+    /// Draws with the GPU from now on.
+    pub fn enable_gpu(&mut self, gpu: crate::gpu::GpuViewport, name: String) {
+        if !self.scene.is_empty() {
+            let mut gpu = gpu;
+            gpu.set_mesh(&self.scene.gpu_mesh(), self.scene.bounds());
+            self.gpu = Some(gpu);
+        } else {
+            self.gpu = Some(gpu);
+        }
+        self.renderer = name;
+        self.rendered = None;
+    }
+
+    /// Which renderer draws the viewport.
+    pub fn renderer_name(&self) -> &str {
+        &self.renderer
+    }
+
     pub fn set_scene(&mut self, scene: Scene, fit: bool) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
+        }
         self.scene = scene;
         self.scene_version += 1;
         self.hovered = None;
@@ -83,16 +164,28 @@ impl Viewport {
         self.fit_pending = true;
     }
 
+    /// Turns smoothly to a standard view, framing the part.
     pub fn set_view(&mut self, view: StandardView) {
-        self.camera.set_view(view);
-        self.fit_pending = true;
+        self.view_request = Some(ViewRequest {
+            orientation: Orientation::View(view),
+            bounds: None,
+        });
     }
 
-    /// Looks straight at a plane (SolidWorks' "Normal To").
+    /// Turns smoothly to look straight at a plane (SolidWorks' "Normal To"), framing the
+    /// part.
     pub fn look_at_plane(&mut self, plane: &Plane) {
+        self.look_at_plane_framing(plane, None);
+    }
+
+    /// Turns smoothly to look straight at a plane, centring the box `bounds` (e.g. a
+    /// sketch being opened), or the part when `None`.
+    pub fn look_at_plane_framing(&mut self, plane: &Plane, bounds: Option<(Point3, Point3)>) {
         let n = plane.normal;
-        self.camera.look_along([n.x, n.y, n.z]);
-        self.fit_pending = true;
+        self.view_request = Some(ViewRequest {
+            orientation: Orientation::Normal([n.x, n.y, n.z]),
+            bounds: bounds.map(|(a, b)| ([a.x, a.y, a.z], [b.x, b.y, b.z])),
+        });
     }
 
     /// Screen position of a model-space point.
@@ -149,6 +242,35 @@ impl Viewport {
             }
         }
 
+        // Animated view changes.
+        let now = ui.input(|i| i.time);
+        if let Some(request) = self.view_request.take() {
+            let mut to = self.camera;
+            match request.orientation {
+                Orientation::View(view) => to.set_view(view),
+                Orientation::Normal(n) => to.look_along(n),
+            }
+            if let Some((lo, hi)) = request.bounds.or_else(|| self.scene.bounds()) {
+                to.fit(lo, hi, w, h);
+            }
+            self.fit_pending = false;
+            self.animation = Some(Animation {
+                from: self.camera,
+                to,
+                start: now,
+            });
+        }
+        if let Some(animation) = self.animation {
+            let t = ((now - animation.start) / ANIMATION).clamp(0.0, 1.0);
+            let eased = t * t * (3.0 - 2.0 * t);
+            self.camera = interpolate(&animation.from, &animation.to, eased);
+            if t >= 1.0 {
+                self.animation = None;
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
+
         // Navigation.
         let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl));
         let delta = response.drag_delta();
@@ -160,6 +282,10 @@ impl Viewport {
             let panning = middle || (shift && primary);
             (panning, !panning && primary)
         };
+        if panning || orbiting {
+            // The user takes over.
+            self.animation = None;
+        }
         if panning {
             self.camera
                 .pan(delta.x as f64 * ppp as f64, delta.y as f64 * ppp as f64, h);
@@ -174,6 +300,7 @@ impl Viewport {
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
+                self.animation = None;
                 if let Some(cursor) = pointer {
                     let factor = (-(scroll as f64) * 0.0015).exp();
                     self.camera.zoom_at(factor, cursor, w, h);
@@ -182,12 +309,23 @@ impl Viewport {
         }
 
         // Picking uses the previous image, which is what the user is looking at.
-        self.hovered = match (&self.frame, pointer, panning || orbiting || sketching) {
-            (Some(frame), Some(cursor), false)
-                if frame.width == width && frame.height == height =>
-            {
-                frame.pick(cursor[0], cursor[1], 4.0 * ppp as f64)
-            }
+        let same_size = self
+            .rendered
+            .as_ref()
+            .is_some_and(|k| k.size == [width, height]);
+        self.hovered = match (pointer, panning || orbiting || sketching || !same_size) {
+            (Some(cursor), false) => match (&self.gpu, &self.frame) {
+                (Some(gpu), _) => match self.last_pick {
+                    Some((at, pick)) if at == cursor => pick,
+                    _ => {
+                        let pick = gpu.pick(cursor[0], cursor[1], 4.0 * ppp as f64);
+                        self.last_pick = Some((cursor, pick));
+                        pick
+                    }
+                },
+                (None, Some(frame)) => frame.pick(cursor[0], cursor[1], 4.0 * ppp as f64),
+                (None, None) => None,
+            },
             _ => None,
         };
         let clicked = (response.clicked() && !sketching).then_some(self.hovered);
@@ -202,7 +340,18 @@ impl Viewport {
             },
             scene: self.scene_version,
         };
-        if self.rendered.as_ref() != Some(&key) {
+        let image_changed = self
+            .rendered
+            .as_ref()
+            .is_none_or(|k| k.camera != key.camera || k.size != key.size || k.scene != key.scene);
+        if image_changed {
+            self.last_pick = None;
+        }
+        if let (Some(gpu), true) = (self.gpu.as_mut(), self.rendered.as_ref() != Some(&key)) {
+            self.gpu_texture =
+                Some(gpu.render(&self.camera, width as u32, height as u32, &key.highlight));
+            self.rendered = Some(key);
+        } else if self.rendered.as_ref() != Some(&key) {
             let frame = render(&self.scene, &self.camera, width, height, &key.highlight);
             let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.rgba);
             if let Some(texture) = self.texture.as_mut() {
@@ -219,9 +368,10 @@ impl Viewport {
         }
 
         let painter = ui.painter_at(rect);
-        if let Some(texture) = &self.texture {
+        let image = self.gpu_texture.or(self.texture.as_ref().map(|t| t.id()));
+        if let Some(texture) = image {
             painter.image(
-                texture.id(),
+                texture,
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,

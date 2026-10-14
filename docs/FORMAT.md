@@ -164,6 +164,7 @@ Connected geometry shares point entities. The ids of lines, circles and arcs are
 | `point_on_circle` | `point`, `curve` |
 | `tangent` | `line`, `curve` |
 | `point_line_distance` | `point`, `line`, `value`: distance to the line's infinite extension |
+| `symmetric` | `a`, `b` (points), `line`: mirror images about the line's infinite extension |
 | `line_distance` | `a`, `b` (lines), `value`: from the middle of `a` to the infinite extension of `b` (for parallel lines) |
 
 Positions are stored as last solved; readers solve the relations again on rebuild.
