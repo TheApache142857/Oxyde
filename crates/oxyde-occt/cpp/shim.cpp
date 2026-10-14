@@ -69,6 +69,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -546,13 +547,18 @@ OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t
         for (int j = 1; j <= input_faces.Extent(); ++j) {
             const TopoDS_Shape& face = input_faces(j);
             const auto index = static_cast<std::uint32_t>(j - 1);
-            // The original faces stay as the skin; Modified() gives their offset copies.
+            // The original faces stay as the skin. Depending on the OCCT version, their
+            // offset copies are reported as modified or as generated: take both.
             add_source(out, result_faces, face, SourceKind::InputFace, 0, index);
-            const TopTools_ListOfShape& modified = maker.Modified(face);
-            for (TopTools_ListIteratorOfListOfShape it(modified); it.More(); it.Next()) {
-                const SourceKind kind =
-                    it.Value().IsSame(face) ? SourceKind::InputFace : SourceKind::OffsetFace;
-                add_source(out, result_faces, it.Value(), kind, 0, index);
+            // Both may return the same internal list, so each is copied before the next call.
+            const TopTools_ListOfShape modified = maker.Modified(face);
+            const TopTools_ListOfShape generated = maker.Generated(face);
+            for (const TopTools_ListOfShape* images : {&modified, &generated}) {
+                for (TopTools_ListIteratorOfListOfShape it(*images); it.More(); it.Next()) {
+                    const SourceKind kind =
+                        it.Value().IsSame(face) ? SourceKind::InputFace : SourceKind::OffsetFace;
+                    add_source(out, result_faces, it.Value(), kind, 0, index);
+                }
             }
         }
         record_generated_faces(maker, input, 0, TopAbs_EDGE, SourceKind::InputEdge,

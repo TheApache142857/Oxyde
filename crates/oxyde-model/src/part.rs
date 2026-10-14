@@ -71,7 +71,6 @@ pub struct SketchResult {
     pub profile: Result<Profile, ProfileError>,
 }
 
-#[derive(Debug)]
 /// Geometry of a reference feature.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReferenceGeometry {
