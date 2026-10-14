@@ -51,6 +51,9 @@ pub enum FaceKey {
         instance: [u32; 2],
         face: Box<FaceName>,
     },
+    /// Face of geometry imported from a file, by its position in the imported shape (stable,
+    /// since the stored file does not change).
+    Imported { feature: FeatureId, index: u32 },
     /// Face whose origin the kernel did not report. Not stable: references to it are
     /// flagged.
     Unknown { feature: FeatureId, index: u32 },
@@ -85,6 +88,7 @@ impl FaceKey {
             | FaceKey::FromVertex { feature, .. }
             | FaceKey::Offset { feature, .. }
             | FaceKey::Instance { feature, .. }
+            | FaceKey::Imported { feature, .. }
             | FaceKey::Unknown { feature, .. } => *feature,
         }
     }
@@ -421,6 +425,7 @@ impl fmt::Display for FaceKey {
                 instance: [i, j],
                 face,
             } => write!(f, "{feature}[{i},{j}]({face})"),
+            FaceKey::Imported { feature, index } => write!(f, "{feature}.imported[{index}]"),
             FaceKey::Unknown { feature, index } => write!(f, "{feature}.face#{index}"),
         }
     }

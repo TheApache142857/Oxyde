@@ -49,6 +49,7 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
         FeatureKind::Mirror(_) => Icon::Mirror,
         FeatureKind::Plane(_) => Icon::RefPlane,
         FeatureKind::Axis(_) => Icon::RefAxis,
+        FeatureKind::Import(_) => Icon::Imported,
     }
 }
 
@@ -235,7 +236,12 @@ impl OxydeApp {
             _ if entry.under_defined => {
                 response.on_hover_text("Under defined: the sketch can still move")
             }
-            _ => response.on_hover_text(entry.type_name),
+            _ => match feature.map(|f| f.kind()) {
+                Some(FeatureKind::Import(import)) => {
+                    response.on_hover_text(format!("Imported from {}", import.file_name))
+                }
+                _ => response.on_hover_text(entry.type_name),
+            },
         };
         if response.double_clicked() {
             *action = Some(Action::Edit(entry.id));
@@ -403,6 +409,17 @@ impl OxydeApp {
                 self.open_pattern(Some(id), PatternKind::Circular, Some(&kind))
             }
             FeatureKind::Mirror(_) => self.open_pattern(Some(id), PatternKind::Mirror, Some(&kind)),
+            FeatureKind::Import(import) => {
+                self.status = format!(
+                    "{} holds the geometry of {}; it has nothing to edit",
+                    self.doc
+                        .part
+                        .feature(id)
+                        .map(|f| f.name().to_owned())
+                        .unwrap_or_default(),
+                    import.file_name
+                );
+            }
         }
     }
 }

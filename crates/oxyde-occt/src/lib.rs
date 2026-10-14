@@ -206,6 +206,11 @@ impl Kernel for OcctKernel {
         Ok(())
     }
 
+    fn import_step(&mut self, data: &[u8]) -> Result<ShapeHandle, OcctError> {
+        let id = self.session.pin_mut().import_step(data)?;
+        Ok(ShapeHandle::from_raw(id))
+    }
+
     fn release(&mut self, shape: ShapeHandle) {
         self.session.pin_mut().release(shape.raw());
     }

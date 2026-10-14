@@ -13,6 +13,8 @@ pub struct Document {
     pub properties: Properties,
     pub document_id: String,
     pub path: Option<PathBuf>,
+    /// Name for a document not saved yet (a part made from a STEP file is named after it).
+    pub untitled_name: Option<String>,
     /// Changed since the last save.
     pub modified: bool,
     /// Incremented by every rebuild, so views know when to refresh.
@@ -36,6 +38,7 @@ impl Document {
             properties: file.properties,
             document_id: file.document_id,
             path,
+            untitled_name: None,
             modified: false,
             revision: 0,
             undo: Vec::new(),
@@ -58,7 +61,15 @@ impl Document {
             .as_deref()
             .and_then(Path::file_stem)
             .map(|s| s.to_string_lossy().into_owned())
+            .or_else(|| self.untitled_name.clone())
             .unwrap_or_else(|| "Untitled".to_owned())
+    }
+
+    /// Forgets the undo and redo history (e.g. after opening a file).
+    pub fn clear_history(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+        self.editing = None;
     }
 
     /// Records the current state before a change, as one undo step.

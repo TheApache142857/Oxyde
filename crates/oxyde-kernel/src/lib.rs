@@ -263,6 +263,11 @@ pub trait Kernel {
     /// Writes `shapes` to a STEP file at `path`, in millimetres.
     fn export_step(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), Self::Error>;
 
+    /// Reads the solids of a STEP file (its contents, not its path), in millimetres. Several
+    /// solids come back as one compound shape; sewn surfaces are kept if they close a
+    /// volume.
+    fn import_step(&mut self, data: &[u8]) -> Result<ShapeHandle, Self::Error>;
+
     /// Frees a shape. Releasing an unknown or already released handle does nothing.
     fn release(&mut self, shape: ShapeHandle);
 }

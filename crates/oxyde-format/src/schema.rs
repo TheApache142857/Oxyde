@@ -3,15 +3,15 @@
 //! The file schema is deliberately separate from the in-memory model types: the model can
 //! evolve freely while files stay readable, through explicit migrations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
     AxisRef, CircularPattern, EdgeBlend, EdgeName, EquationText, Equations, EquationsText, Extrude,
     ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId, FeatureKind, FeatureParameter,
-    GlobalText, LinearPattern, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
-    VertexName,
+    FileData, GlobalText, Import, LinearPattern, Mirror, PartDefinition, PatternDirection,
+    PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
+    StandardPlane, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -197,6 +197,16 @@ pub(crate) enum KindDto {
         seeds: Vec<u32>,
         plane: PlaneDto,
     },
+    /// Geometry imported from a STEP file, stored in the archive at `file`.
+    Import {
+        file_name: String,
+        file: String,
+    },
+}
+
+/// Where the STEP file of an import feature is kept in the archive.
+pub(crate) fn import_entry(feature: FeatureId) -> String {
+    format!("imports/{}.step", feature.raw())
 }
 
 /// A sketch plane, or any plane a feature refers to.
@@ -355,6 +365,10 @@ pub(crate) enum FaceKeyDto {
         instance: [u32; 2],
         face: Box<FaceRefDto>,
     },
+    Imported {
+        feature: u32,
+        index: u32,
+    },
     Unknown {
         feature: u32,
         index: u32,
@@ -498,6 +512,10 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Mirror(mirror) => KindDto::Mirror {
             seeds: ids(&mirror.seeds),
             plane: plane_dto(&mirror.plane),
+        },
+        FeatureKind::Import(import) => KindDto::Import {
+            file_name: import.file_name.clone(),
+            file: import_entry(feature.id()),
         },
     };
     FeatureDto {
@@ -676,6 +694,10 @@ fn face_dto(face: &FaceName) -> FaceRefDto {
             instance: *instance,
             face: Box::new(face_dto(face)),
         },
+        FaceKey::Imported { feature, index } => FaceKeyDto::Imported {
+            feature: feature.raw(),
+            index: *index,
+        },
         FaceKey::Unknown { feature, index } => FaceKeyDto::Unknown {
             feature: feature.raw(),
             index: *index,
@@ -697,13 +719,17 @@ fn edge_dto(edge: &EdgeName) -> EdgeRefDto {
 // ---- File → model --------------------------------------------------------------------------
 
 impl PartModel {
-    /// Converts to a model definition; fails on an inconsistent sketch.
-    pub fn into_definition(self) -> Result<PartDefinition, String> {
+    /// Converts to a model definition; fails on an inconsistent sketch or a missing
+    /// imported file. `files` holds the archive's other entries (imported files) by name.
+    pub fn into_definition(
+        self,
+        files: &HashMap<String, Vec<u8>>,
+    ) -> Result<PartDefinition, String> {
         let mut definition = PartDefinition {
             features: self
                 .features
                 .into_iter()
-                .map(feature_from)
+                .map(|f| feature_from(f, files))
                 .collect::<Result<_, _>>()?,
             rollback: self.rollback,
             next_id: self.next_feature_id,
@@ -793,7 +819,7 @@ fn relation_from(dto: RelationDto) -> Constraint {
     }
 }
 
-fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
+fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Feature, String> {
     let kind = match dto.kind {
         KindDto::Sketch {
             plane,
@@ -914,6 +940,15 @@ fn feature_from(dto: FeatureDto) -> Result<Feature, String> {
             seeds: ids_from(seeds),
             plane: plane_from(plane),
         }),
+        KindDto::Import { file_name, file } => {
+            let bytes = files
+                .get(&file)
+                .ok_or_else(|| format!("{}: the imported file {file} is missing", dto.name))?;
+            FeatureKind::Import(Import {
+                file_name,
+                data: FileData::new(bytes.clone()),
+            })
+        }
     };
     let mut parameter_names = BTreeMap::new();
     for (key, name) in dto.dimension_names {
@@ -1003,6 +1038,10 @@ fn face_from(dto: FaceRefDto) -> FaceName {
             feature: FeatureId::from_raw(feature),
             instance,
             face: Box::new(face_from(*face)),
+        },
+        FaceKeyDto::Imported { feature, index } => FaceKey::Imported {
+            feature: FeatureId::from_raw(feature),
+            index,
         },
         FaceKeyDto::Unknown { feature, index } => FaceKey::Unknown {
             feature: FeatureId::from_raw(feature),

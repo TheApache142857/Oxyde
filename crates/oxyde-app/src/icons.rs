@@ -24,6 +24,7 @@ pub enum Icon {
     RefPlane,
     RefAxis,
     ReferenceGeometry,
+    Imported,
     // Timeline
     Part,
     Plane,
@@ -474,6 +475,23 @@ fn draw(pen: &Pen, icon: Icon) {
         Part => {
             pen.solid(3.0, 10.0, 12.0, 11.0, 6.0);
         }
+        Imported => {
+            // A solid with a page corner (the file) and an arrow coming in.
+            pen.solid(2.0, 11.0, 12.0, 11.0, 5.0);
+            pen.poly(
+                &[
+                    (13.0, 1.5),
+                    (19.5, 1.5),
+                    (22.5, 4.5),
+                    (22.5, 11.0),
+                    (13.0, 11.0),
+                ],
+                WHITE,
+                INK,
+            );
+            pen.line(&[(19.5, 1.5), (19.5, 4.5), (22.5, 4.5)], 1.0, INK);
+            pen.arrow((17.5, 6.5), (11.0, 13.0), 1.8, ACCENT);
+        }
         Plane => {
             pen.plane(1.0, 6.0, 22.0, 12.0);
         }
@@ -792,7 +810,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 44] = {
+pub const ALL: [Icon; 45] = {
     use Icon::*;
     [
         Sketch,
@@ -807,6 +825,7 @@ pub const ALL: [Icon; 44] = {
         RefPlane,
         RefAxis,
         ReferenceGeometry,
+        Imported,
         Part,
         Plane,
         Origin,
