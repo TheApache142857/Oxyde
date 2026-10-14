@@ -2,7 +2,7 @@
 
 An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
 
-> **Status: pre-alpha.** The repository currently contains the design documents and empty crate skeletons. Nothing is usable yet.
+> **Status: pre-alpha.** Milestone M1: the OpenCASCADE bridge can build a box and export it to STEP. There is no application yet.
 
 ## Goals
 
@@ -44,11 +44,12 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/F
 
 ## Building
 
-Not meaningful yet — the crates are empty. Once the OCCT backend lands, building will require:
+**Windows (x64, MSVC) only for now.** You need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.8+ (vcpkg recommended). Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
 
-- Rust (stable, edition 2024)
-- A C++17 compiler
-- OpenCASCADE 7.8 or newer, discoverable via CMake or `pkg-config`
+```powershell
+cargo test -p oxyde-occt
+cargo run  -p oxyde-occt --example make_box   # writes box.step
+```
 
 ## License
 

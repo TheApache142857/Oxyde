@@ -42,14 +42,14 @@ Rules:
 - **No OCCT type crosses the boundary.** Shapes live in a C++-side arena; Rust holds opaque integer handles (`ShapeHandle(u64)`). Data crosses as plain structs (`f64` arrays, enums, strings).
 - **Coarse operations only.** The shim exposes on the order of 50 functions (make prism, revolve, boolean, fillet, shell, tessellate, read/write STEP, …), not OCCT's API surface.
 - **Every operation returns its history.** OCCT's `BRepBuilderAPI_MakeShape::Generated / Modified / IsDeleted` results are returned alongside the new shape. This is the raw material for topological naming (§6).
-- **No C++ exceptions escape.** Each shim function catches `Standard_Failure` and returns a typed error to Rust.
-- **Thread confinement.** All OCCT calls run on one dedicated kernel thread; the Rust side talks to it through a channel. This sidesteps OCCT's uneven thread-safety and keeps the UI responsive during long rebuilds.
+- **No C++ exceptions escape.** Each shim function catches `Standard_Failure` (which does not derive from `std::exception`) and everything else, and rethrows a `std::runtime_error` that `cxx` turns into a Rust `Err`.
+- **Thread confinement.** All OCCT calls run on one dedicated kernel thread; the Rust side talks to it through a channel. This sidesteps OCCT's uneven thread-safety and keeps the UI responsive during long rebuilds. *(Not yet implemented: since M1 `OcctKernel` is simply `!Send`; the kernel thread arrives with the application.)*
 
-Toolchain: `cxx` for the bridge, `cc` (or `cmake`) to compile the shim, OCCT ≥ 7.8 located via CMake config or `pkg-config`, with an environment variable override (`OXYDE_OCCT_DIR`).
+Toolchain: `cxx` / `cxx-build` for the bridge and to compile the shim. **Windows/MSVC only for now.** `build.rs` locates OCCT through `OXYDE_OCCT_DIR`, `VCPKG_ROOT`, or explicit `OXYDE_OCCT_INCLUDE_DIR` + `OXYDE_OCCT_LIB_DIR` — see `BUILDING.md`.
 
 ## 4. The `Kernel` trait (`oxyde-kernel`)
 
-Indicative shape — to be refined when implemented:
+The trait grows with each milestone. **M1** contains only `make_box`, `volume`, `topology_counts`, `export_step` (to a file path) and `release`. The target shape is indicative and will be refined as it is implemented:
 
 ```rust
 pub trait Kernel {
@@ -70,7 +70,7 @@ pub trait Kernel {
 
     // Exchange
     fn import_step(&mut self, bytes: &[u8]) -> Result<Vec<ShapeHandle>, Self::Error>;
-    fn export_step(&self, shapes: &[ShapeHandle]) -> Result<Vec<u8>, Self::Error>;
+    fn export_step(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), Self::Error>;
     fn export_brep(&self, shape: ShapeHandle) -> Result<Vec<u8>, Self::Error>;
     fn import_brep(&mut self, bytes: &[u8]) -> Result<ShapeHandle, Self::Error>;
 
@@ -135,7 +135,7 @@ Approach:
 | Milestone | Content |
 |---|---|
 | **M0** | Workspace, docs, CI (format, clippy, tests) |
-| **M1** | `oxyde-occt` shim builds; make a box, export STEP from a test |
+| **M1** (code written, awaiting first Windows build) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **M2** | Sketch entities + solver with DOF reporting (pure Rust, no UI) |
 | **M3** | Feature tree: sketch → extrude / cut / revolve, rebuild, `.oxy` save/load |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |
