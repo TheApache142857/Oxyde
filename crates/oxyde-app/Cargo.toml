@@ -21,3 +21,6 @@ oxyde-format = { workspace = true }
 oxyde-render = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
+
+[dev-dependencies]
+pollster = "0.3"

@@ -288,6 +288,7 @@ impl OxydeApp {
                         "OpenCASCADE {}",
                         oxyde_occt::OcctKernel::occt_version()
                     ));
+                    ui.label(format!("Viewport: {}", self.viewport.renderer_name()));
                     if ui.button("Close").clicked() {
                         answer = Answer::Cancel;
                     }

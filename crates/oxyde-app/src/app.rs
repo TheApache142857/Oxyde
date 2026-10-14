@@ -137,6 +137,13 @@ impl OxydeApp {
             window_title: String::new(),
             allow_close: false,
         };
+        if let Some(state) = &cc.wgpu_render_state {
+            let info = state.adapter.get_info();
+            app.viewport.enable_gpu(
+                crate::gpu::GpuViewport::new(state),
+                format!("GPU: {} ({:?})", info.name, info.backend),
+            );
+        }
         if let Some(path) = file {
             app.open_path(&path);
         }

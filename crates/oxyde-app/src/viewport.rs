@@ -97,6 +97,13 @@ pub struct Viewport {
     fit_pending: bool,
     view_request: Option<ViewRequest>,
     animation: Option<Animation>,
+    /// GPU renderer; the software renderer draws when there is none.
+    gpu: Option<crate::gpu::GpuViewport>,
+    gpu_texture: Option<egui::TextureId>,
+    /// Last pick, reused while neither the pointer nor the image changed.
+    last_pick: Option<([f64; 2], Option<Pick>)>,
+    /// "GPU (adapter)" or "software", for the About window.
+    renderer: String,
 }
 
 impl Viewport {
@@ -112,10 +119,35 @@ impl Viewport {
             fit_pending: true,
             view_request: None,
             animation: None,
+            gpu: None,
+            gpu_texture: None,
+            last_pick: None,
+            renderer: "software".to_owned(),
         }
     }
 
+    /// Draws with the GPU from now on.
+    pub fn enable_gpu(&mut self, gpu: crate::gpu::GpuViewport, name: String) {
+        if !self.scene.is_empty() {
+            let mut gpu = gpu;
+            gpu.set_mesh(&self.scene.gpu_mesh(), self.scene.bounds());
+            self.gpu = Some(gpu);
+        } else {
+            self.gpu = Some(gpu);
+        }
+        self.renderer = name;
+        self.rendered = None;
+    }
+
+    /// Which renderer draws the viewport.
+    pub fn renderer_name(&self) -> &str {
+        &self.renderer
+    }
+
     pub fn set_scene(&mut self, scene: Scene, fit: bool) {
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
+        }
         self.scene = scene;
         self.scene_version += 1;
         self.hovered = None;
@@ -277,12 +309,23 @@ impl Viewport {
         }
 
         // Picking uses the previous image, which is what the user is looking at.
-        self.hovered = match (&self.frame, pointer, panning || orbiting || sketching) {
-            (Some(frame), Some(cursor), false)
-                if frame.width == width && frame.height == height =>
-            {
-                frame.pick(cursor[0], cursor[1], 4.0 * ppp as f64)
-            }
+        let same_size = self
+            .rendered
+            .as_ref()
+            .is_some_and(|k| k.size == [width, height]);
+        self.hovered = match (pointer, panning || orbiting || sketching || !same_size) {
+            (Some(cursor), false) => match (&self.gpu, &self.frame) {
+                (Some(gpu), _) => match self.last_pick {
+                    Some((at, pick)) if at == cursor => pick,
+                    _ => {
+                        let pick = gpu.pick(cursor[0], cursor[1], 4.0 * ppp as f64);
+                        self.last_pick = Some((cursor, pick));
+                        pick
+                    }
+                },
+                (None, Some(frame)) => frame.pick(cursor[0], cursor[1], 4.0 * ppp as f64),
+                (None, None) => None,
+            },
             _ => None,
         };
         let clicked = (response.clicked() && !sketching).then_some(self.hovered);
@@ -297,7 +340,18 @@ impl Viewport {
             },
             scene: self.scene_version,
         };
-        if self.rendered.as_ref() != Some(&key) {
+        let image_changed = self
+            .rendered
+            .as_ref()
+            .is_none_or(|k| k.camera != key.camera || k.size != key.size || k.scene != key.scene);
+        if image_changed {
+            self.last_pick = None;
+        }
+        if let (Some(gpu), true) = (self.gpu.as_mut(), self.rendered.as_ref() != Some(&key)) {
+            self.gpu_texture =
+                Some(gpu.render(&self.camera, width as u32, height as u32, &key.highlight));
+            self.rendered = Some(key);
+        } else if self.rendered.as_ref() != Some(&key) {
             let frame = render(&self.scene, &self.camera, width, height, &key.highlight);
             let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.rgba);
             if let Some(texture) = self.texture.as_mut() {
@@ -314,9 +368,10 @@ impl Viewport {
         }
 
         let painter = ui.painter_at(rect);
-        if let Some(texture) = &self.texture {
+        let image = self.gpu_texture.or(self.texture.as_ref().map(|t| t.id()));
+        if let Some(texture) = image {
             painter.image(
-                texture.id(),
+                texture,
                 rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
