@@ -1,0 +1,18 @@
+[package]
+name = "oxyde-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "oxyde"
+path = "src/main.rs"
+
+[dependencies]
+oxyde-geom = { workspace = true }
+oxyde-kernel = { workspace = true }
+oxyde-occt = { workspace = true }
+oxyde-model = { workspace = true }
+oxyde-format = { workspace = true }

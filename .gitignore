@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+
+# C++ build output for the OCCT shim
+/build
+compile_commands.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/TheApache142857/oxyde"
+publish = false
+
+[workspace.dependencies]
+oxyde-geom = { path = "crates/oxyde-geom" }
+oxyde-sketch = { path = "crates/oxyde-sketch" }
+oxyde-kernel = { path = "crates/oxyde-kernel" }
+oxyde-occt = { path = "crates/oxyde-occt" }
+oxyde-model = { path = "crates/oxyde-model" }
+oxyde-format = { path = "crates/oxyde-format" }
