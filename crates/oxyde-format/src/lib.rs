@@ -249,9 +249,12 @@ mod tests {
     use std::io::Cursor;
 
     use oxyde_geom::Point2;
+    use std::f64::consts::{PI, TAU};
+
     use oxyde_model::{
-        EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureKind, Sketch,
-        SketchPlane, StandardPlane,
+        AxisRef, CircularPattern, EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
+        FaceName, FeatureKind, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
+        RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
     };
     use oxyde_sketch::Constraint;
 
@@ -301,8 +304,93 @@ mod tests {
             size: 0.5,
         }));
         part.set_suppressed(bevel, true).unwrap();
+
+        // Reference geometry, a revolve, patterns, a mirror and a shell.
+        let plane = part.add_feature(FeatureKind::Plane(RefPlane {
+            base: PlaneRef::Standard(StandardPlane::Top),
+            offset: 25.0,
+            flip: false,
+        }));
+        let axis = part.add_feature(FeatureKind::Axis(RefAxis::TwoPlanes(
+            PlaneRef::Standard(StandardPlane::Front),
+            PlaneRef::Reference(plane),
+        )));
+        let mut profile = Sketch::new(SketchPlane::Reference(plane));
+        let centerline = profile
+            .geometry
+            .line(Point2::new(0.0, -5.0), Point2::new(0.0, 5.0));
+        profile.geometry.set_construction(centerline, true);
+        profile.rectangle(Point2::new(2.0, -1.0), 3.0, 2.0);
+        let s3 = part.add_feature(FeatureKind::Sketch(profile));
+        let ring = part.add_feature(FeatureKind::Revolve(Revolve {
+            sketch: s3,
+            op: ExtrudeOp::Boss,
+            axis: RevolveAxis::SketchLine(centerline.0),
+            angle: PI,
+            mid_plane: true,
+            reverse: false,
+        }));
+        let row = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![hole],
+            first: PatternDirection {
+                axis: AxisRef::Edge(EdgeName::between(
+                    FaceName::profile(boss, 1),
+                    FaceName::end_cap(boss),
+                )),
+                spacing: 8.0,
+                count: 3,
+                reverse: false,
+            },
+            second: Some(PatternDirection {
+                axis: AxisRef::Standard(StandardAxis::Y),
+                spacing: 5.0,
+                count: 2,
+                reverse: true,
+            }),
+        }));
+        part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+            seeds: vec![ring],
+            axis: AxisRef::Reference(axis),
+            angle: TAU,
+            count: 4,
+            equal_spacing: true,
+            reverse: false,
+        }));
+        part.add_feature(FeatureKind::Mirror(Mirror {
+            seeds: vec![hole, ring],
+            plane: PlaneRef::Face(FaceName::start_cap(boss)),
+        }));
+        let shell = part.add_feature(FeatureKind::Shell(Shell {
+            faces: vec![FaceName::new(FaceKey::Instance {
+                feature: row,
+                instance: [1, 0],
+                face: Box::new(FaceName::profile(hole, 1)),
+            })],
+            thickness: 1.0,
+            outward: false,
+        }));
+        part.add_feature(FeatureKind::Fillet(EdgeBlend {
+            edges: vec![EdgeName::between(
+                FaceName::new(FaceKey::Offset {
+                    feature: shell,
+                    face: Box::new(FaceName::end_cap(boss)),
+                }),
+                FaceName::profile(boss, 2),
+            )],
+            size: 0.3,
+        }));
         let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
         part.rename_dimension(depth, "Thickness").unwrap();
+        // Equations, stored by name.
+        let thick = part.parse_expression("12").unwrap();
+        part.add_global("Thick", thick).unwrap();
+        let expr = part.parse_expression("\"Thick\"").unwrap();
+        part.add_equation(depth, expr).unwrap();
+        let hole = part.find_dimension("Hole@Sketch2").unwrap();
+        let expr = part
+            .parse_expression("\"Thickness@Boss-Extrude1\" / 4")
+            .unwrap();
+        part.add_equation(hole, expr).unwrap();
         part.roll_back_to(Some(bevel)).unwrap();
 
         let mut properties = Properties {
@@ -395,6 +483,38 @@ mod tests {
             .collect();
         assert_eq!(names, ["D1@Sketch1", "D1@Boss-Extrude1"]);
         assert_eq!(part.properties, Properties::default());
+    }
+
+    #[test]
+    fn equations_are_stored_as_text() {
+        let bytes = write_part(Cursor::new(Vec::new()), &sample())
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert_eq!(model["global_variables"][0]["name"], "Thick");
+        assert_eq!(model["global_variables"][0]["expression"], "12");
+        assert_eq!(
+            model["equations"][0]["dimension"],
+            "Thickness@Boss-Extrude1"
+        );
+        assert_eq!(model["equations"][0]["expression"], "\"Thick\"");
+        assert_eq!(
+            model["equations"][1]["expression"],
+            "\"Thickness@Boss-Extrude1\" / 4"
+        );
+    }
+
+    #[test]
+    fn equations_with_syntax_errors_are_refused() {
+        let model = r#"{ "next_feature_id": 1, "features": [],
+            "equations": [ { "dimension": "D1@Sketch1", "expression": "2 *" } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        assert!(matches!(
+            read_part(Cursor::new(bytes)),
+            Err(FormatError::InvalidModel(_))
+        ));
     }
 
     #[test]

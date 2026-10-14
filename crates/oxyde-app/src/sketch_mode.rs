@@ -4,6 +4,8 @@
 //! the user exits the sketch. Colours follow SolidWorks: blue geometry can still move,
 //! black is fully defined, red takes part in conflicting relations.
 
+use std::collections::HashSet;
+
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
 use oxyde_geom::{Plane, Point2};
 use oxyde_model::FeatureId;
@@ -110,6 +112,8 @@ pub struct SketchSession {
     /// Where the rollback bar was before editing started.
     pub restore_rollback: Option<FeatureId>,
     pub message: Option<String>,
+    /// Dimensions set by equations: shown with Σ, not editable here.
+    pub driven: HashSet<RelationId>,
     pending: Vec<Pending>,
     hover: Option<EntityId>,
     drag: Option<Drag>,
@@ -138,6 +142,7 @@ impl SketchSession {
             new_sketch,
             restore_rollback,
             message: None,
+            driven: HashSet::new(),
             pending: Vec::new(),
             hover: None,
             drag: None,
@@ -800,6 +805,11 @@ impl SketchSession {
         let mut hovered_label = None;
         for relation in self.sketch.relations() {
             if let Some((anchor, text)) = self.dimension_label(&relation.constraint, to_screen) {
+                let text = if self.driven.contains(&relation.id) {
+                    format!("Σ {text}")
+                } else {
+                    text
+                };
                 let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), FULLY);
                 let rect = Rect::from_center_size(anchor, galley.size() + Vec2::new(8.0, 4.0));
                 painter.rect_filled(

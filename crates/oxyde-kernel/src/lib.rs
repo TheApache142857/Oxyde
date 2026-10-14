@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use oxyde_geom::{Plane, Point3, Profile, Vec3};
+use oxyde_geom::{Axis, Plane, Point3, Profile, Transform, Vec3};
 
 /// Opaque reference to a shape owned by a kernel backend.
 ///
@@ -69,6 +69,8 @@ pub struct FaceInfo {
     pub centroid: Point3,
     /// Outward unit normal, for planar faces only.
     pub normal: Option<Vec3>,
+    /// Axis of revolution of a cylindrical, conical, spherical or toroidal face.
+    pub axis: Option<Axis>,
     /// Indices into [`Topology::edges`].
     pub edges: Vec<u32>,
 }
@@ -80,6 +82,9 @@ pub struct EdgeInfo {
     pub length: f64,
     /// Point at the middle of the edge's parameter range.
     pub midpoint: Point3,
+    /// For a straight edge, its line (from its start, along the edge); for a circular edge,
+    /// the circle's axis (through its centre, along its normal).
+    pub axis: Option<Axis>,
     /// Indices into [`Topology::vertices`]: two for an open edge, one for a closed edge.
     pub vertices: Vec<u32>,
     /// Indices into [`Topology::faces`] of the faces bounded by this edge.
@@ -115,11 +120,13 @@ pub enum FaceSource {
     InputEdge { input: u32, edge: u32 },
     /// The face was generated from an input vertex (e.g. a corner blend).
     InputVertex { input: u32, vertex: u32 },
-    /// Side face swept from the profile segment with this id.
+    /// The face is an offset copy of an input face (the inner wall of a shell).
+    OffsetFace { input: u32, face: u32 },
+    /// Side face swept (extruded or revolved) from the profile segment with this id.
     ProfileSegment(u32),
-    /// Face lying on the profile plane, where the extrusion starts.
+    /// Face lying on the profile plane, where the extrusion or revolution starts.
     StartCap,
-    /// Face at the far end of the extrusion.
+    /// Face at the far end of the extrusion or revolution.
     EndCap,
 }
 
@@ -180,6 +187,42 @@ pub trait Kernel {
         plane: &Plane,
         profile: &Profile,
         vector: Vec3,
+    ) -> Result<OpResult, Self::Error>;
+
+    /// Revolves the regions of `profile`, drawn on `plane`, by `angle` radians
+    /// (0 < angle ≤ 2π) about `axis`, which lies in the plane, counter-clockwise looking
+    /// against the axis direction.
+    ///
+    /// History sources: [`FaceSource::ProfileSegment`], and for less than a full turn
+    /// [`FaceSource::StartCap`] and [`FaceSource::EndCap`].
+    fn revolve(
+        &mut self,
+        plane: &Plane,
+        profile: &Profile,
+        axis: &Axis,
+        angle: f64,
+    ) -> Result<OpResult, Self::Error>;
+
+    /// Hollows a solid: removes the given faces (indices into the shape's
+    /// [`Topology::faces`]) and turns the remaining faces into walls of thickness
+    /// `|offset|`, inside the solid for a negative offset, outside for a positive one.
+    ///
+    /// History sources: [`FaceSource::InputFace`] for the original faces,
+    /// [`FaceSource::OffsetFace`] for their offset copies, [`FaceSource::InputEdge`] and
+    /// [`FaceSource::InputVertex`] for faces closing the walls.
+    fn shell(
+        &mut self,
+        shape: ShapeHandle,
+        removed_faces: &[u32],
+        offset: f64,
+    ) -> Result<OpResult, Self::Error>;
+
+    /// A moved (or mirrored) copy of a shape. History: every face comes from the input face
+    /// it is a copy of ([`FaceSource::InputFace`]).
+    fn transform(
+        &mut self,
+        shape: ShapeHandle,
+        transform: &Transform,
     ) -> Result<OpResult, Self::Error>;
 
     /// Boolean of `target` (input 0) with `tool` (input 1).

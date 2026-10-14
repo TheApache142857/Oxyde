@@ -6,12 +6,14 @@
 //! is always referred to by a [`DimensionRef`] made of stable ids, so renaming a feature or a
 //! dimension changes how it is displayed and nothing else.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use oxyde_sketch::RelationId;
 
+use crate::equations::Equations;
 use crate::error::ModelError;
-use crate::feature::{FeatureId, FeatureKind, FeatureParameter};
+use crate::feature::{Feature, FeatureId, FeatureKind, FeatureParameter};
 use crate::part::Part;
 
 /// Which dimension of a feature.
@@ -34,8 +36,45 @@ pub struct DimensionRef {
 pub enum DimensionUnit {
     /// Millimetres.
     Length,
-    /// Radians internally, degrees in the user interface.
+    /// Radians internally, degrees in the user interface and in equations.
     Angle,
+    /// A number of instances (patterns): a whole number, at least 1.
+    Count,
+}
+
+impl DimensionUnit {
+    /// Internal value → display units (degrees for angles).
+    pub fn to_display(self, value: f64) -> f64 {
+        match self {
+            DimensionUnit::Angle => value.to_degrees(),
+            DimensionUnit::Length | DimensionUnit::Count => value,
+        }
+    }
+
+    /// Display units → internal value; counts are rounded and must be at least 1.
+    pub fn from_display(self, value: f64) -> Result<f64, String> {
+        match self {
+            DimensionUnit::Length => Ok(value),
+            DimensionUnit::Angle => Ok(value.to_radians()),
+            DimensionUnit::Count => {
+                let count = value.round();
+                if count >= 1.0 {
+                    Ok(count)
+                } else {
+                    Err(format!("{value} is not a valid number of instances"))
+                }
+            }
+        }
+    }
+
+    /// Text shown after a value in display units.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            DimensionUnit::Length => " mm",
+            DimensionUnit::Angle => "°",
+            DimensionUnit::Count => "",
+        }
+    }
 }
 
 /// A dimension as listed for the user.
@@ -46,9 +85,11 @@ pub struct Dimension {
     pub name: String,
     /// `name@feature`, e.g. "D1@Sketch1".
     pub full_name: String,
-    /// mm, or radians for angles.
+    /// mm, radians for angles, or a count.
     pub value: f64,
     pub unit: DimensionUnit,
+    /// Set by an equation, so not editable by hand.
+    pub driven: bool,
 }
 
 impl fmt::Display for Dimension {
@@ -73,46 +114,69 @@ pub fn split_full_name(text: &str) -> Option<(&str, &str)> {
     (!dimension.is_empty() && !feature.is_empty()).then_some((dimension, feature))
 }
 
+/// All dimensions of a timeline, in order (sketch dimensions in creation order, then each
+/// feature's own).
+pub(crate) fn list_dimensions(features: &[Feature], equations: &Equations) -> Vec<Dimension> {
+    let driven: HashSet<DimensionRef> = equations
+        .equations
+        .iter()
+        .filter_map(|e| e.target)
+        .collect();
+    let mut out = Vec::new();
+    for feature in features {
+        if let FeatureKind::Sketch(sketch) = feature.kind() {
+            for relation in sketch.geometry.dimensions() {
+                let name = relation.name.clone().unwrap_or_default();
+                let reference = DimensionRef {
+                    feature: feature.id(),
+                    key: DimensionKey::Sketch(relation.id),
+                };
+                out.push(Dimension {
+                    reference,
+                    full_name: full_name(&name, feature.name()),
+                    name,
+                    value: relation.constraint.value().unwrap_or_default(),
+                    unit: if relation.constraint.is_angle() {
+                        DimensionUnit::Angle
+                    } else {
+                        DimensionUnit::Length
+                    },
+                    driven: driven.contains(&reference),
+                });
+            }
+        }
+        for (parameter, value) in feature.kind().parameters() {
+            let name = feature.parameter_name(parameter);
+            let reference = DimensionRef {
+                feature: feature.id(),
+                key: DimensionKey::Feature(parameter),
+            };
+            out.push(Dimension {
+                reference,
+                full_name: full_name(&name, feature.name()),
+                name,
+                value,
+                unit: parameter.unit(),
+                driven: driven.contains(&reference),
+            });
+        }
+    }
+    out
+}
+
 impl Part {
     /// All dimensions, in timeline order (sketch dimensions in creation order, then the
     /// feature's own).
     pub fn dimensions(&self) -> Vec<Dimension> {
-        let mut out = Vec::new();
-        for feature in self.features() {
-            if let FeatureKind::Sketch(sketch) = feature.kind() {
-                for relation in sketch.geometry.dimensions() {
-                    let name = relation.name.clone().unwrap_or_default();
-                    out.push(Dimension {
-                        reference: DimensionRef {
-                            feature: feature.id(),
-                            key: DimensionKey::Sketch(relation.id),
-                        },
-                        full_name: full_name(&name, feature.name()),
-                        name,
-                        value: relation.constraint.value().unwrap_or_default(),
-                        unit: if relation.constraint.is_angle() {
-                            DimensionUnit::Angle
-                        } else {
-                            DimensionUnit::Length
-                        },
-                    });
-                }
-            }
-            for (parameter, value) in feature.kind().parameters() {
-                let name = feature.parameter_name(parameter).to_owned();
-                out.push(Dimension {
-                    reference: DimensionRef {
-                        feature: feature.id(),
-                        key: DimensionKey::Feature(parameter),
-                    },
-                    full_name: full_name(&name, feature.name()),
-                    name,
-                    value,
-                    unit: DimensionUnit::Length,
-                });
-            }
-        }
-        out
+        list_dimensions(self.features(), self.equations())
+    }
+
+    /// Whether an equation sets this dimension.
+    pub fn is_driven(&self, reference: DimensionRef) -> bool {
+        self.equations()
+            .equations
+            .iter()
+            .any(|e| e.target == Some(reference))
     }
 
     pub fn dimension(&self, reference: DimensionRef) -> Option<Dimension> {
@@ -133,8 +197,9 @@ impl Part {
             .map(|d| d.reference)
     }
 
-    /// Changes a dimension's value (mm, or radians for angles). The feature and everything
-    /// after it are rebuilt on the next rebuild.
+    /// Changes a dimension's value (mm, radians for angles, or a count). The feature and
+    /// everything after it are rebuilt on the next rebuild. A dimension driven by an equation
+    /// gets its value back from the equation on the next rebuild.
     pub fn set_dimension(&mut self, reference: DimensionRef, value: f64) -> Result<(), ModelError> {
         let unknown = || ModelError::UnknownDimension(format!("{reference:?}"));
         let kind = self.edit(reference.feature)?;
@@ -161,7 +226,7 @@ impl Part {
         let feature = self
             .feature_mut_quietly(reference.feature)
             .ok_or(ModelError::UnknownFeature(reference.feature))?;
-        match reference.key {
+        let renamed = match reference.key {
             DimensionKey::Sketch(id) => {
                 let FeatureKind::Sketch(sketch) = &mut feature.kind else {
                     return Err(unknown());
@@ -183,14 +248,18 @@ impl Part {
                 if taken {
                     return Err(ModelError::DuplicateName(name.to_owned()));
                 }
-                if name == parameter.default_name() {
+                if name == feature.kind.default_parameter_name(parameter) {
                     feature.parameter_names.remove(&parameter);
                 } else {
                     feature.parameter_names.insert(parameter, name.to_owned());
                 }
                 Ok(())
             }
+        };
+        if renamed.is_ok() {
+            self.refresh_equation_names();
         }
+        renamed
     }
 }
 

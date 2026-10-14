@@ -25,11 +25,11 @@ use crate::feature::FeatureId;
 /// Where a face comes from, independent of kernel numbering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FaceKey {
-    /// Side face swept by an extrusion from a sketch segment.
+    /// Side face swept by an extrusion or a revolve from a sketch segment.
     Profile { feature: FeatureId, segment: u32 },
-    /// Face of an extrusion lying on its sketch plane.
+    /// Face of an extrusion or a revolve lying on its sketch plane.
     StartCap { feature: FeatureId },
-    /// Face at the far end of an extrusion.
+    /// Face at the far end of an extrusion or a revolve.
     EndCap { feature: FeatureId },
     /// Face generated from an edge (fillet or chamfer face).
     FromEdge { feature: FeatureId, edge: EdgeName },
@@ -37,6 +37,19 @@ pub enum FaceKey {
     FromVertex {
         feature: FeatureId,
         vertex: VertexName,
+    },
+    /// Offset copy of a face (inner wall of a shell).
+    Offset {
+        feature: FeatureId,
+        face: Box<FaceName>,
+    },
+    /// Copy of a seed's face made by a pattern or a mirror. `instance` is the position in
+    /// the pattern: `[i, j]` for a linear pattern, `[i, 0]` for a circular one, `[1, 0]`
+    /// for a mirror; `face` names the face in the seed's tool body.
+    Instance {
+        feature: FeatureId,
+        instance: [u32; 2],
+        face: Box<FaceName>,
     },
     /// Face whose origin the kernel did not report. Not stable: references to it are
     /// flagged.
@@ -55,6 +68,9 @@ impl FaceKey {
                 .faces
                 .iter()
                 .for_each(|f| f.key.collect_features(out)),
+            FaceKey::Offset { face, .. } | FaceKey::Instance { face, .. } => {
+                face.key.collect_features(out)
+            }
             _ => {}
         }
     }
@@ -67,6 +83,8 @@ impl FaceKey {
             | FaceKey::EndCap { feature }
             | FaceKey::FromEdge { feature, .. }
             | FaceKey::FromVertex { feature, .. }
+            | FaceKey::Offset { feature, .. }
+            | FaceKey::Instance { feature, .. }
             | FaceKey::Unknown { feature, .. } => *feature,
         }
     }
@@ -397,6 +415,12 @@ impl fmt::Display for FaceKey {
             FaceKey::EndCap { feature } => write!(f, "{feature}.end"),
             FaceKey::FromEdge { feature, edge } => write!(f, "{feature}.blend({edge})"),
             FaceKey::FromVertex { feature, vertex } => write!(f, "{feature}.corner({vertex})"),
+            FaceKey::Offset { feature, face } => write!(f, "{feature}.offset({face})"),
+            FaceKey::Instance {
+                feature,
+                instance: [i, j],
+                face,
+            } => write!(f, "{feature}[{i},{j}]({face})"),
             FaceKey::Unknown { feature, index } => write!(f, "{feature}.face#{index}"),
         }
     }
@@ -453,6 +477,7 @@ mod tests {
             area: 1.0,
             centroid: Point3::new(x, 0.0, 0.0),
             normal: Some(Vec3::Z),
+            axis: None,
             edges: Vec::new(),
         }
     }
@@ -462,6 +487,7 @@ mod tests {
             curve: CurveKind::Line,
             length: 1.0,
             midpoint: Point3::new(x, 0.0, 0.0),
+            axis: None,
             vertices,
             faces,
         }
