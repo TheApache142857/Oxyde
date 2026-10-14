@@ -5,11 +5,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod command_bar;
 mod demo;
 mod dialogs;
 mod document;
 mod equations_ui;
+mod evaluate;
 mod features_ui;
+mod icons;
+mod property_manager;
 mod sketch_mode;
 mod timeline;
 mod viewport;

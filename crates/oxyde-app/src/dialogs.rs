@@ -1,26 +1,24 @@
-//! Modal windows: extrude, fillet/chamfer, sketch plane, dimension value, rename, part
-//! properties, unsaved changes.
+//! The open command or window (`Dialog`), applying it, and the small windows: dimension
+//! value, rename, part properties, unsaved changes, about. Feature commands are drawn in the
+//! PropertyManager (`property_manager`).
 
 use eframe::egui;
 use oxyde_format::Properties;
 use oxyde_model::{
-    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, SketchPlane,
-    StandardPlane,
+    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, StandardPlane,
 };
 use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
-use crate::features_ui::{
-    self, AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog,
-};
+use crate::features_ui::{AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog};
 
 pub struct ExtrudeDialog {
     /// The feature being edited, or `None` for a new one.
     pub editing: Option<FeatureId>,
     /// Full name of the depth dimension ("D1@Boss-Extrude1"), when editing.
     pub dimension: Option<String>,
-    pub sketch: FeatureId,
-    pub sketches: Vec<(FeatureId, String)>,
+    /// The sketch to extrude; picked in the timeline.
+    pub sketch: Option<FeatureId>,
     pub op: ExtrudeOp,
     pub depth: f64,
     pub mid_plane: bool,
@@ -33,10 +31,8 @@ pub struct BlendDialog {
     pub dimension: Option<String>,
     pub fillet: bool,
     pub size: f64,
+    /// Picked in the viewport while the command is open.
     pub edges: Vec<EdgeName>,
-    /// Edges selected in the viewport when the dialog opened (editing only).
-    pub selected_edges: Vec<EdgeName>,
-    pub use_selection: bool,
 }
 
 /// Which dimension the dimension dialog sets.
@@ -47,6 +43,8 @@ pub enum DimensionTarget {
     Existing(RelationId),
 }
 
+/// An open command or window. Feature commands (and the sketch plane prompt) show in the
+/// PropertyManager (see `property_manager`); the others are small windows.
 pub enum Dialog {
     Extrude(ExtrudeDialog),
     Revolve(RevolveDialog),
@@ -56,7 +54,7 @@ pub enum Dialog {
     Pattern(PatternDialog),
     RefPlane(PlaneDialog),
     RefAxis(AxisDialog),
-    /// Pick the plane of a new sketch.
+    /// Pick the plane of a new sketch, in the timeline or the viewport.
     ChoosePlane,
     Dimension {
         target: DimensionTarget,
@@ -75,6 +73,23 @@ pub enum Dialog {
     PartProperties(Properties),
     Discard(PendingAction),
     About,
+}
+
+impl Dialog {
+    /// Shown in the PropertyManager rather than as a window.
+    pub fn is_panel(&self) -> bool {
+        matches!(
+            self,
+            Dialog::Extrude(_)
+                | Dialog::Revolve(_)
+                | Dialog::Blend(_)
+                | Dialog::Shell(_)
+                | Dialog::Pattern(_)
+                | Dialog::RefPlane(_)
+                | Dialog::RefAxis(_)
+                | Dialog::ChoosePlane
+        )
+    }
 }
 
 /// User's answer to a dialog this frame.
@@ -132,70 +147,19 @@ impl OxydeApp {
         let Some(mut dialog) = self.dialog.take() else {
             return;
         };
+        if dialog.is_panel() {
+            self.dialog = Some(dialog);
+            return;
+        }
         let answer = match &mut dialog {
-            Dialog::Extrude(d) => extrude_window(ctx, d),
-            Dialog::Revolve(d) => {
-                let answer = features_ui::revolve_window(ctx, d);
-                self.refresh_revolve_axes(d);
-                answer
-            }
-            Dialog::Blend(d) => blend_window(ctx, d),
-            Dialog::Shell(d) => features_ui::shell_window(ctx, d),
-            Dialog::Pattern(d) => features_ui::pattern_window(ctx, d),
-            Dialog::RefPlane(d) => features_ui::ref_plane_window(ctx, d),
-            Dialog::RefAxis(d) => features_ui::ref_axis_window(ctx, d),
-            Dialog::ChoosePlane => {
-                let mut answer = Answer::Open;
-                let mut chosen = None;
-                let references: Vec<(FeatureId, String)> = self
-                    .plane_choices(None)
-                    .into_iter()
-                    .filter_map(|(label, plane)| match plane {
-                        oxyde_model::PlaneRef::Reference(id) => Some((id, label)),
-                        _ => None,
-                    })
-                    .collect();
-                window("New sketch").show(ctx, |ui| {
-                    ui.label("Sketch on which plane?");
-                    ui.label(
-                        egui::RichText::new("Tip: select a flat face first to sketch on it.")
-                            .small()
-                            .weak(),
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        for plane in [
-                            StandardPlane::Front,
-                            StandardPlane::Top,
-                            StandardPlane::Right,
-                        ] {
-                            if ui.button(format!("{} Plane", plane_name(plane))).clicked() {
-                                chosen = Some(SketchPlane::Standard(plane));
-                            }
-                        }
-                    });
-                    if !references.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            for (id, name) in &references {
-                                if ui.button(name).clicked() {
-                                    chosen = Some(SketchPlane::Reference(*id));
-                                }
-                            }
-                        });
-                    }
-                    ui.add_space(4.0);
-                    if ui.button("Cancel").clicked()
-                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
-                        answer = Answer::Cancel;
-                    }
-                });
-                if let Some(plane) = chosen {
-                    self.start_new_sketch(plane);
-                    answer = Answer::Cancel; // already handled
-                }
-                answer
-            }
+            Dialog::Extrude(_)
+            | Dialog::Revolve(_)
+            | Dialog::Blend(_)
+            | Dialog::Shell(_)
+            | Dialog::Pattern(_)
+            | Dialog::RefPlane(_)
+            | Dialog::RefAxis(_) => Answer::Open,
+            Dialog::ChoosePlane => Answer::Open,
             Dialog::Dimension {
                 label,
                 name,
@@ -294,16 +258,19 @@ impl OxydeApp {
         }
     }
 
-    fn apply_dialog(&mut self, dialog: Dialog, ctx: &egui::Context) {
+    pub(crate) fn apply_dialog(&mut self, dialog: Dialog, ctx: &egui::Context) {
         match dialog {
             Dialog::Extrude(d) => {
+                let Some(sketch) = d.sketch else {
+                    return;
+                };
                 let extent = if d.mid_plane {
                     ExtrudeExtent::MidPlane { depth: d.depth }
                 } else {
                     ExtrudeExtent::Blind { depth: d.depth }
                 };
                 let kind = FeatureKind::Extrude(Extrude {
-                    sketch: d.sketch,
+                    sketch,
                     op: d.op,
                     extent,
                     reverse: d.reverse && !d.mid_plane,
@@ -316,13 +283,8 @@ impl OxydeApp {
                 }
             }
             Dialog::Blend(d) => {
-                let edges = if d.use_selection && !d.selected_edges.is_empty() {
-                    d.selected_edges
-                } else {
-                    d.edges
-                };
                 let blend = EdgeBlend {
-                    edges,
+                    edges: d.edges,
                     size: d.size,
                 };
                 let kind = if d.fillet {
@@ -381,99 +343,6 @@ impl OxydeApp {
             Dialog::About => {}
         }
     }
-}
-
-fn extrude_window(ctx: &egui::Context, d: &mut ExtrudeDialog) -> Answer {
-    let mut answer = Answer::Open;
-    let title = match d.op {
-        ExtrudeOp::Boss => "Extruded Boss",
-        ExtrudeOp::Cut => "Extruded Cut",
-    };
-    window(title).show(ctx, |ui| {
-        egui::Grid::new("extrude_dialog")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Sketch");
-                let current = d
-                    .sketches
-                    .iter()
-                    .find(|(id, _)| *id == d.sketch)
-                    .map_or_else(String::new, |(_, name)| name.clone());
-                egui::ComboBox::from_id_source("extrude_sketch")
-                    .selected_text(current)
-                    .show_ui(ui, |ui| {
-                        for (id, name) in &d.sketches {
-                            ui.selectable_value(&mut d.sketch, *id, name);
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Operation");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.op, ExtrudeOp::Boss, "Boss");
-                    ui.radio_value(&mut d.op, ExtrudeOp::Cut, "Cut");
-                });
-                ui.end_row();
-
-                ui.label("End condition");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.mid_plane, false, "Blind");
-                    ui.radio_value(&mut d.mid_plane, true, "Mid-plane");
-                });
-                ui.end_row();
-
-                ui.label("Depth");
-                ui.horizontal(|ui| {
-                    positive_length(ui, &mut d.depth);
-                    if let Some(name) = &d.dimension {
-                        ui.label(egui::RichText::new(name).small().weak());
-                    }
-                });
-                ui.end_row();
-            });
-        if !d.mid_plane {
-            ui.checkbox(&mut d.reverse, "Reverse direction");
-        }
-        answer = ok_cancel(
-            ui,
-            if d.editing.is_some() {
-                "Apply"
-            } else {
-                "Extrude"
-            },
-        );
-    });
-    answer
-}
-
-fn blend_window(ctx: &egui::Context, d: &mut BlendDialog) -> Answer {
-    let mut answer = Answer::Open;
-    let (title, label) = if d.fillet {
-        ("Fillet", "Radius")
-    } else {
-        ("Chamfer", "Distance")
-    };
-    window(title).show(ctx, |ui| {
-        ui.label(format!("{} edge(s)", d.edges.len()));
-        if d.editing.is_some() && !d.selected_edges.is_empty() {
-            ui.checkbox(
-                &mut d.use_selection,
-                format!(
-                    "Use the {} edge(s) selected now instead",
-                    d.selected_edges.len()
-                ),
-            );
-        }
-        ui.horizontal(|ui| {
-            ui.label(label);
-            positive_length(ui, &mut d.size);
-            if let Some(name) = &d.dimension {
-                ui.label(egui::RichText::new(name).small().weak());
-            }
-        });
-        answer = ok_cancel(ui, if d.editing.is_some() { "Apply" } else { title });
-    });
-    answer
 }
 
 fn properties_window(ctx: &egui::Context, p: &mut Properties) -> Answer {

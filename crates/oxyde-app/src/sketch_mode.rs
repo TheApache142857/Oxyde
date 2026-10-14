@@ -1,8 +1,11 @@
-//! Sketch mode: drawing, dragging and constraining a sketch in the viewport.
+//! Sketch mode: drawing, dragging, trimming and constraining a sketch in the viewport.
 //!
 //! The session edits a working copy of the sketch; it is written back to the timeline when
 //! the user exits the sketch. Colours follow SolidWorks: blue geometry can still move,
 //! black is fully defined, red takes part in conflicting relations.
+//!
+//! While drawing, the cursor snaps to existing points, to the middle of lines, to crossings
+//! and onto curves; the new point keeps that relation (coincident, midpoint, on curve).
 
 use std::collections::HashSet;
 
@@ -14,14 +17,17 @@ use oxyde_sketch::{
     SolveReport,
 };
 
+use crate::icons::Icon;
 use crate::viewport::{Viewport, ViewportOutput};
 
-/// Clicking within this many points of an existing point reuses it.
+/// The cursor snaps to a point or a crossing within this many points.
 const SNAP: f32 = 8.0;
-/// Clicking within this many points of a curve selects it.
+/// Clicking within this many points of a curve selects it (or snaps onto it).
 const PICK: f32 = 6.0;
 /// Lines drawn within 3° of horizontal or vertical get that relation automatically.
 const AUTO_SLOPE: f64 = 0.0524;
+/// Two lines within this angle (radians) are dimensioned as parallel.
+const PARALLEL: f64 = 0.01;
 const UNDO_LIMIT: usize = 100;
 
 const SELECTED: Color32 = Color32::from_rgb(255, 128, 0);
@@ -31,41 +37,77 @@ const FULLY: Color32 = Color32::from_rgb(20, 20, 20);
 const UNDER: Color32 = Color32::from_rgb(0, 90, 220);
 const CONSTRUCTION: Color32 = Color32::from_rgb(110, 140, 190);
 const PREVIEW: Color32 = Color32::from_rgb(120, 120, 120);
+const DIMENSION: Color32 = Color32::from_rgb(90, 90, 90);
+const SNAPPED: Color32 = Color32::from_rgb(230, 120, 0);
+const TRIMMED: Color32 = Color32::from_rgb(220, 40, 40);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Select,
+    Dimension,
     Line,
+    Centerline,
     Rectangle,
     Circle,
     Arc,
+    Trim,
 }
 
 impl Tool {
-    pub const ALL: [(Tool, &'static str); 5] = [
-        (Tool::Select, "Select"),
-        (Tool::Line, "Line"),
-        (Tool::Rectangle, "Rectangle"),
-        (Tool::Circle, "Circle"),
-        (Tool::Arc, "Arc"),
+    /// The tools of the Sketch tab, in order, with icon and label.
+    pub const ALL: [(Tool, Icon, &'static str); 8] = [
+        (Tool::Select, Icon::Select, "Select"),
+        (Tool::Dimension, Icon::SmartDimension, "Smart Dimension"),
+        (Tool::Line, Icon::Line, "Line"),
+        (Tool::Centerline, Icon::Centerline, "Centerline"),
+        (Tool::Rectangle, Icon::Rectangle, "Rectangle"),
+        (Tool::Circle, Icon::Circle, "Circle"),
+        (Tool::Arc, Icon::Arc, "Arc"),
+        (Tool::Trim, Icon::Trim, "Trim"),
     ];
+
+    /// Tools that draw new geometry.
+    pub fn draws(self) -> bool {
+        matches!(
+            self,
+            Tool::Line | Tool::Centerline | Tool::Rectangle | Tool::Circle | Tool::Arc
+        )
+    }
 
     fn hint(self) -> &'static str {
         match self {
             Tool::Select => "Click to select, drag to move, right-click for relations",
-            Tool::Line => "Click points; click an existing point to close the contour",
+            Tool::Dimension => {
+                "Click one entity (then empty space) or two entities to dimension them"
+            }
+            Tool::Line | Tool::Centerline => {
+                "Click points; click an existing point to close the contour"
+            }
             Tool::Rectangle => "Click two opposite corners",
             Tool::Circle => "Click the centre, then a point on the circle",
             Tool::Arc => "Click the centre, the start, then the end (counter-clockwise)",
+            Tool::Trim => "Click the piece of a curve to remove, up to the nearest crossings",
         }
     }
+}
+
+/// What the cursor snapped to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Snap {
+    Point(EntityId),
+    /// The middle of a line.
+    Midpoint(EntityId),
+    /// Where two curves cross.
+    Crossing(EntityId, EntityId),
+    /// Somewhere on a curve.
+    OnCurve(EntityId),
 }
 
 /// A point placed by the current tool, created only when the shape is finished.
 #[derive(Debug, Clone, Copy)]
 struct Pending {
     at: Point2,
-    existing: Option<EntityId>,
+    snap: Option<Snap>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +127,8 @@ struct Drag {
 pub enum SketchRequest {
     /// The user clicked a dimension label: edit that relation's value.
     EditDimension(RelationId),
+    /// The Smart Dimension tool picked what to dimension: ask for the value.
+    NewDimension(DimensionOption),
 }
 
 /// A dimension offered for the current selection.
@@ -194,6 +238,9 @@ impl SketchSession {
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending.clear();
+        if tool == Tool::Dimension || tool.draws() || tool == Tool::Trim {
+            self.selection.clear();
+        }
     }
 
     /// Escape: abandons the shape in progress, then leaves the tool. Returns false when
@@ -204,6 +251,7 @@ impl SketchSession {
             true
         } else if self.tool != Tool::Select {
             self.tool = Tool::Select;
+            self.selection.clear();
             true
         } else if !self.selection.is_empty() {
             self.selection.clear();
@@ -326,6 +374,7 @@ impl SketchSession {
             .map(|e| (e.id, e.construction))
             .collect();
         if curves.is_empty() {
+            self.message = Some("Select lines, circles or arcs first".to_owned());
             return;
         }
         self.checkpoint();
@@ -340,6 +389,20 @@ impl SketchSession {
                 .entity(*id)
                 .is_some_and(|e| !matches!(e.geometry, Geometry::Point(_)))
         })
+    }
+
+    /// Removes the piece of `curve` under `at`, back to the nearest crossings.
+    fn trim(&mut self, curve: EntityId, at: Point2) {
+        self.checkpoint();
+        let previous = self.sketch.clone();
+        self.sketch.trim(curve, at);
+        if !self.solve() {
+            self.sketch = previous;
+            self.history.pop();
+            self.solve();
+            self.message = Some("Trimming there conflicts with the existing relations".to_owned());
+        }
+        self.selection.clear();
     }
 
     /// Selected points, lines, and circles/arcs.
@@ -383,59 +446,18 @@ impl SketchSession {
         }
     }
 
-    /// Dimensions that apply to the selection, with their current measurement.
-    pub fn dimension_options(&self) -> Vec<DimensionOption> {
-        use Constraint::*;
-        let (p, l, r) = self.selected_kinds();
-        let s = &self.sketch;
-        let option = |label, relation, shown, angle| DimensionOption {
-            label,
-            relation,
-            shown,
-            angle,
-        };
-        match (p.len(), l.len(), r.len()) {
-            (0, 1, 0) => {
-                let length = s.line_length(l[0]).unwrap_or(0.0);
-                vec![option("Length…", Length(l[0], length), length, false)]
-            }
-            (2, 0, 0) => {
-                let (a, b) = match (s.position(p[0]), s.position(p[1])) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => return Vec::new(),
-                };
-                let (d, dx, dy) = (a.distance(b), (b.x - a.x).abs(), (b.y - a.y).abs());
-                vec![
-                    option("Distance…", Distance(p[0], p[1], d), d, false),
-                    option(
-                        "Horizontal distance…",
-                        HorizontalDistance(p[0], p[1], dx),
-                        dx,
-                        false,
-                    ),
-                    option(
-                        "Vertical distance…",
-                        VerticalDistance(p[0], p[1], dy),
-                        dy,
-                        false,
-                    ),
-                ]
-            }
-            (0, 0, 1) => {
-                let radius = s.radius_of(r[0]).unwrap_or(0.0);
-                vec![option("Radius…", Radius(r[0], radius), radius, false)]
-            }
-            (0, 2, 0) => {
-                let angle = s.angle_between(l[0], l[1]).unwrap_or(0.0);
-                vec![option(
-                    "Angle…",
-                    Angle(l[0], l[1], angle),
-                    angle.to_degrees(),
-                    true,
-                )]
-            }
-            _ => Vec::new(),
+    /// The centre point of a circle or arc.
+    fn center_of(&self, round: EntityId) -> Option<EntityId> {
+        match self.sketch.entity(round)?.geometry {
+            Geometry::Circle { center, .. } | Geometry::Arc { center, .. } => Some(center),
+            _ => None,
         }
+    }
+
+    /// Dimensions that apply to the selection, with their current measurement. For two
+    /// entities, the first option is the one Smart Dimension picks.
+    pub fn dimension_options(&self) -> Vec<DimensionOption> {
+        dimension_options(&self.sketch, &self.selection)
     }
 
     // ---- Picking -----------------------------------------------------------------------------
@@ -453,11 +475,8 @@ impl SketchSession {
             .map(|(id, _)| id)
     }
 
-    /// The entity under a screen position: points first, then curves.
-    fn hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<EntityId> {
-        if let Some(point) = self.nearest_point(pos, to_screen) {
-            return Some(point);
-        }
+    /// The curve under a screen position.
+    fn curve_hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<EntityId> {
         let at = |id| self.sketch.position(id).unwrap_or_default();
         self.sketch
             .entities()
@@ -473,8 +492,13 @@ impl SketchSession {
                         let rim = to_screen(Point2::new(c.x + radius, c.y));
                         round_distance(pos, to_screen(c), rim)
                     }
-                    Geometry::Arc { center, start, .. } => {
-                        round_distance(pos, to_screen(at(center)), to_screen(at(start)))
+                    Geometry::Arc { center, start, end } => {
+                        let (c, s, f) = (at(center), at(start), at(end));
+                        let path: Vec<Pos2> =
+                            arc_path(c, s, f).into_iter().map(to_screen).collect();
+                        path.windows(2)
+                            .map(|w| segment_distance(pos, w[0], w[1]))
+                            .fold(f32::INFINITY, f32::min)
                     }
                 };
                 Some((e.id, distance))
@@ -482,6 +506,57 @@ impl SketchSession {
             .filter(|(_, d)| *d < PICK)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id)
+    }
+
+    /// The entity under a screen position: points first, then curves.
+    fn hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<EntityId> {
+        self.nearest_point(pos, to_screen)
+            .or_else(|| self.curve_hit(pos, to_screen))
+    }
+
+    /// Where a click at `pos` lands while drawing: an existing point, the middle of a line,
+    /// a crossing, a point on a curve, or just the cursor.
+    fn snap(
+        &self,
+        pos: Pos2,
+        at: Point2,
+        to_screen: &dyn Fn(Point2) -> Pos2,
+    ) -> (Point2, Option<Snap>) {
+        if let Some(id) = self.nearest_point(pos, to_screen) {
+            return (
+                self.sketch.position(id).unwrap_or(at),
+                Some(Snap::Point(id)),
+            );
+        }
+        let near = |p: Point2| (to_screen(p) - pos).length();
+        let middle = self
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .filter_map(|e| Some((e.id, self.sketch.midpoint_of(e.id)?)))
+            .map(|(id, p)| (id, p, near(p)))
+            .filter(|(_, _, d)| *d < SNAP)
+            .min_by(|a, b| a.2.total_cmp(&b.2));
+        if let Some((line, p, _)) = middle {
+            return (p, Some(Snap::Midpoint(line)));
+        }
+        let crossing = self
+            .sketch
+            .intersections()
+            .into_iter()
+            .map(|(a, b, p)| (a, b, p, near(p)))
+            .filter(|(.., d)| *d < SNAP)
+            .min_by(|x, y| x.3.total_cmp(&y.3));
+        if let Some((a, b, p, _)) = crossing {
+            return (p, Some(Snap::Crossing(a, b)));
+        }
+        if let Some(curve) = self.curve_hit(pos, to_screen) {
+            if let Some(p) = self.sketch.closest_point(curve, at) {
+                return (p, Some(Snap::OnCurve(curve)));
+            }
+        }
+        (at, None)
     }
 
     fn click_select(&mut self, hit: Option<EntityId>, additive: bool) {
@@ -496,6 +571,47 @@ impl SketchSession {
             Some(id) => self.selection = vec![id],
             None if !additive => self.selection.clear(),
             None => {}
+        }
+    }
+
+    /// Smart Dimension: the first click picks an entity; a second entity, or a click on
+    /// empty space, gives the dimension to ask for.
+    fn click_dimension(&mut self, hit: Option<EntityId>) -> Option<DimensionOption> {
+        match (hit, self.selection.len()) {
+            (Some(id), 0) => {
+                self.selection.push(id);
+                // A single circle needs no second click.
+                let round = matches!(
+                    self.sketch.entity(id).map(|e| e.geometry),
+                    Some(Geometry::Circle { .. } | Geometry::Arc { .. })
+                );
+                if round {
+                    let option = self.dimension_options().into_iter().next();
+                    self.selection.clear();
+                    return option;
+                }
+                None
+            }
+            (Some(id), _) => {
+                let first = self.selection[0];
+                self.selection = if id == first {
+                    vec![id]
+                } else {
+                    vec![first, id]
+                };
+                let option = self.dimension_options().into_iter().next();
+                self.selection.clear();
+                option
+            }
+            (None, 1) => {
+                let option = self.dimension_options().into_iter().next();
+                self.selection.clear();
+                option
+            }
+            (None, _) => {
+                self.selection.clear();
+                None
+            }
         }
     }
 
@@ -530,13 +646,9 @@ impl SketchSession {
                 }
             }
             DragKind::Radius(circle) => {
-                if let Some(Geometry::Circle { center, .. }) =
-                    self.sketch.entity(circle).map(|e| e.geometry)
-                {
-                    if let Some(c) = self.sketch.position(center) {
-                        self.sketch
-                            .set_circle_radius(circle, c.distance(to).max(1e-3));
-                    }
+                if let Some(c) = self.center_of(circle).and_then(|c| self.sketch.position(c)) {
+                    self.sketch
+                        .set_circle_radius(circle, c.distance(to).max(1e-3));
                 }
             }
         }
@@ -553,26 +665,68 @@ impl SketchSession {
 
     // ---- Drawing tools -----------------------------------------------------------------------
 
-    fn realize(&mut self, p: Pending) -> EntityId {
-        match p.existing {
-            Some(id) => id,
-            None => self.sketch.point(p.at),
+    /// Ties a point to what it was snapped to.
+    fn attach(&mut self, point: EntityId, snap: Option<Snap>) {
+        let on = |sketch: &ConstrainedSketch, curve: EntityId| match sketch
+            .entity(curve)
+            .map(|e| e.geometry)
+        {
+            Some(Geometry::Line { .. }) => Constraint::PointOnLine(point, curve),
+            _ => Constraint::PointOnCircle(point, curve),
+        };
+        let relations = match snap {
+            None => Vec::new(),
+            Some(Snap::Point(existing)) if existing != point => {
+                vec![Constraint::Coincident(point, existing)]
+            }
+            Some(Snap::Point(_)) => Vec::new(),
+            Some(Snap::Midpoint(line)) => vec![Constraint::Midpoint(point, line)],
+            Some(Snap::Crossing(a, b)) => vec![on(&self.sketch, a), on(&self.sketch, b)],
+            Some(Snap::OnCurve(curve)) => vec![on(&self.sketch, curve)],
+        };
+        for relation in relations {
+            self.sketch.constrain(relation);
         }
     }
 
-    fn click_tool(&mut self, at: Point2, snapped: Option<EntityId>) {
-        let p = Pending {
-            at: snapped
-                .and_then(|id| self.sketch.position(id))
-                .unwrap_or(at),
-            existing: snapped,
-        };
+    /// The point entity for a pending point: the existing one it snapped to, or a new one.
+    fn realize(&mut self, p: Pending) -> EntityId {
+        match p.snap {
+            Some(Snap::Point(id)) => id,
+            snap => {
+                let id = self.sketch.point(p.at);
+                self.attach(id, snap);
+                id
+            }
+        }
+    }
+
+    /// Solves after adding a shape; if the snapped relations cannot all hold, drops them
+    /// rather than the shape.
+    fn solve_new_shape(&mut self, relations_before: usize) {
+        if self.solve() {
+            return;
+        }
+        let added: Vec<RelationId> = self.sketch.relations()[relations_before..]
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        for id in added {
+            self.sketch.remove_relation(id);
+        }
+        self.solve();
+    }
+
+    fn click_tool(&mut self, p: Pending) {
+        let relations_before = self.sketch.relations().len();
         match self.tool {
-            Tool::Select => {}
-            Tool::Line => match self.pending.first().copied() {
+            Tool::Select | Tool::Dimension | Tool::Trim => {}
+            Tool::Line | Tool::Centerline => match self.pending.first().copied() {
                 None => self.pending = vec![p],
                 Some(start) => {
-                    let same = (start.existing.is_some() && start.existing == p.existing)
+                    let same = (start.snap.is_some()
+                        && matches!(start.snap, Some(Snap::Point(_)))
+                        && start.snap == p.snap)
                         || start.at.distance(p.at) < 1e-9;
                     if same {
                         return;
@@ -581,20 +735,24 @@ impl SketchSession {
                     let a = self.realize(start);
                     let b = self.realize(p);
                     let line = self.sketch.line_between(a, b);
+                    if self.tool == Tool::Centerline {
+                        self.sketch.set_construction(line, true);
+                    }
                     let auto = self.auto_relation(line, start.at, p.at);
                     if !self.solve() {
                         if let Some(id) = auto {
                             self.sketch.remove_relation(id);
-                            self.solve();
                         }
+                        self.solve_new_shape(relations_before);
                     }
                     // Landing on an existing point closes the contour and ends the chain.
-                    self.pending = if p.existing.is_some() {
+                    let closes = matches!(p.snap, Some(Snap::Point(_)));
+                    self.pending = if closes || self.tool == Tool::Centerline {
                         Vec::new()
                     } else {
                         vec![Pending {
                             at: p.at,
-                            existing: Some(b),
+                            snap: Some(Snap::Point(b)),
                         }]
                     };
                 }
@@ -606,8 +764,23 @@ impl SketchSession {
                     let (y0, y1) = (first.at.y.min(p.at.y), first.at.y.max(p.at.y));
                     if x1 - x0 > 1e-6 && y1 - y0 > 1e-6 {
                         self.checkpoint();
-                        self.sketch.rectangle(Point2::new(x0, y0), x1 - x0, y1 - y0);
-                        self.solve();
+                        let lines = self.sketch.rectangle(Point2::new(x0, y0), x1 - x0, y1 - y0);
+                        // The two clicked corners keep what they snapped to.
+                        let corners: Vec<EntityId> = lines
+                            .iter()
+                            .filter_map(|l| self.sketch.endpoints(*l).map(|(a, _)| a))
+                            .collect();
+                        for clicked in [first, p] {
+                            let corner = corners.iter().copied().find(|c| {
+                                self.sketch
+                                    .position(*c)
+                                    .is_some_and(|q| q.distance(clicked.at) < 1e-9)
+                            });
+                            if let Some(corner) = corner {
+                                self.attach(corner, clicked.snap);
+                            }
+                        }
+                        self.solve_new_shape(relations_before);
                     }
                     self.pending.clear();
                 }
@@ -619,8 +792,12 @@ impl SketchSession {
                     if radius > 1e-6 {
                         self.checkpoint();
                         let c = self.realize(center);
-                        self.sketch.circle_around(c, radius);
-                        self.solve();
+                        let circle = self.sketch.circle_around(c, radius);
+                        // A circle through an existing point stays on it.
+                        if let Some(Snap::Point(q)) = p.snap {
+                            self.sketch.constrain(Constraint::PointOnCircle(q, circle));
+                        }
+                        self.solve_new_shape(relations_before);
                     }
                     self.pending.clear();
                 }
@@ -650,7 +827,7 @@ impl SketchSession {
                     let s = self.realize(start);
                     let e = self.sketch.point(end_at);
                     self.sketch.arc_between(c, s, e);
-                    self.solve();
+                    self.solve_new_shape(relations_before);
                 }
                 self.pending.clear();
             }
@@ -701,12 +878,15 @@ impl SketchSession {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         painter: &egui::Painter,
         to_screen: &dyn Fn(Point2) -> Pos2,
         cursor: Option<Point2>,
         pointer: Option<Pos2>,
+        snapped: Option<(Point2, Option<Snap>)>,
+        trimmed: Option<Vec<Point2>>,
     ) {
         let conflicting = self.conflicting();
         let at = |id| self.sketch.position(id).unwrap_or_default();
@@ -743,16 +923,10 @@ impl SketchSession {
                         .map(to_screen)
                         .collect()
                 }
-                Geometry::Arc { center, start, end } => {
-                    let (c, s, f) = (at(center), at(start), at(end));
-                    let a0 = (s.y - c.y).atan2(s.x - c.x);
-                    let a1 = (f.y - c.y).atan2(f.x - c.x);
-                    let sweep = (a1 - a0).rem_euclid(std::f64::consts::TAU);
-                    arc_points(c, c.distance(s), a0, sweep, 48)
-                        .into_iter()
-                        .map(to_screen)
-                        .collect()
-                }
+                Geometry::Arc { center, start, end } => arc_path(at(center), at(start), at(end))
+                    .into_iter()
+                    .map(to_screen)
+                    .collect(),
             };
             if e.construction {
                 painter.extend(Shape::dashed_line(&path, stroke, 6.0, 4.0));
@@ -784,13 +958,9 @@ impl SketchSession {
                 Constraint::Vertical(l) => (l, "V"),
                 _ => continue,
             };
-            if let Some((a, b)) = self.sketch.endpoints(line) {
-                let mid = to_screen(Point2::new(
-                    (at(a).x + at(b).x) / 2.0,
-                    (at(a).y + at(b).y) / 2.0,
-                ));
+            if let Some(mid) = self.sketch.midpoint_of(line) {
                 painter.text(
-                    mid + Vec2::new(5.0, -5.0),
+                    to_screen(mid) + Vec2::new(5.0, -5.0),
                     Align2::LEFT_BOTTOM,
                     glyph,
                     FontId::proportional(10.0),
@@ -804,26 +974,34 @@ impl SketchSession {
         let mut labels = Vec::new();
         let mut hovered_label = None;
         for relation in self.sketch.relations() {
-            if let Some((anchor, text)) = self.dimension_label(&relation.constraint, to_screen) {
-                let text = if self.driven.contains(&relation.id) {
-                    format!("Σ {text}")
-                } else {
-                    text
-                };
-                let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), FULLY);
-                let rect = Rect::from_center_size(anchor, galley.size() + Vec2::new(8.0, 4.0));
-                painter.rect_filled(
-                    rect,
-                    3.0,
-                    Color32::from_rgba_unmultiplied(255, 255, 255, 220),
-                );
-                painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(160)));
-                painter.galley(rect.center() - galley.size() / 2.0, galley, FULLY);
-                if pointer.is_some_and(|p| rect.contains(p)) {
-                    hovered_label = Some((rect, relation.id));
-                }
-                labels.push((rect, relation.id));
+            let Some(graphics) = self.dimension_graphics(&relation.constraint, to_screen) else {
+                continue;
+            };
+            let stroke = Stroke::new(1.0, DIMENSION);
+            for segment in &graphics.lines {
+                painter.line_segment(*segment, stroke);
             }
+            for (tip, direction) in &graphics.arrows {
+                arrow_head(painter, *tip, *direction, DIMENSION);
+            }
+            let text = if self.driven.contains(&relation.id) {
+                format!("Σ {}", graphics.text)
+            } else {
+                graphics.text
+            };
+            let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), FULLY);
+            let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
+            painter.rect_filled(
+                rect,
+                3.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+            );
+            painter.rect_stroke(rect, 3.0, Stroke::new(1.0, Color32::from_gray(160)));
+            painter.galley(rect.center() - galley.size() / 2.0, galley, FULLY);
+            if pointer.is_some_and(|p| rect.contains(p)) {
+                hovered_label = Some((rect, relation.id));
+            }
+            labels.push((rect, relation.id));
         }
         self.labels = labels;
         // Hovering a dimension shows its full name, as used in equations.
@@ -839,11 +1017,23 @@ impl SketchSession {
             }
         }
 
+        // The piece the Trim tool would remove.
+        if let Some(piece) = trimmed {
+            let path: Vec<Pos2> = piece.into_iter().map(to_screen).collect();
+            painter.extend(Shape::dashed_line(
+                &path,
+                Stroke::new(2.5, TRIMMED),
+                5.0,
+                3.0,
+            ));
+        }
+
         // The shape in progress.
+        let cursor = snapped.map(|(p, _)| p).or(cursor);
         let dashed = Stroke::new(1.2, PREVIEW);
         if let (Some(first), Some(cursor)) = (self.pending.first(), cursor) {
             match self.tool {
-                Tool::Line => {
+                Tool::Line | Tool::Centerline => {
                     painter.extend(Shape::dashed_line(
                         &[to_screen(first.at), to_screen(cursor)],
                         dashed,
@@ -891,77 +1081,339 @@ impl SketchSession {
                     };
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                 }
-                Tool::Select => {}
+                Tool::Select | Tool::Dimension | Tool::Trim => {}
             }
+        }
+
+        // What the cursor snapped to.
+        if let Some((p, Some(snap))) = snapped {
+            draw_snap(painter, to_screen(p), snap);
         }
     }
 
-    fn dimension_label(
+    /// The lines, arrows and label of a dimension, in screen space.
+    fn dimension_graphics(
         &self,
         c: &Constraint,
         to_screen: &dyn Fn(Point2) -> Pos2,
-    ) -> Option<(Pos2, String)> {
+    ) -> Option<DimensionGraphics> {
         use Constraint::*;
         let s = &self.sketch;
         let at = |id| s.position(id);
-        let middle = |a: Point2, b: Point2| Point2::new((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        let middle = |a: Pos2, b: Pos2| a + (b - a) / 2.0;
+        // A dimension line between two screen points, offset sideways by `offset`.
+        let aligned = |a: Pos2, b: Pos2, offset: Vec2, text: String| {
+            let (da, db) = (a + offset, b + offset);
+            let along = db - da;
+            let mut g = DimensionGraphics {
+                anchor: middle(da, db) + offset.normalized() * 2.0,
+                text,
+                lines: Vec::new(),
+                arrows: Vec::new(),
+            };
+            if offset.length() > 0.5 {
+                g.lines.push([a, da + offset.normalized() * 3.0]);
+                g.lines.push([b, db + offset.normalized() * 3.0]);
+            }
+            if along.length() > 1.0 {
+                g.lines.push([da, db]);
+                g.arrows.push((da, -along.normalized()));
+                g.arrows.push((db, along.normalized()));
+            }
+            g
+        };
+        let side = |a: Pos2, b: Pos2| {
+            let d = b - a;
+            if d.length() > 1e-3 {
+                Vec2::new(d.y, -d.x).normalized() * 18.0
+            } else {
+                Vec2::new(0.0, -18.0)
+            }
+        };
         match *c {
             Length(line, value) => {
                 let (a, b) = s.endpoints(line)?;
-                let (a, b) = (at(a)?, at(b)?);
-                let (sa, sb) = (to_screen(a), to_screen(b));
-                let along = sb - sa;
-                let offset = if along.length() > 1e-6 {
-                    Vec2::new(-along.y, along.x).normalized() * 14.0
-                } else {
-                    Vec2::new(0.0, -14.0)
-                };
-                Some((to_screen(middle(a, b)) + offset, format_length(value)))
+                let (a, b) = (to_screen(at(a)?), to_screen(at(b)?));
+                // Outside the shape: on the side away from the middle of the sketch.
+                let points: Vec<Pos2> = s
+                    .entities()
+                    .iter()
+                    .filter_map(|e| match e.geometry {
+                        Geometry::Point(p) => Some(to_screen(p)),
+                        _ => None,
+                    })
+                    .collect();
+                let n = points.len().max(1) as f32;
+                let centre = points
+                    .iter()
+                    .fold(Pos2::ZERO, |sum, p| sum + p.to_vec2() / n);
+                let mut offset = side(a, b);
+                let m = middle(a, b);
+                if ((m + offset) - centre).length() < ((m - offset) - centre).length() {
+                    offset = -offset;
+                }
+                Some(aligned(a, b, offset, format_length(value)))
             }
-            Distance(p, q, value)
-            | HorizontalDistance(p, q, value)
-            | VerticalDistance(p, q, value) => {
-                let m = middle(at(p)?, at(q)?);
-                Some((to_screen(m) + Vec2::new(0.0, -12.0), format_length(value)))
+            Distance(p, q, value) => {
+                let (a, b) = (to_screen(at(p)?), to_screen(at(q)?));
+                Some(aligned(a, b, Vec2::ZERO, format_length(value)))
+            }
+            HorizontalDistance(p, q, value) | VerticalDistance(p, q, value) => {
+                let (pa, pb) = (at(p)?, at(q)?);
+                let horizontal = matches!(c, HorizontalDistance(..));
+                // Measured along the sketch's x (or y) axis, drawn beyond the farther point.
+                let (ea, eb) = if horizontal {
+                    let y = pa.y.max(pb.y);
+                    (Point2::new(pa.x, y), Point2::new(pb.x, y))
+                } else {
+                    let x = pa.x.max(pb.x);
+                    (Point2::new(x, pa.y), Point2::new(x, pb.y))
+                };
+                let (a, b) = (to_screen(ea), to_screen(eb));
+                let towards = if horizontal {
+                    to_screen(Point2::new(ea.x, ea.y + 1.0)) - a
+                } else {
+                    to_screen(Point2::new(ea.x + 1.0, ea.y)) - a
+                };
+                let offset = if towards.length() > 1e-6 {
+                    towards.normalized() * 18.0
+                } else {
+                    Vec2::new(0.0, -18.0)
+                };
+                let mut g = aligned(a, b, offset, format_length(value));
+                g.lines.push([to_screen(pa), a]);
+                g.lines.push([to_screen(pb), b]);
+                Some(g)
+            }
+            PointLineDistance(p, line, value) => {
+                let point = at(p)?;
+                let (a, b) = s.endpoints(line)?;
+                let foot = perpendicular_foot(point, at(a)?, at(b)?);
+                Some(aligned(
+                    to_screen(point),
+                    to_screen(foot),
+                    Vec2::ZERO,
+                    format_length(value),
+                ))
+            }
+            LineDistance(first, second, value) => {
+                let m = s.midpoint_of(first)?;
+                let (a, b) = s.endpoints(second)?;
+                let foot = perpendicular_foot(m, at(a)?, at(b)?);
+                let mut g = aligned(
+                    to_screen(m),
+                    to_screen(foot),
+                    Vec2::ZERO,
+                    format_length(value),
+                );
+                // Extend the second line to the foot if it falls beyond it.
+                g.lines
+                    .push([to_screen(s.closest_point(second, foot)?), to_screen(foot)]);
+                Some(g)
             }
             Radius(round, value) => {
-                let center = match s.entity(round)?.geometry {
-                    Geometry::Circle { center, .. } | Geometry::Arc { center, .. } => at(center)?,
-                    _ => return None,
-                };
+                let center = at(self.center_of(round)?)?;
                 let rim = Point2::new(
                     center.x + value * std::f64::consts::FRAC_1_SQRT_2,
                     center.y + value * std::f64::consts::FRAC_1_SQRT_2,
                 );
-                Some((
-                    to_screen(rim) + Vec2::new(12.0, -8.0),
-                    format!("R{}", format_length(value)),
-                ))
+                let (c, r) = (to_screen(center), to_screen(rim));
+                let out = (r - c).normalized();
+                Some(DimensionGraphics {
+                    anchor: r + out * 22.0,
+                    text: format!("R{}", format_length(value)),
+                    lines: vec![[c, r + out * 12.0]],
+                    arrows: vec![(r, out)],
+                })
             }
             Angle(first, _, value) => {
-                let (a, b) = s.endpoints(first)?;
-                let m = middle(at(a)?, at(b)?);
-                Some((
-                    to_screen(m) + Vec2::new(16.0, -16.0),
-                    format!("{:.1}°", value.to_degrees()),
-                ))
+                let m = s.midpoint_of(first)?;
+                Some(DimensionGraphics {
+                    anchor: to_screen(m) + Vec2::new(16.0, -16.0),
+                    text: format!("{:.1}°", value.to_degrees()),
+                    lines: Vec::new(),
+                    arrows: Vec::new(),
+                })
             }
             _ => None,
         }
     }
 }
 
+/// How one dimension is drawn.
+struct DimensionGraphics {
+    anchor: Pos2,
+    text: String,
+    lines: Vec<[Pos2; 2]>,
+    /// Arrow tips and the direction they point.
+    arrows: Vec<(Pos2, Vec2)>,
+}
+
+/// Dimensions that apply to `selection` (points, lines, circles), with their current
+/// measurement. For two entities, the first option is the one Smart Dimension picks.
+fn dimension_options(s: &ConstrainedSketch, selection: &[EntityId]) -> Vec<DimensionOption> {
+    use Constraint::*;
+    let kind = |id: EntityId| s.entity(id).map(|e| e.geometry);
+    let center = |id: EntityId| match kind(id)? {
+        Geometry::Circle { center, .. } | Geometry::Arc { center, .. } => Some(center),
+        _ => None,
+    };
+    let option = |label, relation, shown, angle| DimensionOption {
+        label,
+        relation,
+        shown,
+        angle,
+    };
+    let point_distance = |p: EntityId, q: EntityId| -> Vec<DimensionOption> {
+        let (Some(a), Some(b)) = (s.position(p), s.position(q)) else {
+            return Vec::new();
+        };
+        let (d, dx, dy) = (a.distance(b), (b.x - a.x).abs(), (b.y - a.y).abs());
+        let aligned = option("Distance…", Distance(p, q, d), d, false);
+        let horizontal = option(
+            "Horizontal distance…",
+            HorizontalDistance(p, q, dx),
+            dx,
+            false,
+        );
+        let vertical = option("Vertical distance…", VerticalDistance(p, q, dy), dy, false);
+        // Smart Dimension: points lined up get the horizontal or vertical distance.
+        if dy < 1e-9 * d.max(1.0) {
+            vec![horizontal, aligned, vertical]
+        } else if dx < 1e-9 * d.max(1.0) {
+            vec![vertical, aligned, horizontal]
+        } else {
+            vec![aligned, horizontal, vertical]
+        }
+    };
+    let point_line = |p: EntityId, l: EntityId| -> Vec<DimensionOption> {
+        let (Some(point), Some((a, b))) = (s.position(p), s.endpoints(l)) else {
+            return Vec::new();
+        };
+        let (Some(a), Some(b)) = (s.position(a), s.position(b)) else {
+            return Vec::new();
+        };
+        let d = point.distance(perpendicular_foot(point, a, b));
+        vec![option("Distance…", PointLineDistance(p, l, d), d, false)]
+    };
+
+    match selection {
+        [one] => match kind(*one) {
+            Some(Geometry::Line { .. }) => {
+                let length = s.line_length(*one).unwrap_or(0.0);
+                vec![option("Length…", Length(*one, length), length, false)]
+            }
+            Some(Geometry::Circle { .. } | Geometry::Arc { .. }) => {
+                let radius = s.radius_of(*one).unwrap_or(0.0);
+                vec![option("Radius…", Radius(*one, radius), radius, false)]
+            }
+            _ => Vec::new(),
+        },
+        [a, b] => match (kind(*a), kind(*b)) {
+            (Some(Geometry::Point(_)), Some(Geometry::Point(_))) => point_distance(*a, *b),
+            (Some(Geometry::Point(_)), Some(Geometry::Line { .. })) => point_line(*a, *b),
+            (Some(Geometry::Line { .. }), Some(Geometry::Point(_))) => point_line(*b, *a),
+            (Some(Geometry::Line { .. }), Some(Geometry::Line { .. })) => {
+                let angle = s.angle_between(*a, *b).unwrap_or(0.0);
+                let folded = angle.abs().min(std::f64::consts::PI - angle.abs());
+                let angle_option = option("Angle…", Angle(*a, *b, angle), angle.to_degrees(), true);
+                if folded < PARALLEL {
+                    let distance = s.midpoint_of(*a).and_then(|m| {
+                        let (p, q) = s.endpoints(*b)?;
+                        let foot = perpendicular_foot(m, s.position(p)?, s.position(q)?);
+                        Some(m.distance(foot))
+                    });
+                    match distance {
+                        Some(d) => vec![option("Distance…", LineDistance(*a, *b, d), d, false)],
+                        None => vec![angle_option],
+                    }
+                } else {
+                    vec![angle_option]
+                }
+            }
+            // Circles and arcs are dimensioned from their centre.
+            (Some(Geometry::Point(_)), Some(_)) => match center(*b) {
+                Some(c) => point_distance(*a, c),
+                None => Vec::new(),
+            },
+            (Some(_), Some(Geometry::Point(_))) => match center(*a) {
+                Some(c) => point_distance(c, *b),
+                None => Vec::new(),
+            },
+            (Some(Geometry::Line { .. }), Some(_)) => match center(*b) {
+                Some(c) => point_line(c, *a),
+                None => Vec::new(),
+            },
+            (Some(_), Some(Geometry::Line { .. })) => match center(*a) {
+                Some(c) => point_line(c, *b),
+                None => Vec::new(),
+            },
+            (Some(_), Some(_)) => match (center(*a), center(*b)) {
+                (Some(p), Some(q)) => point_distance(p, q),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn perpendicular_foot(p: Point2, a: Point2, b: Point2) -> Point2 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length2 = dx * dx + dy * dy;
+    if length2 < 1e-24 {
+        return a;
+    }
+    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / length2;
+    Point2::new(a.x + dx * t, a.y + dy * t)
+}
+
+fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color32) {
+    let back = tip - direction * 7.0;
+    let side = Vec2::new(-direction.y, direction.x) * 2.8;
+    painter.add(Shape::convex_polygon(
+        vec![tip, back + side, back - side],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// Marks what the cursor snapped to, as SolidWorks' inference glyphs do.
+fn draw_snap(painter: &egui::Painter, at: Pos2, snap: Snap) {
+    let stroke = Stroke::new(1.8, SNAPPED);
+    match snap {
+        Snap::Point(_) => {
+            painter.rect_stroke(Rect::from_center_size(at, Vec2::splat(11.0)), 0.0, stroke);
+        }
+        Snap::Midpoint(_) => {
+            let r = 7.0;
+            painter.add(Shape::closed_line(
+                vec![
+                    at + Vec2::new(0.0, -r),
+                    at + Vec2::new(r * 0.87, r * 0.5),
+                    at + Vec2::new(-r * 0.87, r * 0.5),
+                ],
+                stroke,
+            ));
+        }
+        Snap::Crossing(..) => {
+            let r = 6.0;
+            painter.line_segment([at + Vec2::new(-r, -r), at + Vec2::new(r, r)], stroke);
+            painter.line_segment([at + Vec2::new(-r, r), at + Vec2::new(r, -r)], stroke);
+        }
+        Snap::OnCurve(_) => {
+            painter.circle_stroke(at, 5.0, stroke);
+        }
+    }
+}
+
 /// The value of a dimension, as shown to the user (degrees for angles).
 pub fn dimension_value(c: &Constraint) -> Option<(f64, bool)> {
-    use Constraint::*;
-    match *c {
-        Distance(_, _, v)
-        | HorizontalDistance(_, _, v)
-        | VerticalDistance(_, _, v)
-        | Length(_, v)
-        | Radius(_, v) => Some((v, false)),
-        Angle(_, _, v) => Some((v.to_degrees(), true)),
-        _ => None,
+    let value = c.value()?;
+    if c.is_angle() {
+        Some((value.to_degrees(), true))
+    } else {
+        Some((value, false))
     }
 }
 
@@ -977,6 +1429,14 @@ fn arc_points(center: Point2, radius: f64, start: f64, sweep: f64, segments: usi
             Point2::new(center.x + radius * a.cos(), center.y + radius * a.sin())
         })
         .collect()
+}
+
+/// Points along a counter-clockwise arc from `start` to `end` around `center`.
+fn arc_path(center: Point2, start: Point2, end: Point2) -> Vec<Point2> {
+    let a0 = (start.y - center.y).atan2(start.x - center.x);
+    let a1 = (end.y - center.y).atan2(end.x - center.x);
+    let sweep = (a1 - a0).rem_euclid(std::f64::consts::TAU);
+    arc_points(center, center.distance(start), a0, sweep, 48)
 }
 
 fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
@@ -1029,34 +1489,220 @@ pub fn interact(
         }
     }
 
-    session.hover = match (session.drag, pointer) {
-        (None, Some(p)) => session.hit(p, &to_screen),
+    session.hover = match (session.drag, pointer, session.tool) {
+        (None, Some(p), Tool::Trim) => session.curve_hit(p, &to_screen),
+        (None, Some(p), tool) if !tool.draws() => session.hit(p, &to_screen),
+        _ => None,
+    };
+
+    // Drawing tools snap the cursor; Trim previews the piece it would remove.
+    let cursor = pointer.and_then(to_plane);
+    let snapped = match (session.tool.draws(), pointer, cursor) {
+        (true, Some(pos), Some(at)) => Some(session.snap(pos, at, &to_screen)),
+        _ => None,
+    };
+    let trimmed = match (session.tool, session.hover, cursor) {
+        (Tool::Trim, Some(curve), Some(at)) => session.sketch.trim_preview(curve, at),
         _ => None,
     };
 
     if response.clicked() {
         if let Some(pos) = pointer {
-            if session.tool == Tool::Select {
-                let label = session
-                    .labels
-                    .iter()
-                    .find(|(r, _)| r.contains(pos))
-                    .map(|(_, id)| *id);
-                match label {
-                    Some(id) => request = Some(SketchRequest::EditDimension(id)),
-                    None => {
-                        let hit = session.hit(pos, &to_screen);
-                        session.click_select(hit, additive);
+            let label = session
+                .labels
+                .iter()
+                .find(|(r, _)| r.contains(pos))
+                .map(|(_, id)| *id);
+            match session.tool {
+                Tool::Select | Tool::Dimension if label.is_some() => {
+                    request = label.map(SketchRequest::EditDimension);
+                }
+                Tool::Select => {
+                    let hit = session.hit(pos, &to_screen);
+                    session.click_select(hit, additive);
+                }
+                Tool::Dimension => {
+                    let hit = session.hit(pos, &to_screen);
+                    request = session
+                        .click_dimension(hit)
+                        .map(SketchRequest::NewDimension);
+                }
+                Tool::Trim => {
+                    if let (Some(curve), Some(at)) = (session.hover, cursor) {
+                        session.trim(curve, at);
                     }
                 }
-            } else if let Some(at) = to_plane(pos) {
-                let snapped = session.nearest_point(pos, &to_screen);
-                session.click_tool(at, snapped);
+                _ => {
+                    if let Some((at, snap)) = snapped {
+                        session.click_tool(Pending { at, snap });
+                    }
+                }
             }
         }
     }
 
     let painter = ui.painter_at(out.rect);
-    session.draw(&painter, &to_screen, pointer.and_then(to_plane), pointer);
+    session.draw(&painter, &to_screen, cursor, pointer, snapped, trimmed);
     request
+}
+
+#[cfg(test)]
+mod tests {
+    use oxyde_geom::{Plane, Point2};
+    use oxyde_model::FeatureId;
+    use oxyde_sketch::{ConstrainedSketch, Constraint, EntityId, Geometry};
+
+    use super::{Pending, SketchSession, Snap, Tool, dimension_options};
+
+    fn session(sketch: ConstrainedSketch) -> SketchSession {
+        SketchSession::new(
+            FeatureId::from_raw(1),
+            "Sketch1".to_owned(),
+            Plane::FRONT,
+            sketch,
+            false,
+            None,
+        )
+    }
+
+    fn has(s: &SketchSession, wanted: impl Fn(&Constraint) -> bool) -> bool {
+        s.sketch.relations().iter().any(|r| wanted(&r.constraint))
+    }
+
+    #[test]
+    fn smart_dimension_picks_the_dimension_for_each_pair() {
+        let mut s = ConstrainedSketch::new();
+        let a = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = s.line(Point2::new(0.0, 5.0), Point2::new(10.0, 5.0));
+        let c = s.line(Point2::new(0.0, 0.0), Point2::new(5.0, 5.0));
+        let p = s.point(Point2::new(3.0, 8.0));
+        let circle = s.circle(Point2::new(20.0, 0.0), 2.0);
+        let other = s.circle(Point2::new(20.0, 10.0), 1.0);
+
+        let first = |sel: &[EntityId]| dimension_options(&s, sel).into_iter().next().unwrap();
+        let d = first(&[a, b]);
+        assert!(
+            matches!(d.relation, Constraint::LineDistance(x, y, v) if x == a && y == b && (v - 5.0).abs() < 1e-9)
+        );
+        assert!(matches!(first(&[a, c]).relation, Constraint::Angle(..)));
+        assert!(
+            matches!(first(&[p, a]).relation, Constraint::PointLineDistance(q, l, v) if q == p && l == a && (v - 8.0).abs() < 1e-9)
+        );
+        assert!(matches!(
+            first(&[a, p]).relation,
+            Constraint::PointLineDistance(..)
+        ));
+        let centers = first(&[circle, other]);
+        assert!(
+            matches!(centers.relation, Constraint::VerticalDistance(..)),
+            "lined-up centres"
+        );
+        assert!((centers.shown - 10.0).abs() < 1e-9);
+        assert!(matches!(
+            first(&[a, circle]).relation,
+            Constraint::PointLineDistance(..)
+        ));
+        assert!(matches!(first(&[circle]).relation, Constraint::Radius(..)));
+        assert!(matches!(first(&[a]).relation, Constraint::Length(..)));
+    }
+
+    #[test]
+    fn smart_dimension_clicks() {
+        let mut s = ConstrainedSketch::new();
+        let a = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let b = s.line(Point2::new(0.0, 5.0), Point2::new(10.0, 5.0));
+        let circle = s.circle(Point2::new(20.0, 0.0), 2.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Dimension);
+        // A line, then empty space: its length.
+        assert!(session.click_dimension(Some(a)).is_none());
+        let length = session.click_dimension(None).unwrap();
+        assert!(matches!(length.relation, Constraint::Length(..)));
+        // Two lines: their distance.
+        assert!(session.click_dimension(Some(a)).is_none());
+        let distance = session.click_dimension(Some(b)).unwrap();
+        assert!(matches!(distance.relation, Constraint::LineDistance(..)));
+        // A circle at once: its radius.
+        let radius = session.click_dimension(Some(circle)).unwrap();
+        assert!(matches!(radius.relation, Constraint::Radius(..)));
+        assert!(session.selection.is_empty());
+    }
+
+    #[test]
+    fn drawing_keeps_what_points_snapped_to() {
+        let mut s = ConstrainedSketch::new();
+        let base = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let up = s.line(Point2::new(4.0, -5.0), Point2::new(4.0, 5.0));
+        let mut session = session(s);
+        session.set_tool(Tool::Line);
+        // From the middle of `base` to the crossing of the two lines.
+        session.click_tool(Pending {
+            at: Point2::new(5.0, 0.0),
+            snap: Some(Snap::Midpoint(base)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(4.0, 0.0),
+            snap: Some(Snap::Crossing(base, up)),
+        });
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::Midpoint(_, l) if *l == base)
+        ));
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::PointOnLine(_, l) if *l == up)
+        ));
+        assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn centerlines_are_construction_and_rectangles_attach_their_corners() {
+        let mut s = ConstrainedSketch::new();
+        let corner = s.point(Point2::new(0.0, 0.0));
+        let mut session = session(s);
+        session.set_tool(Tool::Centerline);
+        session.click_tool(Pending {
+            at: Point2::new(0.0, -5.0),
+            snap: None,
+        });
+        session.click_tool(Pending {
+            at: Point2::new(0.0, 5.0),
+            snap: None,
+        });
+        let centerline = session
+            .sketch
+            .entities()
+            .iter()
+            .find(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .unwrap();
+        assert!(centerline.construction);
+
+        session.set_tool(Tool::Rectangle);
+        session.click_tool(Pending {
+            at: Point2::new(0.0, 0.0),
+            snap: Some(Snap::Point(corner)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(6.0, 4.0),
+            snap: None,
+        });
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::Coincident(_, p) if *p == corner)
+        ));
+        assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn trimming_in_the_session_can_be_undone() {
+        let mut s = ConstrainedSketch::new();
+        let h = s.line(Point2::new(-10.0, 0.0), Point2::new(10.0, 0.0));
+        s.line(Point2::new(0.0, -10.0), Point2::new(0.0, 10.0));
+        let mut session = session(s);
+        let before = session.sketch.clone();
+        session.trim(h, Point2::new(5.0, 0.0));
+        assert_ne!(session.sketch, before);
+        assert!(session.undo());
+        assert_eq!(session.sketch, before);
+    }
 }

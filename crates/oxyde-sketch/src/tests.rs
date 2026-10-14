@@ -438,7 +438,11 @@ fn trimming_the_middle_splits_a_line() {
 
     let before = s.entities().len();
     assert!(s.trim(h, Point2::new(1.0, 0.0)));
-    assert_eq!(s.entities().len(), before + 3, "two cut points and a second line");
+    assert_eq!(
+        s.entities().len(),
+        before + 3,
+        "two cut points and a second line"
+    );
     let report = s.solve().unwrap();
     assert!(report.converged, "{report:?}");
     let lines: Vec<(Point2, Point2)> = s
@@ -453,8 +457,16 @@ fn trimming_the_middle_splits_a_line() {
         .filter(|(a, b)| a.y.abs() < 1e-9 && b.y.abs() < 1e-9)
         .collect();
     assert_eq!(lines.len(), 2);
-    assert!(lines.iter().any(|(a, b)| close(*a, -10.0, 0.0) && close(*b, -5.0, 0.0)));
-    assert!(lines.iter().any(|(a, b)| close(*a, 5.0, 0.0) && close(*b, 10.0, 0.0)));
+    assert!(
+        lines
+            .iter()
+            .any(|(a, b)| close(*a, -10.0, 0.0) && close(*b, -5.0, 0.0))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|(a, b)| close(*a, 5.0, 0.0) && close(*b, 10.0, 0.0))
+    );
 }
 
 #[test]

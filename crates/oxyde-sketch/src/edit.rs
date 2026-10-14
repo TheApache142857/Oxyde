@@ -354,7 +354,11 @@ impl ConstrainedSketch {
             Piece::Start(cut) => (lo, cut.param),
             Piece::End(cut) => (cut.param, hi),
             Piece::Between(a, b) => {
-                let to = if b.param <= a.param { b.param + TAU } else { b.param };
+                let to = if b.param <= a.param {
+                    b.param + TAU
+                } else {
+                    b.param
+                };
                 (a.param, to)
             }
         };
@@ -458,8 +462,12 @@ impl ConstrainedSketch {
             .collect();
         if !orphans.is_empty() {
             self.entities.retain(|e| !orphans.contains(&e.id));
-            self.relations
-                .retain(|r| r.constraint.entities().iter().all(|id| !orphans.contains(id)));
+            self.relations.retain(|r| {
+                r.constraint
+                    .entities()
+                    .iter()
+                    .all(|id| !orphans.contains(id))
+            });
         }
     }
 
