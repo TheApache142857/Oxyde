@@ -6,6 +6,7 @@
 //! feature the resulting body and the persistent names of all its faces, edges and
 //! vertices.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use oxyde_geom::{Plane, Profile, ProfileError, ProfileSegment};
@@ -77,6 +78,17 @@ impl FeatureResult {
     }
 }
 
+/// Everything that defines a part, without any computed geometry: what gets saved, and what
+/// undo/redo snapshots hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartDefinition {
+    pub features: Vec<Feature>,
+    /// Number of active features; `None` = all.
+    pub rollback: Option<usize>,
+    /// Id the next new feature will get.
+    pub next_id: u32,
+}
+
 /// A part document: its timeline and the cached results of the last rebuild.
 ///
 /// Cached bodies hold kernel shapes; call [`Part::release`] with the same kernel before
@@ -106,6 +118,57 @@ impl Part {
             next_id: 1,
             results: Vec::new(),
             dirty_from: 0,
+        }
+    }
+
+    /// Rebuilds a part from its definition (nothing is computed until [`Part::rebuild`]).
+    pub fn from_definition(definition: PartDefinition) -> Result<Self, ModelError> {
+        let invalid = |reason: String| Err(ModelError::InvalidDefinition(reason));
+        let mut seen = HashSet::new();
+        for (index, feature) in definition.features.iter().enumerate() {
+            if feature.id.raw() == 0 || !seen.insert(feature.id) {
+                return invalid(format!("duplicate or invalid feature id {}", feature.id));
+            }
+            for dependency in feature.kind.dependencies() {
+                if !definition.features[..index]
+                    .iter()
+                    .any(|f| f.id == dependency)
+                {
+                    return invalid(format!(
+                        "{} refers to {dependency}, which does not come before it",
+                        feature.name
+                    ));
+                }
+            }
+        }
+        if let Some(active) = definition.rollback {
+            if active > definition.features.len() {
+                return invalid(format!(
+                    "rollback position {active} is past the last feature"
+                ));
+            }
+        }
+        let highest = definition
+            .features
+            .iter()
+            .map(|f| f.id.raw())
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            next_id: definition.next_id.max(highest + 1),
+            features: definition.features,
+            rollback: definition.rollback,
+            results: Vec::new(),
+            dirty_from: 0,
+        })
+    }
+
+    /// A copy of the part's definition.
+    pub fn definition(&self) -> PartDefinition {
+        PartDefinition {
+            features: self.features.clone(),
+            rollback: self.rollback,
+            next_id: self.next_id,
         }
     }
 
@@ -726,6 +789,35 @@ mod tests {
         part.delete(boss).unwrap();
         part.delete(s1).unwrap();
         assert!(part.features().is_empty());
+    }
+
+    #[test]
+    fn definition_round_trip_and_validation() {
+        let mut part = Part::new();
+        let s1 = part.add_feature(rectangle_sketch());
+        part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            5.0,
+        )));
+        part.roll_back_to(Some(s1)).unwrap();
+
+        let definition = part.definition();
+        let restored = Part::from_definition(definition.clone()).unwrap();
+        assert_eq!(restored.definition(), definition);
+
+        // A feature referring to a later one is rejected.
+        let mut swapped = definition.clone();
+        swapped.features.swap(0, 1);
+        assert!(matches!(
+            Part::from_definition(swapped),
+            Err(ModelError::InvalidDefinition(_))
+        ));
+
+        // Duplicate ids are rejected.
+        let mut duplicated = definition;
+        duplicated.features.push(duplicated.features[0].clone());
+        assert!(Part::from_definition(duplicated).is_err());
     }
 
     #[test]

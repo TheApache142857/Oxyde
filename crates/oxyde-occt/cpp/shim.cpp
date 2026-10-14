@@ -14,22 +14,27 @@
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
+#include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepTools.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <GCPnts_TangentialDeflection.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <Poly_Triangle.hxx>
+#include <Poly_Triangulation.hxx>
 #include <STEPControl_Writer.hxx>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
 #include <TopAbs_ShapeEnum.hxx>
+#include <TopLoc_Location.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
@@ -48,6 +53,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
 #include <algorithm>
@@ -644,6 +650,71 @@ TopologyData Session::topology(std::uint64_t shape) const {
             topo.vertices.push_back(data);
         }
         return topo;
+    });
+}
+
+MeshData Session::tessellate(std::uint64_t shape, double deflection) const {
+    return guarded("tessellate", [&] {
+        if (!(deflection > 0.0)) {
+            throw std::invalid_argument("deflection must be positive");
+        }
+        const TopoDS_Shape& s = get(shape);
+        // Stores a triangulation on every face of the shape (reused by later calls).
+        BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.35, Standard_False);
+
+        TopTools_IndexedMapOfShape faces;
+        TopTools_IndexedMapOfShape edges;
+        TopExp::MapShapes(s, TopAbs_FACE, faces);
+        TopExp::MapShapes(s, TopAbs_EDGE, edges);
+
+        MeshData out{};
+        for (int i = 1; i <= faces.Extent(); ++i) {
+            const TopoDS_Face& face = TopoDS::Face(faces(i));
+            FaceMeshData data{};
+            TopLoc_Location location;
+            const Handle(Poly_Triangulation) triangulation =
+                BRep_Tool::Triangulation(face, location);
+            if (!triangulation.IsNull()) {
+                const gp_Trsf transform = location.Transformation();
+                for (int n = 1; n <= triangulation->NbNodes(); ++n) {
+                    const gp_Pnt p = triangulation->Node(n).Transformed(transform);
+                    data.positions.push_back(static_cast<float>(p.X()));
+                    data.positions.push_back(static_cast<float>(p.Y()));
+                    data.positions.push_back(static_cast<float>(p.Z()));
+                }
+                const bool reversed = face.Orientation() == TopAbs_REVERSED;
+                for (int t = 1; t <= triangulation->NbTriangles(); ++t) {
+                    Standard_Integer a = 0;
+                    Standard_Integer b = 0;
+                    Standard_Integer c = 0;
+                    triangulation->Triangle(t).Get(a, b, c);
+                    if (reversed) {
+                        std::swap(b, c);
+                    }
+                    data.indices.push_back(static_cast<std::uint32_t>(a - 1));
+                    data.indices.push_back(static_cast<std::uint32_t>(b - 1));
+                    data.indices.push_back(static_cast<std::uint32_t>(c - 1));
+                }
+            }
+            out.faces.push_back(std::move(data));
+        }
+
+        for (int i = 1; i <= edges.Extent(); ++i) {
+            const TopoDS_Edge& edge = TopoDS::Edge(edges(i));
+            EdgeLineData data{};
+            if (!BRep_Tool::Degenerated(edge)) {
+                const BRepAdaptor_Curve curve(edge);
+                const GCPnts_TangentialDeflection points(curve, 0.2, deflection);
+                for (int k = 1; k <= points.NbPoints(); ++k) {
+                    const gp_Pnt p = points.Value(k);
+                    data.points.push_back(static_cast<float>(p.X()));
+                    data.points.push_back(static_cast<float>(p.Y()));
+                    data.points.push_back(static_cast<float>(p.Z()));
+                }
+            }
+            out.edges.push_back(std::move(data));
+        }
+        return out;
     });
 }
 

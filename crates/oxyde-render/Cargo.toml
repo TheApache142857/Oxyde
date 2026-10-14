@@ -1,0 +1,11 @@
+[package]
+name = "oxyde-render"
+description = "Software renderer for the Oxyde viewport: shaded faces, edges, pixel-exact picking."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxyde-kernel = { workspace = true }

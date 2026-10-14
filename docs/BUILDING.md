@@ -59,13 +59,17 @@ Open a new terminal afterwards.
 ## 2. Build and test
 
 ```powershell
+cargo run --release -p oxyde-app               # the application
+cargo run --release -p oxyde-app -- part.oxy   # ... opening a file
 cargo test --workspace                         # everything
-cargo test -p oxyde-geom -p oxyde-model        # pure-Rust tests only (no OCCT needed at run time)
+cargo test -p oxyde-geom -p oxyde-model -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
 cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end tests
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```
 
 Open `box.step` in SolidWorks, FreeCAD or eDrawings: you should see a 40 × 20 × 10 mm box.
+
+In the application, **File › Open demo bracket** builds a part using every feature type. The viewport is software-rendered: use `--release` for smooth navigation (the renderer crate is optimized even in debug builds, the rest is not).
 
 ## 3. Troubleshooting
 

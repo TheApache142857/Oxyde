@@ -19,4 +19,4 @@ pub use feature::{
     SketchEntity, SketchPlane, StandardPlane,
 };
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
-pub use part::{Body, FeatureStatus, Part, SketchResult, TimelineEntry};
+pub use part::{Body, FeatureStatus, Part, PartDefinition, SketchResult, TimelineEntry};

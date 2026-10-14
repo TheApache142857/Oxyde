@@ -37,6 +37,22 @@ pub struct Feature {
 }
 
 impl Feature {
+    /// Builds a feature with a given identity, e.g. when loading a file. Within a part, use
+    /// `Part::add_feature`, which assigns ids and names.
+    pub fn new(
+        id: FeatureId,
+        name: impl Into<String>,
+        suppressed: bool,
+        kind: FeatureKind,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            suppressed,
+            kind,
+        }
+    }
+
     pub fn id(&self) -> FeatureId {
         self.id
     }

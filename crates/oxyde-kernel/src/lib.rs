@@ -137,6 +137,23 @@ pub struct OpResult {
     pub history: OpHistory,
 }
 
+/// Triangles of one face, for display.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FaceMesh {
+    pub positions: Vec<[f32; 3]>,
+    /// Indices into `positions`, counter-clockwise seen from outside the solid.
+    pub triangles: Vec<[u32; 3]>,
+}
+
+/// Display mesh of a shape: one [`FaceMesh`] per face and one polyline per edge, indexed
+/// exactly like the shape's [`Topology`], so a triangle or a line under the mouse maps
+/// straight back to a face or an edge.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Mesh {
+    pub faces: Vec<FaceMesh>,
+    pub edges: Vec<Vec<[f32; 3]>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Fuse,
@@ -190,6 +207,10 @@ pub trait Kernel {
     ) -> Result<OpResult, Self::Error>;
 
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, Self::Error>;
+
+    /// Display mesh; `deflection` is the maximum distance in mm between the mesh and the
+    /// true surface.
+    fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, Self::Error>;
 
     /// Volume of a solid, in mm³.
     fn volume(&self, shape: ShapeHandle) -> Result<f64, Self::Error>;

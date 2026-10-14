@@ -16,6 +16,17 @@ oxyde-kernel = { path = "crates/oxyde-kernel" }
 oxyde-occt = { path = "crates/oxyde-occt" }
 oxyde-model = { path = "crates/oxyde-model" }
 oxyde-format = { path = "crates/oxyde-format" }
+oxyde-render = { path = "crates/oxyde-render" }
 
 cxx = "1.0"
 cxx-build = "1.0"
+eframe = "0.29"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.10", features = ["v4"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+# The software renderer is far too slow unoptimized; keep it fast in debug builds.
+[profile.dev.package.oxyde-render]
+opt-level = 3

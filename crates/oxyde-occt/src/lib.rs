@@ -10,8 +10,8 @@ use std::path::Path;
 
 use oxyde_geom::{Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Vec3};
 use oxyde_kernel::{
-    BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle,
-    SurfaceKind, Topology, TopologyCounts, VertexInfo,
+    BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
+    OpResult, ShapeHandle, SurfaceKind, Topology, TopologyCounts, VertexInfo,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -136,6 +136,10 @@ impl Kernel for OcctKernel {
 
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, OcctError> {
         Ok(topology_from(self.session.topology(shape.raw())?))
+    }
+
+    fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, OcctError> {
+        Ok(mesh_from(self.session.tessellate(shape.raw(), deflection)?))
     }
 
     fn volume(&self, shape: ShapeHandle) -> Result<f64, OcctError> {
@@ -299,6 +303,28 @@ fn topology_from(data: ffi::TopologyData) -> Topology {
                 point: Point3::new(v.x, v.y, v.z),
             })
             .collect(),
+    }
+}
+
+fn points3(flat: &[f32]) -> Vec<[f32; 3]> {
+    flat.chunks_exact(3).map(|p| [p[0], p[1], p[2]]).collect()
+}
+
+fn mesh_from(data: ffi::MeshData) -> Mesh {
+    Mesh {
+        faces: data
+            .faces
+            .iter()
+            .map(|f| FaceMesh {
+                positions: points3(&f.positions),
+                triangles: f
+                    .indices
+                    .chunks_exact(3)
+                    .map(|t| [t[0], t[1], t[2]])
+                    .collect(),
+            })
+            .collect(),
+        edges: data.edges.iter().map(|e| points3(&e.points)).collect(),
     }
 }
 

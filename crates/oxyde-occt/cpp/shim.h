@@ -19,6 +19,7 @@
 namespace oxyde::occt {
 
 // Shared structs, defined by the cxx-generated header.
+struct MeshData;
 struct OpResultData;
 struct PlaneData;
 struct RegionData;
@@ -38,6 +39,7 @@ public:
     void release(std::uint64_t shape);
 
     TopologyData topology(std::uint64_t shape) const;
+    MeshData tessellate(std::uint64_t shape, double deflection) const;
     double volume(std::uint64_t shape) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;
 

@@ -141,6 +141,25 @@ pub(crate) mod bridge {
         vertices: Vec<VertexData>,
     }
 
+    // ---- Display mesh ----------------------------------------------------------------------
+
+    struct FaceMeshData {
+        /// x, y, z per node.
+        positions: Vec<f32>,
+        /// Three node indices per triangle.
+        indices: Vec<u32>,
+    }
+
+    struct EdgeLineData {
+        /// x, y, z per point.
+        points: Vec<f32>,
+    }
+
+    struct MeshData {
+        faces: Vec<FaceMeshData>,
+        edges: Vec<EdgeLineData>,
+    }
+
     unsafe extern "C++" {
         include!("oxyde-occt/cpp/shim.h");
 
@@ -196,6 +215,8 @@ pub(crate) mod bridge {
         fn release(self: Pin<&mut Session>, shape: u64);
 
         fn topology(self: &Session, shape: u64) -> Result<TopologyData>;
+
+        fn tessellate(self: &Session, shape: u64, deflection: f64) -> Result<MeshData>;
 
         fn volume(self: &Session, shape: u64) -> Result<f64>;
 

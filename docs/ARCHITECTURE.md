@@ -19,7 +19,8 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-kernel` | `geom` | `occt`, `model` |
 | `oxyde-occt` | `geom`, `kernel` | `model`, `sketch`, `app` |
 | `oxyde-model` | `geom`, `sketch`, `kernel` | `occt`, `app` |
-| `oxyde-format` | `model` | `occt`, `app` |
+| `oxyde-format` | `geom`, `model` | `occt`, `app` |
+| `oxyde-render` | `kernel` (mesh types only) | `occt`, `model`, `app` |
 | `oxyde-app` | all of the above | — |
 | `oxyde-tests` | `model`, `occt` (dev only) | — |
 
@@ -55,7 +56,7 @@ Implemented (see `crates/oxyde-kernel/src/lib.rs` for the documented signatures)
 | Group | Methods |
 |---|---|
 | Construction | `make_box`, `extrude(plane, profile, vector)`, `boolean(Fuse/Cut/Common, target, tool)`, `fillet(shape, edges, radius)`, `chamfer(shape, edges, distance)` |
-| Queries | `topology` (faces, edges, vertices with adjacency, surface/curve kind, area, centroid, planar normal, edge midpoint), `volume`, `topology_counts` |
+| Queries | `topology` (faces, edges, vertices with adjacency, surface/curve kind, area, centroid, planar normal, edge midpoint), `tessellate` (display mesh: triangles per face, polyline per edge, indexed like the topology), `volume`, `topology_counts` |
 | Exchange | `export_step(shapes, path)` |
 | Lifetime | `release` |
 
@@ -69,7 +70,7 @@ Every construction operation returns an `OpResult { shape, history }`. The histo
 | `ProfileSegment(id)` | side face swept from the sketch segment with that id |
 | `StartCap` / `EndCap` | the two ends of an extrusion |
 
-The kernel never remembers anything between calls; turning this history into lasting names is the model's job (§6). Still to come: `revolve`, `shell`, patterns, `tessellate` (for the viewport), STEP import, BREP import/export (for the `.oxy` geometry cache).
+The kernel never remembers anything between calls; turning this history into lasting names is the model's job (§6). Still to come: `revolve`, `shell`, patterns, STEP import, BREP import/export (for an optional `.oxy` geometry cache).
 
 A second, trivial backend (`NullKernel` / mock) lives in tests so that `oxyde-model` can be tested without OCCT installed.
 
@@ -129,11 +130,16 @@ Known limits, to address later: unknown-origin faces (none expected from current
 - The assembly tree is the BOM source: quantities, part numbers and custom properties come straight from each part's `properties.json` (see `FORMAT.md`).
 - Drawings: views computed by the kernel's hidden-line removal (OCCT `HLRBRep`), annotations and dimensions in Rust, export to PDF/SVG/DXF.
 
-## 9. Application (`oxyde-app`)
+## 9. Application (`oxyde-app`) and viewport (`oxyde-render`)
 
-- UI toolkit: `egui` with a `wgpu` viewport (to be confirmed by a small prototype).
-- Rendering consumes tessellated meshes from the kernel; selection maps triangles back to persistent face/edge names.
-- Undo/redo operates on the feature tree (model commands), never on geometry.
+Layout, SolidWorks-style: menu bar, command bar (Sketch, Extruded Boss/Cut, Fillet, Chamfer, standard views, undo/redo), **timeline panel** on the left (reference planes, features with status colours and tooltips, rollback bar, context menu: rename, suppress, roll back, delete) with the **properties** of the selected feature below it, the **3D viewport** in the centre, a status bar.
+
+- UI toolkit: `egui`/`eframe` 0.29, immediate mode. The app owns one `OcctKernel`; it is the only crate that chooses a backend.
+- **Rendering**: `oxyde-render` is a software rasterizer (orthographic, Y-up like SolidWorks). It draws shaded faces (normals smooth within a face, crisp between faces) and edges with a depth buffer, and fills **id buffers** in the same pass, so picking the face or edge under the mouse is exact; edges win within a few pixels. The image is shown as an egui texture and re-rendered only when the camera, size, highlight or scene changes. No GPU code means nothing driver-specific can break; a GPU backend can replace it behind the same `Scene`/`Camera`/`Frame` interface when parts get large.
+- Navigation: left-drag orbit, middle-drag or Shift+left-drag pan, wheel zoom at cursor, `F` zoom to fit; Front/Top/Right/Isometric views.
+- **Selection is held by persistent name** (`FaceName`/`EdgeName`), not index, so it survives rebuilds. Selected edges feed Fillet/Chamfer; a selected planar face becomes the sketch plane.
+- **Undo/redo** stores `PartDefinition` snapshots (the same data that is saved); consecutive edits of one feature in the properties panel coalesce into one step.
+- Sketching is numeric for now (rectangle/circle dialogs, editable coordinates in the properties panel) until the solver and a sketch mode arrive (M2).
 
 ## 10. Roadmap
 
@@ -143,7 +149,8 @@ Known limits, to address later: unknown-origin faces (none expected from current
 | **M1** (code written, awaiting first Windows build) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **Engine** (code written, awaiting first Windows build) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
 | **M2** | Sketch entities + solver with DOF reporting (pure Rust, no UI) |
-| **M3** | Revolve, `.oxy` save/load (feature tree + names) |
+| **App** (code written, awaiting first Windows build) | Timeline panel, properties panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
+| **M3** | Revolve, shell, patterns, interactive sketch mode |
 | **M4** | Viewport + sketcher UI; selection; fillet / chamfer with persistent naming |
 | **M5** | Patterns, mirror, shell, reference geometry, expressions |
 | **M6** | Assemblies with basic mates; BOM export |

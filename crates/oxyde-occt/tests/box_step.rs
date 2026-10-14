@@ -91,3 +91,24 @@ fn exporting_nothing_is_an_error() {
     let kernel = OcctKernel::new();
     assert!(kernel.export_step(&[], &temp_step_path("empty")).is_err());
 }
+
+#[test]
+fn box_tessellation_matches_topology() {
+    let mut kernel = OcctKernel::new();
+    let shape = kernel
+        .make_box(Point3::ORIGIN, Vec3::new(10.0, 20.0, 30.0))
+        .unwrap();
+    let mesh = kernel.tessellate(shape, 0.1).unwrap();
+    let topology = kernel.topology(shape).unwrap();
+
+    assert_eq!(mesh.faces.len(), topology.faces.len());
+    assert_eq!(mesh.edges.len(), topology.edges.len());
+    for face in &mesh.faces {
+        assert!(face.triangles.len() >= 2);
+        for t in &face.triangles {
+            assert!(t.iter().all(|&i| (i as usize) < face.positions.len()));
+        }
+    }
+    // Straight edges need only their two end points.
+    assert!(mesh.edges.iter().all(|e| e.len() == 2));
+}

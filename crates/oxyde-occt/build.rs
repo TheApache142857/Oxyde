@@ -25,6 +25,7 @@ const CORE_TOOLKITS: &[&str] = &[
     "TKBO",
     "TKBool",
     "TKFillet",
+    "TKMesh",
     "TKShHealing",
     "TKXSBase",
 ];

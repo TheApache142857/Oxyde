@@ -11,6 +11,8 @@ pub enum ModelError {
         feature: FeatureId,
         dependents: Vec<FeatureId>,
     },
+    /// A [`PartDefinition`](crate::PartDefinition) that cannot form a valid timeline.
+    InvalidDefinition(String),
 }
 
 impl fmt::Display for ModelError {
@@ -27,6 +29,7 @@ impl fmt::Display for ModelError {
                 }
                 Ok(())
             }
+            ModelError::InvalidDefinition(reason) => write!(f, "invalid part definition: {reason}"),
         }
     }
 }
