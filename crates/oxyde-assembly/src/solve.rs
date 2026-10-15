@@ -374,7 +374,6 @@ fn numeric_jacobian(x: &[f64], f: &dyn Fn(&[f64]) -> Vec<f64>) -> Vec<Vec<f64>> 
 }
 
 fn levenberg_marquardt(x: &mut [f64], f: &dyn Fn(&[f64]) -> Vec<f64>, size: f64) {
-    let n = x.len();
     let mut r = f(x);
     let mut current = cost(&r);
     let mut lambda = 1e-3;
@@ -383,49 +382,88 @@ fn levenberg_marquardt(x: &mut [f64], f: &dyn Fn(&[f64]) -> Vec<f64>, size: f64)
         if current <= done {
             break;
         }
-        let j = numeric_jacobian(x, f);
-        // Normal equations: (JᵀJ + λ diag) δ = −Jᵀr.
-        let mut a = vec![vec![0.0; n]; n];
-        let mut g = vec![0.0; n];
-        for (row, ri) in j.iter().zip(&r) {
-            for p in 0..n {
-                if row[p] == 0.0 {
-                    continue;
-                }
-                g[p] -= row[p] * ri;
-                for q in 0..n {
-                    a[p][q] += row[p] * row[q];
-                }
-            }
+        let mut step = descend(x, f, &numeric_jacobian(x, f), &r, current, &mut lambda);
+        if step.is_none() {
+            // Every way looks level from here although the mates do not hold: a mate that
+            // starts on a symmetric spot (faces in line for an angle, points together for
+            // a distance, as inserted parts often are) has no slope there. The slopes a
+            // little way off show a way out; the step is still taken from here.
+            let aside: Vec<f64> = x
+                .iter()
+                .enumerate()
+                .map(|(k, v)| v + nudge(k, size))
+                .collect();
+            lambda = 1e-3;
+            step = descend(x, f, &numeric_jacobian(&aside, f), &r, current, &mut lambda);
         }
-        let mut improved = false;
-        for _ in 0..12 {
-            let mut m = a.clone();
-            for (p, row) in m.iter_mut().enumerate() {
-                row[p] += lambda * (a[p][p] + 1e-9);
-            }
-            let Some(step) = solve_linear(m, g.clone()) else {
-                lambda *= 10.0;
-                continue;
-            };
-            let trial: Vec<f64> = x.iter().zip(&step).map(|(a, b)| a + b).collect();
-            let rt = f(&trial);
-            let ct = cost(&rt);
-            if ct < current {
-                let small = step.iter().all(|s| s.abs() < 1e-14);
-                x.copy_from_slice(&trial);
-                r = rt;
-                current = ct;
-                lambda = (lambda / 3.0).max(1e-12);
-                improved = !small;
-                break;
-            }
-            lambda *= 4.0;
-        }
-        if !improved {
+        let Some((trial, rt, ct)) = step else {
+            break;
+        };
+        let small = trial
+            .iter()
+            .zip(x.iter())
+            .all(|(t, v)| (t - v).abs() < 1e-14);
+        x.copy_from_slice(&trial);
+        r = rt;
+        current = ct;
+        if small {
             break;
         }
     }
+}
+
+/// A damped Gauss–Newton step from `x` with Jacobian `j`, damped further until it lowers
+/// the cost: the new point, its residuals and its cost, or `None` if it never does.
+fn descend(
+    x: &[f64],
+    f: &dyn Fn(&[f64]) -> Vec<f64>,
+    j: &[Vec<f64>],
+    r: &[f64],
+    current: f64,
+    lambda: &mut f64,
+) -> Option<(Vec<f64>, Vec<f64>, f64)> {
+    let n = x.len();
+    // Normal equations: (JᵀJ + λ diag) δ = −Jᵀr.
+    let mut a = vec![vec![0.0; n]; n];
+    let mut g = vec![0.0; n];
+    for (row, ri) in j.iter().zip(r) {
+        for p in 0..n {
+            if row[p] == 0.0 {
+                continue;
+            }
+            g[p] -= row[p] * ri;
+            for q in 0..n {
+                a[p][q] += row[p] * row[q];
+            }
+        }
+    }
+    for _ in 0..12 {
+        let mut m = a.clone();
+        for (p, row) in m.iter_mut().enumerate() {
+            row[p] += *lambda * (a[p][p] + 1e-9);
+        }
+        let Some(step) = solve_linear(m, g.clone()) else {
+            *lambda *= 10.0;
+            continue;
+        };
+        let trial: Vec<f64> = x.iter().zip(&step).map(|(a, b)| a + b).collect();
+        let rt = f(&trial);
+        let ct = cost(&rt);
+        if ct < current {
+            *lambda = (*lambda / 3.0).max(1e-12);
+            return Some((trial, rt, ct));
+        }
+        *lambda *= 4.0;
+    }
+    None
+}
+
+/// A small fixed offset for unknown `k` (each component has a turn in radians, then a shift
+/// in mm), lopsided so that no symmetric spot stays symmetric.
+fn nudge(k: usize, size: f64) -> f64 {
+    let wobble = ((k as f64 + 1.0) * 0.618_033_988_749_895).fract() - 0.5;
+    let scale = if k % 6 < 3 { 1e-3 } else { 1e-3 * size };
+    wobble * scale
 }
 
 /// Gaussian elimination with partial pivoting.

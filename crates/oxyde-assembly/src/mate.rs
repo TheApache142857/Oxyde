@@ -1,4 +1,6 @@
-use oxyde_geom::{Point3, Vec3};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+use oxyde_geom::{LINEAR_TOLERANCE, Point3, Vec3};
 use oxyde_kernel::{CurveKind, SurfaceKind};
 use oxyde_model::{Body, EdgeName, FaceName, StandardAxis, StandardPlane};
 
@@ -292,6 +294,31 @@ fn push3(out: &mut Vec<f64>, v: Vec3, scale: f64) {
     out.extend([v.x * scale, v.y * scale, v.z * scale]);
 }
 
+/// Angle targets this close (radians) to where the angle stops being smooth (directions in
+/// line, or square for lines) are held as exactly that.
+const ANGLE_SNAP: f64 = 1e-6;
+
+/// The angle between two unit vectors, accurate everywhere (the arc cosine of the dot
+/// product is not, near 0 and 180°).
+fn angle_between(u: Vec3, v: Vec3) -> f64 {
+    u.cross(v).length().atan2(u.dot(v))
+}
+
+/// `|h| − d` for a signed height `h`, without the kink at `h = 0` where the solver could
+/// not tell which way to go: geometry that starts level moves to the positive side.
+fn gap(h: f64, d: f64) -> f64 {
+    if h < -LINEAR_TOLERANCE { -h - d } else { h - d }
+}
+
+/// `|v| = d`. At no distance all of `v` must vanish: its length has no slope there.
+fn apart(out: &mut Vec<f64>, v: Vec3, d: f64) {
+    if d <= LINEAR_TOLERANCE {
+        push3(out, v, 1.0);
+    } else {
+        out.push(v.length() - d);
+    }
+}
+
 /// Equations that are all zero when the mate holds, given both sides in assembly
 /// coordinates. Directions are scaled by `size` so that they weigh like lengths.
 pub(crate) fn residuals(
@@ -418,7 +445,9 @@ pub(crate) fn residuals(
             match (kind == MateKind::Parallel) != crossed {
                 true if kind.has_alignment(a.kind(), b.kind()) => same(u, v, out),
                 true => parallel(u, v, out),
-                false => out.push(u.dot(v) * size),
+                // The angle rather than the dot product, which is level where the
+                // directions start in line (as parts are inserted).
+                false => out.push((angle_between(u, v) - FRAC_PI_2) * size),
             }
         }
         MateKind::Distance(d) => match (*a, *b) {
@@ -430,7 +459,7 @@ pub(crate) fn residuals(
                 },
             ) => {
                 same(normal, n2, out);
-                out.push(height(o2, origin, normal).abs() - d);
+                out.push(gap(height(o2, origin, normal), d));
             }
             (P::Plane { origin, normal }, other) | (other, P::Plane { origin, normal }) => {
                 if let (P::Circle { normal: cn, .. }, true) = (other, matches!(a, P::Plane { .. }))
@@ -439,7 +468,7 @@ pub(crate) fn residuals(
                 } else if let P::Circle { normal: cn, .. } = other {
                     same(cn, normal, out);
                 }
-                out.push(height(other.anchor(), origin, normal).abs() - d);
+                out.push(gap(height(other.anchor(), origin, normal), d));
             }
             (
                 P::Line { origin, direction },
@@ -449,18 +478,40 @@ pub(crate) fn residuals(
                 },
             ) => {
                 parallel(direction, d2, out);
-                out.push(off_line(o2, origin, direction).length() - d);
+                apart(out, off_line(o2, origin, direction), d);
             }
-            _ => out.push((b.anchor() - a.anchor()).length() - d),
+            _ => apart(out, b.anchor() - a.anchor(), d),
         },
         MateKind::Angle(angle) => {
             let (u, v) = (a.direction().unwrap(), b.direction().unwrap());
-            let s = if kind.has_alignment(a.kind(), b.kind()) {
-                sign
+            // Between directions, 200° is 160°.
+            let angle = angle.rem_euclid(TAU);
+            let angle = if angle > PI { TAU - angle } else { angle };
+            if kind.has_alignment(a.kind(), b.kind()) {
+                // Normals have a way round: any angle up to 180°. At 0 and 180° they are
+                // in line, which holds two turns, not one.
+                let v = v * sign;
+                if angle.sin().abs() < ANGLE_SNAP {
+                    push3(out, v - u * angle.cos().signum(), size);
+                } else {
+                    out.push((angle_between(u, v) - angle) * size);
+                }
             } else {
-                1.0
-            };
-            out.push((u.dot(v) * s - angle.cos()) * size);
+                // A line has no way round, so the angle to it is at most 90°: between two
+                // lines (or a line and an axis) it is measured from parallel, between a
+                // line and a plane from the plane, as Parallel and Perpendicular read them.
+                let target = angle.min(PI - angle);
+                let crossed = a.kind() == PrimitiveKind::Plane || b.kind() == PrimitiveKind::Plane;
+                let tilt = if crossed { FRAC_PI_2 - target } else { target };
+                if tilt < ANGLE_SNAP {
+                    parallel(u, v, out);
+                } else if FRAC_PI_2 - tilt < ANGLE_SNAP {
+                    out.push((angle_between(u, v) - FRAC_PI_2) * size);
+                } else {
+                    let acute = u.cross(v).length().atan2(u.dot(v).abs());
+                    out.push((acute - tilt) * size);
+                }
+            }
         }
     }
     Ok(())

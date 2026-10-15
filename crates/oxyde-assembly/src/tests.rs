@@ -508,3 +508,146 @@ fn a_conflict_in_one_group_leaves_the_others_alone() {
         assert_eq!(solution.degrees(pin), Some(1));
     }
 }
+
+fn front(c: ComponentId) -> MateRef {
+    r(c, MateTarget::Plane(StandardPlane::Front))
+}
+
+fn right(c: ComponentId) -> MateRef {
+    r(c, MateTarget::Plane(StandardPlane::Right))
+}
+
+fn x_axis(c: ComponentId) -> MateRef {
+    r(c, MateTarget::Axis(StandardAxis::X))
+}
+
+/// Two components the way the app inserts them: side by side along X and turned alike, so
+/// their front and top planes are level and all their planes in line.
+fn side_by_side() -> (Assembly, ComponentId, ComponentId) {
+    let (mut asm, a, b) = two();
+    asm.component_mut(b).unwrap().placement =
+        Placement::from_translation(Vec3::new(60.0, 0.0, 0.0));
+    (asm, a, b)
+}
+
+#[test]
+fn mates_solve_from_where_inserted_parts_sit() {
+    // Each mate starts where its equation is level: no slope says which way to go.
+    // Level planes: the second moves off along the first one's normal.
+    let (mut asm, a, b) = side_by_side();
+    asm.add_mate(MateKind::Distance(10.0), front(a), front(b), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let t = asm.component(b).unwrap().placement.translation;
+    assert!(close(t.z, 10.0), "{t:?}");
+    assert_eq!(solution.degrees(b), Some(3));
+
+    // Lines in line.
+    let (mut asm, a, b) = side_by_side();
+    asm.add_mate(MateKind::Distance(10.0), x_axis(a), x_axis(b), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let t = asm.component(b).unwrap().placement.translation;
+    assert!(close(t.y.hypot(t.z), 10.0), "{t:?}");
+
+    // Points together.
+    let (mut asm, a, b) = side_by_side();
+    asm.component_mut(b).unwrap().placement = Placement::IDENTITY;
+    let origin = |c| r(c, MateTarget::Origin);
+    asm.add_mate(MateKind::Distance(10.0), origin(a), origin(b), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let t = asm.component(b).unwrap().placement.translation;
+    assert!(close(t.length(), 10.0), "{t:?}");
+    assert_eq!(solution.degrees(b), Some(5));
+
+    // Planes in line, to be turned apart.
+    for (kind, degrees) in [
+        (MateKind::Angle(30f64.to_radians()), 30f64),
+        (MateKind::Perpendicular, 90.0),
+    ] {
+        let (mut asm, a, b) = side_by_side();
+        asm.add_mate(MateKind::Coincident, front(a), front(b), true);
+        asm.add_mate(kind, right(a), right(b), true);
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{kind:?}: {:?}", solution.mates);
+        let x = asm.component(b).unwrap().placement.apply_vector(Vec3::X);
+        assert!(close(x.dot(Vec3::X), degrees.to_radians().cos()), "{x:?}");
+        assert_eq!(solution.degrees(b), Some(2));
+    }
+}
+
+#[test]
+fn angles_of_0_and_180_degrees_hold_exactly() {
+    // There the normals are in line, which also stops the turn the angle leaves elsewhere.
+    for (degrees, aligned, dot) in [(0f64, true, 1.0), (180.0, true, -1.0), (0.0, false, -1.0)] {
+        let (mut asm, a, b) = two();
+        asm.add_mate(MateKind::Coincident, front(a), front(b), true);
+        asm.add_mate(
+            MateKind::Angle(degrees.to_radians()),
+            right(a),
+            right(b),
+            aligned,
+        );
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+        let x = asm.component(b).unwrap().placement.apply_vector(Vec3::X);
+        assert!((x.dot(Vec3::X) - dot).abs() < 1e-12, "{degrees}: {x:?}");
+        assert_eq!(solution.degrees(b), Some(2));
+    }
+}
+
+#[test]
+fn an_angle_between_lines_has_no_way_round() {
+    // Lines have no direction, so 150° between them is 30°: from 154° the part turns 4°,
+    // not 124°.
+    let (mut asm, a, b) = two();
+    asm.component_mut(b).unwrap().placement = placed(
+        Vec3::new(10.0, 20.0, 0.0),
+        Vec3::new(0.0, 0.0, 154f64.to_radians()),
+    );
+    asm.add_mate(MateKind::Coincident, front(a), front(b), true);
+    asm.add_mate(
+        MateKind::Angle(30f64.to_radians()),
+        x_axis(a),
+        x_axis(b),
+        true,
+    );
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let x = asm.component(b).unwrap().placement.apply_vector(Vec3::X);
+    assert!(close(x.dot(Vec3::X), 150f64.to_radians().cos()), "{x:?}");
+}
+
+#[test]
+fn an_angle_between_a_line_and_a_plane_is_measured_from_the_plane() {
+    // As Parallel and Perpendicular read them: at 0° the line runs along the plane.
+    for degrees in [0f64, 30.0, 90.0] {
+        let (mut asm, a, b) = two();
+        asm.add_mate(
+            MateKind::Angle(degrees.to_radians()),
+            front(a),
+            x_axis(b),
+            true,
+        );
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{degrees}: {:?}", solution.mates);
+        let x = asm.component(b).unwrap().placement.apply_vector(Vec3::X);
+        assert!(
+            close(x.dot(Vec3::Z).abs(), degrees.to_radians().sin()),
+            "{degrees}: {x:?}"
+        );
+    }
+}
+
+#[test]
+fn a_zero_distance_holds_points_together() {
+    let (mut asm, a, b) = two();
+    let origin = |c| r(c, MateTarget::Origin);
+    asm.add_mate(MateKind::Distance(0.0), origin(a), origin(b), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let t = asm.component(b).unwrap().placement.translation;
+    assert!(close(t.length(), 0.0), "{t:?}");
+    assert_eq!(solution.degrees(b), Some(3));
+}
