@@ -69,6 +69,8 @@ cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```
 
+On a machine without OpenCASCADE (Linux, macOS), the whole workspace can still be type-checked: `OXYDE_OCCT_CHECK_ONLY=1 cargo check --workspace --all-targets`. It skips compiling and linking the C++ shim, so only `cargo check` works this way, not `build`, `run` or `test`.
+
 Open `box.step` in SolidWorks, FreeCAD or eDrawings: you should see a 40 × 20 × 10 mm box.
 
 In the application, **File › Open demo bracket** builds a part using every feature type. The viewport is software-rendered: use `--release` for smooth navigation (the renderer crate is optimized even in debug builds, the rest is not).

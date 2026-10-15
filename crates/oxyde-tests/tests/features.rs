@@ -324,6 +324,66 @@ fn two_direction_pattern() {
 }
 
 #[test]
+fn pattern_directions_along_edges() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 100.0, 50.0, 10.0);
+    part.rebuild(&mut kernel);
+    // Two edges of the top face: one along X, one along Y.
+    let (along_x, along_y) = {
+        let body = part.body().expect("part has a body");
+        let top = FaceName::end_cap(base);
+        let edge = |direction: [f64; 3]| {
+            body.topology
+                .edges
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| {
+                    let axis = e.axis.as_ref()?;
+                    let d = axis.direction;
+                    let parallel = (d.x.abs() - direction[0]).abs() < 1e-9
+                        && (d.y.abs() - direction[1]).abs() < 1e-9
+                        && (d.z.abs() - direction[2]).abs() < 1e-9;
+                    let name = body.naming.edge(i as u32)?;
+                    (parallel && name.faces.contains(&top)).then(|| name.clone())
+                })
+                .next()
+                .expect("an edge of the top face")
+        };
+        (edge([1.0, 0.0, 0.0]), edge([0.0, 1.0, 0.0]))
+    };
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(base)));
+    sketch.circle(Point2::new(10.0, 10.0), 3.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(sketch));
+    let hole = part.add_feature(cut(s2, 10.0));
+    let direction = |axis: EdgeName, spacing: f64, count: u32| PatternDirection {
+        axis: AxisRef::Edge(axis),
+        spacing,
+        count,
+        reverse: false,
+    };
+    let pattern = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole],
+        first: direction(along_x.clone(), 20.0, 4),
+        second: Some(direction(along_y, 15.0, 3)),
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 50000.0 - 12.0 * hole_volume());
+
+    // The same edge twice: refused rather than copies stacked on each other.
+    if let Ok(FeatureKind::LinearPattern(p)) = part.edit(pattern) {
+        p.second = Some(direction(along_x, 15.0, 3));
+    }
+    part.rebuild(&mut kernel);
+    match part.status(pattern) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("parallel")),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
+#[test]
 fn circular_pattern_about_the_axis_of_a_cylindrical_face() {
     let mut kernel = OcctKernel::new();
     let mut part = Part::new();

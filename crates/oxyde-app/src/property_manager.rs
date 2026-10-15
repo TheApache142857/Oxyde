@@ -69,23 +69,102 @@ fn selection_box(ui: &mut egui::Ui, items: &[(String, String)], hint: &str) -> O
     removed
 }
 
+/// A single-reference selection box (a direction, an axis, a plane), as in SolidWorks:
+/// the active box, outlined, takes the next click in the viewport or the timeline;
+/// clicking a box makes it the active one. The arrow lists the other choices, the model
+/// axes and planes among them. Returns true when the user clicked the box or chose from
+/// the list.
+fn reference_box<T>(
+    ui: &mut egui::Ui,
+    id: &str,
+    choices: &[(String, T)],
+    selected: &mut Option<usize>,
+    active: bool,
+    hint: &str,
+) -> bool {
+    let current = selected
+        .and_then(|i| choices.get(i))
+        .map(|(label, _)| label);
+    let stroke = if active {
+        Stroke::new(2.0, BOX_ACTIVE)
+    } else {
+        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+    };
+    let (mut clicked, mut chosen) = (false, false);
+    ui.push_id(id, |ui| {
+        egui::Frame::none()
+            .fill(if active {
+                BOX_FILL
+            } else {
+                Color32::TRANSPARENT
+            })
+            .stroke(stroke)
+            .rounding(3.0)
+            .inner_margin(egui::Margin::symmetric(6.0, 4.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("▾", |ui| {
+                        for (i, (label, _)) in choices.iter().enumerate() {
+                            if ui.selectable_label(*selected == Some(i), label).clicked() {
+                                *selected = Some(i);
+                                chosen = true;
+                                ui.close_menu();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text("Choose from the list");
+                    // The rest of the box, left of the arrow, activates it.
+                    let layout = egui::Layout::left_to_right(egui::Align::Center);
+                    ui.with_layout(layout, |ui| {
+                        let text = match current {
+                            Some(label) => RichText::new(label),
+                            None => RichText::new(hint).italics().weak(),
+                        };
+                        let label = ui.add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        let rest = ui.allocate_response(
+                            egui::vec2(ui.available_width(), label.rect.height()),
+                            egui::Sense::click(),
+                        );
+                        let hover = if active {
+                            "Click in the graphics area or the tree to fill this in"
+                        } else {
+                            "Click here, then in the graphics area or the tree"
+                        };
+                        clicked = label.on_hover_text(hover).clicked()
+                            || rest.on_hover_text(hover).clicked();
+                    });
+                });
+            });
+    });
+    clicked || chosen
+}
+
+/// `reference_box` for a field that always has a value.
+fn reference_box_set<T>(
+    ui: &mut egui::Ui,
+    id: &str,
+    choices: &[(String, T)],
+    selected: &mut usize,
+    active: bool,
+    hint: &str,
+) -> bool {
+    let mut value = Some(*selected);
+    let clicked = reference_box(ui, id, choices, &mut value, active, hint);
+    if let Some(value) = value {
+        *selected = value;
+    }
+    clicked
+}
+
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(title).strong());
-}
-
-fn combo<T>(ui: &mut egui::Ui, id: &str, choices: &[(String, T)], selected: &mut usize) {
-    let text = choices
-        .get(*selected)
-        .map_or("(none available)", |(label, _)| label.as_str());
-    egui::ComboBox::from_id_salt(id)
-        .selected_text(text)
-        .width(ui.available_width() - 8.0)
-        .show_ui(ui, |ui| {
-            for (i, (label, _)) in choices.iter().enumerate() {
-                ui.selectable_value(selected, i, label);
-            }
-        });
 }
 
 fn degrees(ui: &mut egui::Ui, value: &mut f64) {
@@ -409,10 +488,14 @@ impl OxydeApp {
                     match self.axis_of_pick(&pick, d.editing) {
                         Some((axis, label)) => {
                             let i = choose(&mut d.axes, axis, label);
-                            if d.second && d.second_next {
-                                d.axis2 = i;
+                            if d.kind == PatternKind::Linear && d.second && d.second_next {
+                                d.axis2 = Some(i);
                             } else {
                                 d.axis = i;
+                                // On to the second direction while it is still empty.
+                                if d.kind == PatternKind::Linear && d.second && d.axis2.is_none() {
+                                    d.second_next = true;
+                                }
                             }
                             true
                         }
@@ -490,8 +573,8 @@ impl OxydeApp {
                     let mut v: Vec<Pick> = axis(d.axes.get(d.axis).map(|(_, a)| a))
                         .into_iter()
                         .collect();
-                    if d.second {
-                        v.extend(axis(d.axes.get(d.axis2).map(|(_, a)| a)));
+                    if d.kind == PatternKind::Linear && d.second {
+                        v.extend(axis(d.axis2.and_then(|i| d.axes.get(i)).map(|(_, a)| a)));
                     }
                     v
                 }
@@ -627,7 +710,8 @@ impl OxydeApp {
                     PatternKind::Circular => (Icon::CircularPattern, "Circular Pattern"),
                     PatternKind::Mirror => (Icon::Mirror, "Mirror"),
                 };
-                (icon, title, !d.seeds.is_empty())
+                let directions = d.kind != PatternKind::Linear || !d.second || d.axis2.is_some();
+                (icon, title, !d.seeds.is_empty() && directions)
             }
             Dialog::RefPlane(_) => (Icon::RefPlane, "Plane", true),
             Dialog::RefAxis(_) => (Icon::RefAxis, "Axis", true),
@@ -733,9 +817,16 @@ impl OxydeApp {
         section(ui, "Material");
         operation(ui, &mut d.op, self.doc.part.body().is_some());
         section(ui, "Axis");
-        combo(ui, "revolve_axis", &d.axes, &mut d.axis);
+        reference_box_set(
+            ui,
+            "revolve_axis",
+            &d.axes,
+            &mut d.axis,
+            true,
+            "Select an edge, a round face or an axis",
+        );
         ui.label(
-            RichText::new("A centerline of the sketch, or click an edge, a round face or an axis.")
+            RichText::new("The arrow lists the sketch's centerlines too.")
                 .small()
                 .weak(),
         );
@@ -811,7 +902,17 @@ impl OxydeApp {
         match d.kind {
             PatternKind::Linear => {
                 section(ui, "Direction 1");
-                combo(ui, "pattern_axis", &d.axes, &mut d.axis);
+                let first_active = !(d.second && d.second_next);
+                if reference_box_set(
+                    ui,
+                    "pattern_axis",
+                    &d.axes,
+                    &mut d.axis,
+                    first_active,
+                    "Select an edge, a face or an axis",
+                ) {
+                    d.second_next = false;
+                }
                 egui::Grid::new("pattern_d1").num_columns(2).show(ui, |ui| {
                     ui.label("Spacing");
                     positive_length(ui, &mut d.spacing);
@@ -822,9 +923,21 @@ impl OxydeApp {
                 });
                 ui.checkbox(&mut d.reverse, "Reverse direction");
                 ui.add_space(4.0);
-                ui.checkbox(&mut d.second, "Direction 2");
+                if ui.checkbox(&mut d.second, "Direction 2").changed() {
+                    // Turned on: the next click sets it.
+                    d.second_next = d.second;
+                }
                 if d.second {
-                    combo(ui, "pattern_axis2", &d.axes, &mut d.axis2);
+                    if reference_box(
+                        ui,
+                        "pattern_axis2",
+                        &d.axes,
+                        &mut d.axis2,
+                        d.second_next,
+                        "Select an edge, a face or an axis",
+                    ) {
+                        d.second_next = true;
+                    }
                     egui::Grid::new("pattern_d2").num_columns(2).show(ui, |ui| {
                         ui.label("Spacing");
                         positive_length(ui, &mut d.spacing2);
@@ -834,16 +947,18 @@ impl OxydeApp {
                         ui.end_row();
                     });
                     ui.checkbox(&mut d.reverse2, "Reverse direction 2");
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Clicks set").small().weak());
-                        ui.radio_value(&mut d.second_next, false, "Direction 1");
-                        ui.radio_value(&mut d.second_next, true, "Direction 2");
-                    });
                 }
             }
             PatternKind::Circular => {
                 section(ui, "Axis");
-                combo(ui, "pattern_axis", &d.axes, &mut d.axis);
+                reference_box_set(
+                    ui,
+                    "pattern_axis",
+                    &d.axes,
+                    &mut d.axis,
+                    true,
+                    "Select a round edge or face, or an axis",
+                );
                 egui::Grid::new("pattern_circ")
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -863,11 +978,13 @@ impl OxydeApp {
             }
             PatternKind::Mirror => {
                 section(ui, "Mirror plane");
-                combo(ui, "mirror_plane", &d.planes, &mut d.plane);
-                ui.label(
-                    RichText::new("Or click a plane in the tree or a flat face.")
-                        .small()
-                        .weak(),
+                reference_box_set(
+                    ui,
+                    "mirror_plane",
+                    &d.planes,
+                    &mut d.plane,
+                    true,
+                    "Select a plane or a flat face",
                 );
             }
         }
@@ -879,11 +996,13 @@ impl OxydeApp {
 
 fn ref_plane_body(ui: &mut egui::Ui, d: &mut PlaneDialog) {
     section(ui, "Offset from");
-    combo(ui, "plane_base", &d.planes, &mut d.base);
-    ui.label(
-        RichText::new("Or click a plane in the tree or a flat face.")
-            .small()
-            .weak(),
+    reference_box_set(
+        ui,
+        "plane_base",
+        &d.planes,
+        &mut d.base,
+        true,
+        "Select a plane or a flat face",
     );
     section(ui, "Distance");
     ui.horizontal(|ui| {
@@ -898,16 +1017,37 @@ fn ref_axis_body(ui: &mut egui::Ui, d: &mut AxisDialog) {
     ui.radio_value(&mut d.two_planes, true, "Where two planes meet");
     if d.two_planes {
         section(ui, "First plane");
-        combo(ui, "axis_plane_a", &d.planes, &mut d.plane_a);
+        let hint = "Select a plane or a flat face";
+        if reference_box_set(
+            ui,
+            "axis_plane_a",
+            &d.planes,
+            &mut d.plane_a,
+            !d.next_b,
+            hint,
+        ) {
+            d.next_b = false;
+        }
         section(ui, "Second plane");
-        combo(ui, "axis_plane_b", &d.planes, &mut d.plane_b);
+        if reference_box_set(
+            ui,
+            "axis_plane_b",
+            &d.planes,
+            &mut d.plane_b,
+            d.next_b,
+            hint,
+        ) {
+            d.next_b = true;
+        }
     } else {
         section(ui, "Along");
-        combo(ui, "axis_along", &d.axes, &mut d.axis);
+        reference_box_set(
+            ui,
+            "axis_along",
+            &d.axes,
+            &mut d.axis,
+            true,
+            "Select an edge, a face or an axis",
+        );
     }
-    ui.label(
-        RichText::new("Clicks in the tree or the graphics area fill these in.")
-            .small()
-            .weak(),
-    );
 }

@@ -66,11 +66,12 @@ pub struct PatternDialog {
     pub count: u32,
     pub reverse: bool,
     pub second: bool,
-    pub axis2: usize,
+    /// None until a second direction is picked.
+    pub axis2: Option<usize>,
     pub spacing2: f64,
     pub count2: u32,
     pub reverse2: bool,
-    /// Whether clicked edges set direction 2 rather than direction 1.
+    /// Whether clicks set direction 2 rather than direction 1: the active selection box.
     pub second_next: bool,
     /// Degrees.
     pub angle: f64,
@@ -365,7 +366,7 @@ impl OxydeApp {
             count: 3,
             reverse: false,
             second: false,
-            axis2: 1,
+            axis2: None,
             spacing2: 20.0,
             count2: 2,
             reverse2: false,
@@ -376,14 +377,21 @@ impl OxydeApp {
             axes,
             planes,
         };
-        // A selected edge or face is the most likely direction.
+        // A selected edge or face is the most likely direction; a second one, the second
+        // direction.
         if editing.is_none() {
-            if let Some(i) = d
+            let mut picked = d
                 .axes
                 .iter()
-                .position(|(_, a)| matches!(a, AxisRef::Edge(_) | AxisRef::Face(_)))
-            {
+                .enumerate()
+                .filter(|(_, (_, a))| matches!(a, AxisRef::Edge(_) | AxisRef::Face(_)))
+                .map(|(i, _)| i);
+            if let Some(i) = picked.next() {
                 d.axis = i;
+            }
+            if let (PatternKind::Linear, Some(i)) = (kind, picked.next()) {
+                d.second = true;
+                d.axis2 = Some(i);
             }
             if let Some(i) = d
                 .planes
@@ -406,7 +414,7 @@ impl OxydeApp {
                 d.reverse = p.first.reverse;
                 if let Some(second) = &p.second {
                     d.second = true;
-                    d.axis2 = position(&d.axes, Some(&second.axis));
+                    d.axis2 = Some(position(&d.axes, Some(&second.axis)));
                     d.spacing2 = second.spacing;
                     d.count2 = second.count;
                     d.reverse2 = second.reverse;
@@ -570,8 +578,9 @@ impl OxydeApp {
                     return;
                 };
                 let second = if d.second {
-                    let Some(axis2) = axis(d.axis2) else {
-                        self.status = "Choose the second direction".to_owned();
+                    let Some(axis2) = d.axis2.and_then(axis) else {
+                        self.status =
+                            "Select the second direction: an edge, a face or an axis".to_owned();
                         return;
                     };
                     Some(PatternDirection {

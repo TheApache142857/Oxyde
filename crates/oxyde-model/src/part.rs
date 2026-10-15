@@ -1167,6 +1167,15 @@ fn linear_instances(
         Some(direction) => (step(direction, warnings)?, direction.count.max(1)),
         None => (oxyde_geom::Vec3::ZERO, 1),
     };
+    // Parallel directions would stack the second row on the first.
+    if count1 > 1
+        && count2 > 1
+        && first.cross(second).length() <= 1e-9 * first.length() * second.length()
+    {
+        return Err(
+            "the two directions are parallel: pick a second direction across the first".to_owned(),
+        );
+    }
     check_count(u64::from(count1) * u64::from(count2))?;
     let mut out = Vec::new();
     for j in 0..count2 {

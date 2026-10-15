@@ -6,6 +6,8 @@
 //!      installer folder, or a CMake install prefix)
 //!   3. `VCPKG_ROOT` — uses `%VCPKG_ROOT%\installed\x64-windows`
 //!
+//! `OXYDE_OCCT_CHECK_ONLY=1` skips all of this, for `cargo check` on other systems.
+//!
 //! See `docs/BUILDING.md`.
 
 use std::env;
@@ -44,8 +46,14 @@ fn main() {
         "OXYDE_OCCT_INCLUDE_DIR",
         "OXYDE_OCCT_LIB_DIR",
         "VCPKG_ROOT",
+        "OXYDE_OCCT_CHECK_ONLY",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
+    }
+
+    // `cargo check` without OpenCASCADE, on any system: nothing to compile or link.
+    if env::var_os("OXYDE_OCCT_CHECK_ONLY").is_some() {
+        return;
     }
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
