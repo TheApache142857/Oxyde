@@ -999,7 +999,11 @@ impl OxydeApp {
             return;
         }
         let picks = self.panel_picks().unwrap_or_else(|| self.selection_picks());
-        let hint = (self.doc.part.body().is_none() && self.dialog.is_none() && !self.splash.open)
+        // Only for an empty part: once there is a sketch or a failed feature, the hint would
+        // cover the geometry and contradict the status bar.
+        let hint = (self.doc.part.features().is_empty()
+            && self.dialog.is_none()
+            && !self.splash.open)
             .then_some(
                 "Start with a sketch (Sketch tab), then Extrude it — or File › Open demo bracket",
             );

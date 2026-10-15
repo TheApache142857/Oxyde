@@ -1835,7 +1835,13 @@ pub fn interact(
 
     if session.tool == Tool::Select {
         if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(press) = response.interact_pointer_pos() {
+            // Where the button went down: egui reports the drag only once the pointer has
+            // moved past its click distance, and a quick drag is by then off the point it
+            // grabbed (and a dragged line would lag the cursor by that much).
+            let press = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(press) = press {
                 let hit = session.hit(press, &to_screen);
                 if let (Some(id), Some(at)) = (hit, to_plane(press)) {
                     session.start_drag(id, at);
