@@ -1,6 +1,7 @@
 use oxyde_kernel::Mesh;
 
 use crate::camera::Camera;
+use crate::style::Style;
 use crate::vec3::{V3, add, cross, dot, lerp, normalize, scale, sub};
 
 /// What is under a pixel: a face or an edge, by index into the shape's topology.
@@ -191,32 +192,29 @@ impl Frame {
     }
 }
 
-const BACKGROUND_TOP: [f32; 3] = [205.0, 214.0, 228.0];
-const BACKGROUND_BOTTOM: [f32; 3] = [246.0, 247.0, 249.0];
-const FACE: [f32; 3] = [182.0, 190.0, 202.0];
-const FACE_SELECTED: [f32; 3] = [96.0, 160.0, 255.0];
-const FACE_HOVERED: [f32; 3] = [255.0, 178.0, 92.0];
-const EDGE: [u8; 3] = [32, 36, 44];
-const EDGE_SELECTED: [u8; 3] = [0, 110, 255];
-const EDGE_HOVERED: [u8; 3] = [255, 128, 0];
+fn rgb(c: [u8; 3]) -> [f32; 3] {
+    c.map(f32::from)
+}
 
-fn face_color(face: u32, highlight: &Highlight) -> [f32; 3] {
+fn face_color(face: u32, highlight: &Highlight, style: &Style) -> [f32; 3] {
     if highlight.hovered == Some(Pick::Face(face)) {
-        FACE_HOVERED
+        rgb(style.face_hovered)
     } else if highlight.selected.contains(&Pick::Face(face)) {
-        FACE_SELECTED
+        rgb(style.face_selected)
     } else {
-        FACE
+        rgb(style.face)
     }
 }
 
-fn edge_style(edge: u32, highlight: &Highlight) -> ([u8; 3], i64) {
+/// Colour and width in whole pixels (the software renderer draws square pens).
+fn edge_style(edge: u32, highlight: &Highlight, style: &Style) -> ([u8; 3], i64) {
+    let px = |w: f32| (w.round() as i64).max(1);
     if highlight.hovered == Some(Pick::Edge(edge)) {
-        (EDGE_HOVERED, 3)
+        (style.edge_hovered, px(style.highlight_width))
     } else if highlight.selected.contains(&Pick::Edge(edge)) {
-        (EDGE_SELECTED, 3)
+        (style.edge_selected, px(style.highlight_width))
     } else {
-        (EDGE, 1)
+        (style.edge, px(style.edge_width))
     }
 }
 
@@ -244,13 +242,26 @@ fn shade(n: V3, lights: &Lights) -> f32 {
     (0.38 + 0.37 * facing + 0.40 * key) as f32
 }
 
-/// Renders `scene` seen through `camera` into a `width` × `height` pixel frame.
+/// Renders `scene` seen through `camera` into a `width` × `height` pixel frame, in the
+/// default style.
 pub fn render(
     scene: &Scene,
     camera: &Camera,
     width: usize,
     height: usize,
     highlight: &Highlight,
+) -> Frame {
+    render_styled(scene, camera, width, height, highlight, &Style::default())
+}
+
+/// [`render`] in a given style.
+pub fn render_styled(
+    scene: &Scene,
+    camera: &Camera,
+    width: usize,
+    height: usize,
+    highlight: &Highlight,
+    style: &Style,
 ) -> Frame {
     let n = width * height;
     let mut frame = Frame {
@@ -264,9 +275,8 @@ pub fn render(
 
     for y in 0..height {
         let t = y as f32 / (height.max(2) - 1) as f32;
-        let c: [u8; 3] = std::array::from_fn(|k| {
-            (BACKGROUND_TOP[k] + (BACKGROUND_BOTTOM[k] - BACKGROUND_TOP[k]) * t) as u8
-        });
+        let (top, bottom) = (rgb(style.background_top), rgb(style.background_bottom));
+        let c: [u8; 3] = std::array::from_fn(|k| (top[k] + (bottom[k] - top[k]) * t) as u8);
         for x in 0..width {
             frame.put(y * width + x, c);
         }
@@ -279,7 +289,7 @@ pub fn render(
     };
 
     for (index, face) in scene.faces.iter().enumerate() {
-        let base = face_color(index as u32, highlight);
+        let base = face_color(index as u32, highlight, style);
         let projected: Vec<V3> = face
             .positions
             .iter()
@@ -299,8 +309,13 @@ pub fn render(
 
     // Edges are drawn over faces they lie on, but hidden behind faces in front of them.
     let bias = (camera.height * 0.004) as f32;
-    for (index, edge) in scene.edges.iter().enumerate() {
-        let (color, thickness) = edge_style(index as u32, highlight);
+    let edges = if style.show_edges {
+        scene.edges.as_slice()
+    } else {
+        &[]
+    };
+    for (index, edge) in edges.iter().enumerate() {
+        let (color, thickness) = edge_style(index as u32, highlight, style);
         let points: Vec<V3> = edge.iter().map(|&p| camera.project(p, w, h)).collect();
         for segment in points.windows(2) {
             draw_line(
@@ -573,5 +588,30 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn styles_change_colours_and_can_hide_edges() {
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let style = Style::DARK;
+        let empty = render_styled(
+            &Scene::default(),
+            &camera,
+            100,
+            100,
+            &Highlight::default(),
+            &style,
+        );
+        assert_eq!(&empty.rgba[0..3], &style.background_top);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(0)));
+        let plain = Style {
+            show_edges: false,
+            ..Style::LIGHT
+        };
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &plain);
+        assert!(frame.edge_ids.iter().all(|&e| e == 0));
+        assert!(frame.face_ids.iter().any(|&f| f != 0));
     }
 }

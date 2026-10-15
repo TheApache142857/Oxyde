@@ -11,7 +11,7 @@
 
 use eframe::egui;
 use oxyde_geom::{Plane, Point2, Point3};
-use oxyde_render::{Camera, Frame, Highlight, Pick, Scene, StandardView, render};
+use oxyde_render::{Camera, Frame, Highlight, Pick, Scene, StandardView, Style, render_styled};
 
 /// What happened in the viewport this frame.
 pub struct ViewportOutput {
@@ -75,8 +75,31 @@ struct Animation {
     start: f64,
 }
 
-/// How long view changes take, in seconds.
-const ANIMATION: f64 = 0.45;
+/// How the viewport looks and responds: set from the preferences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewSettings {
+    pub style: Style,
+    pub show_triad: bool,
+    /// 1 = default.
+    pub orbit_speed: f64,
+    pub zoom_speed: f64,
+    pub invert_zoom: bool,
+    /// Seconds a view change takes; 0 = at once.
+    pub animation_time: f64,
+}
+
+impl Default for ViewSettings {
+    fn default() -> Self {
+        Self {
+            style: Style::default(),
+            show_triad: true,
+            orbit_speed: 1.0,
+            zoom_speed: 1.0,
+            invert_zoom: false,
+            animation_time: 0.45,
+        }
+    }
+}
 
 /// The camera between `from` (t = 0) and `to` (t = 1): the shorter way round, zooming
 /// geometrically.
@@ -103,6 +126,7 @@ struct RenderKey {
     size: [usize; 2],
     highlight: Highlight,
     scene: u64,
+    style: Style,
 }
 
 pub struct Viewport {
@@ -127,6 +151,9 @@ pub struct Viewport {
     pub grab_enabled: bool,
     /// The pick under the pointer when the current grab started.
     grabbed: Option<Option<Pick>>,
+    pub settings: ViewSettings,
+    /// Triangles and edge segments of the scene.
+    scene_counts: (usize, usize),
 }
 
 impl Viewport {
@@ -148,6 +175,8 @@ impl Viewport {
             renderer: "software".to_owned(),
             grab_enabled: false,
             grabbed: None,
+            settings: ViewSettings::default(),
+            scene_counts: (0, 0),
         }
     }
 
@@ -170,8 +199,10 @@ impl Viewport {
     }
 
     pub fn set_scene(&mut self, scene: Scene, fit: bool) {
+        let mesh = scene.gpu_mesh();
+        self.scene_counts = (mesh.indices.len() / 3, mesh.segments.len());
         if let Some(gpu) = self.gpu.as_mut() {
-            gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
+            gpu.set_mesh(&mesh, scene.bounds());
         }
         self.scene = scene;
         self.scene_version += 1;
@@ -286,7 +317,12 @@ impl Viewport {
             });
         }
         if let Some(animation) = self.animation {
-            let t = ((now - animation.start) / ANIMATION).clamp(0.0, 1.0);
+            let duration = self.settings.animation_time;
+            let t = if duration <= 0.0 {
+                1.0
+            } else {
+                ((now - animation.start) / duration).clamp(0.0, 1.0)
+            };
             let eased = t * t * (3.0 - 2.0 * t);
             self.camera = interpolate(&animation.from, &animation.to, eased);
             if t >= 1.0 {
@@ -341,7 +377,8 @@ impl Viewport {
             self.camera
                 .pan(delta.x as f64 * ppp as f64, delta.y as f64 * ppp as f64, h);
         } else if orbiting {
-            self.camera.orbit(delta.x as f64, delta.y as f64);
+            let k = self.settings.orbit_speed;
+            self.camera.orbit(delta.x as f64 * k, delta.y as f64 * k);
         }
 
         let pointer = response.hover_pos().map(|p| {
@@ -353,7 +390,9 @@ impl Viewport {
             if scroll != 0.0 {
                 self.animation = None;
                 if let Some(cursor) = pointer {
-                    let factor = (-(scroll as f64) * 0.0015).exp();
+                    let sign = if self.settings.invert_zoom { 1.0 } else { -1.0 };
+                    let rate = 0.0015 * self.settings.zoom_speed;
+                    let factor = (sign * scroll as f64 * rate).exp();
                     self.camera.zoom_at(factor, cursor, w, h);
                 }
             }
@@ -391,20 +430,35 @@ impl Viewport {
                 selected,
             },
             scene: self.scene_version,
+            style: self.settings.style,
         };
-        let image_changed = self
-            .rendered
-            .as_ref()
-            .is_none_or(|k| k.camera != key.camera || k.size != key.size || k.scene != key.scene);
+        let image_changed = self.rendered.as_ref().is_none_or(|k| {
+            k.camera != key.camera
+                || k.size != key.size
+                || k.scene != key.scene
+                || k.style != key.style
+        });
         if image_changed {
             self.last_pick = None;
         }
         if let (Some(gpu), true) = (self.gpu.as_mut(), self.rendered.as_ref() != Some(&key)) {
-            self.gpu_texture =
-                Some(gpu.render(&self.camera, width as u32, height as u32, &key.highlight));
+            self.gpu_texture = Some(gpu.render(
+                &self.camera,
+                width as u32,
+                height as u32,
+                &key.highlight,
+                &key.style,
+            ));
             self.rendered = Some(key);
         } else if self.rendered.as_ref() != Some(&key) {
-            let frame = render(&self.scene, &self.camera, width, height, &key.highlight);
+            let frame = render_styled(
+                &self.scene,
+                &self.camera,
+                width,
+                height,
+                &key.highlight,
+                &key.style,
+            );
             let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.rgba);
             if let Some(texture) = self.texture.as_mut() {
                 texture.set(image, egui::TextureOptions::NEAREST);
@@ -429,7 +483,9 @@ impl Viewport {
                 egui::Color32::WHITE,
             );
         }
-        self.draw_triad(&painter, rect);
+        if self.settings.show_triad {
+            self.draw_triad(&painter, rect);
+        }
         if let Some(hint) = hint {
             painter.text(
                 rect.center(),
@@ -448,6 +504,16 @@ impl Viewport {
             pixels_per_point: ppp,
             grab,
         }
+    }
+
+    /// What is under the pointer now.
+    pub fn hovered(&self) -> Option<Pick> {
+        self.hovered
+    }
+
+    /// Faces (triangles) and edge segments in the scene, for the debug overlay.
+    pub fn scene_size(&self) -> (usize, usize) {
+        self.scene_counts
     }
 
     /// Small X/Y/Z axes in the lower-left corner, showing the current orientation.

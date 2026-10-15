@@ -129,6 +129,11 @@ pub struct OxydeApp {
     pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
     /// The assembly a part was opened from, to go back to.
     pub(crate) return_to: Option<PathBuf>,
+    pub(crate) prefs: crate::prefs::Preferences,
+    pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
+    pub(crate) debug_stats: crate::prefs_ui::DebugStats,
+    /// Where the viewport was last drawn, for the debug overlay.
+    pub(crate) viewport_rect: egui::Rect,
 }
 
 impl OxydeApp {
@@ -164,11 +169,23 @@ impl OxydeApp {
             grabbing: None,
             pending_open_component: None,
             return_to: None,
+            prefs: crate::prefs::Preferences::load(),
+            prefs_window: Default::default(),
+            debug_stats: Default::default(),
+            viewport_rect: egui::Rect::NOTHING,
         };
+        app.apply_preferences(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
             let info = state.adapter.get_info();
             app.viewport.enable_gpu(
-                crate::gpu::GpuViewport::new(state),
+                crate::gpu::GpuViewport::new(
+                    state,
+                    if app.prefs.graphics.antialiasing {
+                        crate::gpu::DEFAULT_SAMPLES
+                    } else {
+                        1
+                    },
+                ),
                 format!("GPU: {} ({:?})", info.name, info.backend),
             );
         }
@@ -181,7 +198,9 @@ impl OxydeApp {
     // ---- Model changes -----------------------------------------------------------------------
 
     pub(crate) fn rebuild(&mut self) {
+        let start = std::time::Instant::now();
         self.doc.rebuild(&mut self.kernel);
+        self.debug_stats.rebuild = Some(start.elapsed().as_secs_f64());
     }
 
     /// Adds a feature at the rollback bar as one undo step, rebuilds and selects it.
@@ -843,6 +862,7 @@ impl OxydeApp {
         self.refresh_scene();
         if self.sketch.is_some() {
             let output = self.viewport.ui(ui, Vec::new(), None, true);
+            self.viewport_rect = output.rect;
             let request = match self.sketch.as_mut() {
                 Some(session) => sketch_mode::interact(session, &self.viewport, ui, &output),
                 None => None,
@@ -870,6 +890,7 @@ impl OxydeApp {
             "Start with a sketch (Sketch tab), then Extrude it — or File › Open demo bracket",
         );
         let output = self.viewport.ui(ui, picks, hint, false);
+        self.viewport_rect = output.rect;
         let overlays = self.draw_references(ui, &output);
         if let Some(pick) = output.clicked {
             let position = output.response.interact_pointer_pos();
@@ -1271,7 +1292,7 @@ impl OxydeApp {
         };
         match self
             .kernel
-            .tessellate(body.shape, deflection(&body.topology))
+            .tessellate(body.shape, deflection(&body.topology, self.mesh_fraction()))
         {
             Ok(mesh) => self.viewport.set_scene(Scene::from_mesh(&mesh), first),
             Err(e) => self.status = format!("Display failed: {e}"),
@@ -1314,79 +1335,23 @@ impl OxydeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, KeyboardShortcut, Modifiers};
-        let command = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
-        let (redo_shift, undo, redo, save, open, new, rebuild) = ctx.input_mut(|i| {
-            (
-                i.consume_shortcut(&KeyboardShortcut::new(
-                    Modifiers::COMMAND | Modifiers::SHIFT,
-                    Key::Z,
-                )),
-                i.consume_shortcut(&command(Key::Z)),
-                i.consume_shortcut(&command(Key::Y)),
-                i.consume_shortcut(&command(Key::S)),
-                i.consume_shortcut(&command(Key::O)),
-                i.consume_shortcut(&command(Key::N)),
-                i.consume_shortcut(&command(Key::B)),
-            )
-        });
-        if let Some(session) = self.sketch.as_mut() {
-            // In sketch mode, undo works inside the sketch.
-            if undo {
-                session.undo();
-            }
-        } else {
-            if undo {
-                self.undo();
-            }
-            if redo || redo_shift {
-                self.redo();
-            }
-        }
-        if save {
-            self.save();
-        }
-        if open {
-            self.guard(PendingAction::Open, ctx);
-        }
-        if new {
-            self.guard(PendingAction::New, ctx);
-        }
-        if rebuild {
-            self.doc.release(&mut self.kernel);
-            self.rebuild();
-        }
+        use egui::{Key, Modifiers};
+        self.dispatch_shortcuts(ctx);
 
-        // Plain keys only when no text field has the focus.
+        // Escape is not configurable: it always cancels.
         if self.dialog.is_none() && !ctx.wants_keyboard_input() {
-            let (fit, delete, escape) = ctx.input_mut(|i| {
-                (
-                    i.consume_key(Modifiers::NONE, Key::F),
-                    i.consume_key(Modifiers::NONE, Key::Delete),
-                    i.consume_key(Modifiers::NONE, Key::Escape),
-                )
-            });
-            if fit {
-                self.viewport.request_fit();
+            let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            if !escape {
+                return;
             }
             if let Some(session) = self.sketch.as_mut() {
-                if delete {
-                    session.delete_selection();
-                }
-                if escape && !session.cancel_operation() {
+                if !session.cancel_operation() {
                     self.finish_sketch(true);
                 }
                 return;
             }
-            if delete {
-                if let Some(id) = self.selected_feature {
-                    self.delete_feature(id);
-                }
-            }
-            if escape {
-                self.selection.clear();
-                self.selected_plane = None;
-            }
+            self.selection.clear();
+            self.selected_plane = None;
         }
     }
 
@@ -1486,7 +1451,8 @@ fn overlay_at(
 }
 
 /// Mesh precision: about a thousandth of the part size.
-pub(crate) fn deflection(topology: &Topology) -> f64 {
+/// Mesh precision: `fraction` of the part size (about a thousandth by default).
+pub(crate) fn deflection(topology: &Topology, fraction: f64) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     let points = topology
@@ -1502,7 +1468,7 @@ pub(crate) fn deflection(topology: &Topology) -> f64 {
     }
     let diagonal = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
     if diagonal.is_finite() && diagonal > 0.0 {
-        (diagonal * 0.001).clamp(0.002, 5.0)
+        (diagonal * fraction).clamp(0.0005, 5.0)
     } else {
         0.05
     }
@@ -1525,6 +1491,8 @@ impl eframe::App for OxydeApp {
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| self.assembly_viewport(ui));
             self.bom_window(ctx);
+            self.preferences_window(ctx);
+            self.debug_overlay(ctx, self.viewport_rect);
             self.dialogs_ui(ctx);
             self.update_title(ctx);
             return;
@@ -1549,6 +1517,8 @@ impl eframe::App for OxydeApp {
 
         self.equations_window(ctx);
         self.evaluate_windows(ctx);
+        self.preferences_window(ctx);
+        self.debug_overlay(ctx, self.viewport_rect);
         self.dialogs_ui(ctx);
         self.update_title(ctx);
     }

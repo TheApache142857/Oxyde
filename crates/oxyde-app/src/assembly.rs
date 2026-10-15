@@ -135,6 +135,10 @@ pub struct AssemblyDoc {
     pub expanded: HashSet<ComponentId>,
     /// The combined mesh's faces and edges, per part occurrence, from the last scene.
     pub ranges: Vec<MeshRange<Occurrence>>,
+    /// Mesh precision for parts, as a fraction of their size (from the preferences).
+    pub mesh_fraction: f64,
+    /// How long the last solve took, seconds.
+    pub last_solve: Option<f64>,
     undo: Vec<Assembly>,
     redo: Vec<Assembly>,
 }
@@ -161,6 +165,8 @@ impl AssemblyDoc {
             selection: Vec::new(),
             expanded: HashSet::new(),
             ranges: Vec::new(),
+            mesh_fraction: 0.001,
+            last_solve: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -220,6 +226,7 @@ impl AssemblyDoc {
                 kernel,
                 &mut notes,
                 &component.name,
+                self.mesh_fraction,
             );
             self.sources.insert(component.id, path);
         }
@@ -390,10 +397,12 @@ impl AssemblyDoc {
 
     /// Solves the document's own mates.
     pub fn solve(&mut self) {
+        let start = std::time::Instant::now();
         let mut assembly = std::mem::take(&mut self.assembly);
         let solution = self.solve_assembly(&mut assembly);
         self.assembly = assembly;
         self.solution = Some(solution);
+        self.last_solve = Some(start.elapsed().as_secs_f64());
         self.revision += 1;
     }
 
@@ -604,7 +613,16 @@ impl AssemblyDoc {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        load_into(&mut self.docs, path, &mut stack, kernel, &mut notes, &name);
+        let fraction = self.mesh_fraction;
+        load_into(
+            &mut self.docs,
+            path,
+            &mut stack,
+            kernel,
+            &mut notes,
+            &name,
+            fraction,
+        );
         match self.docs.get(path) {
             Some(Ok(_)) => Ok(()),
             Some(Err(e)) => {
@@ -711,6 +729,7 @@ fn load_into<K: Kernel>(
     kernel: &mut K,
     notes: &mut Vec<String>,
     name: &str,
+    fraction: f64,
 ) {
     if stack.iter().any(|p| p == path) {
         // Not stored: the assembly holding it is refused instead (see below).
@@ -746,6 +765,7 @@ fn load_into<K: Kernel>(
                         kernel,
                         notes,
                         &format!("{name} › {}", c.name),
+                        fraction,
                     );
                     sources.insert(c.id, inner);
                 }
@@ -769,7 +789,7 @@ fn load_into<K: Kernel>(
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
     } else {
-        load(path, kernel).map(Loaded::Part)
+        load(path, kernel, fraction).map(Loaded::Part)
     };
     if let Err(e) = &loaded {
         notes.push(format!("{name}: {e}"));
@@ -778,14 +798,14 @@ fn load_into<K: Kernel>(
 }
 
 /// Opens and rebuilds a part file, and meshes it.
-pub fn load<K: Kernel>(path: &Path, kernel: &mut K) -> Result<LoadedPart, String> {
+pub fn load<K: Kernel>(path: &Path, kernel: &mut K, fraction: f64) -> Result<LoadedPart, String> {
     let file = oxyde_format::load_part(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut part = Part::from_definition(file.definition).map_err(|e| e.to_string())?;
     part.rebuild(kernel);
     let (mesh, bounds) = match part.body() {
         Some(body) => {
             let mesh = kernel
-                .tessellate(body.shape, deflection(&body.topology))
+                .tessellate(body.shape, deflection(&body.topology, fraction))
                 .ok();
             let bounds = mesh.as_ref().and_then(mesh_bounds);
             (mesh, bounds)

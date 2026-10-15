@@ -215,6 +215,11 @@ impl OxydeApp {
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
+                if ui.button("Preferences…").clicked() {
+                    ui.close_menu();
+                    self.open_preferences(crate::prefs_ui::PrefsTab::Graphics);
+                }
+                ui.separator();
                 if ui.button("Equations…").clicked() {
                     ui.close_menu();
                     self.equations.show(EquationsTab::Equations);
@@ -234,6 +239,10 @@ impl OxydeApp {
                 }
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Keyboard shortcuts").clicked() {
+                    ui.close_menu();
+                    self.open_preferences(crate::prefs_ui::PrefsTab::Shortcuts);
+                }
                 if ui.button("About Oxyde").clicked() {
                     ui.close_menu();
                     self.dialog = Some(Dialog::About);

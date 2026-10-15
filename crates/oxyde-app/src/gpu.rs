@@ -12,9 +12,10 @@
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
-use oxyde_render::{Camera, GpuMesh, Highlight, Pick};
+use oxyde_render::{Camera, GpuMesh, Highlight, Pick, Style};
 
-const SAMPLES: u32 = 4;
+/// Anti-aliasing by default: 4× multisampling.
+pub const DEFAULT_SAMPLES: u32 = 4;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
@@ -30,8 +31,11 @@ struct View {
     key: vec4<f32>,
     // x, y: millimetres to clip space; z: depth scale; w: edge depth bias (mm).
     scale: vec4<f32>,
-    // x, y: viewport size in pixels.
+    // x, y: viewport size in pixels; z: edge width, w: highlighted edge width (pixels).
     viewport: vec4<f32>,
+    // sRGB 0..255: background top and bottom, face, selected and hovered face, edge,
+    // selected and hovered edge.
+    colors: array<vec4<f32>, 8>,
 };
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -73,8 +77,8 @@ fn background_vs(@builtin(vertex_index) i: u32) -> BackgroundOut {
 
 @fragment
 fn background_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
-    let top = vec3<f32>(205.0, 214.0, 228.0);
-    let bottom = vec3<f32>(246.0, 247.0, 249.0);
+    let top = view.colors[0].xyz;
+    let bottom = view.colors[1].xyz;
     return vec4<f32>(linear(mix(top, bottom, clamp(in.t, 0.0, 1.0))), 1.0);
 }
 
@@ -108,11 +112,11 @@ fn face_fs(in: FaceOut) -> @location(0) vec4<f32> {
     }
     let light = 0.38 + 0.37 * dot(n, view.eye.xyz) + 0.40 * max(dot(n, view.key.xyz), 0.0);
     let flags = face_flags[in.face];
-    var base = vec3<f32>(182.0, 190.0, 202.0);
+    var base = view.colors[2].xyz;
     if ((flags & 1u) != 0u) {
-        base = vec3<f32>(255.0, 178.0, 92.0);
+        base = view.colors[4].xyz;
     } else if ((flags & 2u) != 0u) {
-        base = vec3<f32>(96.0, 160.0, 255.0);
+        base = view.colors[3].xyz;
     }
     return vec4<f32>(linear(min(base * light, vec3<f32>(255.0))), 1.0);
 }
@@ -149,9 +153,9 @@ fn edge_vs(
         along = vec2<f32>(1.0, 0.0);
     }
     let side = normalize(vec2<f32>(-along.y, along.x));
-    var width = 1.25;
+    var width = view.viewport.z;
     if (edge_flags[edge] != 0u) {
-        width = 3.0;
+        width = view.viewport.w;
     }
     let p = mix(a, b, corner.x);
     var out: EdgeOut;
@@ -163,11 +167,11 @@ fn edge_vs(
 @fragment
 fn edge_fs(in: EdgeOut) -> @location(0) vec4<f32> {
     let flags = edge_flags[in.edge];
-    var color = vec3<f32>(32.0, 36.0, 44.0);
+    var color = view.colors[5].xyz;
     if ((flags & 1u) != 0u) {
-        color = vec3<f32>(255.0, 128.0, 0.0);
+        color = view.colors[7].xyz;
     } else if ((flags & 2u) != 0u) {
-        color = vec3<f32>(0.0, 110.0, 255.0);
+        color = view.colors[6].xyz;
     }
     return vec4<f32>(linear(color), 1.0);
 }
@@ -190,7 +194,8 @@ fn bytes_u32(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
 struct Targets {
     width: u32,
     height: u32,
-    color: wgpu::TextureView,
+    /// Multisampled image, resolved into `resolved`; none without multisampling.
+    color: Option<wgpu::TextureView>,
     resolved: wgpu::Texture,
     resolved_view: wgpu::TextureView,
     depth: wgpu::TextureView,
@@ -200,7 +205,7 @@ struct Targets {
 }
 
 impl Targets {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    fn new(device: &wgpu::Device, width: u32, height: u32, samples: u32) -> Self {
         let make = |label, format, samples, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -219,14 +224,16 @@ impl Targets {
         };
         let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
         let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
-        let color = make("oxyde color", COLOR_FORMAT, SAMPLES, attachment);
+        // Without multisampling the image is drawn straight into the resolved texture.
+        let color =
+            (samples > 1).then(|| view(&make("oxyde color", COLOR_FORMAT, samples, attachment)));
         let resolved = make(
             "oxyde image",
             COLOR_FORMAT,
             1,
             attachment | wgpu::TextureUsages::TEXTURE_BINDING,
         );
-        let depth = make("oxyde depth", DEPTH_FORMAT, SAMPLES, attachment);
+        let depth = make("oxyde depth", DEPTH_FORMAT, samples, attachment);
         let ids = make(
             "oxyde ids",
             ID_FORMAT,
@@ -237,7 +244,7 @@ impl Targets {
         Self {
             width,
             height,
-            color: view(&color),
+            color,
             resolved_view: view(&resolved),
             resolved,
             depth: view(&depth),
@@ -275,10 +282,13 @@ pub struct GpuViewport {
     bounds: Option<([f64; 3], [f64; 3])>,
     targets: Option<Targets>,
     texture: Option<egui::TextureId>,
+    samples: u32,
 }
 
 impl GpuViewport {
-    pub fn new(state: &egui_wgpu::RenderState) -> Self {
+    /// `samples`: 1 (no anti-aliasing) or 4.
+    pub fn new(state: &egui_wgpu::RenderState, samples: u32) -> Self {
+        let samples = if samples > 1 { 4 } else { 1 };
         let device = state.device.clone();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oxyde viewport"),
@@ -418,7 +428,7 @@ impl GpuViewport {
             "background_fs",
             &[],
             COLOR_FORMAT,
-            SAMPLES,
+            samples,
             depth(false, wgpu::CompareFunction::Always),
         );
         let faces = pipeline(
@@ -427,7 +437,7 @@ impl GpuViewport {
             "face_fs",
             &face_buffers,
             COLOR_FORMAT,
-            SAMPLES,
+            samples,
             depth(true, less),
         );
         let edges = pipeline(
@@ -436,7 +446,7 @@ impl GpuViewport {
             "edge_fs",
             &edge_buffers,
             COLOR_FORMAT,
-            SAMPLES,
+            samples,
             depth(true, wgpu::CompareFunction::LessEqual),
         );
         let face_ids = pipeline(
@@ -459,7 +469,7 @@ impl GpuViewport {
         );
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("oxyde view"),
-            size: 7 * 16,
+            size: 15 * 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -478,6 +488,7 @@ impl GpuViewport {
             bounds: None,
             targets: None,
             texture: None,
+            samples,
         }
     }
 
@@ -544,6 +555,7 @@ impl GpuViewport {
         width: u32,
         height: u32,
         highlight: &Highlight,
+        style: &Style,
     ) -> egui::TextureId {
         let (width, height) = (width.max(1), height.max(1));
         let resized = self
@@ -551,7 +563,7 @@ impl GpuViewport {
             .as_ref()
             .is_none_or(|t| t.width != width || t.height != height);
         if resized {
-            let targets = Targets::new(&self.device, width, height);
+            let targets = Targets::new(&self.device, width, height, self.samples);
             let mut renderer = self.renderer.write();
             match self.texture {
                 Some(id) => renderer.update_egui_texture_from_wgpu_texture(
@@ -615,7 +627,24 @@ impl GpuViewport {
             (1.0 / (2.0 * reach)) as f32,
             (camera.height * 0.004) as f32,
         ]);
-        view.extend([width as f32, height as f32, 0.0, 0.0]);
+        view.extend([
+            width as f32,
+            height as f32,
+            style.edge_width,
+            style.highlight_width,
+        ]);
+        for c in [
+            style.background_top,
+            style.background_bottom,
+            style.face,
+            style.face_selected,
+            style.face_hovered,
+            style.edge,
+            style.edge_selected,
+            style.edge_hovered,
+        ] {
+            view.extend([f32::from(c[0]), f32::from(c[1]), f32::from(c[2]), 0.0]);
+        }
         self.queue.write_buffer(&self.uniforms, 0, &bytes_f32(view));
 
         let (faces, edges) = self
@@ -674,8 +703,8 @@ impl GpuViewport {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("oxyde image"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color,
-                    resolve_target: Some(&targets.resolved_view),
+                    view: targets.color.as_ref().unwrap_or(&targets.resolved_view),
+                    resolve_target: targets.color.as_ref().map(|_| &targets.resolved_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: wgpu::StoreOp::Store,
@@ -700,9 +729,11 @@ impl GpuViewport {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                pass.set_pipeline(&self.edges);
-                pass.set_vertex_buffer(0, mesh.segments.slice(..));
-                pass.draw(0..6, 0..mesh.segment_count);
+                if style.show_edges {
+                    pass.set_pipeline(&self.edges);
+                    pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                    pass.draw(0..6, 0..mesh.segment_count);
+                }
             }
         }
         {
@@ -733,9 +764,11 @@ impl GpuViewport {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                pass.set_pipeline(&self.edge_ids);
-                pass.set_vertex_buffer(0, mesh.segments.slice(..));
-                pass.draw(0..6, 0..mesh.segment_count);
+                if style.show_edges {
+                    pass.set_pipeline(&self.edge_ids);
+                    pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                    pass.draw(0..6, 0..mesh.segment_count);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
@@ -868,9 +901,15 @@ mod tests {
         let (lo, hi) = scene.bounds().unwrap();
         camera.fit(lo, hi, w as f64, h as f64);
 
-        let mut gpu = GpuViewport::new(&state);
+        let mut gpu = GpuViewport::new(&state, super::DEFAULT_SAMPLES);
         gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
-        gpu.render(&camera, w as u32, h as u32, &Highlight::default());
+        gpu.render(
+            &camera,
+            w as u32,
+            h as u32,
+            &Highlight::default(),
+            &oxyde_render::Style::default(),
+        );
         let cpu = render(&scene, &camera, w, h, &Highlight::default());
 
         let (mut faces, mut agree, mut checked) = (0, 0, 0);

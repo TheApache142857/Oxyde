@@ -12,7 +12,9 @@
 
 mod camera;
 mod raster;
+mod style;
 mod vec3;
 
 pub use camera::{Camera, StandardView};
-pub use raster::{Frame, GpuMesh, Highlight, Pick, Scene, render};
+pub use raster::{Frame, GpuMesh, Highlight, Pick, Scene, render, render_styled};
+pub use style::{Rgb, Style};

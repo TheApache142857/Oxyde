@@ -18,6 +18,8 @@ mod features_ui;
 mod gpu;
 mod icons;
 mod model_refs;
+mod prefs;
+mod prefs_ui;
 mod property_manager;
 mod sketch_mode;
 mod timeline;
@@ -51,7 +53,8 @@ fn run(renderer: eframe::Renderer, file: Option<PathBuf>) -> eframe::Result<()> 
 /// the software renderer.
 fn main() -> eframe::Result<()> {
     let file = std::env::args_os().nth(1).map(PathBuf::from);
-    let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"));
+    let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))
+        || prefs::Preferences::load().graphics.renderer == prefs::Renderer::Software;
     if software {
         return run(eframe::Renderer::Glow, file);
     }

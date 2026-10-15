@@ -22,6 +22,8 @@ oxyde-format = { workspace = true }
 oxyde-render = { workspace = true }
 eframe = { workspace = true }
 rfd = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 pollster = "0.3"

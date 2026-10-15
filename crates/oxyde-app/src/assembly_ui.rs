@@ -255,6 +255,7 @@ impl OxydeApp {
     pub(crate) fn enter_assembly(&mut self, mut doc: AssemblyDoc) {
         self.leave_assembly();
         self.dialog = None;
+        doc.mesh_fraction = self.mesh_fraction();
         let notes = doc.load_parts(&mut self.kernel);
         doc.solve();
         let errors = doc.solution.as_ref().map_or(0, Solution::errors);
@@ -626,7 +627,10 @@ impl OxydeApp {
         doc.solve();
     }
 
-    fn delete_selected(&mut self) {
+    pub(crate) fn delete_selected(&mut self) {
+        if self.mate_dialog.is_some() {
+            return;
+        }
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
@@ -658,9 +662,11 @@ impl OxydeApp {
     }
 
     pub(crate) fn reload_assembly_parts(&mut self) {
+        let fraction = self.mesh_fraction();
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
+        doc.mesh_fraction = fraction;
         let notes = doc.reload_parts(&mut self.kernel);
         doc.solve();
         self.status = notes
@@ -752,7 +758,17 @@ impl OxydeApp {
                     self.reload_assembly_parts();
                 }
             });
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Preferences…").clicked() {
+                    ui.close_menu();
+                    self.open_preferences(crate::prefs_ui::PrefsTab::Graphics);
+                }
+            });
             ui.menu_button("Help", |ui| {
+                if ui.button("Keyboard shortcuts").clicked() {
+                    ui.close_menu();
+                    self.open_preferences(crate::prefs_ui::PrefsTab::Shortcuts);
+                }
                 if ui.button("Assembly mouse controls").clicked() {
                     ui.close_menu();
                     self.status = "Alt+drag moves a component, Alt+Shift+drag turns it; mates \
@@ -1359,6 +1375,7 @@ impl OxydeApp {
             .then_some("Insert Component adds a part — then Mate holds parts together");
         self.viewport.grab_enabled = true;
         let output = self.viewport.ui(ui, picks, hint, false);
+        self.viewport_rect = output.rect;
 
         if let Some(grab) = output.grab {
             self.grab_component(&grab);
@@ -1496,38 +1513,7 @@ impl OxydeApp {
     }
 
     pub(crate) fn assembly_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
-            return;
-        }
-        let (undo, redo, save, delete, reload, fit) = ctx.input_mut(|i| {
-            let cmd = egui::Modifiers::COMMAND;
-            (
-                i.consume_key(cmd, egui::Key::Z),
-                i.consume_key(cmd, egui::Key::Y),
-                i.consume_key(cmd, egui::Key::S),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Delete),
-                i.consume_key(cmd, egui::Key::B),
-                i.consume_key(egui::Modifiers::NONE, egui::Key::F),
-            )
-        });
-        if undo {
-            self.asm_undo();
-        }
-        if redo {
-            self.asm_redo();
-        }
-        if save {
-            self.save_assembly(false);
-        }
-        if delete && self.mate_dialog.is_none() {
-            self.delete_selected();
-        }
-        if reload {
-            self.reload_assembly_parts();
-        }
-        if fit {
-            self.viewport.request_fit();
-        }
+        self.dispatch_shortcuts(ctx);
     }
 
     // ---- Bill of materials -----------------------------------------------------------------

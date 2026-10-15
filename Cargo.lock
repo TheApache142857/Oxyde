@@ -2443,6 +2443,8 @@ dependencies = [
  "oxyde-sketch",
  "pollster 0.3.0",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
