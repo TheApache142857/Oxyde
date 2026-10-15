@@ -975,25 +975,41 @@ OpResultData Session::transform(std::uint64_t shape, rust::Slice<const double> r
     });
 }
 
-OpResultData Session::boolean_op(std::uint8_t kind, std::uint64_t target, std::uint64_t tool) {
+OpResultData Session::boolean_op(std::uint8_t kind, std::uint64_t target,
+                                 rust::Slice<const std::uint64_t> tools) {
     return guarded("boolean", [&] {
+        if (tools.empty()) {
+            throw std::invalid_argument("a boolean needs a tool");
+        }
         const TopoDS_Shape& a = get(target);
-        const TopoDS_Shape& b = get(tool);
+        std::vector<TopoDS_Shape> tool_shapes;
+        TopTools_ListOfShape arguments;
+        TopTools_ListOfShape tool_list;
+        arguments.Append(a);
+        for (const std::uint64_t id : tools) {
+            tool_shapes.push_back(get(id));
+            tool_list.Append(tool_shapes.back());
+        }
 
         std::unique_ptr<BRepAlgoAPI_BooleanOperation> op;
         switch (kind) {
         case 0:
-            op = std::make_unique<BRepAlgoAPI_Fuse>(a, b);
+            op = std::make_unique<BRepAlgoAPI_Fuse>();
             break;
         case 1:
-            op = std::make_unique<BRepAlgoAPI_Cut>(a, b);
+            op = std::make_unique<BRepAlgoAPI_Cut>();
             break;
         case 2:
-            op = std::make_unique<BRepAlgoAPI_Common>(a, b);
+            op = std::make_unique<BRepAlgoAPI_Common>();
             break;
         default:
             throw std::invalid_argument("unknown boolean kind " + std::to_string(kind));
         }
+        // All the tools in one operation: one boolean per tool would redo the work on a
+        // target that grows with each (a pattern of n holes cost n² before).
+        op->SetArguments(arguments);
+        op->SetTools(tool_list);
+        op->Build();
         if (!op->IsDone() || op->HasErrors()) {
             throw std::runtime_error("boolean operation failed");
         }
@@ -1005,7 +1021,10 @@ OpResultData Session::boolean_op(std::uint8_t kind, std::uint64_t target, std::u
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
         OpResultData out = empty_result(result_faces);
         record_kept_faces(*op, a, 0, result_faces, out);
-        record_kept_faces(*op, b, 1, result_faces, out);
+        for (std::size_t k = 0; k < tool_shapes.size(); ++k) {
+            record_kept_faces(*op, tool_shapes[k], static_cast<std::uint32_t>(k + 1),
+                              result_faces, out);
+        }
 
         out.shape = insert(result);
         return out;

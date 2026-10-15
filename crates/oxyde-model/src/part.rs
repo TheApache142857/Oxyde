@@ -830,11 +830,12 @@ fn sweep_names(id: FeatureId, history: &OpHistory) -> Vec<Option<FaceName>> {
         .collect()
 }
 
-/// Names after a boolean of input 0 (its faces named `a`) and input 1 (named `b`).
+/// Names after a boolean of input 0 (its faces named `a`) with inputs 1, 2… (named
+/// `tools[0]`, `tools[1]`…).
 fn boolean_names(
     history: &OpHistory,
     a: &[Option<FaceName>],
-    b: &[Option<FaceName>],
+    tools: &[&[Option<FaceName>]],
 ) -> Vec<Option<FaceName>> {
     history
         .faces
@@ -842,7 +843,11 @@ fn boolean_names(
         .map(|sources| {
             oldest(sources.iter().filter_map(|source| match *source {
                 FaceSource::InputFace { input: 0, face } => a.get(face as usize).cloned().flatten(),
-                FaceSource::InputFace { input: 1, face } => b.get(face as usize).cloned().flatten(),
+                FaceSource::InputFace { input, face } => tools
+                    .get(input as usize - 1)
+                    .and_then(|names| names.get(face as usize))
+                    .cloned()
+                    .flatten(),
                 _ => None,
             }))
         })
@@ -900,11 +905,25 @@ fn combine_into<K: Kernel>(
     tool_names: &[Option<FaceName>],
     kernel: &mut K,
 ) -> Result<(), String> {
+    combine_all_into(work, index, op, &[(tool, tool_names)], kernel)
+}
+
+/// Booleans several tools (each with its faces' names) into body `index` of `work`, in
+/// one operation.
+fn combine_all_into<K: Kernel>(
+    work: &mut Working,
+    index: usize,
+    op: BooleanOp,
+    tools: &[(ShapeHandle, &[Option<FaceName>])],
+    kernel: &mut K,
+) -> Result<(), String> {
     let target = work.pieces[index].shape;
+    let shapes: Vec<ShapeHandle> = tools.iter().map(|(shape, _)| *shape).collect();
     let result = kernel
-        .boolean(op, target, tool)
+        .boolean_many(op, target, &shapes)
         .map_err(|e| e.to_string())?;
-    let names = boolean_names(&result.history, work.names(index), tool_names);
+    let tool_names: Vec<&[Option<FaceName>]> = tools.iter().map(|(_, names)| *names).collect();
+    let names = boolean_names(&result.history, work.names(index), &tool_names);
     work.replace(index, result.shape, names, kernel)
 }
 
@@ -1548,78 +1567,93 @@ fn build_instances<K: Kernel>(
 
     let mut work = Working::from(ctx.body);
     let mut new_bodies = 0;
+    let mut copies: Vec<(ShapeHandle, Vec<Option<FaceName>>)> = Vec::new();
     let outcome = (|| -> Result<(), String> {
         for tool in &tools {
             for (key, transform) in instances {
                 let copy = kernel
                     .transform(tool.shape, transform)
                     .map_err(|e| e.to_string())?;
-                let copy_names: Vec<Option<FaceName>> =
-                    copy.history
-                        .faces
-                        .iter()
-                        .map(|sources| {
-                            sources.iter().find_map(|source| match *source {
-                                FaceSource::InputFace { input: 0, face } => {
-                                    tool.names.get(face as usize).cloned().flatten().map(
-                                        |seed_face| {
-                                            FaceName::new(FaceKey::Instance {
-                                                feature: id,
-                                                instance: *key,
-                                                face: Box::new(seed_face),
-                                            })
-                                        },
-                                    )
-                                }
-                                _ => None,
-                            })
+                let names = copy
+                    .history
+                    .faces
+                    .iter()
+                    .map(|sources| {
+                        sources.iter().find_map(|source| match *source {
+                            FaceSource::InputFace { input: 0, face } => {
+                                tool.names.get(face as usize).cloned().flatten().map(
+                                    |seed_face| {
+                                        FaceName::new(FaceKey::Instance {
+                                            feature: id,
+                                            instance: *key,
+                                            face: Box::new(seed_face),
+                                        })
+                                    },
+                                )
+                            }
+                            _ => None,
                         })
-                        .collect();
-                let applied = match tool.op {
-                    ToolOp::NewBody => {
-                        let body = BodyId::new(id, new_bodies);
-                        new_bodies += 1;
-                        // The copy is the new body's shape.
-                        work.push(body, copy.shape, copy_names, true, kernel)?;
-                        continue;
+                    })
+                    .collect();
+                if tool.op == ToolOp::NewBody {
+                    let body = BodyId::new(id, new_bodies);
+                    new_bodies += 1;
+                    // The copy is the new body's shape.
+                    work.push(body, copy.shape, names, true, kernel)?;
+                } else {
+                    copies.push((copy.shape, names));
+                }
+            }
+            // Every copy of a seed at once: one boolean per copy would redo the work on a
+            // body that grows with each.
+            let all: Vec<(ShapeHandle, &[Option<FaceName>])> = copies
+                .iter()
+                .map(|(shape, names)| (*shape, names.as_slice()))
+                .collect();
+            match tool.op {
+                ToolOp::NewBody => {}
+                ToolOp::Join => {
+                    let index = tool
+                        .targets
+                        .first()
+                        .and_then(|t| work.find(*t))
+                        .ok_or("the body the seed joined no longer exists")?;
+                    combine_all_into(&mut work, index, BooleanOp::Fuse, &all, kernel)?;
+                }
+                ToolOp::Cut => {
+                    for target in &tool.targets {
+                        if let Some(index) = work.find(*target) {
+                            combine_all_into(&mut work, index, BooleanOp::Cut, &all, kernel)?;
+                        }
                     }
-                    ToolOp::Join => match tool.targets.first().and_then(|t| work.find(*t)) {
-                        Some(index) => combine_into(
-                            &mut work,
-                            index,
-                            BooleanOp::Fuse,
-                            copy.shape,
-                            &copy_names,
-                            kernel,
-                        ),
-                        None => Err("the body the seed joined no longer exists".to_owned()),
-                    },
-                    ToolOp::Cut | ToolOp::Intersect => {
-                        let mut done = Ok(());
-                        for target in &tool.targets {
+                }
+                // What a body shares with every copy, as each copy of the seed would keep;
+                // one at a time (a common with several tools keeps what is in any of them).
+                ToolOp::Intersect => {
+                    for target in &tool.targets {
+                        for copy in &all {
                             if let Some(index) = work.find(*target) {
-                                done = combine_into(
+                                combine_all_into(
                                     &mut work,
                                     index,
-                                    tool.op.boolean(),
-                                    copy.shape,
-                                    &copy_names,
+                                    BooleanOp::Common,
+                                    std::slice::from_ref(copy),
                                     kernel,
-                                );
-                                if done.is_err() {
-                                    break;
-                                }
+                                )?;
                             }
                         }
-                        done
                     }
-                };
-                kernel.release(copy.shape);
-                applied?;
+                }
+            }
+            for (shape, _) in copies.drain(..) {
+                kernel.release(shape);
             }
         }
         Ok(())
     })();
+    for (shape, _) in copies {
+        kernel.release(shape);
+    }
     match outcome {
         Ok(()) => Ok(work.finish(id)),
         Err(e) => {

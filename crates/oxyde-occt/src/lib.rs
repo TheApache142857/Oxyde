@@ -134,21 +134,22 @@ impl Kernel for OcctKernel {
         Ok(op_result(data))
     }
 
-    fn boolean(
+    fn boolean_many(
         &mut self,
         op: BooleanOp,
         target: ShapeHandle,
-        tool: ShapeHandle,
+        tools: &[ShapeHandle],
     ) -> Result<OpResult, OcctError> {
         let kind = match op {
             BooleanOp::Fuse => 0,
             BooleanOp::Cut => 1,
             BooleanOp::Common => 2,
         };
+        let tools: Vec<u64> = tools.iter().map(|t| t.raw()).collect();
         let data = self
             .session
             .pin_mut()
-            .boolean_op(kind, target.raw(), tool.raw())?;
+            .boolean_op(kind, target.raw(), &tools)?;
         Ok(op_result(data))
     }
 

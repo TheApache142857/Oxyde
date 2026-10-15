@@ -110,7 +110,8 @@ pub struct Topology {
 /// Where a face of an operation's result comes from.
 ///
 /// `input` is the position of the input shape in the operation's arguments: for
-/// [`Kernel::boolean`] 0 is the target and 1 the tool; for fillet and chamfer 0 is the shape.
+/// [`Kernel::boolean`] 0 is the target and 1 the tool (1, 2… for the tools of
+/// [`Kernel::boolean_many`]); for fillet and chamfer 0 is the shape.
 /// `face`, `edge` and `vertex` index that input's [`Topology`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaceSource {
@@ -271,6 +272,18 @@ pub trait Kernel {
         op: BooleanOp,
         target: ShapeHandle,
         tool: ShapeHandle,
+    ) -> Result<OpResult, Self::Error> {
+        self.boolean_many(op, target, &[tool])
+    }
+
+    /// Boolean of `target` (input 0) with several tools (inputs 1, 2…) in one operation,
+    /// far faster than one boolean per tool: a fuse joins them all, a cut removes them all,
+    /// a common keeps what the target shares with any of them.
+    fn boolean_many(
+        &mut self,
+        op: BooleanOp,
+        target: ShapeHandle,
+        tools: &[ShapeHandle],
     ) -> Result<OpResult, Self::Error>;
 
     /// Rounds the given edges (indices into the shape's [`Topology::edges`]).

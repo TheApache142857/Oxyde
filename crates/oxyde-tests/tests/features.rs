@@ -630,6 +630,45 @@ fn revolved_flat_faces_face_outward_and_caps_keep_their_names() {
 }
 
 #[test]
+fn pattern_copies_that_overlap_each_other() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 50.0, 10.0, 5.0);
+    // A 2 mm wide cut across the plate, copied every 1 mm: the copies overlap, and all of
+    // them go in one boolean. Together they clear x = 5 to 11.
+    let mut slot = Sketch::new(SketchPlane::Face(FaceName::end_cap(base)));
+    let [_, right, _, _] = slot.rectangle(Point2::new(5.0, -1.0), 2.0, 12.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(slot));
+    let cut_slot = part.add_feature(cut(s2, 5.0));
+    let pattern = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![cut_slot],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 1.0,
+            count: 5,
+            reverse: false,
+        },
+        second: None,
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 2500.0 - 6.0 * 10.0 * 5.0);
+    // The far wall of the last copy is named after it.
+    let last_wall = FaceName::new(FaceKey::Instance {
+        feature: pattern,
+        instance: [4, 0],
+        face: Box::new(FaceName::profile(cut_slot, right)),
+    });
+    let body = part.body().unwrap();
+    assert!(
+        body.naming.find_face(&last_wall).is_some(),
+        "{:?}",
+        body.naming.faces()
+    );
+    part.release(&mut kernel);
+}
+
+#[test]
 fn a_pattern_or_mirror_of_the_first_boss_joins_its_body() {
     let mut kernel = OcctKernel::new();
     let mut part = Part::new();

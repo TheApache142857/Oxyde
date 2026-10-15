@@ -250,12 +250,12 @@ pub(crate) mod bridge {
         /// Copy moved by the 3 × 4 matrix `rows` (row-major), which may be a mirror.
         fn transform(self: Pin<&mut Session>, shape: u64, rows: &[f64]) -> Result<OpResultData>;
 
-        /// `kind`: 0 = fuse, 1 = cut, 2 = common.
+        /// `kind`: 0 = fuse, 1 = cut, 2 = common; all `tools` at once.
         fn boolean_op(
             self: Pin<&mut Session>,
             kind: u8,
             target: u64,
-            tool: u64,
+            tools: &[u64],
         ) -> Result<OpResultData>;
 
         fn fillet(

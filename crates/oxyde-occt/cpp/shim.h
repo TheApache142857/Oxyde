@@ -38,7 +38,8 @@ public:
     OpResultData shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
                        double offset);
     OpResultData transform(std::uint64_t shape, rust::Slice<const double> rows);
-    OpResultData boolean_op(std::uint8_t kind, std::uint64_t target, std::uint64_t tool);
+    OpResultData boolean_op(std::uint8_t kind, std::uint64_t target,
+                            rust::Slice<const std::uint64_t> tools);
     OpResultData fillet(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
                         double radius);
     OpResultData chamfer(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
