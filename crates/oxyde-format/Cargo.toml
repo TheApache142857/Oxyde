@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 oxyde-geom = { workspace = true }
+oxyde-assembly = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-sketch = { workspace = true }
 serde = { workspace = true }

@@ -2445,9 +2445,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxyde-assembly"
+version = "0.0.1"
+dependencies = [
+ "oxyde-geom",
+ "oxyde-kernel",
+ "oxyde-model",
+]
+
+[[package]]
 name = "oxyde-format"
 version = "0.0.1"
 dependencies = [
+ "oxyde-assembly",
  "oxyde-geom",
  "oxyde-model",
  "oxyde-sketch",

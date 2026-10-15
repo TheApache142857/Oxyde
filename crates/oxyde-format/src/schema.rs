@@ -664,7 +664,7 @@ fn relation_dto(c: &Constraint) -> RelationDto {
     }
 }
 
-fn face_dto(face: &FaceName) -> FaceRefDto {
+pub(crate) fn face_dto(face: &FaceName) -> FaceRefDto {
     let key = match &face.key {
         FaceKey::Profile { feature, segment } => FaceKeyDto::Profile {
             feature: feature.raw(),
@@ -715,7 +715,7 @@ fn face_dto(face: &FaceName) -> FaceRefDto {
     }
 }
 
-fn edge_dto(edge: &EdgeName) -> EdgeRefDto {
+pub(crate) fn edge_dto(edge: &EdgeName) -> EdgeRefDto {
     EdgeRefDto {
         faces: edge.faces.iter().map(face_dto).collect(),
         part: edge.part,
@@ -1010,7 +1010,7 @@ fn direction_from(dto: DirectionDto) -> PatternDirection {
     }
 }
 
-fn face_from(dto: FaceRefDto) -> FaceName {
+pub(crate) fn face_from(dto: FaceRefDto) -> FaceName {
     let key = match dto.key {
         FaceKeyDto::Profile { feature, segment } => FaceKey::Profile {
             feature: FeatureId::from_raw(feature),
@@ -1061,7 +1061,7 @@ fn face_from(dto: FaceRefDto) -> FaceName {
     }
 }
 
-fn edge_from(dto: EdgeRefDto) -> EdgeName {
+pub(crate) fn edge_from(dto: EdgeRefDto) -> EdgeName {
     EdgeName {
         faces: sorted(dto.faces.into_iter().map(face_from).collect()),
         part: dto.part,

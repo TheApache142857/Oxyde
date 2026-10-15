@@ -19,7 +19,8 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-kernel` | `geom` | `occt`, `model` |
 | `oxyde-occt` | `geom`, `kernel` | `model`, `sketch`, `app` |
 | `oxyde-model` | `geom`, `sketch`, `kernel` | `occt`, `app` |
-| `oxyde-format` | `geom`, `model` | `occt`, `app` |
+| `oxyde-assembly` | `geom`, `kernel` (topology types only), `model` | `occt`, `app` |
+| `oxyde-format` | `geom`, `model`, `assembly` | `occt`, `app` |
 | `oxyde-render` | `kernel` (mesh types only) | `occt`, `model`, `app` |
 | `oxyde-app` | all of the above | — |
 | `oxyde-tests` | `model`, `occt` (dev only) | — |

@@ -1,12 +1,16 @@
-//! Reading and writing `.oxy` files.
+//! Reading and writing Oxyde documents: parts (`.oxyprt`, formerly `.oxy`) and assemblies
+//! (`.oxyasm`); drawings (`.oxydrw`) come later.
 //!
-//! An `.oxy` file is a ZIP archive holding `manifest.json`, `model.json` (the feature
-//! timeline, the source of truth), `properties.json` (BOM-ready metadata) and, for import
-//! features, the imported files under `imports/`. Geometry is never stored as the source of
-//! truth: it is rebuilt from the timeline on load.
+//! Every document is a ZIP archive starting with `manifest.json`, which says what kind of
+//! document it is. A part holds `model.json` (the feature timeline, the source of truth),
+//! `properties.json` (BOM-ready metadata) and, for import features, the imported files
+//! under `imports/`. Geometry is never stored as the source of truth: it is rebuilt from
+//! the timeline on load. An assembly holds `assembly.json`: its components (part files by
+//! relative path and document id, with their placements) and mates.
 //!
 //! See `docs/FORMAT.md` for the specification.
 
+mod assembly_schema;
 mod schema;
 
 use std::fmt;
@@ -16,10 +20,12 @@ use std::path::Path;
 
 use std::collections::HashMap;
 
+use oxyde_assembly::Assembly;
 use oxyde_model::{FeatureKind, ModelError, Part, PartDefinition};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use assembly_schema::AssemblyModel;
 pub use schema::Properties;
 use schema::{Manifest, PartModel, Units, import_entry};
 
@@ -30,6 +36,34 @@ const FORMAT_NAME: &str = "oxyde";
 const MANIFEST: &str = "manifest.json";
 const MODEL: &str = "model.json";
 const PROPERTIES: &str = "properties.json";
+const ASSEMBLY: &str = "assembly.json";
+
+/// File extension of parts.
+pub const PART_EXTENSION: &str = "oxyprt";
+/// File extension of parts saved before assemblies existed; still opened.
+pub const LEGACY_PART_EXTENSION: &str = "oxy";
+/// File extension of assemblies.
+pub const ASSEMBLY_EXTENSION: &str = "oxyasm";
+/// File extension reserved for drawings.
+pub const DRAWING_EXTENSION: &str = "oxydrw";
+
+/// What an Oxyde file holds, from its manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    Part,
+    Assembly,
+    Drawing,
+}
+
+impl DocumentKind {
+    fn name(self) -> &'static str {
+        match self {
+            DocumentKind::Part => "part",
+            DocumentKind::Assembly => "assembly",
+            DocumentKind::Drawing => "drawing",
+        }
+    }
+}
 
 /// A part document as stored on disk.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,25 +113,33 @@ pub enum FormatError {
         found: u32,
         supported: u32,
     },
-    /// An Oxyde document of another kind (assembly, drawing).
-    WrongKind(String),
+    /// An Oxyde document of another kind than the one expected.
+    WrongKind {
+        expected: &'static str,
+        found: String,
+    },
     /// The timeline in the file is inconsistent.
     InvalidModel(ModelError),
+    /// The assembly in the file is inconsistent.
+    InvalidAssembly(String),
 }
 
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FormatError::Io(e) => write!(f, "{e}"),
-            FormatError::Archive(e) => write!(f, "not a valid .oxy archive: {e}"),
+            FormatError::Archive(e) => write!(f, "not a valid Oxyde archive: {e}"),
             FormatError::Json { entry, source } => write!(f, "{entry}: {source}"),
             FormatError::NotOxyde => write!(f, "not an Oxyde document"),
             FormatError::UnsupportedVersion { found, supported } => write!(
                 f,
                 "this file uses format version {found}; this version of Oxyde reads up to {supported}"
             ),
-            FormatError::WrongKind(kind) => write!(f, "expected a part, found a {kind} document"),
+            FormatError::WrongKind { expected, found } => {
+                write!(f, "expected a {expected}, found a {found} document")
+            }
             FormatError::InvalidModel(e) => write!(f, "{e}"),
+            FormatError::InvalidAssembly(e) => write!(f, "invalid assembly: {e}"),
         }
     }
 }
@@ -137,19 +179,72 @@ fn from_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(bytes).map_err(|source| FormatError::Json { entry, source })
 }
 
-/// Writes a part document as an `.oxy` archive.
-pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, FormatError> {
-    let manifest = Manifest {
+fn manifest(kind: DocumentKind, document_id: &str) -> Manifest {
+    Manifest {
         format: FORMAT_NAME.to_owned(),
         format_version: FORMAT_VERSION,
-        kind: "part".to_owned(),
-        document_id: part.document_id.clone(),
+        kind: kind.name().to_owned(),
+        document_id: document_id.to_owned(),
         units: Units {
             length: "mm".to_owned(),
             angle: "deg".to_owned(),
         },
         created_by: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// Reads and checks the manifest: an Oxyde document this version can read.
+fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Manifest, FormatError> {
+    let manifest: Manifest =
+        from_json(MANIFEST, &read_entry(archive, MANIFEST)?).map_err(|e| match e {
+            // Something that is not even shaped like our manifest is not an Oxyde file.
+            FormatError::Json { .. } => FormatError::NotOxyde,
+            other => other,
+        })?;
+    if manifest.format != FORMAT_NAME {
+        return Err(FormatError::NotOxyde);
+    }
+    if manifest.format_version > FORMAT_VERSION {
+        return Err(FormatError::UnsupportedVersion {
+            found: manifest.format_version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    Ok(manifest)
+}
+
+fn expect_kind(manifest: &Manifest, kind: DocumentKind) -> Result<(), FormatError> {
+    if manifest.kind == kind.name() {
+        Ok(())
+    } else {
+        Err(FormatError::WrongKind {
+            expected: kind.name(),
+            found: manifest.kind.clone(),
+        })
+    }
+}
+
+/// What kind of document `path` is, and its document id, reading only the manifest.
+pub fn document_kind(path: &Path) -> Result<(DocumentKind, String), FormatError> {
+    let mut archive = ZipArchive::new(BufReader::new(File::open(path)?))?;
+    let manifest = read_manifest(&mut archive)?;
+    let kind = match manifest.kind.as_str() {
+        "part" => DocumentKind::Part,
+        "assembly" => DocumentKind::Assembly,
+        "drawing" => DocumentKind::Drawing,
+        other => {
+            return Err(FormatError::WrongKind {
+                expected: "part, assembly or drawing",
+                found: other.to_owned(),
+            });
+        }
     };
+    Ok((kind, manifest.document_id))
+}
+
+/// Writes a part document as a ZIP archive (`.oxyprt`).
+pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, FormatError> {
+    let manifest = manifest(DocumentKind::Part, &part.document_id);
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
@@ -175,28 +270,11 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
     Ok(zip.finish()?)
 }
 
-/// Reads a part document from an `.oxy` archive and checks that its timeline is valid.
+/// Reads a part document (`.oxyprt` or `.oxy`) and checks that its timeline is valid.
 pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
     let mut archive = ZipArchive::new(reader)?;
-
-    let manifest: Manifest =
-        from_json(MANIFEST, &read_entry(&mut archive, MANIFEST)?).map_err(|e| match e {
-            // Something that is not even shaped like our manifest is not an Oxyde file.
-            FormatError::Json { .. } => FormatError::NotOxyde,
-            other => other,
-        })?;
-    if manifest.format != FORMAT_NAME {
-        return Err(FormatError::NotOxyde);
-    }
-    if manifest.format_version > FORMAT_VERSION {
-        return Err(FormatError::UnsupportedVersion {
-            found: manifest.format_version,
-            supported: FORMAT_VERSION,
-        });
-    }
-    if manifest.kind != "part" {
-        return Err(FormatError::WrongKind(manifest.kind));
-    }
+    let manifest = read_manifest(&mut archive)?;
+    expect_kind(&manifest, DocumentKind::Part)?;
 
     let model: PartModel = from_json(MODEL, &read_entry(&mut archive, MODEL)?)?;
     let properties: Properties = from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?;
@@ -240,29 +318,115 @@ fn read_entry<R: Read + Seek>(
 /// Saves a part to `path`. The file is written next to the target first and then moved
 /// into place, so a failed save never destroys the previous version.
 pub fn save_part(path: &Path, part: &PartFile) -> Result<(), FormatError> {
+    save_with(path, |file| write_part(file, part))
+}
+
+/// Saves an assembly to `path`, safely like [`save_part`].
+pub fn save_assembly(path: &Path, assembly: &AssemblyFile) -> Result<(), FormatError> {
+    save_with(path, |file| write_assembly(file, assembly))
+}
+
+type Writer = BufWriter<File>;
+
+fn save_with(
+    path: &Path,
+    write: impl FnOnce(Writer) -> Result<Writer, FormatError>,
+) -> Result<(), FormatError> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = std::path::PathBuf::from(temporary);
 
-    let result = write_then_move(&temporary, path, part);
+    let result = (|| {
+        let mut file = write(BufWriter::new(File::create(&temporary)?))?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     result
 }
 
-fn write_then_move(temporary: &Path, path: &Path, part: &PartFile) -> Result<(), FormatError> {
-    let file = BufWriter::new(File::create(temporary)?);
-    let mut file = write_part(file, part)?;
-    file.flush()?;
-    drop(file);
-    std::fs::rename(temporary, path)?;
-    Ok(())
-}
-
 /// Loads a part from `path`.
 pub fn load_part(path: &Path) -> Result<PartFile, FormatError> {
     read_part(BufReader::new(File::open(path)?))
+}
+
+/// An assembly document as stored on disk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssemblyFile {
+    pub document_id: String,
+    pub assembly: Assembly,
+    pub properties: Properties,
+}
+
+impl AssemblyFile {
+    /// A new, empty assembly with a fresh document id.
+    pub fn new() -> Self {
+        Self {
+            document_id: new_document_id(),
+            assembly: Assembly::new(),
+            properties: Properties::default(),
+        }
+    }
+}
+
+impl Default for AssemblyFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Writes an assembly document as a ZIP archive (`.oxyasm`).
+pub fn write_assembly<W: Write + Seek>(
+    writer: W,
+    assembly: &AssemblyFile,
+) -> Result<W, FormatError> {
+    let manifest = manifest(DocumentKind::Assembly, &assembly.document_id);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut zip = ZipWriter::new(writer);
+    for (entry, bytes) in [
+        (MANIFEST, to_json(MANIFEST, &manifest)?),
+        (
+            ASSEMBLY,
+            to_json(ASSEMBLY, &AssemblyModel::from_assembly(&assembly.assembly))?,
+        ),
+        (PROPERTIES, to_json(PROPERTIES, &assembly.properties)?),
+    ] {
+        zip.start_file(entry, options)?;
+        zip.write_all(&bytes)?;
+    }
+    Ok(zip.finish()?)
+}
+
+/// Reads an assembly document and checks it: unique ids, mates between its components.
+/// The part files it refers to are not opened.
+pub fn read_assembly<R: Read + Seek>(reader: R) -> Result<AssemblyFile, FormatError> {
+    let mut archive = ZipArchive::new(reader)?;
+    let manifest = read_manifest(&mut archive)?;
+    expect_kind(&manifest, DocumentKind::Assembly)?;
+    let model: AssemblyModel = from_json(ASSEMBLY, &read_entry(&mut archive, ASSEMBLY)?)?;
+    let has_properties = archive.file_names().any(|name| name == PROPERTIES);
+    let properties: Properties = if has_properties {
+        from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?
+    } else {
+        Properties::default()
+    };
+    let assembly = model
+        .into_assembly()
+        .map_err(FormatError::InvalidAssembly)?;
+    Ok(AssemblyFile {
+        document_id: manifest.document_id,
+        assembly,
+        properties,
+    })
+}
+
+/// Loads an assembly from `path`.
+pub fn load_assembly(path: &Path) -> Result<AssemblyFile, FormatError> {
+    read_assembly(BufReader::new(File::open(path)?))
 }
 
 #[cfg(test)]
@@ -596,5 +760,117 @@ mod tests {
         let loaded = load_part(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, part);
+    }
+
+    fn sample_assembly() -> AssemblyFile {
+        use oxyde_assembly::{MateKind, MateRef, MateTarget, Placement};
+        use oxyde_geom::Point3;
+        let mut file = AssemblyFile::new();
+        let asm = &mut file.assembly;
+        let base = asm.add_component(
+            "Base",
+            "parts/base.oxyprt".into(),
+            "11111111-1111-1111-1111-111111111111".into(),
+            Placement::IDENTITY,
+        );
+        let pin = asm.add_component(
+            "Pin",
+            "pin.oxyprt".into(),
+            "22222222-2222-2222-2222-222222222222".into(),
+            Placement::IDENTITY.moved(
+                oxyde_geom::Vec3::new(0.1, 0.2, 0.3),
+                Point3::ORIGIN,
+                oxyde_geom::Vec3::new(1.0, 2.0, 3.0),
+            ),
+        );
+        let feature = sample().definition.features[1].id();
+        let face = FaceName::end_cap(feature);
+        asm.add_mate(
+            MateKind::Concentric,
+            MateRef {
+                component: base,
+                target: MateTarget::Face(face.clone()),
+            },
+            MateRef {
+                component: pin,
+                target: MateTarget::Axis(StandardAxis::Z),
+            },
+            true,
+        );
+        asm.add_mate(
+            MateKind::Distance(4.5),
+            MateRef {
+                component: base,
+                target: MateTarget::Plane(StandardPlane::Top),
+            },
+            MateRef {
+                component: pin,
+                target: MateTarget::Origin,
+            },
+            false,
+        );
+        asm.add_mate(
+            MateKind::Angle(0.5),
+            MateRef {
+                component: base,
+                target: MateTarget::Edge(EdgeName::between(face, FaceName::start_cap(feature))),
+            },
+            MateRef {
+                component: pin,
+                target: MateTarget::Plane(StandardPlane::Right),
+            },
+            true,
+        );
+        file.properties.part_number = "ASM-1".into();
+        file
+    }
+
+    #[test]
+    fn assemblies_round_trip() {
+        let file = sample_assembly();
+        let bytes = write_assembly(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        assert_eq!(read_assembly(Cursor::new(bytes.clone())).unwrap(), file);
+        // A part reader refuses it, and says why.
+        match read_part(Cursor::new(bytes)) {
+            Err(FormatError::WrongKind { found, .. }) => assert_eq!(found, "assembly"),
+            other => panic!("expected the wrong kind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_kind_reads_the_manifest() {
+        let dir = std::env::temp_dir();
+        let asm = dir.join(format!("oxyde-kind-{}.oxyasm", std::process::id()));
+        let prt = dir.join(format!("oxyde-kind-{}.oxyprt", std::process::id()));
+        let file = sample_assembly();
+        save_assembly(&asm, &file).unwrap();
+        save_part(&prt, &sample()).unwrap();
+        let kinds = (document_kind(&asm), document_kind(&prt));
+        let loaded = load_assembly(&asm);
+        let _ = std::fs::remove_file(&asm);
+        let _ = std::fs::remove_file(&prt);
+        assert_eq!(
+            kinds.0.unwrap(),
+            (DocumentKind::Assembly, file.document_id.clone())
+        );
+        assert_eq!(kinds.1.unwrap().0, DocumentKind::Part);
+        assert_eq!(loaded.unwrap(), file);
+    }
+
+    #[test]
+    fn assemblies_with_dangling_mates_are_refused() {
+        let manifest = MANIFEST_V1.replace("\"part\"", "\"assembly\"");
+        let model = r#"{ "next_component_id": 2, "next_mate_id": 2,
+            "components": [ { "id": 1, "name": "A<1>", "path": "a.oxyprt",
+              "rotation": [[1,0,0],[0,1,0],[0,0,1]], "translation": [0,0,0], "fixed": true } ],
+            "mates": [ { "id": 1, "name": "Coincident1", "type": "coincident",
+              "a": { "component": 1, "origin": true }, "b": { "component": 7, "origin": true } } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, &manifest), (ASSEMBLY, model)]);
+        match read_assembly(Cursor::new(bytes)) {
+            Err(FormatError::InvalidAssembly(e)) => assert!(e.contains("component 7"), "{e}"),
+            other => panic!("expected an invalid assembly, got {other:?}"),
+        }
     }
 }

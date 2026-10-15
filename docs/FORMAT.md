@@ -1,13 +1,21 @@
-# The `.oxy` file format
+# Oxyde file formats
 
 Status: **version 1, implemented** in `crates/oxyde-format`. The format is open: anyone may read and write it, with or without Oxyde.
 
+| Extension | Document | `manifest.kind` |
+|---|---|---|
+| `.oxyprt` | Part (files saved before assemblies existed use `.oxy`; same content, still opened) | `"part"` |
+| `.oxyasm` | Assembly (§6) | `"assembly"` |
+| `.oxydrw` | Drawing (reserved, not written yet) | `"drawing"` |
+
+Readers identify a document by its manifest, not its extension.
+
 ## 1. Container
 
-An `.oxy` file is a **ZIP archive** (deflate or stored):
+Every document is a **ZIP archive** (deflate or stored). A part:
 
 ```
-part.oxy
+part.oxyprt
 ├── manifest.json        required  — format identity and version (first entry)
 ├── model.json           required  — the feature timeline: the source of truth
 ├── properties.json      required  — part metadata, BOM-ready
@@ -19,7 +27,7 @@ Rules:
 - `manifest.json` is written first so readers can identify a file cheaply.
 - All JSON is UTF-8, written with stable key order and indentation so files diff cleanly.
 - Geometry is **not stored**: Oxyde rebuilds the part from `model.json` on load. The one exception is imported geometry: an `import` feature's STEP file is kept as it was read, under `imports/`, so the part does not depend on the original file. A later version may add an optional `geometry/` cache (BREP/STEP) for tools that cannot rebuild; readers must ignore entries they do not know.
-- Oxyde saves by writing `<name>.oxy.tmp` and renaming it over the target, so a failed save never destroys the previous file.
+- Oxyde saves by writing `<name>.<extension>.tmp` and renaming it over the target, so a failed save never destroys the previous file.
 
 ## 2. `manifest.json`
 
@@ -34,7 +42,7 @@ Rules:
 }
 ```
 
-- `kind`: `"part"` (assemblies and drawings later).
+- `kind`: `"part"`, `"assembly"` or `"drawing"`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
 - `units` are display units. Values in `model.json` are always millimetres.
 
@@ -228,3 +236,44 @@ All fields are optional when reading. `volume_mm3` is computed at save time and 
 - Older versions are upgraded through explicit, tested migrations (v1 → v2 → …), never by guessing.
 - Validate the timeline on open: unique feature ids, every feature refers only to features before it, sketch entities and relations refer to existing entities of the right kind, relation ids are unique, and names are valid and unique as described above. An unknown feature or relation `type` is an error in version 1.
 - Additive changes (new optional fields, new entries) do not bump the version; anything else does.
+
+## 6. Assemblies (`.oxyasm`)
+
+```
+robot.oxyasm
+├── manifest.json        required  — "kind": "assembly"
+├── assembly.json        required  — components and mates
+└── properties.json      optional  — the assembly's own metadata (same fields as a part)
+```
+
+An assembly stores no geometry and no copy of its parts: it refers to part files, which Oxyde opens and rebuilds.
+
+```json
+{
+  "next_component_id": 3,
+  "next_mate_id": 2,
+  "components": [
+    { "id": 1, "name": "Base<1>", "path": "parts/base.oxyprt",
+      "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
+      "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0],
+      "fixed": true, "hidden": false },
+    { "id": 2, "name": "Pin<1>", "path": "pin.oxyprt", "document_id": "…",
+      "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [20, 0, 10] }
+  ],
+  "mates": [
+    { "id": 1, "name": "Concentric1", "type": "concentric", "aligned": false,
+      "a": { "component": 1, "face": { "key": { "type": "profile", "feature": 4, "segment": 2 } } },
+      "b": { "component": 2, "axis": "z" } },
+    { "id": 2, "name": "Distance1", "type": "distance", "value": 5, "aligned": false,
+      "a": { "component": 1, "plane": "top" },
+      "b": { "component": 2, "face": { "key": { "type": "end_cap", "feature": 2 } } } }
+  ]
+}
+```
+
+- **Components** are instances of part files. `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only.
+- **Mates**: `type` is `coincident`, `concentric`, `parallel`, `perpendicular`, `distance` (`value` in mm) or `angle` (`value` in radians). `a` and `b` name a component and one of: `face` or `edge` (persistent names, as in a part's `model.json`, resolved in that part's rebuilt body), `plane` (`front`, `top`, `right`: the part's standard planes), `axis` (`x`, `y`, `z`) or `origin` (`true`). `aligned`: normals or axes point the same way (otherwise they face each other). `suppressed` mates are kept but not solved.
+- Placements are the solved result, saved so that a reader without a solver sees the assembly as it was. Oxyde re-solves on open, starting from them.
+- Readers check that component and mate ids are unique and below the `next_…` counters, that component names are unique, and that mates refer to existing components.
+
+Sub-assemblies (an assembly as a component) are not part of version 1.
