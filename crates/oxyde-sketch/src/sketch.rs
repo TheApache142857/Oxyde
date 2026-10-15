@@ -1,7 +1,7 @@
 //! Sketch entities, constraints, and how they map to solver unknowns and equations.
 
 use std::collections::HashMap;
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
 
 use oxyde_geom::{Curve2, Point2, ProfileSegment};
@@ -1196,6 +1196,13 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
         let across = |p: Point<T>, s: Point<T>, d: Point<T>| {
             (d.0 * (p.1 - s.1) - d.1 * (p.0 - s.0)) / length(d)
         };
+        // The angle from `u` to `v` less `target`, folded into [−90°, 90°) since lines have
+        // no way round. Unlike the sine or cosine of the angle, it has a slope where the
+        // lines start square (for parallel) or in line (for perpendicular).
+        let folded = |u: Point<T>, v: Point<T>, target: f64| {
+            let angle = (u.0 * v.1 - u.1 * v.0).atan2(u.0 * v.0 + u.1 * v.1);
+            (angle * k(2.0) - k(2.0 * target)).wrap_angle() * k(0.5)
+        };
         match *c {
             // Fixed points are not unknowns; nothing to solve.
             Fixed(_) => {}
@@ -1205,14 +1212,8 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
             }
             Horizontal(l) => out.push(direction(l).1),
             Vertical(l) => out.push(direction(l).0),
-            Parallel(a, b) => {
-                let (u, v) = (direction(a), direction(b));
-                out.push((u.0 * v.1 - u.1 * v.0) / (length(u) * length(v)));
-            }
-            Perpendicular(a, b) => {
-                let (u, v) = (direction(a), direction(b));
-                out.push((u.0 * v.0 + u.1 * v.1) / (length(u) * length(v)));
-            }
+            Parallel(a, b) => out.push(folded(direction(a), direction(b), 0.0)),
+            Perpendicular(a, b) => out.push(folded(direction(a), direction(b), FRAC_PI_2)),
             EqualLength(a, b) => out.push(length(direction(a)) - length(direction(b))),
             EqualRadius(a, b) => out.push(self.round(a).1 - self.round(b).1),
             Distance(a, b, d) => out.push(distance(self.point(a), self.point(b)) - k(d)),

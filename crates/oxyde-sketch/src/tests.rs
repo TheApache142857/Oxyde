@@ -612,3 +612,36 @@ fn a_sketch_saved_without_its_origin_recorded_finds_it() {
     assert!(s.clone().with_origin(Some(line)).is_err());
     assert!(s.with_origin(Some(EntityId(999))).is_err());
 }
+
+#[test]
+fn perpendicular_and_parallel_from_lines_that_start_the_other_way() {
+    // The sine or cosine of the angle has no slope there, so the solver could not start.
+    let direction = |s: &ConstrainedSketch, l: EntityId| {
+        let (a, b) = s.endpoints(l).unwrap();
+        let (a, b) = (s.position(a).unwrap(), s.position(b).unwrap());
+        (b.x - a.x, b.y - a.y)
+    };
+    for (relation, start) in [
+        (Perpendicular as fn(EntityId, EntityId) -> _, (10.0, 3.0)),
+        (Parallel, (-3.0, 10.0)),
+    ] {
+        let mut s = ConstrainedSketch::new();
+        let first = s.line(Point2::ORIGIN, Point2::new(10.0, 3.0));
+        let (origin, end) = s.endpoints(first).unwrap();
+        s.constrain(Fixed(origin));
+        s.constrain(Fixed(end));
+        let second = s.line(Point2::new(0.0, 5.0), Point2::new(start.0, 5.0 + start.1));
+        let wanted = relation(first, second);
+        s.constrain(wanted.clone());
+        let report = s.solve().unwrap();
+        assert!(report.converged, "{wanted:?}: {report:?}");
+        let (u, v) = (direction(&s, first), direction(&s, second));
+        let (dot, cross) = (u.0 * v.0 + u.1 * v.1, u.0 * v.1 - u.1 * v.0);
+        let off = if matches!(wanted, Perpendicular(..)) {
+            dot
+        } else {
+            cross
+        };
+        assert!(off.abs() < 1e-7, "{wanted:?}: {u:?} {v:?}");
+    }
+}
