@@ -271,7 +271,7 @@ pub fn resolve(target: &MateTarget, body: Option<&Body>) -> Result<Primitive, St
 }
 
 /// Whether `aligned` makes the mate closest to how the geometry sits now: what a new
-/// mate starts with.
+/// mate starts with, and the way round a parallel-either-way mate is solved.
 pub(crate) fn closest_alignment(a: &Primitive, b: &Primitive) -> bool {
     match (a.direction(), b.direction()) {
         (Some(u), Some(v)) => u.dot(v) >= 0.0,
@@ -321,9 +321,15 @@ fn apart(out: &mut Vec<f64>, v: Vec3, d: f64) {
 
 /// Equations that are all zero when the mate holds, given both sides in assembly
 /// coordinates. Directions are scaled by `size` so that they weigh like lengths.
+///
+/// `fold` says which way round a mate that holds directions parallel either way (lines on
+/// an axis, a parallel mate between edges…) is taken: `true` for the same way. It is
+/// chosen once, from where the parts start, and kept through a solve, so that the
+/// equations stay smooth while the solver turns the parts.
 pub(crate) fn residuals(
     kind: MateKind,
     aligned: bool,
+    fold: bool,
     a: &Primitive,
     b: &Primitive,
     size: f64,
@@ -331,6 +337,7 @@ pub(crate) fn residuals(
 ) -> Result<(), String> {
     use Primitive as P;
     let sign = if aligned { 1.0 } else { -1.0 };
+    let fold = if fold { 1.0 } else { -1.0 };
     let invalid = || {
         Err(format!(
             "a {} mate does not apply to {} and {}",
@@ -344,8 +351,10 @@ pub(crate) fn residuals(
     }
     // Same direction, or opposite.
     let same = |u: Vec3, v: Vec3, out: &mut Vec<f64>| push3(out, v - u * sign, size);
-    // Parallel either way.
-    let parallel = |u: Vec3, v: Vec3, out: &mut Vec<f64>| push3(out, u.cross(v), size);
+    // Parallel either way: `v` turned onto `u`, the way round `fold` says. (The cross
+    // product would do, but it is flat where the directions start square, as a screw
+    // beside its hole often does: the solver found no way to turn it.)
+    let parallel = |u: Vec3, v: Vec3, out: &mut Vec<f64>| push3(out, v * fold - u, size);
     match kind {
         MateKind::Coincident => match (*a, *b) {
             (

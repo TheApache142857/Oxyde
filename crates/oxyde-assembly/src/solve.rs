@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use oxyde_geom::Vec3;
+use oxyde_geom::{Point3, Vec3};
 
 use crate::mate::{closest_alignment, residuals};
 use crate::{Assembly, ComponentId, MateId, MateRef, Placement, Primitive};
@@ -57,6 +57,8 @@ struct Active {
     id: MateId,
     kind: crate::MateKind,
     aligned: bool,
+    /// The way round a parallel-either-way mate is solved: see [`residuals`].
+    fold: bool,
     a: (ComponentId, Primitive),
     b: (ComponentId, Primitive),
 }
@@ -66,7 +68,8 @@ const TOLERANCE: f64 = 1e-6;
 const ITERATIONS: usize = 200;
 
 /// Moves the components that are not fixed until the mates hold, starting from where they
-/// are, so that the answer is the nearest one: what dragging a part expects.
+/// are, so that the answer is the nearest one: what dragging a part expects. Each
+/// component turns about its own origin; see [`solve_about`] to choose the point.
 ///
 /// `local` gives the geometry a mate refers to in its component's own coordinates (see
 /// [`crate::resolve`]). `size` is about the size of the assembly in mm; it balances
@@ -74,6 +77,19 @@ const ITERATIONS: usize = 200;
 pub fn solve(
     assembly: &Assembly,
     local: impl Fn(&MateRef) -> Result<Primitive, String>,
+    size: f64,
+) -> Solution {
+    solve_about(assembly, local, |_| Point3::ORIGIN, size)
+}
+
+/// [`solve`], with each component turning about `center` (a point in its own
+/// coordinates: the middle of its geometry, say). The solution is the same; which one is
+/// found is not: a part modelled far from its origin, turned about that origin, would
+/// swing right across the assembly to meet a mate it could have met by turning in place.
+pub fn solve_about(
+    assembly: &Assembly,
+    local: impl Fn(&MateRef) -> Result<Primitive, String>,
+    center: impl Fn(ComponentId) -> Point3,
     size: f64,
 ) -> Solution {
     let size = if size.is_finite() && size > 0.0 {
@@ -87,7 +103,7 @@ pub fn solve(
         if mate.suppressed {
             continue;
         }
-        let known = |r: &MateRef| assembly.component(r.component).is_some();
+        let known = |r: &MateRef| assembly.knows(r.component);
         if !known(&mate.a) || !known(&mate.b) {
             statuses.push((
                 mate.id,
@@ -103,13 +119,23 @@ pub fn solve(
             continue;
         }
         match (local(&mate.a), local(&mate.b)) {
-            (Ok(a), Ok(b)) => active.push(Active {
-                id: mate.id,
-                kind: mate.kind,
-                aligned: mate.aligned,
-                a: (mate.a.component, a),
-                b: (mate.b.component, b),
-            }),
+            (Ok(a), Ok(b)) => {
+                let placed = |c: ComponentId, p: &Primitive| {
+                    p.placed(&assembly.placement_of(c).unwrap_or_default())
+                };
+                let fold = closest_alignment(
+                    &placed(mate.a.component, &a),
+                    &placed(mate.b.component, &b),
+                );
+                active.push(Active {
+                    id: mate.id,
+                    kind: mate.kind,
+                    aligned: mate.aligned,
+                    fold,
+                    a: (mate.a.component, a),
+                    b: (mate.b.component, b),
+                })
+            }
             (Err(e), _) | (_, Err(e)) => statuses.push((mate.id, MateStatus::Error(e))),
         }
     }
@@ -117,7 +143,7 @@ pub fn solve(
     // Mates that cannot apply to their geometry at all are reported, not solved.
     active.retain(|m| {
         let mut scratch = Vec::new();
-        match residuals(m.kind, m.aligned, &m.a.1, &m.b.1, size, &mut scratch) {
+        match residuals(m.kind, m.aligned, m.fold, &m.a.1, &m.b.1, size, &mut scratch) {
             Ok(()) => true,
             Err(e) => {
                 statuses.push((m.id, MateStatus::Error(e)));
@@ -129,7 +155,7 @@ pub fn solve(
     // Groups of mates tied together through components that may move (fixed components tie
     // nothing): each group is solved on its own, which costs far less than one system for
     // the whole assembly and gives the same answer.
-    let fixed = |c: ComponentId| assembly.component(c).is_some_and(|c| c.fixed);
+    let fixed = |c: ComponentId| assembly.is_fixed(c);
     let mut group: Vec<usize> = (0..active.len()).collect();
     fn root(group: &mut [usize], mut i: usize) -> usize {
         while group[i] != i {
@@ -170,7 +196,7 @@ pub fn solve(
     let mut freedom: HashMap<ComponentId, usize> = HashMap::new();
     for members in &groups {
         let mates: Vec<&Active> = members.iter().map(|&i| &active[i]).collect();
-        let solved = solve_group(assembly, &mates, size);
+        let solved = solve_group(assembly, &mates, &center, size);
         placements.extend(solved.placements);
         statuses.extend(solved.statuses);
         freedom.extend(solved.freedom);
@@ -205,13 +231,17 @@ struct Solved {
 }
 
 /// Solves mates that share no moving component with any other mate.
-fn solve_group(assembly: &Assembly, active: &[&Active], size: f64) -> Solved {
+fn solve_group(
+    assembly: &Assembly,
+    active: &[&Active],
+    center: &dyn Fn(ComponentId) -> Point3,
+    size: f64,
+) -> Solved {
     // Unknowns: a small rotation and a shift for each component that may move.
     let mut moving: Vec<ComponentId> = Vec::new();
     for m in active {
         for c in [m.a.0, m.b.0] {
-            let fixed = assembly.component(c).is_some_and(|c| c.fixed);
-            if !fixed && !moving.contains(&c) {
+            if !assembly.is_fixed(c) && !moving.contains(&c) {
                 moving.push(c);
             }
         }
@@ -219,19 +249,23 @@ fn solve_group(assembly: &Assembly, active: &[&Active], size: f64) -> Solved {
     let base: HashMap<ComponentId, Placement> = active
         .iter()
         .flat_map(|m| [m.a.0, m.b.0])
-        .filter_map(|c| assembly.component(c).map(|c| (c.id, c.placement)))
+        .filter_map(|c| assembly.placement_of(c).map(|p| (c, p)))
+        .collect();
+    // Where each moving component turns, in the assembly.
+    let centers: Vec<Point3> = moving
+        .iter()
+        .map(|c| base[c].apply_point(center(*c)))
         .collect();
     let placements = |x: &[f64]| -> HashMap<ComponentId, Placement> {
         let mut out = base.clone();
         for (i, c) in moving.iter().enumerate() {
             let p = &base[c];
             let v = &x[6 * i..6 * i + 6];
-            let center = oxyde_geom::Point3::ORIGIN + p.translation;
             out.insert(
                 *c,
                 p.moved(
                     Vec3::new(v[0], v[1], v[2]),
-                    center,
+                    centers[i],
                     Vec3::new(v[3], v[4], v[5]),
                 ),
             );
@@ -248,7 +282,7 @@ fn solve_group(assembly: &Assembly, active: &[&Active], size: f64) -> Solved {
             let a = m.a.1.placed(&placed[&m.a.0]);
             let b = m.b.1.placed(&placed[&m.b.0]);
             // Errors were ruled out when the mate was accepted.
-            let _ = residuals(m.kind, m.aligned, &a, &b, size, &mut r);
+            let _ = residuals(m.kind, m.aligned, m.fold, &a, &b, size, &mut r);
             spans.push((start, r.len()));
         }
         (r, spans)
@@ -308,6 +342,10 @@ fn solve_group(assembly: &Assembly, active: &[&Active], size: f64) -> Solved {
         .map(|((m, on), worst)| {
             let status = if *on {
                 MateStatus::Ok
+            } else if n == 0 {
+                MateStatus::Error(format!(
+                    "both sides are fixed: Float one of them (off by {worst:.3})"
+                ))
             } else {
                 MateStatus::Error(format!(
                     "cannot be met together with the other mates (off by {worst:.3})"

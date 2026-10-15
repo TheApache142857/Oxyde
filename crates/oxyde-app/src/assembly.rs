@@ -137,6 +137,8 @@ pub struct AssemblyDoc {
     pub mesh_fraction: f64,
     /// How long the last solve took, seconds.
     pub last_solve: Option<f64>,
+    /// Volume of each part file (mm³), computed when Mass Properties first asks.
+    pub volumes: HashMap<PathBuf, Option<f64>>,
     undo: Vec<Assembly>,
     redo: Vec<Assembly>,
 }
@@ -165,6 +167,7 @@ impl AssemblyDoc {
             ranges: Vec::new(),
             mesh_fraction: 0.001,
             last_solve: None,
+            volumes: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -245,6 +248,7 @@ impl AssemblyDoc {
             }
         }
         self.sources.clear();
+        self.volumes.clear();
     }
 
     /// The loaded file of a top-level component.
@@ -292,6 +296,18 @@ impl AssemblyDoc {
             Loaded::Part(p) => Some(p),
             Loaded::Assembly(_) => None,
         }
+    }
+
+    /// The file an occurrence shows.
+    pub fn path_at(&self, o: &Occurrence) -> Option<PathBuf> {
+        let mut path = self.sources.get(&o.top)?.clone();
+        for id in &o.path {
+            let Some(Ok(Loaded::Assembly(sub))) = self.docs.get(&path) else {
+                return None;
+            };
+            path = sub.sources.get(id)?.clone();
+        }
+        Some(path)
     }
 
     /// Names of the components inside sub-assemblies leading to an occurrence.
@@ -344,8 +360,17 @@ impl AssemblyDoc {
 
     // ---- Solving -------------------------------------------------------------------------
 
-    /// Mate geometry in the top-level component's own coordinates.
+    /// Mate geometry in the top-level component's own coordinates (the assembly's, for
+    /// its own planes and origin).
     pub fn local(&self, r: &MateRef) -> Result<Primitive, String> {
+        if r.component == ComponentId::ASSEMBLY {
+            return match &r.target {
+                MateTarget::Plane(_) | MateTarget::Axis(_) | MateTarget::Origin => {
+                    oxyde_assembly::resolve(&r.target, None)
+                }
+                _ => Err("the assembly itself has only planes, axes and an origin".to_owned()),
+            };
+        }
         let (loaded, placement, _) = self
             .walk(r.component, &r.path)
             .ok_or_else(|| "the component's file could not be opened".to_owned())?;
@@ -365,8 +390,8 @@ impl AssemblyDoc {
 
     /// Mate geometry placed in the assembly.
     pub fn placed(&self, assembly: &Assembly, r: &MateRef) -> Option<Primitive> {
-        let component = assembly.component(r.component)?;
-        Some(self.local(r).ok()?.placed(&component.placement))
+        let placement = assembly.placement_of(r.component)?;
+        Some(self.local(r).ok()?.placed(&placement))
     }
 
     /// About the size of the assembly, in mm.
@@ -378,9 +403,21 @@ impl AssemblyDoc {
         (hi - lo).length().max(1.0)
     }
 
-    /// Solves `assembly`'s mates in place and returns the result.
+    /// Solves `assembly`'s mates in place and returns the result. Each component turns
+    /// about the middle of its geometry, so a part modelled away from its origin does not
+    /// swing across the assembly.
     pub fn solve_assembly(&self, assembly: &mut Assembly) -> Solution {
-        let solution = oxyde_assembly::solve(assembly, |r| self.local(r), self.size());
+        let center = |c: ComponentId| {
+            self.component_bounds(c).map_or(Point3::ORIGIN, |(lo, hi)| {
+                Point3::new(
+                    (lo.x + hi.x) / 2.0,
+                    (lo.y + hi.y) / 2.0,
+                    (lo.z + hi.z) / 2.0,
+                )
+            })
+        };
+        let solution =
+            oxyde_assembly::solve_about(assembly, |r| self.local(r), center, self.size());
         for (id, placement) in &solution.placements {
             if let Some(c) = assembly.component_mut(*id) {
                 c.placement = *placement;

@@ -213,7 +213,10 @@ impl AssemblyModel {
                 return Err(format!("mate id {} is not below next_mate_id", m.id.0));
             }
             for side in [&m.a, &m.b] {
-                if !components.iter().any(|c| c.id == side.component) {
+                // Component 0 is the assembly itself (its own planes and origin).
+                if side.component != ComponentId::ASSEMBLY
+                    && !components.iter().any(|c| c.id == side.component)
+                {
                     return Err(format!(
                         "mate {} refers to component {}, which does not exist",
                         m.name, side.component.0

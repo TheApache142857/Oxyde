@@ -163,6 +163,9 @@ pub struct Navigation {
     pub zoom_speed: f64,
     /// Wheel forward zooms out (as in SolidWorks by default) rather than in.
     pub invert_zoom: bool,
+    /// Orbit about the point under the pointer where the drag started, rather than the
+    /// centre of the view.
+    pub orbit_about_pointer: bool,
     /// Standard views and Normal To turn the camera smoothly.
     pub animate_views: bool,
     /// Seconds.
@@ -175,6 +178,7 @@ impl Default for Navigation {
             orbit_speed: 1.0,
             zoom_speed: 1.0,
             invert_zoom: false,
+            orbit_about_pointer: true,
             animate_views: true,
             animation_time: 0.45,
         }

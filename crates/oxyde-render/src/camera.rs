@@ -127,11 +127,25 @@ impl Camera {
         ]
     }
 
-    /// Rotates the view as if dragging the model by `dx`, `dy` pixels.
+    /// Rotates the view as if dragging the model by `dx`, `dy` pixels, about the centre of
+    /// the view.
     pub fn orbit(&mut self, dx: f64, dy: f64) {
+        let pivot = self.target;
+        self.orbit_about(dx, dy, pivot);
+    }
+
+    /// Rotates the view as if dragging the model by `dx`, `dy` pixels, about `pivot` (a
+    /// model point, e.g. the one under the pointer when the drag started): it stays where
+    /// it is on screen, as in SolidWorks and Creo.
+    pub fn orbit_about(&mut self, dx: f64, dy: f64, pivot: V3) {
         const RADIANS_PER_PIXEL: f64 = 0.008;
+        // Where the pivot is on screen, relative to the centre.
+        let v = sub(pivot, self.target);
+        let (sx, sy) = (dot(v, self.right()), dot(v, self.up()));
         self.yaw -= dx * RADIANS_PER_PIXEL;
         self.pitch = (self.pitch + dy * RADIANS_PER_PIXEL).clamp(-FRAC_PI_2, FRAC_PI_2);
+        // The centre that puts the pivot back at the same place on screen.
+        self.target = sub(pivot, add(scale(self.right(), sx), scale(self.up(), sy)));
     }
 
     /// Moves the view so the model follows a drag of `dx`, `dy` pixels.
@@ -232,6 +246,19 @@ mod tests {
         let p = camera.project(under, w, h);
         assert!((p[0] - cursor[0]).abs() < 1e-6 && (p[1] - cursor[1]).abs() < 1e-6);
         assert!((camera.height - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn orbiting_about_a_pivot_keeps_it_on_screen() {
+        let mut camera = Camera::default();
+        let (w, h) = (300.0, 200.0);
+        let pivot = [12.0, -7.0, 30.0];
+        let before = camera.project(pivot, w, h);
+        camera.orbit_about(40.0, -25.0, pivot);
+        let after = camera.project(pivot, w, h);
+        assert!((after[0] - before[0]).abs() < 1e-9 && (after[1] - before[1]).abs() < 1e-9);
+        // And the view did turn.
+        assert!((camera.yaw - FRAC_PI_4).abs() > 0.1);
     }
 
     #[test]

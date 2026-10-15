@@ -76,6 +76,8 @@ pub(crate) struct Row {
     pub(crate) cut: bool,
     pub(crate) text: RichText,
     pub(crate) highlighted: bool,
+    /// Drawn as if the pointer were over it: what is under the pointer in the viewport.
+    pub(crate) hovered: bool,
     /// Error or warning, on the right.
     pub(crate) badge: Option<Icon>,
     /// Children are indented.
@@ -116,7 +118,7 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
         let painter = ui.painter();
         if row.highlighted {
             painter.rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
-        } else if response.hovered() {
+        } else if response.hovered() || row.hovered {
             painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
         }
         if let Some(expanded) = row.expander {
@@ -192,6 +194,8 @@ impl OxydeApp {
         let mut hover_feature = None;
         let mut hover_body = None;
         let creator = self.selection_creator();
+        // The face or edge under the pointer in the viewport lights up its feature here.
+        let under_pointer = self.viewport.hovered().and_then(|p| self.pick_creator(p));
         let referenced = self.panel_features();
         let enabled = self.sketch.is_none();
         ui.add_enabled_ui(enabled, |ui| {
@@ -212,6 +216,7 @@ impl OxydeApp {
                                 cut: false,
                                 text: RichText::new(format!("{} Plane", plane_name(plane))),
                                 highlighted: self.selected_plane == Some(plane),
+                                hovered: false,
                                 badge: None,
                                 indent: 0.0,
                                 expander: None,
@@ -231,6 +236,7 @@ impl OxydeApp {
                             cut: false,
                             text: RichText::new("Origin"),
                             highlighted: false,
+                            hovered: false,
                             badge: None,
                             indent: 0.0,
                             expander: None,
@@ -252,6 +258,7 @@ impl OxydeApp {
                                     body.solids.len()
                                 )),
                                 highlighted: false,
+                                hovered: false,
                                 badge: None,
                                 indent: 0.0,
                                 expander: Some(self.bodies_expanded),
@@ -278,6 +285,7 @@ impl OxydeApp {
                                         cut: false,
                                         text: RichText::new(self.body_label(id)),
                                         highlighted: self.selected_body == Some(id),
+                                        hovered: false,
                                         badge: None,
                                         indent: 16.0,
                                         expander: None,
@@ -333,6 +341,7 @@ impl OxydeApp {
                             ui,
                             entry,
                             highlighted(entry.id),
+                            under_pointer == Some(entry.id),
                             0.0,
                             child.map(|_| expanded),
                             &mut action,
@@ -344,6 +353,7 @@ impl OxydeApp {
                                     ui,
                                     &entries[child_index],
                                     highlighted(sketch),
+                                    under_pointer == Some(sketch),
                                     16.0,
                                     None,
                                     &mut action,
@@ -395,8 +405,28 @@ impl OxydeApp {
         if let Some(id) = hover_body {
             self.viewport.preselect = self.body_picks(id);
         }
+        // The row was scrolled into view while drawing; once is enough.
+        self.scroll_to_feature = None;
         if let Some(action) = action {
             self.apply_action(action);
+        }
+    }
+
+    /// The feature that created a face or edge of the viewport (for an edge, the later of
+    /// the two features that made its faces).
+    pub(crate) fn pick_creator(&self, pick: oxyde_render::Pick) -> Option<FeatureId> {
+        let body = self.doc.part.body()?;
+        let features = self.doc.part.features();
+        let position = |id: FeatureId| features.iter().position(|f| f.id() == id);
+        match pick {
+            oxyde_render::Pick::Face(i) => body.naming.face(i).map(|n| n.key.feature()),
+            oxyde_render::Pick::Edge(i) => body
+                .naming
+                .edge(i)?
+                .faces
+                .iter()
+                .map(|f| f.key.feature())
+                .max_by_key(|id| position(*id)),
         }
     }
 
@@ -427,6 +457,7 @@ impl OxydeApp {
         ui: &mut egui::Ui,
         entry: &TimelineEntry,
         highlighted: bool,
+        hovered: bool,
         indent: f32,
         expander: Option<bool>,
         action: &mut Option<Action>,
@@ -468,6 +499,7 @@ impl OxydeApp {
                 cut,
                 text,
                 highlighted,
+                hovered,
                 badge,
                 indent,
                 expander,
@@ -475,6 +507,9 @@ impl OxydeApp {
             },
         );
         let mut response = row.response;
+        if self.scroll_to_feature == Some(entry.id) {
+            response.scroll_to_me(Some(egui::Align::Center));
+        }
         response = match &entry.status {
             FeatureStatus::Error(message) | FeatureStatus::Warning(message) => {
                 response.on_hover_text(message.as_str())

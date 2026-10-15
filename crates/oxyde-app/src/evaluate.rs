@@ -1,10 +1,12 @@
-//! The Evaluate tab's windows: mass properties of the part, and measurements of the faces
-//! and edges selected in the viewport.
+//! The Evaluate tab's windows: mass properties of the part (or of the whole assembly), and
+//! measurements of the faces and edges selected in the viewport.
 
 use eframe::egui;
+use oxyde_assembly::Primitive;
 use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, Kernel, SurfaceKind};
 
 use crate::app::{OxydeApp, Selected};
+use crate::assembly::AsmSelected;
 
 fn surface_name(kind: SurfaceKind) -> &'static str {
     match kind {
@@ -58,6 +60,10 @@ impl OxydeApp {
     }
 
     fn mass_properties_ui(&mut self, ui: &mut egui::Ui) {
+        if self.asm.is_some() {
+            self.asm_mass_properties_ui(ui);
+            return;
+        }
         let Some(body) = self.doc.part.body() else {
             ui.label("There is no solid yet.");
             return;
@@ -117,7 +123,83 @@ impl OxydeApp {
         );
     }
 
+    /// Volume, size and counts of the whole assembly.
+    fn asm_mass_properties_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = self.asm.as_mut() else {
+            return;
+        };
+        if doc.assembly.components.is_empty() {
+            ui.label("There are no components yet.");
+            return;
+        }
+        // Each part file's volume, computed once per load.
+        let missing: Vec<std::path::PathBuf> = doc
+            .docs
+            .keys()
+            .filter(|p| !doc.volumes.contains_key(*p))
+            .cloned()
+            .collect();
+        for path in missing {
+            let volume = match doc.docs.get(&path) {
+                Some(Ok(crate::assembly::Loaded::Part(p))) => p
+                    .part
+                    .body()
+                    .and_then(|b| crate::app::bodies_volume(&self.kernel, b).ok()),
+                _ => None,
+            };
+            doc.volumes.insert(path, volume);
+        }
+        let leaves = doc.leaves(&doc.assembly);
+        let parts = leaves.len();
+        let mut volume = Some(0.0);
+        for (o, _, _) in &leaves {
+            let v = doc
+                .path_at(o)
+                .and_then(|p| doc.volumes.get(&p).copied().flatten());
+            volume = match (volume, v) {
+                (Some(total), Some(v)) => Some(total + v),
+                _ => None,
+            };
+        }
+        let bounds = doc.bounds(&doc.assembly);
+        let hidden = doc.assembly.components.iter().filter(|c| c.hidden).count();
+        egui::Grid::new("asm_mass_properties")
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                row(
+                    ui,
+                    "Volume",
+                    volume.map_or_else(|| "?".to_owned(), |v| format!("{v:.2} mm³")),
+                );
+                if let Some((lo, hi)) = bounds {
+                    row(
+                        ui,
+                        "Size (X × Y × Z)",
+                        format!(
+                            "{:.2} × {:.2} × {:.2} mm",
+                            hi.x - lo.x,
+                            hi.y - lo.y,
+                            hi.z - lo.z
+                        ),
+                    );
+                }
+                row(ui, "Components", doc.assembly.components.len().to_string());
+                row(ui, "Parts (every level)", parts.to_string());
+                row(ui, "Mates", doc.assembly.mates.len().to_string());
+            });
+        let mut notes = vec!["Volumes add up every part shown, through every sub-assembly."];
+        if hidden > 0 {
+            notes.push("Hidden components are left out.");
+        }
+        ui.label(egui::RichText::new(notes.join(" ")).small().weak());
+    }
+
     fn measure_ui(&mut self, ui: &mut egui::Ui) {
+        if self.asm.is_some() {
+            self.asm_measure_ui(ui);
+            return;
+        }
         let Some(body) = self.doc.part.body() else {
             ui.label("There is no solid yet.");
             return;
@@ -201,6 +283,114 @@ impl OxydeApp {
                             let cos = aa.direction.dot(ab.direction).clamp(-1.0, 1.0);
                             let angle = cos.acos().to_degrees();
                             row(ui, "Angle", format!("{:.3}°", angle.min(180.0 - angle)));
+                        }
+                    }
+                }
+            });
+    }
+
+    /// Areas, lengths, and the angle and distance between two faces or edges selected in
+    /// the assembly, where they sit.
+    fn asm_measure_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = self.asm.as_ref() else {
+            return;
+        };
+        // Each selected face or edge: its label, its size, and its geometry in the
+        // assembly (a plane, a line, a circle…).
+        let mut faces: Vec<(String, f64, Option<Primitive>)> = Vec::new();
+        let mut edges: Vec<(String, String, Option<Primitive>)> = Vec::new();
+        for item in &doc.selection {
+            let Some(part) = (match item {
+                AsmSelected::Face(o, _) | AsmSelected::Edge(o, _) => doc.part_at(o),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some(body) = part.part.body() else {
+                continue;
+            };
+            let placed = item
+                .mate_ref()
+                .and_then(|r| doc.placed(&doc.assembly, &r));
+            match item {
+                AsmSelected::Face(_, name) => {
+                    if let Some(f) = body
+                        .naming
+                        .find_face(name)
+                        .and_then(|i| body.topology.faces.get(i as usize))
+                    {
+                        faces.push((surface_name(f.surface).to_owned(), f.area, placed));
+                    }
+                }
+                AsmSelected::Edge(_, name) => {
+                    if let Some(e) = body
+                        .naming
+                        .find_edge(name)
+                        .and_then(|i| body.topology.edges.get(i as usize))
+                    {
+                        let mut text = format!("{:.3} mm", e.length);
+                        if e.curve == CurveKind::Circle && e.vertices.len() < 2 {
+                            text.push_str(&format!(
+                                "  (Ø {:.3})",
+                                e.length / std::f64::consts::PI
+                            ));
+                        }
+                        edges.push((curve_name(e.curve).to_owned(), text, placed));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if faces.is_empty() && edges.is_empty() {
+            ui.label("Click faces or edges in the graphics area (Ctrl+click for more).");
+            return;
+        }
+        egui::Grid::new("asm_measure")
+            .num_columns(2)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                for (i, (kind, area, _)) in faces.iter().enumerate() {
+                    row(ui, &format!("Face {} ({kind})", i + 1), format!("{area:.3} mm²"));
+                }
+                for (i, (kind, text, _)) in edges.iter().enumerate() {
+                    row(ui, &format!("Edge {} ({kind})", i + 1), text.clone());
+                }
+                if faces.len() > 1 {
+                    let total: f64 = faces.iter().map(|(_, a, _)| a).sum();
+                    row(ui, "Total area", format!("{total:.3} mm²"));
+                }
+                // Two things with a direction: the angle between them, and the distance
+                // between two parallel planes or a plane and a point.
+                let directed: Vec<&Primitive> = faces
+                    .iter()
+                    .map(|(_, _, p)| p)
+                    .chain(edges.iter().map(|(_, _, p)| p))
+                    .flatten()
+                    .collect();
+                if let [a, b] = directed.as_slice() {
+                    let direction = |p: &Primitive| match *p {
+                        Primitive::Plane { normal, .. } | Primitive::Circle { normal, .. } => {
+                            Some(normal)
+                        }
+                        Primitive::Line { direction, .. } => Some(direction),
+                        Primitive::Point(_) => None,
+                    };
+                    if let (Some(u), Some(v)) = (direction(a), direction(b)) {
+                        let cos = u.dot(v).clamp(-1.0, 1.0);
+                        let angle = cos.acos().to_degrees();
+                        let folded = angle.min(180.0 - angle);
+                        row(ui, "Angle", format!("{folded:.3}°"));
+                        if let (Primitive::Plane { origin, normal }, other) = (a, b) {
+                            let anchor = match **other {
+                                Primitive::Plane { origin, .. }
+                                | Primitive::Line { origin, .. } => origin,
+                                Primitive::Circle { center, .. } => center,
+                                Primitive::Point(p) => p,
+                            };
+                            if folded < 1e-3 {
+                                let distance = (anchor - *origin).dot(*normal).abs();
+                                row(ui, "Distance", format!("{distance:.3} mm"));
+                            }
                         }
                     }
                 }

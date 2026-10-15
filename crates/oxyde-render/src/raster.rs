@@ -131,9 +131,86 @@ impl Scene {
         self.bounds
     }
 
+    /// The model point where the ray from `origin` along `direction` meets what was
+    /// picked: the nearest crossing of the face's triangles, or the point of the edge
+    /// nearest to the ray. The orbit pivot.
+    pub fn hit(&self, pick: Pick, origin: V3, direction: V3) -> Option<V3> {
+        match pick {
+            Pick::Face(index) => {
+                let face = self.faces.get(index as usize)?;
+                let mut best: Option<f64> = None;
+                for t in &face.triangles {
+                    let [a, b, c] = t.map(|i| face.positions[i]);
+                    if let Some(s) = ray_triangle(origin, direction, a, b, c) {
+                        if best.is_none_or(|d| s < d) {
+                            best = Some(s);
+                        }
+                    }
+                }
+                best.map(|s| add(origin, scale(direction, s)))
+            }
+            Pick::Edge(index) => {
+                let edge = self.edges.get(index as usize)?;
+                let mut best: Option<(f64, V3)> = None;
+                for w in edge.windows(2) {
+                    let p = nearest_on_segment(origin, direction, w[0], w[1]);
+                    // Distance from the ray.
+                    let d = sub(p, origin);
+                    let across = sub(d, scale(direction, dot(d, direction)));
+                    let dist = dot(across, across);
+                    if best.is_none_or(|(b, _)| dist < b) {
+                        best = Some((dist, p));
+                    }
+                }
+                best.map(|(_, p)| p)
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.faces.is_empty() && self.edges.is_empty()
     }
+}
+
+/// Distance along the ray to the triangle `a b c` (Möller–Trumbore), if it crosses it.
+fn ray_triangle(origin: V3, direction: V3, a: V3, b: V3, c: V3) -> Option<f64> {
+    let (e1, e2) = (sub(b, a), sub(c, a));
+    let p = cross(direction, e2);
+    let det = dot(e1, p);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = sub(origin, a);
+    let u = dot(s, p) * inv;
+    if !(-1e-9..=1.0 + 1e-9).contains(&u) {
+        return None;
+    }
+    let q = cross(s, e1);
+    let v = dot(direction, q) * inv;
+    if v < -1e-9 || u + v > 1.0 + 1e-9 {
+        return None;
+    }
+    Some(dot(e2, q) * inv)
+}
+
+/// The point of segment `a b` nearest to the line from `origin` along `direction`.
+fn nearest_on_segment(origin: V3, direction: V3, a: V3, b: V3) -> V3 {
+    let ab = sub(b, a);
+    let len2 = dot(ab, ab);
+    if len2 < 1e-18 {
+        return a;
+    }
+    // Minimise |a + t ab − (origin + s direction)|² over t, s (direction is unit).
+    let w = sub(a, origin);
+    let (d_ab, w_d, w_ab) = (dot(direction, ab), dot(w, direction), dot(w, ab));
+    let denom = len2 - d_ab * d_ab;
+    let t = if denom.abs() < 1e-12 {
+        0.0
+    } else {
+        ((d_ab * w_d) - w_ab) / denom
+    };
+    add(a, scale(ab, t.clamp(0.0, 1.0)))
 }
 
 /// A [`Scene`] as flat arrays, ready to upload to a GPU.

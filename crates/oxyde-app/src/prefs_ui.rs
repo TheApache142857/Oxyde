@@ -61,6 +61,7 @@ impl OxydeApp {
             orbit_speed: p.navigation.orbit_speed,
             zoom_speed: p.navigation.zoom_speed,
             invert_zoom: p.navigation.invert_zoom,
+            orbit_about_pointer: p.navigation.orbit_about_pointer,
             animation_time: if p.navigation.animate_views {
                 p.navigation.animation_time
             } else {
@@ -257,12 +258,25 @@ impl OxydeApp {
             ui.add(egui::Slider::new(&mut n.orbit_speed, 0.2..=3.0).suffix("×"));
             ui.end_row();
             ui.label("Zoom speed");
-            ui.add(egui::Slider::new(&mut n.zoom_speed, 0.2..=3.0).suffix("×"));
+            ui.add(
+                egui::Slider::new(&mut n.zoom_speed, 0.1..=5.0)
+                    .logarithmic(true)
+                    .suffix("×"),
+            )
+            .on_hover_text("How much one wheel notch zooms");
             ui.end_row();
         });
         ui.checkbox(
             &mut n.invert_zoom,
             "Reverse the mouse wheel (forward zooms out)",
+        );
+        ui.checkbox(
+            &mut n.orbit_about_pointer,
+            "Orbit about the point under the pointer",
+        )
+        .on_hover_text(
+            "The model point under the pointer when the drag starts stays put on screen; \
+             off, the view turns about its centre",
         );
         ui.checkbox(&mut n.animate_views, "Animate view changes");
         ui.add_enabled_ui(n.animate_views, |ui| {
@@ -274,15 +288,19 @@ impl OxydeApp {
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Mouse");
         for (what, how) in [
-            ("Orbit", "left-drag"),
-            ("Pan", "middle-drag, or Shift+left-drag"),
+            ("Orbit", "left-drag, about the point under the pointer"),
+            ("Pan", "right-drag, middle-drag, or Shift+left-drag"),
             ("Zoom", "wheel, at the pointer"),
+            ("Zoom to fit", "double-click the middle button, or F"),
             ("Select", "click; Ctrl+click adds"),
             (
                 "Move a component (assembly)",
                 "Alt+drag; Alt+Shift+drag turns it",
             ),
-            ("Sketch mode", "middle-drag pans, Ctrl+middle-drag orbits"),
+            (
+                "Sketch mode",
+                "right-drag or middle-drag pans, Ctrl+middle-drag orbits",
+            ),
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(what).strong());
@@ -620,7 +638,7 @@ impl OxydeApp {
             Action::ViewRight => self.viewport.set_view(StandardView::Right),
             Action::ViewIsometric => self.viewport.set_view(StandardView::Isometric),
             Action::NormalTo => {
-                if let Some(plane) = (!assembly).then(|| self.normal_to_target()).flatten() {
+                if let Some(plane) = self.normal_to_target() {
                     self.viewport.look_at_plane(&plane);
                 }
             }

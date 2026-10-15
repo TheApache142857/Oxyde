@@ -651,3 +651,81 @@ fn a_zero_distance_holds_points_together() {
     assert!(close(t.length(), 0.0), "{t:?}");
     assert_eq!(solution.degrees(b), Some(3));
 }
+
+#[test]
+fn axes_that_start_square_can_be_made_concentric() {
+    // A screw inserted beside a plate often has its axis square to the hole's.
+    for kind in [MateKind::Concentric, MateKind::Coincident, MateKind::Parallel] {
+        let (mut asm, a, b) = side_by_side();
+        asm.add_mate(
+            kind,
+            r(a, MateTarget::Axis(StandardAxis::Z)),
+            r(b, MateTarget::Axis(StandardAxis::Y)),
+            true,
+        );
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{kind:?}: {:?}", solution.mates);
+        let y = asm.component(b).unwrap().placement.apply_vector(Vec3::Y);
+        assert!(close(y.cross(Vec3::Z).length(), 0.0), "{kind:?}: {y:?}");
+        if kind != MateKind::Parallel {
+            let t = asm.component(b).unwrap().placement.translation;
+            assert!(close(t.x, 0.0) && close(t.y, 0.0), "{kind:?}: {t:?}");
+        }
+    }
+}
+
+#[test]
+fn a_component_mates_to_the_assembly_itself() {
+    // The first component is fixed where it was inserted; floated, it can be mated to the
+    // assembly's own planes and origin, which never move.
+    let (mut asm, a, b) = two();
+    asm.component_mut(a).unwrap().fixed = false;
+    let me = ComponentId::ASSEMBLY;
+    assert!(asm.knows(me) && asm.is_fixed(me));
+    asm.add_mate(MateKind::Coincident, front(me), front(b), true);
+    asm.add_mate(MateKind::Coincident, right(me), right(b), true);
+    asm.add_mate(
+        MateKind::Coincident,
+        r(me, MateTarget::Plane(StandardPlane::Top)),
+        r(b, MateTarget::Plane(StandardPlane::Top)),
+        true,
+    );
+    // A fixed component cannot follow a mate to the assembly.
+    asm.component_mut(a).unwrap().fixed = true;
+    let stuck = asm.add_mate(
+        MateKind::Distance(5.0),
+        r(me, MateTarget::Origin),
+        r(a, MateTarget::Origin),
+        true,
+    );
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 1, "{:?}", solution.mates);
+    assert!(is_identity(&asm.component(b).unwrap().placement));
+    assert_eq!(solution.degrees(b), Some(0));
+    match solution.status(stuck) {
+        Some(MateStatus::Error(e)) => assert!(e.contains("fixed"), "{e}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_part_turns_about_its_own_middle() {
+    // A pin modelled 1000 mm from its origin, inserted beside the base, square to it: made
+    // concentric with the base's axis, it should turn in place, not swing about its origin.
+    let (mut asm, a, b) = side_by_side();
+    let far = Point3::new(1000.0, 0.0, 0.0);
+    asm.add_mate(
+        MateKind::Concentric,
+        r(a, MateTarget::Axis(StandardAxis::Z)),
+        r(b, MateTarget::Axis(StandardAxis::Y)),
+        true,
+    );
+    let before = asm.component(b).unwrap().placement.apply_point(far);
+    let solution = solve_about(&asm, |m| resolve(&m.target, None), |_| far, 100.0);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let placement = solution.placements[0].1;
+    let after = placement.apply_point(far);
+    // The middle moved only sideways onto the axis, not by a thousand millimetres.
+    assert!((after - before).length() < 100.0, "{before:?} -> {after:?}");
+    assert!(close(placement.apply_vector(Vec3::Y).cross(Vec3::Z).length(), 0.0));
+}

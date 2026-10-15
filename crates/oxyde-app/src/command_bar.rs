@@ -604,12 +604,15 @@ impl OxydeApp {
         }
     }
 
-    /// View › Hide/Show: whole kinds of items.
-    fn visibility_menu(&mut self, ui: &mut egui::Ui) {
+    /// View › Hide/Show: whole kinds of items (an assembly has only planes and an origin).
+    pub(crate) fn visibility_menu(&mut self, ui: &mut egui::Ui) {
+        let assembly = self.asm.is_some();
         let v = &mut self.visibility;
         ui.checkbox(&mut v.planes, "Planes");
-        ui.checkbox(&mut v.axes, "Axes");
-        ui.checkbox(&mut v.sketches, "Sketches");
+        if !assembly {
+            ui.checkbox(&mut v.axes, "Axes");
+            ui.checkbox(&mut v.sketches, "Sketches");
+        }
         ui.checkbox(&mut v.origins, "Origins");
         ui.label(
             egui::RichText::new("Single items: the eye in the tree")
@@ -665,9 +668,11 @@ impl OxydeApp {
                             );
                             let target = self.normal_to_target();
                             if icons::icon_button(ui, Icon::NormalTo, 26.0, target.is_some())
-                                .on_hover_text(
-                                    "Normal To: look straight at the sketch, plane or flat face",
-                                )
+                                .on_hover_text(if self.asm.is_some() {
+                                    "Normal To: look straight at the selected plane"
+                                } else {
+                                    "Normal To: look straight at the sketch, plane or flat face"
+                                })
                                 .clicked()
                             {
                                 if let Some(plane) = target {

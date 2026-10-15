@@ -1,10 +1,12 @@
 //! The 3D viewport: shows the part, handles camera navigation and picking.
 //!
-//! Mouse, part mode: left-drag orbits, middle-drag or Shift+left-drag pans, the wheel zooms
-//! at the cursor, left-click selects (Ctrl+click adds to the selection).
+//! Mouse, part mode: left-drag orbits about the point under the pointer where the drag
+//! started (the model stays put under it, as in SolidWorks and Creo), right-drag,
+//! middle-drag or Shift+left-drag pans, the wheel zooms at the cursor, a middle double-click
+//! zooms to fit, left-click selects (Ctrl+click adds to the selection).
 //!
-//! Sketch mode keeps the left button for drawing: middle-drag pans, Ctrl+middle-drag orbits,
-//! and picking of the 3D model is off.
+//! Sketch mode keeps the left button for drawing: right-drag or middle-drag pans,
+//! Ctrl+middle-drag orbits, and picking of the 3D model is off.
 //!
 //! In an assembly, Alt+left-drag grabs what is under the pointer instead of orbiting
 //! (Alt+Shift+left-drag to turn it); see [`Grab`].
@@ -84,6 +86,8 @@ pub struct ViewSettings {
     pub orbit_speed: f64,
     pub zoom_speed: f64,
     pub invert_zoom: bool,
+    /// Orbit about the point under the pointer rather than the centre of the view.
+    pub orbit_about_pointer: bool,
     /// Seconds a view change takes; 0 = at once.
     pub animation_time: f64,
 }
@@ -96,6 +100,7 @@ impl Default for ViewSettings {
             orbit_speed: 1.0,
             zoom_speed: 1.0,
             invert_zoom: false,
+            orbit_about_pointer: true,
             animation_time: 0.45,
         }
     }
@@ -151,6 +156,8 @@ pub struct Viewport {
     pub grab_enabled: bool,
     /// The pick under the pointer when the current grab started.
     grabbed: Option<Option<Pick>>,
+    /// The model point an orbit drag turns about, from the press to the release.
+    pivot: Option<[f64; 3]>,
     pub settings: ViewSettings,
     /// Faces and edges to draw as hovered this frame, set before `ui` (tree hover).
     pub preselect: Vec<Pick>,
@@ -177,6 +184,7 @@ impl Viewport {
             renderer: "software".to_owned(),
             grab_enabled: false,
             grabbed: None,
+            pivot: None,
             settings: ViewSettings::default(),
             preselect: Vec::new(),
             scene_counts: (0, 0),
@@ -340,7 +348,31 @@ impl Viewport {
             ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl, i.modifiers.alt));
         let delta = response.drag_delta();
         let middle = response.dragged_by(egui::PointerButton::Middle);
+        let secondary = response.dragged_by(egui::PointerButton::Secondary);
         let mut primary = response.dragged_by(egui::PointerButton::Primary);
+        if response.double_clicked_by(egui::PointerButton::Middle) {
+            self.fit_pending = true;
+        }
+        // An orbit drag turns about what was under the pointer when it started.
+        let orbit_started = if sketching {
+            response.drag_started_by(egui::PointerButton::Middle) && ctrl
+        } else {
+            response.drag_started_by(egui::PointerButton::Primary) && !shift && !alt
+        };
+        if orbit_started {
+            self.pivot = self
+                .settings
+                .orbit_about_pointer
+                .then(|| {
+                    let pick = self.hovered?;
+                    let pos = response.interact_pointer_pos()?;
+                    let local = (pos - rect.min) * ppp;
+                    let (origin, direction) =
+                        self.camera.ray(local.x as f64, local.y as f64, w, h);
+                    self.scene.hit(pick, origin, direction)
+                })
+                .flatten();
+        }
         // Alt+drag grabs; it keeps grabbing until the button is released.
         if self.grab_enabled
             && alt
@@ -367,9 +399,9 @@ impl Viewport {
             _ => None,
         };
         let (panning, orbiting) = if sketching {
-            (middle && !ctrl, middle && ctrl)
+            ((middle && !ctrl) || secondary, middle && ctrl)
         } else {
-            let panning = middle || (shift && primary);
+            let panning = middle || secondary || (shift && primary);
             (panning, !panning && primary)
         };
         if panning || orbiting {
@@ -381,7 +413,13 @@ impl Viewport {
                 .pan(delta.x as f64 * ppp as f64, delta.y as f64 * ppp as f64, h);
         } else if orbiting {
             let k = self.settings.orbit_speed;
-            self.camera.orbit(delta.x as f64 * k, delta.y as f64 * k);
+            let (dx, dy) = (delta.x as f64 * k, delta.y as f64 * k);
+            match self.pivot {
+                Some(pivot) => self.camera.orbit_about(dx, dy, pivot),
+                None => self.camera.orbit(dx, dy),
+            }
+        } else {
+            self.pivot = None;
         }
 
         let pointer = response.hover_pos().map(|p| {
@@ -394,7 +432,7 @@ impl Viewport {
                 self.animation = None;
                 if let Some(cursor) = pointer {
                     let sign = if self.settings.invert_zoom { 1.0 } else { -1.0 };
-                    let rate = 0.0015 * self.settings.zoom_speed;
+                    let rate = 0.003 * self.settings.zoom_speed;
                     let factor = (sign * scroll as f64 * rate).exp();
                     self.camera.zoom_at(factor, cursor, w, h);
                 }

@@ -4,6 +4,13 @@
 //!
 //! The app is in assembly mode while `OxydeApp::asm` holds an assembly. Parts are edited in
 //! their own documents: *Open Part* leaves the assembly, *Back to assembly* returns to it.
+//!
+//! The assembly has an origin and standard planes of its own (component 0,
+//! [`ComponentId::ASSEMBLY`]), listed at the top of the tree and drawn in the viewport, so
+//! that a component can be mated exactly where it should be. The Mate command collects
+//! any number of mates before the parts move (as Creo's component placement does): each
+//! pair is added to a list, and OK places the parts with all of them at once; a preview
+//! can be switched on to see them move as mates are added.
 
 use std::path::Path;
 
@@ -14,14 +21,23 @@ use oxyde_assembly::{
 };
 use oxyde_geom::{Point3, Vec3};
 use oxyde_model::{StandardAxis, StandardPlane};
-use oxyde_render::Scene;
+use oxyde_render::{Scene, StandardView};
 
-use crate::app::{OxydeApp, PendingAction};
+use crate::app::{Overlay, OverlayShape, OxydeApp, PendingAction, overlay_at};
 use crate::assembly::{AsmSelected, AssemblyDoc};
 use crate::dialogs::plane_name;
+use crate::display::Item;
 use crate::icons::{self, Icon};
 use crate::property_manager::{box_active, box_fill};
 use crate::timeline::{Row, tree_row};
+
+/// The tabs of the assembly command bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AsmTab {
+    #[default]
+    Assembly,
+    Evaluate,
+}
 
 /// The mate types offered, in the order shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +100,34 @@ pub struct MateDialog {
     pub aligned: bool,
     /// The user flipped the alignment: it no longer follows the geometry.
     pub aligned_set: bool,
+    /// Mates collected in this command, applied together on OK.
+    pub pending: Vec<Draft>,
+    /// Move the parts as mates are added, rather than on OK.
+    pub preview: bool,
 }
 
 impl MateDialog {
     fn kind(&self) -> MateKind {
         self.kind_for(self.choice)
+    }
+
+    /// Everything the command would add: the list, and the pair being picked.
+    fn drafts(&self) -> Vec<Draft> {
+        let mut out = self.pending.clone();
+        out.extend(self.draft());
+        out
+    }
+
+    /// Moves the pair being picked into the list, ready for the next one.
+    fn push_draft(&mut self) -> Option<Draft> {
+        let draft = self.draft()?;
+        self.pending.push(draft.clone());
+        self.a = None;
+        self.b = None;
+        self.second = false;
+        self.choice_set = false;
+        self.aligned_set = false;
+        Some(draft)
     }
 
     fn kind_for(&self, choice: MateChoice) -> MateKind {
@@ -113,17 +152,19 @@ impl MateDialog {
     }
 }
 
+/// A mate as the Mate command holds it before it is added.
 #[derive(Debug, Clone, PartialEq)]
-struct Draft {
+pub struct Draft {
     kind: MateKind,
     a: MateRef,
     b: MateRef,
     aligned: bool,
 }
 
-/// The assembly as it would be with the mate being made, shown while the command is open.
+/// The assembly as it would be with the mates being made, shown while the command is open
+/// and its preview is on.
 pub struct MatePreview {
-    draft: Draft,
+    drafts: Vec<Draft>,
     pub assembly: Assembly,
     pub solution: Solution,
 }
@@ -131,6 +172,9 @@ pub struct MatePreview {
 /// A row clicked in the assembly tree.
 enum TreeAction {
     Select(AsmSelected),
+    /// The assembly's own plane, selected (shown and Normal To).
+    SelectPlane(StandardPlane),
+    ToggleItem(Item),
     Target(MateRef),
     Toggle(ComponentId),
     Hide(ComponentId),
@@ -169,6 +213,15 @@ fn standard_targets() -> [(MateTarget, &'static str, Icon); 4] {
     ]
 }
 
+/// A component's name; the assembly itself for its own planes and origin.
+fn component_label(doc: &AssemblyDoc, id: ComponentId) -> String {
+    if id == ComponentId::ASSEMBLY {
+        return format!("{} (assembly)", doc.display_name());
+    }
+    doc.component(id)
+        .map_or_else(|| "(missing)".to_owned(), |c| c.name.clone())
+}
+
 /// "Face of Bracket<1>", "Top Plane of Pin<2>"…
 fn describe_ref(doc: &AssemblyDoc, r: &MateRef) -> String {
     let what = match &r.target {
@@ -185,14 +238,22 @@ fn describe_ref(doc: &AssemblyDoc, r: &MateRef) -> String {
         ),
         MateTarget::Origin => "Origin".to_owned(),
     };
-    let owner = doc
-        .component(r.component)
-        .map_or("(missing)", |c| c.name.as_str());
+    let owner = component_label(doc, r.component);
     // A part inside a sub-assembly: "Face of Pin<2> in Arm<1>".
     match doc.inner_names(r.component, &r.path).last() {
         Some(inner) => format!("{what} of {inner} in {owner}"),
         None => format!("{what} of {owner}"),
     }
+}
+
+/// "Coincident: Face of A<1> — Top Plane of B<1>", for the list of mates to add.
+fn describe_draft(doc: &AssemblyDoc, d: &Draft) -> String {
+    format!(
+        "{}: {} — {}",
+        d.kind.label(),
+        describe_ref(doc, &d.a),
+        describe_ref(doc, &d.b)
+    )
 }
 
 /// A selection box of the Mate command.
@@ -277,6 +338,11 @@ impl OxydeApp {
         self.mate_dialog = None;
         self.mate_preview = None;
         self.show_bom = false;
+        self.show_mass_properties = false;
+        self.show_measure = false;
+        self.asm_plane = None;
+        self.asm_scroll_to = None;
+        self.asm_tab = AsmTab::Assembly;
         self.viewport.grab_enabled = false;
         self.scene_revision = None;
     }
@@ -451,6 +517,8 @@ impl OxydeApp {
             angle: 90.0,
             aligned: true,
             aligned_set: false,
+            pending: Vec::new(),
+            preview: false,
         };
         for r in refs.into_iter().take(2) {
             self.mate_pick(&mut dialog, r);
@@ -460,6 +528,9 @@ impl OxydeApp {
         if let Some(doc) = self.asm.as_mut() {
             doc.selection.clear();
         }
+        self.status = "Pick a face, edge or plane on each of two components; add as many \
+                       mates as needed, then OK places the parts"
+            .to_owned();
     }
 
     fn edit_mate(&mut self, id: MateId) {
@@ -482,6 +553,8 @@ impl OxydeApp {
             angle,
             aligned: mate.aligned,
             aligned_set: true,
+            pending: Vec::new(),
+            preview: true,
         });
         self.mate_preview = None;
     }
@@ -538,59 +611,85 @@ impl OxydeApp {
         }
     }
 
+    /// Adds every mate the command collected (or changes the one being edited) and
+    /// solves once, so the parts move with all of them holding.
     fn apply_mate(&mut self, d: MateDialog) {
-        let Some(draft) = d.draft() else {
+        let drafts = d.drafts();
+        if drafts.is_empty() {
+            self.mate_preview = None;
+            self.bump_asm();
             return;
-        };
-        // The preview is reused only if it shows exactly this mate.
-        let preview = self.mate_preview.take().filter(|p| p.draft == draft);
+        }
+        // The preview is reused only if it shows exactly these mates.
+        let preview = self.mate_preview.take().filter(|p| p.drafts == drafts);
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
         doc.checkpoint();
-        let id = match d.editing {
-            Some(id) => {
-                if let Some(m) = doc.assembly.mate_mut(id) {
-                    m.kind = draft.kind;
-                    m.a = draft.a;
-                    m.b = draft.b;
-                    m.aligned = draft.aligned;
+        let mut ids = Vec::new();
+        for draft in drafts {
+            let id = match d.editing {
+                Some(id) => {
+                    if let Some(m) = doc.assembly.mate_mut(id) {
+                        m.kind = draft.kind;
+                        m.a = draft.a;
+                        m.b = draft.b;
+                        m.aligned = draft.aligned;
+                    }
+                    id
                 }
-                id
-            }
-            None => doc
-                .assembly
-                .add_mate(draft.kind, draft.a, draft.b, draft.aligned),
-        };
+                None => doc
+                    .assembly
+                    .add_mate(draft.kind, draft.a, draft.b, draft.aligned),
+            };
+            ids.push(id);
+        }
         match preview {
             // The preview already holds the solved placements.
-            Some(p) if p.assembly.mate(id).is_some() => {
+            Some(p) if ids.iter().all(|id| p.assembly.mate(*id).is_some()) => {
                 doc.assembly = p.assembly;
                 doc.solution = Some(p.solution);
                 doc.revision = crate::document::next_revision();
             }
             _ => doc.solve(),
         }
-        let name = doc
-            .assembly
-            .mate(id)
-            .map(|m| m.name.clone())
-            .unwrap_or_default();
-        self.status = match doc.solution.as_ref().and_then(|s| s.status(id)) {
-            Some(MateStatus::Error(e)) => format!("{name}: {e}"),
-            _ => format!("{name} added"),
+        let names: Vec<String> = ids
+            .iter()
+            .filter_map(|id| doc.assembly.mate(*id).map(|m| m.name.clone()))
+            .collect();
+        let errors: Vec<String> = ids
+            .iter()
+            .filter_map(|id| match doc.solution.as_ref().and_then(|s| s.status(*id)) {
+                Some(MateStatus::Error(e)) => Some(format!(
+                    "{}: {e}",
+                    doc.assembly.mate(*id).map_or("?", |m| m.name.as_str())
+                )),
+                _ => None,
+            })
+            .collect();
+        self.status = if errors.is_empty() {
+            match d.editing {
+                Some(_) => format!("{} changed", names.join(", ")),
+                None => format!("Added {}", names.join(", ")),
+            }
+        } else {
+            errors.join("; ")
         };
     }
 
-    /// Keeps the preview in step with the Mate command.
+    /// Keeps the preview in step with the Mate command, while its preview is on.
     fn refresh_mate_preview(&mut self) {
-        let Some(draft) = self.mate_dialog.as_ref().and_then(MateDialog::draft) else {
+        let drafts = match self.mate_dialog.as_ref() {
+            Some(d) if d.preview => d.drafts(),
+            _ => Vec::new(),
+        };
+        if drafts.is_empty() {
             if self.mate_preview.take().is_some() {
                 self.bump_asm();
             }
             return;
-        };
-        if self.mate_preview.as_ref().is_some_and(|p| p.draft == draft) {
+        }
+        if self.mate_preview.as_ref().is_some_and(|p| p.drafts == drafts) {
             return;
         }
         let editing = self.mate_dialog.as_ref().and_then(|d| d.editing);
@@ -598,20 +697,22 @@ impl OxydeApp {
             return;
         };
         let mut assembly = doc.assembly.clone();
-        match editing.and_then(|id| assembly.mate_mut(id)) {
-            Some(m) => {
-                m.kind = draft.kind;
-                m.a = draft.a.clone();
-                m.b = draft.b.clone();
-                m.aligned = draft.aligned;
-            }
-            None => {
-                assembly.add_mate(draft.kind, draft.a.clone(), draft.b.clone(), draft.aligned);
+        for draft in &drafts {
+            match editing.and_then(|id| assembly.mate_mut(id)) {
+                Some(m) => {
+                    m.kind = draft.kind;
+                    m.a = draft.a.clone();
+                    m.b = draft.b.clone();
+                    m.aligned = draft.aligned;
+                }
+                None => {
+                    assembly.add_mate(draft.kind, draft.a.clone(), draft.b.clone(), draft.aligned);
+                }
             }
         }
         let solution = doc.solve_assembly(&mut assembly);
         self.mate_preview = Some(MatePreview {
-            draft,
+            drafts,
             assembly,
             solution,
         });
@@ -774,7 +875,35 @@ impl OxydeApp {
                     self.reload_assembly_parts();
                 }
             });
+            ui.menu_button("View", |ui| {
+                for (label, view) in [
+                    ("Front (Ctrl+1)", StandardView::Front),
+                    ("Top (Ctrl+5)", StandardView::Top),
+                    ("Right (Ctrl+4)", StandardView::Right),
+                    ("Isometric (Ctrl+7)", StandardView::Isometric),
+                ] {
+                    if ui.button(label).clicked() {
+                        ui.close_menu();
+                        self.viewport.set_view(view);
+                    }
+                }
+                ui.separator();
+                if ui.button("Zoom to fit (F)").clicked() {
+                    ui.close_menu();
+                    self.viewport.request_fit();
+                }
+                ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
+            });
             ui.menu_button("Tools", |ui| {
+                if ui.button("Mass properties").clicked() {
+                    ui.close_menu();
+                    self.show_mass_properties = true;
+                }
+                if ui.button("Measure").clicked() {
+                    ui.close_menu();
+                    self.show_measure = true;
+                }
+                ui.separator();
                 if ui.button("Preferences…").clicked() {
                     ui.close_menu();
                     self.open_preferences(crate::prefs_ui::PrefsTab::Graphics);
@@ -787,8 +916,9 @@ impl OxydeApp {
                 }
                 if ui.button("Assembly mouse controls").clicked() {
                     ui.close_menu();
-                    self.status = "Alt+drag moves a component, Alt+Shift+drag turns it; mates \
-                                   pull it back where they hold"
+                    self.status = "Left-drag orbits about the point under the pointer, \
+                                   right-drag pans, middle double-click fits; Alt+drag moves a \
+                                   component, Alt+Shift+drag turns it"
                         .to_owned();
                 }
                 if ui.button("About Oxyde").clicked() {
@@ -802,7 +932,16 @@ impl OxydeApp {
     pub(crate) fn assembly_command_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            let _ = ui.selectable_label(true, RichText::new("Assembly").size(13.0).strong());
+            for (tab, label) in [
+                (AsmTab::Assembly, "Assembly"),
+                (AsmTab::Evaluate, "Evaluate"),
+            ] {
+                let text = RichText::new(label).size(13.0);
+                let text = if self.asm_tab == tab { text.strong() } else { text };
+                if ui.selectable_label(self.asm_tab == tab, text).clicked() {
+                    self.asm_tab = tab;
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (undo, redo) = self
                     .asm
@@ -823,6 +962,10 @@ impl OxydeApp {
             });
         });
         ui.add_space(2.0);
+        if self.asm_tab == AsmTab::Evaluate {
+            ui.horizontal(|ui| self.assembly_evaluate_tab(ui));
+            return;
+        }
         let selected = self.asm.as_ref().and_then(|d| {
             d.selection
                 .iter()
@@ -888,6 +1031,45 @@ impl OxydeApp {
         });
     }
 
+    /// The Evaluate tab of an assembly: mass properties of the whole, measurements of
+    /// the selection, and reloading the part files.
+    fn assembly_evaluate_tab(&mut self, ui: &mut egui::Ui) {
+        let has_parts = self
+            .asm
+            .as_ref()
+            .is_some_and(|d| !d.assembly.components.is_empty());
+        if icons::command_button(
+            ui,
+            Icon::MassProperties,
+            "Mass Properties",
+            has_parts,
+            self.show_mass_properties,
+        )
+        .on_hover_text("Volume and size of the whole assembly, counts of parts and mates")
+        .clicked()
+        {
+            self.show_mass_properties = !self.show_mass_properties;
+        }
+        if icons::command_button(ui, Icon::Measure, "Measure", has_parts, self.show_measure)
+            .on_hover_text(
+                "Areas and lengths of the selected faces and edges, the angle and distance \
+                 between two of them",
+            )
+            .clicked()
+        {
+            self.show_measure = !self.show_measure;
+        }
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(2.0);
+        if icons::command_button(ui, Icon::Rebuild, "Reload\nParts", true, false)
+            .on_hover_text("Read the part files again, after editing them (Ctrl+B)")
+            .clicked()
+        {
+            self.reload_assembly_parts();
+        }
+    }
+
     pub(crate) fn assembly_status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(&self.status);
@@ -934,16 +1116,31 @@ impl OxydeApp {
         let ready = d.a.is_some() && d.b.is_some();
         let text_a = d.a.as_ref().map(|r| describe_ref(doc, r));
         let text_b = d.b.as_ref().map(|r| describe_ref(doc, r));
+        // What the preview says about the mates being made: the edited one, else the
+        // ones beyond the assembly's own.
         let preview_error = self.mate_preview.as_ref().and_then(|p| {
-            let id = d
-                .editing
-                .or_else(|| p.assembly.mates.last().map(|m| m.id))?;
-            match p.solution.status(id) {
-                Some(MateStatus::Error(e)) => Some(e.clone()),
+            let new: Vec<MateId> = match d.editing {
+                Some(id) => vec![id],
+                None => p
+                    .assembly
+                    .mates
+                    .iter()
+                    .skip(doc.assembly.mates.len())
+                    .map(|m| m.id)
+                    .collect(),
+            };
+            new.iter().find_map(|id| match p.solution.status(*id) {
+                Some(MateStatus::Error(e)) => Some(format!(
+                    "{}: {e}",
+                    p.assembly.mate(*id).map_or("?", |m| m.name.as_str())
+                )),
                 _ => None,
-            }
+            })
         });
+        let pending: Vec<String> = d.pending.iter().map(|p| describe_draft(doc, p)).collect();
         let mut answer = None;
+        let mut add = false;
+        let mut remove = None;
         egui::Frame::none()
             .fill(ui.visuals().faint_bg_color)
             .stroke(Stroke::new(
@@ -969,10 +1166,13 @@ impl OxydeApp {
                         {
                             answer = Some(false);
                         }
-                        let ok = icons::icon_button(ui, Icon::Ok, 24.0, ready);
+                        let can_ok = ready || !d.pending.is_empty();
+                        let ok = icons::icon_button(ui, Icon::Ok, 24.0, can_ok);
                         if ok
-                            .on_hover_text(if ready {
+                            .on_hover_text(if d.editing.is_some() {
                                 "OK (Enter)"
+                            } else if can_ok {
+                                "OK: add the mates and place the parts"
                             } else {
                                 "Pick geometry on two components first"
                             })
@@ -1053,6 +1253,45 @@ impl OxydeApp {
                         });
                     }
                 }
+                if d.editing.is_none() {
+                    ui.add_space(6.0);
+                    crate::property_manager::section(ui, "Mates to add");
+                    for (i, text) in pending.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if icons::icon_button(ui, Icon::Cancel, 16.0, true)
+                                .on_hover_text("Remove from the list")
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            ui.add(egui::Label::new(text).truncate());
+                        });
+                    }
+                    if pending.is_empty() {
+                        ui.label(
+                            RichText::new("None yet: the parts stay put until OK.")
+                                .italics()
+                                .weak(),
+                        );
+                    }
+                    ui.add_space(2.0);
+                    if ui
+                        .add_enabled(ready, egui::Button::new("Add this mate (Enter)"))
+                        .on_hover_text(
+                            "Keep this mate in the list and pick the next pair; OK adds them \
+                             all and places the parts",
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                }
+                ui.add_space(4.0);
+                ui.checkbox(&mut d.preview, "Preview: move the parts as mates are added")
+                    .on_hover_text(
+                        "Off, the parts stay where they are until OK, so every mate can be \
+                         picked where the parts sit now",
+                    );
                 if let Some(e) = &preview_error {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1065,11 +1304,33 @@ impl OxydeApp {
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             answer = Some(false);
         }
-        if ready && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            answer = Some(true);
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            // Editing: done. Otherwise Enter keeps the mate and goes on to the next pair;
+            // with nothing picked and a list waiting, it is OK.
+            if ready && d.editing.is_some() {
+                answer = Some(true);
+            } else if ready {
+                add = true;
+            } else if !d.pending.is_empty() && d.a.is_none() && d.b.is_none() {
+                answer = Some(true);
+            }
+        }
+        if let Some(i) = remove {
+            if i < d.pending.len() {
+                d.pending.remove(i);
+            }
         }
         if d.a.is_some() && d.b.is_some() {
             self.mate_defaults(&mut d);
+        }
+        if add && answer.is_none() {
+            if let Some(draft) = d.push_draft() {
+                let n = d.pending.len();
+                self.status = format!(
+                    "{} kept ({n} in the list): pick the next pair, or OK to place the parts",
+                    draft.kind.label()
+                );
+            }
         }
         match answer {
             None => self.mate_dialog = Some(d),
@@ -1096,10 +1357,85 @@ impl OxydeApp {
         // What the pointer is over in the tree, lit up in the viewport.
         let mut hovered: Vec<AsmSelected> = Vec::new();
         let mut hovered_refs: Vec<MateRef> = Vec::new();
+        // And the other way round: the component under the pointer in the viewport.
+        let under_pointer = self
+            .viewport
+            .hovered()
+            .and_then(|p| doc.picked(p))
+            .and_then(|s| s.component());
+        let scroll_to = self.asm_scroll_to;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
+                // The assembly's own planes and origin: fixed, to mate the first parts to.
+                for plane in [
+                    StandardPlane::Front,
+                    StandardPlane::Top,
+                    StandardPlane::Right,
+                ] {
+                    let item = Item::Plane(plane);
+                    let row = tree_row(
+                        ui,
+                        Row {
+                            icon: Icon::Plane,
+                            cut: false,
+                            text: RichText::new(format!("{} Plane", plane_name(plane))),
+                            highlighted: self.asm_plane == Some(plane),
+                            hovered: false,
+                            badge: None,
+                            indent: 0.0,
+                            expander: None,
+                            eye: Some(self.item_shown(item)),
+                        },
+                    );
+                    let response = row.response.on_hover_text(if mating {
+                        "The assembly's own plane: click to use it in the mate"
+                    } else {
+                        "The assembly's own plane, which never moves"
+                    });
+                    if row.eye_clicked {
+                        action = Some(TreeAction::ToggleItem(item));
+                    } else if response.clicked() {
+                        action = Some(if mating {
+                            TreeAction::Target(MateRef::new(
+                                ComponentId::ASSEMBLY,
+                                MateTarget::Plane(plane),
+                            ))
+                        } else {
+                            TreeAction::SelectPlane(plane)
+                        });
+                    }
+                }
+                let origin = tree_row(
+                    ui,
+                    Row {
+                        icon: Icon::Origin,
+                        cut: false,
+                        text: RichText::new("Origin"),
+                        highlighted: false,
+                        hovered: false,
+                        badge: None,
+                        indent: 0.0,
+                        expander: None,
+                        eye: Some(self.item_shown(Item::Origin)),
+                    },
+                );
+                let response = origin.response.on_hover_text(if mating {
+                    "The assembly's origin: click to use it in the mate"
+                } else {
+                    "The assembly's origin, which never moves"
+                });
+                if origin.eye_clicked {
+                    action = Some(TreeAction::ToggleItem(Item::Origin));
+                } else if response.clicked() && mating {
+                    action = Some(TreeAction::Target(MateRef::new(
+                        ComponentId::ASSEMBLY,
+                        MateTarget::Origin,
+                    )));
+                }
+                ui.add_space(3.0);
+                ui.separator();
                 if doc.assembly.components.is_empty() {
                     ui.label(
                         RichText::new("Insert Component adds a part file.")
@@ -1134,6 +1470,7 @@ impl OxydeApp {
                             cut: false,
                             text: RichText::new(format!("{prefix}{}", c.name)),
                             highlighted: selected,
+                            hovered: under_pointer == Some(c.id),
                             badge: error.map(|_| Icon::Error),
                             indent: 0.0,
                             expander: Some(expanded),
@@ -1141,6 +1478,9 @@ impl OxydeApp {
                         },
                     );
                     let id = c.id;
+                    if scroll_to == Some(id) {
+                        row.response.scroll_to_me(Some(egui::Align::Center));
+                    }
                     if row.response.hovered() {
                         hovered.push(AsmSelected::Component(id));
                     }
@@ -1197,6 +1537,7 @@ impl OxydeApp {
                                     cut: false,
                                     text: RichText::new(label),
                                     highlighted: false,
+                                    hovered: false,
                                     badge: None,
                                     indent: 16.0,
                                     expander: None,
@@ -1226,6 +1567,7 @@ impl OxydeApp {
                         cut: false,
                         text: RichText::new("Mates").strong(),
                         highlighted: false,
+                        hovered: false,
                         badge: None,
                         indent: 0.0,
                         expander: None,
@@ -1238,13 +1580,18 @@ impl OxydeApp {
                         Some(MateStatus::Error(e)) => Some(e.clone()),
                         _ => None,
                     };
+                    let side = |id: ComponentId| {
+                        if id == ComponentId::ASSEMBLY {
+                            "assembly".to_owned()
+                        } else {
+                            component_label(doc, id)
+                        }
+                    };
                     let text = RichText::new(format!(
                         "{} ({}, {})",
                         m.name,
-                        doc.component(m.a.component)
-                            .map_or("?", |c| c.name.as_str()),
-                        doc.component(m.b.component)
-                            .map_or("?", |c| c.name.as_str()),
+                        side(m.a.component),
+                        side(m.b.component),
                     ));
                     let text = if m.suppressed {
                         text.weak()
@@ -1260,6 +1607,7 @@ impl OxydeApp {
                             cut: false,
                             text,
                             highlighted: doc.selection.contains(&AsmSelected::Mate(m.id)),
+                            hovered: false,
                             badge: error.as_ref().map(|_| Icon::Error),
                             indent: 16.0,
                             expander: None,
@@ -1307,6 +1655,8 @@ impl OxydeApp {
             preselect.extend(doc.picks_of_ref(r));
         }
         self.viewport.preselect = preselect;
+        // Scrolled while drawing; once is enough.
+        self.asm_scroll_to = None;
         let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
         if let Some(action) = action {
             self.tree_action(action, additive);
@@ -1319,7 +1669,15 @@ impl OxydeApp {
                 if let Some(doc) = self.asm.as_mut() {
                     select(&mut doc.selection, item, additive);
                 }
+                self.asm_plane = None;
             }
+            TreeAction::SelectPlane(plane) => {
+                self.asm_plane = (self.asm_plane != Some(plane)).then_some(plane);
+                if let Some(doc) = self.asm.as_mut() {
+                    doc.selection.clear();
+                }
+            }
+            TreeAction::ToggleItem(item) => self.toggle_item(item),
             TreeAction::Target(r) => {
                 if let Some(mut d) = self.mate_dialog.take() {
                     self.mate_pick(&mut d, r);
@@ -1410,6 +1768,7 @@ impl OxydeApp {
         self.viewport.grab_enabled = true;
         let output = self.viewport.ui(ui, picks, hint, false);
         self.viewport_rect = output.rect;
+        let overlays = self.draw_assembly_references(ui, &output);
 
         if let Some(grab) = output.grab {
             self.grab_component(&grab);
@@ -1417,15 +1776,34 @@ impl OxydeApp {
             self.grabbing = None;
         }
         if let Some(pick) = output.clicked {
+            let position = output.response.interact_pointer_pos();
+            let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some()));
             let item = pick.and_then(|p| self.asm.as_ref().and_then(|d| d.picked(p)));
             if let Some(mut d) = self.mate_dialog.take() {
-                if let Some(r) = item.as_ref().and_then(AsmSelected::mate_ref) {
+                let target = match overlay {
+                    Some(Overlay::Plane(plane)) => Some(MateRef::new(
+                        ComponentId::ASSEMBLY,
+                        MateTarget::Plane(plane),
+                    )),
+                    _ => item.as_ref().and_then(AsmSelected::mate_ref),
+                };
+                if let Some(r) = target {
                     self.mate_pick(&mut d, r);
                 }
                 self.mate_dialog = Some(d);
+            } else if let Some(Overlay::Plane(plane)) = overlay {
+                self.asm_plane = Some(plane);
+                if let Some(doc) = self.asm.as_mut() {
+                    doc.selection.clear();
+                }
             } else if let Some(doc) = self.asm.as_mut() {
+                self.asm_plane = None;
                 match item {
-                    Some(item) => select(&mut doc.selection, item, output.additive),
+                    Some(item) => {
+                        // The tree shows the component it belongs to.
+                        self.asm_scroll_to = item.component();
+                        select(&mut doc.selection, item, output.additive);
+                    }
                     None if !output.additive => doc.selection.clear(),
                     None => {}
                 }
@@ -1464,6 +1842,66 @@ impl OxydeApp {
         if let Some(id) = self.pending_open_component.take() {
             self.guard(PendingAction::OpenComponent(id), &ctx);
         }
+        self.heads_up_toolbar(&ctx, output.rect);
+    }
+
+    /// Draws the assembly's own origin and standard planes over the image (the planes when
+    /// shown, selected, or while the Mate command can take them), sized to the assembly.
+    /// Returns the planes for clicking.
+    fn draw_assembly_references(
+        &self,
+        ui: &egui::Ui,
+        output: &crate::viewport::ViewportOutput,
+    ) -> Vec<(Overlay, OverlayShape)> {
+        let mut overlays = Vec::new();
+        let Some(doc) = self.asm.as_ref() else {
+            return overlays;
+        };
+        let (center, size) = match doc.bounds(&doc.assembly) {
+            Some((lo, hi)) => (
+                Point3::new(
+                    (lo.x + hi.x) / 2.0,
+                    (lo.y + hi.y) / 2.0,
+                    (lo.z + hi.z) / 2.0,
+                ),
+                ((hi - lo).length() * 0.6).max(10.0),
+            ),
+            None => (Point3::ORIGIN, 50.0),
+        };
+        let painter = ui.painter_at(output.rect);
+        let to_screen = |p: Point3| self.viewport.to_screen(p, output);
+        let pointer = output.response.hover_pos();
+        let mating = self.mate_dialog.is_some();
+        for plane in [
+            StandardPlane::Front,
+            StandardPlane::Top,
+            StandardPlane::Right,
+        ] {
+            let selected = self.asm_plane == Some(plane);
+            if !(mating || selected || self.item_visible(Item::Plane(plane))) {
+                continue;
+            }
+            let geometry = plane.plane();
+            let quad = crate::app::plane_quad(&to_screen, &geometry, center, size);
+            let hovered = mating
+                && pointer.is_some_and(|p| {
+                    crate::app::near_outline(&quad, p) || crate::app::inside(&quad, p)
+                });
+            let quad = crate::app::paint_plane(
+                &painter,
+                &to_screen,
+                &geometry,
+                center,
+                size,
+                &format!("{} Plane", plane_name(plane)),
+                selected || hovered,
+            );
+            overlays.push((Overlay::Plane(plane), OverlayShape::Quad(quad)));
+        }
+        if self.item_visible(Item::Origin) {
+            crate::app::paint_origin(&painter, &to_screen);
+        }
+        overlays
     }
 
     /// Alt+drag: slides (or turns) the grabbed component, then lets the mates pull it back.
@@ -1617,20 +2055,26 @@ impl OxydeApp {
                         .on_hover_text("Sub-assemblies followed by their own parts");
                 });
                 ui.add_space(4.0);
-                egui::Grid::new("bom")
-                    .striped(true)
-                    .num_columns(6)
+                let max_height = (ctx.screen_rect().height() * 0.55).max(120.0);
+                egui::ScrollArea::both()
+                    .max_height(max_height)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        for (i, row) in rows.iter().enumerate() {
-                            for cell in row {
-                                if i == 0 {
-                                    ui.label(RichText::new(cell).strong());
-                                } else {
-                                    ui.label(cell);
+                        egui::Grid::new("bom")
+                            .striped(true)
+                            .num_columns(6)
+                            .show(ui, |ui| {
+                                for (i, row) in rows.iter().enumerate() {
+                                    for cell in row {
+                                        if i == 0 {
+                                            ui.label(RichText::new(cell).strong());
+                                        } else {
+                                            ui.label(cell);
+                                        }
+                                    }
+                                    ui.end_row();
                                 }
-                            }
-                            ui.end_row();
-                        }
+                            });
                     });
                 if rows.len() == 1 {
                     ui.label(RichText::new("No components yet.").italics().weak());
@@ -1702,6 +2146,7 @@ fn sub_tree(
                 cut: false,
                 text: RichText::new(&c.name).weak(),
                 highlighted: false,
+                hovered: false,
                 badge: inner.is_none().then_some(Icon::Error),
                 indent,
                 expander: None,

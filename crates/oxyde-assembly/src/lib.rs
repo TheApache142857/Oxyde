@@ -24,11 +24,17 @@ mod solve;
 
 pub use mate::{Mate, MateKind, MateRef, MateTarget, Primitive, PrimitiveKind, resolve};
 pub use placement::Placement;
-pub use solve::{ComponentFreedom, MateStatus, Solution, default_alignment, solve};
+pub use solve::{ComponentFreedom, MateStatus, Solution, default_alignment, solve, solve_about};
 
 /// Identifies a component within its assembly. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(pub u32);
+
+impl ComponentId {
+    /// The assembly itself, as a mate reference: its own standard planes, axes and origin,
+    /// fixed at the identity. Real components are numbered from 1.
+    pub const ASSEMBLY: ComponentId = ComponentId(0);
+}
 
 /// Identifies a mate within its assembly. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,6 +72,24 @@ impl Assembly {
 
     pub fn component(&self, id: ComponentId) -> Option<&Component> {
         self.components.iter().find(|c| c.id == id)
+    }
+
+    /// Whether a mate may refer to `id`: a component, or the assembly itself.
+    pub fn knows(&self, id: ComponentId) -> bool {
+        id == ComponentId::ASSEMBLY || self.component(id).is_some()
+    }
+
+    /// Where `id` sits: the identity for the assembly itself.
+    pub fn placement_of(&self, id: ComponentId) -> Option<Placement> {
+        if id == ComponentId::ASSEMBLY {
+            return Some(Placement::IDENTITY);
+        }
+        self.component(id).map(|c| c.placement)
+    }
+
+    /// Whether `id` never moves: fixed components, and the assembly itself.
+    pub fn is_fixed(&self, id: ComponentId) -> bool {
+        id == ComponentId::ASSEMBLY || self.component(id).is_some_and(|c| c.fixed)
     }
 
     pub fn component_mut(&mut self, id: ComponentId) -> Option<&mut Component> {

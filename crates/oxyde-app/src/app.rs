@@ -77,17 +77,85 @@ pub enum CommandTab {
 
 /// A plane or axis drawn over the viewport, which can be clicked.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Overlay {
+pub(crate) enum Overlay {
     Plane(StandardPlane),
     Reference(FeatureId),
 }
 
 /// Where an overlay is on screen.
-enum OverlayShape {
+pub(crate) enum OverlayShape {
     Quad([egui::Pos2; 4]),
     Segment(egui::Pos2, egui::Pos2),
     /// Curves of a sketch.
     Polylines(Vec<Vec<egui::Pos2>>),
+}
+
+/// The colour of planes, axes and sketches drawn over the viewport.
+pub(crate) fn overlay_color(strong: bool) -> egui::Color32 {
+    if strong {
+        egui::Color32::from_rgb(230, 120, 0)
+    } else if crate::theme::view_dark() {
+        egui::Color32::from_rgb(110, 170, 235)
+    } else {
+        egui::Color32::from_rgb(60, 120, 200)
+    }
+}
+
+/// Paints a plane as a translucent square of half-size `size` around the projection of
+/// `center` onto it, with its name; returns the square for clicking.
+pub(crate) fn paint_plane(
+    painter: &egui::Painter,
+    to_screen: &dyn Fn(Point3) -> egui::Pos2,
+    plane: &Plane,
+    center: Point3,
+    size: f64,
+    name: &str,
+    strong: bool,
+) -> [egui::Pos2; 4] {
+    let to_center = center - plane.origin;
+    let c = center - plane.normal * to_center.dot(plane.normal);
+    let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
+    let corners: Vec<egui::Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .into_iter()
+        .map(|(a, b)| to_screen(c + u * a + v * b))
+        .collect();
+    let quad = [corners[0], corners[1], corners[2], corners[3]];
+    let color = overlay_color(strong);
+    painter.add(egui::Shape::convex_polygon(
+        corners,
+        color.gamma_multiply(0.12),
+        egui::Stroke::new(if strong { 2.0 } else { 1.0 }, color),
+    ));
+    painter.text(
+        quad[3],
+        egui::Align2::LEFT_BOTTOM,
+        name,
+        egui::FontId::proportional(11.0),
+        color,
+    );
+    quad
+}
+
+/// Paints an origin as three short axes of fixed screen length.
+pub(crate) fn paint_origin(painter: &egui::Painter, to_screen: &dyn Fn(Point3) -> egui::Pos2) {
+    let o = to_screen(Point3::ORIGIN);
+    for (axis, color) in [
+        (Vec3::X, egui::Color32::from_rgb(210, 50, 50)),
+        (Vec3::Y, egui::Color32::from_rgb(40, 150, 60)),
+        (Vec3::Z, egui::Color32::from_rgb(50, 90, 220)),
+    ] {
+        let d = to_screen(Point3::ORIGIN + axis) - o;
+        if d.length() > 1e-6 {
+            let tip = o + d.normalized() * 22.0;
+            painter.line_segment([o, tip], egui::Stroke::new(1.6, color));
+        }
+    }
+    painter.circle(
+        o,
+        3.0,
+        egui::Color32::from_rgb(200, 60, 60),
+        egui::Stroke::new(1.0, egui::Color32::WHITE),
+    );
 }
 
 pub struct OxydeApp {
@@ -116,6 +184,8 @@ pub struct OxydeApp {
     pub(crate) visibility: crate::display::Visibility,
     /// Features expanded in the timeline (showing the sketch they absorb).
     pub(crate) expanded: std::collections::HashSet<FeatureId>,
+    /// A feature the timeline scrolls to on the next frame (selected in the viewport).
+    pub(crate) scroll_to_feature: Option<FeatureId>,
     /// Document revision the viewport currently shows.
     pub(crate) scene_revision: Option<u64>,
     /// Status-bar summary, cached per document revision.
@@ -126,6 +196,12 @@ pub struct OxydeApp {
     pub(crate) asm: Option<crate::assembly::AssemblyDoc>,
     pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
     pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
+    /// The assembly command bar's tab.
+    pub(crate) asm_tab: crate::assembly_ui::AsmTab,
+    /// The assembly's own plane selected in its tree or the viewport.
+    pub(crate) asm_plane: Option<StandardPlane>,
+    /// A component the assembly tree scrolls to on the next frame.
+    pub(crate) asm_scroll_to: Option<oxyde_assembly::ComponentId>,
     pub(crate) show_bom: bool,
     pub(crate) bom_mode: oxyde_assembly::bom::BomMode,
     /// Assembly revision the viewport shows.
@@ -166,6 +242,7 @@ impl OxydeApp {
             show_measure: false,
             visibility: Default::default(),
             expanded: Default::default(),
+            scroll_to_feature: None,
             scene_revision: None,
             summary: None,
             window_title: String::new(),
@@ -173,6 +250,9 @@ impl OxydeApp {
             asm: None,
             mate_dialog: None,
             mate_preview: None,
+            asm_tab: Default::default(),
+            asm_plane: None,
+            asm_scroll_to: None,
             show_bom: false,
             bom_mode: oxyde_assembly::bom::BomMode::TopLevel,
             asm_scene: None,
@@ -336,6 +416,8 @@ impl OxydeApp {
                     self.selection = vec![item];
                     self.selected_plane = None;
                 }
+                // The timeline shows the feature that made it.
+                self.scroll_to_feature = self.selection_creator();
             }
         }
     }
@@ -1243,38 +1325,19 @@ impl OxydeApp {
         let label_font = egui::FontId::proportional(11.0);
 
         let draw_plane = |plane: Plane, name: String, selected: bool| -> OverlayShape {
-            let to_center = center - plane.origin;
-            let c = center - plane.normal * to_center.dot(plane.normal);
-            let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
-            let corners: Vec<egui::Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-                .into_iter()
-                .map(|(a, b)| to_screen(c + u * a + v * b))
-                .collect();
-            let quad = [corners[0], corners[1], corners[2], corners[3]];
+            // Hovered: lit up like a selected one, when a command can take it.
+            let quad = plane_quad(&to_screen, &plane, center, size);
             let hovered = pointer.is_some_and(|p| near_outline(&quad, p) || inside(&quad, p))
                 && self.wants_planes();
-            let color = if selected || hovered {
-                egui::Color32::from_rgb(230, 120, 0)
-            } else {
-                if crate::theme::view_dark() {
-                    egui::Color32::from_rgb(110, 170, 235)
-                } else {
-                    egui::Color32::from_rgb(60, 120, 200)
-                }
-            };
-            painter.add(egui::Shape::convex_polygon(
-                corners,
-                color.gamma_multiply(0.12),
-                egui::Stroke::new(if selected || hovered { 2.0 } else { 1.0 }, color),
-            ));
-            painter.text(
-                quad[3],
-                egui::Align2::LEFT_BOTTOM,
-                name,
-                label_font.clone(),
-                color,
-            );
-            OverlayShape::Quad(quad)
+            OverlayShape::Quad(paint_plane(
+                &painter,
+                &to_screen,
+                &plane,
+                center,
+                size,
+                &name,
+                selected || hovered,
+            ))
         };
 
         let all_planes = self.wants_planes();
@@ -1314,15 +1377,7 @@ impl OxydeApp {
                     overlays.push((Overlay::Reference(id), shape));
                 }
                 ReferenceGeometry::Axis(axis) => {
-                    let color = if selected {
-                        egui::Color32::from_rgb(230, 120, 0)
-                    } else {
-                        if crate::theme::view_dark() {
-                            egui::Color32::from_rgb(110, 170, 235)
-                        } else {
-                            egui::Color32::from_rgb(60, 120, 200)
-                        }
-                    };
+                    let color = overlay_color(selected);
                     let t = (center - axis.origin).dot(axis.direction);
                     let c = axis.origin + axis.direction * t;
                     let a = to_screen(c - axis.direction * size);
@@ -1387,24 +1442,7 @@ impl OxydeApp {
 
         // The origin: three short axes of fixed screen length.
         if self.item_visible(crate::display::Item::Origin) {
-            let o = to_screen(Point3::ORIGIN);
-            for (axis, color) in [
-                (Vec3::X, egui::Color32::from_rgb(210, 50, 50)),
-                (Vec3::Y, egui::Color32::from_rgb(40, 150, 60)),
-                (Vec3::Z, egui::Color32::from_rgb(50, 90, 220)),
-            ] {
-                let d = to_screen(Point3::ORIGIN + axis) - o;
-                if d.length() > 1e-6 {
-                    let tip = o + d.normalized() * 22.0;
-                    painter.line_segment([o, tip], egui::Stroke::new(1.6, color));
-                }
-            }
-            painter.circle(
-                o,
-                3.0,
-                egui::Color32::from_rgb(200, 60, 60),
-                egui::Stroke::new(1.0, egui::Color32::WHITE),
-            );
+            paint_origin(&painter, &to_screen);
         }
         overlays
     }
@@ -1427,8 +1465,11 @@ impl OxydeApp {
     }
 
     /// The plane "Normal To" turns the view to: the sketch's, else the selected plane or
-    /// flat face.
+    /// flat face; in an assembly, its selected plane.
     pub(crate) fn normal_to_target(&self) -> Option<Plane> {
+        if self.asm.is_some() {
+            return self.asm_plane.map(|p| p.plane());
+        }
         if let Some(session) = &self.sketch {
             return Some(session.plane);
         }
@@ -1518,8 +1559,22 @@ fn pick_step() -> Option<PathBuf> {
         .pick_file()
 }
 
+/// The screen square a plane is drawn as (see [`paint_plane`]).
+pub(crate) fn plane_quad(
+    to_screen: &dyn Fn(Point3) -> egui::Pos2,
+    plane: &Plane,
+    center: Point3,
+    size: f64,
+) -> [egui::Pos2; 4] {
+    let to_center = center - plane.origin;
+    let c = center - plane.normal * to_center.dot(plane.normal);
+    let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
+    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+        .map(|(a, b)| to_screen(c + u * a + v * b))
+}
+
 /// Whether `p` is inside a convex quad.
-fn inside(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
+pub(crate) fn inside(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
     let mut sign = 0.0f32;
     for k in 0..4 {
         let (a, b) = (quad[k], quad[(k + 1) % 4]);
@@ -1546,13 +1601,13 @@ fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     (p - (a + ab * t)).length()
 }
 
-fn near_outline(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
+pub(crate) fn near_outline(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
     (0..4).any(|k| segment_distance(p, quad[k], quad[(k + 1) % 4]) < 6.0)
 }
 
 /// The overlay clicked at `p`: an outline or axis near the pointer first; inside a plane
 /// only when the click did not land on the part.
-fn overlay_at(
+pub(crate) fn overlay_at(
     overlays: &[(Overlay, OverlayShape)],
     p: egui::Pos2,
     on_part: bool,
@@ -1647,6 +1702,7 @@ impl eframe::App for OxydeApp {
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| self.assembly_viewport(ui));
             self.bom_window(ctx);
+            self.evaluate_windows(ctx);
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
             self.dialogs_ui(ctx);
