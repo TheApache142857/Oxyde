@@ -841,14 +841,18 @@ fn boolean_names(
         .faces
         .iter()
         .map(|sources| {
-            oldest(sources.iter().filter_map(|source| match *source {
-                FaceSource::InputFace { input: 0, face } => a.get(face as usize).cloned().flatten(),
-                FaceSource::InputFace { input, face } => tools
-                    .get(input as usize - 1)
-                    .and_then(|names| names.get(face as usize))
-                    .cloned()
-                    .flatten(),
-                _ => None,
+            oldest(sources.iter().filter_map(|source| {
+                match *source {
+                    FaceSource::InputFace { input: 0, face } => {
+                        a.get(face as usize).cloned().flatten()
+                    }
+                    FaceSource::InputFace { input, face } => tools
+                        .get(input as usize - 1)
+                        .and_then(|names| names.get(face as usize))
+                        .cloned()
+                        .flatten(),
+                    _ => None,
+                }
             }))
         })
         .collect()
@@ -1574,27 +1578,27 @@ fn build_instances<K: Kernel>(
                 let copy = kernel
                     .transform(tool.shape, transform)
                     .map_err(|e| e.to_string())?;
-                let names = copy
-                    .history
-                    .faces
-                    .iter()
-                    .map(|sources| {
-                        sources.iter().find_map(|source| match *source {
-                            FaceSource::InputFace { input: 0, face } => {
-                                tool.names.get(face as usize).cloned().flatten().map(
-                                    |seed_face| {
-                                        FaceName::new(FaceKey::Instance {
-                                            feature: id,
-                                            instance: *key,
-                                            face: Box::new(seed_face),
-                                        })
-                                    },
-                                )
-                            }
-                            _ => None,
+                let names =
+                    copy.history
+                        .faces
+                        .iter()
+                        .map(|sources| {
+                            sources.iter().find_map(|source| match *source {
+                                FaceSource::InputFace { input: 0, face } => {
+                                    tool.names.get(face as usize).cloned().flatten().map(
+                                        |seed_face| {
+                                            FaceName::new(FaceKey::Instance {
+                                                feature: id,
+                                                instance: *key,
+                                                face: Box::new(seed_face),
+                                            })
+                                        },
+                                    )
+                                }
+                                _ => None,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
                 if tool.op == ToolOp::NewBody {
                     let body = BodyId::new(id, new_bodies);
                     new_bodies += 1;
