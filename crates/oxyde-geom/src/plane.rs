@@ -65,7 +65,10 @@ impl Plane {
         // not turn the frame, and the sketch with it, by 90° from one rebuild to the next.
         let axes = [Vec3::X, Vec3::Y, Vec3::Z];
         let alignment = |a: Vec3| a.dot(normal).abs();
-        let least = axes.into_iter().map(alignment).fold(f64::INFINITY, f64::min);
+        let least = axes
+            .into_iter()
+            .map(alignment)
+            .fold(f64::INFINITY, f64::min);
         let axis = axes
             .into_iter()
             .find(|a| alignment(*a) <= least + crate::ANGULAR_TOLERANCE)?;
@@ -119,10 +122,20 @@ mod tests {
         // A face normal to X, as rebuilt geometry gives it: Y and Z tie, whatever the noise.
         let a = Plane::from_point_normal(Point3::ORIGIN, Vec3::new(1.0, 2e-16, 1e-16)).unwrap();
         let b = Plane::from_point_normal(Point3::ORIGIN, Vec3::new(1.0, 1e-16, 2e-16)).unwrap();
-        assert!(a.x_dir.distance_to_vec(b.x_dir) < 1e-12, "{:?} vs {:?}", a.x_dir, b.x_dir);
+        assert!(
+            a.x_dir.distance_to_vec(b.x_dir) < 1e-12,
+            "{:?} vs {:?}",
+            a.x_dir,
+            b.x_dir
+        );
         let c = Plane::from_point_normal(Point3::ORIGIN, Vec3::new(-6e-17, 1.0, 1e-16)).unwrap();
         let d = Plane::from_point_normal(Point3::ORIGIN, Vec3::new(1e-16, 1.0, -6e-17)).unwrap();
-        assert!(c.x_dir.distance_to_vec(d.x_dir) < 1e-12, "{:?} vs {:?}", c.x_dir, d.x_dir);
+        assert!(
+            c.x_dir.distance_to_vec(d.x_dir) < 1e-12,
+            "{:?} vs {:?}",
+            c.x_dir,
+            d.x_dir
+        );
     }
 
     #[test]
