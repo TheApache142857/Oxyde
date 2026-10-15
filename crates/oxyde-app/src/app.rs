@@ -882,7 +882,19 @@ impl OxydeApp {
         if !known {
             path.set_extension(PART_EXTENSION);
         }
-        self.save_to(&path)
+        // Saved under another name, it is another document, as in SolidWorks: with the
+        // same id, an assembly would take it for the original (in its bill of materials,
+        // or when the original goes missing).
+        let copy = self.doc.path.as_deref().is_some_and(|p| p != path);
+        let original_id = self.doc.document_id.clone();
+        if copy {
+            self.doc.document_id = oxyde_format::new_document_id();
+        }
+        let saved = self.save_to(&path);
+        if !saved {
+            self.doc.document_id = original_id;
+        }
+        saved
     }
 
     fn save_to(&mut self, path: &Path) -> bool {

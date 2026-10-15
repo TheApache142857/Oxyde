@@ -1,5 +1,5 @@
 use oxyde_geom::{Point3, Vec3};
-use oxyde_kernel::CurveKind;
+use oxyde_kernel::{CurveKind, SurfaceKind};
 use oxyde_model::{Body, EdgeName, FaceName, StandardAxis, StandardPlane};
 
 use crate::{ComponentId, MateId, Placement};
@@ -233,13 +233,17 @@ pub fn resolve(target: &MateTarget, body: Option<&Body>) -> Result<Primitive, St
                     origin: face.centroid,
                     normal,
                 })
+            } else if let (SurfaceKind::Sphere, Some(axis)) = (face.surface, face.axis) {
+                // A ball mates by its centre (on an axis, at a point); the axis OCCT gives a
+                // sphere is only how it is parametrised.
+                Ok(Primitive::Point(axis.origin))
             } else if let Some(axis) = face.axis {
                 Ok(Primitive::Line {
                     origin: axis.origin,
                     direction: axis.direction,
                 })
             } else {
-                Err("only flat, cylindrical and conical faces can be mated".to_owned())
+                Err("only flat, cylindrical, conical and spherical faces can be mated".to_owned())
             }
         }
         MateTarget::Edge(name) => {

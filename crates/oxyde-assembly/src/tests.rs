@@ -404,3 +404,74 @@ fn placements_compose_like_nested_frames() {
     let got = outer.compose(&inner).apply_point(p);
     assert!((got - expected).length() < 1e-12, "{got:?} {expected:?}");
 }
+
+#[test]
+fn a_component_held_by_one_that_moves_is_not_fully_defined() {
+    // Base (fixed), Pin concentric with it (it can still turn and slide), Cap held to the
+    // Pin by three planes: the cap cannot move on the pin, but moves with it.
+    let (mut asm, base, pin) = two();
+    asm.add_mate(
+        MateKind::Concentric,
+        r(base, MateTarget::Axis(StandardAxis::Z)),
+        r(pin, MateTarget::Axis(StandardAxis::Z)),
+        true,
+    );
+    let cap = asm.add_component(
+        "Cap",
+        "cap.oxyprt".into(),
+        "c".into(),
+        placed(Vec3::new(-5.0, 3.0, 8.0), Vec3::new(0.1, 0.2, -0.1)),
+    );
+    for plane in [
+        StandardPlane::Front,
+        StandardPlane::Top,
+        StandardPlane::Right,
+    ] {
+        asm.add_mate(
+            MateKind::Coincident,
+            r(pin, MateTarget::Plane(plane)),
+            r(cap, MateTarget::Plane(plane)),
+            true,
+        );
+    }
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    assert_eq!(solution.degrees(pin), Some(2));
+    assert_eq!(solution.degrees(cap), Some(2));
+    // Fixing the pin defines both.
+    asm.component_mut(pin).unwrap().fixed = true;
+    let solution = run(&mut asm);
+    assert_eq!(solution.degrees(pin), Some(0));
+    assert_eq!(solution.degrees(cap), Some(0));
+}
+
+#[test]
+fn a_ball_mates_by_its_centre() {
+    use oxyde_geom::Axis;
+    use oxyde_kernel::{FaceInfo, SurfaceKind, Topology};
+    use oxyde_model::{Body, BodyNaming, FaceName, FeatureId};
+    let feature = FeatureId::from_raw(2);
+    let center = Point3::new(1.0, 2.0, 3.0);
+    let topology = Topology {
+        faces: vec![FaceInfo {
+            surface: SurfaceKind::Sphere,
+            area: 50.0,
+            centroid: center,
+            normal: None,
+            axis: Axis::new(center, Vec3::Z),
+            edges: Vec::new(),
+        }],
+        edges: Vec::new(),
+        vertices: Vec::new(),
+    };
+    let ball = FaceName::profile(feature, 1);
+    let body = Body {
+        naming: BodyNaming::build(feature, vec![Some(ball.clone())], &topology),
+        topology,
+        solids: Vec::new(),
+    };
+    assert_eq!(
+        resolve(&MateTarget::Face(ball), Some(&body)),
+        Ok(Primitive::Point(center))
+    );
+}

@@ -140,19 +140,31 @@ impl AssemblyModel {
         let components: Vec<Component> = self
             .components
             .into_iter()
-            .map(|c| Component {
-                id: ComponentId(c.id),
-                name: c.name,
-                path: c.path,
-                document_id: c.document_id,
-                placement: Placement {
+            .map(|c| {
+                let stored = Placement {
                     rotation: c.rotation,
                     translation: Vec3::new(c.translation[0], c.translation[1], c.translation[2]),
-                },
-                fixed: c.fixed,
-                hidden: c.hidden,
+                };
+                // A rotation (to 1e-6), not a scaling or a mirror; kept exactly as stored.
+                let placement = Placement::from_transform(&stored.transform())
+                    .map(|_| stored)
+                    .ok_or_else(|| {
+                        format!(
+                            "component {} is not placed by a rotation and a translation",
+                            c.name
+                        )
+                    })?;
+                Ok(Component {
+                    id: ComponentId(c.id),
+                    name: c.name,
+                    path: c.path,
+                    document_id: c.document_id,
+                    placement,
+                    fixed: c.fixed,
+                    hidden: c.hidden,
+                })
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         let mates: Vec<Mate> = self
             .mates
             .into_iter()

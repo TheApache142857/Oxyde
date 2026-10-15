@@ -816,6 +816,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn placements_must_be_rotations() {
+        let mut file = sample_assembly();
+        file.assembly.components[1].placement.rotation[0][0] = 2.0;
+        let bytes = write_assembly(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        match read_assembly(Cursor::new(bytes)) {
+            Err(FormatError::InvalidAssembly(e)) => assert!(e.contains("rotation"), "{e}"),
+            other => panic!("expected an invalid assembly, got {other:?}"),
+        }
+    }
+
     fn sample_assembly() -> AssemblyFile {
         use oxyde_assembly::{MateKind, MateRef, MateTarget, Placement};
         use oxyde_geom::Point3;

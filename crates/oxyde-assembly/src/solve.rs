@@ -235,9 +235,11 @@ pub fn solve(
     // Keep the assembly's order of mates.
     statuses.sort_by_key(|(id, _)| assembly.mates.iter().position(|m| m.id == *id));
 
-    // What each component can still do: the rank of its columns, among the mates that hold.
-    let jacobian = if n > 0 {
-        numeric_jacobian(&x, &|x| objective(x, &mask))
+    // What each component can still do, among the mates that hold: the motions of the
+    // whole assembly that keep them (the null space of their Jacobian), seen on that
+    // component. A component held only by one that can still move moves with it.
+    let motions = if n > 0 {
+        null_space(&numeric_jacobian(&x, &|x| objective(x, &mask)), n)
     } else {
         Vec::new()
     };
@@ -248,11 +250,11 @@ pub fn solve(
             let degrees = if c.fixed {
                 0
             } else if let Some(k) = column(c.id) {
-                let rows: Vec<Vec<f64>> = jacobian
+                let own: Vec<Vec<f64>> = motions
                     .iter()
-                    .map(|row| row[6 * k..6 * k + 6].to_vec())
+                    .map(|v| v[6 * k..6 * k + 6].to_vec())
                     .collect();
-                6 - rank(&rows, 6)
+                rank(&own, 6)
             } else {
                 6
             };
@@ -384,8 +386,9 @@ fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     Some(x)
 }
 
-/// Numerical rank of a set of row vectors of length `width`.
-fn rank(rows: &[Vec<f64>], width: usize) -> usize {
+/// Orthonormal basis of the span of `rows` (vectors of length `width`), by Gram–Schmidt;
+/// what is left of a row below `1e-6` of the largest entry counts as nothing.
+fn orthonormal_basis(rows: &[Vec<f64>], width: usize) -> Vec<Vec<f64>> {
     let scale = rows
         .iter()
         .flatten()
@@ -394,9 +397,12 @@ fn rank(rows: &[Vec<f64>], width: usize) -> usize {
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for row in rows {
         let mut v = row.clone();
-        for b in &basis {
-            let d: f64 = v.iter().zip(b).map(|(x, y)| x * y).sum();
-            v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+        // Twice, so that what is left is orthogonal to working precision.
+        for _ in 0..2 {
+            for b in &basis {
+                let d: f64 = v.iter().zip(b).map(|(x, y)| x * y).sum();
+                v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            }
         }
         let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm > 1e-6 * scale {
@@ -406,5 +412,41 @@ fn rank(rows: &[Vec<f64>], width: usize) -> usize {
             }
         }
     }
-    basis.len()
+    basis
+}
+
+/// Numerical rank of a set of row vectors of length `width`.
+fn rank(rows: &[Vec<f64>], width: usize) -> usize {
+    orthonormal_basis(rows, width).len()
+}
+
+/// Orthonormal basis of the vectors `x` (length `width`) with `J x = 0`: the complement
+/// of the rows' span, from the unit vectors.
+fn null_space(jacobian: &[Vec<f64>], width: usize) -> Vec<Vec<f64>> {
+    let mut basis = orthonormal_basis(jacobian, width);
+    let rank = basis.len();
+    let units: Vec<Vec<f64>> = (0..width)
+        .map(|i| {
+            let mut e = vec![0.0; width];
+            e[i] = 1.0;
+            e
+        })
+        .collect();
+    for e in &units {
+        if basis.len() == width {
+            break;
+        }
+        let mut v = e.clone();
+        for _ in 0..2 {
+            for b in &basis {
+                let d: f64 = v.iter().zip(b).map(|(x, y)| x * y).sum();
+                v.iter_mut().zip(b).for_each(|(x, y)| *x -= d * y);
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 1e-6 {
+            basis.push(v.into_iter().map(|x| x / norm).collect());
+        }
+    }
+    basis.split_off(rank)
 }

@@ -317,6 +317,11 @@ impl OxydeApp {
             }
         };
         let doc = self.asm.as_mut().expect("checked above");
+        // Under another name it is another document (see `save_as` for parts).
+        let original_id = doc.document_id.clone();
+        if doc.path.as_deref().is_some_and(|p| p != path) {
+            doc.document_id = oxyde_format::new_document_id();
+        }
         // Part paths are stored relative to where the assembly is.
         doc.relocate(&path);
         match oxyde_format::save_assembly(&path, &doc.to_file()) {
@@ -328,6 +333,7 @@ impl OxydeApp {
                 true
             }
             Err(e) => {
+                doc.document_id = original_id;
                 self.status = format!("Could not save {}: {e}", path.display());
                 false
             }
