@@ -2,7 +2,7 @@
 
 An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
 
-> **Status: pre-alpha.** A first desktop application is written: a tabbed command bar with icons (Features, Sketch, Evaluate) and a SolidWorks-style PropertyManager (select first, then run the command), timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, Smart Dimension between any two entities, snapping, trim, fully/under-defined colouring), extrude and revolve joining, cutting, intersecting or making new bodies (multi-body parts with Combine), fillet, chamfer, shell, reference planes and axes, linear and circular patterns, mirror, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`), global variables and equations, STEP import (as an *Imported* feature to build on) and export, STEP assembly import (one part file per part, one assembly file per assembly, e.g. from a SolidWorks STEP AP242 export), mass properties and measuring, a GPU-rendered 3D viewport with picking, `.oxyprt` save/load. **Assemblies** (`.oxyasm`): insert part files and sub-assemblies, mate them (coincident, concentric, parallel, perpendicular, distance, angle) with a live preview, move free components with Alt+drag while mates hold, fixed/floating components with degrees of freedom shown in the tree, and a bill of materials (top level, parts only or indented) exported as CSV. A Preferences window covers viewport colours and display, navigation, configurable keyboard shortcuts and debugging overlays. Builds and runs on Windows with OpenCASCADE 8.
+> **Status: pre-alpha.** A first desktop application is written: a tabbed command bar with icons (Features, Sketch, Evaluate) and a SolidWorks-style PropertyManager (select first, then run the command), timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, Smart Dimension between any two entities, snapping, trim, fully/under-defined colouring), extrude and revolve joining, cutting, intersecting or making new bodies (multi-body parts with Combine), fillet, chamfer, shell, reference planes and axes, linear and circular patterns, mirror, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`), global variables and equations, STEP import (as an *Imported* feature to build on) and export, STEP assembly import (one part file per part, one assembly file per assembly, e.g. from a SolidWorks STEP AP242 export), mass properties and measuring, a GPU-rendered 3D viewport with picking, `.oxyprt` save/load. **Assemblies** (`.oxyasm`): insert part files and sub-assemblies, mate them (coincident, concentric, parallel, perpendicular, distance, angle) with a live preview, move free components with Alt+drag while mates hold, fixed/floating components with degrees of freedom shown in the tree, and a bill of materials (top level, parts only or indented) exported as CSV. A Preferences window covers viewport colours and display, navigation, configurable keyboard shortcuts and debugging overlays. Builds and runs on Windows with OpenCASCADE 8, and on Linux with the OpenCASCADE 7.8 that Debian and Ubuntu ship.
 
 ## Goals
 
@@ -45,11 +45,11 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | `oxyde-app` | Desktop application (UI and viewport) |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/FORMAT.md).
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/FORMAT.md), and [`CHANGELOG.md`](CHANGELOG.md) for what changed recently.
 
 ## Building
 
-**Windows (x64, MSVC) only for now.** You need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.7+ (8.0 tested; vcpkg recommended). Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
+**Windows (x64, MSVC)** is the main platform: you need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.7+ (8.0 tested; vcpkg recommended). **Linux** works with the distribution's OpenCASCADE 7.8. Full instructions: [`docs/BUILDING.md`](docs/BUILDING.md).
 
 ```powershell
 cargo run --release -p oxyde-app              # the application (File › Open demo bracket)
