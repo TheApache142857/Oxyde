@@ -78,6 +78,18 @@ fn ink_trimmed() -> Color32 {
 fn ink_model() -> Color32 {
     on_view([130, 130, 130], [150, 162, 175])
 }
+/// Behind dimension values, so they read over the geometry in either theme.
+fn label_background() -> Color32 {
+    let [r, g, b] = if crate::theme::view_dark() {
+        [28, 38, 50]
+    } else {
+        [255, 255, 255]
+    };
+    Color32::from_rgba_unmultiplied(r, g, b, 220)
+}
+fn label_border() -> Color32 {
+    on_view([160, 160, 160], [95, 110, 128])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -296,6 +308,14 @@ impl SketchSession {
                 false
             }
         }
+    }
+
+    /// Whether the last solve found this relation implied by the others.
+    fn is_redundant(&self, id: RelationId) -> bool {
+        self.report
+            .as_ref()
+            .and_then(|r| r.state(id))
+            .is_some_and(|s| s == ConstraintState::Redundant)
     }
 
     fn checkpoint(&mut self) {
@@ -941,7 +961,15 @@ impl SketchSession {
                         self.sketch.set_construction(line, true);
                     }
                     let auto = self.auto_relation(line, start.at, p.at);
-                    if !self.solve() {
+                    if self.solve() {
+                        // A line between two midpoints of a rectangle's sides is already
+                        // horizontal or vertical: the inferred relation would only
+                        // over-define the sketch, so it is not kept.
+                        if let Some(id) = auto.filter(|&id| self.is_redundant(id)) {
+                            self.sketch.remove_relation(id);
+                            self.solve();
+                        }
+                    } else {
                         if let Some(id) = auto {
                             self.sketch.remove_relation(id);
                         }
@@ -1308,15 +1336,11 @@ impl SketchSession {
             };
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), ink);
             let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
-            painter.rect_filled(
-                rect,
-                3.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 220),
-            );
+            painter.rect_filled(rect, 3.0, label_background());
             let border = if selected {
                 Stroke::new(2.0, ink_selected())
             } else {
-                Stroke::new(1.0, Color32::from_gray(160))
+                Stroke::new(1.0, label_border())
             };
             painter.rect_stroke(rect, 3.0, border);
             painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
@@ -2049,6 +2073,64 @@ mod tests {
             |c| matches!(c, Constraint::PointOnLine(_, l) if *l == up)
         ));
         assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn a_centerline_between_two_midpoints_keeps_no_implied_relation() {
+        let mut s = ConstrainedSketch::new();
+        let [bottom, right, top, left] = s.rectangle(Point2::new(-25.0, -15.0), 50.0, 30.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Centerline);
+        // Top middle to bottom middle: vertical already, so Vertical is not added.
+        session.click_tool(Pending {
+            at: Point2::new(0.0, 15.0),
+            snap: Some(Snap::Midpoint(top)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(0.0, -15.0),
+            snap: Some(Snap::Midpoint(bottom)),
+        });
+        // Right middle to left middle, likewise horizontal.
+        session.click_tool(Pending {
+            at: Point2::new(25.0, 0.0),
+            snap: Some(Snap::Midpoint(right)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(-25.0, 0.0),
+            snap: Some(Snap::Midpoint(left)),
+        });
+        let midpoints = session
+            .sketch
+            .relations()
+            .iter()
+            .filter(|r| matches!(r.constraint, Constraint::Midpoint(..)))
+            .count();
+        assert_eq!(midpoints, 4);
+        assert!(!has(
+            &session,
+            |c| matches!(c, Constraint::Vertical(l) | Constraint::Horizontal(l) if *l != bottom && *l != right && *l != top && *l != left)
+        ));
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        assert_eq!(report.count(oxyde_sketch::ConstraintState::Redundant), 0);
+        // A free-standing nearly vertical centerline still gets its relation.
+        session.click_tool(Pending {
+            at: Point2::new(40.0, 0.0),
+            snap: None,
+        });
+        session.click_tool(Pending {
+            at: Point2::new(40.1, 10.0),
+            snap: None,
+        });
+        assert_eq!(
+            session
+                .sketch
+                .relations()
+                .iter()
+                .filter(|r| matches!(r.constraint, Constraint::Vertical(..)))
+                .count(),
+            3
+        );
     }
 
     #[test]
