@@ -11,7 +11,8 @@ use std::path::Path;
 use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
-    OpResult, ShapeHandle, SurfaceKind, Topology, TopologyCounts, VertexInfo,
+    OpResult, ShapeHandle, StepAssembly, StepInstance, StepNode, StepNodeContent, SurfaceKind,
+    Topology, TopologyCounts, VertexInfo,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -211,9 +212,60 @@ impl Kernel for OcctKernel {
         Ok(ShapeHandle::from_raw(id))
     }
 
+    fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, OcctError> {
+        let tree = self.session.pin_mut().read_step_assembly(data)?;
+        step_assembly(tree)
+    }
+
     fn release(&mut self, shape: ShapeHandle) {
         self.session.pin_mut().release(shape.raw());
     }
+}
+
+// ---- C++ → Rust: STEP assemblies ----------------------------------------------------------
+
+fn step_assembly(tree: ffi::StepAssemblyData) -> Result<StepAssembly, OcctError> {
+    let count = tree.nodes.len();
+    let index = |i: u32| -> Result<usize, OcctError> {
+        let i = i as usize;
+        if i < count {
+            Ok(i)
+        } else {
+            Err(OcctError(format!("STEP node {i} out of {count}")))
+        }
+    };
+    let root = index(tree.root)?;
+    let mut nodes = Vec::with_capacity(count);
+    for node in tree.nodes {
+        let content = if node.is_assembly {
+            let mut instances = Vec::with_capacity(node.instances.len());
+            for instance in node.instances {
+                let r = &instance.rows;
+                if r.len() != 12 {
+                    return Err(OcctError(format!("placement with {} values", r.len())));
+                }
+                instances.push(StepInstance {
+                    node: index(instance.node)?,
+                    name: instance.name,
+                    transform: Transform {
+                        rows: [
+                            [r[0], r[1], r[2], r[3]],
+                            [r[4], r[5], r[6], r[7]],
+                            [r[8], r[9], r[10], r[11]],
+                        ],
+                    },
+                });
+            }
+            StepNodeContent::Assembly { instances }
+        } else {
+            StepNodeContent::Part { step: node.step }
+        };
+        nodes.push(StepNode {
+            name: node.name,
+            content,
+        });
+    }
+    Ok(StepAssembly { nodes, root })
 }
 
 // ---- Rust → C++ ----------------------------------------------------------------------------

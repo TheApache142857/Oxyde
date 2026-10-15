@@ -713,6 +713,14 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
                 }
+                if ui
+                    .button("Import STEP assembly…")
+                    .on_hover_text("One part file per part and one assembly file per assembly")
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.guard(PendingAction::ImportStepAssembly, &ctx);
+                }
                 ui.separator();
                 if ui.button("Save").clicked() {
                     ui.close_menu();

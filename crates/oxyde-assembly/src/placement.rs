@@ -33,6 +33,35 @@ impl Placement {
         }
     }
 
+    /// The placement doing what `t` does, if `t` is a rotation and a translation (no
+    /// mirror, no scaling, within `1e-6`). Re-orthonormalized.
+    pub fn from_transform(t: &Transform) -> Option<Placement> {
+        let rows = &t.rows;
+        let rotation = [0, 1, 2].map(|i| [rows[i][0], rows[i][1], rows[i][2]]);
+        let rotation_t = [0, 1, 2].map(|i| [rotation[0][i], rotation[1][i], rotation[2][i]]);
+        let product = multiply(&rotation, &rotation_t);
+        for (i, row) in product.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                if !value.is_finite() || (value - expected).abs() > 1e-6 {
+                    return None;
+                }
+            }
+        }
+        let r = rotation;
+        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+        let translation = Vec3::new(rows[0][3], rows[1][3], rows[2][3]);
+        if det <= 0.0 || !translation.length().is_finite() {
+            return None;
+        }
+        Some(Placement {
+            rotation: orthonormalize(rotation),
+            translation,
+        })
+    }
+
     pub fn apply_point(&self, p: Point3) -> Point3 {
         Point3::ORIGIN + self.apply_vector(p.to_vec()) + self.translation
     }

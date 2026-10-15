@@ -24,6 +24,7 @@ struct MeshData;
 struct OpResultData;
 struct PlaneData;
 struct RegionData;
+struct StepAssemblyData;
 struct TopologyCounts;
 struct TopologyData;
 
@@ -51,6 +52,7 @@ public:
 
     void export_step(rust::Slice<const std::uint64_t> shapes, rust::Str path) const;
     std::uint64_t import_step(rust::Slice<const std::uint8_t> data);
+    StepAssemblyData read_step_assembly(rust::Slice<const std::uint8_t> data);
 
 private:
     std::uint64_t insert(const TopoDS_Shape& shape);

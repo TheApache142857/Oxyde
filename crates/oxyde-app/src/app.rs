@@ -44,6 +44,8 @@ pub enum PendingAction {
     BackToAssembly,
     /// A new part from a STEP file.
     OpenStep,
+    /// Part and assembly files from a STEP assembly.
+    ImportStepAssembly,
     Demo,
     DemoFlange,
     Exit,
@@ -646,6 +648,11 @@ impl OxydeApp {
                     self.open_step_as_part(&path);
                 }
             }
+            PendingAction::ImportStepAssembly => {
+                if let Some(path) = pick_step() {
+                    self.import_step_assembly(&path);
+                }
+            }
             PendingAction::DemoFlange => {
                 self.leave_assembly();
                 let mut doc = Document::new();
@@ -716,6 +723,83 @@ impl OxydeApp {
             // Opening is not an edit: nothing to undo, nothing unsaved yet.
             self.doc.modified = false;
             self.doc.clear_history();
+        }
+    }
+
+    /// File › Import STEP assembly: one part file per distinct part of `path` (an
+    /// Imported feature holding its solids) and one assembly file per assembly, written
+    /// into a folder the user picks; then opens the top-level document.
+    fn import_step_assembly(&mut self, path: &Path) {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status = format!("Could not read {}: {e}", path.display());
+                return;
+            }
+        };
+        let source = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "import.step".to_owned());
+        let plan = match self.kernel.read_step_assembly(&bytes) {
+            Ok(tree) => oxyde_format::step_import::plan_step_import(&tree, &source)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.status = format!("Could not import {source}: {e}");
+                return;
+            }
+        };
+        let mut dialog = rfd::FileDialog::new().set_title(format!(
+            "Folder for the {} part(s) and {} assembly file(s) of {source}",
+            plan.part_count(),
+            plan.assembly_count()
+        ));
+        if let Some(parent) = path.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(dir) = dialog.pick_folder() else {
+            return;
+        };
+        let existing = plan.existing_files(&dir);
+        if !existing.is_empty() {
+            let names: Vec<String> = existing
+                .iter()
+                .take(10)
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            let more = existing.len().saturating_sub(names.len());
+            let mut text = format!(
+                "These files already exist and will be replaced:\n\n{}",
+                names.join("\n")
+            );
+            if more > 0 {
+                text += &format!("\n…and {more} more");
+            }
+            let answer = rfd::MessageDialog::new()
+                .set_title("Replace files?")
+                .set_description(text)
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .set_level(rfd::MessageLevel::Warning)
+                .show();
+            if answer != rfd::MessageDialogResult::Yes {
+                return;
+            }
+        }
+        match plan.write(&dir) {
+            Ok(top) => {
+                self.open_path(&top);
+                self.status = format!(
+                    "Imported {source}: {} part(s), {} assembly file(s) in {}",
+                    plan.part_count(),
+                    plan.assembly_count(),
+                    dir.display()
+                );
+            }
+            Err(e) => self.status = format!("Could not write the imported files: {e}"),
         }
     }
 

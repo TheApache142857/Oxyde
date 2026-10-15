@@ -177,6 +177,29 @@ pub(crate) mod bridge {
         edges: Vec<EdgeLineData>,
     }
 
+    // ---- STEP assemblies --------------------------------------------------------------------
+
+    struct StepInstanceData {
+        /// Index into `StepAssemblyData::nodes`.
+        node: u32,
+        name: String,
+        /// 3 × 4 rigid motion, row-major.
+        rows: Vec<f64>,
+    }
+
+    struct StepNodeData {
+        name: String,
+        is_assembly: bool,
+        /// A part's solids as a STEP file; empty when it has none.
+        step: Vec<u8>,
+        instances: Vec<StepInstanceData>,
+    }
+
+    struct StepAssemblyData {
+        nodes: Vec<StepNodeData>,
+        root: u32,
+    }
+
     unsafe extern "C++" {
         include!("oxyde-occt/cpp/shim.h");
 
@@ -263,6 +286,11 @@ pub(crate) mod bridge {
 
         /// Reads the solids of a STEP file held in memory, in millimetres.
         fn import_step(self: Pin<&mut Session>, data: &[u8]) -> Result<u64>;
+
+        /// Reads the product structure of a STEP file held in memory: every part once, as
+        /// its own STEP file, and every assembly with its placed instances. Children come
+        /// before their parents.
+        fn read_step_assembly(self: Pin<&mut Session>, data: &[u8]) -> Result<StepAssemblyData>;
     }
 }
 

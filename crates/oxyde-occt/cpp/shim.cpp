@@ -39,6 +39,17 @@
 #include <Poly_Triangulation.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
+#include <STEPCAFControl_Reader.hxx>
+#include <TCollection_AsciiString.hxx>
+#include <TCollection_ExtendedString.hxx>
+#include <TDF_Label.hxx>
+#include <TDF_LabelSequence.hxx>
+#include <TDF_Tool.hxx>
+#include <TDataStd_Name.hxx>
+#include <TDocStd_Document.hxx>
+#include <XCAFApp_Application.hxx>
+#include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_ShapeTool.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <ShapeFix_Shape.hxx>
@@ -78,6 +89,8 @@
 #include <cmath>
 #include <initializer_list>
 #include <stdexcept>
+#include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -118,6 +131,184 @@ std::uint32_t count_subshapes(const TopoDS_Shape& shape, TopAbs_ShapeEnum kind) 
     TopExp::MapShapes(shape, kind, map);
     return static_cast<std::uint32_t>(map.Extent());
 }
+
+// ---- STEP import helpers -------------------------------------------------------------------
+
+// OCCT's STEP translators and the XCAF application keep global state: two sessions reading
+// or writing STEP at the same time can crash. Every STEP read and write holds this lock.
+std::mutex& step_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+// The solids of `all` as one shape (a compound when there are several), repaired and
+// facing outward. Sewn surfaces count when they close a volume. Null when there is none.
+TopoDS_Shape solid_body(const TopoDS_Shape& all) {
+    TopTools_IndexedMapOfShape solids;
+    TopExp::MapShapes(all, TopAbs_SOLID, solids);
+    if (solids.Extent() == 0) {
+        // Surfaces only: sew them, and keep the closed shells as solids.
+        BRepBuilderAPI_Sewing sewing(1.0e-3);
+        sewing.Add(all);
+        sewing.Perform();
+        TopTools_IndexedMapOfShape shells;
+        TopExp::MapShapes(sewing.SewedShape(), TopAbs_SHELL, shells);
+        for (int i = 1; i <= shells.Extent(); ++i) {
+            const TopoDS_Shell& shell = TopoDS::Shell(shells(i));
+            if (BRep_Tool::IsClosed(shell)) {
+                BRepBuilderAPI_MakeSolid solid(shell);
+                if (solid.IsDone()) {
+                    solids.Add(solid.Solid());
+                }
+            }
+        }
+    }
+    if (solids.Extent() == 0) {
+        return TopoDS_Shape();
+    }
+
+    TopoDS_Shape result;
+    if (solids.Extent() == 1) {
+        result = solids(1);
+    } else {
+        TopoDS_Compound compound;
+        BRep_Builder builder;
+        builder.MakeCompound(compound);
+        for (int i = 1; i <= solids.Extent(); ++i) {
+            builder.Add(compound, solids(i));
+        }
+        result = compound;
+    }
+    ShapeFix_Shape fix(result);
+    fix.Perform();
+    result = fix.Shape();
+    // Some exporters write solids inside out.
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(result, props);
+    if (props.Mass() < 0.0) {
+        result.Reverse();
+    }
+    return result;
+}
+
+// `shape` written as a STEP file, in millimetres.
+rust::Vec<std::uint8_t> step_bytes(const TopoDS_Shape& shape) {
+    STEPControl_Writer writer;
+    if (writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone) {
+        throw std::runtime_error("transfer of a part failed");
+    }
+    std::ostringstream stream;
+    if (writer.WriteStream(stream) != IFSelect_RetDone) {
+        throw std::runtime_error("could not write a part");
+    }
+    const std::string text = stream.str();
+    rust::Vec<std::uint8_t> out;
+    out.reserve(text.size());
+    for (const char c : text) {
+        out.push_back(static_cast<std::uint8_t>(c));
+    }
+    return out;
+}
+
+// The name attribute of an XCAF label, in UTF-8; empty when it has none.
+std::string label_name(const TDF_Label& label) {
+    Handle(TDataStd_Name) name;
+    if (!label.FindAttribute(TDataStd_Name::GetID(), name)) {
+        return std::string();
+    }
+    const TCollection_ExtendedString& text = name->Get();
+    std::string out(static_cast<std::size_t>(text.LengthOfCString()) + 1, '\0');
+    Standard_PCharacter buffer = &out[0];
+    const int length = text.ToUTF8CString(buffer);
+    out.resize(static_cast<std::size_t>(std::max(length, 0)));
+    // OCCT names unnamed instances after the label they refer to: "=>[0:1:1:4]".
+    if (out.rfind("=>[", 0) == 0) {
+        return std::string();
+    }
+    return out;
+}
+
+StepInstanceData instance_data(std::uint32_t node, const std::string& name, const gp_Trsf& trsf) {
+    StepInstanceData out{};
+    out.node = node;
+    out.name = rust::String(name);
+    for (int row = 1; row <= 3; ++row) {
+        for (int col = 1; col <= 4; ++col) {
+            out.rows.push_back(trsf.Value(row, col));
+        }
+    }
+    return out;
+}
+
+// Walks an XCAF document, adding each part and assembly to `out` once, children first.
+class StepTreeBuilder {
+public:
+    explicit StepTreeBuilder(StepAssemblyData& out) : out_(out) {}
+
+    // Index of the node for a shape definition label.
+    std::uint32_t node(const TDF_Label& label) {
+        TCollection_AsciiString entry;
+        TDF_Tool::Entry(label, entry);
+        const std::string key(entry.ToCString());
+        const auto found = done_.find(key);
+        if (found != done_.end()) {
+            return found->second;
+        }
+        std::uint32_t index;
+        if (XCAFDoc_ShapeTool::IsAssembly(label)) {
+            StepNodeData node{};
+            node.name = rust::String(label_name(label));
+            node.is_assembly = true;
+            TDF_LabelSequence components;
+            XCAFDoc_ShapeTool::GetComponents(label, components, false);
+            for (int i = 1; i <= components.Length(); ++i) {
+                const TDF_Label& component = components.Value(i);
+                TDF_Label referred;
+                if (!XCAFDoc_ShapeTool::GetReferredShape(component, referred)) {
+                    continue;
+                }
+                const gp_Trsf trsf = XCAFDoc_ShapeTool::GetLocation(component).Transformation();
+                const bool rigid = !trsf.IsNegative() && std::abs(trsf.ScaleFactor() - 1.0) < 1e-9;
+                if (rigid) {
+                    const std::uint32_t child = this->node(referred);
+                    node.instances.push_back(instance_data(child, label_name(component), trsf));
+                } else {
+                    // Mirrored or scaled: a part of its own, with the motion applied.
+                    const TopoDS_Shape moved =
+                        BRepBuilderAPI_Transform(XCAFDoc_ShapeTool::GetShape(referred), trsf, true)
+                            .Shape();
+                    const std::uint32_t child =
+                        part(label_name(referred) + " (mirrored)", moved);
+                    node.instances.push_back(instance_data(child, label_name(component), gp_Trsf()));
+                }
+            }
+            index = static_cast<std::uint32_t>(out_.nodes.size());
+            out_.nodes.push_back(std::move(node));
+        } else {
+            index = part(label_name(label), XCAFDoc_ShapeTool::GetShape(label));
+        }
+        done_.emplace(key, index);
+        return index;
+    }
+
+private:
+    std::uint32_t part(const std::string& name, const TopoDS_Shape& shape) {
+        StepNodeData node{};
+        node.name = rust::String(name);
+        node.is_assembly = false;
+        if (!shape.IsNull()) {
+            const TopoDS_Shape body = solid_body(shape);
+            if (!body.IsNull()) {
+                node.step = step_bytes(body);
+            }
+        }
+        out_.nodes.push_back(std::move(node));
+        return static_cast<std::uint32_t>(out_.nodes.size() - 1);
+    }
+
+    StepAssemblyData& out_;
+    std::map<std::string, std::uint32_t> done_;
+};
 
 // ---- History helpers -----------------------------------------------------------------------
 
@@ -982,6 +1173,7 @@ TopologyCounts Session::topology_counts(std::uint64_t shape) const {
 
 void Session::export_step(rust::Slice<const std::uint64_t> shapes, rust::Str path) const {
     guarded("export_step", [&] {
+        const std::lock_guard<std::mutex> lock(step_mutex());
         if (shapes.empty()) {
             throw std::invalid_argument("no shapes to export");
         }
@@ -1001,6 +1193,7 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes, rust::Str pat
 
 std::uint64_t Session::import_step(rust::Slice<const std::uint8_t> data) {
     return guarded("import_step", [&] {
+        const std::lock_guard<std::mutex> lock(step_mutex());
         std::istringstream stream(
             std::string(reinterpret_cast<const char*>(data.data()), data.size()));
         STEPControl_Reader reader;
@@ -1012,52 +1205,66 @@ std::uint64_t Session::import_step(rust::Slice<const std::uint8_t> data) {
         if (all.IsNull()) {
             throw std::runtime_error("the STEP file holds no geometry");
         }
-
-        TopTools_IndexedMapOfShape solids;
-        TopExp::MapShapes(all, TopAbs_SOLID, solids);
-        if (solids.Extent() == 0) {
-            // Surfaces only: sew them, and keep the closed shells as solids.
-            BRepBuilderAPI_Sewing sewing(1.0e-3);
-            sewing.Add(all);
-            sewing.Perform();
-            TopTools_IndexedMapOfShape shells;
-            TopExp::MapShapes(sewing.SewedShape(), TopAbs_SHELL, shells);
-            for (int i = 1; i <= shells.Extent(); ++i) {
-                const TopoDS_Shell& shell = TopoDS::Shell(shells(i));
-                if (BRep_Tool::IsClosed(shell)) {
-                    BRepBuilderAPI_MakeSolid solid(shell);
-                    if (solid.IsDone()) {
-                        solids.Add(solid.Solid());
-                    }
-                }
-            }
-        }
-        if (solids.Extent() == 0) {
+        const TopoDS_Shape result = solid_body(all);
+        if (result.IsNull()) {
             throw std::runtime_error("the STEP file has no solid body (open surfaces only)");
         }
-
-        TopoDS_Shape result;
-        if (solids.Extent() == 1) {
-            result = solids(1);
-        } else {
-            TopoDS_Compound compound;
-            BRep_Builder builder;
-            builder.MakeCompound(compound);
-            for (int i = 1; i <= solids.Extent(); ++i) {
-                builder.Add(compound, solids(i));
-            }
-            result = compound;
-        }
-        ShapeFix_Shape fix(result);
-        fix.Perform();
-        result = fix.Shape();
-        // Some exporters write solids inside out.
-        GProp_GProps props;
-        BRepGProp::VolumeProperties(result, props);
-        if (props.Mass() < 0.0) {
-            result.Reverse();
-        }
         return insert(result);
+    });
+}
+
+StepAssemblyData Session::read_step_assembly(rust::Slice<const std::uint8_t> data) {
+    return guarded("read_step_assembly", [&] {
+        const std::lock_guard<std::mutex> lock(step_mutex());
+        std::istringstream stream(
+            std::string(reinterpret_cast<const char*>(data.data()), data.size()));
+        const Handle(XCAFApp_Application) app = XCAFApp_Application::GetApplication();
+        Handle(TDocStd_Document) doc;
+        app->NewDocument("MDTV-XCAF", doc);
+        // Closes the document however this function ends.
+        struct Closer {
+            const Handle(XCAFApp_Application)& app;
+            Handle(TDocStd_Document)& doc;
+            ~Closer() {
+                try {
+                    if (!doc.IsNull() && doc->IsOpened()) {
+                        app->Close(doc);
+                    }
+                } catch (...) {
+                }
+            }
+        } closer{app, doc};
+
+        STEPCAFControl_Reader reader;
+        reader.SetNameMode(true);
+        if (reader.ChangeReader().ReadStream("import.step", stream) != IFSelect_RetDone) {
+            throw std::runtime_error("not a readable STEP file");
+        }
+        if (!reader.Transfer(doc)) {
+            throw std::runtime_error("could not transfer the STEP file");
+        }
+        TDF_LabelSequence roots;
+        XCAFDoc_DocumentTool::ShapeTool(doc->Main())->GetFreeShapes(roots);
+        if (roots.Length() == 0) {
+            throw std::runtime_error("the STEP file holds no geometry");
+        }
+
+        StepAssemblyData out{};
+        StepTreeBuilder builder(out);
+        if (roots.Length() == 1) {
+            out.root = builder.node(roots.Value(1));
+        } else {
+            // Several top-level products: an unnamed assembly holds them.
+            StepNodeData top{};
+            top.is_assembly = true;
+            for (int i = 1; i <= roots.Length(); ++i) {
+                const std::uint32_t child = builder.node(roots.Value(i));
+                top.instances.push_back(instance_data(child, label_name(roots.Value(i)), gp_Trsf()));
+            }
+            out.root = static_cast<std::uint32_t>(out.nodes.size());
+            out.nodes.push_back(std::move(top));
+        }
+        return out;
     });
 }
 

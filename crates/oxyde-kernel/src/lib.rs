@@ -161,6 +161,44 @@ pub struct Mesh {
     pub edges: Vec<Vec<[f32; 3]>>,
 }
 
+/// The product structure of a STEP file: its parts and (sub-)assemblies, each listed once
+/// however many times it is used. Read by [`Kernel::read_step_assembly`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StepAssembly {
+    pub nodes: Vec<StepNode>,
+    /// Index into `nodes` of the top-level product.
+    pub root: usize,
+}
+
+/// A part or an assembly of a STEP file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepNode {
+    /// Product name as written by the exporting system (may be empty).
+    pub name: String,
+    pub content: StepNodeContent,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepNodeContent {
+    /// A part: its solids alone, in its own coordinates, written as a STEP file that
+    /// [`Kernel::import_step`] reads back.
+    Part { step: Vec<u8> },
+    /// An assembly: instances of other nodes.
+    Assembly { instances: Vec<StepInstance> },
+}
+
+/// One use of a node inside an assembly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepInstance {
+    /// Index into [`StepAssembly::nodes`].
+    pub node: usize,
+    /// Instance name as written by the exporting system (may be empty).
+    pub name: String,
+    /// Where the node sits in the assembly: always a rotation and a translation. Mirrored
+    /// or scaled instances are turned into parts of their own, with the motion applied.
+    pub transform: Transform,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Fuse,
@@ -267,6 +305,12 @@ pub trait Kernel {
     /// solids come back as one compound shape; sewn surfaces are kept if they close a
     /// volume.
     fn import_step(&mut self, data: &[u8]) -> Result<ShapeHandle, Self::Error>;
+
+    /// Reads the product structure of a STEP file (its contents): every distinct part, with
+    /// its solids as a STEP file of its own, and every assembly with the placed instances
+    /// of its children. Products without solids are left out. A file without assembly
+    /// structure gives a single part.
+    fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, Self::Error>;
 
     /// Frees a shape. Releasing an unknown or already released handle does nothing.
     fn release(&mut self, shape: ShapeHandle);

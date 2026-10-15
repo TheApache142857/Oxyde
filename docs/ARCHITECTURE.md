@@ -20,7 +20,7 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-occt` | `geom`, `kernel` | `model`, `sketch`, `app` |
 | `oxyde-model` | `geom`, `sketch`, `kernel` | `occt`, `app` |
 | `oxyde-assembly` | `geom`, `kernel` (topology types only), `model` | `occt`, `app` |
-| `oxyde-format` | `geom`, `model`, `assembly` | `occt`, `app` |
+| `oxyde-format` | `geom`, `model`, `assembly`, `kernel` (STEP structure types only) | `occt`, `app` |
 | `oxyde-render` | `kernel` (mesh types only) | `occt`, `model`, `app` |
 | `oxyde-app` | all of the above | — |
 | `oxyde-tests` | `model`, `occt` (dev only) | — |
@@ -58,7 +58,7 @@ Implemented (see `crates/oxyde-kernel/src/lib.rs` for the documented signatures)
 |---|---|
 | Construction | `make_box`, `extrude(plane, profile, vector)`, `revolve(plane, profile, axis, angle)`, `boolean(Fuse/Cut/Common, target, tool)`, `fillet(shape, edges, radius)`, `chamfer(shape, edges, distance)`, `shell(shape, removed faces, signed offset)`, `transform(shape, rigid motion or mirror)` |
 | Queries | `topology` (faces, edges, vertices with adjacency, surface/curve kind, area, centroid, planar normal, axis of a surface of revolution, line or circle axis of an edge, edge midpoint), `tessellate` (display mesh: triangles per face, polyline per edge, indexed like the topology), `volume`, `topology_counts` |
-| Exchange | `export_step(shapes, path)` |
+| Exchange | `export_step(shapes, path)`, `import_step(data)`, `read_step_assembly(data)` (product structure: each part once as its own STEP file, assemblies with placed instances) |
 | Lifetime | `release` |
 
 Every construction operation returns an `OpResult { shape, history }`. The history lists, **for each face of the result**, where it came from:
@@ -72,7 +72,7 @@ Every construction operation returns an `OpResult { shape, history }`. The histo
 | `ProfileSegment(id)` | side face swept (extruded or revolved) from the sketch segment with that id |
 | `StartCap` / `EndCap` | the two ends of an extrusion, or of a revolve of less than a full turn |
 
-`transform` reports every face as the `InputFace` it is a copy of, so pattern instances can be named after the seed's faces. The kernel never remembers anything between calls; turning this history into lasting names is the model's job (§6). Still to come: STEP import, BREP import/export (for an optional `.oxy` geometry cache).
+`transform` reports every face as the `InputFace` it is a copy of, so pattern instances can be named after the seed's faces. The kernel never remembers anything between calls; turning this history into lasting names is the model's job (§6). Still to come: BREP import/export (for an optional `.oxy` geometry cache).
 
 A second, trivial backend (`NullKernel` / mock) lives in tests so that `oxyde-model` can be tested without OCCT installed.
 
@@ -216,3 +216,22 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 | **Bodies** (code written, awaiting first Windows build) | Multi-body parts: join / cut / intersect / new body, Combine, Solid Bodies folder |
 | **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files and sub-assemblies, mates with a 3D solver (reaching into sub-assemblies), fixed/floating, Alt+drag, BOM (top level, parts only, indented) exported as CSV; parts renamed `.oxyprt` |
 | **M7** | Drawings: views, dimensions, PDF/DXF |
+
+## STEP assembly import
+
+File › Import STEP assembly turns a STEP file's product structure into Oxyde documents:
+
+1. `Kernel::read_step_assembly` (OCCT's XCAF reader) lists every distinct product once.
+   A part comes back as its solids written to a STEP file of its own, in its own
+   coordinates; an assembly as instances of other products with rigid placements.
+   Mirrored or scaled instances become parts of their own with the motion applied.
+2. `oxyde_format::step_import::plan_step_import` decides the files: one `.oxyprt` per
+   part, holding a single *Imported* feature with that STEP file, and one `.oxyasm` per
+   assembly placing its components where the STEP file had them. Names come from the
+   products, made valid and unique (ignoring case) file names; products without a solid
+   are dropped. All files go into one folder.
+3. The app writes them (asking before replacing files) and opens the top level.
+
+Mates are not in STEP files; components keep their imported positions until mated.
+OCCT's STEP translators and XCAF application are not thread-safe, so the shim serializes
+every STEP read and write behind one lock.

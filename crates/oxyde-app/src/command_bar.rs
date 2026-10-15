@@ -73,6 +73,14 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::OpenStep, &ctx);
                 }
+                if ui
+                    .button("Import STEP assembly…")
+                    .on_hover_text("One part file per part and one assembly file per assembly")
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.guard(PendingAction::ImportStepAssembly, &ctx);
+                }
                 if ui.button("Open demo bracket").clicked() {
                     ui.close_menu();
                     self.guard(PendingAction::Demo, &ctx);

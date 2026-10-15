@@ -12,6 +12,7 @@
 
 mod assembly_schema;
 mod schema;
+pub mod step_import;
 
 use std::fmt;
 use std::fs::File;

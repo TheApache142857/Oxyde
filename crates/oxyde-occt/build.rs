@@ -31,11 +31,15 @@ const CORE_TOOLKITS: &[&str] = &[
     "TKMesh",
     "TKShHealing",
     "TKXSBase",
+    // XCAF documents, for reading the product structure of STEP assemblies.
+    "TKCDF",
+    "TKLCAF",
+    "TKXCAF",
 ];
 
 /// OCCT 7.8 merged the STEP toolkits into TKDESTEP; older versions ship them separately.
 const STEP_TOOLKITS_7_8: &[&str] = &["TKDESTEP"];
-const STEP_TOOLKITS_LEGACY: &[&str] = &["TKSTEP", "TKSTEPBase"];
+const STEP_TOOLKITS_LEGACY: &[&str] = &["TKSTEP", "TKSTEPBase", "TKXDESTEP"];
 
 fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");

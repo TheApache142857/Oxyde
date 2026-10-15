@@ -2463,6 +2463,7 @@ version = "0.0.1"
 dependencies = [
  "oxyde-assembly",
  "oxyde-geom",
+ "oxyde-kernel",
  "oxyde-model",
  "oxyde-sketch",
  "serde",
