@@ -82,6 +82,15 @@ impl OxydeApp {
         let shown = self.item_shown(item);
         self.visibility.items.insert(item, !shown);
     }
+}
+
+impl Visibility {
+    pub(crate) fn set_item_shown(&mut self, item: Item, shown: bool) {
+        self.items.insert(item, shown);
+    }
+}
+
+impl OxydeApp {
 
     /// Whether an item is drawn: shown, and its kind not filtered out.
     pub(crate) fn item_visible(&self, item: Item) -> bool {

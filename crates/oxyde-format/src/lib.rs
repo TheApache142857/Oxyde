@@ -14,6 +14,7 @@ mod assembly_schema;
 pub mod material_library;
 mod schema;
 pub mod step_import;
+pub mod stl;
 
 use std::fmt;
 use std::fs::File;

@@ -5,6 +5,43 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Editing in place, STL export, multi-selection (October 2026)
+
+- **Edit a component in place.** Right-click a component › *Edit part in place* (or
+  *Edit sub-assembly in place*; double-click does the same) opens its file for editing
+  with the rest of the assembly shown ghosted around it, in the component's own
+  coordinates. The assembly is set aside meanwhile, with its undo history and selection;
+  *File › Finish editing* (also the button under the tree's heading) comes back to it
+  and reads the edited files again. Editing nests: a part inside a sub-assembly inside
+  the main assembly. New, Open or Exit while editing finish each level first, asking
+  about unsaved changes level by level. The old *Back to assembly*, which needed the
+  assembly saved first and reloaded everything, is gone.
+- **Edit locks.** While a part or assembly is open for editing, a small file sits next to
+  it (`Bracket.oxyprt.lock`) saying who edits it from which window. A second window
+  opening the same file (directly, or as a component to edit in place) is told, and can
+  open it read-only (Save then asks for another name) or take the file over. A lock left
+  behind by a crashed window on the same computer is replaced without asking. Saving
+  over a file another window edits is refused. See [FORMAT.md](docs/FORMAT.md) §7.
+- **Export STL** (File menu, parts and assemblies) for 3D printing. A window chooses the
+  quality (presets scaled to the model's size, or a custom maximum deviation and angle),
+  the unit (millimetres as slicers expect, or cm, m, inches) and binary or ASCII STL, and
+  shows the mesh in the viewport as it will be written, triangles and all, before the
+  file is saved. It reports the triangle and vertex counts, the size, the file size and
+  whether the mesh is watertight. An assembly is exported as one mesh of every visible
+  part where it sits. The mesh is made afresh with both a linear and an angular
+  deflection (`Kernel::tessellate_for_export`), so small fillets and holes keep their
+  shape at any size.
+- **Shift+click selects ranges**, in the timeline and in the assembly tree (components
+  and mates); Ctrl+click adds or removes one, as before, and Shift+click in the viewport
+  adds like Ctrl+click. Right-click › Fix / Float, Hide / Show and Delete act on every
+  selected component (the Fix button of the command bar too); in the timeline Suppress,
+  Hide / Show and Delete act on every selected feature, and Delete (the key or the Edit
+  menu) deletes the whole selection as one undo step, later features first so a feature
+  and its sketch go together.
+- **Subsurface scattering** (View menu, and Preferences › Graphics with a strength
+  slider): soft, translucent-looking shading, as of wax, resin or printed plastic, in
+  both renderers.
+
 ### STEP colours and materials (October 2026)
 
 - **STEP colours come in and go out.** Import STEP (and New part from STEP, and the

@@ -234,6 +234,17 @@ impl OxydeApp {
                 ui.add(egui::Slider::new(&mut g.reflection_strength, 0.05..=1.0));
             });
         });
+        ui.checkbox(&mut g.subsurface_scattering, "Subsurface scattering")
+            .on_hover_text(
+                "Soft, translucent-looking shading, as of wax, resin or printed plastic: light \
+                 wraps round the shadow side and glows near the silhouette (also in View)",
+            );
+        ui.add_enabled_ui(g.subsurface_scattering, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Scattering strength");
+                ui.add(egui::Slider::new(&mut g.subsurface_strength, 0.05..=1.0));
+            });
+        });
         ui.horizontal(|ui| {
             ui.label("Mesh quality");
             egui::ComboBox::from_id_salt("mesh_quality")
@@ -641,8 +652,11 @@ impl OxydeApp {
                     self.delete_selected();
                 } else if let Some(session) = self.sketch.as_mut() {
                     session.delete_selection();
-                } else if let Some(id) = self.selected_feature {
-                    self.delete_feature(id);
+                } else {
+                    let selected = self.selected_feature_set();
+                    if !selected.is_empty() {
+                        self.delete_features(&selected);
+                    }
                 }
             }
             Action::Rebuild => {

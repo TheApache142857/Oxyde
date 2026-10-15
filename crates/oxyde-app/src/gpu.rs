@@ -39,6 +39,7 @@ struct View {
     right: vec4<f32>,
     up: vec4<f32>,
     eye: vec4<f32>,
+    // xyz: towards the key light; w: subsurface scattering strength, 0..1.
     key: vec4<f32>,
     // x, y: millimetres to clip space; z: depth scale; w: edge depth bias (mm).
     scale: vec4<f32>,
@@ -160,7 +161,21 @@ fn face_fs(in: FaceOut) -> @location(0) vec4<f32> {
     if (dot(n, view.eye.xyz) < 0.0) {
         n = -n;
     }
-    let light = 0.38 + 0.37 * dot(n, view.eye.xyz) + 0.40 * max(dot(n, view.key.xyz), 0.0);
+    // As `shade` in the software renderer: ambient, headlight, key light, and with
+    // subsurface scattering a wrapped key light and a glow near the silhouette.
+    let facing = dot(n, view.eye.xyz);
+    let towards_key = dot(n, view.key.xyz);
+    var key = max(towards_key, 0.0);
+    var rim = 0.0;
+    let s = view.key.w;
+    if (s > 0.0) {
+        let wrap = 0.6 * s;
+        let soft = max((towards_key + wrap) / (1.0 + wrap), 0.0);
+        key = key + (soft - key) * s;
+        let edge = max(1.0 - facing, 0.0);
+        rim = edge * edge * edge * 0.45 * s;
+    }
+    let light = 0.38 + 0.37 * facing + 0.40 * key + rim;
     let flags = face_flags[in.face];
     let material = materials[in.face];
     var base = material.color.xyz;
@@ -941,7 +956,12 @@ impl GpuViewport {
         view.extend(v4(right));
         view.extend(v4(up));
         view.extend(v4(eye));
-        view.extend(v4(key));
+        view.extend([
+            key[0] as f32,
+            key[1] as f32,
+            key[2] as f32,
+            style.subsurface.clamp(0.0, 1.0),
+        ]);
         view.extend([
             (2.0 / (camera.height * aspect)) as f32,
             (2.0 / camera.height) as f32,
@@ -1429,6 +1449,7 @@ mod tests {
         );
         let style = Style {
             floor_reflection: 0.4,
+            subsurface: 0.5,
             ..Style::LIGHT
         };
         let mut gpu = GpuViewport::new(&state, super::DEFAULT_SAMPLES);

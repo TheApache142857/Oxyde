@@ -1457,15 +1457,10 @@ TopologyData Session::topology(std::uint64_t shape) const {
     });
 }
 
-MeshData Session::tessellate(std::uint64_t shape, double deflection) const {
-    return guarded("tessellate", [&] {
-        if (!(deflection > 0.0)) {
-            throw std::invalid_argument("deflection must be positive");
-        }
-        const TopoDS_Shape& s = get(shape);
-        // Stores a triangulation on every face of the shape (reused by later calls).
-        BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.35, Standard_False);
+namespace {
 
+/// The triangulation stored on the faces of `s`, and its edges as polylines.
+MeshData mesh_of(const TopoDS_Shape& s, double deflection) {
         TopTools_IndexedMapOfShape faces;
         TopTools_IndexedMapOfShape edges;
         TopExp::MapShapes(s, TopAbs_FACE, faces);
@@ -1519,6 +1514,33 @@ MeshData Session::tessellate(std::uint64_t shape, double deflection) const {
             out.edges.push_back(std::move(data));
         }
         return out;
+}
+
+} // namespace
+
+MeshData Session::tessellate(std::uint64_t shape, double deflection) const {
+    return guarded("tessellate", [&] {
+        if (!(deflection > 0.0)) {
+            throw std::invalid_argument("deflection must be positive");
+        }
+        const TopoDS_Shape& s = get(shape);
+        // Stores a triangulation on every face of the shape (reused by later calls).
+        BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.35, Standard_False);
+        return mesh_of(s, deflection);
+    });
+}
+
+MeshData Session::tessellate_with(std::uint64_t shape, double deflection, double angle) const {
+    return guarded("tessellate_with", [&] {
+        if (!(deflection > 0.0) || !(angle > 0.0)) {
+            throw std::invalid_argument("deflection and angle must be positive");
+        }
+        const TopoDS_Shape& s = get(shape);
+        // A triangulation made for display (or an earlier export) would be kept if it
+        // were fine enough: start afresh so the mesh is exactly what was asked for.
+        BRepTools::Clean(s);
+        BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, angle, Standard_True);
+        return mesh_of(s, deflection);
     });
 }
 

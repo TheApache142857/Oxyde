@@ -177,15 +177,16 @@ enum TreeAction {
     ToggleItem(Item),
     Target(MateRef),
     Toggle(ComponentId),
-    Hide(ComponentId),
-    Fix(ComponentId, bool),
+    /// Shows hidden components and hides shown ones.
+    Hide(Vec<ComponentId>),
+    Fix(Vec<ComponentId>, bool),
     OpenPart(ComponentId),
     Appearance(ComponentId),
     /// Gives the parts of these components a material of the library (`None`: none).
     Material(Vec<ComponentId>, Option<String>),
     /// Selects every component whose part has this material.
     SelectMaterial(String),
-    DeleteComponent(ComponentId),
+    DeleteComponents(Vec<ComponentId>),
     EditMate(MateId),
     FlipMate(MateId),
     SuppressMate(MateId, bool),
@@ -346,6 +347,7 @@ impl OxydeApp {
     pub(crate) fn enter_assembly(&mut self, mut doc: AssemblyDoc) {
         self.leave_assembly();
         self.dialog = None;
+        self.stl = None;
         doc.mesh_fraction = self.mesh_fraction();
         let notes = doc.load_parts(&mut self.kernel);
         doc.solve();
@@ -377,12 +379,28 @@ impl OxydeApp {
         self.scene_revision = None;
     }
 
-    pub(crate) fn open_assembly(&mut self, path: &Path) {
+    /// Opens an assembly file, taking its edit lock as `mode` says.
+    pub(crate) fn open_assembly_with(&mut self, path: &Path, mode: crate::edit_in_place::LockMode) {
+        let read_only = match self.claim(path, mode) {
+            Ok(read_only) => read_only,
+            Err(holder) => {
+                self.ask_about_lock(
+                    path,
+                    holder,
+                    crate::edit_in_place::OpenRequest::Path(path.to_path_buf()),
+                );
+                return;
+            }
+        };
         match oxyde_format::load_assembly(path) {
             Ok(file) => {
-                self.enter_assembly(AssemblyDoc::from_file(file, Some(path.to_path_buf())));
+                let mut doc = AssemblyDoc::from_file(file, Some(path.to_path_buf()));
+                doc.read_only = read_only;
+                self.enter_assembly(doc);
                 self.remember_recent(path);
-                self.return_to = None;
+                if read_only {
+                    self.status = format!("{} (read-only)", self.status);
+                }
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
         }
@@ -392,7 +410,7 @@ impl OxydeApp {
         let Some(doc) = self.asm.as_ref() else {
             return false;
         };
-        let path = match (&doc.path, choose) {
+        let path = match (&doc.path, choose || doc.read_only) {
             (Some(path), false) => path.clone(),
             _ => {
                 let Some(mut path) = rfd::FileDialog::new()
@@ -412,6 +430,20 @@ impl OxydeApp {
                 path
             }
         };
+        let new_name = self
+            .asm
+            .as_ref()
+            .is_some_and(|d| d.path.as_deref() != Some(path.as_path()) || d.read_only);
+        if new_name {
+            if let Err(holder) = self.locks.acquire(&path) {
+                self.status = format!(
+                    "Cannot save over {}: it is being edited by {}",
+                    path.display(),
+                    holder.describe()
+                );
+                return false;
+            }
+        }
         let doc = self.asm.as_mut().expect("checked above");
         // Under another name it is another document (see `save_as` for parts).
         let original_id = doc.document_id.clone();
@@ -424,6 +456,7 @@ impl OxydeApp {
             Ok(()) => {
                 doc.path = Some(path.clone());
                 doc.modified = false;
+                doc.read_only = false;
                 self.remember_recent(&path);
                 self.status = format!("Saved {}", path.display());
                 true
@@ -436,27 +469,9 @@ impl OxydeApp {
         }
     }
 
-    /// Opens a component's part for editing, remembering the assembly to come back to.
+    /// Opens a component's part or sub-assembly for editing in place.
     pub(crate) fn open_component(&mut self, id: ComponentId) {
-        let Some(doc) = self.asm.as_ref() else {
-            return;
-        };
-        let Some(path) = doc.sources.get(&id).cloned() else {
-            return;
-        };
-        if doc.load_error(id).is_some() {
-            self.status = format!("{} cannot be opened", path.display());
-            return;
-        }
-        self.return_to = doc.path.clone();
-        self.leave_assembly();
-        self.open_path(&path);
-        if self.return_to.is_none() {
-            self.status = format!(
-                "{}: save the assembly first to come back to it from the part",
-                self.status
-            );
-        }
+        self.open_component_with(id, crate::edit_in_place::LockMode::Lock);
     }
 
     // ---- Commands --------------------------------------------------------------------------
@@ -757,15 +772,24 @@ impl OxydeApp {
         }
     }
 
-    pub(crate) fn toggle_fixed(&mut self, id: ComponentId, fixed: bool) {
+    pub(crate) fn set_fixed(&mut self, ids: &[ComponentId], fixed: bool) {
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
         doc.checkpoint();
-        if let Some(c) = doc.assembly.component_mut(id) {
-            c.fixed = fixed;
+        for id in ids {
+            if let Some(c) = doc.assembly.component_mut(*id) {
+                c.fixed = fixed;
+            }
         }
         doc.solve();
+        if ids.len() > 1 {
+            self.status = format!(
+                "{} components {}",
+                ids.len(),
+                if fixed { "fixed" } else { "floating" }
+            );
+        }
     }
 
     /// Right-click › Material on components: gives every part under them the library
@@ -958,6 +982,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::ImportStepAssembly, &ctx);
                 }
+                self.finish_editing_item(ui);
                 ui.separator();
                 if ui.button("Save").clicked() {
                     ui.close_menu();
@@ -966,6 +991,14 @@ impl OxydeApp {
                 if ui.button("Save as…").clicked() {
                     ui.close_menu();
                     self.save_assembly(true);
+                }
+                if ui
+                    .button("Export STL…")
+                    .on_hover_text("Every part as one mesh, for 3D printing")
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.begin_stl_export();
                 }
                 ui.separator();
                 if ui.button("Insert component…").clicked() {
@@ -1024,6 +1057,7 @@ impl OxydeApp {
                 }
                 ui.separator();
                 self.floor_reflections_item(ui);
+                self.subsurface_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
@@ -1100,12 +1134,15 @@ impl OxydeApp {
             ui.horizontal(|ui| self.assembly_evaluate_tab(ui));
             return;
         }
+        // Fix/Float: every selected component, named after the first.
         let selected = self.asm.as_ref().and_then(|d| {
-            d.selection
+            let ids: Vec<ComponentId> = d
+                .selection
                 .iter()
-                .find_map(AsmSelected::component)
-                .and_then(|c| d.component(c))
-                .map(|c| (c.id, c.fixed))
+                .filter_map(AsmSelected::component)
+                .collect();
+            let first = d.component(*ids.first()?)?;
+            Some((ids, first.fixed))
         });
         let has_two = self
             .asm
@@ -1133,15 +1170,18 @@ impl OxydeApp {
             {
                 self.begin_mate();
             }
-            let fix_label = match selected {
+            let fix_label = match &selected {
                 Some((_, true)) => "Float",
                 _ => "Fix",
             };
             let fix = icons::command_button(ui, Icon::Part, fix_label, selected.is_some(), false)
-                .on_hover_text("A fixed component never moves; a floating one follows its mates");
+                .on_hover_text(
+                    "A fixed component never moves; a floating one follows its mates \
+                     (every selected component)",
+                );
             if fix.clicked() {
-                if let Some((id, fixed)) = selected {
-                    self.toggle_fixed(id, !fixed);
+                if let Some((ids, fixed)) = &selected {
+                    self.set_fixed(ids, !fixed);
                 }
             }
             if icons::command_button(ui, Icon::Rebuild, "Reload\nParts", true, false)
@@ -1487,6 +1527,10 @@ impl OxydeApp {
             ui.heading(doc.display_name());
         });
         ui.add_space(2.0);
+        self.edit_in_place_banner(ui);
+        let Some(doc) = self.asm.as_ref() else {
+            return;
+        };
         let mating = self.mate_dialog.is_some();
         let material_names: Vec<String> = self
             .materials
@@ -1638,45 +1682,63 @@ impl OxydeApp {
                     if row.expand_clicked {
                         action = Some(TreeAction::Toggle(id));
                     } else if row.eye_clicked {
-                        action = Some(TreeAction::Hide(id));
+                        action = Some(TreeAction::Hide(vec![id]));
                     } else if row.response.double_clicked() {
                         action = Some(TreeAction::OpenPart(id));
                     } else if row.response.clicked() && !mating {
                         action = Some(TreeAction::Select(AsmSelected::Component(id)));
                     }
+                    // Fix, Hide, Material and Delete act on every selected component when
+                    // this one is among them, else on this one alone.
+                    let mut targets: Vec<ComponentId> = doc
+                        .selection
+                        .iter()
+                        .filter_map(AsmSelected::component)
+                        .collect();
+                    if !targets.contains(&id) {
+                        targets = vec![id];
+                    }
+                    let count = targets.len();
+                    let counted = |label: &str| {
+                        if count > 1 {
+                            format!("{label} ({count} components)")
+                        } else {
+                            label.to_owned()
+                        }
+                    };
                     let response = row.response.on_hover_text(hover);
                     response.context_menu(|ui| {
                         let open = if sub.is_some() {
-                            "Open sub-assembly"
+                            "Edit sub-assembly in place"
                         } else {
-                            "Open part"
+                            "Edit part in place"
                         };
-                        if ui.button(open).clicked() {
+                        if ui
+                            .button(open)
+                            .on_hover_text(
+                                "Opens the file for editing, with the rest of the assembly \
+                                 shown around it; File › Finish editing comes back here",
+                            )
+                            .clicked()
+                        {
                             action = Some(TreeAction::OpenPart(id));
                             ui.close_menu();
                         }
-                        if ui.button(if fixed { "Float" } else { "Fix" }).clicked() {
-                            action = Some(TreeAction::Fix(id, !fixed));
+                        if ui
+                            .button(counted(if fixed { "Float" } else { "Fix" }))
+                            .clicked()
+                        {
+                            action = Some(TreeAction::Fix(targets.clone(), !fixed));
                             ui.close_menu();
                         }
-                        if ui.button("Hide / Show").clicked() {
-                            action = Some(TreeAction::Hide(id));
+                        if ui.button(counted("Hide / Show")).clicked() {
+                            action = Some(TreeAction::Hide(targets.clone()));
                             ui.close_menu();
                         }
                         if ui.button("Appearance…").clicked() {
                             action = Some(TreeAction::Appearance(id));
                             ui.close_menu();
                         }
-                        // Material: for every selected component, and this one.
-                        let mut targets: Vec<ComponentId> = doc
-                            .selection
-                            .iter()
-                            .filter_map(AsmSelected::component)
-                            .collect();
-                        if !targets.contains(&id) {
-                            targets.push(id);
-                        }
-                        let count = targets.len();
                         ui.menu_button("Material", |ui| {
                             if count > 1 {
                                 ui.label(
@@ -1698,8 +1760,8 @@ impl OxydeApp {
                             }
                         }
                         ui.separator();
-                        if ui.button("Delete").clicked() {
-                            action = Some(TreeAction::DeleteComponent(id));
+                        if ui.button(counted("Delete")).clicked() {
+                            action = Some(TreeAction::DeleteComponents(targets.clone()));
                             ui.close_menu();
                         }
                     });
@@ -1832,17 +1894,25 @@ impl OxydeApp {
         self.viewport.preselect = preselect;
         // Scrolled while drawing; once is enough.
         self.asm_scroll_to = None;
-        let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let (additive, range) =
+            ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
         if let Some(action) = action {
-            self.tree_action(action, additive);
+            self.tree_action(action, additive, range);
         }
     }
 
-    fn tree_action(&mut self, action: TreeAction, additive: bool) {
+    fn tree_action(&mut self, action: TreeAction, additive: bool, range: bool) {
         match action {
             TreeAction::Select(item) => {
                 if let Some(doc) = self.asm.as_mut() {
-                    select(&mut doc.selection, item, additive);
+                    if range {
+                        select_range(doc, item, additive);
+                    } else {
+                        select(&mut doc.selection, item, additive);
+                    }
+                    if doc.selection.len() > 1 {
+                        self.status = format!("{} items selected", doc.selection.len());
+                    }
                 }
                 self.asm_plane = None;
             }
@@ -1866,30 +1936,40 @@ impl OxydeApp {
                     }
                 }
             }
-            TreeAction::Hide(id) => {
+            TreeAction::Hide(ids) => {
                 if let Some(doc) = self.asm.as_mut() {
                     doc.checkpoint();
-                    if let Some(c) = doc.assembly.component_mut(id) {
-                        c.hidden = !c.hidden;
+                    for id in ids {
+                        if let Some(c) = doc.assembly.component_mut(id) {
+                            c.hidden = !c.hidden;
+                        }
                     }
                     doc.revision = crate::document::next_revision();
                 }
             }
-            TreeAction::Fix(id, fixed) => self.toggle_fixed(id, fixed),
+            TreeAction::Fix(ids, fixed) => self.set_fixed(&ids, fixed),
             TreeAction::OpenPart(id) => self.pending_open_component = Some(id),
             TreeAction::Appearance(id) => self.begin_component_appearance(id),
             TreeAction::Material(targets, name) => self.apply_component_material(&targets, name),
             TreeAction::SelectMaterial(name) => self.select_parts_with_material(&name),
-            TreeAction::DeleteComponent(id) => {
+            TreeAction::DeleteComponents(ids) => {
                 if let Some(doc) = self.asm.as_mut() {
                     doc.checkpoint();
-                    let removed = doc.assembly.remove_component(id);
+                    let mut removed = Vec::new();
+                    for id in &ids {
+                        removed.extend(doc.assembly.remove_component(*id));
+                    }
                     doc.selection.clear();
                     doc.solve();
-                    self.status = if removed.is_empty() {
+                    let what = if ids.len() == 1 {
                         "Component deleted".to_owned()
                     } else {
-                        format!("Component deleted, with {}", removed.join(", "))
+                        format!("{} components deleted", ids.len())
+                    };
+                    self.status = if removed.is_empty() {
+                        what
+                    } else {
+                        format!("{what}, with {}", removed.join(", "))
                     };
                 }
             }
@@ -2019,7 +2099,7 @@ impl OxydeApp {
             .and_then(|d| d.selection.iter().find_map(AsmSelected::component));
         output.response.context_menu(|ui| match hovered {
             Some(id) => {
-                if ui.button("Open part").clicked() {
+                if ui.button("Edit part in place").clicked() {
                     self.pending_open_component = Some(id);
                     ui.close_menu();
                 }
@@ -2028,8 +2108,27 @@ impl OxydeApp {
                     .as_ref()
                     .and_then(|d| d.component(id))
                     .is_some_and(|c| c.fixed);
-                if ui.button(if fixed { "Float" } else { "Fix" }).clicked() {
-                    self.toggle_fixed(id, !fixed);
+                let targets: Vec<ComponentId> = self
+                    .asm
+                    .as_ref()
+                    .map(|d| {
+                        d.selection
+                            .iter()
+                            .filter_map(AsmSelected::component)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let label = if targets.len() > 1 {
+                    format!(
+                        "{} ({} components)",
+                        if fixed { "Float" } else { "Fix" },
+                        targets.len()
+                    )
+                } else {
+                    (if fixed { "Float" } else { "Fix" }).to_owned()
+                };
+                if ui.button(label).clicked() {
+                    self.set_fixed(&targets, !fixed);
                     ui.close_menu();
                 }
                 if ui.button("Mate…").clicked() {
@@ -2231,9 +2330,11 @@ impl OxydeApp {
             Some(p) => p.assembly.clone(),
             None => doc.assembly.clone(),
         };
-        let mesh = doc.scene_mesh(&assembly);
+        let mut mesh = doc.scene_mesh(&assembly);
+        let (mut materials, textures) = self.assembly_materials(&assembly);
+        self.add_context(&mut mesh, &mut materials);
+        self.viewport.pickable = self.own_mesh_counts(&mesh);
         let mut scene = Scene::from_mesh(&mesh);
-        let (materials, textures) = self.assembly_materials(&assembly);
         scene.set_materials(materials, textures);
         self.viewport.set_scene(scene, first);
     }
@@ -2416,6 +2517,53 @@ fn sub_tree(
 }
 
 /// Selects `item`, or toggles it with Ctrl.
+/// Shift+click: selects everything in the tree between the last selected item of the same
+/// kind (a component or a mate) and `item`, keeping the previous selection with Ctrl.
+fn select_range(doc: &mut AssemblyDoc, item: AsmSelected, additive: bool) {
+    let range: Option<Vec<AsmSelected>> = match &item {
+        AsmSelected::Component(id) => {
+            let order: Vec<ComponentId> = doc.assembly.components.iter().map(|c| c.id).collect();
+            let anchor = doc.selection.iter().rev().find_map(|s| match s {
+                AsmSelected::Component(c) => Some(*c),
+                _ => None,
+            });
+            between(&order, anchor, *id).map(|ids| {
+                ids.into_iter().map(AsmSelected::Component).collect()
+            })
+        }
+        AsmSelected::Mate(id) => {
+            let order: Vec<MateId> = doc.assembly.mates.iter().map(|m| m.id).collect();
+            let anchor = doc.selection.iter().rev().find_map(|s| match s {
+                AsmSelected::Mate(m) => Some(*m),
+                _ => None,
+            });
+            between(&order, anchor, *id).map(|ids| ids.into_iter().map(AsmSelected::Mate).collect())
+        }
+        _ => None,
+    };
+    match range {
+        Some(items) => {
+            if !additive {
+                doc.selection.clear();
+            }
+            for item in items {
+                if !doc.selection.contains(&item) {
+                    doc.selection.push(item);
+                }
+            }
+        }
+        None => select(&mut doc.selection, item, additive),
+    }
+}
+
+/// The items of `order` from `anchor` to `end`, both included, whichever comes first; `None`
+/// without an anchor in the list.
+fn between<T: Copy + PartialEq>(order: &[T], anchor: Option<T>, end: T) -> Option<Vec<T>> {
+    let a = order.iter().position(|x| Some(*x) == anchor)?;
+    let b = order.iter().position(|x| *x == end)?;
+    Some(order[a.min(b)..=a.max(b)].to_vec())
+}
+
 fn select(selection: &mut Vec<AsmSelected>, item: AsmSelected, additive: bool) {
     if additive {
         match selection.iter().position(|s| *s == item) {

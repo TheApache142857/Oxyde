@@ -79,6 +79,12 @@ pub enum Dialog {
     },
     PartProperties(Properties),
     Discard(PendingAction),
+    /// A file another window is editing: open read-only, take over, or not at all.
+    Locked {
+        path: std::path::PathBuf,
+        holder: crate::lockfile::LockInfo,
+        request: crate::edit_in_place::OpenRequest,
+    },
     About,
 }
 
@@ -221,6 +227,7 @@ impl OxydeApp {
             self.dialog = Some(dialog);
             return;
         }
+        let mut locked_mode = None;
         let answer = match &mut dialog {
             Dialog::Extrude(_)
             | Dialog::Revolve(_)
@@ -282,6 +289,14 @@ impl OxydeApp {
                 answer
             }
             Dialog::PartProperties(p) => properties_window(ctx, p),
+            Dialog::Locked { path, holder, .. } => match Self::locked_window(ctx, path, holder) {
+                None => Answer::Open,
+                Some(None) => Answer::Cancel,
+                Some(Some(mode)) => {
+                    locked_mode = Some(mode);
+                    Answer::Ok
+                }
+            },
             Dialog::Discard(_) => {
                 let mut answer = Answer::Open;
                 let mut save = false;
@@ -343,7 +358,10 @@ impl OxydeApp {
                 }
             }
             Answer::Cancel => {}
-            Answer::Ok => self.apply_dialog(dialog, ctx),
+            Answer::Ok => match (dialog, locked_mode) {
+                (Dialog::Locked { request, .. }, Some(mode)) => self.open_locked(request, mode),
+                (dialog, _) => self.apply_dialog(dialog, ctx),
+            },
         }
     }
 
@@ -435,7 +453,7 @@ impl OxydeApp {
                 }
             }
             Dialog::Discard(action) => self.perform(action, ctx),
-            Dialog::About => {}
+            Dialog::Locked { .. } | Dialog::About => {}
         }
     }
 }

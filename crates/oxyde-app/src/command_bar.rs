@@ -59,16 +59,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
                 }
-                if let Some(path) = self.return_to.clone() {
-                    let name = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    if ui.button(format!("Back to assembly {name}")).clicked() {
-                        ui.close_menu();
-                        self.guard(PendingAction::BackToAssembly, &ctx);
-                    }
-                }
+                self.finish_editing_item(ui);
                 if ui.button("New part from STEP…").clicked() {
                     ui.close_menu();
                     self.guard(PendingAction::OpenStep, &ctx);
@@ -106,6 +97,14 @@ impl OxydeApp {
                     ui.close_menu();
                     self.export_step();
                 }
+                if ui
+                    .button("Export STL…")
+                    .on_hover_text("A mesh of the part for 3D printing, with a preview")
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.begin_stl_export();
+                }
                 ui.separator();
                 if ui.button("Part properties…").clicked() {
                     ui.close_menu();
@@ -133,17 +132,18 @@ impl OxydeApp {
                     self.redo();
                 }
                 ui.separator();
+                let selected = self.selected_feature_set();
+                let label = if selected.len() > 1 {
+                    format!("Delete {} features", selected.len())
+                } else {
+                    "Delete feature".to_owned()
+                };
                 if ui
-                    .add_enabled(
-                        self.selected_feature.is_some(),
-                        egui::Button::new("Delete feature"),
-                    )
+                    .add_enabled(!selected.is_empty(), egui::Button::new(label))
                     .clicked()
                 {
                     ui.close_menu();
-                    if let Some(id) = self.selected_feature {
-                        self.delete_feature(id);
-                    }
+                    self.delete_features(&selected);
                 }
                 if ui.button("Rebuild all (Ctrl+B)").clicked() {
                     ui.close_menu();
@@ -223,6 +223,7 @@ impl OxydeApp {
                 }
                 ui.separator();
                 self.floor_reflections_item(ui);
+                self.subsurface_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
@@ -623,6 +624,25 @@ impl OxydeApp {
         if ui
             .checkbox(&mut self.prefs.graphics.floor_reflections, "Floor reflections")
             .on_hover_text("The part mirrored in a floor just under it. Strength: Preferences › Graphics.")
+            .changed()
+        {
+            let ctx = ui.ctx().clone();
+            self.apply_preferences(&ctx);
+            self.save_preferences();
+        }
+    }
+
+    /// View › Subsurface scattering: soft, translucent-looking shading.
+    pub(crate) fn subsurface_item(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(
+                &mut self.prefs.graphics.subsurface_scattering,
+                "Subsurface scattering",
+            )
+            .on_hover_text(
+                "Light scattered under the surface, as in wax, resin or printed plastic. \
+                 Strength: Preferences › Graphics.",
+            )
             .changed()
         {
             let ctx = ui.ctx().clone();

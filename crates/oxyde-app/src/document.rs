@@ -25,6 +25,8 @@ pub struct Document {
     pub untitled_name: Option<String>,
     /// Changed since the last save.
     pub modified: bool,
+    /// Opened while another window edits the file: Save asks for another name.
+    pub read_only: bool,
     /// Changed by every rebuild, so views know when to refresh; never the same for two
     /// documents (see [`next_revision`]).
     pub revision: u64,
@@ -49,6 +51,7 @@ impl Document {
             path,
             untitled_name: None,
             modified: false,
+            read_only: false,
             revision: next_revision(),
             undo: Vec::new(),
             redo: Vec::new(),

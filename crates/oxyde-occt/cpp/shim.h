@@ -51,6 +51,7 @@ public:
 
     TopologyData topology(std::uint64_t shape) const;
     MeshData tessellate(std::uint64_t shape, double deflection) const;
+    MeshData tessellate_with(std::uint64_t shape, double deflection, double angle) const;
     double volume(std::uint64_t shape) const;
     BoundsData bounds(std::uint64_t shape) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;

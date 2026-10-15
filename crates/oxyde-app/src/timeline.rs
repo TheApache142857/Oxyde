@@ -33,16 +33,27 @@ fn rollback() -> Color32 {
     crate::theme::tokens().accent
 }
 
+/// How a click changes the feature selection: plain, Ctrl (one more or one less) or
+/// Shift (everything between the last selected feature and this one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectMode {
+    Replace,
+    Toggle,
+    Range,
+}
+
 /// Timeline interactions, applied after drawing.
 enum Action {
     SelectPlane(StandardPlane),
-    Select(FeatureId),
+    Select(FeatureId, SelectMode),
     Edit(FeatureId),
     Rename(FeatureId),
-    Suppress(FeatureId, bool),
+    Suppress(Vec<FeatureId>, bool),
+    /// Show or hide several features at once.
+    Show(Vec<FeatureId>, bool),
     /// Move the rollback bar so that this many features are active.
     RollTo(usize),
-    Delete(FeatureId),
+    Delete(Vec<FeatureId>),
     /// Show or hide the sketch a feature absorbs.
     ToggleExpand(FeatureId),
     /// Show or hide an item in the viewport.
@@ -190,10 +201,21 @@ impl OxydeApp {
             ui.heading(self.doc.display_name());
         });
         ui.add_space(2.0);
+        self.edit_in_place_banner(ui);
 
+        // The multi-selection lives as long as its anchor stays selected: commands and the
+        // viewport set `selected_feature` directly, which ends it.
+        if self
+            .selected_feature
+            .is_none_or(|id| !self.selected_features.contains(&id))
+        {
+            self.selected_features.clear();
+        }
         let mut action = None;
         let mut hover_feature = None;
         let mut hover_body = None;
+        // Features in display order, for Shift+click ranges.
+        let mut order: Vec<FeatureId> = Vec::new();
         let creator = self.selection_creator();
         // The face or edge under the pointer in the viewport lights up its feature here.
         let under_pointer = self.viewport.hovered().and_then(|p| self.pick_creator(p));
@@ -324,6 +346,7 @@ impl OxydeApp {
                     let index_of = |id: FeatureId| entries.iter().position(|e| e.id == id);
                     let highlighted = |id: FeatureId| {
                         self.selected_feature == Some(id)
+                            || self.selected_features.contains(&id)
                             || creator == Some(id)
                             || referenced.contains(&id)
                     };
@@ -367,6 +390,7 @@ impl OxydeApp {
                             }
                         }
                     }
+                    order = rows.iter().map(|(_, i)| entries[*i].id).collect();
                     // The feature under the pointer lights up what it made in the viewport.
                     hover_feature = ui
                         .ctx()
@@ -413,7 +437,78 @@ impl OxydeApp {
         // The row was scrolled into view while drawing; once is enough.
         self.scroll_to_feature = None;
         if let Some(action) = action {
-            self.apply_action(action);
+            self.apply_action(action, &order);
+        }
+    }
+
+    /// The features a command from the timeline applies to: the multi-selection when `id`
+    /// is part of it, else `id` alone.
+    fn targets_of(&self, id: FeatureId) -> Vec<FeatureId> {
+        if self.selected_features.len() > 1 && self.selected_features.contains(&id) {
+            self.selected_features.clone()
+        } else {
+            vec![id]
+        }
+    }
+
+    /// Every selected feature: the multi-selection, or the one selected feature.
+    pub(crate) fn selected_feature_set(&self) -> Vec<FeatureId> {
+        if self.selected_features.len() > 1 {
+            self.selected_features.clone()
+        } else {
+            self.selected_feature.into_iter().collect()
+        }
+    }
+
+    /// Changes the feature selection by a click in the timeline.
+    fn select_feature(&mut self, id: FeatureId, mode: SelectMode, order: &[FeatureId]) {
+        match mode {
+            SelectMode::Replace => {
+                self.selected_feature = Some(id);
+                self.selected_features = vec![id];
+            }
+            SelectMode::Toggle => {
+                if self.selected_features.is_empty() {
+                    self.selected_features.extend(self.selected_feature);
+                }
+                match self.selected_features.iter().position(|f| *f == id) {
+                    Some(i) => {
+                        self.selected_features.remove(i);
+                        self.selected_feature = self.selected_features.last().copied();
+                    }
+                    None => {
+                        self.selected_features.push(id);
+                        self.selected_feature = Some(id);
+                    }
+                }
+            }
+            SelectMode::Range => {
+                let anchor = self
+                    .selected_feature
+                    .and_then(|a| order.iter().position(|f| *f == a));
+                let end = order.iter().position(|f| *f == id);
+                match (anchor, end) {
+                    (Some(a), Some(b)) => {
+                        let range = &order[a.min(b)..=a.max(b)];
+                        for f in range {
+                            if !self.selected_features.contains(f) {
+                                self.selected_features.push(*f);
+                            }
+                        }
+                        // Clicked above the anchor: the range reads down to it.
+                        if !self.selected_features.contains(&order[a]) {
+                            self.selected_features.push(order[a]);
+                        }
+                    }
+                    _ => {
+                        self.selected_feature = Some(id);
+                        self.selected_features = vec![id];
+                    }
+                }
+            }
+        }
+        if self.selected_features.len() > 1 {
+            self.status = format!("{} features selected", self.selected_features.len());
         }
     }
 
@@ -536,10 +631,28 @@ impl OxydeApp {
         } else if response.double_clicked() {
             *action = Some(Action::Edit(entry.id));
         } else if response.clicked() {
-            *action = Some(Action::Select(entry.id));
+            let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+            let mode = if shift {
+                SelectMode::Range
+            } else if ctrl {
+                SelectMode::Toggle
+            } else {
+                SelectMode::Replace
+            };
+            *action = Some(Action::Select(entry.id, mode));
         }
         let id = entry.id;
         let is_sketch = entry.type_name == "Sketch";
+        // Suppress, Hide and Delete act on the whole multi-selection when the row is in it.
+        let targets = self.targets_of(id);
+        let many = targets.len() > 1;
+        let count = |label: &str| {
+            if many {
+                format!("{label} ({} features)", targets.len())
+            } else {
+                label.to_owned()
+            }
+        };
         response.context_menu(|ui| {
             let edit = if is_sketch {
                 "Edit sketch"
@@ -555,26 +668,40 @@ impl OxydeApp {
                 ui.close_menu();
             }
             if let Some(shown) = eye {
-                if ui.button(if shown { "Hide" } else { "Show" }).clicked() {
+                if many {
+                    let visible: Vec<FeatureId> = targets
+                        .iter()
+                        .copied()
+                        .filter(|f| self.has_visibility(*f))
+                        .collect();
+                    let label = if shown { "Hide" } else { "Show" };
+                    if ui
+                        .button(format!("{label} ({} features)", visible.len()))
+                        .clicked()
+                    {
+                        *action = Some(Action::Show(visible, !shown));
+                        ui.close_menu();
+                    }
+                } else if ui.button(if shown { "Hide" } else { "Show" }).clicked() {
                     *action = Some(Action::ToggleItem(item));
                     ui.close_menu();
                 }
             }
             let label = if suppressed { "Unsuppress" } else { "Suppress" };
-            if ui.button(label).clicked() {
-                *action = Some(Action::Suppress(id, !suppressed));
+            if ui.button(count(label)).clicked() {
+                *action = Some(Action::Suppress(targets.clone(), !suppressed));
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("Delete").clicked() {
-                *action = Some(Action::Delete(id));
+            if ui.button(count("Delete")).clicked() {
+                *action = Some(Action::Delete(targets.clone()));
                 ui.close_menu();
             }
         });
         response.rect
     }
 
-    fn apply_action(&mut self, action: Action) {
+    fn apply_action(&mut self, action: Action, order: &[FeatureId]) {
         match action {
             Action::SelectPlane(plane) => {
                 if self.offer_to_panel(PanelPick::Plane(plane)) {
@@ -582,14 +709,15 @@ impl OxydeApp {
                 }
                 self.selected_plane = Some(plane);
                 self.selected_feature = None;
+                self.selected_features.clear();
                 self.selection.clear();
                 self.doc.end_edit();
             }
-            Action::Select(id) => {
-                if self.offer_to_panel(PanelPick::Feature(id)) {
+            Action::Select(id, mode) => {
+                if mode != SelectMode::Range && self.offer_to_panel(PanelPick::Feature(id)) {
                     return;
                 }
-                self.selected_feature = Some(id);
+                self.select_feature(id, mode, order);
                 self.selected_plane = None;
                 self.doc.end_edit();
             }
@@ -614,10 +742,25 @@ impl OxydeApp {
                     .unwrap_or_default();
                 self.dialog = Some(Dialog::Rename { feature, name });
             }
-            Action::Suppress(id, suppressed) => {
+            Action::Suppress(ids, suppressed) => {
                 self.doc.checkpoint();
-                if self.doc.part.set_suppressed(id, suppressed).is_ok() {
+                let changed = ids
+                    .iter()
+                    .filter(|id| self.doc.part.set_suppressed(**id, suppressed).is_ok())
+                    .count();
+                if changed > 0 {
                     self.rebuild();
+                }
+                if ids.len() > 1 {
+                    self.status = format!(
+                        "{changed} features {}",
+                        if suppressed { "suppressed" } else { "unsuppressed" }
+                    );
+                }
+            }
+            Action::Show(ids, shown) => {
+                for id in ids {
+                    self.visibility.set_item_shown(Item::Feature(id), shown);
                 }
             }
             Action::RollTo(active) => {
@@ -627,7 +770,7 @@ impl OxydeApp {
                     self.rebuild();
                 }
             }
-            Action::Delete(id) => self.delete_feature(id),
+            Action::Delete(ids) => self.delete_features(&ids),
             Action::ToggleExpand(id) => {
                 if !self.expanded.remove(&id) {
                     self.expanded.insert(id);

@@ -273,7 +273,7 @@ impl OxydeApp {
             }
         }
         if faces.is_empty() && edges.is_empty() {
-            ui.label("Click faces or edges in the graphics area (Ctrl+click for more).");
+            ui.label("Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).");
             return;
         }
         egui::Grid::new("measure")
@@ -386,7 +386,7 @@ impl OxydeApp {
             }
         }
         if faces.is_empty() && edges.is_empty() {
-            ui.label("Click faces or edges in the graphics area (Ctrl+click for more).");
+            ui.label("Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).");
             return;
         }
         egui::Grid::new("asm_measure")

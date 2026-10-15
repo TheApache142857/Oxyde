@@ -482,10 +482,15 @@ struct Lights {
     eye: V3,
     /// Towards the key light.
     key: V3,
+    /// Subsurface scattering strength, 0..1 (see [`Style::subsurface`]).
+    subsurface: f64,
 }
 
 /// Brightness factor for a surface with unit normal `n`: ambient, plus a headlight so no
 /// face goes black, plus a key light so differently oriented faces get different shades.
+/// With subsurface scattering, the key light wraps round the shadow side and light glows
+/// out near the silhouette, where the part is thin as seen from the eye. The GPU shader
+/// (`gpu.rs` in the application) computes the same.
 fn shade(n: V3, lights: &Lights) -> f32 {
     // Closed solids are seen from outside: orient the normal towards the viewer, which also
     // tolerates meshes with inconsistent winding.
@@ -495,8 +500,17 @@ fn shade(n: V3, lights: &Lights) -> f32 {
         n
     };
     let facing = dot(n, lights.eye);
-    let key = dot(n, lights.key).max(0.0);
-    (0.38 + 0.37 * facing + 0.40 * key) as f32
+    let towards_key = dot(n, lights.key);
+    let mut key = towards_key.max(0.0);
+    let mut rim = 0.0;
+    let s = lights.subsurface;
+    if s > 0.0 {
+        let wrap = 0.6 * s;
+        let soft = ((towards_key + wrap) / (1.0 + wrap)).max(0.0);
+        key += (soft - key) * s;
+        rim = (1.0 - facing).max(0.0).powi(3) * 0.45 * s;
+    }
+    (0.38 + 0.37 * facing + 0.40 * key + rim) as f32
 }
 
 /// Renders `scene` seen through `camera` into a `width` × `height` pixel frame, in the
@@ -543,6 +557,7 @@ pub fn render_styled(
     let lights = Lights {
         eye: camera.eye_direction(),
         key: camera.key_light(),
+        subsurface: f64::from(style.subsurface.clamp(0.0, 1.0)),
     };
     let depth_of = |p: V3| -dot(sub(p, camera.target), camera.eye_direction());
     let draw_face = |frame: &mut Frame, face: &SceneFace, world: &[V3], flip: bool, paint: &Paint| {
@@ -897,6 +912,7 @@ mod tests {
         let lights = Lights {
             eye: camera.eye_direction(),
             key: camera.key_light(),
+            subsurface: 0.0,
         };
         let x = shade([1.0, 0.0, 0.0], &lights);
         let y = shade([0.0, 1.0, 0.0], &lights);
@@ -1104,6 +1120,38 @@ mod tests {
         let frame = render_styled(&scene, &camera, w, h, &Highlight::default(), &mirrored);
         let plain = render_styled(&scene, &camera, w, h, &Highlight::default(), &Style::LIGHT);
         assert_eq!(frame.rgba, plain.rgba);
+    }
+
+    #[test]
+    fn subsurface_scattering_softens_the_shading() {
+        // A square facing the camera: its shading is flat, so the only change is that the
+        // key light wraps (no pixel gets darker, and a square turned away from the key
+        // light gets brighter), never the ids.
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let plain = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &Style::LIGHT);
+        let waxy = Style {
+            subsurface: 1.0,
+            ..Style::LIGHT
+        };
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &waxy);
+        assert_eq!(frame.face_ids, plain.face_ids);
+        let brighter = (0..100 * 100)
+            .filter(|i| frame.rgba[i * 4] > plain.rgba[i * 4])
+            .count();
+        let darker = (0..100 * 100)
+            .filter(|i| frame.rgba[i * 4] < plain.rgba[i * 4])
+            .count();
+        assert!(brighter > 0 && darker == 0, "{brighter} brighter, {darker} darker");
+        // Lights wrapped: a normal turned 120° from the key light is still lit a little.
+        let lights = Lights {
+            eye: [0.0, 0.0, 1.0],
+            key: [0.0, 0.0, 1.0],
+            subsurface: 1.0,
+        };
+        let turned = normalize([0.0, 0.866, -0.5]).unwrap();
+        let unlit = shade(turned, &Lights { subsurface: 0.0, ..lights });
+        assert!(shade(turned, &lights) > unlit);
     }
 
     #[test]

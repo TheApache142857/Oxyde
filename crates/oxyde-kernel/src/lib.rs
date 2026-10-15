@@ -340,6 +340,20 @@ pub trait Kernel {
     /// true surface.
     fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, Self::Error>;
 
+    /// A fresh mesh for export (STL): at most `deflection` mm from the true surface and
+    /// at most `angle` radians between the normals at the ends of a triangle's edge, so
+    /// that small curved features keep their shape. Unlike [`Kernel::tessellate`], a mesh
+    /// made earlier with other settings is not reused.
+    fn tessellate_for_export(
+        &self,
+        shape: ShapeHandle,
+        deflection: f64,
+        angle: f64,
+    ) -> Result<Mesh, Self::Error> {
+        let _ = angle;
+        self.tessellate(shape, deflection)
+    }
+
     /// Volume of a solid, in mm³.
     fn volume(&self, shape: ShapeHandle) -> Result<f64, Self::Error>;
 

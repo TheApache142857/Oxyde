@@ -343,3 +343,13 @@ An assembly stores no geometry and no copy of its parts: it refers to part files
 - Readers check that component and mate ids are unique and below the `next_…` counters, that component names are unique, and that mates refer to existing components. Component `0` in a mate is the assembly itself: its own `plane`, `axis` or `origin`, fixed at the identity (components are numbered from 1).
 
 - **Sub-assemblies** are rigid in their parent: their components keep the placements saved in their own file, and only the parent's own components move when the parent's mates are solved. An assembly must not contain itself, directly or through other assemblies; readers refuse such a component.
+
+## 7. Edit locks (`.lock`)
+
+While Oxyde has a part or assembly open for editing, a small file sits next to it with `.lock` appended to the document's name (`bracket.oxyprt.lock`, `robot.oxyasm.lock`):
+
+```json
+{ "user": "hugo", "host": "WORKSTATION", "pid": 18324, "since": 1760530200 }
+```
+
+`since` is in seconds since 1970 (UTC). The lock is advisory: it tells another Oxyde window (and other tools that care) that the file is being edited, so that window opens the file read-only or takes it over; nothing stops a program from writing the file. Oxyde removes the lock when the document is closed or the window quits. A lock whose `host` is this computer and whose `pid` no longer runs is one left behind by a crash: Oxyde replaces it without asking. Other tools reading a folder of Oxyde documents should ignore `.lock` files.

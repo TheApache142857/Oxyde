@@ -185,6 +185,18 @@ impl Kernel for OcctKernel {
         Ok(mesh_from(self.session.tessellate(shape.raw(), deflection)?))
     }
 
+    fn tessellate_for_export(
+        &self,
+        shape: ShapeHandle,
+        deflection: f64,
+        angle: f64,
+    ) -> Result<Mesh, OcctError> {
+        Ok(mesh_from(
+            self.session
+                .tessellate_with(shape.raw(), deflection, angle)?,
+        ))
+    }
+
     fn volume(&self, shape: ShapeHandle) -> Result<f64, OcctError> {
         Ok(self.session.volume(shape.raw())?)
     }

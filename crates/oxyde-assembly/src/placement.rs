@@ -75,6 +75,17 @@ impl Placement {
         )
     }
 
+    /// The placement undoing this one: `inverse(self(p)) = p`.
+    pub fn inverse(&self) -> Placement {
+        let r = &self.rotation;
+        let rotation = [0, 1, 2].map(|i| [r[0][i], r[1][i], r[2][i]]);
+        let translation = apply(&rotation, self.translation) * -1.0;
+        Placement {
+            rotation,
+            translation,
+        }
+    }
+
     /// `inner` (a placement inside a sub-assembly) seen from where this one puts the
     /// sub-assembly: `self(inner(p))`.
     pub fn compose(&self, inner: &Placement) -> Placement {

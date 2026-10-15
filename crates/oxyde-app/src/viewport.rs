@@ -3,7 +3,7 @@
 //! Mouse, part mode: by default right-drag orbits about the point under the pointer where
 //! the drag started (the model stays put under it, as in SolidWorks and Creo), middle-drag
 //! or Shift+right-drag pans, the wheel zooms at the cursor, a middle double-click zooms to
-//! fit, left-click selects (Ctrl+click adds to the selection) and left-drag draws a
+//! fit, left-click selects (Ctrl+click or Shift+click adds to the selection) and left-drag draws a
 //! selection box: left to right takes what lies inside it, right to left what it touches.
 //! The preferences offer the SolidWorks mapping (middle button turns) and the old one (left
 //! button turns, no box); see [`MouseScheme`].
@@ -179,6 +179,9 @@ pub struct Viewport {
     pub settings: ViewSettings,
     /// Faces and edges to draw as hovered this frame, set before `ui` (tree hover).
     pub preselect: Vec<Pick>,
+    /// How many faces and edges of the scene can be picked: the ones after them (the
+    /// ghosted context of a component edited in place) are only looked at.
+    pub pickable: Option<(u32, u32)>,
     /// Triangles and edge segments of the scene.
     scene_counts: (usize, usize),
     /// Where a selection box started (screen position), while the left button is down.
@@ -207,6 +210,7 @@ impl Viewport {
             pivot: None,
             settings: ViewSettings::default(),
             preselect: Vec::new(),
+            pickable: None,
             scene_counts: (0, 0),
             box_start: None,
         }
@@ -536,8 +540,15 @@ impl Viewport {
             },
             _ => None,
         };
+        if let Some((faces, edges)) = self.pickable {
+            self.hovered = self.hovered.filter(|p| match p {
+                Pick::Face(i) => *i < faces,
+                Pick::Edge(i) => *i < edges,
+            });
+        }
         let clicked = (response.clicked() && !sketching).then_some(self.hovered);
-        let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let additive =
+            ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift);
 
         let key = RenderKey {
             camera: self.camera,

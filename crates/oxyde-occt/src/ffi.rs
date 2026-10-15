@@ -312,6 +312,15 @@ pub(crate) mod bridge {
 
         fn tessellate(self: &Session, shape: u64, deflection: f64) -> Result<MeshData>;
 
+        /// A fresh mesh with both a linear and an angular deflection (radians), for
+        /// export; a triangulation made earlier is thrown away first.
+        fn tessellate_with(
+            self: &Session,
+            shape: u64,
+            deflection: f64,
+            angle: f64,
+        ) -> Result<MeshData>;
+
         fn volume(self: &Session, shape: u64) -> Result<f64>;
 
         fn bounds(self: &Session, shape: u64) -> Result<BoundsData>;

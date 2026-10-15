@@ -38,10 +38,10 @@ pub enum PendingAction {
     New,
     NewAssembly,
     Open,
-    /// Leave the assembly to edit a component's part.
+    /// Edit a component's part or sub-assembly in place (see `edit_in_place`).
     OpenComponent(oxyde_assembly::ComponentId),
-    /// Back to the assembly a part was opened from.
-    BackToAssembly,
+    /// Back to the assembly a component was opened from.
+    FinishEdit,
     /// A new part from a STEP file.
     OpenStep,
     /// Part and assembly files from a STEP assembly.
@@ -49,6 +49,14 @@ pub enum PendingAction {
     Demo,
     DemoFlange,
     Exit,
+}
+
+impl PendingAction {
+    /// Whether the action closes every open document, including the assemblies set
+    /// aside while a component is edited in place: those are finished first.
+    pub fn leaves_everything(self) -> bool {
+        !matches!(self, PendingAction::OpenComponent(_) | PendingAction::FinishEdit)
+    }
 }
 
 /// A feature command, from the command bar or the Insert menu.
@@ -163,6 +171,9 @@ pub struct OxydeApp {
     pub(crate) doc: Document,
     pub(crate) viewport: Viewport,
     pub(crate) selected_feature: Option<FeatureId>,
+    /// Several features selected in the timeline (Ctrl+click, Shift+click), including
+    /// `selected_feature`, which anchors it; empty for a plain selection.
+    pub(crate) selected_features: Vec<FeatureId>,
     pub(crate) selected_plane: Option<StandardPlane>,
     /// A body selected in the Solid Bodies folder.
     pub(crate) selected_body: Option<oxyde_model::BodyId>,
@@ -210,8 +221,14 @@ pub struct OxydeApp {
     pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
     /// A component whose part should open once unsaved changes are dealt with.
     pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
-    /// The assembly a part was opened from, to go back to.
-    pub(crate) return_to: Option<PathBuf>,
+    /// The assemblies set aside while a component is edited in place, outermost first.
+    pub(crate) edit_stack: Vec<crate::edit_in_place::Suspended>,
+    /// An action to take once editing in place is finished, level by level.
+    pub(crate) after_unwind: Option<PendingAction>,
+    /// The edit locks this window holds (one per open document).
+    pub(crate) locks: crate::lockfile::Locks,
+    /// File › Export STL, while its window is open.
+    pub(crate) stl: Option<crate::stl_export::StlDialog>,
     pub(crate) prefs: crate::prefs::Preferences,
     pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
     pub(crate) debug_stats: crate::prefs_ui::DebugStats,
@@ -232,6 +249,7 @@ impl OxydeApp {
             doc: Document::new(),
             viewport: Viewport::new(),
             selected_feature: None,
+            selected_features: Vec::new(),
             selected_plane: None,
             selected_body: None,
             bodies_expanded: true,
@@ -262,7 +280,10 @@ impl OxydeApp {
             asm_scene: None,
             grabbing: None,
             pending_open_component: None,
-            return_to: None,
+            edit_stack: Vec::new(),
+            after_unwind: None,
+            locks: Default::default(),
+            stl: None,
             prefs: crate::prefs::Preferences::load(),
             prefs_window: Default::default(),
             debug_stats: Default::default(),
@@ -342,6 +363,46 @@ impl OxydeApp {
             }
             self.rebuild();
         }
+    }
+
+    /// Deletes several features as one undo step, later ones first so that a feature and
+    /// the sketch it uses can go together. Nothing is deleted if a feature outside the set
+    /// still uses one of them.
+    pub(crate) fn delete_features(&mut self, ids: &[FeatureId]) {
+        if ids.len() == 1 {
+            self.delete_feature(ids[0]);
+            return;
+        }
+        let position = |id: FeatureId| self.doc.part.index_of(id);
+        let mut blocked: Vec<String> = Vec::new();
+        for id in ids {
+            for d in self.doc.part.dependents(*id) {
+                if !ids.contains(&d) {
+                    if let Some(f) = self.doc.part.feature(d) {
+                        blocked.push(f.name().to_owned());
+                    }
+                }
+            }
+        }
+        if !blocked.is_empty() {
+            blocked.sort();
+            blocked.dedup();
+            self.status = format!("Cannot delete: used by {}", blocked.join(", "));
+            return;
+        }
+        let mut sorted: Vec<FeatureId> = ids.to_vec();
+        sorted.sort_by_key(|id| std::cmp::Reverse(position(*id)));
+        self.doc.checkpoint();
+        let mut deleted = 0;
+        for id in sorted {
+            if self.doc.part.delete(id).is_ok() {
+                deleted += 1;
+            }
+        }
+        self.selected_feature = None;
+        self.selected_features.clear();
+        self.rebuild();
+        self.status = format!("Deleted {deleted} features");
     }
 
     pub(crate) fn undo(&mut self) {
@@ -732,6 +793,18 @@ impl OxydeApp {
     // ---- Files -------------------------------------------------------------------------------
 
     pub(crate) fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
+        // Components edited in place are finished first, innermost first, each asking
+        // about its unsaved changes; the action follows once the main assembly is back.
+        if action.leaves_everything() && !self.edit_stack.is_empty() {
+            self.after_unwind = Some(action);
+            self.guard(PendingAction::FinishEdit, ctx);
+            return;
+        }
+        // Editing a component in place sets the assembly aside, changes and all.
+        if matches!(action, PendingAction::OpenComponent(_)) {
+            self.perform(action, ctx);
+            return;
+        }
         if self.is_modified() {
             self.dialog = Some(Dialog::Discard(action));
         } else {
@@ -741,6 +814,10 @@ impl OxydeApp {
 
     pub(crate) fn perform(&mut self, action: PendingAction, ctx: &egui::Context) {
         use oxyde_format::{ASSEMBLY_EXTENSION, LEGACY_PART_EXTENSION, PART_EXTENSION};
+        if action.leaves_everything() {
+            // Normally finished one by one by `guard`; freed here if that was bypassed.
+            self.drop_edit_stack();
+        }
         match action {
             PendingAction::New => {
                 self.leave_assembly();
@@ -772,11 +849,7 @@ impl OxydeApp {
                 }
             }
             PendingAction::OpenComponent(id) => self.open_component(id),
-            PendingAction::BackToAssembly => {
-                if let Some(path) = self.return_to.clone() {
-                    self.open_assembly(&path);
-                }
-            }
+            PendingAction::FinishEdit => self.finish_edit(ctx),
             PendingAction::OpenStep => {
                 if let Some(path) = pick_step() {
                     self.leave_assembly();
@@ -816,8 +889,10 @@ impl OxydeApp {
         self.doc = doc;
         self.sketch = None;
         self.dialog = None;
+        self.stl = None;
         self.selection.clear();
         self.selected_feature = None;
+        self.selected_features.clear();
         self.selected_plane = None;
         self.scene_revision = None;
         self.tab = CommandTab::Features;
@@ -826,8 +901,14 @@ impl OxydeApp {
     }
 
     pub(crate) fn open_path(&mut self, path: &Path) {
+        self.open_path_with(path, crate::edit_in_place::LockMode::Lock);
+    }
+
+    /// Opens a part, assembly or STEP file, taking its edit lock as `mode` says (a STEP
+    /// file is read into a new, unsaved part and needs none).
+    pub(crate) fn open_path_with(&mut self, path: &Path, mode: crate::edit_in_place::LockMode) {
         if crate::assembly_ui::is_assembly(path) {
-            self.open_assembly(path);
+            self.open_assembly_with(path, mode);
             return;
         }
         self.leave_assembly();
@@ -835,14 +916,30 @@ impl OxydeApp {
             self.open_step_as_part(path);
             return;
         }
+        let read_only = match self.claim(path, mode) {
+            Ok(read_only) => read_only,
+            Err(holder) => {
+                self.ask_about_lock(
+                    path,
+                    holder,
+                    crate::edit_in_place::OpenRequest::Path(path.to_path_buf()),
+                );
+                return;
+            }
+        };
         let loaded = oxyde_format::load_part(path)
             .map_err(|e| e.to_string())
             .and_then(|file| Document::from_file(file, Some(path.to_path_buf())));
         match loaded {
-            Ok(doc) => {
+            Ok(mut doc) => {
+                doc.read_only = read_only;
                 self.replace_document(doc);
                 self.remember_recent(path);
-                self.status = format!("Opened {}", path.display());
+                self.status = if read_only {
+                    format!("Opened {} read-only", path.display())
+                } else {
+                    format!("Opened {}", path.display())
+                };
                 self.report_errors();
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
@@ -995,8 +1092,8 @@ impl OxydeApp {
         // A sketch being edited is closed (kept) first, so the file has it.
         self.finish_sketch(true);
         match self.doc.path.clone() {
-            Some(path) => self.save_to(&path),
-            None => self.save_as(),
+            Some(path) if !self.doc.read_only => self.save_to(&path),
+            _ => self.save_as(),
         }
     }
 
@@ -1031,6 +1128,17 @@ impl OxydeApp {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
+        // A new name: the file must not be one another window edits.
+        if self.doc.path.as_deref() != Some(path) || self.doc.read_only {
+            if let Err(holder) = self.locks.acquire(path) {
+                self.status = format!(
+                    "Cannot save over {}: it is being edited by {}",
+                    path.display(),
+                    holder.describe()
+                );
+                return false;
+            }
+        }
         let mut file = self.doc.to_file();
         file.properties.volume_mm3 = self
             .doc
@@ -1040,6 +1148,7 @@ impl OxydeApp {
         match oxyde_format::save_part(path, &file) {
             Ok(()) => {
                 self.doc.path = Some(path.to_path_buf());
+                self.doc.read_only = false;
                 self.remember_recent(path);
                 self.doc.properties.volume_mm3 = file.properties.volume_mm3;
                 self.doc.modified = false;
@@ -1535,13 +1644,16 @@ impl OxydeApp {
         self.scene_revision = Some(self.doc.revision);
         let first = self.viewport.is_empty();
         let Some(body) = self.doc.part.body() else {
+            self.viewport.pickable = None;
             self.viewport.set_scene(Scene::default(), false);
             return;
         };
         match tessellate_bodies(&self.kernel, body, self.mesh_fraction()) {
-            Ok(mesh) => {
+            Ok(mut mesh) => {
+                let (mut materials, textures) = self.part_materials();
+                self.add_context(&mut mesh, &mut materials);
+                self.viewport.pickable = self.own_mesh_counts(&mesh);
                 let mut scene = Scene::from_mesh(&mesh);
-                let (materials, textures) = self.part_materials();
                 scene.set_materials(materials, textures);
                 self.viewport.set_scene(scene, first);
             }
@@ -1609,20 +1721,27 @@ impl OxydeApp {
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.is_modified() && !self.allow_close
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.allow_close
+            && (self.any_modified() || !self.edit_stack.is_empty())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::Discard(PendingAction::Exit));
+            self.guard(PendingAction::Exit, ctx);
         }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
-        let name = match &self.asm {
-            Some(doc) => doc.display_name(),
-            None => self.doc.display_name(),
+        let (name, read_only) = match &self.asm {
+            Some(doc) => (doc.display_name(), doc.read_only),
+            None => (self.doc.display_name(), self.doc.read_only),
         };
+        let context = self
+            .editing_in()
+            .map(|(_, parent)| format!(" (in {parent})"))
+            .unwrap_or_default();
         let title = format!(
-            "{name}{} - Oxyde",
+            "{name}{context}{}{} - Oxyde",
+            if read_only { " (read-only)" } else { "" },
             if self.is_modified() { " *" } else { "" }
         );
         if title != self.window_title {
@@ -1773,6 +1892,7 @@ impl eframe::App for OxydeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
         self.splash_step(ctx);
+        self.sync_locks();
         if self.asm.is_some() {
             self.assembly_shortcuts(ctx);
             egui::TopBottomPanel::top("menu").show(ctx, |ui| self.assembly_menu_bar(ui));
@@ -1788,6 +1908,7 @@ impl eframe::App for OxydeApp {
                 .show(ctx, |ui| self.assembly_viewport(ui));
             self.bom_window(ctx);
             self.evaluate_windows(ctx);
+            self.stl_window(ctx);
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
             self.dialogs_ui(ctx);
@@ -1815,6 +1936,7 @@ impl eframe::App for OxydeApp {
 
         self.equations_window(ctx);
         self.evaluate_windows(ctx);
+        self.stl_window(ctx);
         self.preferences_window(ctx);
         self.debug_overlay(ctx, self.viewport_rect);
         self.dialogs_ui(ctx);
@@ -1826,6 +1948,8 @@ impl eframe::App for OxydeApp {
 impl Drop for OxydeApp {
     fn drop(&mut self) {
         self.leave_assembly();
+        self.drop_edit_stack();
         self.doc.release(&mut self.kernel);
+        self.locks.release_all();
     }
 }

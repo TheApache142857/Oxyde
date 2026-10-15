@@ -119,6 +119,8 @@ pub struct AssemblyDoc {
     pub document_id: String,
     pub path: Option<PathBuf>,
     pub modified: bool,
+    /// Opened while another window edits the file: Save asks for another name.
+    pub read_only: bool,
     /// Bumped whenever what the viewport shows changes.
     pub revision: u64,
     /// Component files (parts and sub-assemblies, at every depth) by absolute path; `Err`
@@ -158,6 +160,7 @@ impl AssemblyDoc {
             document_id: file.document_id,
             path,
             modified: false,
+            read_only: false,
             revision: crate::document::next_revision(),
             docs: HashMap::new(),
             sources: HashMap::new(),
