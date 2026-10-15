@@ -75,7 +75,10 @@ impl ModelGeometry {
                 }
                 CurveKind::Circle => {
                     let Some(axis) = edge.axis else { continue };
-                    if !on_plane(plane, axis.origin) {
+                    // Its axis along the normal: a circle standing across the plane has its
+                    // vertex and its middle on it too (two ends of a diameter).
+                    let flat = axis.direction.cross(plane.normal).length() < 1e-6;
+                    if !flat || !on_plane(plane, axis.origin) {
                         continue;
                     }
                     let center = local(plane, axis.origin);
@@ -167,6 +170,13 @@ mod tests {
                     vec![3],
                     Point3::new(3.0, 0.0, 5.0),
                     Axis::new(Point3::new(3.0, 0.0, 6.0), Vec3::Y),
+                ),
+                // A circle standing across the plane: its vertex and middle are on it.
+                edge(
+                    CurveKind::Circle,
+                    vec![1],
+                    Point3::new(20.0, 0.0, 0.0),
+                    Axis::new(Point3::new(15.0, 0.0, 0.0), Vec3::Z),
                 ),
             ],
         };

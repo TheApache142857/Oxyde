@@ -219,6 +219,11 @@ impl Viewport {
         self.scene.is_empty()
     }
 
+    /// Bounding box of what is shown, `(min, max)` along the model axes.
+    pub fn scene_bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        self.scene.bounds()
+    }
+
     pub fn request_fit(&mut self) {
         self.fit_pending = true;
     }

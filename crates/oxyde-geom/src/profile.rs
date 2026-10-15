@@ -439,6 +439,7 @@ fn meetings(a: &Shape, b: &Shape, tolerance: f64) -> Vec<Point2> {
                 let mid = start + sweep / 2.0;
                 let mut points = vec![Point2::new(c2.x + r2 * mid.cos(), c2.y + r2 * mid.sin())];
                 for shape in [a, b] {
+                    // (Nested: let chains need a newer Rust than the 1.85 the build allows.)
                     if let Shape::Arc {
                         center,
                         radius,
@@ -527,7 +528,9 @@ fn circle_circle(c1: Point2, r1: f64, c2: Point2, r2: f64, tolerance: f64) -> Ve
 fn check_crossings(loops: &[Loop]) -> Result<(), ProfileError> {
     // Points this close are one: what the sketch solver leaves, well above rounding.
     let tolerance = 1e3 * LINEAR_TOLERANCE;
-    let segments: Vec<(u32, Shape, Option<(Point2, Point2)>)> = loops
+    // Each segment's id, shape and ends.
+    type Entry = (u32, Shape, Option<(Point2, Point2)>);
+    let segments: Vec<Entry> = loops
         .iter()
         .flat_map(|l| &l.segments)
         .filter_map(|s| Some((s.id, Shape::of(&s.curve)?, s.curve.endpoints())))

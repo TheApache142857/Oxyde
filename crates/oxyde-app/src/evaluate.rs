@@ -65,20 +65,25 @@ impl OxydeApp {
         let volume = crate::app::bodies_volume(&self.kernel, body).ok();
         let topology = &body.topology;
         let area: f64 = topology.faces.iter().map(|f| f.area).sum();
-        let mut lo = [f64::INFINITY; 3];
-        let mut hi = [f64::NEG_INFINITY; 3];
-        for p in topology
-            .vertices
-            .iter()
-            .map(|v| v.point)
-            .chain(topology.faces.iter().map(|f| f.centroid))
-            .chain(topology.edges.iter().map(|e| e.midpoint))
-        {
-            for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
-                lo[k] = lo[k].min(value);
-                hi[k] = hi[k].max(value);
+        // The displayed mesh follows the surfaces: vertices, centroids and edge middles alone
+        // all lie on one diameter of a cylinder, which then measured 0 across.
+        let (lo, hi) = self.viewport.scene_bounds().unwrap_or_else(|| {
+            let mut lo = [f64::INFINITY; 3];
+            let mut hi = [f64::NEG_INFINITY; 3];
+            for p in topology
+                .vertices
+                .iter()
+                .map(|v| v.point)
+                .chain(topology.faces.iter().map(|f| f.centroid))
+                .chain(topology.edges.iter().map(|e| e.midpoint))
+            {
+                for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
+                    lo[k] = lo[k].min(value);
+                    hi[k] = hi[k].max(value);
+                }
             }
-        }
+            (lo, hi)
+        });
         egui::Grid::new("mass_properties")
             .num_columns(2)
             .spacing([16.0, 4.0])
@@ -113,7 +118,7 @@ impl OxydeApp {
             );
         }
         ui.label(
-            egui::RichText::new("The size is measured along the model axes, from the vertices.")
+            egui::RichText::new("The size is the bounding box along the model axes.")
                 .small()
                 .weak(),
         );

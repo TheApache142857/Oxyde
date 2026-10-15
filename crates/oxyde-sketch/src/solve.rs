@@ -166,7 +166,19 @@ impl ConstrainedSketch {
     /// Moves the geometry to satisfy every relation, then reports degrees of freedom and
     /// the state of each entity and relation. On failure the geometry is left unchanged.
     pub fn solve(&mut self) -> Result<SolveReport, SketchError> {
-        let layout = self.layout()?;
+        self.solve_holding(&[])
+    }
+
+    /// Like [`solve`](Self::solve), with the points `held` kept where they are as if they
+    /// were fixed: dragging holds the dragged point under the cursor this way while the
+    /// rest follows. The report counts them as fixed.
+    pub fn solve_holding(&mut self, held: &[EntityId]) -> Result<SolveReport, SketchError> {
+        let mut layout = self.layout()?;
+        for &point in held {
+            if layout.point.contains_key(&point) && !layout.fixed.contains(&point) {
+                layout.fixed.push(point);
+            }
+        }
         let free = layout.free_params();
         let mut params = layout.params.clone();
         let clusters = self.clusters(&layout, &free);

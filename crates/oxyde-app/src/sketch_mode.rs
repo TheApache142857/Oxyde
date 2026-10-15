@@ -785,15 +785,23 @@ impl SketchSession {
             return;
         };
         let before = self.sketch.clone();
+        // What moves with the cursor. Fixed points never do (a line from the origin turns
+        // about it).
+        let mut moved = Vec::new();
         match drag.kind {
             DragKind::Point(p) => {
                 self.sketch.move_point(p, to);
+                moved.push(p);
             }
             DragKind::Line(a, b) => {
                 let (dx, dy) = (to.x - drag.last.x, to.y - drag.last.y);
                 for p in [a, b] {
+                    if self.sketch.is_fixed(p) {
+                        continue;
+                    }
                     if let Some(q) = self.sketch.position(p) {
                         self.sketch.move_point(p, Point2::new(q.x + dx, q.y + dy));
+                        moved.push(p);
                     }
                 }
             }
@@ -803,6 +811,11 @@ impl SketchSession {
                         .set_circle_radius(circle, c.distance(to).max(1e-3));
                 }
             }
+        }
+        // The moved points stay under the cursor while the rest follows, when the relations
+        // allow it; otherwise they go as near as the relations let them.
+        if !moved.is_empty() {
+            let _ = self.sketch.solve_holding(&moved);
         }
         match self.sketch.solve() {
             Ok(report) if report.converged => {
@@ -2106,6 +2119,41 @@ mod tests {
         session.selection = vec![origin];
         session.delete_selection();
         assert_eq!(session.sketch.origin(), Some(origin));
+    }
+
+    #[test]
+    fn dragging_keeps_fixed_points_and_follows_the_cursor() {
+        let mut sketch = ConstrainedSketch::new();
+        let origin = sketch.ensure_origin(Point2::ORIGIN);
+        let tip = sketch.point(Point2::new(10.0, 0.0));
+        let line = sketch.line_between(origin, tip);
+        let mut turning = session(sketch);
+        // Dragging the line turns it about the origin, which does not move.
+        turning.start_drag(line, Point2::new(5.0, 0.0));
+        turning.drag_to(Point2::new(5.0, 5.0));
+        assert_eq!(turning.sketch.position(origin), Some(Point2::ORIGIN));
+        assert_eq!(turning.sketch.position(tip), Some(Point2::new(10.0, 5.0)));
+
+        // A rectangle's corner stays under the cursor; its neighbours keep it rectangular.
+        let mut sketch = ConstrainedSketch::new();
+        sketch.ensure_origin(Point2::ORIGIN);
+        let [bottom, right, ..] = sketch.rectangle(Point2::new(1.0, 1.0), 10.0, 5.0);
+        let corner = sketch.endpoints(right).unwrap().1;
+        let mut stretching = session(sketch);
+        stretching.start_drag(corner, Point2::new(11.0, 6.0));
+        stretching.drag_to(Point2::new(14.0, 9.0));
+        let at = stretching.sketch.position(corner).unwrap();
+        assert!(at.distance(Point2::new(14.0, 9.0)) < 1e-6, "{at:?}");
+        let (a, b) = stretching.sketch.endpoints(bottom).unwrap();
+        let (a, b) = (
+            stretching.sketch.position(a).unwrap(),
+            stretching.sketch.position(b).unwrap(),
+        );
+        assert!(
+            (a.y - b.y).abs() < 1e-6 && (b.x - 14.0).abs() < 1e-6,
+            "{a:?} {b:?}"
+        );
+        assert_eq!(stretching.report.as_ref().unwrap().degrees_of_freedom, 4);
     }
 
     #[test]

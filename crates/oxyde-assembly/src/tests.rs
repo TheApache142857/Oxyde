@@ -475,3 +475,36 @@ fn a_ball_mates_by_its_centre() {
         Ok(Primitive::Point(center))
     );
 }
+
+#[test]
+fn a_conflict_in_one_group_leaves_the_others_alone() {
+    // Two pins on a fixed base, mated to it only: two groups solved apart. The second pin's
+    // two distances contradict each other; the newest one is blamed, the first pin is fine.
+    let (mut asm, base, first) = two();
+    let second = asm.add_component(
+        "Pin",
+        "pin.oxyprt".into(),
+        "b".into(),
+        placed(Vec3::new(-10.0, 5.0, 2.0), Vec3::new(0.1, 0.0, 0.2)),
+    );
+    let front = |c| r(c, MateTarget::Plane(StandardPlane::Front));
+    let axis = |c| r(c, MateTarget::Axis(StandardAxis::Z));
+    asm.add_mate(MateKind::Concentric, axis(base), axis(first), true);
+    asm.add_mate(MateKind::Distance(5.0), front(base), front(first), true);
+    asm.add_mate(MateKind::Concentric, axis(base), axis(second), true);
+    asm.add_mate(MateKind::Distance(8.0), front(base), front(second), true);
+    let late = asm.add_mate(MateKind::Distance(12.0), front(base), front(second), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 1, "{:?}", solution.mates);
+    assert!(matches!(solution.status(late), Some(MateStatus::Error(_))));
+    // Both pins on the axis, at their first distance.
+    for (pin, gap) in [(first, 5.0), (second, 8.0)] {
+        let p = asm.component(pin).unwrap().placement;
+        assert!(
+            close(p.translation.x, 0.0) && close(p.translation.y, 0.0),
+            "{p:?}"
+        );
+        assert!(close(p.translation.z.abs(), gap), "{p:?}");
+        assert_eq!(solution.degrees(pin), Some(1));
+    }
+}

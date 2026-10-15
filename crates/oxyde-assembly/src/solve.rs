@@ -126,9 +126,89 @@ pub fn solve(
         }
     });
 
+    // Groups of mates tied together through components that may move (fixed components tie
+    // nothing): each group is solved on its own, which costs far less than one system for
+    // the whole assembly and gives the same answer.
+    let fixed = |c: ComponentId| assembly.component(c).is_some_and(|c| c.fixed);
+    let mut group: Vec<usize> = (0..active.len()).collect();
+    fn root(group: &mut [usize], mut i: usize) -> usize {
+        while group[i] != i {
+            group[i] = group[group[i]];
+            i = group[i];
+        }
+        i
+    }
+    let mut owner: HashMap<ComponentId, usize> = HashMap::new();
+    for (i, m) in active.iter().enumerate() {
+        for c in [m.a.0, m.b.0] {
+            if fixed(c) {
+                continue;
+            }
+            match owner.get(&c) {
+                Some(&j) => {
+                    let (a, b) = (root(&mut group, i), root(&mut group, j));
+                    group[a.max(b)] = a.min(b);
+                }
+                None => {
+                    owner.insert(c, i);
+                }
+            }
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut slot: HashMap<usize, usize> = HashMap::new();
+    for i in 0..active.len() {
+        let r = root(&mut group, i);
+        let g = *slot.entry(r).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+
+    let mut placements = Vec::new();
+    let mut freedom: HashMap<ComponentId, usize> = HashMap::new();
+    for members in &groups {
+        let mates: Vec<&Active> = members.iter().map(|&i| &active[i]).collect();
+        let solved = solve_group(assembly, &mates, size);
+        placements.extend(solved.placements);
+        statuses.extend(solved.statuses);
+        freedom.extend(solved.freedom);
+    }
+    // Keep the assembly's order of mates.
+    statuses.sort_by_key(|(id, _)| assembly.mates.iter().position(|m| m.id == *id));
+    let freedom = assembly
+        .components
+        .iter()
+        .map(|c| ComponentFreedom {
+            component: c.id,
+            degrees: if c.fixed {
+                0
+            } else {
+                freedom.get(&c.id).copied().unwrap_or(6)
+            },
+        })
+        .collect();
+    Solution {
+        placements,
+        mates: statuses,
+        freedom,
+    }
+}
+
+/// What solving one group of mates gives.
+struct Solved {
+    placements: Vec<(ComponentId, Placement)>,
+    statuses: Vec<(MateId, MateStatus)>,
+    /// Degrees of freedom of each component that may move.
+    freedom: Vec<(ComponentId, usize)>,
+}
+
+/// Solves mates that share no moving component with any other mate.
+fn solve_group(assembly: &Assembly, active: &[&Active], size: f64) -> Solved {
     // Unknowns: a small rotation and a shift for each component that may move.
     let mut moving: Vec<ComponentId> = Vec::new();
-    for m in &active {
+    for m in active {
         for c in [m.a.0, m.b.0] {
             let fixed = assembly.component(c).is_some_and(|c| c.fixed);
             if !fixed && !moving.contains(&c) {
@@ -136,12 +216,11 @@ pub fn solve(
             }
         }
     }
-    let base: HashMap<ComponentId, Placement> = assembly
-        .components
+    let base: HashMap<ComponentId, Placement> = active
         .iter()
-        .map(|c| (c.id, c.placement))
+        .flat_map(|m| [m.a.0, m.b.0])
+        .filter_map(|c| assembly.component(c).map(|c| (c.id, c.placement)))
         .collect();
-    let column = |c: ComponentId| moving.iter().position(|m| *m == c);
     let placements = |x: &[f64]| -> HashMap<ComponentId, Placement> {
         let mut out = base.clone();
         for (i, c) in moving.iter().enumerate() {
@@ -164,11 +243,11 @@ pub fn solve(
         let placed = placements(x);
         let mut r = Vec::new();
         let mut spans = Vec::new();
-        for m in &active {
+        for m in active {
             let start = r.len();
             let a = m.a.1.placed(&placed[&m.a.0]);
             let b = m.b.1.placed(&placed[&m.b.0]);
-            // Errors were ruled out when the mate was accepted below.
+            // Errors were ruled out when the mate was accepted.
             let _ = residuals(m.kind, m.aligned, &a, &b, size, &mut r);
             spans.push((start, r.len()));
         }
@@ -222,53 +301,46 @@ pub fn solve(
         }
     }
     let miss = misses(&x);
-    for ((m, on), worst) in active.iter().zip(&mask).zip(&miss) {
-        let status = if *on {
-            MateStatus::Ok
-        } else {
-            MateStatus::Error(format!(
-                "cannot be met together with the other mates (off by {worst:.3})"
-            ))
-        };
-        statuses.push((m.id, status));
-    }
-    // Keep the assembly's order of mates.
-    statuses.sort_by_key(|(id, _)| assembly.mates.iter().position(|m| m.id == *id));
+    let statuses = active
+        .iter()
+        .zip(&mask)
+        .zip(&miss)
+        .map(|((m, on), worst)| {
+            let status = if *on {
+                MateStatus::Ok
+            } else {
+                MateStatus::Error(format!(
+                    "cannot be met together with the other mates (off by {worst:.3})"
+                ))
+            };
+            (m.id, status)
+        })
+        .collect();
 
     // What each component can still do, among the mates that hold: the motions of the
-    // whole assembly that keep them (the null space of their Jacobian), seen on that
+    // whole group that keep them (the null space of their Jacobian), seen on that
     // component. A component held only by one that can still move moves with it.
     let motions = if n > 0 {
         null_space(&numeric_jacobian(&x, &|x| objective(x, &mask)), n)
     } else {
         Vec::new()
     };
-    let freedom = assembly
-        .components
+    let freedom = moving
         .iter()
-        .map(|c| {
-            let degrees = if c.fixed {
-                0
-            } else if let Some(k) = column(c.id) {
-                let own: Vec<Vec<f64>> = motions
-                    .iter()
-                    .map(|v| v[6 * k..6 * k + 6].to_vec())
-                    .collect();
-                rank(&own, 6)
-            } else {
-                6
-            };
-            ComponentFreedom {
-                component: c.id,
-                degrees,
-            }
+        .enumerate()
+        .map(|(k, c)| {
+            let own: Vec<Vec<f64>> = motions
+                .iter()
+                .map(|v| v[6 * k..6 * k + 6].to_vec())
+                .collect();
+            (*c, rank(&own, 6))
         })
         .collect();
 
     let placed = placements(&x);
-    Solution {
+    Solved {
         placements: moving.iter().map(|c| (*c, placed[c])).collect(),
-        mates: statuses,
+        statuses,
         freedom,
     }
 }
