@@ -36,7 +36,13 @@ fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Oxyde")
             .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([800.0, 500.0])
+            .with_icon(egui::IconData {
+                // 64 × 64 RGBA, drawn by packaging/make_icon.py.
+                rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         renderer,
         ..Default::default()
     }
@@ -54,7 +60,18 @@ fn run(renderer: eframe::Renderer, file: Option<PathBuf>) -> eframe::Result<()> 
 /// start, or with `OXYDE_RENDERER=cpu`, the window falls back to OpenGL and the viewport to
 /// the software renderer.
 fn main() -> eframe::Result<()> {
-    let file = std::env::args_os().nth(1).map(PathBuf::from);
+    let first = std::env::args_os().nth(1);
+    // `--version`: prints the versions and quits; the bundle script uses it to check that
+    // every DLL is there (OpenCASCADE is loaded to ask it its version).
+    if first.as_deref() == Some(std::ffi::OsStr::new("--version")) {
+        println!(
+            "Oxyde {} (OpenCASCADE {})",
+            env!("CARGO_PKG_VERSION"),
+            oxyde_occt::OcctKernel::occt_version()
+        );
+        return Ok(());
+    }
+    let file = first.map(PathBuf::from);
     let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))
         || prefs::Preferences::load().graphics.renderer == prefs::Renderer::Software;
     if software {

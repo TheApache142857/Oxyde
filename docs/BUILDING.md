@@ -81,7 +81,21 @@ The viewport draws with the GPU (wgpu). If it shows nothing or crashes on startu
 $env:OXYDE_RENDERER = "cpu"; cargo run --release -p oxyde-app
 ```
 
-## 3. Troubleshooting
+## 3. Bundling for Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\bundle.ps1
+```
+
+builds the release and writes:
+
+- `dist\Oxyde\`: `Oxyde.exe` with exactly the OpenCASCADE DLLs it needs (followed with `dumpbin`; without it, every DLL of OpenCASCADE's `bin` folder), the licences and the README;
+- `dist\Oxyde-<version>-windows-x64.zip`: the same, to unzip and run anywhere;
+- `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed: a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde.
+
+The script checks the bundle by running `Oxyde.exe --version`, which loads OpenCASCADE: a missing DLL fails the bundle rather than the user. The version comes from the workspace `Cargo.toml`. The icon is drawn by `packaging/make_icon.py` (Pillow); its outputs are committed.
+
+## 4. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

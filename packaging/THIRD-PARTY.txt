@@ -1,0 +1,14 @@
+Oxyde is MIT-licensed (LICENSE.txt). It ships with:
+
+OpenCASCADE Technology (the TK*.dll files)
+  Copyright (c) Open CASCADE SAS
+  GNU Lesser General Public License v2.1, with the Open CASCADE exception.
+  https://dev.opencascade.org/resources/licensing
+  Source code: https://github.com/Open-Cascade-SAS/OCCT
+  The DLLs are used unmodified and can be replaced by other builds of the same version.
+
+The libraries OpenCASCADE uses, when present beside it (for example FreeType, TBB, zlib),
+are under their own licences, found with their sources.
+
+Oxyde's Rust dependencies (egui, wgpu, serde, zip and others) are MIT or Apache-2.0
+licensed; `cargo about` or `cargo license` lists them from the source tree.
