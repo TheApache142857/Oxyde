@@ -45,6 +45,7 @@ Rules:
 - **No OCCT type crosses the boundary.** Shapes live in a C++-side arena; Rust holds opaque integer handles (`ShapeHandle(u64)`). Data crosses as plain structs (`f64` arrays, enums, strings).
 - **Coarse operations only.** The shim exposes on the order of 50 functions (make prism, revolve, boolean, fillet, shell, tessellate, read/write STEP, …), not OCCT's API surface.
 - **Every operation returns its history.** OCCT's `BRepBuilderAPI_MakeShape::Generated / Modified / IsDeleted` results are returned alongside the new shape. This is the raw material for topological naming (§6).
+- **Results are checked.** OCCT's builders can report success on geometry they could not really make: shells, fillets and chamfers are checked with `BRepCheck_Analyzer`, and each wall of a shell must lie the wall thickness from the face it copies (a wall thicker than a face's curvature comes out turned inside out, which `BRepCheck` accepts).
 - **No C++ exceptions escape.** Each shim function catches `Standard_Failure` (which does not derive from `std::exception`) and everything else, and rethrows a `std::runtime_error` that `cxx` turns into a Rust `Err`.
 - **Thread confinement.** All OCCT calls run on one dedicated kernel thread; the Rust side talks to it through a channel. This sidesteps OCCT's uneven thread-safety and keeps the UI responsive during long rebuilds. *(Not yet implemented: since M1 `OcctKernel` is simply `!Send`; the kernel thread arrives with the application.)*
 
@@ -87,7 +88,7 @@ Implemented (M2, solver only):
   - **degrees of freedom** = unknowns − rank;
   - an entity is **fully defined** (black) when no remaining motion (null space of the Jacobian) moves any of its parameters, otherwise under-defined (blue);
   - relations are taken in order: one adding no independent equation is **redundant**, one left unsatisfied is **conflicting**. A failed solve leaves the geometry untouched. The rank, the degrees of freedom and the null space all come from one incrementally reduced basis of the Jacobian's rows, so they always agree with each other.
-- `profile_segments()` turns the solved sketch into profile curves whose segment ids are the entity ids, so face names (`F2.side[7]`) follow sketch entities.
+- `profile_segments()` turns the solved sketch into profile curves whose segment ids are the entity ids, so face names (`F2.side[7]`) follow sketch entities. Contours that cross or touch each other, or themselves, are refused (`ProfileError::Crossing`, found exactly, not on sampled polygons), as SolidWorks refuses self-intersecting contours: OpenCASCADE would extrude them into empty or overlapping solids without complaint.
 
 Relations have a stable `RelationId`. Dimensions are named `D1`, `D2`… in creation order, as in SolidWorks, and can be renamed. Entity ids, relation ids and default-name numbers come from counters saved with the sketch, so nothing is ever reused after a deletion.
 

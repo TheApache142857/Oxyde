@@ -176,6 +176,9 @@ pub enum ProfileError {
     Degenerate { segment: u32 },
     /// A circle with a non-positive radius.
     InvalidCircle { segment: u32 },
+    /// Two segments cross or touch away from a shared end: contours that intersect (or a
+    /// contour crossing itself) bound no region, and would give zero-thickness geometry.
+    Crossing { a: u32, b: u32 },
 }
 
 impl fmt::Display for ProfileError {
@@ -194,6 +197,10 @@ impl fmt::Display for ProfileError {
             ProfileError::InvalidCircle { segment } => {
                 write!(f, "circle {segment} has an invalid radius")
             }
+            ProfileError::Crossing { a, b } => write!(
+                f,
+                "segments {a} and {b} cross or touch: contours must not intersect"
+            ),
         }
     }
 }
@@ -204,6 +211,7 @@ impl Profile {
     /// Builds the profile from sketch curves given in any order and orientation.
     pub fn from_curves(curves: &[ProfileSegment]) -> Result<Profile, ProfileError> {
         let loops = chain_loops(curves)?;
+        check_crossings(&loops)?;
         Ok(Profile {
             regions: nest_loops(loops),
         })
@@ -314,6 +322,243 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
         loops.push(Loop { segments });
     }
     Ok(loops)
+}
+
+/// A profile curve as plain geometry, for intersections: a segment, or an arc of a circle
+/// running counter-clockwise from `start` by `sweep` radians (a full turn for a circle).
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    Segment(Point2, Point2),
+    Arc {
+        center: Point2,
+        radius: f64,
+        start: f64,
+        sweep: f64,
+    },
+}
+
+impl Shape {
+    fn of(curve: &Curve2) -> Option<Shape> {
+        match *curve {
+            Curve2::Line { start, end } => Some(Shape::Segment(start, end)),
+            Curve2::Circle { center, radius } => Some(Shape::Arc {
+                center,
+                radius,
+                start: 0.0,
+                sweep: TAU,
+            }),
+            Curve2::Arc { start, mid, end } => {
+                let (center, radius) = circle_through(start, mid, end)?;
+                let a0 = angle(center, start);
+                let sweep = arc_sweep(a0, angle(center, mid), angle(center, end));
+                // Counter-clockwise from whichever end that makes it.
+                let (start, sweep) = if sweep >= 0.0 {
+                    (a0, sweep)
+                } else {
+                    (angle(center, end), -sweep)
+                };
+                Some(Shape::Arc {
+                    center,
+                    radius,
+                    start,
+                    sweep,
+                })
+            }
+        }
+    }
+
+    /// Bounding box, `(min, max)`, grown by `margin`.
+    fn bounds(&self, margin: f64) -> (Point2, Point2) {
+        let (lo, hi) = match *self {
+            Shape::Segment(a, b) => (
+                Point2::new(a.x.min(b.x), a.y.min(b.y)),
+                Point2::new(a.x.max(b.x), a.y.max(b.y)),
+            ),
+            // The whole circle: enough to rule pairs out.
+            Shape::Arc { center, radius, .. } => (
+                Point2::new(center.x - radius, center.y - radius),
+                Point2::new(center.x + radius, center.y + radius),
+            ),
+        };
+        (
+            Point2::new(lo.x - margin, lo.y - margin),
+            Point2::new(hi.x + margin, hi.y + margin),
+        )
+    }
+
+    /// Whether `p`, on the shape's line or circle, is within the segment or the arc.
+    fn spans(&self, p: Point2, tolerance: f64) -> bool {
+        match *self {
+            Shape::Segment(a, b) => {
+                let (dx, dy) = (b.x - a.x, b.y - a.y);
+                let length = dx.hypot(dy);
+                let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / length;
+                t >= -tolerance && t <= length + tolerance
+            }
+            Shape::Arc {
+                center,
+                radius,
+                start,
+                sweep,
+            } => {
+                if sweep >= TAU {
+                    return true;
+                }
+                let offset = (angle(center, p) - start).rem_euclid(TAU);
+                let slack = tolerance / radius;
+                offset <= sweep + slack || offset >= TAU - slack
+            }
+        }
+    }
+}
+
+/// Points where two curves meet, or a point of their overlap when they share a stretch.
+fn meetings(a: &Shape, b: &Shape, tolerance: f64) -> Vec<Point2> {
+    let candidates = match (*a, *b) {
+        (Shape::Segment(p, q), Shape::Segment(r, s)) => segment_crossings(p, q, r, s, tolerance),
+        (Shape::Segment(p, q), Shape::Arc { center, radius, .. })
+        | (Shape::Arc { center, radius, .. }, Shape::Segment(p, q)) => {
+            line_circle(p, q, center, radius, tolerance)
+        }
+        (
+            Shape::Arc {
+                center: c1,
+                radius: r1,
+                ..
+            },
+            Shape::Arc {
+                center: c2,
+                radius: r2,
+                start,
+                sweep,
+            },
+        ) => {
+            if c1.distance(c2) <= tolerance && (r1 - r2).abs() <= tolerance {
+                // The same circle: they overlap if either holds an end of the other, or
+                // the middle of the second.
+                let mid = start + sweep / 2.0;
+                let mut points = vec![Point2::new(c2.x + r2 * mid.cos(), c2.y + r2 * mid.sin())];
+                for shape in [a, b] {
+                    if let Shape::Arc {
+                        center,
+                        radius,
+                        start,
+                        sweep,
+                    } = *shape
+                    {
+                        if sweep < TAU {
+                            for t in [start, start + sweep] {
+                                points.push(Point2::new(
+                                    center.x + radius * t.cos(),
+                                    center.y + radius * t.sin(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                points
+            } else {
+                circle_circle(c1, r1, c2, r2, tolerance)
+            }
+        }
+    };
+    candidates
+        .into_iter()
+        .filter(|p| a.spans(*p, tolerance) && b.spans(*p, tolerance))
+        .collect()
+}
+
+/// Where two segments meet: their crossing, or the ends of each lying on the other when
+/// they are collinear.
+fn segment_crossings(p: Point2, q: Point2, r: Point2, s: Point2, tolerance: f64) -> Vec<Point2> {
+    let d = (q.x - p.x, q.y - p.y);
+    let e = (s.x - r.x, s.y - r.y);
+    let cross = d.0 * e.1 - d.1 * e.0;
+    let (ld, le) = (d.0.hypot(d.1), e.0.hypot(e.1));
+    if cross.abs() <= 1e-12 * ld * le {
+        // Parallel: overlapping only if on one line; then any end on the other segment.
+        let off = (d.0 * (r.y - p.y) - d.1 * (r.x - p.x)).abs() / ld;
+        return if off <= tolerance {
+            vec![p, q, r, s]
+        } else {
+            Vec::new()
+        };
+    }
+    let t = ((r.x - p.x) * e.1 - (r.y - p.y) * e.0) / cross;
+    vec![Point2::new(p.x + d.0 * t, p.y + d.1 * t)]
+}
+
+fn line_circle(p: Point2, q: Point2, c: Point2, r: f64, tolerance: f64) -> Vec<Point2> {
+    let length = p.distance(q);
+    let u = ((q.x - p.x) / length, (q.y - p.y) / length);
+    let along = (c.x - p.x) * u.0 + (c.y - p.y) * u.1;
+    let foot = Point2::new(p.x + u.0 * along, p.y + u.1 * along);
+    let h = c.distance(foot);
+    if h > r + tolerance {
+        Vec::new()
+    } else if h >= r - tolerance {
+        vec![foot]
+    } else {
+        let half = (r * r - h * h).sqrt();
+        vec![
+            Point2::new(foot.x - u.0 * half, foot.y - u.1 * half),
+            Point2::new(foot.x + u.0 * half, foot.y + u.1 * half),
+        ]
+    }
+}
+
+fn circle_circle(c1: Point2, r1: f64, c2: Point2, r2: f64, tolerance: f64) -> Vec<Point2> {
+    let d = c1.distance(c2);
+    if d <= tolerance || d > r1 + r2 + tolerance || d < (r1 - r2).abs() - tolerance {
+        return Vec::new();
+    }
+    let a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+    let h = (r1 * r1 - a * a).max(0.0).sqrt();
+    let u = ((c2.x - c1.x) / d, (c2.y - c1.y) / d);
+    let m = Point2::new(c1.x + u.0 * a, c1.y + u.1 * a);
+    vec![
+        Point2::new(m.x - u.1 * h, m.y + u.0 * h),
+        Point2::new(m.x + u.1 * h, m.y - u.0 * h),
+    ]
+}
+
+/// Refuses loops that cross or touch each other or themselves. Consecutive segments of a
+/// loop share an end: meeting there is how they connect, anywhere else is a crossing.
+fn check_crossings(loops: &[Loop]) -> Result<(), ProfileError> {
+    // Points this close are one: what the sketch solver leaves, well above rounding.
+    let tolerance = 1e3 * LINEAR_TOLERANCE;
+    let segments: Vec<(u32, Shape, Option<(Point2, Point2)>)> = loops
+        .iter()
+        .flat_map(|l| &l.segments)
+        .filter_map(|s| Some((s.id, Shape::of(&s.curve)?, s.curve.endpoints())))
+        .collect();
+    let bounds: Vec<(Point2, Point2)> = segments
+        .iter()
+        .map(|(_, shape, _)| shape.bounds(tolerance))
+        .collect();
+    for i in 0..segments.len() {
+        for j in i + 1..segments.len() {
+            let ((lo1, hi1), (lo2, hi2)) = (bounds[i], bounds[j]);
+            if lo1.x > hi2.x || lo2.x > hi1.x || lo1.y > hi2.y || lo2.y > hi1.y {
+                continue;
+            }
+            let (ida, a, ends_a) = &segments[i];
+            let (idb, b, ends_b) = &segments[j];
+            // An end the two share is where they connect.
+            let shared = |p: Point2| {
+                let at_end = |ends: &Option<(Point2, Point2)>| {
+                    ends.is_some_and(|(s, e)| {
+                        s.distance(p) <= tolerance || e.distance(p) <= tolerance
+                    })
+                };
+                at_end(ends_a) && at_end(ends_b)
+            };
+            if meetings(a, b, tolerance).into_iter().any(|p| !shared(p)) {
+                return Err(ProfileError::Crossing { a: *ida, b: *idb });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sorts loops into regions: loops nested an even number of times are outer boundaries,
@@ -528,6 +773,97 @@ mod tests {
             Profile::from_curves(&[circle(2, 0.0, 0.0, 0.0)]),
             Err(ProfileError::InvalidCircle { segment: 2 })
         ));
+    }
+
+    fn arc(id: u32, start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> ProfileSegment {
+        ProfileSegment {
+            id,
+            curve: Curve2::Arc {
+                start: Point2::new(start.0, start.1),
+                mid: Point2::new(mid.0, mid.1),
+                end: Point2::new(end.0, end.1),
+            },
+        }
+    }
+
+    fn crossing(curves: &[ProfileSegment]) -> bool {
+        matches!(
+            Profile::from_curves(curves),
+            Err(ProfileError::Crossing { .. })
+        )
+    }
+
+    #[test]
+    fn contours_that_cross_are_refused() {
+        // A bow tie: one loop crossing itself.
+        let bow_tie = vec![
+            line(1, 0.0, 0.0, 10.0, 10.0),
+            line(2, 10.0, 10.0, 10.0, 0.0),
+            line(3, 10.0, 0.0, 0.0, 10.0),
+            line(4, 0.0, 10.0, 0.0, 0.0),
+        ];
+        assert!(crossing(&bow_tie));
+        // Overlapping circles, equal or not.
+        assert!(crossing(&[
+            circle(1, 0.0, 0.0, 10.0),
+            circle(2, 12.0, 0.0, 10.0)
+        ]));
+        assert!(crossing(&[
+            circle(1, 0.0, 0.0, 10.0),
+            circle(2, 8.0, 0.0, 5.0)
+        ]));
+        // A hole across the boundary, or touching it.
+        let mut hole_across = rectangle(1, 0.0, 0.0, 20.0, 10.0);
+        hole_across.push(circle(5, 19.0, 5.0, 3.0));
+        assert!(crossing(&hole_across));
+        let mut hole_touching = rectangle(1, 0.0, 0.0, 20.0, 10.0);
+        hole_touching.push(circle(5, 17.0, 5.0, 3.0));
+        assert!(crossing(&hole_touching));
+        // Two rectangles sharing part of a side.
+        let mut overlapping = rectangle(1, 0.0, 0.0, 10.0, 10.0);
+        overlapping.extend(rectangle(5, 10.0, 5.0, 10.0, 10.0));
+        assert!(crossing(&overlapping));
+        // A line that folds back over the one before it.
+        let folded = vec![
+            line(1, 0.0, 0.0, 10.0, 0.0),
+            line(2, 10.0, 0.0, 5.0, 0.0),
+            line(3, 5.0, 0.0, 0.0, 0.0),
+        ];
+        assert!(crossing(&folded));
+    }
+
+    #[test]
+    fn contours_that_only_meet_at_their_ends_are_kept() {
+        // A slot: lines tangent to the arcs where they meet.
+        let slot = vec![
+            line(1, 0.0, 0.0, 10.0, 0.0),
+            arc(2, (10.0, 0.0), (15.0, 5.0), (10.0, 10.0)),
+            line(3, 10.0, 10.0, 0.0, 10.0),
+            arc(4, (0.0, 10.0), (-5.0, 5.0), (0.0, 0.0)),
+        ];
+        assert!(Profile::from_curves(&slot).is_ok());
+        // A ring, a hole well inside, an island in a hole, a D shape.
+        assert!(
+            Profile::from_curves(&[circle(1, 0.0, 0.0, 10.0), circle(2, 0.0, 0.0, 5.0)]).is_ok()
+        );
+        let mut plate = rectangle(1, 0.0, 0.0, 20.0, 10.0);
+        plate.push(circle(5, 10.0, 5.0, 3.0));
+        assert!(Profile::from_curves(&plate).is_ok());
+        let mut nested = rectangle(1, 0.0, 0.0, 100.0, 100.0);
+        nested.extend(rectangle(5, 10.0, 10.0, 80.0, 80.0));
+        nested.extend(rectangle(9, 40.0, 40.0, 20.0, 20.0));
+        assert!(Profile::from_curves(&nested).is_ok());
+        let d_shape = vec![
+            line(1, 0.0, -5.0, 0.0, 5.0),
+            arc(2, (0.0, 5.0), (5.0, 0.0), (0.0, -5.0)),
+        ];
+        assert!(Profile::from_curves(&d_shape).is_ok());
+        // A full circle made of two arcs.
+        let two_halves = vec![
+            arc(1, (5.0, 0.0), (0.0, 5.0), (-5.0, 0.0)),
+            arc(2, (-5.0, 0.0), (0.0, -5.0), (5.0, 0.0)),
+        ];
+        assert!(Profile::from_curves(&two_halves).is_ok());
     }
 
     #[test]

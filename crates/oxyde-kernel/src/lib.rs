@@ -244,6 +244,8 @@ pub trait Kernel {
     /// Hollows a solid: removes the given faces (indices into the shape's
     /// [`Topology::faces`]) and turns the remaining faces into walls of thickness
     /// `|offset|`, inside the solid for a negative offset, outside for a positive one.
+    /// With no face removed the result is closed: the solid around a void (inward), or a
+    /// skin around the solid (outward).
     ///
     /// History sources: [`FaceSource::InputFace`] for the original faces,
     /// [`FaceSource::OffsetFace`] for their offset copies, [`FaceSource::InputEdge`] and

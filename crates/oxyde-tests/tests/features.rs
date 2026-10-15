@@ -198,6 +198,96 @@ fn shell_hollows_the_part_and_names_its_inner_walls() {
     part.release(&mut kernel);
 }
 
+/// A Ø20 × 20 cylinder on the Front plane, and a shell of it.
+fn shelled_cylinder(
+    faces: impl Fn(FeatureId) -> Vec<FaceName>,
+    thickness: f64,
+    outward: bool,
+) -> (Part, FeatureId, FeatureId) {
+    let mut part = Part::new();
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    sketch.circle(Point2::ORIGIN, 10.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(sketch));
+    let base = part.add_feature(boss(s1, 20.0));
+    let shell = part.add_feature(FeatureKind::Shell(Shell {
+        faces: faces(base),
+        thickness,
+        outward,
+    }));
+    (part, base, shell)
+}
+
+#[test]
+fn a_shell_with_no_face_removed_is_hollow() {
+    let mut kernel = OcctKernel::new();
+    for outward in [false, true] {
+        let (mut part, base, shell) = shelled_cylinder(|_| Vec::new(), 1.0, outward);
+        part.rebuild(&mut kernel);
+        assert_all_ok(&part);
+        // Inward: Ø20 × 20 around a Ø18 × 18 void; outward: Ø22 × 22 around the part.
+        let (outside, void) = if outward {
+            (PI * 121.0 * 22.0, PI * 100.0 * 20.0)
+        } else {
+            (PI * 100.0 * 20.0, PI * 81.0 * 18.0)
+        };
+        assert_close(volume(&part, &kernel), outside - void);
+        let body = part.body().unwrap();
+        assert_eq!(
+            kernel.topology_counts(body.solids[0].shape).unwrap().shells,
+            2
+        );
+        // The part's faces and their offset copies, all named.
+        for face in [FaceName::start_cap(base), FaceName::end_cap(base)] {
+            let copy = FaceName::new(FaceKey::Offset {
+                feature: shell,
+                face: Box::new(face.clone()),
+            });
+            assert!(body.naming.find_face(&face).is_some(), "{face}");
+            assert!(body.naming.find_face(&copy).is_some(), "{copy}");
+        }
+        part.release(&mut kernel);
+    }
+}
+
+#[test]
+fn a_shell_thicker_than_the_part_is_an_error() {
+    let mut kernel = OcctKernel::new();
+    // 12 mm walls in a 10 mm radius: OpenCASCADE turns the wall inside out.
+    let (mut part, _, shell) = shelled_cylinder(|base| vec![FaceName::end_cap(base)], 12.0, false);
+    part.rebuild(&mut kernel);
+    assert!(matches!(part.status(shell), Some(FeatureStatus::Error(_))));
+    // An outward shell, open at the top, is fine.
+    if let Ok(FeatureKind::Shell(s)) = part.edit(shell) {
+        s.thickness = 1.0;
+        s.outward = true;
+    }
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(
+        volume(&part, &kernel),
+        PI * 121.0 * 21.0 - PI * 100.0 * 20.0,
+    );
+    part.release(&mut kernel);
+}
+
+#[test]
+fn contours_that_cross_are_not_extruded() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    // Two overlapping circles: OpenCASCADE would make two overlapping solids.
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    sketch.circle(Point2::ORIGIN, 10.0);
+    sketch.circle(Point2::new(8.0, 0.0), 5.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(sketch));
+    let bad = part.add_feature(boss(s1, 5.0));
+    part.rebuild(&mut kernel);
+    match part.status(bad) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("cross"), "{message}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
 #[test]
 fn sketch_on_a_reference_plane() {
     let mut kernel = OcctKernel::new();

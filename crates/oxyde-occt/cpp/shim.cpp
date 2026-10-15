@@ -14,10 +14,12 @@
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
+#include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -628,6 +630,92 @@ void push_unique(rust::Vec<std::uint32_t>& values, std::uint32_t value) {
     }
 }
 
+// Refuses what OCCT's builders made but could not really make: they can report success on
+// a shell thicker than the part or a fillet too big for its faces, leaving invalid shapes.
+void check_valid(const TopoDS_Shape& shape, const std::string& failure) {
+    if (shape.IsNull() || !BRepCheck_Analyzer(shape).IsValid()) {
+        throw std::runtime_error(failure);
+    }
+}
+
+const char* const SHELL_FAILED = "shell failed (walls too thick for the part?)";
+
+// What a face of a shell made from face `face` of the part is, by where it lies: on the
+// face itself (the skin, perhaps rebuilt), or `thickness` away (its wall). Anywhere else is
+// a wall turned inside out, which OCCT makes valid but wrong when the wall is thicker than
+// a face's curvature (12 mm in a 10 mm radius cylinder).
+SourceKind wall_kind(const TopoDS_Shape& face, const TopoDS_Shape& image, double thickness) {
+    if (image.IsSame(face)) {
+        return SourceKind::InputFace;
+    }
+    BRepExtrema_DistShapeShape gap(face, image);
+    if (!gap.IsDone()) {
+        throw std::runtime_error(SHELL_FAILED);
+    }
+    const double tolerance = 1e-4 + 1e-3 * thickness;
+    if (gap.Value() <= tolerance) {
+        return SourceKind::InputFace;
+    }
+    if (std::abs(gap.Value() - thickness) <= tolerance) {
+        return SourceKind::OffsetFace;
+    }
+    throw std::runtime_error(SHELL_FAILED);
+}
+
+// A closed hollow part, no face removed: the space between the part and the part offset
+// by `offset` (OCCT's thick solid, given no face to open, only makes the offset). History:
+// the part's faces, and the offset copies of them, as `shell` reports them.
+TopoDS_Shape closed_shell(const TopoDS_Shape& input, const TopTools_IndexedMapOfShape& input_faces,
+                          double offset, OpResultData& out) {
+    BRepOffsetAPI_MakeOffsetShape grown;
+    grown.PerformByJoin(input, offset, 1.0e-6, BRepOffset_Skin, Standard_False, Standard_False,
+                        GeomAbs_Intersection);
+    if (!grown.IsDone()) {
+        throw std::runtime_error(SHELL_FAILED);
+    }
+    const TopoDS_Shape wall = grown.Shape();
+    check_valid(wall, SHELL_FAILED);
+    // Inward: the part minus the smaller solid; outward: the bigger one minus the part.
+    const bool inward = offset < 0.0;
+    BRepAlgoAPI_Cut cut(inward ? input : wall, inward ? wall : input);
+    if (!cut.IsDone() || cut.HasErrors()) {
+        throw std::runtime_error(SHELL_FAILED);
+    }
+    const TopoDS_Shape result = cut.Shape();
+    check_valid(result, SHELL_FAILED);
+
+    TopTools_IndexedMapOfShape result_faces;
+    TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+    out = empty_result(result_faces);
+    // Where a face of either side of the cut ended up.
+    const auto after_cut = [&](const TopoDS_Shape& face, SourceKind kind, std::uint32_t index) {
+        if (face.ShapeType() != TopAbs_FACE || cut.IsDeleted(face)) {
+            return;
+        }
+        const TopTools_ListOfShape modified = cut.Modified(face);
+        if (modified.IsEmpty()) {
+            add_source(out, result_faces, face, kind, 0, index);
+        } else {
+            add_sources(out, result_faces, modified, kind, 0, index);
+        }
+    };
+    for (int j = 1; j <= input_faces.Extent(); ++j) {
+        const auto index = static_cast<std::uint32_t>(j - 1);
+        const TopoDS_Shape& face = input_faces(j);
+        after_cut(face, SourceKind::InputFace, index);
+        const TopTools_ListOfShape modified = grown.Modified(face);
+        const TopTools_ListOfShape generated = grown.Generated(face);
+        for (const TopTools_ListOfShape* images : {&modified, &generated}) {
+            for (TopTools_ListOfShape::Iterator it(*images); it.More(); it.Next()) {
+                if (it.Value().ShapeType() == TopAbs_FACE) {
+                    after_cut(it.Value(), wall_kind(face, it.Value(), std::abs(offset)), index);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 const TopoDS_Edge& edge_at(const TopTools_IndexedMapOfShape& edges, std::uint32_t index) {
     if (index >= static_cast<std::uint32_t>(edges.Extent())) {
         throw std::out_of_range("edge index " + std::to_string(index) + " out of range");
@@ -764,11 +852,19 @@ OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t
         TopTools_IndexedMapOfShape input_faces;
         TopExp::MapShapes(input, TopAbs_FACE, input_faces);
         TopTools_ListOfShape removed;
+        TopTools_IndexedMapOfShape opened;
         for (const std::uint32_t index : faces) {
             if (index >= static_cast<std::uint32_t>(input_faces.Extent())) {
                 throw std::out_of_range("face index " + std::to_string(index) + " out of range");
             }
             removed.Append(input_faces(static_cast<int>(index) + 1));
+            opened.Add(input_faces(static_cast<int>(index) + 1));
+        }
+        if (removed.IsEmpty()) {
+            OpResultData out{};
+            const TopoDS_Shape result = closed_shell(input, input_faces, offset, out);
+            out.shape = insert(result);
+            return out;
         }
 
         BRepOffsetAPI_MakeThickSolid maker;
@@ -776,9 +872,10 @@ OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t
                                    Standard_False, Standard_False, GeomAbs_Intersection);
         maker.Build();
         if (!maker.IsDone()) {
-            throw std::runtime_error("shell failed (walls too thick for the part?)");
+            throw std::runtime_error(SHELL_FAILED);
         }
         const TopoDS_Shape result = maker.Shape();
+        check_valid(result, SHELL_FAILED);
 
         TopTools_IndexedMapOfShape result_faces;
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
@@ -794,8 +891,16 @@ OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t
             const TopTools_ListOfShape generated = maker.Generated(face);
             for (const TopTools_ListOfShape* images : {&modified, &generated}) {
                 for (TopTools_ListOfShape::Iterator it(*images); it.More(); it.Next()) {
+                    if (it.Value().ShapeType() != TopAbs_FACE ||
+                        result_faces.FindIndex(it.Value()) <= 0) {
+                        continue;
+                    }
+                    // What a removed face leaves is the rim closing the walls there.
                     const SourceKind kind =
-                        it.Value().IsSame(face) ? SourceKind::InputFace : SourceKind::OffsetFace;
+                        opened.Contains(face)
+                            ? (it.Value().IsSame(face) ? SourceKind::InputFace
+                                                       : SourceKind::OffsetFace)
+                            : wall_kind(face, it.Value(), std::abs(offset));
                     add_source(out, result_faces, it.Value(), kind, 0, index);
                 }
             }
@@ -892,10 +997,12 @@ OpResultData Session::fillet(std::uint64_t shape, rust::Slice<const std::uint32_
             maker.Add(radius, edge_at(input_edges, index));
         }
         maker.Build();
+        const char* const failed = "fillet failed (radius too large for the selected edges?)";
         if (!maker.IsDone()) {
-            throw std::runtime_error("fillet failed (radius too large for the selected edges?)");
+            throw std::runtime_error(failed);
         }
         const TopoDS_Shape result = maker.Shape();
+        check_valid(result, failed);
 
         TopTools_IndexedMapOfShape result_faces;
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
@@ -926,11 +1033,12 @@ OpResultData Session::chamfer(std::uint64_t shape, rust::Slice<const std::uint32
             maker.Add(distance, edge_at(input_edges, index));
         }
         maker.Build();
+        const char* const failed = "chamfer failed (distance too large for the selected edges?)";
         if (!maker.IsDone()) {
-            throw std::runtime_error(
-                "chamfer failed (distance too large for the selected edges?)");
+            throw std::runtime_error(failed);
         }
         const TopoDS_Shape result = maker.Shape();
+        check_valid(result, failed);
 
         TopTools_IndexedMapOfShape result_faces;
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
