@@ -558,3 +558,57 @@ fn mirrored_geometry_follows_the_original() {
     assert!((p.x + q.x).abs() < 1e-7 && (p.y - q.y).abs() < 1e-7);
     assert!(((p.x - q.x).abs() - 20.0).abs() < 1e-7);
 }
+
+#[test]
+fn the_origin_is_remembered_among_other_fixed_construction_points() {
+    let mut s = ConstrainedSketch::new();
+    // A fixed construction point that is not the origin (Convert Entities makes such points
+    // on the rim of converted circles).
+    let rim = s.point(Point2::new(5.0, 0.0));
+    s.set_construction(rim, true);
+    s.constrain(Fixed(rim));
+    let origin = s.ensure_origin(Point2::ORIGIN);
+    assert_ne!(origin, rim);
+    assert_eq!(s.origin(), Some(origin));
+    // Placing the origin again finds it, and moves it, not the other point.
+    assert_eq!(s.ensure_origin(Point2::new(3.0, 4.0)), origin);
+    assert_eq!(s.position(rim), Some(Point2::new(5.0, 0.0)));
+    assert_eq!(s.position(origin), Some(Point2::new(3.0, 4.0)));
+    // Even with its relation gone, it is still the origin, and fixed again when placed.
+    let fixed = s
+        .relations()
+        .iter()
+        .find(|r| r.constraint == Fixed(origin))
+        .map(|r| r.id)
+        .unwrap();
+    s.remove_relation(fixed);
+    assert_eq!(s.ensure_origin(Point2::ORIGIN), origin);
+    assert!(s.is_fixed(origin));
+    // Deleting everything keeps it.
+    let all: Vec<EntityId> = s.entities().iter().map(|e| e.id).collect();
+    s.remove(&all);
+    assert_eq!(s.origin(), Some(origin));
+    assert_eq!(s.entities().len(), 1);
+}
+
+#[test]
+fn a_sketch_saved_without_its_origin_recorded_finds_it() {
+    // Old files: the origin is the fixed construction point where the model origin falls.
+    let mut s = ConstrainedSketch::new();
+    let rim = s.point(Point2::new(5.0, 0.0));
+    s.set_construction(rim, true);
+    s.constrain(Fixed(rim));
+    let old_origin = s.point(Point2::ORIGIN);
+    s.set_construction(old_origin, true);
+    s.constrain(Fixed(old_origin));
+    let s =
+        ConstrainedSketch::from_parts(s.entities().to_vec(), s.relations().to_vec(), s.counters())
+            .unwrap();
+    let mut s = s;
+    assert_eq!(s.ensure_origin(Point2::ORIGIN), old_origin);
+    assert_eq!(s.position(rim), Some(Point2::new(5.0, 0.0)));
+    // A wrong origin in a file is refused.
+    let line = s.line(Point2::new(1.0, 1.0), Point2::new(2.0, 2.0));
+    assert!(s.clone().with_origin(Some(line)).is_err());
+    assert!(s.with_origin(Some(EntityId(999))).is_err());
+}

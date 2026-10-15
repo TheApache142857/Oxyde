@@ -239,6 +239,8 @@ pub struct ConstrainedSketch {
     pub(crate) entities: Vec<Entity>,
     pub(crate) relations: Vec<Relation>,
     pub(crate) counters: Counters,
+    /// The origin point, once [`ensure_origin`](Self::ensure_origin) made it.
+    pub(crate) origin: Option<EntityId>,
 }
 
 impl ConstrainedSketch {
@@ -290,6 +292,7 @@ impl ConstrainedSketch {
                 relation: counters.relation.max(highest_relation + 1),
                 dimension: counters.dimension.max(highest_dimension + 1),
             },
+            origin: None,
         };
         sketch.layout()?;
         // Dimensions stored without a name get the next default one.
@@ -303,6 +306,25 @@ impl ConstrainedSketch {
             }
         }
         Ok(sketch)
+    }
+
+    /// Records which point is the sketch origin (as stored in a file); it must be a point.
+    pub fn with_origin(mut self, origin: Option<EntityId>) -> Result<Self, SketchError> {
+        if let Some(id) = origin {
+            match self.entity(id) {
+                None => return Err(SketchError::UnknownEntity(id)),
+                Some(e) if !matches!(e.geometry, Geometry::Point(_)) => {
+                    return Err(SketchError::WrongKind {
+                        constraint: None,
+                        entity: id,
+                        expected: Kind::Point.name(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        self.origin = origin;
+        Ok(self)
     }
 
     /// The next free default dimension name ("D4"), advancing the counter.
@@ -534,22 +556,36 @@ impl ConstrainedSketch {
         });
     }
 
-    /// The sketch origin: a construction point held by a `Fixed` relation, made by
+    /// The sketch origin: a fixed construction point made by
     /// [`ensure_origin`](Self::ensure_origin). It can be snapped to, dimensioned and related
     /// like any point, but is never deleted with the geometry around it.
+    ///
+    /// The sketch records which point it is. Sketches saved before it did take the first
+    /// fixed construction point, which their origin always is (it is made before anything
+    /// else), but not the only one: Convert Entities fixes construction points too.
     pub fn origin(&self) -> Option<EntityId> {
-        self.entities
-            .iter()
-            .find(|e| {
-                matches!(e.geometry, Geometry::Point(_)) && e.construction && self.is_fixed(e.id)
-            })
-            .map(|e| e.id)
+        match self.origin {
+            Some(id) => self
+                .entity(id)
+                .filter(|e| matches!(e.geometry, Geometry::Point(_)))
+                .map(|e| e.id),
+            None => self
+                .entities
+                .iter()
+                .find(|e| {
+                    matches!(e.geometry, Geometry::Point(_))
+                        && e.construction
+                        && self.is_fixed(e.id)
+                })
+                .map(|e| e.id),
+        }
     }
 
     /// The origin point, created if the sketch has none, and moved to `at` (where the model
     /// origin falls in the sketch plane) if it is elsewhere.
     pub fn ensure_origin(&mut self, at: Point2) -> EntityId {
-        match self.origin() {
+        let recorded = self.origin.filter(|id| self.position(*id).is_some());
+        let id = match recorded {
             Some(id) => {
                 if self.position(id).is_some_and(|p| p.distance(at) > 1e-9) {
                     self.move_point(id, at);
@@ -557,12 +593,30 @@ impl ConstrainedSketch {
                 id
             }
             None => {
-                let id = self.point(at);
-                self.set_construction(id, true);
-                self.constrain(Constraint::Fixed(id));
-                id
+                // Saved before the origin was recorded: the fixed construction point where
+                // the origin goes is it. Any other one is someone's geometry, left alone.
+                let found = self
+                    .entities
+                    .iter()
+                    .find(|e| {
+                        matches!(e.geometry, Geometry::Point(p) if p.distance(at) <= 1e-9)
+                            && e.construction
+                            && self.is_fixed(e.id)
+                    })
+                    .map(|e| e.id);
+                found.unwrap_or_else(|| {
+                    let id = self.point(at);
+                    self.set_construction(id, true);
+                    id
+                })
             }
+        };
+        // It stays fixed whatever happened to its relations.
+        if !self.is_fixed(id) {
+            self.constrain(Constraint::Fixed(id));
         }
+        self.origin = Some(id);
+        id
     }
 
     /// Whether a `Fixed` relation holds this point.
@@ -768,27 +822,47 @@ impl ConstrainedSketch {
         }
     }
 
-    /// Appends the residuals of every equation; `owners` receives, per residual, the index
-    /// of its constraint (`None` for the implicit equal-radius equation of arcs).
+    /// Appends the residuals of the equal-radius equations of `arcs`, then of `relations`
+    /// (indices into the relations, in that order); `owners` receives, per residual, the
+    /// index of its relation (`None` for an arc's implicit equation).
     pub(crate) fn residuals(
         &self,
         layout: &Layout,
         params: &[f64],
+        arcs: &[EntityId],
+        relations: &[usize],
         out: &mut Vec<f64>,
-        owners: &mut Vec<Option<usize>>,
+        owners: Option<&mut Vec<Option<usize>>>,
     ) {
-        let eval = Eval { layout, params };
-        for e in &self.entities {
-            if let Geometry::Arc { center, start, end } = e.geometry {
-                let c = eval.point(center);
-                out.push(dist(c, eval.point(start)) - dist(c, eval.point(end)));
-                owners.push(None);
+        let eval = Eval {
+            layout,
+            param: |i: usize| params[i],
+        };
+        self.residuals_with(&eval, arcs, relations, out, owners);
+    }
+
+    /// [`residuals`](Self::residuals) with any kind of number.
+    pub(crate) fn residuals_with<T: Scalar, P: Fn(usize) -> T>(
+        &self,
+        eval: &Eval<'_, T, P>,
+        arcs: &[EntityId],
+        relations: &[usize],
+        out: &mut Vec<T>,
+        mut owners: Option<&mut Vec<Option<usize>>>,
+    ) {
+        for &arc in arcs {
+            let before = out.len();
+            eval.arc(arc, out);
+            if let Some(owners) = owners.as_deref_mut() {
+                owners.extend(std::iter::repeat_n(None, out.len() - before));
             }
         }
-        for (index, c) in self.relations.iter().map(|r| &r.constraint).enumerate() {
+        for &index in relations {
             let before = out.len();
-            eval.constraint(c, out);
-            owners.extend(std::iter::repeat_n(Some(index), out.len() - before));
+            eval.constraint(&self.relations[index].constraint, out);
+            if let Some(owners) = owners.as_deref_mut() {
+                owners.extend(std::iter::repeat_n(Some(index), out.len() - before));
+            }
         }
     }
 }
@@ -921,18 +995,167 @@ impl Layout {
     }
 }
 
-struct Eval<'a> {
-    layout: &'a Layout,
-    params: &'a [f64],
+/// What the residuals are computed with: plain numbers, or numbers carrying a derivative
+/// ([`Dual`]), so that one piece of code gives both the residuals and their exact Jacobian.
+pub(crate) trait Scalar:
+    Copy
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<Output = Self>
+    + std::ops::Div<Output = Self>
+{
+    fn constant(value: f64) -> Self;
+    fn sqrt(self) -> Self;
+    fn abs(self) -> Self;
+    /// `atan2(self, x)`.
+    fn atan2(self, x: Self) -> Self;
+    /// The angle brought into [−π, π).
+    fn wrap_angle(self) -> Self;
+    /// At least `floor`.
+    fn at_least(self, floor: f64) -> Self;
 }
 
-impl Eval<'_> {
-    fn point(&self, id: EntityId) -> Point2 {
+impl Scalar for f64 {
+    fn constant(value: f64) -> Self {
+        value
+    }
+    fn sqrt(self) -> Self {
+        f64::sqrt(self)
+    }
+    fn abs(self) -> Self {
+        f64::abs(self)
+    }
+    fn atan2(self, x: Self) -> Self {
+        f64::atan2(self, x)
+    }
+    fn wrap_angle(self) -> Self {
+        (self + PI).rem_euclid(TAU) - PI
+    }
+    fn at_least(self, floor: f64) -> Self {
+        self.max(floor)
+    }
+}
+
+/// A value and its derivative along one direction: forward-mode automatic differentiation.
+/// Exact derivatives keep the solver's rank decisions (redundant relations, degrees of
+/// freedom) far from the noise that finite differences leave.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Dual {
+    pub value: f64,
+    pub derivative: f64,
+}
+
+impl std::ops::Add for Dual {
+    type Output = Dual;
+    fn add(self, b: Dual) -> Dual {
+        Dual {
+            value: self.value + b.value,
+            derivative: self.derivative + b.derivative,
+        }
+    }
+}
+
+impl std::ops::Sub for Dual {
+    type Output = Dual;
+    fn sub(self, b: Dual) -> Dual {
+        Dual {
+            value: self.value - b.value,
+            derivative: self.derivative - b.derivative,
+        }
+    }
+}
+
+impl std::ops::Mul for Dual {
+    type Output = Dual;
+    fn mul(self, b: Dual) -> Dual {
+        Dual {
+            value: self.value * b.value,
+            derivative: self.derivative * b.value + self.value * b.derivative,
+        }
+    }
+}
+
+impl std::ops::Div for Dual {
+    type Output = Dual;
+    fn div(self, b: Dual) -> Dual {
+        Dual {
+            value: self.value / b.value,
+            derivative: (self.derivative * b.value - self.value * b.derivative)
+                / (b.value * b.value),
+        }
+    }
+}
+
+impl Scalar for Dual {
+    fn constant(value: f64) -> Self {
+        Dual {
+            value,
+            derivative: 0.0,
+        }
+    }
+    fn sqrt(self) -> Self {
+        let root = self.value.sqrt();
+        Dual {
+            value: root,
+            // A length of zero has no direction to change in: no derivative.
+            derivative: if root > 0.0 {
+                self.derivative / (2.0 * root)
+            } else {
+                0.0
+            },
+        }
+    }
+    fn abs(self) -> Self {
+        if self.value < 0.0 {
+            Dual {
+                value: -self.value,
+                derivative: -self.derivative,
+            }
+        } else {
+            self
+        }
+    }
+    fn atan2(self, x: Self) -> Self {
+        let r2 = x.value * x.value + self.value * self.value;
+        Dual {
+            value: self.value.atan2(x.value),
+            derivative: if r2 > 0.0 {
+                (x.value * self.derivative - self.value * x.derivative) / r2
+            } else {
+                0.0
+            },
+        }
+    }
+    fn wrap_angle(self) -> Self {
+        Dual {
+            value: self.value.wrap_angle(),
+            derivative: self.derivative,
+        }
+    }
+    fn at_least(self, floor: f64) -> Self {
+        if self.value > floor {
+            self
+        } else {
+            Dual::constant(floor)
+        }
+    }
+}
+
+/// Evaluates equations with parameter `i` read as `param(i)`.
+pub(crate) struct Eval<'a, T, P: Fn(usize) -> T> {
+    pub layout: &'a Layout,
+    pub param: P,
+}
+
+type Point<T> = (T, T);
+
+impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
+    fn point(&self, id: EntityId) -> Point<T> {
         let i = self.layout.point[&id];
-        Point2::new(self.params[i], self.params[i + 1])
+        ((self.param)(i), (self.param)(i + 1))
     }
 
-    fn line(&self, id: EntityId) -> (Point2, Point2) {
+    fn line(&self, id: EntityId) -> (Point<T>, Point<T>) {
         match self.layout.kind[&id] {
             Geometry::Line { start, end } => (self.point(start), self.point(end)),
             _ => unreachable!("validated by layout()"),
@@ -940,32 +1163,45 @@ impl Eval<'_> {
     }
 
     /// Centre and radius of a circle or arc.
-    fn round(&self, id: EntityId) -> (Point2, f64) {
+    fn round(&self, id: EntityId) -> (Point<T>, T) {
         match self.layout.kind[&id] {
             Geometry::Circle { center, .. } => {
-                (self.point(center), self.params[self.layout.radius[&id]])
+                (self.point(center), (self.param)(self.layout.radius[&id]))
             }
             Geometry::Arc { center, start, .. } => {
                 let c = self.point(center);
-                (c, dist(c, self.point(start)))
+                (c, distance(c, self.point(start)))
             }
             _ => unreachable!("validated by layout()"),
         }
     }
 
-    fn constraint(&self, c: &Constraint, out: &mut Vec<f64>) {
+    /// The implicit equation of an arc: its two ends at the same distance from its centre.
+    pub fn arc(&self, id: EntityId, out: &mut Vec<T>) {
+        if let Geometry::Arc { center, start, end } = self.layout.kind[&id] {
+            let c = self.point(center);
+            out.push(distance(c, self.point(start)) - distance(c, self.point(end)));
+        }
+    }
+
+    pub fn constraint(&self, c: &Constraint, out: &mut Vec<T>) {
         use Constraint::*;
+        let k = T::constant;
         let direction = |l| {
             let (s, e) = self.line(l);
-            (e.x - s.x, e.y - s.y)
+            (e.0 - s.0, e.1 - s.1)
         };
-        let length = |(x, y): (f64, f64)| (x * x + y * y).sqrt().max(1e-12);
+        let length = |(x, y): Point<T>| (x * x + y * y).sqrt().at_least(1e-12);
+        // Signed distance from `p` to the line through `s` along `d`.
+        let across = |p: Point<T>, s: Point<T>, d: Point<T>| {
+            (d.0 * (p.1 - s.1) - d.1 * (p.0 - s.0)) / length(d)
+        };
         match *c {
             // Fixed points are not unknowns; nothing to solve.
             Fixed(_) => {}
             Coincident(a, b) => {
                 let (a, b) = (self.point(a), self.point(b));
-                out.extend([a.x - b.x, a.y - b.y]);
+                out.extend([a.0 - b.0, a.1 - b.1]);
             }
             Horizontal(l) => out.push(direction(l).1),
             Vertical(l) => out.push(direction(l).0),
@@ -979,62 +1215,65 @@ impl Eval<'_> {
             }
             EqualLength(a, b) => out.push(length(direction(a)) - length(direction(b))),
             EqualRadius(a, b) => out.push(self.round(a).1 - self.round(b).1),
-            Distance(a, b, d) => out.push(dist(self.point(a), self.point(b)) - d),
-            HorizontalDistance(a, b, d) => out.push((self.point(b).x - self.point(a).x).abs() - d),
-            VerticalDistance(a, b, d) => out.push((self.point(b).y - self.point(a).y).abs() - d),
-            Length(l, d) => out.push(length(direction(l)) - d),
-            Radius(r, value) => out.push(self.round(r).1 - value),
+            Distance(a, b, d) => out.push(distance(self.point(a), self.point(b)) - k(d)),
+            HorizontalDistance(a, b, d) => {
+                out.push((self.point(b).0 - self.point(a).0).abs() - k(d));
+            }
+            VerticalDistance(a, b, d) => {
+                out.push((self.point(b).1 - self.point(a).1).abs() - k(d));
+            }
+            Length(l, d) => out.push(length(direction(l)) - k(d)),
+            Radius(r, value) => out.push(self.round(r).1 - k(value)),
             Angle(a, b, angle) => {
                 let (u, v) = (direction(a), direction(b));
-                let between = v.1.atan2(v.0) - u.1.atan2(u.0) - angle;
-                out.push((between + PI).rem_euclid(TAU) - PI);
+                let between = v.1.atan2(v.0) - u.1.atan2(u.0) - k(angle);
+                out.push(between.wrap_angle());
             }
             PointOnLine(p, l) => {
                 let (s, e) = self.line(l);
-                let p = self.point(p);
-                let d = (e.x - s.x, e.y - s.y);
-                out.push((d.0 * (p.y - s.y) - d.1 * (p.x - s.x)) / length(d));
+                out.push(across(self.point(p), s, (e.0 - s.0, e.1 - s.1)));
             }
             PointOnCircle(p, r) => {
                 let (c, radius) = self.round(r);
-                out.push(dist(self.point(p), c) - radius);
+                out.push(distance(self.point(p), c) - radius);
             }
             Midpoint(p, l) => {
                 let (s, e) = self.line(l);
                 let p = self.point(p);
-                out.extend([p.x - (s.x + e.x) / 2.0, p.y - (s.y + e.y) / 2.0]);
+                let half = k(0.5);
+                out.extend([p.0 - (s.0 + e.0) * half, p.1 - (s.1 + e.1) * half]);
             }
             Tangent(l, r) => {
                 let (s, e) = self.line(l);
                 let (c, radius) = self.round(r);
-                let d = (e.x - s.x, e.y - s.y);
-                let distance = (d.0 * (c.y - s.y) - d.1 * (c.x - s.x)).abs() / length(d);
-                out.push(distance - radius);
+                out.push(across(c, s, (e.0 - s.0, e.1 - s.1)).abs() - radius);
             }
             PointLineDistance(p, l, value) => {
                 let (s, e) = self.line(l);
-                let p = self.point(p);
-                let d = (e.x - s.x, e.y - s.y);
-                let distance = (d.0 * (p.y - s.y) - d.1 * (p.x - s.x)).abs() / length(d);
-                out.push(distance - value);
+                out.push(across(self.point(p), s, (e.0 - s.0, e.1 - s.1)).abs() - k(value));
             }
             Symmetric(a, b, l) => {
                 // The middle on the line, and the segment between them across it.
                 let (s, e) = self.line(l);
                 let (a, b) = (self.point(a), self.point(b));
-                let d = (e.x - s.x, e.y - s.y);
-                let m = ((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
-                out.push((d.0 * (m.1 - s.y) - d.1 * (m.0 - s.x)) / length(d));
-                out.push(((b.x - a.x) * d.0 + (b.y - a.y) * d.1) / length(d));
+                let d = (e.0 - s.0, e.1 - s.1);
+                let half = k(0.5);
+                let m = ((a.0 + b.0) * half, (a.1 + b.1) * half);
+                out.push(across(m, s, d));
+                out.push(((b.0 - a.0) * d.0 + (b.1 - a.1) * d.1) / length(d));
             }
             LineDistance(a, b, value) => {
                 let (a0, a1) = self.line(a);
-                let m = Point2::new((a0.x + a1.x) / 2.0, (a0.y + a1.y) / 2.0);
+                let half = k(0.5);
+                let m = ((a0.0 + a1.0) * half, (a0.1 + a1.1) * half);
                 let (s, e) = self.line(b);
-                let d = (e.x - s.x, e.y - s.y);
-                let distance = (d.0 * (m.y - s.y) - d.1 * (m.x - s.x)).abs() / length(d);
-                out.push(distance - value);
+                out.push(across(m, s, (e.0 - s.0, e.1 - s.1)).abs() - k(value));
             }
         }
     }
+}
+
+fn distance<T: Scalar>(a: Point<T>, b: Point<T>) -> T {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    (dx * dx + dy * dy).sqrt()
 }

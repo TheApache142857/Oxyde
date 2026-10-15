@@ -131,6 +131,9 @@ pub(crate) enum KindDto {
         relations: Vec<RelationEntryDto>,
         #[serde(default)]
         next_ids: Option<CountersDto>,
+        /// The entity id of the sketch origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<u32>,
     },
     Extrude {
         sketch: u32,
@@ -494,6 +497,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                     dimension: c.dimension,
                 })
             },
+            origin: sketch.geometry.origin().map(|id| id.0),
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
@@ -889,6 +893,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             entities,
             relations,
             next_ids,
+            origin,
         } => {
             let counters = next_ids.map_or_else(Counters::default, |c| Counters {
                 entity: c.entity,
@@ -907,6 +912,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
                     .collect(),
                 counters,
             )
+            .and_then(|sketch| sketch.with_origin(origin.map(EntityId)))
             .map_err(|e| format!("{}: {e}", dto.name))?;
             FeatureKind::Sketch(Sketch {
                 plane: match plane_from(plane) {

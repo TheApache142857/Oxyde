@@ -39,15 +39,16 @@ pub(crate) fn solve_linear(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<
     Some(x)
 }
 
-/// Reduced row echelon form of a matrix with `columns` columns.
+/// Reduced row echelon form of a matrix with `columns` columns: one row per pivot.
 pub(crate) struct Echelon {
-    pub rank: usize,
-    /// Pivot column of each of the first `rank` rows.
+    /// Pivot column of each row.
     pub pivots: Vec<usize>,
     pub rows: Vec<Vec<f64>>,
 }
 
-/// Row-reduces `rows`, treating entries at or below `tolerance` as zero.
+/// Row-reduces `rows`, treating entries at or below `tolerance` as zero. The reference the
+/// incremental [`Basis`] is tested against.
+#[cfg(test)]
 pub(crate) fn rref(mut rows: Vec<Vec<f64>>, columns: usize, tolerance: f64) -> Echelon {
     let mut pivots = Vec::new();
     let mut rank = 0;
@@ -82,7 +83,81 @@ pub(crate) fn rref(mut rows: Vec<Vec<f64>>, columns: usize, tolerance: f64) -> E
         pivots.push(col);
         rank += 1;
     }
-    Echelon { rank, pivots, rows }
+    rows.truncate(rank);
+    Echelon { pivots, rows }
+}
+
+/// Rows added one at a time and kept reduced, telling whether each new row is independent
+/// of the ones before it: the rank of a row reduction, built incrementally (each row costs
+/// one pass over the rows already in, instead of reducing them all again).
+pub(crate) struct Basis {
+    tolerance: f64,
+    /// Reduced rows with their pivot column: 1 there, and 0 at the pivot of every row
+    /// added before them.
+    rows: Vec<(usize, Vec<f64>)>,
+}
+
+impl Basis {
+    pub fn new(tolerance: f64) -> Self {
+        Self {
+            tolerance,
+            rows: Vec::new(),
+        }
+    }
+
+    /// Adds `row`; true when it is independent of the rows already added (what is left of
+    /// it after reduction counts as zero at or below the tolerance).
+    pub fn add(&mut self, mut row: Vec<f64>) -> bool {
+        for (pivot, reduced) in &self.rows {
+            let factor = row[*pivot];
+            if factor != 0.0 {
+                for (v, r) in row.iter_mut().zip(reduced) {
+                    *v -= factor * r;
+                }
+            }
+        }
+        let Some((pivot, size)) = row
+            .iter()
+            .map(|v| v.abs())
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+        else {
+            return false;
+        };
+        if size <= self.tolerance {
+            return false;
+        }
+        let p = row[pivot];
+        row.iter_mut().for_each(|v| *v /= p);
+        self.rows.push((pivot, row));
+        true
+    }
+
+    /// Independent rows added so far.
+    pub fn rank(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// The rows in reduced row echelon form (each pivot column zero in every other row),
+    /// for [`null_space`].
+    pub fn into_echelon(self) -> Echelon {
+        let (pivots, mut rows): (Vec<usize>, Vec<Vec<f64>>) = self.rows.into_iter().unzip();
+        // Each row is already zero at the pivots of the rows before it: clear the later ones,
+        // last first.
+        for i in (0..rows.len()).rev() {
+            let (before, rest) = rows.split_at_mut(i);
+            let row = &rest[0];
+            for earlier in before.iter_mut() {
+                let factor = earlier[pivots[i]];
+                if factor != 0.0 {
+                    for (v, r) in earlier.iter_mut().zip(row) {
+                        *v -= factor * r;
+                    }
+                }
+            }
+        }
+        Echelon { pivots, rows }
+    }
 }
 
 /// Unit vectors spanning the null space of the matrix reduced to `echelon`.
@@ -118,11 +193,33 @@ mod tests {
     }
 
     #[test]
+    fn an_incremental_basis_finds_the_same_rank() {
+        let rows = vec![
+            vec![1.0, 2.0, 0.0, 1.0],
+            vec![2.0, 4.0, 0.0, 2.0], // twice the first
+            vec![0.0, 1.0, 1.0, 0.0],
+            vec![1.0, 3.0, 1.0, 1.0], // first + third
+            vec![0.0, 0.0, 0.0, 5.0],
+        ];
+        let mut basis = Basis::new(1e-12);
+        let added: Vec<bool> = rows.iter().map(|r| basis.add(r.clone())).collect();
+        assert_eq!(added, [true, false, true, false, true]);
+        assert_eq!(rref(rows.clone(), 4, 1e-12).pivots.len(), 3);
+        // Its null space is that of the matrix: one direction, orthogonal to every row.
+        let null = null_space(&basis.into_echelon(), 4);
+        assert_eq!(null.len(), 1);
+        for row in &rows {
+            let dot: f64 = row.iter().zip(&null[0]).map(|(a, b)| a * b).sum();
+            assert!(dot.abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn rank_and_null_space() {
         // Rank 1: the second row is twice the first.
         let m = vec![vec![1.0, 2.0, 0.0], vec![2.0, 4.0, 0.0]];
         let e = rref(m, 3, 1e-12);
-        assert_eq!(e.rank, 1);
+        assert_eq!(e.pivots.len(), 1);
         let basis = null_space(&e, 3);
         assert_eq!(basis.len(), 2);
         for v in &basis {
