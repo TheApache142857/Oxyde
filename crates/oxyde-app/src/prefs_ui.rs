@@ -29,6 +29,8 @@ pub struct PrefsWindow {
     /// The action waiting for a key combination.
     capturing: Option<Action>,
     filter: String,
+    /// The interface theme in use, to restyle only when it changes.
+    applied_theme: Option<crate::theme::UiTheme>,
 }
 
 /// Timings and counts for the debug overlay.
@@ -65,7 +67,13 @@ impl OxydeApp {
                 0.0
             },
         };
-        let debug = p.debug.ui_debug_on_hover;
+        crate::theme::set_viewport(&self.viewport.settings.style);
+        let theme = p.graphics.ui_theme;
+        if self.prefs_window.applied_theme != Some(theme) {
+            crate::theme::apply(ctx, theme);
+            self.prefs_window.applied_theme = Some(theme);
+        }
+        let debug = self.prefs.debug.ui_debug_on_hover;
         ctx.style_mut(|s| s.debug.debug_on_hover = debug);
     }
 
@@ -147,7 +155,18 @@ impl OxydeApp {
 
     fn graphics_page(&mut self, ui: &mut egui::Ui) {
         let g = &mut self.prefs.graphics;
-        ui.label(RichText::new("Renderer").strong());
+        crate::property_manager::section(ui, "Interface");
+        ui.horizontal(|ui| {
+            for (theme, label) in crate::theme::UiTheme::ALL {
+                if ui.radio(g.ui_theme == theme, label).clicked() && g.ui_theme != theme {
+                    g.ui_theme = theme;
+                    // The viewport follows; its colours can still be changed below.
+                    g.set_style(&theme.viewport());
+                }
+            }
+        });
+        ui.add_space(8.0);
+        crate::property_manager::section(ui, "Renderer");
         ui.horizontal(|ui| {
             ui.radio_value(&mut g.renderer, Renderer::Gpu, "GPU");
             ui.radio_value(&mut g.renderer, Renderer::Software, "Software");
@@ -163,10 +182,13 @@ impl OxydeApp {
         );
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Colours").strong());
+        crate::property_manager::section(ui, "Viewport colours");
         ui.horizontal(|ui| {
-            ui.label("Theme");
-            for (name, style) in Style::PRESETS {
+            ui.label("Preset");
+            let presets = [("Flux", crate::theme::FLUX_VIEWPORT)]
+                .into_iter()
+                .chain(Style::PRESETS);
+            for (name, style) in presets {
                 if ui.button(name).clicked() {
                     g.set_style(&style);
                 }
@@ -184,7 +206,7 @@ impl OxydeApp {
         });
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Display").strong());
+        crate::property_manager::section(ui, "Display");
         ui.checkbox(&mut g.show_edges, "Show edges")
             .on_hover_text("Hidden edges cannot be clicked: pick faces instead");
         ui.add_enabled_ui(g.show_edges, |ui| {
@@ -246,7 +268,7 @@ impl OxydeApp {
             });
         });
         ui.add_space(8.0);
-        ui.label(RichText::new("Mouse").strong());
+        crate::property_manager::section(ui, "Mouse");
         for (what, how) in [
             ("Orbit", "left-drag"),
             ("Pan", "middle-drag, or Shift+left-drag"),
@@ -325,7 +347,7 @@ impl OxydeApp {
                     let conflicts = self.prefs.conflicts(action);
                     let mut text = RichText::new(text).monospace();
                     if !conflicts.is_empty() {
-                        text = text.color(Color32::from_rgb(190, 40, 40));
+                        text = text.color(crate::theme::tokens().err);
                     }
                     let mut button =
                         ui.add(egui::Button::new(text).min_size(egui::vec2(130.0, 0.0)));
@@ -373,7 +395,7 @@ impl OxydeApp {
         );
         ui.checkbox(&mut d.ui_inspector, "Interface: egui inspector window");
         ui.add_space(8.0);
-        ui.label(RichText::new("About this build").strong());
+        crate::property_manager::section(ui, "About this build");
         egui::Grid::new("build").num_columns(2).show(ui, |ui| {
             ui.label("Oxyde");
             ui.label(env!("CARGO_PKG_VERSION"));

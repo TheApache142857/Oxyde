@@ -231,7 +231,7 @@ impl OxydeApp {
                         ui.label(
                             egui::RichText::new("Type a number")
                                 .small()
-                                .color(egui::Color32::from_rgb(200, 40, 40)),
+                                .color(crate::theme::tokens().err),
                         );
                     }
                     answer = ok_cancel(ui, "OK");

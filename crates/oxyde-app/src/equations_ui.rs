@@ -15,7 +15,9 @@ use oxyde_model::{Dimension, DimensionRef, DimensionUnit, GlobalId, ModelError, 
 
 use crate::app::OxydeApp;
 
-const ERROR: Color32 = Color32::from_rgb(200, 40, 40);
+fn error() -> Color32 {
+    crate::theme::tokens().err
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EquationsTab {
@@ -116,7 +118,7 @@ fn result_label(
             ui.label(format!("{}{suffix}", format_value(*value, unit_)));
         }
         Some(Err(message)) => {
-            ui.label(RichText::new("⚠ error").color(ERROR))
+            ui.label(RichText::new("⚠ error").color(error()))
                 .on_hover_text(message.as_str());
         }
         None => {
@@ -324,7 +326,7 @@ fn equations_tab(
                 let label = if equation.target.is_some_and(|t| part.dimension(t).is_some()) {
                     RichText::new(format!("\"{target}\""))
                 } else {
-                    RichText::new(format!("\"{target}\"")).color(ERROR)
+                    RichText::new(format!("\"{target}\"")).color(error())
                 };
                 ui.label(label);
                 let text = part.expression_text(&equation.expr);

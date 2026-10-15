@@ -16,6 +16,15 @@ pub enum Pick {
 pub struct Highlight {
     pub hovered: Option<Pick>,
     pub selected: Vec<Pick>,
+    /// Drawn like `hovered`: everything a hovered tree item stands for (a component, the
+    /// faces a feature made).
+    pub preselected: Vec<Pick>,
+}
+
+impl Highlight {
+    fn is_hovered(&self, pick: Pick) -> bool {
+        self.hovered == Some(pick) || self.preselected.contains(&pick)
+    }
 }
 
 struct SceneFace {
@@ -197,7 +206,7 @@ fn rgb(c: [u8; 3]) -> [f32; 3] {
 }
 
 fn face_color(face: u32, highlight: &Highlight, style: &Style) -> [f32; 3] {
-    if highlight.hovered == Some(Pick::Face(face)) {
+    if highlight.is_hovered(Pick::Face(face)) {
         rgb(style.face_hovered)
     } else if highlight.selected.contains(&Pick::Face(face)) {
         rgb(style.face_selected)
@@ -209,7 +218,7 @@ fn face_color(face: u32, highlight: &Highlight, style: &Style) -> [f32; 3] {
 /// Colour and width in whole pixels (the software renderer draws square pens).
 fn edge_style(edge: u32, highlight: &Highlight, style: &Style) -> ([u8; 3], i64) {
     let px = |w: f32| (w.round() as i64).max(1);
-    if highlight.hovered == Some(Pick::Edge(edge)) {
+    if highlight.is_hovered(Pick::Edge(edge)) {
         (style.edge_hovered, px(style.highlight_width))
     } else if highlight.selected.contains(&Pick::Edge(edge)) {
         (style.edge_selected, px(style.highlight_width))
@@ -556,12 +565,34 @@ mod tests {
             100,
             100,
             &Highlight {
-                hovered: None,
                 selected: vec![Pick::Face(0)],
+                ..Highlight::default()
             },
         );
         let at = (50 * 100 + 50) * 4;
         assert_ne!(plain.rgba[at..at + 3], selected.rgba[at..at + 3]);
+    }
+
+    #[test]
+    fn preselected_faces_look_hovered() {
+        let scene = Scene::from_mesh(&mesh());
+        let draw = |highlight: Highlight| render(&scene, &front_camera(), 100, 100, &highlight);
+        let hovered = draw(Highlight {
+            hovered: Some(Pick::Face(0)),
+            ..Highlight::default()
+        });
+        let preselected = draw(Highlight {
+            preselected: vec![Pick::Face(0), Pick::Face(1)],
+            ..Highlight::default()
+        });
+        let at = (50 * 100 + 50) * 4;
+        assert_eq!(hovered.rgba[at..at + 3], preselected.rgba[at..at + 3]);
+        // The big face behind is lit up too.
+        let corner = (5 * 100 + 5) * 4;
+        assert_ne!(
+            hovered.rgba[corner..corner + 3],
+            preselected.rgba[corner..corner + 3]
+        );
     }
 
     #[test]

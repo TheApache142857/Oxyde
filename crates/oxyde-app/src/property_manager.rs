@@ -29,16 +29,22 @@ pub enum PanelPick {
     Edge(EdgeName),
 }
 
-pub(crate) const BOX_FILL: Color32 = Color32::from_rgb(232, 241, 252);
-pub(crate) const BOX_ACTIVE: Color32 = Color32::from_rgb(70, 130, 220);
+/// Fill and outline of the active selection box.
+pub(crate) fn box_fill() -> Color32 {
+    crate::theme::tokens().accent_bg
+}
+
+pub(crate) fn box_active() -> Color32 {
+    crate::theme::tokens().accent
+}
 
 /// A selection box: what the command acts on, filled by clicking in the viewport or the
 /// timeline. Items are (label, hover text). Returns the index of an item the user removed.
 fn selection_box(ui: &mut egui::Ui, items: &[(String, String)], hint: &str) -> Option<usize> {
     let mut removed = None;
     egui::Frame::none()
-        .fill(BOX_FILL)
-        .stroke(Stroke::new(1.0, BOX_ACTIVE))
+        .fill(box_fill())
+        .stroke(Stroke::new(1.0, box_active()))
         .rounding(3.0)
         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
         .show(ui, |ui| {
@@ -86,7 +92,7 @@ fn reference_box<T>(
         .and_then(|i| choices.get(i))
         .map(|(label, _)| label);
     let stroke = if active {
-        Stroke::new(2.0, BOX_ACTIVE)
+        Stroke::new(2.0, box_active())
     } else {
         Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
@@ -94,7 +100,7 @@ fn reference_box<T>(
     ui.push_id(id, |ui| {
         egui::Frame::none()
             .fill(if active {
-                BOX_FILL
+                box_fill()
             } else {
                 Color32::TRANSPARENT
             })
@@ -162,9 +168,15 @@ fn reference_box_set<T>(
     clicked
 }
 
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title).strong());
+/// A section title, as KiCad Flux's panels: small, upper case, dimmed.
+pub(crate) fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .size(11.0)
+            .extra_letter_spacing(0.6)
+            .color(crate::theme::tokens().dim),
+    );
 }
 
 fn degrees(ui: &mut egui::Ui, value: &mut f64) {

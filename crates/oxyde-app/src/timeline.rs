@@ -20,10 +20,18 @@ use crate::features_ui::PatternKind;
 use crate::icons::{self, Icon};
 use crate::property_manager::PanelPick;
 
-const ERROR: Color32 = Color32::from_rgb(200, 40, 40);
-const WARNING: Color32 = Color32::from_rgb(210, 120, 0);
-const INACTIVE: Color32 = Color32::from_gray(140);
-const ROLLBACK: Color32 = Color32::from_rgb(0, 110, 255);
+fn error() -> Color32 {
+    crate::theme::tokens().err
+}
+fn warning() -> Color32 {
+    crate::theme::tokens().warn
+}
+fn inactive() -> Color32 {
+    crate::theme::tokens().dim
+}
+fn rollback() -> Color32 {
+    crate::theme::tokens().accent
+}
 
 /// Timeline interactions, applied after drawing.
 enum Action {
@@ -178,6 +186,7 @@ impl OxydeApp {
         ui.add_space(2.0);
 
         let mut action = None;
+        let mut hover_feature = None;
         let creator = self.selection_creator();
         let referenced = self.panel_features();
         let enabled = self.sketch.is_none();
@@ -282,6 +291,12 @@ impl OxydeApp {
                             }
                         }
                     }
+                    // The feature under the pointer lights up what it made in the viewport.
+                    hover_feature = ui
+                        .ctx()
+                        .pointer_hover_pos()
+                        .and_then(|p| rows.iter().find(|(r, _)| r.contains(p)))
+                        .map(|(_, i)| entries[*i].id);
                     if bar.is_none() {
                         bar = Some(rollback_bar(ui));
                     }
@@ -294,7 +309,7 @@ impl OxydeApp {
                                 ui.painter().hline(
                                     bar.rect.x_range(),
                                     pos.y,
-                                    Stroke::new(2.0, ROLLBACK.gamma_multiply(0.5)),
+                                    Stroke::new(2.0, rollback().gamma_multiply(0.5)),
                                 );
                             }
                         }
@@ -313,9 +328,23 @@ impl OxydeApp {
                 });
         });
 
+        if let Some(id) = hover_feature {
+            self.viewport.preselect = self.feature_picks(id);
+        }
         if let Some(action) = action {
             self.apply_action(action);
         }
+    }
+
+    /// The faces of the body a feature made or changed, for highlighting.
+    fn feature_picks(&self, id: FeatureId) -> Vec<oxyde_render::Pick> {
+        let Some(body) = self.doc.part.body() else {
+            return Vec::new();
+        };
+        (0..body.topology.faces.len() as u32)
+            .filter(|&i| body.naming.face(i).is_some_and(|n| n.key.feature() == id))
+            .map(oxyde_render::Pick::Face)
+            .collect()
     }
 
     /// Draws one feature row and returns its rectangle.
@@ -342,11 +371,13 @@ impl OxydeApp {
             entry.name.clone()
         };
         let (mut text, badge) = match &entry.status {
-            FeatureStatus::Error(_) => (RichText::new(label).color(ERROR), Some(Icon::Error)),
-            FeatureStatus::Warning(_) => (RichText::new(label).color(WARNING), Some(Icon::Warning)),
+            FeatureStatus::Error(_) => (RichText::new(label).color(error()), Some(Icon::Error)),
+            FeatureStatus::Warning(_) => {
+                (RichText::new(label).color(warning()), Some(Icon::Warning))
+            }
             FeatureStatus::Ok => (RichText::new(label), None),
             FeatureStatus::Suppressed | FeatureStatus::RolledBack | FeatureStatus::Pending => {
-                (RichText::new(label).color(INACTIVE), None)
+                (RichText::new(label).color(inactive()), None)
             }
         };
         if suppressed {
@@ -586,8 +617,8 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 12.0), Sense::drag());
     let y = rect.center().y;
     let painter = ui.painter();
-    painter.hline(rect.x_range(), y, Stroke::new(2.0, ROLLBACK));
-    painter.circle_filled(egui::pos2(rect.left() + 6.0, y), 4.5, ROLLBACK);
+    painter.hline(rect.x_range(), y, Stroke::new(2.0, rollback()));
+    painter.circle_filled(egui::pos2(rect.left() + 6.0, y), 4.5, rollback());
     let cursor = if response.dragged() {
         CursorIcon::Grabbing
     } else {

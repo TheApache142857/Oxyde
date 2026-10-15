@@ -138,7 +138,7 @@ pub struct OxydeApp {
 
 impl OxydeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
+        crate::theme::load_fonts(&cc.egui_ctx);
         let mut app = Self {
             kernel: OcctKernel::new(),
             doc: Document::new(),
@@ -1138,7 +1138,11 @@ impl OxydeApp {
             let color = if selected || hovered {
                 egui::Color32::from_rgb(230, 120, 0)
             } else {
-                egui::Color32::from_rgb(60, 120, 200)
+                if crate::theme::view_dark() {
+                    egui::Color32::from_rgb(110, 170, 235)
+                } else {
+                    egui::Color32::from_rgb(60, 120, 200)
+                }
             };
             painter.add(egui::Shape::convex_polygon(
                 corners,
@@ -1195,7 +1199,11 @@ impl OxydeApp {
                     let color = if selected {
                         egui::Color32::from_rgb(230, 120, 0)
                     } else {
-                        egui::Color32::from_rgb(60, 120, 200)
+                        if crate::theme::view_dark() {
+                            egui::Color32::from_rgb(110, 170, 235)
+                        } else {
+                            egui::Color32::from_rgb(60, 120, 200)
+                        }
                     };
                     let t = (center - axis.origin).dot(axis.direction);
                     let c = axis.origin + axis.direction * t;
@@ -1242,7 +1250,11 @@ impl OxydeApp {
                 let color = if selected {
                     hovered_color
                 } else {
-                    egui::Color32::from_rgb(40, 70, 150)
+                    if crate::theme::view_dark() {
+                        egui::Color32::from_rgb(130, 175, 235)
+                    } else {
+                        egui::Color32::from_rgb(40, 70, 150)
+                    }
                 };
                 let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.3 }, color);
                 if construction {

@@ -152,6 +152,8 @@ pub struct Viewport {
     /// The pick under the pointer when the current grab started.
     grabbed: Option<Option<Pick>>,
     pub settings: ViewSettings,
+    /// Faces and edges to draw as hovered this frame, set before `ui` (tree hover).
+    pub preselect: Vec<Pick>,
     /// Triangles and edge segments of the scene.
     scene_counts: (usize, usize),
 }
@@ -176,6 +178,7 @@ impl Viewport {
             grab_enabled: false,
             grabbed: None,
             settings: ViewSettings::default(),
+            preselect: Vec::new(),
             scene_counts: (0, 0),
         }
     }
@@ -428,6 +431,7 @@ impl Viewport {
             highlight: Highlight {
                 hovered: self.hovered,
                 selected,
+                preselected: std::mem::take(&mut self.preselect),
             },
             scene: self.scene_version,
             style: self.settings.style,
@@ -492,7 +496,11 @@ impl Viewport {
                 egui::Align2::CENTER_CENTER,
                 hint,
                 egui::FontId::proportional(16.0),
-                egui::Color32::from_gray(90),
+                if crate::theme::view_dark() {
+                    egui::Color32::from_gray(185)
+                } else {
+                    egui::Color32::from_gray(90)
+                },
             );
         }
 

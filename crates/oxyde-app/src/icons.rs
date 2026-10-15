@@ -105,10 +105,25 @@ impl Pen<'_> {
         points.iter().map(|&(x, y)| self.p(x, y)).collect()
     }
 
-    /// Greyed out when the command is not available.
+    /// Greyed out when the command is not available. On a dark theme the outlines and
+    /// sketch blue turn light, so the icons stand out from the panel.
     fn c(&self, color: Color32) -> Color32 {
+        let color = if crate::theme::ui_dark() {
+            match color {
+                INK => Color32::from_rgb(196, 210, 224),
+                SKETCH => Color32::from_rgb(79, 195, 247),
+                _ => color,
+            }
+        } else {
+            color
+        };
         if self.enabled {
             color
+        } else if crate::theme::ui_dark() {
+            let [r, g, b, a] = color.to_array();
+            let grey = ((r as u32 * 3 + g as u32 * 6 + b as u32) / 10) as u8;
+            let grey = 70 + grey / 3;
+            Color32::from_rgba_unmultiplied(grey, grey, grey, a)
         } else {
             let [r, g, b, a] = color.to_array();
             let grey = ((r as u32 * 3 + g as u32 * 6 + b as u32) / 10) as u8;

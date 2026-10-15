@@ -20,7 +20,7 @@ use crate::app::{OxydeApp, PendingAction};
 use crate::assembly::{AsmSelected, AssemblyDoc};
 use crate::dialogs::plane_name;
 use crate::icons::{self, Icon};
-use crate::property_manager::{BOX_ACTIVE, BOX_FILL};
+use crate::property_manager::{box_active, box_fill};
 use crate::timeline::{Row, tree_row};
 
 /// The mate types offered, in the order shown.
@@ -198,14 +198,14 @@ fn describe_ref(doc: &AssemblyDoc, r: &MateRef) -> String {
 /// A selection box of the Mate command.
 fn mate_box(ui: &mut egui::Ui, text: Option<String>, active: bool, hint: &str) -> (bool, bool) {
     let stroke = if active {
-        Stroke::new(2.0, BOX_ACTIVE)
+        Stroke::new(2.0, box_active())
     } else {
         Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
     let (mut clicked, mut cleared) = (false, false);
     egui::Frame::none()
         .fill(if active {
-            BOX_FILL
+            box_fill()
         } else {
             Color32::TRANSPARENT
         })
@@ -967,7 +967,7 @@ impl OxydeApp {
                     });
                 });
                 ui.separator();
-                ui.label(RichText::new("Entities to mate").strong());
+                crate::property_manager::section(ui, "Entities to mate");
                 let hint = "Click a face, an edge, or a plane in the tree";
                 let (click_a, clear_a) = mate_box(ui, text_a, !d.second, hint);
                 ui.add_space(2.0);
@@ -985,7 +985,7 @@ impl OxydeApp {
                     d.b = None;
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("Mate type").strong());
+                crate::property_manager::section(ui, "Mate type");
                 ui.horizontal_wrapped(|ui| {
                     for choice in CHOICES {
                         let fits = kinds.is_none_or(|(a, b)| d.kind_for(choice).applies(a, b));
@@ -1037,7 +1037,7 @@ impl OxydeApp {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         icons::small(ui, Icon::Error, 16.0);
-                        ui.label(RichText::new(e).color(Color32::from_rgb(190, 40, 40)));
+                        ui.label(RichText::new(e).color(crate::theme::tokens().err));
                     });
                 }
             });
@@ -1073,6 +1073,9 @@ impl OxydeApp {
         ui.add_space(2.0);
         let mating = self.mate_dialog.is_some();
         let mut action = None;
+        // What the pointer is over in the tree, lit up in the viewport.
+        let mut hovered: Vec<AsmSelected> = Vec::new();
+        let mut hovered_refs: Vec<MateRef> = Vec::new();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1118,6 +1121,9 @@ impl OxydeApp {
                         },
                     );
                     let id = c.id;
+                    if row.response.hovered() {
+                        hovered.push(AsmSelected::Component(id));
+                    }
                     let fixed = c.fixed;
                     let hover = match (error, degrees) {
                         (Some(e), _) => e.to_owned(),
@@ -1223,7 +1229,7 @@ impl OxydeApp {
                     let text = if m.suppressed {
                         text.weak()
                     } else if error.is_some() {
-                        text.color(Color32::from_rgb(190, 40, 40))
+                        text.color(crate::theme::tokens().err)
                     } else {
                         text
                     };
@@ -1241,6 +1247,9 @@ impl OxydeApp {
                         },
                     );
                     let id = m.id;
+                    if row.response.hovered() {
+                        hovered_refs.extend([m.a.clone(), m.b.clone()]);
+                    }
                     let suppressed = m.suppressed;
                     if row.response.double_clicked() {
                         action = Some(TreeAction::EditMate(id));
@@ -1273,6 +1282,11 @@ impl OxydeApp {
                     });
                 }
             });
+        let mut preselect = doc.picks_of(&hovered);
+        for r in &hovered_refs {
+            preselect.extend(doc.picks_of_ref(r));
+        }
+        self.viewport.preselect = preselect;
         let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
         if let Some(action) = action {
             self.tree_action(action, additive);

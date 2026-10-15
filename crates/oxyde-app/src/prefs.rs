@@ -72,6 +72,8 @@ impl MeshQuality {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Graphics {
+    /// The interface's colours (and the viewport's, when changed).
+    pub ui_theme: crate::theme::UiTheme,
     /// Takes effect at the next start.
     pub renderer: Renderer,
     /// 4× multisampling on the GPU; takes effect at the next start.
@@ -95,6 +97,7 @@ pub struct Graphics {
 impl Default for Graphics {
     fn default() -> Self {
         let mut g = Self {
+            ui_theme: crate::theme::UiTheme::default(),
             renderer: Renderer::Gpu,
             antialiasing: true,
             background_top: [0; 3],
@@ -111,7 +114,7 @@ impl Default for Graphics {
             mesh_quality: MeshQuality::Normal,
             show_triad: true,
         };
-        g.set_style(&Style::default());
+        g.set_style(&g.ui_theme.viewport());
         g
     }
 }

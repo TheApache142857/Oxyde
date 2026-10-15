@@ -661,8 +661,8 @@ impl GpuViewport {
         for pick in &highlight.selected {
             flag(*pick, 2);
         }
-        if let Some(pick) = highlight.hovered {
-            flag(pick, 1);
+        for pick in highlight.hovered.iter().chain(&highlight.preselected) {
+            flag(*pick, 1);
         }
         use wgpu::util::DeviceExt;
         let storage = |label, data: Vec<u32>| {

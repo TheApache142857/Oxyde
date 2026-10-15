@@ -34,17 +34,50 @@ const AUTO_SLOPE: f64 = 0.0524;
 const PARALLEL: f64 = 0.01;
 const UNDO_LIMIT: usize = 100;
 
-const SELECTED: Color32 = Color32::from_rgb(255, 128, 0);
-const HOVERED: Color32 = Color32::from_rgb(255, 170, 60);
-const CONFLICT: Color32 = Color32::from_rgb(200, 40, 40);
-const FULLY: Color32 = Color32::from_rgb(20, 20, 20);
-const UNDER: Color32 = Color32::from_rgb(0, 90, 220);
-const CONSTRUCTION: Color32 = Color32::from_rgb(110, 140, 190);
-const PREVIEW: Color32 = Color32::from_rgb(120, 120, 120);
-const DIMENSION: Color32 = Color32::from_rgb(90, 90, 90);
-const SNAPPED: Color32 = Color32::from_rgb(230, 120, 0);
-const TRIMMED: Color32 = Color32::from_rgb(220, 40, 40);
-const MODEL: Color32 = Color32::from_rgb(130, 130, 130);
+/// A colour for drawing over the viewport: `light` on a light background, `dark` on a
+/// dark one.
+fn on_view(light: [u8; 3], dark: [u8; 3]) -> Color32 {
+    let [r, g, b] = if crate::theme::view_dark() {
+        dark
+    } else {
+        light
+    };
+    Color32::from_rgb(r, g, b)
+}
+
+fn ink_selected() -> Color32 {
+    on_view([255, 128, 0], [255, 160, 40])
+}
+fn ink_hovered() -> Color32 {
+    on_view([255, 170, 60], [255, 196, 110])
+}
+fn ink_conflict() -> Color32 {
+    on_view([200, 40, 40], [239, 83, 80])
+}
+fn ink_fully() -> Color32 {
+    on_view([20, 20, 20], [236, 241, 246])
+}
+fn ink_under() -> Color32 {
+    on_view([0, 90, 220], [79, 195, 247])
+}
+fn ink_construction() -> Color32 {
+    on_view([110, 140, 190], [132, 164, 206])
+}
+fn ink_preview() -> Color32 {
+    on_view([120, 120, 120], [170, 180, 190])
+}
+fn ink_dimension() -> Color32 {
+    on_view([90, 90, 90], [200, 210, 220])
+}
+fn ink_snapped() -> Color32 {
+    on_view([230, 120, 0], [255, 170, 60])
+}
+fn ink_trimmed() -> Color32 {
+    on_view([220, 40, 40], [239, 83, 80])
+}
+fn ink_model() -> Color32 {
+    on_view([130, 130, 130], [150, 162, 175])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -1097,17 +1130,17 @@ impl SketchSession {
 
     fn color(&self, id: EntityId, construction: bool, conflicting: &[EntityId]) -> Color32 {
         if self.selection.contains(&id) {
-            SELECTED
+            ink_selected()
         } else if self.hover == Some(id) {
-            HOVERED
+            ink_hovered()
         } else if conflicting.contains(&id) {
-            CONFLICT
+            ink_conflict()
         } else if construction {
-            CONSTRUCTION
+            ink_construction()
         } else {
             match self.report.as_ref().and_then(|r| r.definition(id)) {
-                Some(Definition::Fully) => FULLY,
-                _ => UNDER,
+                Some(Definition::Fully) => ink_fully(),
+                _ => ink_under(),
             }
         }
     }
@@ -1130,14 +1163,14 @@ impl SketchSession {
         for (p, kind) in &self.model.points {
             if *kind == ModelPointKind::Center {
                 let c = to_screen(*p);
-                let stroke = Stroke::new(1.0, MODEL);
+                let stroke = Stroke::new(1.0, ink_model());
                 painter.line_segment([c - Vec2::new(5.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
                 painter.line_segment([c - Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 5.0)], stroke);
             }
         }
         if let Some(curve) = self.model_hover.and_then(|i| self.model.curves.get(i)) {
             let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
-            painter.add(Shape::line(path, Stroke::new(3.0, HOVERED)));
+            painter.add(Shape::line(path, Stroke::new(3.0, ink_hovered())));
         }
 
         // Sketch origin: a point that can be picked, with its axes.
@@ -1159,9 +1192,9 @@ impl SketchSession {
         }
         if let Some(id) = origin_id {
             let color = if self.selection.contains(&id) {
-                SELECTED
+                ink_selected()
             } else if self.hover == Some(id) {
-                HOVERED
+                ink_hovered()
             } else {
                 Color32::from_rgb(200, 60, 60)
             };
@@ -1229,7 +1262,7 @@ impl SketchSession {
                     Align2::LEFT_BOTTOM,
                     glyph,
                     FontId::proportional(10.0),
-                    PREVIEW,
+                    ink_preview(),
                 );
             }
         }
@@ -1242,12 +1275,12 @@ impl SketchSession {
             let Some(graphics) = self.dimension_graphics(&relation.constraint, to_screen) else {
                 continue;
             };
-            let stroke = Stroke::new(1.0, DIMENSION);
+            let stroke = Stroke::new(1.0, ink_dimension());
             for segment in &graphics.lines {
                 painter.line_segment(*segment, stroke);
             }
             for (tip, direction) in &graphics.arrows {
-                arrow_head(painter, *tip, *direction, DIMENSION);
+                arrow_head(painter, *tip, *direction, ink_dimension());
             }
             let text = if self.driven.contains(&relation.id) {
                 format!("Σ {}", graphics.text)
@@ -1255,7 +1288,11 @@ impl SketchSession {
                 graphics.text
             };
             let selected = self.selected_dimensions.contains(&relation.id);
-            let ink = if selected { SELECTED } else { FULLY };
+            let ink = if selected {
+                ink_selected()
+            } else {
+                ink_fully()
+            };
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), ink);
             let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
             painter.rect_filled(
@@ -1264,7 +1301,7 @@ impl SketchSession {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 220),
             );
             let border = if selected {
-                Stroke::new(2.0, SELECTED)
+                Stroke::new(2.0, ink_selected())
             } else {
                 Stroke::new(1.0, Color32::from_gray(160))
             };
@@ -1284,7 +1321,7 @@ impl SketchSession {
                     Align2::CENTER_BOTTOM,
                     name,
                     FontId::proportional(11.0),
-                    UNDER,
+                    ink_under(),
                 );
             }
         }
@@ -1294,7 +1331,7 @@ impl SketchSession {
             let path: Vec<Pos2> = piece.into_iter().map(to_screen).collect();
             painter.extend(Shape::dashed_line(
                 &path,
-                Stroke::new(2.5, TRIMMED),
+                Stroke::new(2.5, ink_trimmed()),
                 5.0,
                 3.0,
             ));
@@ -1302,7 +1339,7 @@ impl SketchSession {
 
         // The shape in progress.
         let cursor = snapped.map(|(p, _)| p).or(cursor);
-        let dashed = Stroke::new(1.2, PREVIEW);
+        let dashed = Stroke::new(1.2, ink_preview());
         if let (Some(first), Some(cursor)) = (self.pending.first(), cursor) {
             match self.tool {
                 Tool::Line | Tool::Centerline => {
@@ -1327,7 +1364,7 @@ impl SketchSession {
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                     painter.extend(Shape::dashed_line(
                         &[path[0], path[2]],
-                        Stroke::new(1.0, CONSTRUCTION),
+                        Stroke::new(1.0, ink_construction()),
                         4.0,
                         3.0,
                     ));
@@ -1680,7 +1717,7 @@ fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color3
 
 /// Marks what the cursor snapped to, as SolidWorks' inference glyphs do.
 fn draw_snap(painter: &egui::Painter, at: Pos2, snap: Snap) {
-    let stroke = Stroke::new(1.8, SNAPPED);
+    let stroke = Stroke::new(1.8, ink_snapped());
     match snap {
         Snap::Point(_) => {
             painter.rect_stroke(Rect::from_center_size(at, Vec2::splat(11.0)), 0.0, stroke);
