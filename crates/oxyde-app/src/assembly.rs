@@ -202,18 +202,17 @@ impl AssemblyDoc {
     // ---- Loading -------------------------------------------------------------------------
 
     /// Opens the component files not loaded yet, sub-assemblies with what they hold. A file
-    /// that moved is looked for, by document id, in its assembly's folder. Returns messages
-    /// about files found elsewhere or that could not be opened.
+    /// that moved is looked for, by document id, in its assembly's folder. The part files
+    /// are rebuilt and meshed on every core at once when the kernel allows it. Returns
+    /// messages about files found elsewhere or that could not be opened.
     pub fn load_parts<K: Kernel>(&mut self, kernel: &mut K) -> Vec<String> {
-        let mut notes = Vec::new();
         let folder = self.folder();
-        // The assembly itself is on the stack: a component may not contain it.
-        let mut stack: Vec<PathBuf> = self.path.iter().cloned().collect();
+        let mut walk = Walk::new(&mut self.docs, self.path.as_deref());
         for i in 0..self.assembly.components.len() {
             let component = &self.assembly.components[i];
             let (path, moved) = locate(component, folder.as_deref());
             if let Some(found) = moved {
-                notes.push(format!(
+                walk.notes.push(format!(
                     "{}: {} was not found, using {}",
                     component.name,
                     component.path,
@@ -223,17 +222,10 @@ impl AssemblyDoc {
                 self.modified = true;
             }
             let component = &self.assembly.components[i];
-            load_into(
-                &mut self.docs,
-                &path,
-                &mut stack,
-                kernel,
-                &mut notes,
-                &component.name,
-                self.mesh_fraction,
-            );
+            walk.visit(&path, &component.name);
             self.sources.insert(component.id, path);
         }
+        let notes = walk.finish(kernel, self.mesh_fraction);
         self.revision = crate::document::next_revision();
         notes
     }
@@ -684,22 +676,13 @@ impl AssemblyDoc {
         if self.path.as_deref() == Some(path) {
             return Err("an assembly cannot contain itself".to_owned());
         }
-        let mut stack: Vec<PathBuf> = self.path.iter().cloned().collect();
-        let mut notes = Vec::new();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let fraction = self.mesh_fraction;
-        load_into(
-            &mut self.docs,
-            path,
-            &mut stack,
-            kernel,
-            &mut notes,
-            &name,
-            fraction,
-        );
+        let mut walk = Walk::new(&mut self.docs, self.path.as_deref());
+        walk.visit(path, &name);
+        walk.finish(kernel, self.mesh_fraction);
         match self.docs.get(path) {
             Some(Ok(_)) => Ok(()),
             Some(Err(e)) => {
@@ -797,58 +780,97 @@ fn locate(component: &Component, folder: Option<&Path>) -> (PathBuf, Option<Path
     }
 }
 
-/// Loads `path` (and, for an assembly, what it holds) into `docs` unless it is there.
-/// `stack` holds the assemblies being loaded, to catch one that contains itself.
-fn load_into<K: Kernel>(
-    docs: &mut HashMap<PathBuf, Result<Loaded, String>>,
-    path: &Path,
-    stack: &mut Vec<PathBuf>,
-    kernel: &mut K,
-    notes: &mut Vec<String>,
-    name: &str,
-    fraction: f64,
-) {
-    if stack.iter().any(|p| p == path) {
-        // Not stored: the assembly holding it is refused instead (see below).
-        notes.push(format!(
-            "{name}: {} contains the assembly itself",
-            path.display()
-        ));
-        return;
+/// The walk over an assembly's files. Assembly files are read as they are met, so that
+/// the whole tree is known; the part files met are only listed, to be loaded together
+/// afterwards ([`load_many`]).
+struct Walk<'a> {
+    docs: &'a mut HashMap<PathBuf, Result<Loaded, String>>,
+    /// The assemblies being read, to catch one that contains itself.
+    stack: Vec<PathBuf>,
+    /// The part files to load, each once, with the name of the component that first used it.
+    parts: Vec<(PathBuf, String)>,
+    listed: HashSet<PathBuf>,
+    notes: Vec<String>,
+}
+
+impl<'a> Walk<'a> {
+    /// A walk from `assembly`, the file being edited: no component may contain it.
+    fn new(
+        docs: &'a mut HashMap<PathBuf, Result<Loaded, String>>,
+        assembly: Option<&Path>,
+    ) -> Self {
+        Walk {
+            docs,
+            stack: assembly.map(Path::to_path_buf).into_iter().collect(),
+            parts: Vec::new(),
+            listed: HashSet::new(),
+            notes: Vec::new(),
+        }
     }
-    if docs.contains_key(path) {
-        return;
+
+    /// Loads the part files met, on every core the kernel allows, and stores them. Returns
+    /// the notes of the walk: files found elsewhere or that could not be opened.
+    fn finish<K: Kernel>(self, kernel: &mut K, fraction: f64) -> Vec<String> {
+        let Walk {
+            docs,
+            parts,
+            mut notes,
+            ..
+        } = self;
+        let loaded = load_many(&parts, kernel, fraction);
+        for ((path, name), result) in parts.into_iter().zip(loaded) {
+            if let Err(e) = &result {
+                notes.push(format!("{name}: {e}"));
+            }
+            docs.insert(path, result.map(Loaded::Part));
+        }
+        notes
     }
-    let loaded = if crate::assembly_ui::is_assembly(path) {
-        match oxyde_format::load_assembly(path) {
+
+    /// Whether `path` was met: read, or listed to be loaded.
+    fn known(&self, path: &Path) -> bool {
+        self.docs.contains_key(path) || self.listed.contains(path)
+    }
+
+    /// Meets `path` (and, for an assembly, what it holds) unless it was met already.
+    fn visit(&mut self, path: &Path, name: &str) {
+        if self.stack.iter().any(|p| p == path) {
+            // Not stored: the assembly holding it is refused instead (see below).
+            self.notes.push(format!(
+                "{name}: {} contains the assembly itself",
+                path.display()
+            ));
+            return;
+        }
+        if self.known(path) {
+            return;
+        }
+        if !crate::assembly_ui::is_assembly(path) {
+            self.parts.push((path.to_path_buf(), name.to_owned()));
+            self.listed.insert(path.to_path_buf());
+            return;
+        }
+        let loaded = match oxyde_format::load_assembly(path) {
             Ok(file) => {
                 let folder = path.parent().map(Path::to_path_buf);
                 let mut sources = HashMap::new();
-                stack.push(path.to_path_buf());
+                self.stack.push(path.to_path_buf());
                 for c in &file.assembly.components {
                     let (inner, moved) = locate(c, folder.as_deref());
                     if let Some(found) = moved {
-                        notes.push(format!(
+                        self.notes.push(format!(
                             "{name} › {}: {} was not found, using {}",
                             c.name,
                             c.path,
                             found.display()
                         ));
                     }
-                    load_into(
-                        docs,
-                        &inner,
-                        stack,
-                        kernel,
-                        notes,
-                        &format!("{name} › {}", c.name),
-                        fraction,
-                    );
+                    self.visit(&inner, &format!("{name} › {}", c.name));
                     sources.insert(c.id, inner);
                 }
-                stack.pop();
+                self.stack.pop();
                 // A component that could not be stored is the assembly coming round again.
-                let loops = sources.values().any(|p| !docs.contains_key(p));
+                let loops = sources.values().any(|p| !self.known(p));
                 if loops {
                     Err(format!(
                         "{} contains the assembly being edited",
@@ -864,14 +886,65 @@ fn load_into<K: Kernel>(
                 }
             }
             Err(e) => Err(format!("{}: {e}", path.display())),
+        };
+        if let Err(e) = &loaded {
+            self.notes.push(format!("{name}: {e}"));
         }
-    } else {
-        load(path, kernel, fraction).map(Loaded::Part)
-    };
-    if let Err(e) = &loaded {
-        notes.push(format!("{name}: {e}"));
+        self.docs.insert(path.to_path_buf(), loaded);
     }
-    docs.insert(path.to_path_buf(), loaded);
+}
+
+/// Opens, rebuilds and meshes every part file of `parts`, in their order. The files are
+/// shared out between the caller's thread and one worker thread per further core, each
+/// worker with a kernel of its own ([`Kernel::open_worker`]) whose shapes the caller's
+/// kernel can use afterwards. A kernel that cannot open workers loads them one by one.
+fn load_many<K: Kernel>(
+    parts: &[(PathBuf, String)],
+    kernel: &mut K,
+    fraction: f64,
+) -> Vec<Result<LoadedPart, String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(parts.len());
+    let next = AtomicUsize::new(0);
+    // Takes files from the queue until it is empty.
+    let work = |kernel: &mut K| {
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some((path, _)) = parts.get(i) else {
+                break;
+            };
+            done.push((i, load(path, kernel, fraction)));
+        }
+        done
+    };
+    let mut results: Vec<Option<Result<LoadedPart, String>>> = parts.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (1..threads)
+            .map(|_| {
+                scope.spawn(|| match K::open_worker() {
+                    Some(mut kernel) => work(&mut kernel),
+                    None => Vec::new(),
+                })
+            })
+            .collect();
+        for (i, result) in work(kernel) {
+            results[i] = Some(result);
+        }
+        for worker in workers {
+            // A worker that panicked leaves its files unloaded; they are reported below.
+            for (i, result) in worker.join().unwrap_or_default() {
+                results[i] = Some(result);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err("the part could not be loaded".to_owned())))
+        .collect()
 }
 
 /// Opens and rebuilds a part file, and meshes it.

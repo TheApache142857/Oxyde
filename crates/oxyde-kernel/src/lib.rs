@@ -386,4 +386,16 @@ pub trait Kernel {
 
     /// Frees a shape. Releasing an unknown or already released handle does nothing.
     fn release(&mut self, shape: ShapeHandle);
+
+    /// Opens a kernel on the calling thread that shares this kernel's shapes: a handle made
+    /// by either is valid in the other, so a part can be rebuilt on a worker thread and its
+    /// shapes drawn, or released, from the main one. `None` when the kernel's shapes are
+    /// bound to the thread that made them. Two kernels must never work on the same shape
+    /// at the same time: a part stays with one thread until it is handed over.
+    fn open_worker() -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }

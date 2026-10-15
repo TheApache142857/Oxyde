@@ -82,6 +82,10 @@ fn main() {
         .file("cpp/shim.cpp")
         .include(&occt.include_dir)
         .std("c++17")
+        // MSVC runs no destructors while a C++ exception unwinds unless told the exception
+        // model: without this, an OCCT failure thrown through the shim leaks every local
+        // on the way out, locks included (the STEP lock and the shape arena's).
+        .flag_if_supported("/EHsc")
         // Keep <windows.h>, if an OCCT header pulls it in, from defining min/max macros.
         .define("NOMINMAX", None)
         .define("WIN32_LEAN_AND_MEAN", None)

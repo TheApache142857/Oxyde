@@ -105,6 +105,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -959,20 +960,76 @@ const TopoDS_Edge& edge_at(const TopTools_IndexedMapOfShape& edges, std::uint32_
     return TopoDS::Edge(edges(static_cast<int>(index) + 1));
 }
 
+// ---- The shape arena -----------------------------------------------------------------------
+
+// Every shape of the process, keyed by handle. One arena for every Session, so a handle
+// made by a kernel on one thread is valid in a kernel on another: workers rebuild parts
+// with sessions of their own and hand the handles back. The lock covers only the map: a
+// TopoDS_Shape is a reference-counted handle, copied out before any OCCT work, and OCCT's
+// algorithms are safe on different shapes from different threads. Two threads must not
+// work on the same shape at once (meshing stores triangulations on its faces); the Rust
+// side keeps each part on one thread until it is handed back.
+class Arena {
+public:
+    std::uint64_t insert(const TopoDS_Shape& shape) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        const std::uint64_t id = next_id_++;
+        shapes_.emplace(id, shape);
+        return id;
+    }
+
+    // Nothing is thrown while the lock is held.
+    TopoDS_Shape get(std::uint64_t shape) const {
+        TopoDS_Shape found;
+        bool known = false;
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = shapes_.find(shape);
+            if (it != shapes_.end()) {
+                found = it->second;
+                known = true;
+            }
+        }
+        if (!known) {
+            throw std::out_of_range("unknown shape handle " + std::to_string(shape));
+        }
+        return found;
+    }
+
+    void release(std::uint64_t shape) {
+        // The handle leaves the map under the lock; the shape itself is freed outside it,
+        // once `removed` goes, in case it is the last reference and freeing takes time.
+        TopoDS_Shape removed;
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = shapes_.find(shape);
+            if (it == shapes_.end()) {
+                return;
+            }
+            removed = std::move(it->second);
+            shapes_.erase(it);
+        }
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<std::uint64_t, TopoDS_Shape> shapes_;
+    std::uint64_t next_id_ = 1; // 0 is never issued
+};
+
+Arena& arena() {
+    static Arena instance;
+    return instance;
+}
+
 } // namespace
 
 std::uint64_t Session::insert(const TopoDS_Shape& shape) {
-    const std::uint64_t id = next_id_++;
-    shapes_.emplace(id, shape);
-    return id;
+    return arena().insert(shape);
 }
 
-const TopoDS_Shape& Session::get(std::uint64_t shape) const {
-    const auto it = shapes_.find(shape);
-    if (it == shapes_.end()) {
-        throw std::out_of_range("unknown shape handle " + std::to_string(shape));
-    }
-    return it->second;
+TopoDS_Shape Session::get(std::uint64_t shape) {
+    return arena().get(shape);
 }
 
 std::uint64_t Session::make_box(double x, double y, double z, double dx, double dy, double dz) {
@@ -1084,7 +1141,7 @@ OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t
         if (!(std::abs(offset) > 1e-9)) {
             throw std::invalid_argument("the wall thickness is zero");
         }
-        const TopoDS_Shape& input = get(shape);
+        const TopoDS_Shape input = get(shape);
         TopTools_IndexedMapOfShape input_faces;
         TopExp::MapShapes(input, TopAbs_FACE, input_faces);
         TopTools_ListOfShape removed;
@@ -1156,7 +1213,7 @@ OpResultData Session::transform(std::uint64_t shape, rust::Slice<const double> r
         if (rows.size() != 12) {
             throw std::invalid_argument("a transform needs 12 values");
         }
-        const TopoDS_Shape& input = get(shape);
+        const TopoDS_Shape input = get(shape);
         gp_Trsf trsf;
         trsf.SetValues(rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7],
                        rows[8], rows[9], rows[10], rows[11]);
@@ -1187,7 +1244,7 @@ OpResultData Session::boolean_op(std::uint8_t kind, std::uint64_t target,
         if (tools.empty()) {
             throw std::invalid_argument("a boolean needs a tool");
         }
-        const TopoDS_Shape& a = get(target);
+        const TopoDS_Shape a = get(target);
         std::vector<TopoDS_Shape> tool_shapes;
         TopTools_ListOfShape arguments;
         TopTools_ListOfShape tool_list;
@@ -1243,7 +1300,7 @@ OpResultData Session::fillet(std::uint64_t shape, rust::Slice<const std::uint32_
         if (edges.empty()) {
             throw std::invalid_argument("no edges to fillet");
         }
-        const TopoDS_Shape& input = get(shape);
+        const TopoDS_Shape input = get(shape);
         TopTools_IndexedMapOfShape input_edges;
         TopExp::MapShapes(input, TopAbs_EDGE, input_edges);
 
@@ -1279,7 +1336,7 @@ OpResultData Session::chamfer(std::uint64_t shape, rust::Slice<const std::uint32
         if (edges.empty()) {
             throw std::invalid_argument("no edges to chamfer");
         }
-        const TopoDS_Shape& input = get(shape);
+        const TopoDS_Shape input = get(shape);
         TopTools_IndexedMapOfShape input_edges;
         TopExp::MapShapes(input, TopAbs_EDGE, input_edges);
 
@@ -1310,12 +1367,12 @@ OpResultData Session::chamfer(std::uint64_t shape, rust::Slice<const std::uint32
 }
 
 void Session::release(std::uint64_t shape) {
-    shapes_.erase(shape);
+    arena().release(shape);
 }
 
 TopologyData Session::topology(std::uint64_t shape) const {
     return guarded("topology", [&] {
-        const TopoDS_Shape& s = get(shape);
+        const TopoDS_Shape s = get(shape);
         TopTools_IndexedMapOfShape faces;
         TopTools_IndexedMapOfShape edges;
         TopTools_IndexedMapOfShape vertices;
@@ -1523,7 +1580,7 @@ MeshData Session::tessellate(std::uint64_t shape, double deflection) const {
         if (!(deflection > 0.0)) {
             throw std::invalid_argument("deflection must be positive");
         }
-        const TopoDS_Shape& s = get(shape);
+        const TopoDS_Shape s = get(shape);
         // Stores a triangulation on every face of the shape (reused by later calls).
         BRepMesh_IncrementalMesh mesher(s, deflection, Standard_False, 0.35, Standard_False);
         return mesh_of(s, deflection);
@@ -1535,7 +1592,7 @@ MeshData Session::tessellate_with(std::uint64_t shape, double deflection, double
         if (!(deflection > 0.0) || !(angle > 0.0)) {
             throw std::invalid_argument("deflection and angle must be positive");
         }
-        const TopoDS_Shape& s = get(shape);
+        const TopoDS_Shape s = get(shape);
         // A triangulation made for display (or an earlier export) would be kept if it
         // were fine enough: start afresh so the mesh is exactly what was asked for.
         BRepTools::Clean(s);
@@ -1568,7 +1625,7 @@ BoundsData Session::bounds(std::uint64_t shape) const {
 
 TopologyCounts Session::topology_counts(std::uint64_t shape) const {
     return guarded("topology_counts", [&] {
-        const TopoDS_Shape& s = get(shape);
+        const TopoDS_Shape s = get(shape);
         TopologyCounts counts{};
         counts.solids = count_subshapes(s, TopAbs_SOLID);
         counts.shells = count_subshapes(s, TopAbs_SHELL);

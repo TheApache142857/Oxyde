@@ -42,8 +42,11 @@ impl From<cxx::Exception> for OcctError {
 
 /// A [`Kernel`] backed by OpenCASCADE.
 ///
-/// Not `Send`: OCCT calls stay on the thread that created the kernel. A dedicated kernel
-/// thread will be introduced with the application (see `docs/ARCHITECTURE.md` §3).
+/// Not `Send`: a kernel stays on the thread that created it. Its shapes do not: they live
+/// in one arena shared by every kernel of the process, so another thread opens a kernel of
+/// its own ([`Kernel::open_worker`]) and the handles it makes are valid everywhere. OCCT's
+/// modelling algorithms are safe on different shapes from different threads; its STEP
+/// translators are not, and the shim runs them one at a time (`docs/ARCHITECTURE.md` §3).
 pub struct OcctKernel {
     session: cxx::UniquePtr<ffi::Session>,
 }
@@ -257,6 +260,10 @@ impl Kernel for OcctKernel {
 
     fn release(&mut self, shape: ShapeHandle) {
         self.session.pin_mut().release(shape.raw());
+    }
+
+    fn open_worker() -> Option<Self> {
+        Some(Self::new())
     }
 }
 

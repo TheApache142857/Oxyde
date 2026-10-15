@@ -237,7 +237,8 @@ pub(crate) mod bridge {
     unsafe extern "C++" {
         include!("oxyde-occt/cpp/shim.h");
 
-        /// Owns every shape created through it, keyed by handle.
+        /// A kernel for one thread. Shapes live in an arena shared by every session of the
+        /// process, so a handle is valid in any of them.
         type Session;
 
         fn new_session() -> UniquePtr<Session>;

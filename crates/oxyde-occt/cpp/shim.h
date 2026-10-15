@@ -14,7 +14,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <unordered_map>
 
 namespace oxyde::occt {
 
@@ -62,11 +61,11 @@ public:
     StepAssemblyData read_step_assembly(rust::Slice<const std::uint8_t> data);
 
 private:
-    std::uint64_t insert(const TopoDS_Shape& shape);
-    const TopoDS_Shape& get(std::uint64_t shape) const;
-
-    std::unordered_map<std::uint64_t, TopoDS_Shape> shapes_;
-    std::uint64_t next_id_ = 1; // 0 is never issued
+    // Shapes live in one arena shared by every Session of the process (shim.cpp), so a
+    // handle is valid in any session, on any thread. `get` returns a copy of the
+    // reference-counted handle: nothing points into the arena.
+    static std::uint64_t insert(const TopoDS_Shape& shape);
+    static TopoDS_Shape get(std::uint64_t shape);
 };
 
 std::unique_ptr<Session> new_session();
