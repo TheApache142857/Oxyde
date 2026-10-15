@@ -446,9 +446,89 @@ fn mirror_copies_a_boss_through_a_plane() {
         .naming
         .find_face(&mirrored_top)
         .expect("mirrored top face");
-    let centroid = body.topology.faces[index as usize].centroid;
-    assert_close(centroid.x, -7.5);
-    assert_close(centroid.z, 15.0);
+    let face = &body.topology.faces[index as usize];
+    assert_close(face.centroid.x, -7.5);
+    assert_close(face.centroid.z, 15.0);
+    // Mirrored faces face outward like any other: a boss sketched on the mirrored top
+    // grows upwards, out of the part.
+    assert_eq!(face.normal, Some(oxyde_geom::Vec3::Z));
+    let mut on_top = Sketch::new(SketchPlane::Face(mirrored_top));
+    on_top.circle(Point2::new(-7.5, 7.5), 1.0);
+    let s3 = part.add_feature(FeatureKind::Sketch(on_top));
+    part.add_feature(boss(s3, 2.0));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 8000.0 + 2.0 * 125.0 + PI * 2.0);
+    part.release(&mut kernel);
+}
+
+#[test]
+fn revolved_flat_faces_face_outward_and_caps_keep_their_names() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    // A washer: r = 5 to 10, y = 0 to 2, a quarter turn about the sketch's centerline.
+    let (profile, axis) = revolve_profile(5.0, 10.0, 0.0, 2.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    let washer = part.add_feature(revolve(
+        s1,
+        ExtrudeOp::Boss,
+        RevolveAxis::SketchLine(axis),
+        PI / 2.0,
+    ));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let body = part.body().unwrap();
+    let center = oxyde_geom::Point3::new(5.0, 1.0, -5.0);
+    let mut caps = 0;
+    for (i, face) in body.topology.faces.iter().enumerate() {
+        let Some(normal) = face.normal else { continue };
+        let name = body.naming.face(i as u32).unwrap();
+        assert!(
+            (face.centroid - center).dot(normal) > 0.0,
+            "{name} faces inward"
+        );
+        if [FaceName::start_cap(washer), FaceName::end_cap(washer)].contains(name) {
+            caps += 1;
+        } else {
+            // The flat ring faces come from the bottom and top lines of the rectangle.
+            assert!(matches!(name.key, FaceKey::Profile { .. }), "{name}");
+            assert_eq!(name.part, 0, "{name}");
+        }
+    }
+    assert_eq!(caps, 2);
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_pattern_or_mirror_of_the_first_boss_joins_its_body() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 10.0, 10.0, 5.0);
+    // Instances overlap the seed: one body of 3 overlapping blocks, 20 × 10 × 5.
+    part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![base],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 5.0,
+            count: 3,
+            reverse: false,
+        },
+        second: None,
+    }));
+    // Mirrored through the Right plane: touching it, merged with it.
+    part.add_feature(FeatureKind::Mirror(Mirror {
+        seeds: vec![base],
+        plane: PlaneRef::Standard(StandardPlane::Right),
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let body = part.body().unwrap();
+    assert_eq!(body.solids.len(), 1);
+    assert_eq!(
+        kernel.topology_counts(body.solids[0].shape).unwrap().solids,
+        1
+    );
+    assert_close(volume(&part, &kernel), 1000.0 + 500.0);
     part.release(&mut kernel);
 }
 

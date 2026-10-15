@@ -112,3 +112,45 @@ fn box_tessellation_matches_topology() {
     // Straight edges need only their two end points.
     assert!(mesh.edges.iter().all(|e| e.len() == 2));
 }
+
+/// Planar faces whose normal does not point away from the centre of `shape`.
+fn inward_faces(kernel: &OcctKernel, shape: ShapeHandle, center: Point3) -> Vec<usize> {
+    let topology = kernel.topology(shape).unwrap();
+    (0..topology.faces.len())
+        .filter(|&i| {
+            let face = &topology.faces[i];
+            let normal = face.normal.expect("a box has flat faces");
+            (face.centroid - center).dot(normal) <= 0.0
+        })
+        .collect()
+}
+
+#[test]
+fn mirrored_and_rotated_faces_still_face_outward() {
+    use oxyde_geom::{Axis, Plane, Transform};
+    let mut kernel = OcctKernel::new();
+    let shape = kernel
+        .make_box(Point3::new(10.0, 0.0, 0.0), Vec3::new(10.0, 20.0, 30.0))
+        .unwrap();
+    assert_eq!(
+        inward_faces(&kernel, shape, Point3::new(15.0, 10.0, 15.0)),
+        []
+    );
+
+    // A mirror turns the planes' frames left-handed: normals must still point out.
+    let mirrored = kernel
+        .transform(shape, &Transform::mirror(&Plane::RIGHT))
+        .unwrap();
+    assert!((kernel.volume(mirrored.shape).unwrap() - 6000.0).abs() < 1e-6);
+    assert_eq!(
+        inward_faces(&kernel, mirrored.shape, Point3::new(-15.0, 10.0, 15.0)),
+        []
+    );
+
+    let quarter = Transform::rotation(&Axis::Z, std::f64::consts::FRAC_PI_2);
+    let rotated = kernel.transform(shape, &quarter).unwrap();
+    assert_eq!(
+        inward_faces(&kernel, rotated.shape, Point3::new(-10.0, 15.0, 15.0)),
+        []
+    );
+}

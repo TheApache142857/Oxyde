@@ -96,6 +96,21 @@ impl Dialog {
                 | Dialog::ChoosePlane
         )
     }
+
+    /// The existing feature this command edits, if any.
+    pub fn editing(&self) -> Option<FeatureId> {
+        match self {
+            Dialog::Extrude(d) => d.editing,
+            Dialog::Revolve(d) => d.editing,
+            Dialog::Blend(d) => d.editing,
+            Dialog::Shell(d) => d.editing,
+            Dialog::Pattern(d) => d.editing,
+            Dialog::Combine(d) => d.editing,
+            Dialog::RefPlane(d) => d.editing,
+            Dialog::RefAxis(d) => d.editing,
+            _ => None,
+        }
+    }
 }
 
 /// User's answer to a dialog this frame.

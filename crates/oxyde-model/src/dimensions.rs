@@ -242,9 +242,17 @@ impl Part {
                 if !parameters.contains(&parameter) {
                     return Err(unknown());
                 }
+                // Default names of optional dimensions are kept free too (a linear pattern's
+                // second direction brings D3 and D4 when it is added).
                 let taken = parameters
                     .iter()
-                    .any(|p| *p != parameter && feature.parameter_name(*p) == name);
+                    .any(|p| *p != parameter && feature.parameter_name(*p) == name)
+                    || feature
+                        .kind
+                        .possible_parameters()
+                        .iter()
+                        .enumerate()
+                        .any(|(i, p)| *p != parameter && name == format!("D{}", i + 1));
                 if taken {
                     return Err(ModelError::DuplicateName(name.to_owned()));
                 }

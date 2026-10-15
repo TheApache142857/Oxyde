@@ -423,8 +423,33 @@ impl OxydeApp {
         }
     }
 
+    /// Whether a face, an edge or a body clicked in the finished part exists just before the
+    /// feature being edited, the only geometry that feature can use.
+    fn exists_before(&self, pick: &PanelPick, editing: FeatureId) -> bool {
+        let body = self.doc.part.body_before(editing);
+        match pick {
+            PanelPick::Face(f) => body.is_some_and(|b| b.naming.find_face(f).is_some()),
+            PanelPick::Edge(e) => body.is_some_and(|b| b.naming.find_edge(e).is_some()),
+            PanelPick::Body(id) => body.is_some_and(|b| b.solid(*id).is_some()),
+            PanelPick::Feature(_) | PanelPick::Plane(_) => true,
+        }
+    }
+
     /// Offers a click to the open command. Returns true when the command took it.
     pub(crate) fn offer_to_panel(&mut self, pick: PanelPick) -> bool {
+        // The viewport shows the finished part: geometry made or changed by later features
+        // cannot be used by the feature being edited (and would stop the file from opening).
+        if let Some(editing) = self.dialog.as_ref().and_then(Dialog::editing) {
+            if self.dialog.as_ref().is_some_and(Dialog::is_panel)
+                && !self.exists_before(&pick, editing)
+            {
+                self.status = format!(
+                    "That is made or changed by a feature after {}: pick geometry that exists before it",
+                    self.feature_name(editing)
+                );
+                return true;
+            }
+        }
         let Some(mut dialog) = self.dialog.take() else {
             return false;
         };

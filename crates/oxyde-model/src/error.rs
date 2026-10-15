@@ -11,6 +11,11 @@ pub enum ModelError {
         feature: FeatureId,
         dependents: Vec<FeatureId>,
     },
+    /// A feature may only refer to features before it in the timeline.
+    LaterReference {
+        feature: FeatureId,
+        reference: FeatureId,
+    },
     /// A [`PartDefinition`](crate::PartDefinition) that cannot form a valid timeline.
     InvalidDefinition(String),
     /// Feature and dimension names cannot be empty, start or end with a space, or contain
@@ -38,6 +43,10 @@ impl fmt::Display for ModelError {
                 }
                 Ok(())
             }
+            ModelError::LaterReference { feature, reference } => write!(
+                f,
+                "feature {feature} cannot refer to {reference}, which does not come before it"
+            ),
             ModelError::InvalidDefinition(reason) => write!(f, "invalid part definition: {reason}"),
             ModelError::InvalidName(name) => write!(
                 f,

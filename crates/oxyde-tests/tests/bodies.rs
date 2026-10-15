@@ -96,8 +96,8 @@ fn a_cut_goes_through_every_body_unless_told() {
     part.rebuild(&mut kernel);
     assert_ok(&part);
     close(volume(&part, &kernel), 16000.0 - 2.0 * hole_volume());
-    // Only through the second body.
-    hole(&mut part, 25.0, vec![BodyId::new(b, 0)]);
+    // Only through the second body, still where both are (clear of the first hole).
+    hole(&mut part, 36.5, vec![BodyId::new(b, 0)]);
     part.rebuild(&mut kernel);
     assert_ok(&part);
     close(volume(&part, &kernel), 16000.0 - 3.0 * hole_volume());

@@ -737,7 +737,8 @@ OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionDa
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);
         OpResultData out = empty_result(result_faces);
         record_profile_faces(revol, base, marks, result_faces, out);
-        record_unnamed_profile_faces(base, marks, result_faces, out);
+        // Caps first: the start cap holds every profile edge, so the matching below would
+        // otherwise take it for a side face.
         if (!full) {
             for (TopExp_Explorer it(revol.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
                 add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
@@ -746,6 +747,7 @@ OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionDa
                 add_source(out, result_faces, it.Current(), SourceKind::EndCap, 0, 0);
             }
         }
+        record_unnamed_profile_faces(base, marks, result_faces, out);
 
         out.shape = insert(result);
         return out;
@@ -977,7 +979,14 @@ TopologyData Session::topology(std::uint64_t shape) const {
             data.cz = centroid.Z();
 
             if (surface.GetType() == GeomAbs_Plane) {
-                gp_Dir normal = surface.Plane().Axis().Direction();
+                // The surface normal is X × Y of the plane's frame: against its main
+                // direction when the frame is left-handed, as mirrored copies and some
+                // revolved faces have.
+                const gp_Pln plane = surface.Plane();
+                gp_Dir normal = plane.Axis().Direction();
+                if (!plane.Position().Direct()) {
+                    normal.Reverse();
+                }
                 if (face.Orientation() == TopAbs_REVERSED) {
                     normal.Reverse();
                 }

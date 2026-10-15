@@ -74,14 +74,20 @@ impl Document {
 
     /// Records the current state before a change, as one undo step.
     pub fn checkpoint(&mut self) {
-        self.push_undo();
+        self.push_undo(self.part.definition());
+        self.editing = None;
+    }
+
+    /// Records `before`, the definition just before a change already made, as one undo step.
+    pub fn checkpoint_from(&mut self, before: PartDefinition) {
+        self.push_undo(before);
         self.editing = None;
     }
 
     /// Like [`Document::checkpoint`], but successive edits of the same feature share one step.
     pub fn checkpoint_edit(&mut self, feature: FeatureId) {
         if self.editing != Some(feature) {
-            self.push_undo();
+            self.push_undo(self.part.definition());
             self.editing = Some(feature);
         }
         self.modified = true;
@@ -92,8 +98,8 @@ impl Document {
         self.editing = None;
     }
 
-    fn push_undo(&mut self) {
-        self.undo.push(self.part.definition());
+    fn push_undo(&mut self, definition: PartDefinition) {
+        self.undo.push(definition);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }

@@ -523,17 +523,19 @@ impl OxydeApp {
 
     /// Replaces a feature's definition as one undo step and rebuilds.
     pub(crate) fn replace_feature(&mut self, id: FeatureId, kind: FeatureKind) {
-        self.doc.checkpoint();
-        if let Ok(definition) = self.doc.part.edit(id) {
-            *definition = kind;
-        }
-        self.rebuild();
         let name = self
             .doc
             .part
             .feature(id)
             .map(|f| f.name().to_owned())
             .unwrap_or_default();
+        let before = self.doc.part.definition();
+        if let Err(e) = self.doc.part.replace_feature(id, kind) {
+            self.status = format!("{name} was not changed: {e}");
+            return;
+        }
+        self.doc.checkpoint_from(before);
+        self.rebuild();
         self.status = match self.doc.part.status(id) {
             Some(FeatureStatus::Error(message)) => format!("{name} failed: {message}"),
             _ => format!("Updated {name}"),

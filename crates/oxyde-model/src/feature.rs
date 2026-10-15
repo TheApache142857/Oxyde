@@ -179,6 +179,30 @@ impl Feature {
             .unwrap_or_else(|| self.kind.default_parameter_name(parameter))
     }
 
+    /// After the definition changed: forgets user names of dimensions it no longer has, and
+    /// user names that now clash with another dimension's default name ("D3" given to the
+    /// spacing before a second direction brought its own D3).
+    pub(crate) fn tidy_parameter_names(&mut self) {
+        let parameters: Vec<FeatureParameter> =
+            self.kind.parameters().iter().map(|(p, _)| *p).collect();
+        self.parameter_names.retain(|p, _| parameters.contains(p));
+        // Each pass drops one clashing name, back to its default (defaults never clash).
+        loop {
+            let clash = self.parameter_names.iter().find_map(|(p, name)| {
+                parameters
+                    .iter()
+                    .any(|q| q != p && self.parameter_name(*q) == *name)
+                    .then_some(*p)
+            });
+            match clash {
+                Some(p) => {
+                    self.parameter_names.remove(&p);
+                }
+                None => break,
+            }
+        }
+    }
+
     pub fn id(&self) -> FeatureId {
         self.id
     }
@@ -306,6 +330,17 @@ impl FeatureKind {
             FeatureKind::CircularPattern(c) => {
                 vec![(P::Angle, c.angle), (P::Count, f64::from(c.count))]
             }
+        }
+    }
+
+    /// Every parameter this kind of feature can have, optional ones included, in the order
+    /// of [`FeatureKind::parameters`]; so the one at position `i` is named "D{i+1}" by
+    /// default whenever it exists.
+    pub(crate) fn possible_parameters(&self) -> Vec<FeatureParameter> {
+        use FeatureParameter as P;
+        match self {
+            FeatureKind::LinearPattern(_) => vec![P::Spacing, P::Count, P::Spacing2, P::Count2],
+            other => other.parameters().into_iter().map(|(p, _)| p).collect(),
         }
     }
 

@@ -304,11 +304,36 @@ impl Part {
     }
 
     /// Gives mutable access to a feature's definition; it and everything after it will be
-    /// rebuilt.
+    /// rebuilt. To swap in a whole new definition, prefer [`Part::replace_feature`], which
+    /// checks its references.
     pub fn edit(&mut self, id: FeatureId) -> Result<&mut FeatureKind, ModelError> {
         let index = self.require(id)?;
         self.mark_dirty(index);
         Ok(&mut self.features[index].kind)
+    }
+
+    /// Replaces a feature's definition (after editing it in its window). Refused when the
+    /// new definition refers to the feature itself or to a later one: only what comes before
+    /// a feature exists when it is built, and such a part could not be opened again. User
+    /// names of dimensions the new definition no longer has are dropped.
+    pub fn replace_feature(&mut self, id: FeatureId, kind: FeatureKind) -> Result<(), ModelError> {
+        let index = self.require(id)?;
+        let earlier = &self.features[..index];
+        if let Some(reference) = kind
+            .dependencies()
+            .into_iter()
+            .find(|d| !earlier.iter().any(|f| f.id == *d))
+        {
+            return Err(ModelError::LaterReference {
+                feature: id,
+                reference,
+            });
+        }
+        let feature = &mut self.features[index];
+        feature.kind = kind;
+        feature.tidy_parameter_names();
+        self.mark_dirty(index);
+        Ok(())
     }
 
     /// Renames a feature. Names must be valid and unique in the part; dimension full names
@@ -967,7 +992,8 @@ fn apply_tool<K: Kernel>(
 ) -> Result<(Body, ToolBody), String> {
     let id = ctx.feature().id;
     let tool_names = sweep_names(id, &tool.history);
-    let mut op = ToolOp::of(op);
+    let requested = ToolOp::of(op);
+    let mut op = requested;
     let targets = match tool_targets(ctx, op, chosen, Some(sketch)) {
         Ok(t) => t,
         Err(e) => {
@@ -1038,6 +1064,13 @@ fn apply_tool<K: Kernel>(
         }
     })();
     let new_body = op == ToolOp::NewBody;
+    // The first boss of a part makes its first body, but it is still a boss: pattern and
+    // mirror copies of it join that body, as copies of any other boss join theirs.
+    let (copies_op, targets) = if requested == ToolOp::Join && new_body {
+        (ToolOp::Join, vec![BodyId::new(id, 0)])
+    } else {
+        (op, targets)
+    };
     match outcome {
         Ok(()) => Ok((
             work.finish(id),
@@ -1045,7 +1078,7 @@ fn apply_tool<K: Kernel>(
                 shape: tool.shape,
                 owned: !new_body,
                 names: tool_names,
-                op,
+                op: copies_op,
                 targets,
             },
         )),
@@ -1720,6 +1753,118 @@ mod tests {
         let mut duplicated = definition;
         duplicated.features.push(duplicated.features[0].clone());
         assert!(Part::from_definition(duplicated).is_err());
+    }
+
+    #[test]
+    fn a_replaced_definition_may_only_refer_to_earlier_features() {
+        let mut part = Part::new();
+        let s1 = part.add_feature(rectangle_sketch());
+        let boss = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            5.0,
+        )));
+        let edge = EdgeName::between(FaceName::profile(boss, 1), FaceName::end_cap(boss));
+        let fillet = part.add_feature(FeatureKind::Fillet(EdgeBlend {
+            edges: vec![edge.clone()],
+            size: 1.0,
+        }));
+        let s2 = part.add_feature(rectangle_sketch());
+        let cut = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s2,
+            ExtrudeOp::Cut,
+            1.0,
+        )));
+
+        // A sketch after the extrusion, an edge made by a later cut, the fillet's own face.
+        let later_sketch = FeatureKind::Extrude(Extrude::blind(s2, ExtrudeOp::Boss, 5.0));
+        let later_edge = FeatureKind::Fillet(EdgeBlend {
+            edges: vec![EdgeName::between(
+                FaceName::profile(cut, 1),
+                FaceName::end_cap(boss),
+            )],
+            size: 1.0,
+        });
+        let own_face = FeatureKind::Fillet(EdgeBlend {
+            edges: vec![EdgeName::between(
+                FaceName::from_edge(fillet, edge.clone()),
+                FaceName::end_cap(boss),
+            )],
+            size: 1.0,
+        });
+        for (feature, kind, reference) in [
+            (boss, later_sketch, s2),
+            (fillet, later_edge, cut),
+            (fillet, own_face, fillet),
+        ] {
+            assert_eq!(
+                part.replace_feature(feature, kind),
+                Err(ModelError::LaterReference { feature, reference })
+            );
+        }
+        // Nothing changed, and what is saved can be opened again.
+        assert!(Part::from_definition(part.definition()).is_ok());
+
+        part.replace_feature(
+            fillet,
+            FeatureKind::Fillet(EdgeBlend {
+                edges: vec![edge],
+                size: 2.0,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            part.feature(fillet).unwrap().kind(),
+            FeatureKind::Fillet(b) if b.size == 2.0
+        ));
+    }
+
+    #[test]
+    fn dimension_names_survive_a_change_of_definition() {
+        use crate::dimensions::{DimensionKey, DimensionRef};
+        use crate::feature::{
+            AxisRef, FeatureParameter, LinearPattern, PatternDirection, StandardAxis,
+        };
+        let mut part = Part::new();
+        let s1 = part.add_feature(rectangle_sketch());
+        let boss = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            5.0,
+        )));
+        let direction = |axis| PatternDirection {
+            axis: AxisRef::Standard(axis),
+            spacing: 20.0,
+            count: 2,
+            reverse: false,
+        };
+        let one_way = FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![boss],
+            first: direction(StandardAxis::X),
+            second: None,
+        });
+        let two_ways = FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![boss],
+            first: direction(StandardAxis::X),
+            second: Some(direction(StandardAxis::Y)),
+        });
+        let pattern = part.add_feature(one_way.clone());
+        let dimension = |parameter| DimensionRef {
+            feature: pattern,
+            key: DimensionKey::Feature(parameter),
+        };
+        // D3 and D4 belong to the second direction, even before it exists.
+        assert_eq!(
+            part.rename_dimension(dimension(FeatureParameter::Spacing), "D3"),
+            Err(ModelError::DuplicateName("D3".to_owned()))
+        );
+        part.replace_feature(pattern, two_ways).unwrap();
+        part.rename_dimension(dimension(FeatureParameter::Spacing2), "Pitch")
+            .unwrap();
+        // Without the second direction, its name goes too: the part still opens.
+        part.replace_feature(pattern, one_way).unwrap();
+        assert!(part.feature(pattern).unwrap().parameter_names().is_empty());
+        assert!(Part::from_definition(part.definition()).is_ok());
     }
 
     #[test]
