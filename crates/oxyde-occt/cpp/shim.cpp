@@ -16,6 +16,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepFilletAPI_MakeChamfer.hxx>
+#include <BRepFilletAPI_LocalOperation.hxx>
 #include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
@@ -101,6 +102,23 @@ namespace oxyde::occt {
 
 namespace {
 
+// "Standard_Failure: what went wrong", as OCCT tells it.
+std::string failure_text(const Standard_Failure& e) {
+#if OCC_VERSION_HEX >= 0x080000
+    // OCCT 8: exceptions derive from std::exception and are no longer Standard_Transient.
+    std::string message = e.ExceptionType();
+    const char* detail = e.what();
+#else
+    std::string message = e.DynamicType()->Name();
+    const char* detail = e.GetMessageString();
+#endif
+    if (detail != nullptr && *detail != '\0') {
+        message += ": ";
+        message += detail;
+    }
+    return message;
+}
+
 // Runs `body`, converting every exception into std::runtime_error prefixed with `op`.
 // Before OCCT 8, Standard_Failure did not derive from std::exception, so cxx would not catch it.
 template <typename F>
@@ -108,19 +126,7 @@ auto guarded(const char* op, F&& body) -> decltype(body()) {
     try {
         return body();
     } catch (const Standard_Failure& e) {
-#if OCC_VERSION_HEX >= 0x080000
-        // OCCT 8: exceptions derive from std::exception and are no longer Standard_Transient.
-        std::string message = std::string(op) + ": " + e.ExceptionType();
-        const char* detail = e.what();
-#else
-        std::string message = std::string(op) + ": " + e.DynamicType()->Name();
-        const char* detail = e.GetMessageString();
-#endif
-        if (detail != nullptr && *detail != '\0') {
-            message += ": ";
-            message += detail;
-        }
-        throw std::runtime_error(message);
+        throw std::runtime_error(std::string(op) + ": " + failure_text(e));
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string(op) + ": " + e.what());
     } catch (...) {
@@ -169,28 +175,37 @@ TopoDS_Shape solid_body(const TopoDS_Shape& all) {
         return TopoDS_Shape();
     }
 
-    TopoDS_Shape result;
-    if (solids.Extent() == 1) {
-        result = solids(1);
-    } else {
-        TopoDS_Compound compound;
-        BRep_Builder builder;
-        builder.MakeCompound(compound);
-        for (int i = 1; i <= solids.Extent(); ++i) {
-            builder.Add(compound, solids(i));
+    // Repaired one by one, and turned the right way out: some exporters write solids
+    // inside out, and one such solid among others must not go unnoticed.
+    TopTools_IndexedMapOfShape repaired;
+    for (int i = 1; i <= solids.Extent(); ++i) {
+        ShapeFix_Shape fix(solids(i));
+        fix.Perform();
+        TopExp::MapShapes(fix.Shape(), TopAbs_SOLID, repaired);
+    }
+    std::vector<TopoDS_Shape> body;
+    for (int i = 1; i <= repaired.Extent(); ++i) {
+        TopoDS_Shape solid = repaired(i);
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(solid, props);
+        if (props.Mass() < 0.0) {
+            solid.Reverse();
         }
-        result = compound;
+        body.push_back(solid);
     }
-    ShapeFix_Shape fix(result);
-    fix.Perform();
-    result = fix.Shape();
-    // Some exporters write solids inside out.
-    GProp_GProps props;
-    BRepGProp::VolumeProperties(result, props);
-    if (props.Mass() < 0.0) {
-        result.Reverse();
+    if (body.empty()) {
+        return TopoDS_Shape();
     }
-    return result;
+    if (body.size() == 1) {
+        return body[0];
+    }
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    for (const TopoDS_Shape& solid : body) {
+        builder.Add(compound, solid);
+    }
+    return compound;
 }
 
 // `shape` written as a STEP file, in millimetres.
@@ -716,6 +731,21 @@ TopoDS_Shape closed_shell(const TopoDS_Shape& input, const TopTools_IndexedMapOf
     return result;
 }
 
+// Builds a fillet or a chamfer, telling in plain words why the usual failure happens.
+void build_blend(BRepFilletAPI_LocalOperation& maker, const char* what) {
+    try {
+        maker.Build();
+    } catch (const Standard_Failure& e) {
+        // OCCT's words for edges between faces that meet smoothly.
+        if (failure_text(e).find("no suitable edges") != std::string::npos) {
+            throw std::runtime_error(std::string(what) +
+                                     " failed: the selected edges are smooth (their faces "
+                                     "meet tangentially), there is no corner to round");
+        }
+        throw;
+    }
+}
+
 const TopoDS_Edge& edge_at(const TopTools_IndexedMapOfShape& edges, std::uint32_t index) {
     if (index >= static_cast<std::uint32_t>(edges.Extent())) {
         throw std::out_of_range("edge index " + std::to_string(index) + " out of range");
@@ -996,7 +1026,7 @@ OpResultData Session::fillet(std::uint64_t shape, rust::Slice<const std::uint32_
         for (const std::uint32_t index : edges) {
             maker.Add(radius, edge_at(input_edges, index));
         }
-        maker.Build();
+        build_blend(maker, "fillet");
         const char* const failed = "fillet failed (radius too large for the selected edges?)";
         if (!maker.IsDone()) {
             throw std::runtime_error(failed);
@@ -1032,7 +1062,7 @@ OpResultData Session::chamfer(std::uint64_t shape, rust::Slice<const std::uint32
         for (const std::uint32_t index : edges) {
             maker.Add(distance, edge_at(input_edges, index));
         }
-        maker.Build();
+        build_blend(maker, "chamfer");
         const char* const failed = "chamfer failed (distance too large for the selected edges?)";
         if (!maker.IsDone()) {
             throw std::runtime_error(failed);

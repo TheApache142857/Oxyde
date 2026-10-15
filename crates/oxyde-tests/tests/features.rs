@@ -271,6 +271,46 @@ fn a_shell_thicker_than_the_part_is_an_error() {
 }
 
 #[test]
+fn a_fillet_on_a_smooth_edge_says_so() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    // A slot: straight sides tangent to the round ends.
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let g = &mut sketch.geometry;
+    let (a, b) = (
+        g.point(Point2::new(0.0, 0.0)),
+        g.point(Point2::new(10.0, 0.0)),
+    );
+    let (c, d) = (
+        g.point(Point2::new(10.0, 10.0)),
+        g.point(Point2::new(0.0, 10.0)),
+    );
+    let (right, left) = (
+        g.point(Point2::new(10.0, 5.0)),
+        g.point(Point2::new(0.0, 5.0)),
+    );
+    let bottom = g.line_between(a, b);
+    let end = g.arc_between(right, b, c);
+    g.line_between(c, d);
+    g.arc_between(left, d, a);
+    let s1 = part.add_feature(FeatureKind::Sketch(sketch));
+    let slot = part.add_feature(boss(s1, 5.0));
+    let fillet = part.add_feature(FeatureKind::Fillet(EdgeBlend {
+        edges: vec![EdgeName::between(
+            FaceName::profile(slot, bottom.0),
+            FaceName::profile(slot, end.0),
+        )],
+        size: 1.0,
+    }));
+    part.rebuild(&mut kernel);
+    match part.status(fillet) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("smooth"), "{message}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
+#[test]
 fn contours_that_cross_are_not_extruded() {
     let mut kernel = OcctKernel::new();
     let mut part = Part::new();

@@ -190,7 +190,7 @@ Positions are stored as last solved; readers solve the relations again on rebuil
 
 `next_ids` (optional): `entity` and `relation` are the ids the next new entity and relation will get, `dimension` the number of the next default dimension name (`D3`). They keep ids from being reused after a deletion, which would silently re-attach face references and equations to other geometry. Readers raise them if they are not above every id in use. A dimension without a `name` gets the next default name on load.
 
-Sketch coordinates are in the sketch plane's frame. For standard planes: Front = XY, Top = XZ (sketch Y towards −Z), Right = YZ (sketch X towards −Z). On a face, the origin is the model origin projected onto the face and the X axis is the model axis least aligned with the face normal, projected.
+Sketch coordinates are in the sketch plane's frame. For standard planes: Front = XY, Top = XZ (sketch Y towards −Z), Right = YZ (sketch X towards −Z). On a face, the origin is the model origin projected onto the face and the X axis is the model axis least aligned with the face normal, projected (on a tie within 1e-9, the first of X, Y, Z).
 
 ### References: persistent names
 
