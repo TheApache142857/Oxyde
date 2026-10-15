@@ -1,10 +1,12 @@
 //! Compiles the C++ shim against OpenCASCADE and links the OCCT toolkits.
 //!
-//! Windows (MSVC) only for now. OCCT is located from, in order:
+//! Windows (MSVC), Linux and macOS. OCCT is located from, in order:
 //!   1. `OXYDE_OCCT_INCLUDE_DIR` + `OXYDE_OCCT_LIB_DIR` (explicit, both required together)
 //!   2. `OXYDE_OCCT_DIR` — an install root (vcpkg `installed\x64-windows`, the official
 //!      installer folder, or a CMake install prefix)
 //!   3. `VCPKG_ROOT` — uses `%VCPKG_ROOT%\installed\x64-windows`
+//!   4. On Linux and macOS, the system: `/usr` (Debian's `libocct-*-dev`), `/usr/local`,
+//!      Homebrew
 //!
 //! `OXYDE_OCCT_CHECK_ONLY=1` skips all of this, for `cargo check` on other systems.
 //!
@@ -62,9 +64,14 @@ fn main() {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    if target_os != "windows" || target_env != "msvc" {
+    let supported = match target_os.as_str() {
+        "windows" => target_env == "msvc",
+        "linux" | "macos" => true,
+        _ => false,
+    };
+    if !supported {
         fail(&format!(
-            "oxyde-occt currently supports only Windows with the MSVC toolchain \
+            "oxyde-occt supports Windows (MSVC), Linux and macOS \
              (target_os = \"{target_os}\", target_env = \"{target_env}\")."
         ));
     }
@@ -91,7 +98,8 @@ fn main() {
     for lib in CORE_TOOLKITS.iter().chain(step) {
         if !occt.has_lib(lib) {
             fail(&format!(
-                "OpenCASCADE library {lib}.lib not found in {}",
+                "OpenCASCADE library {} not found in {}",
+                lib_file(lib),
                 occt.lib_dir.display()
             ));
         }
@@ -124,9 +132,10 @@ impl Occt {
                 include_dir.display()
             ));
         }
-        if !lib_dir.join("TKernel.lib").is_file() {
+        if !lib_dir.join(lib_file("TKernel")).is_file() {
             fail(&format!(
-                "TKernel.lib not found in OpenCASCADE library directory {}",
+                "{} not found in OpenCASCADE library directory {}",
+                lib_file("TKernel"),
                 lib_dir.display()
             ));
         }
@@ -143,6 +152,17 @@ impl Occt {
         }
         if let Some(vcpkg) = env::var_os("VCPKG_ROOT") {
             roots.push(PathBuf::from(vcpkg).join("installed").join("x64-windows"));
+        }
+        // Linux distributions and Homebrew install it system-wide.
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+            for root in [
+                "/usr",
+                "/usr/local",
+                "/opt/homebrew",
+                "/opt/homebrew/opt/opencascade",
+            ] {
+                roots.push(PathBuf::from(root));
+            }
         }
         if roots.is_empty() {
             fail(
@@ -175,7 +195,7 @@ impl Occt {
     }
 
     fn has_lib(&self, name: &str) -> bool {
-        self.lib_dir.join(format!("{name}.lib")).is_file()
+        self.lib_dir.join(lib_file(name)).is_file()
     }
 }
 
@@ -190,10 +210,27 @@ fn find_include_dir(root: &Path) -> Option<PathBuf> {
 fn find_lib_dir(root: &Path) -> Option<PathBuf> {
     // Official installer / CMake on Windows: win64\vc14\lib; vcpkg and others: lib.
     // Always the release libraries: Rust links the release C runtime even in debug builds.
-    ["win64/vc14/lib", "lib"]
-        .iter()
-        .map(|rel| root.join(rel))
-        .find(|dir| dir.join("TKernel.lib").is_file())
+    // Debian and Ubuntu: lib/<multiarch triple>.
+    let mut dirs = vec![root.join("win64/vc14/lib"), root.join("lib")];
+    if let (Ok(arch), Ok(os)) = (
+        env::var("CARGO_CFG_TARGET_ARCH"),
+        env::var("CARGO_CFG_TARGET_OS"),
+    ) {
+        if os == "linux" {
+            dirs.push(root.join(format!("lib/{arch}-linux-gnu")));
+        }
+    }
+    dirs.into_iter()
+        .find(|dir| dir.join(lib_file("TKernel")).is_file())
+}
+
+/// The file name of a library to link against: `TKernel.lib`, `libTKernel.so`…
+fn lib_file(name: &str) -> String {
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => format!("{name}.lib"),
+        Ok("macos") => format!("lib{name}.dylib"),
+        _ => format!("lib{name}.so"),
+    }
 }
 
 fn opencascade_subdirs(root: &Path) -> Vec<PathBuf> {

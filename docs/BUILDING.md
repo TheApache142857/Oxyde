@@ -81,6 +81,18 @@ The viewport draws with the GPU (wgpu). If it shows nothing or crashes on startu
 $env:OXYDE_RENDERER = "cpu"; cargo run --release -p oxyde-app
 ```
 
+## Linux
+
+Debian 13 (trixie) and Ubuntu ship OpenCASCADE 7.8, which the build finds in `/usr` on its own:
+
+```sh
+sudo apt install g++ libocct-foundation-dev libocct-modeling-data-dev \
+  libocct-modeling-algorithms-dev libocct-data-exchange-dev libocct-ocaf-dev
+cargo run --release -p oxyde-app
+```
+
+Without root, the same packages in a `debian:trixie` container work too, with the host's Rust toolchain mounted. `cargo run -p oxyde-tests --example step_to_oxyde -- file.step out/` converts a STEP assembly into Oxyde files from the command line.
+
 ## 3. Bundling for Windows
 
 ```powershell

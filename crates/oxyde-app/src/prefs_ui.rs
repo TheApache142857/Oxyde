@@ -73,8 +73,12 @@ impl OxydeApp {
             crate::theme::apply(ctx, theme);
             self.prefs_window.applied_theme = Some(theme);
         }
-        let debug = self.prefs.debug.ui_debug_on_hover;
-        ctx.style_mut(|s| s.debug.debug_on_hover = debug);
+        // egui only has its widget debugging in debug builds.
+        #[cfg(debug_assertions)]
+        {
+            let debug = self.prefs.debug.ui_debug_on_hover;
+            ctx.style_mut(|s| s.debug.debug_on_hover = debug);
+        }
     }
 
     pub(crate) fn mesh_fraction(&self) -> f64 {
@@ -389,10 +393,14 @@ impl OxydeApp {
             .on_hover_text("Frame time, renderer, triangles and edges, rebuild and solve times");
         ui.checkbox(&mut d.hover_info, "What is under the pointer")
             .on_hover_text("Face or edge index and its persistent name");
-        ui.checkbox(
-            &mut d.ui_debug_on_hover,
-            "Interface: outline widgets on hover",
-        );
+        ui.add_enabled(
+            cfg!(debug_assertions),
+            egui::Checkbox::new(
+                &mut d.ui_debug_on_hover,
+                "Interface: outline widgets on hover",
+            ),
+        )
+        .on_disabled_hover_text("Only in debug builds (cargo run without --release)");
         ui.checkbox(&mut d.ui_inspector, "Interface: egui inspector window");
         ui.add_space(8.0);
         crate::property_manager::section(ui, "About this build");

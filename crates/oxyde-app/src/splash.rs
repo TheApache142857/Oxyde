@@ -163,6 +163,11 @@ impl OxydeApp {
         let now = ctx.input(|i| i.time);
         let target = self.splash.progress();
         self.splash.shown += (target - self.splash.shown) * 0.25;
+        // Loaded: the bar is full, whatever the easing reached (egui stops repainting when
+        // idle, so it may never get there by itself).
+        if !self.splash.loading() {
+            self.splash.shown = 1.0;
+        }
         let mut close = false;
         let mut action: Option<SplashAction> = None;
 
@@ -260,7 +265,7 @@ impl OxydeApp {
                     art.left_bottom() + Vec2::new(20.0, 14.0),
                     card.right_bottom() - Vec2::new(20.0, 12.0),
                 );
-                if self.splash.loading() || self.splash.shown < 0.995 {
+                if self.splash.loading() {
                     painter.text(
                         below.left_top(),
                         Align2::LEFT_TOP,

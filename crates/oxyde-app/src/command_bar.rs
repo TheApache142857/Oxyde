@@ -620,8 +620,9 @@ impl OxydeApp {
 
     /// Standard views, zoom to fit and Normal To, floating at the top of the viewport.
     pub(crate) fn heads_up_toolbar(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
+        // Middle, like windows: a window opened over the viewport covers the toolbar.
         egui::Area::new(egui::Id::new("heads_up_toolbar"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .pivot(egui::Align2::CENTER_TOP)
             .fixed_pos(viewport.center_top() + egui::vec2(0.0, 6.0))
             .show(ctx, |ui| {

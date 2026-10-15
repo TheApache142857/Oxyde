@@ -834,7 +834,21 @@ pub fn command_button(
     enabled: bool,
     active: bool,
 ) -> Response {
-    let width = 68.0;
+    // Wide enough for the longest word of the label; longer labels wrap.
+    let label_width = label
+        .split_whitespace()
+        .map(|word| {
+            ui.painter()
+                .layout_no_wrap(
+                    word.to_owned(),
+                    egui::FontId::proportional(11.0),
+                    Color32::WHITE,
+                )
+                .size()
+                .x
+        })
+        .fold(0.0f32, f32::max);
+    let width = (label_width + 10.0).max(68.0);
     let height = 66.0;
     let sense = if enabled {
         Sense::click()
