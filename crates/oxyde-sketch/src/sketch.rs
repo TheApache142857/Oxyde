@@ -581,6 +581,19 @@ impl ConstrainedSketch {
         }
     }
 
+    /// The origin point as recorded (read from the file, or placed by
+    /// [`ensure_origin`](Self::ensure_origin)), without the guess [`origin`](Self::origin)
+    /// makes for a sketch saved before the origin was recorded. This is what files store:
+    /// a guess stored as fact would have the origin moved onto someone's point.
+    pub fn recorded_origin(&self) -> Option<EntityId> {
+        self.origin.filter(|id| {
+            matches!(
+                self.entity(*id).map(|e| e.geometry),
+                Some(Geometry::Point(_))
+            )
+        })
+    }
+
     /// The origin point, created if the sketch has none, and moved to `at` (where the model
     /// origin falls in the sketch plane) if it is elsewhere.
     pub fn ensure_origin(&mut self, at: Point2) -> EntityId {

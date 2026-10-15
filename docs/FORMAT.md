@@ -162,7 +162,7 @@ Every feature may also carry `dimension_names` (optional, default empty): custom
 | `circle` | `center`: point id, `radius` |
 | `arc` | `center`, `start`, `end`: point ids; counter-clockwise from `start` to `end` |
 
-The **sketch origin** is a construction point held by a `fixed` relation, named by the sketch's optional `origin` (an entity id); Oxyde places it where the model origin falls in the sketch plane, and other geometry may share it or refer to it like any point. A sketch has at most one. Files without `origin` take the first fixed construction point (other fixed construction points exist: Convert Entities makes them).
+The **sketch origin** is a construction point held by a `fixed` relation, named by the sketch's optional `origin` (an entity id); Oxyde places it where the model origin falls in the sketch plane, and other geometry may share it or refer to it like any point. A sketch has at most one, and `origin` is written once it is known. A sketch without it gets it when it is next edited: the fixed construction point where the model origin falls, else a new one; other fixed construction points (Convert Entities makes them) are never taken for it.
 
 Connected geometry shares point entities. The ids of lines, circles and arcs are the `segment` numbers in face references, so they must stay stable.
 

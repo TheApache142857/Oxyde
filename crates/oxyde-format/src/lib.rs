@@ -632,6 +632,32 @@ mod tests {
     }
 
     #[test]
+    fn a_sketch_origin_is_stored_only_once_known() {
+        // A sketch from a file older than the origin record, holding a point Convert
+        // Entities fixed on a circle's rim and nothing yet at the origin. Saving must not
+        // record that point as the origin: opening the sketch would move it there.
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        let rim = sketch.geometry.point(Point2::new(5.0, 0.0));
+        sketch.geometry.set_construction(rim, true);
+        sketch.geometry.constrain(Constraint::Fixed(rim));
+        let mut part = Part::new();
+        part.add_feature(FeatureKind::Sketch(sketch));
+        let file = PartFile {
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties: Properties::default(),
+        };
+        let read = round_trip(&file);
+        assert_eq!(read, file);
+        let FeatureKind::Sketch(sketch) = read.definition.features[0].kind() else {
+            panic!("not a sketch");
+        };
+        let mut geometry = sketch.geometry.clone();
+        assert_ne!(geometry.ensure_origin(Point2::ORIGIN), rim);
+        assert_eq!(geometry.position(rim), Some(Point2::new(5.0, 0.0)));
+    }
+
+    #[test]
     fn empty_part_round_trips() {
         let part = PartFile::new();
         assert_eq!(round_trip(&part), part);

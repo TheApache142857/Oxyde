@@ -497,7 +497,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                     dimension: c.dimension,
                 })
             },
-            origin: sketch.geometry.origin().map(|id| id.0),
+            origin: sketch.geometry.recorded_origin().map(|id| id.0),
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
