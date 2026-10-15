@@ -1,12 +1,15 @@
 //! The 3D viewport: shows the part, handles camera navigation and picking.
 //!
-//! Mouse, part mode: left-drag orbits about the point under the pointer where the drag
-//! started (the model stays put under it, as in SolidWorks and Creo), right-drag,
-//! middle-drag or Shift+left-drag pans, the wheel zooms at the cursor, a middle double-click
-//! zooms to fit, left-click selects (Ctrl+click adds to the selection).
+//! Mouse, part mode: by default right-drag orbits about the point under the pointer where
+//! the drag started (the model stays put under it, as in SolidWorks and Creo), middle-drag
+//! or Shift+right-drag pans, the wheel zooms at the cursor, a middle double-click zooms to
+//! fit, left-click selects (Ctrl+click adds to the selection) and left-drag draws a
+//! selection box: left to right takes what lies inside it, right to left what it touches.
+//! The preferences offer the SolidWorks mapping (middle button turns) and the old one (left
+//! button turns, no box); see [`MouseScheme`].
 //!
-//! Sketch mode keeps the left button for drawing: right-drag or middle-drag pans,
-//! Ctrl+middle-drag orbits, and picking of the 3D model is off.
+//! Sketch mode keeps the left button for drawing: the turning button orbits, the others
+//! pan, and picking of the 3D model is off.
 //!
 //! In an assembly, Alt+left-drag grabs what is under the pointer instead of orbiting
 //! (Alt+Shift+left-drag to turn it); see [`Grab`].
@@ -14,6 +17,8 @@
 use eframe::egui;
 use oxyde_geom::{Plane, Point2, Point3};
 use oxyde_render::{Camera, Frame, Highlight, Pick, Scene, StandardView, Style, render_styled};
+
+pub use crate::prefs::MouseScheme;
 
 /// What happened in the viewport this frame.
 pub struct ViewportOutput {
@@ -27,6 +32,17 @@ pub struct ViewportOutput {
     pub pixels_per_point: f32,
     /// An Alt+drag in progress, when grabbing is enabled.
     pub grab: Option<Grab>,
+    /// A selection box just finished (the left button released).
+    pub box_select: Option<BoxSelect>,
+}
+
+/// A selection box, in viewport pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxSelect {
+    pub min: [f64; 2],
+    pub max: [f64; 2],
+    /// Dragged right to left: take what the box touches, not only what lies inside it.
+    pub crossing: bool,
 }
 
 /// An Alt+left-drag this frame: what was under the pointer when it started, and how far
@@ -81,6 +97,7 @@ struct Animation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewSettings {
     pub style: Style,
+    pub mouse: MouseScheme,
     pub show_triad: bool,
     /// 1 = default.
     pub orbit_speed: f64,
@@ -96,6 +113,7 @@ impl Default for ViewSettings {
     fn default() -> Self {
         Self {
             style: Style::default(),
+            mouse: MouseScheme::default(),
             show_triad: true,
             orbit_speed: 1.0,
             zoom_speed: 1.0,
@@ -163,6 +181,8 @@ pub struct Viewport {
     pub preselect: Vec<Pick>,
     /// Triangles and edge segments of the scene.
     scene_counts: (usize, usize),
+    /// Where a selection box started (screen position), while the left button is down.
+    box_start: Option<egui::Pos2>,
 }
 
 impl Viewport {
@@ -188,6 +208,16 @@ impl Viewport {
             settings: ViewSettings::default(),
             preselect: Vec::new(),
             scene_counts: (0, 0),
+            box_start: None,
+        }
+    }
+
+    /// The faces and edges in a selection box, from the id buffers of the last image.
+    pub fn picks_in(&self, b: &BoxSelect) -> Vec<Pick> {
+        match (&self.gpu, &self.frame) {
+            (Some(gpu), _) => gpu.picks_in(b.min, b.max, b.crossing),
+            (None, Some(frame)) => frame.picks_in(b.min, b.max, b.crossing),
+            (None, None) => Vec::new(),
         }
     }
 
@@ -221,6 +251,19 @@ impl Viewport {
         if fit {
             self.fit_pending = true;
         }
+    }
+
+    /// Changes how the faces look without re-meshing.
+    pub fn set_materials(
+        &mut self,
+        materials: Vec<oxyde_render::Material>,
+        textures: Vec<oxyde_render::TextureRef>,
+    ) {
+        self.scene.set_materials(materials, textures);
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_mesh(&self.scene.gpu_mesh(), self.scene.bounds());
+        }
+        self.scene_version += 1;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -353,11 +396,15 @@ impl Viewport {
         if response.double_clicked_by(egui::PointerButton::Middle) {
             self.fit_pending = true;
         }
+        let scheme = self.settings.mouse;
+        let started = |b| response.drag_started_by(b);
+        use egui::PointerButton::{Middle, Primary, Secondary};
         // An orbit drag turns about what was under the pointer when it started.
-        let orbit_started = if sketching {
-            response.drag_started_by(egui::PointerButton::Middle) && ctrl
-        } else {
-            response.drag_started_by(egui::PointerButton::Primary) && !shift && !alt
+        let orbit_started = match scheme {
+            MouseScheme::RightTurns => started(Secondary) && !shift,
+            MouseScheme::MiddleTurns => started(Middle) && (if sketching { ctrl } else { !ctrl }),
+            MouseScheme::LeftTurns if sketching => started(Middle) && ctrl,
+            MouseScheme::LeftTurns => started(Primary) && !shift && !alt,
         };
         if orbit_started {
             self.pivot = self
@@ -398,12 +445,41 @@ impl Viewport {
             }
             _ => None,
         };
-        let (panning, orbiting) = if sketching {
-            ((middle && !ctrl) || secondary, middle && ctrl)
-        } else {
-            let panning = middle || secondary || (shift && primary);
-            (panning, !panning && primary)
+        let (panning, orbiting) = match scheme {
+            MouseScheme::RightTurns => (middle || (secondary && shift), secondary && !shift),
+            MouseScheme::MiddleTurns if sketching => {
+                ((middle && !ctrl) || secondary, middle && ctrl)
+            }
+            MouseScheme::MiddleTurns => ((middle && ctrl) || secondary, middle && !ctrl),
+            MouseScheme::LeftTurns if sketching => ((middle && !ctrl) || secondary, middle && ctrl),
+            MouseScheme::LeftTurns => {
+                let panning = middle || secondary || (shift && primary);
+                (panning, !panning && primary)
+            }
         };
+        // The selection box: the left button, where it neither turns nor grabs.
+        let boxing = scheme != MouseScheme::LeftTurns && !sketching && self.grabbed.is_none();
+        if boxing && started(Primary) && !alt {
+            self.box_start = response.interact_pointer_pos();
+        }
+        let mut box_select = None;
+        if let Some(start) = self.box_start {
+            let end = response.interact_pointer_pos().or_else(|| response.hover_pos());
+            if response.drag_stopped_by(Primary) || !primary || !boxing {
+                self.box_start = None;
+                if let Some(end) = end.filter(|_| boxing && response.drag_stopped_by(Primary)) {
+                    let a = (start - rect.min) * ppp;
+                    let b = (end - rect.min) * ppp;
+                    if (a.x - b.x).abs() > 3.0 && (a.y - b.y).abs() > 3.0 {
+                        box_select = Some(BoxSelect {
+                            min: [a.x.min(b.x) as f64, a.y.min(b.y) as f64],
+                            max: [a.x.max(b.x) as f64, a.y.max(b.y) as f64],
+                            crossing: end.x < start.x,
+                        });
+                    }
+                }
+            }
+        }
         if panning || orbiting {
             // The user takes over.
             self.animation = None;
@@ -528,6 +604,26 @@ impl Viewport {
         if self.settings.show_triad {
             self.draw_triad(&painter, rect);
         }
+        if let (Some(start), Some(end)) = (self.box_start, response.hover_pos()) {
+            let color = egui::Color32::from_rgb(79, 195, 247);
+            let r = egui::Rect::from_two_pos(start, end);
+            painter.rect_filled(r, 0.0, color.gamma_multiply(0.12));
+            let stroke = egui::Stroke::new(1.0, color);
+            if end.x < start.x {
+                // Right to left: what the box touches.
+                let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+                for k in 0..4 {
+                    painter.add(egui::Shape::dashed_line(
+                        &[corners[k], corners[(k + 1) % 4]],
+                        stroke,
+                        4.0,
+                        3.0,
+                    ));
+                }
+            } else {
+                painter.rect_stroke(r, 0.0, stroke);
+            }
+        }
         if let Some(hint) = hint {
             painter.text(
                 rect.center(),
@@ -549,6 +645,7 @@ impl Viewport {
             rect,
             pixels_per_point: ppp,
             grab,
+            box_select,
         }
     }
 

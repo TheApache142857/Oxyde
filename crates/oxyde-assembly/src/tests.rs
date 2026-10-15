@@ -141,6 +141,76 @@ fn anti_aligned_faces_face_each_other() {
     assert!(close(p.translation.z, 0.0));
 }
 
+/// A pin standing in a hole, head on the base: concentric with the hole's axis, its
+/// head's underside on the base's top. Then the coincident mate is flipped, which needs
+/// the pin turned over while it stays on the axis.
+#[test]
+fn a_flipped_alignment_turns_the_part_over() {
+    let (mut asm, a, b) = two();
+    asm.component_mut(b).unwrap().placement = Placement::from_translation(Vec3::new(40.0, 0.0, 0.0));
+    asm.add_mate(MateKind::Concentric, r(a, MateTarget::Axis(StandardAxis::Z)), r(b, MateTarget::Axis(StandardAxis::Z)), true);
+    let head = asm.add_mate(
+        MateKind::Coincident,
+        r(a, MateTarget::Plane(StandardPlane::Front)),
+        r(b, MateTarget::Plane(StandardPlane::Front)),
+        true,
+    );
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let p = asm.component(b).unwrap().placement;
+    assert!(close(p.apply_vector(Vec3::Z).z, 1.0), "{p:?}");
+    assert!(close(p.translation.x, 0.0) && close(p.translation.y, 0.0), "{p:?}");
+
+    asm.mate_mut(head).unwrap().aligned = false;
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let p = asm.component(b).unwrap().placement;
+    assert!(close(p.apply_vector(Vec3::Z).z, -1.0), "{p:?}");
+    assert!(close(p.translation.x, 0.0) && close(p.translation.y, 0.0), "{p:?}");
+    assert!(close(p.translation.z, 0.0), "{p:?}");
+
+    // And back again.
+    asm.mate_mut(head).unwrap().aligned = true;
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let p = asm.component(b).unwrap().placement;
+    assert!(close(p.apply_vector(Vec3::Z).z, 1.0), "{p:?}");
+}
+
+/// The concentric axis lies across the mated plane: the half turn is about that axis,
+/// so the pin keeps it.
+#[test]
+fn a_flipped_alignment_turns_about_the_axis_it_keeps() {
+    let (mut asm, a, b) = side_by_side();
+    asm.add_mate(MateKind::Concentric, x_axis(a), x_axis(b), true);
+    let side = asm.add_mate(MateKind::Coincident, front(a), front(b), true);
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    asm.mate_mut(side).unwrap().aligned = false;
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let p = asm.component(b).unwrap().placement;
+    assert!(close(p.apply_vector(Vec3::Z).z, -1.0), "{p:?}");
+    assert!(close(p.apply_vector(Vec3::X).x.abs(), 1.0), "{p:?}");
+    assert!(close(p.translation.y, 0.0) && close(p.translation.z, 0.0), "{p:?}");
+}
+
+#[test]
+fn faces_of_solids_start_anti_aligned_when_square() {
+    let plane = |normal: Vec3| Primitive::Plane {
+        origin: Point3::ORIGIN,
+        normal,
+    };
+    // Square: solids touch, reference planes take the closest (aligned).
+    assert!(!default_alignment_between(&plane(Vec3::Z), &plane(Vec3::X), true));
+    assert!(default_alignment_between(&plane(Vec3::Z), &plane(Vec3::X), false));
+    // Clearly the same way: aligned either way.
+    assert!(default_alignment_between(&plane(Vec3::Z), &plane(Vec3::Z), true));
+    // Opposite: anti-aligned.
+    assert!(!default_alignment_between(&plane(Vec3::Z), &plane(-Vec3::Z), true));
+    assert!(!default_alignment_between(&plane(Vec3::Z), &plane(-Vec3::Z), false));
+}
+
 #[test]
 fn conflicting_mates_are_reported() {
     let (mut asm, a, b) = two();

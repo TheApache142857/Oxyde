@@ -1,8 +1,9 @@
 use oxyde_kernel::Mesh;
 
 use crate::camera::Camera;
+use crate::material::{Material, Texture, TextureRef};
 use crate::style::Style;
-use crate::vec3::{V3, add, cross, dot, lerp, normalize, scale, sub};
+use crate::vec3::{V3, add, cross, dot, length, lerp, normalize, scale, sub};
 
 /// What is under a pixel: a face or an edge, by index into the shape's topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +33,7 @@ struct SceneFace {
     /// Smooth within the face, so curved faces look round while edges stay crisp.
     normals: Vec<V3>,
     triangles: Vec<[usize; 3]>,
+    centroid: V3,
 }
 
 /// A display mesh prepared for rendering.
@@ -40,6 +42,9 @@ pub struct Scene {
     faces: Vec<SceneFace>,
     edges: Vec<Vec<V3>>,
     bounds: Option<(V3, V3)>,
+    /// One per face, or empty: every face in the style's part colour.
+    materials: Vec<Material>,
+    textures: Vec<TextureRef>,
 }
 
 impl Scene {
@@ -81,10 +86,18 @@ impl Scene {
                 .map(|n| normalize(n).unwrap_or([0.0, 0.0, 1.0]))
                 .collect();
 
+            let mut centroid = [0.0; 3];
+            if !positions.is_empty() {
+                for p in &positions {
+                    centroid = add(centroid, *p);
+                }
+                centroid = scale(centroid, 1.0 / positions.len() as f64);
+            }
             faces.push(SceneFace {
                 positions,
                 normals,
                 triangles,
+                centroid,
             });
         }
 
@@ -99,14 +112,65 @@ impl Scene {
             faces,
             edges,
             bounds,
+            materials: Vec::new(),
+            textures: Vec::new(),
         }
+    }
+
+    /// Gives the faces their materials: one per face (missing ones take the default), with
+    /// the textures they index.
+    pub fn set_materials(&mut self, mut materials: Vec<Material>, textures: Vec<TextureRef>) {
+        materials.resize(self.faces.len(), Material::default());
+        for m in &mut materials {
+            if m.texture.is_some_and(|t| t >= textures.len()) {
+                m.texture = None;
+            }
+        }
+        if materials.iter().all(|m| *m == Material::default()) {
+            materials.clear();
+        }
+        self.materials = materials;
+        self.textures = textures;
+    }
+
+    pub fn materials(&self) -> &[Material] {
+        &self.materials
+    }
+
+    pub fn textures(&self) -> &[TextureRef] {
+        &self.textures
+    }
+
+    fn material(&self, face: usize) -> Material {
+        self.materials.get(face).cloned().unwrap_or_default()
+    }
+
+    fn texture_of(&self, material: &Material) -> Option<(&Texture, f32)> {
+        let t = self.textures.get(material.texture?)?;
+        Some((t.as_ref(), material.texture_scale))
+    }
+
+    /// Whether any face is see-through.
+    pub fn has_transparency(&self) -> bool {
+        self.materials.iter().any(Material::is_transparent)
     }
 
     /// The scene as flat arrays for a GPU: indexed triangles with per-vertex normals and
     /// face indices, and edge segments with their edge index.
     pub fn gpu_mesh(&self) -> GpuMesh {
         let f = |v: V3| [v[0] as f32, v[1] as f32, v[2] as f32];
-        let mut mesh = GpuMesh::default();
+        let mut mesh = GpuMesh {
+            materials: self.materials.clone(),
+            textures: self.textures.clone(),
+            ..GpuMesh::default()
+        };
+        let mut next_index = 0u32;
+        for face in &self.faces {
+            mesh.centroids.push(f(face.centroid));
+            let count = (face.triangles.len() * 3) as u32;
+            mesh.triangle_ranges.push((next_index, next_index + count));
+            next_index += count;
+        }
         for (index, face) in self.faces.iter().enumerate() {
             let base = mesh.positions.len() as u32;
             for (p, n) in face.positions.iter().zip(&face.normals) {
@@ -225,6 +289,39 @@ pub struct GpuMesh {
     pub indices: Vec<u32>,
     /// Edge segments: start, end, edge index.
     pub segments: Vec<([f32; 3], [f32; 3], u32)>,
+    /// Range of `indices` holding each face's triangles.
+    pub triangle_ranges: Vec<(u32, u32)>,
+    /// Centroid of each face, to sort transparent faces by depth.
+    pub centroids: Vec<[f32; 3]>,
+    /// One per face, or empty for the default everywhere.
+    pub materials: Vec<Material>,
+    pub textures: Vec<TextureRef>,
+}
+
+/// Where the floor is for the reflection: just under the scene (the world is Y-up), and
+/// how fast the reflection fades with the height of what it mirrors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Floor {
+    pub y: f64,
+    pub fade: f64,
+}
+
+impl Floor {
+    /// The floor of a scene with bounds `lo`..`hi`: a hair below its lowest point, so a
+    /// face lying on the floor does not fight with its own reflection.
+    pub fn under(lo: V3, hi: V3) -> Self {
+        let size = length(sub(hi, lo)).max(1e-3);
+        Floor {
+            y: lo[1] - size * 0.001,
+            fade: ((hi[1] - lo[1]) * 1.5).max(size * 0.25),
+        }
+    }
+
+    /// Whether the reflection shows from this camera: only when it looks down on the
+    /// floor.
+    pub fn visible(&self, camera: &Camera) -> bool {
+        camera.eye_direction()[1] > 0.02
+    }
 }
 
 /// A rendered image with its depth and id buffers.
@@ -268,6 +365,13 @@ impl Frame {
         (id != 0).then(|| Pick::Face(id - 1))
     }
 
+    /// The faces and edges inside the rectangle from `min` to `max` (pixels): with
+    /// `crossing`, everything with a visible pixel in it, otherwise only what lies
+    /// entirely inside (every one of its visible pixels), as SolidWorks' box selection.
+    pub fn picks_in(&self, min: [f64; 2], max: [f64; 2], crossing: bool) -> Vec<Pick> {
+        picks_in_rect(&self.face_ids, &self.edge_ids, self.width, min, max, crossing)
+    }
+
     fn index(&self, x: i64, y: i64) -> Option<usize> {
         (x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height)
             .then(|| y as usize * self.width + x as usize)
@@ -276,19 +380,86 @@ impl Frame {
     fn put(&mut self, index: usize, color: [u8; 3]) {
         self.rgba[index * 4..index * 4 + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
     }
+
+    /// Blends `color` over the pixel with `alpha` coverage.
+    fn blend(&mut self, index: usize, color: [f32; 3], alpha: f32) {
+        let k = index * 4;
+        for c in 0..3 {
+            let under = f32::from(self.rgba[k + c]);
+            self.rgba[k + c] = (under + (color[c] - under) * alpha).clamp(0.0, 255.0) as u8;
+        }
+        self.rgba[k + 3] = 255;
+    }
 }
 
 fn rgb(c: [u8; 3]) -> [f32; 3] {
     c.map(f32::from)
 }
 
-fn face_color(face: u32, highlight: &Highlight, style: &Style) -> [f32; 3] {
+/// Box selection over id buffers (`index + 1` per pixel, 0 for none, rows of `width`
+/// pixels from the top): the faces and edges with a visible pixel inside the rectangle
+/// (`crossing`), or with all their visible pixels inside it. Edges come after faces.
+pub fn picks_in_rect(
+    face_ids: &[u32],
+    edge_ids: &[u32],
+    width: usize,
+    min: [f64; 2],
+    max: [f64; 2],
+    crossing: bool,
+) -> Vec<Pick> {
+    use std::collections::HashMap;
+    if width == 0 {
+        return Vec::new();
+    }
+    let (x0, x1) = (min[0].min(max[0]), min[0].max(max[0]));
+    let (y0, y1) = (min[1].min(max[1]), min[1].max(max[1]));
+    let inside = |i: usize| {
+        let (x, y) = ((i % width) as f64 + 0.5, (i / width) as f64 + 0.5);
+        x >= x0 && x <= x1 && y >= y0 && y <= y1
+    };
+    // Pixels of each id: inside the rectangle, and in all.
+    let count = |ids: &[u32]| -> HashMap<u32, (u32, u32)> {
+        let mut out: HashMap<u32, (u32, u32)> = HashMap::new();
+        for (i, &id) in ids.iter().enumerate() {
+            if id == 0 {
+                continue;
+            }
+            let entry = out.entry(id).or_insert((0, 0));
+            entry.1 += 1;
+            if inside(i) {
+                entry.0 += 1;
+            }
+        }
+        out
+    };
+    let chosen = |counts: HashMap<u32, (u32, u32)>| -> Vec<u32> {
+        let mut ids: Vec<u32> = counts
+            .into_iter()
+            .filter(|(_, (within, all))| *within > 0 && (crossing || within == all))
+            .map(|(id, _)| id - 1)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    let mut picks: Vec<Pick> = chosen(count(face_ids)).into_iter().map(Pick::Face).collect();
+    picks.extend(chosen(count(edge_ids)).into_iter().map(Pick::Edge));
+    picks
+}
+
+/// The colour a face is drawn in, and whether its texture (if any) replaces it:
+/// highlights win over the material, the material over the style.
+fn face_color(
+    face: u32,
+    material: &Material,
+    highlight: &Highlight,
+    style: &Style,
+) -> ([f32; 3], bool) {
     if highlight.is_hovered(Pick::Face(face)) {
-        rgb(style.face_hovered)
+        (rgb(style.face_hovered), false)
     } else if highlight.selected.contains(&Pick::Face(face)) {
-        rgb(style.face_selected)
+        (rgb(style.face_selected), false)
     } else {
-        rgb(style.face)
+        (rgb(material.color.unwrap_or(style.face)), true)
     }
 }
 
@@ -373,24 +544,68 @@ pub fn render_styled(
         eye: camera.eye_direction(),
         key: camera.key_light(),
     };
-
-    for (index, face) in scene.faces.iter().enumerate() {
-        let base = face_color(index as u32, highlight, style);
-        let projected: Vec<V3> = face
-            .positions
-            .iter()
-            .map(|&p| camera.project(p, w, h))
-            .collect();
+    let depth_of = |p: V3| -dot(sub(p, camera.target), camera.eye_direction());
+    let draw_face = |frame: &mut Frame, face: &SceneFace, world: &[V3], flip: bool, paint: &Paint| {
+        let projected: Vec<V3> = world.iter().map(|&p| camera.project(p, w, h)).collect();
         for t in &face.triangles {
+            let normals = t.map(|i| {
+                let n = face.normals[i];
+                if flip { [n[0], -n[1], n[2]] } else { n }
+            });
             raster_triangle(
-                &mut frame,
+                frame,
                 t.map(|i| projected[i]),
-                t.map(|i| face.normals[i]),
+                t.map(|i| world[i]),
+                normals,
                 &lights,
-                base,
-                index as u32 + 1,
+                paint,
             );
         }
+    };
+
+    // The reflection: the faces mirrored in the floor, faded with height, drawn first so
+    // the part itself covers it. Front to back, so each pixel is blended once.
+    let floor = scene.bounds().map(|(lo, hi)| Floor::under(lo, hi));
+    if let Some(floor) = floor.filter(|f| style.floor_reflection > 0.0 && f.visible(camera)) {
+        let mirror = |p: V3| [p[0], 2.0 * floor.y - p[1], p[2]];
+        let mut order: Vec<(f64, usize)> = (0..scene.faces.len())
+            .map(|i| (depth_of(mirror(scene.faces[i].centroid)), i))
+            .collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, index) in order {
+            let face = &scene.faces[index];
+            let material = scene.material(index);
+            let (base, textured) = face_color(index as u32, &material, highlight, style);
+            let paint = Paint {
+                base,
+                alpha: style.floor_reflection.clamp(0.0, 1.0) * material.opacity,
+                texture: textured.then(|| scene.texture_of(&material)).flatten(),
+                fade: Some(&floor),
+                write_depth: true,
+                id: 0,
+            };
+            let world: Vec<V3> = face.positions.iter().map(|&p| mirror(p)).collect();
+            draw_face(&mut frame, face, &world, true, &paint);
+        }
+    }
+
+    let mut transparent: Vec<(f64, usize)> = Vec::new();
+    for (index, face) in scene.faces.iter().enumerate() {
+        let material = scene.material(index);
+        if material.is_transparent() {
+            transparent.push((depth_of(face.centroid), index));
+            continue;
+        }
+        let (base, textured) = face_color(index as u32, &material, highlight, style);
+        let paint = Paint {
+            base,
+            alpha: 1.0,
+            texture: textured.then(|| scene.texture_of(&material)).flatten(),
+            fade: None,
+            write_depth: true,
+            id: index as u32 + 1,
+        };
+        draw_face(&mut frame, face, &face.positions, false, &paint);
     }
 
     // Edges are drawn over faces they lie on, but hidden behind faces in front of them.
@@ -415,7 +630,38 @@ pub fn render_styled(
             );
         }
     }
+
+    // See-through faces last, the farthest first, blended over what is behind them. They
+    // leave the depth alone, so what is behind stays visible, but they can be picked.
+    transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, index) in transparent {
+        let face = &scene.faces[index];
+        let material = scene.material(index);
+        let (base, textured) = face_color(index as u32, &material, highlight, style);
+        let paint = Paint {
+            base,
+            alpha: material.opacity.clamp(0.0, 1.0),
+            texture: textured.then(|| scene.texture_of(&material)).flatten(),
+            fade: None,
+            write_depth: false,
+            id: index as u32 + 1,
+        };
+        draw_face(&mut frame, face, &face.positions, false, &paint);
+    }
     frame
+}
+
+/// How a triangle is painted.
+struct Paint<'a> {
+    base: [f32; 3],
+    alpha: f32,
+    /// Replaces `base`, with its scale in mm per repeat.
+    texture: Option<(&'a Texture, f32)>,
+    /// A reflection: fades with the height of the mirrored point above the floor.
+    fade: Option<&'a Floor>,
+    write_depth: bool,
+    /// Face index + 1, or 0 to leave the id buffer alone.
+    id: u32,
 }
 
 /// Twice the signed area of the triangle (a, b, (x, y)).
@@ -426,10 +672,10 @@ fn edge_fn(a: V3, b: V3, x: f64, y: f64) -> f64 {
 fn raster_triangle(
     frame: &mut Frame,
     p: [V3; 3],
+    world: [V3; 3],
     normals: [V3; 3],
     lights: &Lights,
-    base: [f32; 3],
-    id: u32,
+    paint: &Paint,
 ) {
     let area = edge_fn(p[0], p[1], p[2][0], p[2][1]);
     if area.abs() < 1e-12 || p.iter().flatten().any(|v| !v.is_finite()) {
@@ -442,6 +688,7 @@ fn raster_triangle(
     if min_x > max_x || min_y > max_y {
         return;
     }
+    let opaque = paint.alpha >= 0.999 && paint.fade.is_none();
 
     for y in min_y..=max_y {
         let py = y as f64 + 0.5;
@@ -458,15 +705,44 @@ fn raster_triangle(
             if z >= frame.depth[index] {
                 continue;
             }
-            frame.depth[index] = z;
-            frame.face_ids[index] = id;
+            if paint.write_depth {
+                frame.depth[index] = z;
+            }
+            if paint.id != 0 {
+                frame.face_ids[index] = paint.id;
+            }
 
             let n = add(
                 add(scale(normals[0], w0), scale(normals[1], w1)),
                 scale(normals[2], w2),
             );
-            let light = normalize(n).map_or(1.0, |n| shade(n, lights));
-            frame.put(index, base.map(|c| (c * light).min(255.0) as u8));
+            let n = normalize(n);
+            let light = n.map_or(1.0, |n| shade(n, lights));
+            let q = add(
+                add(scale(world[0], w0), scale(world[1], w1)),
+                scale(world[2], w2),
+            );
+            let base = match paint.texture {
+                Some((texture, scale_mm)) => texture.triplanar(
+                    [q[0] as f32, q[1] as f32, q[2] as f32],
+                    n.map_or([0.0, 1.0, 0.0], |n| [n[0] as f32, n[1] as f32, n[2] as f32]),
+                    scale_mm,
+                ),
+                None => paint.base,
+            };
+            let color = base.map(|c| (c * light).min(255.0));
+            if opaque {
+                frame.put(index, color.map(|c| c as u8));
+                continue;
+            }
+            let mut alpha = paint.alpha;
+            if let Some(floor) = paint.fade {
+                let height = (floor.y - q[1]).max(0.0);
+                alpha *= (1.0 - height / floor.fade).clamp(0.0, 1.0) as f32;
+            }
+            if alpha > 0.0 {
+                frame.blend(index, color, alpha);
+            }
         }
     }
 }
@@ -696,6 +972,160 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn pixel(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
+        let at = (y * frame.width + x) * 4;
+        [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
+    }
+
+    #[test]
+    fn materials_colour_faces_and_transparent_ones_blend() {
+        let mut scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let style = Style::LIGHT;
+        let plain = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        // Face 0 red and half transparent, face 1 (behind, covering everything) green.
+        scene.set_materials(
+            vec![
+                Material {
+                    color: Some([255, 0, 0]),
+                    opacity: 0.5,
+                    ..Material::default()
+                },
+                Material {
+                    color: Some([0, 255, 0]),
+                    ..Material::default()
+                },
+            ],
+            Vec::new(),
+        );
+        assert!(scene.has_transparency());
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        let corner = pixel(&frame, 5, 5);
+        assert!(corner[1] > 100 && corner[0] == 0 && corner[2] == 0, "{corner:?}");
+        let middle = pixel(&frame, 50, 50);
+        // Red over green, half and half: both channels present.
+        assert!(middle[0] > 60 && middle[1] > 60 && middle[2] == 0, "{middle:?}");
+        assert_ne!(middle, pixel(&plain, 50, 50));
+        // The transparent face is still what the cursor is on; the edges still show.
+        assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(0)));
+        assert_eq!(frame.pick(27.0, 50.0, 3.0), Some(Pick::Edge(3)));
+        // A selected transparent face takes the selection colour.
+        let selected = render_styled(
+            &scene,
+            &camera,
+            100,
+            100,
+            &Highlight {
+                selected: vec![Pick::Face(0)],
+                ..Highlight::default()
+            },
+            &style,
+        );
+        assert_ne!(pixel(&selected, 50, 50), middle);
+    }
+
+    #[test]
+    fn textures_are_mapped_over_faces() {
+        let mut scene = Scene::from_mesh(&mesh());
+        // A 2 × 2 checker: black and white squares, 10 mm per repeat on face 0 (20 mm
+        // wide: two repeats, four squares across).
+        let px = |v: u8| [v, v, v, 255];
+        let checker = Texture {
+            width: 2,
+            height: 2,
+            rgba: [px(0), px(255), px(255), px(0)].concat(),
+        };
+        scene.set_materials(
+            vec![Material {
+                texture: Some(0),
+                texture_scale: 10.0,
+                ..Material::default()
+            }],
+            vec![std::sync::Arc::new(checker)],
+        );
+        let frame = render_styled(
+            &scene,
+            &front_camera(),
+            100,
+            100,
+            &Highlight::default(),
+            &Style::LIGHT,
+        );
+        // Face 0 spans pixels 25..75 (2.5 px/mm). Squares are 5 mm = 12.5 px wide.
+        let a = pixel(&frame, 31, 44);
+        let b = pixel(&frame, 44, 44);
+        assert!(a[0].abs_diff(b[0]) > 100, "{a:?} vs {b:?}");
+        // The big face behind keeps the plain colour.
+        assert_eq!(pixel(&frame, 5, 5), pixel(&frame, 94, 94));
+        // Out-of-range texture indices are ignored rather than crashing.
+        scene.set_materials(
+            vec![Material {
+                texture: Some(7),
+                ..Material::default()
+            }],
+            Vec::new(),
+        );
+        assert!(scene.materials().is_empty());
+    }
+
+    #[test]
+    fn the_floor_reflects_the_part_when_asked() {
+        // A square standing up (its plane is XY), seen from an isometric view: the
+        // reflection shows under it.
+        let scene = Scene::from_mesh(&Mesh {
+            faces: vec![mesh().faces[0].clone()],
+            edges: Vec::new(),
+        });
+        let (w, h) = (120usize, 120usize);
+        let mut camera = Camera::default();
+        camera.set_view(StandardView::Isometric);
+        let (lo, hi) = scene.bounds().unwrap();
+        camera.fit([lo[0], lo[1] - 25.0, lo[2]], [hi[0], hi[1], hi[2]], w as f64, h as f64);
+        let plain = render_styled(&scene, &camera, w, h, &Highlight::default(), &Style::LIGHT);
+        let mirrored = Style {
+            floor_reflection: 0.5,
+            ..Style::LIGHT
+        };
+        let frame = render_styled(&scene, &camera, w, h, &Highlight::default(), &mirrored);
+        // Where the reflection is, below the part, the image differs from the plain one;
+        // the part itself and the ids are untouched.
+        let below = camera.project([0.0, -14.0, 0.0], w as f64, h as f64);
+        let (bx, by) = (below[0] as usize, below[1] as usize);
+        assert_ne!(pixel(&frame, bx, by), pixel(&plain, bx, by));
+        assert_eq!(frame.pick(bx as f64, by as f64, 0.0), None);
+        let on = camera.project([0.0, 5.0, 0.0], w as f64, h as f64);
+        let (ox, oy) = (on[0] as usize, on[1] as usize);
+        assert_eq!(pixel(&frame, ox, oy), pixel(&plain, ox, oy));
+        assert_eq!(frame.pick(ox as f64, oy as f64, 0.0), Some(Pick::Face(0)));
+        // From below the floor there is no reflection.
+        camera.set_view(StandardView::Bottom);
+        let frame = render_styled(&scene, &camera, w, h, &Highlight::default(), &mirrored);
+        let plain = render_styled(&scene, &camera, w, h, &Highlight::default(), &Style::LIGHT);
+        assert_eq!(frame.rgba, plain.rgba);
+    }
+
+    #[test]
+    fn box_selection_takes_what_is_inside_or_touched() {
+        let scene = Scene::from_mesh(&mesh());
+        let frame = render(&scene, &front_camera(), 100, 100, &Highlight::default());
+        // Face 0 spans pixels 25..75; face 1 shows around it. A box around face 0 only.
+        let inside = frame.picks_in([20.0, 20.0], [80.0, 80.0], false);
+        assert_eq!(
+            inside,
+            vec![Pick::Face(0), Pick::Edge(0), Pick::Edge(1), Pick::Edge(2), Pick::Edge(3)]
+        );
+        // Crossing: the big face behind is touched too.
+        let crossing = frame.picks_in([20.0, 20.0], [80.0, 80.0], true);
+        assert!(crossing.contains(&Pick::Face(1)) && crossing.contains(&Pick::Face(0)));
+        // A box over the left half: nothing lies entirely inside, but the left edge.
+        let half = frame.picks_in([10.0, 10.0], [40.0, 90.0], false);
+        assert_eq!(half, vec![Pick::Edge(3)]);
+        let half = frame.picks_in([10.0, 10.0], [40.0, 90.0], true);
+        assert!(half.contains(&Pick::Face(0)) && !half.contains(&Pick::Edge(1)));
+        // Nothing in an empty corner... of face 1, which covers it.
+        assert_eq!(frame.picks_in([0.0, 0.0], [3.0, 3.0], true), vec![Pick::Face(1)]);
     }
 
     #[test]

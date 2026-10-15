@@ -21,6 +21,9 @@ pub struct Style {
     /// Edge width in pixels, and of a selected or hovered edge.
     pub edge_width: f32,
     pub highlight_width: f32,
+    /// Strength of the part's reflection in a floor just under it, 0 (none) to 1: a
+    /// mirrored, faded copy drawn below the part.
+    pub floor_reflection: f32,
 }
 
 impl Style {
@@ -37,6 +40,7 @@ impl Style {
         show_edges: true,
         edge_width: 1.25,
         highlight_width: 3.0,
+        floor_reflection: 0.0,
     };
 
     /// Dark background, light part.

@@ -17,7 +17,7 @@ use std::path::Path;
 use eframe::egui::{self, Color32, RichText, Stroke};
 use oxyde_assembly::{
     Assembly, ComponentId, MateId, MateKind, MateRef, MateStatus, MateTarget, PrimitiveKind,
-    Solution, bom, default_alignment,
+    Solution, bom, default_alignment_between,
 };
 use oxyde_geom::{Point3, Vec3};
 use oxyde_model::{StandardAxis, StandardPlane};
@@ -180,6 +180,7 @@ enum TreeAction {
     Hide(ComponentId),
     Fix(ComponentId, bool),
     OpenPart(ComponentId),
+    Appearance(ComponentId),
     DeleteComponent(ComponentId),
     EditMate(MateId),
     FlipMate(MateId),
@@ -606,7 +607,9 @@ impl OxydeApp {
             if let (Some(pa), Some(pb)) =
                 (doc.placed(&doc.assembly, a), doc.placed(&doc.assembly, b))
             {
-                d.aligned = default_alignment(&pa, &pb);
+                // Between the faces or edges of two solids, square faces start touching.
+                let solid = |r: &MateRef| matches!(r.target, MateTarget::Face(_) | MateTarget::Edge(_));
+                d.aligned = default_alignment_between(&pa, &pb, solid(a) && solid(b));
             }
         }
     }
@@ -892,6 +895,8 @@ impl OxydeApp {
                     ui.close_menu();
                     self.viewport.request_fit();
                 }
+                ui.separator();
+                self.floor_reflections_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
@@ -916,10 +921,12 @@ impl OxydeApp {
                 }
                 if ui.button("Assembly mouse controls").clicked() {
                     ui.close_menu();
-                    self.status = "Left-drag orbits about the point under the pointer, \
-                                   right-drag pans, middle double-click fits; Alt+drag moves a \
-                                   component, Alt+Shift+drag turns it"
-                        .to_owned();
+                    let help = self.prefs.navigation.mouse.help();
+                    self.status = format!(
+                        "Orbit: {}. Pan: {}. Middle double-click fits. Alt+left-drag moves a \
+                         component, Alt+Shift+left-drag turns it",
+                        help[0].1, help[1].1
+                    );
                 }
                 if ui.button("About Oxyde").clicked() {
                     ui.close_menu();
@@ -1096,6 +1103,7 @@ impl OxydeApp {
     pub(crate) fn assembly_panel(&mut self, ui: &mut egui::Ui) {
         self.mate_manager(ui);
         self.refresh_mate_preview();
+        self.property_manager(ui);
         self.assembly_tree(ui);
     }
 
@@ -1522,6 +1530,10 @@ impl OxydeApp {
                             action = Some(TreeAction::Hide(id));
                             ui.close_menu();
                         }
+                        if ui.button("Appearance…").clicked() {
+                            action = Some(TreeAction::Appearance(id));
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui.button("Delete").clicked() {
                             action = Some(TreeAction::DeleteComponent(id));
@@ -1702,6 +1714,7 @@ impl OxydeApp {
             }
             TreeAction::Fix(id, fixed) => self.toggle_fixed(id, fixed),
             TreeAction::OpenPart(id) => self.pending_open_component = Some(id),
+            TreeAction::Appearance(id) => self.begin_component_appearance(id),
             TreeAction::DeleteComponent(id) => {
                 if let Some(doc) = self.asm.as_mut() {
                     doc.checkpoint();
@@ -1809,6 +1822,31 @@ impl OxydeApp {
                 }
             }
         }
+        // A selection box takes whole components, unless the Mate command is collecting.
+        if let (Some(b), None) = (output.box_select, &self.mate_dialog) {
+            let picks = self.viewport.picks_in(&b);
+            if let Some(doc) = self.asm.as_mut() {
+                let mut components: Vec<ComponentId> = Vec::new();
+                for pick in picks {
+                    if let Some(c) = doc.picked(pick).and_then(|s| s.component()) {
+                        if !components.contains(&c) {
+                            components.push(c);
+                        }
+                    }
+                }
+                if !output.additive {
+                    doc.selection.clear();
+                }
+                for c in components {
+                    let item = AsmSelected::Component(c);
+                    if !doc.selection.contains(&item) {
+                        doc.selection.push(item);
+                    }
+                }
+                self.asm_plane = None;
+                self.status = format!("{} component(s) selected", doc.selection.len());
+            }
+        }
         // Right-click on the part: what can be done with its component.
         let hovered = self
             .asm
@@ -1831,6 +1869,10 @@ impl OxydeApp {
                 }
                 if ui.button("Mate…").clicked() {
                     self.begin_mate();
+                    ui.close_menu();
+                }
+                if ui.button("Appearance…").clicked() {
+                    self.begin_component_appearance(id);
                     ui.close_menu();
                 }
             }
@@ -1981,7 +2023,10 @@ impl OxydeApp {
             None => doc.assembly.clone(),
         };
         let mesh = doc.scene_mesh(&assembly);
-        self.viewport.set_scene(Scene::from_mesh(&mesh), first);
+        let mut scene = Scene::from_mesh(&mesh);
+        let (materials, textures) = self.assembly_materials(&assembly);
+        scene.set_materials(materials, textures);
+        self.viewport.set_scene(scene, first);
     }
 
     pub(crate) fn assembly_shortcuts(&mut self, ctx: &egui::Context) {

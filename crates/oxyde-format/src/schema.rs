@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText,
+    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText,
     Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
     FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Mirror,
     PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
-    Sketch, SketchPlane, StandardAxis, StandardPlane, VertexName,
+    Sketch, SketchPlane, StandardAxis, StandardPlane, Texture, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -74,6 +74,187 @@ pub(crate) struct PartModel {
     pub equations: Vec<EquationDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_global_id: Option<u32>,
+    /// Colours, transparency and textures; absent = the viewport's default everywhere.
+    #[serde(default, skip_serializing_if = "AppearancesDto::is_empty")]
+    pub appearances: AppearancesDto,
+}
+
+// ---- Appearances ---------------------------------------------------------------------------
+
+/// The appearances of a part: its own, and those of bodies and faces, which win over it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub(crate) struct AppearancesDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<AppearanceDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bodies: Vec<BodyAppearanceDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub faces: Vec<FaceAppearanceDto>,
+}
+
+impl AppearancesDto {
+    pub fn is_empty(&self) -> bool {
+        self.part.is_none() && self.bodies.is_empty() && self.faces.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BodyAppearanceDto {
+    pub body: BodyIdDto,
+    #[serde(flatten)]
+    pub appearance: AppearanceDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FaceAppearanceDto {
+    pub face: FaceRefDto,
+    #[serde(flatten)]
+    pub appearance: AppearanceDto,
+}
+
+/// A colour, a transparency and an optional texture.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AppearanceDto {
+    /// sRGB, 0–255.
+    pub color: [u8; 3],
+    /// 0 (opaque, the default) to 1 (invisible).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub transparency: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture: Option<TextureDto>,
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// An image repeated over the surface, kept in the archive under `textures/`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TextureDto {
+    /// The archive entry holding the image (PNG or JPEG).
+    pub file: String,
+    /// The image's original file name, for display.
+    #[serde(default)]
+    pub file_name: String,
+    /// Millimetres covered by one repeat of the image.
+    pub scale: f64,
+}
+
+/// The texture images of a document and the archive entries they are written to: each
+/// image once, however many appearances use it.
+#[derive(Debug, Default)]
+pub struct TextureTable {
+    entries: Vec<(FileData, String)>,
+}
+
+impl TextureTable {
+    pub fn new<'a>(textures: impl IntoIterator<Item = &'a Texture>) -> Self {
+        let mut table = Self::default();
+        for t in textures {
+            if table.entries.iter().any(|(d, _)| *d == t.data) {
+                continue;
+            }
+            let extension = std::path::Path::new(&t.file_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg"))
+                .unwrap_or_else(|| "bin".to_owned());
+            let name = format!("textures/{}.{}", table.entries.len() + 1, extension);
+            table.entries.push((t.data.clone(), name));
+        }
+        table
+    }
+
+    /// The archive entries to write: name and contents.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.entries.iter().map(|(d, n)| (n.as_str(), d.bytes()))
+    }
+
+    fn entry(&self, data: &FileData) -> String {
+        self.entries
+            .iter()
+            .find(|(d, _)| d == data)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn appearance_dto(a: &Appearance, textures: &TextureTable) -> AppearanceDto {
+    AppearanceDto {
+        color: a.color,
+        transparency: a.transparency,
+        texture: a.texture.as_ref().map(|t| TextureDto {
+            file: textures.entry(&t.data),
+            file_name: t.file_name.clone(),
+            scale: t.scale,
+        }),
+    }
+}
+
+/// `files` holds the archive's `textures/` entries by name.
+pub(crate) fn appearance_from(
+    dto: AppearanceDto,
+    files: &HashMap<String, Vec<u8>>,
+) -> Result<Appearance, String> {
+    let texture = match dto.texture {
+        Some(t) => Some(Texture {
+            data: FileData::new(
+                files
+                    .get(&t.file)
+                    .cloned()
+                    .ok_or_else(|| format!("texture {} is missing from the archive", t.file))?,
+            ),
+            file_name: t.file_name,
+            scale: t.scale,
+        }),
+        None => None,
+    };
+    Ok(Appearance {
+        color: dto.color,
+        transparency: dto.transparency,
+        texture,
+    }
+    .clamped())
+}
+
+pub(crate) fn appearances_dto(a: &Appearances, textures: &TextureTable) -> AppearancesDto {
+    AppearancesDto {
+        part: a.part.as_ref().map(|p| appearance_dto(p, textures)),
+        bodies: a
+            .bodies
+            .iter()
+            .map(|(id, p)| BodyAppearanceDto {
+                body: body_dto(id),
+                appearance: appearance_dto(p, textures),
+            })
+            .collect(),
+        faces: a
+            .faces
+            .iter()
+            .map(|(name, p)| FaceAppearanceDto {
+                face: face_dto(name),
+                appearance: appearance_dto(p, textures),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn appearances_from(
+    dto: AppearancesDto,
+    files: &HashMap<String, Vec<u8>>,
+) -> Result<Appearances, String> {
+    let mut out = Appearances::default();
+    if let Some(p) = dto.part {
+        out.set_part(Some(appearance_from(p, files)?));
+    }
+    for b in dto.bodies {
+        out.set_body(body_from(b.body), Some(appearance_from(b.appearance, files)?));
+    }
+    for f in dto.faces {
+        out.set_face(&face_from(f.face), Some(appearance_from(f.appearance, files)?));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -438,9 +619,10 @@ pub(crate) struct VertexRefDto {
 // ---- Model → file --------------------------------------------------------------------------
 
 impl PartModel {
-    pub fn from_definition(definition: &PartDefinition) -> Self {
+    pub fn from_definition(definition: &PartDefinition, textures: &TextureTable) -> Self {
         let text = definition.equations_text();
         Self {
+            appearances: appearances_dto(&definition.appearances, textures),
             next_feature_id: definition.next_id,
             rollback: definition.rollback,
             features: definition.features.iter().map(feature_dto).collect(),
@@ -800,6 +982,8 @@ impl PartModel {
             rollback: self.rollback,
             next_id: self.next_feature_id,
             equations: Equations::default(),
+            appearances: appearances_from(self.appearances, files)
+                .map_err(|e| format!("appearances: {e}"))?,
         };
         definition
             .set_equations_text(EquationsText {

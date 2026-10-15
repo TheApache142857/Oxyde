@@ -43,7 +43,11 @@ pub(crate) fn box_active() -> Color32 {
 
 /// A selection box: what the command acts on, filled by clicking in the viewport or the
 /// timeline. Items are (label, hover text). Returns the index of an item the user removed.
-fn selection_box(ui: &mut egui::Ui, items: &[(String, String)], hint: &str) -> Option<usize> {
+pub(crate) fn selection_box(
+    ui: &mut egui::Ui,
+    items: &[(String, String)],
+    hint: &str,
+) -> Option<usize> {
     let mut removed = None;
     egui::Frame::none()
         .fill(box_fill())
@@ -621,6 +625,7 @@ impl OxydeApp {
                 }
                 None => false,
             },
+            Dialog::Appearance(d) => self.appearance_pick(d, pick),
             Dialog::RefAxis(d) => {
                 if d.two_planes {
                     match self.plane_of_pick(&pick, d.editing) {
@@ -670,6 +675,14 @@ impl OxydeApp {
             _ => None,
         };
         let picks = match dialog {
+            Dialog::Appearance(d) => match d.scope {
+                crate::appearance_ui::Scope::Faces => d.faces.iter().filter_map(face).collect(),
+                crate::appearance_ui::Scope::Body(id) => body
+                    .and_then(|b| b.solid(id))
+                    .map(|s| s.faces.clone().map(Pick::Face).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            },
             Dialog::Blend(d) => d.edges.iter().filter_map(edge).collect(),
             Dialog::Shell(d) => d.faces.iter().filter_map(face).collect(),
             Dialog::Revolve(d) => match d.axes.get(d.axis).map(|(_, a)| a) {
@@ -782,7 +795,11 @@ impl OxydeApp {
                     self.dialog = Some(dialog);
                 }
             }
-            Answer::Cancel => {}
+            Answer::Cancel => {
+                if let Dialog::Appearance(d) = dialog {
+                    self.cancel_appearance(d);
+                }
+            }
             Answer::Ok => self.apply_dialog(dialog, &ctx),
         }
     }
@@ -831,6 +848,10 @@ impl OxydeApp {
             ),
             Dialog::RefPlane(_) => (Icon::RefPlane, "Plane", true),
             Dialog::RefAxis(_) => (Icon::RefAxis, "Axis", true),
+            Dialog::Appearance(d) => {
+                let (title, ready) = self.appearance_header(d);
+                (Icon::Appearance, title, ready)
+            }
             _ => (Icon::Part, "", false),
         }
     }
@@ -847,6 +868,7 @@ impl OxydeApp {
             Dialog::Combine(d) => self.combine_body(ui, d),
             Dialog::RefPlane(d) => ref_plane_body(ui, d),
             Dialog::RefAxis(d) => ref_axis_body(ui, d),
+            Dialog::Appearance(d) => return self.appearance_body(ui, d),
             _ => {}
         }
         false

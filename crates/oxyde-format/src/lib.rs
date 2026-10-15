@@ -28,7 +28,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use assembly_schema::AssemblyModel;
 pub use schema::Properties;
-use schema::{Manifest, PartModel, Units, import_entry};
+use schema::{Manifest, PartModel, TextureTable, Units, import_entry};
 
 /// The `format_version` written by this crate, and the newest it can read.
 pub const FORMAT_VERSION: u32 = 1;
@@ -255,12 +255,13 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
+    let textures = TextureTable::new(part.definition.appearances.textures());
     // The manifest goes first so readers can identify the file cheaply.
     for (entry, bytes) in [
         (MANIFEST, to_json(MANIFEST, &manifest)?),
         (
             MODEL,
-            to_json(MODEL, &PartModel::from_definition(&part.definition))?,
+            to_json(MODEL, &PartModel::from_definition(&part.definition, &textures))?,
         ),
         (PROPERTIES, to_json(PROPERTIES, &part.properties)?),
     ] {
@@ -274,7 +275,39 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
             zip.write_all(import.data.bytes())?;
         }
     }
+    write_textures(&mut zip, &textures, options)?;
     Ok(zip.finish()?)
+}
+
+/// Texture images are already compressed: stored as they are.
+fn write_textures<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    textures: &TextureTable,
+    options: SimpleFileOptions,
+) -> Result<(), FormatError> {
+    for (name, bytes) in textures.entries() {
+        zip.start_file(name, options.compression_method(CompressionMethod::Stored))?;
+        zip.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+/// The archive's binary entries (imported files, texture images) by name.
+fn read_files<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Result<HashMap<String, Vec<u8>>, FormatError> {
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|name| name.starts_with("imports/") || name.starts_with("textures/"))
+        .map(str::to_owned)
+        .collect();
+    let mut files = HashMap::new();
+    for name in names {
+        let mut bytes = Vec::new();
+        archive.by_name(&name)?.read_to_end(&mut bytes)?;
+        files.insert(name, bytes);
+    }
+    Ok(files)
 }
 
 /// Reads a part document (`.oxyprt` or `.oxy`) and checks that its timeline is valid.
@@ -285,17 +318,7 @@ pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
 
     let model: PartModel = from_json(MODEL, &read_entry(&mut archive, MODEL)?)?;
     let properties: Properties = from_json(PROPERTIES, &read_entry(&mut archive, PROPERTIES)?)?;
-    let mut files = HashMap::new();
-    let imports: Vec<String> = archive
-        .file_names()
-        .filter(|name| name.starts_with("imports/"))
-        .map(str::to_owned)
-        .collect();
-    for name in imports {
-        let mut bytes = Vec::new();
-        archive.by_name(&name)?.read_to_end(&mut bytes)?;
-        files.insert(name, bytes);
-    }
+    let files = read_files(&mut archive)?;
 
     let definition = model
         .into_definition(&files)
@@ -399,17 +422,28 @@ pub fn write_assembly<W: Write + Seek>(
     let manifest = manifest(DocumentKind::Assembly, &assembly.document_id);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
+    let textures = TextureTable::new(
+        assembly
+            .assembly
+            .components
+            .iter()
+            .filter_map(|c| c.appearance.as_ref()?.texture.as_ref()),
+    );
     for (entry, bytes) in [
         (MANIFEST, to_json(MANIFEST, &manifest)?),
         (
             ASSEMBLY,
-            to_json(ASSEMBLY, &AssemblyModel::from_assembly(&assembly.assembly))?,
+            to_json(
+                ASSEMBLY,
+                &AssemblyModel::from_assembly(&assembly.assembly, &textures),
+            )?,
         ),
         (PROPERTIES, to_json(PROPERTIES, &assembly.properties)?),
     ] {
         zip.start_file(entry, options)?;
         zip.write_all(&bytes)?;
     }
+    write_textures(&mut zip, &textures, options)?;
     Ok(zip.finish()?)
 }
 
@@ -426,8 +460,9 @@ pub fn read_assembly<R: Read + Seek>(reader: R) -> Result<AssemblyFile, FormatEr
     } else {
         Properties::default()
     };
+    let files = read_files(&mut archive)?;
     let assembly = model
-        .into_assembly()
+        .into_assembly(&files)
         .map_err(FormatError::InvalidAssembly)?;
     Ok(AssemblyFile {
         document_id: manifest.document_id,
@@ -939,6 +974,93 @@ mod tests {
             Err(FormatError::WrongKind { found, .. }) => assert_eq!(found, "assembly"),
             other => panic!("expected the wrong kind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn appearances_and_textures_round_trip() {
+        use oxyde_model::{Appearance, FileData, Texture};
+        let mut file = sample();
+        let boss = file.definition.features[1].id();
+        let wood = Texture {
+            file_name: "oak.PNG".into(),
+            data: FileData::new(b"PNG, not really".to_vec()),
+            scale: 80.0,
+        };
+        let steel = Texture {
+            file_name: "brushed.jpg".into(),
+            data: FileData::new(b"JPEG, not really".to_vec()),
+            scale: 25.0,
+        };
+        let a = &mut file.definition.appearances;
+        a.set_part(Some(Appearance {
+            color: [200, 160, 90],
+            transparency: 0.0,
+            texture: Some(wood.clone()),
+        }));
+        a.set_body(
+            BodyId::new(boss, 0),
+            Some(Appearance {
+                color: [120, 125, 130],
+                transparency: 0.4,
+                texture: Some(steel),
+            }),
+        );
+        // The same image twice is stored once.
+        a.set_face(
+            &FaceName::end_cap(boss),
+            Some(Appearance {
+                color: [10, 20, 30],
+                transparency: 0.0,
+                texture: Some(Texture {
+                    file_name: "copy of oak.png".into(),
+                    ..wood
+                }),
+            }),
+        );
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes.clone())).unwrap();
+        let mut names: Vec<&str> = archive
+            .file_names()
+            .filter(|n| n.starts_with("textures/"))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["textures/1.png", "textures/2.jpg"]);
+        let model = String::from_utf8(read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert!(model.contains("\"file\": \"textures/1.png\""));
+        assert!(model.contains("\"transparency\": 0.4"));
+        assert_eq!(read_part(Cursor::new(bytes)).unwrap(), file);
+
+        // A part without appearances writes none.
+        let plain = write_part(Cursor::new(Vec::new()), &sample())
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(plain)).unwrap();
+        assert!(archive.file_names().all(|n| !n.starts_with("textures/")));
+        let model = String::from_utf8(read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert!(!model.contains("appearances"));
+    }
+
+    #[test]
+    fn component_appearances_round_trip() {
+        use oxyde_model::{Appearance, FileData, Texture};
+        let mut file = sample_assembly();
+        file.assembly.components[1].appearance = Some(Appearance {
+            color: [255, 0, 0],
+            transparency: 0.25,
+            texture: Some(Texture {
+                file_name: "red.png".into(),
+                data: FileData::new(vec![1, 2, 3, 4]),
+                scale: 10.0,
+            }),
+        });
+        let bytes = write_assembly(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let archive = ZipArchive::new(Cursor::new(bytes.clone())).unwrap();
+        assert!(archive.file_names().any(|n| n == "textures/1.png"));
+        assert_eq!(read_assembly(Cursor::new(bytes)).unwrap(), file);
     }
 
     #[test]

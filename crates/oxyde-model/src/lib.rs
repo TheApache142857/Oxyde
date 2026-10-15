@@ -9,10 +9,13 @@
 //!   (`D1@Sketch1`); [`DimensionRef`] refers to one by stable ids.
 //! - [`Equations`]: global variables and equations driving dimensions
 //!   (`"D1@Sketch1" = "Width" * 2`), evaluated before every rebuild.
+//! - [`Appearances`]: colours, transparency and colour textures of the part, its bodies and
+//!   single faces (display only; not part of the rebuild).
 //!
 //! Depends on the `Kernel` trait only, never on a concrete backend.
 //! See `docs/ARCHITECTURE.md` §6.
 
+mod appearance;
 mod bodies;
 mod dimensions;
 mod equations;
@@ -22,6 +25,7 @@ mod feature;
 mod naming;
 mod part;
 
+pub use appearance::{Appearance, Appearances, Texture};
 pub use bodies::{Body, Solid};
 pub use dimensions::{
     Dimension, DimensionKey, DimensionRef, DimensionUnit, full_name, split_full_name,

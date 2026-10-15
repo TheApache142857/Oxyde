@@ -57,6 +57,7 @@ impl OxydeApp {
         let p = &self.prefs;
         self.viewport.settings = ViewSettings {
             style: p.graphics.style(),
+            mouse: p.navigation.mouse,
             show_triad: p.graphics.show_triad,
             orbit_speed: p.navigation.orbit_speed,
             zoom_speed: p.navigation.zoom_speed,
@@ -86,7 +87,7 @@ impl OxydeApp {
         self.prefs.graphics.mesh_quality.fraction()
     }
 
-    fn save_preferences(&mut self) {
+    pub(crate) fn save_preferences(&mut self) {
         if let Err(e) = self.prefs.save() {
             self.status = format!("Could not save the preferences: {e}");
         }
@@ -225,6 +226,14 @@ impl OxydeApp {
             });
         });
         ui.checkbox(&mut g.show_triad, "Orientation triad in the corner");
+        ui.checkbox(&mut g.floor_reflections, "Floor reflections")
+            .on_hover_text("The part mirrored in a floor just under it (also in View)");
+        ui.add_enabled_ui(g.floor_reflections, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Reflection strength");
+                ui.add(egui::Slider::new(&mut g.reflection_strength, 0.05..=1.0));
+            });
+        });
         ui.horizontal(|ui| {
             ui.label("Mesh quality");
             egui::ComboBox::from_id_salt("mesh_quality")
@@ -254,6 +263,20 @@ impl OxydeApp {
     fn navigation_page(&mut self, ui: &mut egui::Ui) {
         let n = &mut self.prefs.navigation;
         egui::Grid::new("navigation").num_columns(2).show(ui, |ui| {
+            ui.label("Mouse buttons");
+            egui::ComboBox::from_id_salt("mouse_scheme")
+                .selected_text(
+                    crate::prefs::MouseScheme::ALL
+                        .iter()
+                        .find(|(s, _)| *s == n.mouse)
+                        .map_or("", |(_, l)| *l),
+                )
+                .show_ui(ui, |ui| {
+                    for (scheme, label) in crate::prefs::MouseScheme::ALL {
+                        ui.selectable_value(&mut n.mouse, scheme, label);
+                    }
+                });
+            ui.end_row();
             ui.label("Orbit speed");
             ui.add(egui::Slider::new(&mut n.orbit_speed, 0.2..=3.0).suffix("×"));
             ui.end_row();
@@ -287,20 +310,18 @@ impl OxydeApp {
         });
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Mouse");
+        let help = n.mouse.help();
         for (what, how) in [
-            ("Orbit", "left-drag, about the point under the pointer"),
-            ("Pan", "right-drag, middle-drag, or Shift+left-drag"),
+            help[0],
+            help[1],
             ("Zoom", "wheel, at the pointer"),
             ("Zoom to fit", "double-click the middle button, or F"),
-            ("Select", "click; Ctrl+click adds"),
+            help[2],
             (
                 "Move a component (assembly)",
-                "Alt+drag; Alt+Shift+drag turns it",
+                "Alt+left-drag; Alt+Shift+left-drag turns it",
             ),
-            (
-                "Sketch mode",
-                "right-drag or middle-drag pans, Ctrl+middle-drag orbits",
-            ),
+            help[3],
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(what).strong());

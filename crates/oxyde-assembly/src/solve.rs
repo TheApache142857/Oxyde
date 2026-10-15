@@ -53,6 +53,7 @@ impl Solution {
 }
 
 /// A mate whose two sides could be resolved, ready to solve.
+#[derive(Clone)]
 struct Active {
     id: MateId,
     kind: crate::MateKind,
@@ -246,11 +247,14 @@ fn solve_group(
             }
         }
     }
-    let base: HashMap<ComponentId, Placement> = active
+    let mut base: HashMap<ComponentId, Placement> = active
         .iter()
         .flat_map(|m| [m.a.0, m.b.0])
         .filter_map(|c| assembly.placement_of(c).map(|p| (c, p)))
         .collect();
+    let mut active: Vec<Active> = active.iter().map(|m| (*m).clone()).collect();
+    half_turns(&mut active, &mut base, &moving, center, size);
+    let active = &active;
     // Where each moving component turns, in the assembly.
     let centers: Vec<Point3> = moving
         .iter()
@@ -387,6 +391,117 @@ fn solve_group(
 /// with: the one closest to how they sit now.
 pub fn default_alignment(a: &Primitive, b: &Primitive) -> bool {
     closest_alignment(a, b)
+}
+
+/// [`default_alignment`] for a mate between the faces or edges of two solids: when the
+/// directions start square (as a screw beside its hole does) nothing is closest, and two
+/// faces of solids nearly always touch, normals opposite — anti-aligned, as SolidWorks
+/// starts a coincident mate between faces. Reference planes and axes keep the closest.
+pub fn default_alignment_between(a: &Primitive, b: &Primitive, solids: bool) -> bool {
+    match (a.direction(), b.direction()) {
+        (Some(u), Some(v)) => {
+            let d = u.dot(v);
+            if solids { d >= 0.5 } else { d >= 0.0 }
+        }
+        _ => true,
+    }
+}
+
+/// A mate whose alignment is the opposite of how its sides sit now (an alignment just
+/// flipped, say) needs a half turn, which no small step finds: the error is highest
+/// there, and an axis mate on the same component holds it either way round, so the two
+/// cancel out for the whole first quarter turn. The component is turned half a turn
+/// first, about the axis through its centre that keeps the other mates best (an axis it
+/// is concentric with, when that lies across the mated normal), and the solve goes on
+/// from there. The folds of the either-way mates are then taken again.
+fn half_turns(
+    active: &mut [Active],
+    base: &mut HashMap<ComponentId, Placement>,
+    moving: &[ComponentId],
+    center: &dyn Fn(ComponentId) -> Point3,
+    size: f64,
+) {
+    use std::f64::consts::PI;
+    let placed = |m: &Active, base: &HashMap<ComponentId, Placement>| {
+        (m.a.1.placed(&base[&m.a.0]), m.b.1.placed(&base[&m.b.0]))
+    };
+    let total = |active: &[Active], base: &HashMap<ComponentId, Placement>| -> f64 {
+        let mut r = Vec::new();
+        for m in active {
+            let (a, b) = placed(m, base);
+            let fold = closest_alignment(&a, &b);
+            let _ = residuals(m.kind, m.aligned, fold, &a, &b, size, &mut r);
+        }
+        cost(&r)
+    };
+    let mut turned = Vec::new();
+    for i in 0..active.len() {
+        let m = &active[i];
+        if !m.kind.has_alignment(m.a.1.kind(), m.b.1.kind())
+            || matches!(m.kind, crate::MateKind::Angle(_))
+        {
+            continue;
+        }
+        let (a, b) = placed(m, base);
+        let (Some(u), Some(v)) = (a.direction(), b.direction()) else {
+            continue;
+        };
+        let sign = if m.aligned { 1.0 } else { -1.0 };
+        if u.dot(v) * sign > -0.5 {
+            continue;
+        }
+        // The side that turns: the second, when it can move.
+        let (c, stays) = if moving.contains(&m.b.0) {
+            (m.b.0, u)
+        } else if moving.contains(&m.a.0) {
+            (m.a.0, v)
+        } else {
+            continue;
+        };
+        if turned.contains(&c) {
+            continue;
+        }
+        // Axes to turn about: across the normal that stays, from the directions of the
+        // other mates on this component, then any.
+        let across = |d: Vec3| {
+            let w = d - stays * d.dot(stays);
+            (w.length() > 0.5).then(|| w * (1.0 / w.length()))
+        };
+        let mut axes: Vec<Vec3> = active
+            .iter()
+            .filter(|o| o.id != m.id && (o.a.0 == c || o.b.0 == c))
+            .flat_map(|o| {
+                let (oa, ob) = placed(o, base);
+                [oa.direction(), ob.direction()]
+            })
+            .flatten()
+            .filter_map(across)
+            .collect();
+        let any = if stays.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        axes.extend(across(any));
+        let pivot = base[&c].apply_point(center(c));
+        let best = axes
+            .iter()
+            .map(|axis| {
+                let mut trial = base.clone();
+                trial.insert(c, base[&c].moved(*axis * PI, pivot, Vec3::ZERO));
+                let cost = total(active, &trial);
+                (cost, trial)
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0));
+        if let Some((cost, trial)) = best {
+            if cost < total(active, base) {
+                *base = trial;
+                turned.push(c);
+            }
+        }
+    }
+    if !turned.is_empty() {
+        for m in active.iter_mut() {
+            let (a, b) = placed(m, base);
+            m.fold = closest_alignment(&a, &b);
+        }
+    }
 }
 
 fn cost(r: &[f64]) -> f64 {

@@ -57,6 +57,8 @@ pub enum Dialog {
     Combine(crate::features_ui::CombineDialog),
     RefPlane(PlaneDialog),
     RefAxis(AxisDialog),
+    /// Colour, transparency and texture of faces, a body, the part or a component.
+    Appearance(crate::appearance_ui::AppearanceDialog),
     /// Pick the plane of a new sketch, in the timeline or the viewport.
     ChoosePlane,
     Dimension {
@@ -93,6 +95,7 @@ impl Dialog {
                 | Dialog::Combine(_)
                 | Dialog::RefPlane(_)
                 | Dialog::RefAxis(_)
+                | Dialog::Appearance(_)
                 | Dialog::ChoosePlane
         )
     }
@@ -226,7 +229,8 @@ impl OxydeApp {
             | Dialog::Pattern(_)
             | Dialog::Combine(_)
             | Dialog::RefPlane(_)
-            | Dialog::RefAxis(_) => Answer::Open,
+            | Dialog::RefAxis(_)
+            | Dialog::Appearance(_) => Answer::Open,
             Dialog::ChoosePlane => Answer::Open,
             Dialog::Dimension {
                 label,
@@ -391,6 +395,7 @@ impl OxydeApp {
             Dialog::Combine(d) => self.apply_combine(d),
             Dialog::RefPlane(d) => self.apply_ref_plane(d),
             Dialog::RefAxis(d) => self.apply_ref_axis(d),
+            Dialog::Appearance(d) => self.apply_appearance(d),
             Dialog::ChoosePlane => {}
             Dialog::Dimension {
                 target,

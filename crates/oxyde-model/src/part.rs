@@ -13,6 +13,7 @@ use oxyde_geom::{Axis, Plane, Profile, ProfileError, Transform};
 use oxyde_kernel::{BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind};
 use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
+use crate::appearance::{Appearance, Appearances};
 use crate::bodies::{Body, Solid, Working};
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
@@ -155,6 +156,8 @@ pub struct PartDefinition {
     pub next_id: u32,
     /// Global variables and equations.
     pub equations: Equations,
+    /// Colours, transparency and textures of the part, its bodies and faces.
+    pub appearances: Appearances,
 }
 
 /// A part document: its timeline and the cached results of the last rebuild.
@@ -169,6 +172,7 @@ pub struct Part {
     next_id: u32,
     pub(crate) equations: Equations,
     pub(crate) equation_results: EquationResults,
+    appearances: Appearances,
     results: Vec<FeatureResult>,
     /// Results from this index on are stale.
     dirty_from: usize,
@@ -188,6 +192,7 @@ impl Part {
             next_id: 1,
             equations: Equations::default(),
             equation_results: EquationResults::default(),
+            appearances: Appearances::default(),
             results: Vec::new(),
             dirty_from: 0,
         }
@@ -258,6 +263,7 @@ impl Part {
             rollback: definition.rollback,
             equations: definition.equations,
             equation_results: EquationResults::default(),
+            appearances: definition.appearances,
             results: Vec::new(),
             dirty_from: 0,
         })
@@ -270,7 +276,31 @@ impl Part {
             rollback: self.rollback,
             next_id: self.next_id,
             equations: self.equations.clone(),
+            appearances: self.appearances.clone(),
         }
+    }
+
+    // ---- Appearances -------------------------------------------------------------------------
+
+    /// Colours, transparency and textures of the part, its bodies and faces.
+    pub fn appearances(&self) -> &Appearances {
+        &self.appearances
+    }
+
+    /// Changing appearances needs no rebuild: the viewport just redraws.
+    pub fn appearances_mut(&mut self) -> &mut Appearances {
+        &mut self.appearances
+    }
+
+    /// The appearance face `index` of `body` (the part's current body) is drawn with:
+    /// `None` for the viewport's default.
+    pub fn face_appearance(&self, body: &Body, index: u32) -> Option<&Appearance> {
+        if self.appearances.is_empty() {
+            return None;
+        }
+        let name = body.naming.face(index);
+        let solid = body.solid_of_face(index).map(|s| s.id);
+        self.appearances.of_face(name, solid)
     }
 
     // ---- Timeline editing --------------------------------------------------------------------
@@ -378,6 +408,7 @@ impl Part {
             });
         }
         self.features.remove(index);
+        self.appearances.remove_feature(id);
         if let Some(active) = self.rollback.as_mut() {
             if index < *active {
                 *active -= 1;

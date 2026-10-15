@@ -19,7 +19,8 @@ part.oxyprt
 ├── manifest.json        required  — format identity and version (first entry)
 ├── model.json           required  — the feature timeline: the source of truth
 ├── properties.json      required  — part metadata, BOM-ready
-└── imports/<id>.step    one per import feature — the imported file, byte for byte
+├── imports/<id>.step    one per import feature — the imported file, byte for byte
+└── textures/<n>.png     one per texture image used by an appearance (PNG or JPEG), as read
 ```
 
 Rules:
@@ -27,6 +28,7 @@ Rules:
 - `manifest.json` is written first so readers can identify a file cheaply.
 - All JSON is UTF-8, written with stable key order and indentation so files diff cleanly.
 - Geometry is **not stored**: Oxyde rebuilds the part from `model.json` on load. The one exception is imported geometry: an `import` feature's STEP file is kept as it was read, under `imports/`, so the part does not depend on the original file. A later version may add an optional `geometry/` cache (BREP/STEP) for tools that cannot rebuild; readers must ignore entries they do not know.
+- Texture images are kept as they were read, under `textures/`, each image once however many appearances use it (stored, not deflated: they are compressed already).
 - Oxyde saves by writing `<name>.<extension>.tmp` and renaming it over the target, so a failed save never destroys the previous file.
 
 ## 2. `manifest.json`
@@ -220,6 +222,26 @@ Optional, default empty, SolidWorks style:
 
 Expressions are text: numbers, names between double quotes (`"Width"` for a global variable, `"D1@Sketch1"` for a dimension), `+ - * / ^`, parentheses, `pi`, and the functions `sin cos tan asin acos atan` (in degrees), `sqrt abs exp log` (natural) `log10 int round sgn` (one argument) and `min max` (two). Values are in mm, angles in **degrees** (unlike the rest of the file, as in SolidWorks), instance counts are rounded. Names are written as they are at save time. A name that matches nothing on load is kept and reported as an error when the equations are evaluated (a broken equation, not a broken file); a syntax error refuses the file.
 
+### Appearances
+
+How the part looks, optional (absent = the viewport's part colour everywhere); display only, never part of the rebuild:
+
+```json
+"appearances": {
+  "part": { "color": [200, 160, 90], "texture": { "file": "textures/1.png", "file_name": "oak.png", "scale": 80 } },
+  "bodies": [
+    { "body": { "feature": 2, "index": 0 }, "color": [120, 125, 130], "transparency": 0.4 }
+  ],
+  "faces": [
+    { "face": { "key": { "type": "end_cap", "feature": 2 }, "part": 0 }, "color": [10, 20, 30] }
+  ]
+}
+```
+
+- `part` is the appearance of the whole part; `bodies` and `faces` override it for single bodies (by the feature that made them, see *Bodies*) and single faces (by persistent name, see *References*). The most specific wins: face over body over part.
+- An appearance has a `color` (sRGB, 0–255), a `transparency` from 0 (opaque, the default when absent) to 1 (invisible), and optionally a `texture`: an image in the archive (`file`), its original name (`file_name`, display only) and `scale`, the millimetres one repeat of the image covers along its width. The image is mapped automatically along the part's axes (projected along X, Y and Z and blended by the surface's orientation), so no texture coordinates are stored; it replaces the colour where it is.
+- Appearances of bodies and faces that no longer exist are kept and ignored; a `texture.file` missing from the archive is an error.
+
 ### Names
 
 Feature and dimension names follow SolidWorks: a dimension's full name is `dimension@feature`, e.g. `D1@Sketch1` or `Thickness@Boss-Extrude1`, which is how equations refer to it. A name is valid when it is not empty, has no leading or trailing spaces, and contains no `@`, `"` or control character. Feature names are unique within the part, dimension names within their feature. Names are display only: every internal reference uses ids, so renaming never breaks anything.
@@ -269,7 +291,8 @@ An assembly stores no geometry and no copy of its parts: it refers to part files
       "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0],
       "fixed": true, "hidden": false },
     { "id": 2, "name": "Pin<1>", "path": "pin.oxyprt", "document_id": "…",
-      "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [20, 0, 10] }
+      "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [20, 0, 10],
+      "appearance": { "color": [200, 40, 40], "transparency": 0.25 } }
   ],
   "mates": [
     { "id": 1, "name": "Concentric1", "type": "concentric", "aligned": false,
@@ -282,7 +305,7 @@ An assembly stores no geometry and no copy of its parts: it refers to part files
 }
 ```
 
-- **Components** are instances of part files or of other assemblies (sub-assemblies; the file's manifest says which). `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only.
+- **Components** are instances of part files or of other assemblies (sub-assemblies; the file's manifest says which). `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only. An optional `appearance` (same shape as a part's, see §3 *Appearances*; its texture images go under `textures/` in the assembly file) is drawn instead of the part's own appearances for that component, as in SolidWorks.
 - **Mates**: `type` is `coincident`, `concentric`, `parallel`, `perpendicular`, `distance` (`value` in mm) or `angle` (`value` in radians, 0 to π; an angle with a line is read as at most π/2, and between a line and a plane it is measured from the plane). `a` and `b` name a component, an optional `path` and one of: `face` or `edge` (persistent names, as in a part's `model.json`, resolved in that part's rebuilt body), `plane` (`front`, `top`, `right`: the part's standard planes), `axis` (`x`, `y`, `z`) or `origin` (`true`). `aligned`: normals or axes point the same way (otherwise they face each other). `suppressed` mates are kept but not solved. When the component is a sub-assembly, `path` lists component ids inside it, level by level, down to the part holding the face or edge (`"path": [3, 1]`: component 3 of the sub-assembly, then component 1 of that one); without `path`, `plane`, `axis` and `origin` are the sub-assembly's own.
 - Placements are the solved result, saved so that a reader without a solver sees the assembly as it was. Oxyde re-solves on open, starting from them.
 - Readers check that component and mate ids are unique and below the `next_…` counters, that component names are unique, and that mates refer to existing components. Component `0` in a mate is the assembly itself: its own `plane`, `axis` or `origin`, fixed at the identity (components are numbered from 1).

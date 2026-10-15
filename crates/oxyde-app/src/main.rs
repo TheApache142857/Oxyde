@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod appearance_ui;
 mod assembly;
 mod assembly_ui;
 mod command_bar;

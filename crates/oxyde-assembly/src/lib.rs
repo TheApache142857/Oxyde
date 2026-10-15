@@ -23,8 +23,12 @@ pub mod scene;
 mod solve;
 
 pub use mate::{Mate, MateKind, MateRef, MateTarget, Primitive, PrimitiveKind, resolve};
+pub use oxyde_model::Appearance;
 pub use placement::Placement;
-pub use solve::{ComponentFreedom, MateStatus, Solution, default_alignment, solve, solve_about};
+pub use solve::{
+    ComponentFreedom, MateStatus, Solution, default_alignment, default_alignment_between, solve,
+    solve_about,
+};
 
 /// Identifies a component within its assembly. Never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -54,6 +58,9 @@ pub struct Component {
     /// Fixed components never move; the first one inserted is fixed, as in SolidWorks.
     pub fixed: bool,
     pub hidden: bool,
+    /// Drawn with this instead of the part's own appearances, when set (a component-level
+    /// appearance, as in SolidWorks).
+    pub appearance: Option<Appearance>,
 }
 
 /// An assembly document's content.
@@ -138,6 +145,7 @@ impl Assembly {
             placement,
             fixed,
             hidden: false,
+            appearance: None,
         });
         id
     }

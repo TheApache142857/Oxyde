@@ -218,6 +218,8 @@ pub struct OxydeApp {
     /// Where the viewport was last drawn, for the debug overlay.
     pub(crate) viewport_rect: egui::Rect,
     pub(crate) splash: crate::splash::Splash,
+    /// Decoded texture images of the open documents.
+    pub(crate) texture_cache: crate::appearance_ui::TextureCache,
 }
 
 impl OxydeApp {
@@ -265,6 +267,7 @@ impl OxydeApp {
             viewport_rect: egui::Rect::NOTHING,
             // The file to open, if any, is opened by the splash screen's last step.
             splash: crate::splash::Splash::new(file.clone()),
+            texture_cache: Default::default(),
         };
         app.apply_preferences(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
@@ -420,6 +423,46 @@ impl OxydeApp {
                 self.scroll_to_feature = self.selection_creator();
             }
         }
+    }
+
+    /// Faces and edges caught in a selection box: handed to the open command, else
+    /// selected (added to the selection with Ctrl).
+    fn box_select(&mut self, picks: Vec<Pick>, additive: bool) {
+        if self.dialog.as_ref().is_some_and(|d| d.is_panel()) {
+            for pick in picks {
+                if let Some(panel_pick) = self.panel_pick(Some(pick)) {
+                    self.offer_to_panel(panel_pick);
+                }
+            }
+            return;
+        }
+        let Some(body) = self.doc.part.body() else {
+            return;
+        };
+        let items: Vec<Selected> = picks
+            .iter()
+            .filter_map(|p| match p {
+                Pick::Face(i) => body.naming.face(*i).cloned().map(Selected::Face),
+                Pick::Edge(i) => body.naming.edge(*i).cloned().map(Selected::Edge),
+            })
+            .collect();
+        if !additive {
+            self.selection.clear();
+            self.selected_plane = None;
+        }
+        for item in items {
+            if !self.selection.contains(&item) {
+                self.selection.push(item);
+            }
+        }
+        let faces = self
+            .selection
+            .iter()
+            .filter(|s| matches!(s, Selected::Face(_)))
+            .count();
+        let edges = self.selection.len() - faces;
+        self.status = format!("{faces} face(s) and {edges} edge(s) selected");
+        self.scroll_to_feature = self.selection_creator();
     }
 
     /// A face or edge clicked in the viewport, as offered to an open command.
@@ -1121,6 +1164,10 @@ impl OxydeApp {
                 }
             }
         }
+        if let Some(b) = output.box_select {
+            let picks = self.viewport.picks_in(&b);
+            self.box_select(picks, output.additive);
+        }
         output.response.context_menu(|ui| {
             if ui.button("Sketch").clicked() {
                 ui.close_menu();
@@ -1143,6 +1190,16 @@ impl OxydeApp {
             {
                 ui.close_menu();
                 self.run(Command::Blend(false));
+            }
+            ui.separator();
+            let has_body = self.doc.part.body().is_some();
+            if ui
+                .add_enabled(has_body, egui::Button::new("Appearance…"))
+                .on_hover_text("Colour, transparency or texture of the selected faces, or the part")
+                .clicked()
+            {
+                ui.close_menu();
+                self.begin_appearance();
             }
             ui.separator();
             if ui.button("Zoom to fit").clicked() {
@@ -1459,7 +1516,12 @@ impl OxydeApp {
             return;
         };
         match tessellate_bodies(&self.kernel, body, self.mesh_fraction()) {
-            Ok(mesh) => self.viewport.set_scene(Scene::from_mesh(&mesh), first),
+            Ok(mesh) => {
+                let mut scene = Scene::from_mesh(&mesh);
+                let (materials, textures) = self.part_materials();
+                scene.set_materials(materials, textures);
+                self.viewport.set_scene(scene, first);
+            }
             Err(e) => self.status = format!("Display failed: {e}"),
         }
     }

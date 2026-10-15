@@ -2,7 +2,10 @@
 //!
 //! Draws a display [`Mesh`](oxyde_kernel::Mesh) — shaded faces and their edges — into an
 //! RGBA image with a depth buffer, and keeps an id buffer alongside so that the face or
-//! edge under any pixel is known exactly (picking). It needs no GPU, which keeps the first
+//! edge under any pixel is known exactly (picking). Faces can have a [`Material`]: a
+//! colour, an opacity (transparent faces are drawn last, back to front) and a colour
+//! texture mapped automatically along the model's axes. A [`Style`] can ask for the
+//! part's reflection in a floor under it. It needs no GPU, which keeps the first
 //! versions of the application simple and fully testable. The application's GPU viewport
 //! draws the same [`Scene`] (see [`Scene::gpu_mesh`]) with the same colours and shading, and
 //! falls back to this renderer when no GPU is available.
@@ -11,10 +14,12 @@
 //! Y-up like SolidWorks: the Front view looks down −Z with X to the right.
 
 mod camera;
+mod material;
 mod raster;
 mod style;
 mod vec3;
 
 pub use camera::{Camera, StandardView};
-pub use raster::{Frame, GpuMesh, Highlight, Pick, Scene, render, render_styled};
+pub use material::{Material, Texture, TextureRef};
+pub use raster::{Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render, render_styled};
 pub use style::{Rgb, Style};

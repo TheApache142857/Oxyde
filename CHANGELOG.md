@@ -5,6 +5,45 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Appearances (October 2026)
+
+- **Appearances.** Faces, bodies, the whole part, or a component of an assembly can be
+  given a colour, a transparency and a colour texture (PNG or JPEG), as in SolidWorks:
+  Features › Appearance, right-click › Appearance… in the graphics area, on a body in the
+  Solid Bodies folder or on a component. The most specific appearance wins (face over body
+  over part; a component's over the part's). The panel has colour and material presets
+  (steel, brass, glass…), a transparency slider, and an image picker with the size one
+  repeat of the image covers; textures are mapped along the model's axes, so nothing has
+  to be unwrapped. Every change shows at once; OK is one undo step. See-through faces
+  show what is behind them and can still be picked.
+- **Floor reflections** (View › Floor reflections, on by default; strength in
+  Preferences › Graphics): the model mirrored in a floor just under it, fading with
+  height.
+- **File format**: optional `appearances` in `model.json` and `appearance` on a
+  component in `assembly.json`; texture images under `textures/` in the archive
+  ([FORMAT.md](docs/FORMAT.md)). Files without them read as before; older versions ignore
+  them.
+
+### Mates and navigation (October 2026)
+
+- **Flipping a mate's alignment works** when an axis mate holds the same part: it used to
+  be reported as "cannot be met together with the other mates", because the half turn
+  the flip needs flips the axis too, and the solver had fixed which way round the axis
+  mate was taken. The part is now turned over first (about the axis it is concentric
+  with, when that lies across the mated face, so the axis mate keeps holding) and the
+  solve goes on from there.
+- **A coincident mate between two faces of solids starts anti-aligned** when their
+  normals are square, as a screw's head beside a hole: the faces touch instead of the
+  part turning upside down. Reference planes and axes keep the nearest alignment.
+- **Mouse buttons** (Preferences › Navigation): by default the right button now turns the
+  view, the middle button (or Shift+right) pans, and the left button is for selecting
+  only. The SolidWorks mapping (middle turns) and the previous one (left turns) are still
+  there.
+- **Selection box**: drag with the left button. Left to right selects what lies entirely
+  inside the box, right to left (dashed) what it touches, as in SolidWorks; Ctrl adds to
+  the selection. In an assembly a box selects components; with a command such as Fillet
+  open, the faces and edges go to the command.
+
 ### October 2026 bug hunt
 
 Checked on Linux against OpenCASCADE 7.8.1: the end-to-end tests, 31 STEP files from

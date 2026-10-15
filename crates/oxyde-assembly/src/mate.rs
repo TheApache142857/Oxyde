@@ -187,7 +187,7 @@ impl Primitive {
     }
 
     /// Normal of a plane or circle, direction of a line.
-    fn direction(&self) -> Option<Vec3> {
+    pub(crate) fn direction(&self) -> Option<Vec3> {
         match *self {
             Primitive::Plane { normal, .. } | Primitive::Circle { normal, .. } => Some(normal),
             Primitive::Line { direction, .. } => Some(direction),

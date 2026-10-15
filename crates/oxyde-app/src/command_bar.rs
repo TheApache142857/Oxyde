@@ -222,6 +222,7 @@ impl OxydeApp {
                     self.viewport.request_fit();
                 }
                 ui.separator();
+                self.floor_reflections_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
@@ -335,6 +336,10 @@ impl OxydeApp {
     }
 
     /// Whether `command` is the one open in the PropertyManager.
+    fn command_is_appearance(&self) -> bool {
+        matches!(self.dialog, Some(Dialog::Appearance(_)))
+    }
+
     fn command_is_open(&self, command: Command) -> bool {
         match (&self.dialog, command) {
             (Some(Dialog::Extrude(d)), Command::Extrude) => d.editing.is_none(),
@@ -429,6 +434,15 @@ impl OxydeApp {
             "Join, cut or intersect bodies of the part.\nMake bodies with Extrude › New body.",
             Command::Combine,
         );
+        group_separator(ui);
+        if command_button(ui, Icon::Appearance, "Appearance", body, self.command_is_appearance())
+            .on_hover_text(
+                "Colour, transparency or a texture for the selected faces, a body or the part.",
+            )
+            .clicked()
+        {
+            self.begin_appearance();
+        }
         group_separator(ui);
         let response = command_button(
             ui,
@@ -601,6 +615,19 @@ impl OxydeApp {
             self.doc.release(&mut self.kernel);
             self.rebuild();
             self.status = "Rebuilt".to_owned();
+        }
+    }
+
+    /// View › Floor reflections: the part mirrored in a floor under it.
+    pub(crate) fn floor_reflections_item(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.prefs.graphics.floor_reflections, "Floor reflections")
+            .on_hover_text("The part mirrored in a floor just under it. Strength: Preferences › Graphics.")
+            .changed()
+        {
+            let ctx = ui.ctx().clone();
+            self.apply_preferences(&ctx);
+            self.save_preferences();
         }
     }
 

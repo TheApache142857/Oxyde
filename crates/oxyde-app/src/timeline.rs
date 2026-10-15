@@ -49,6 +49,7 @@ enum Action {
     ToggleItem(Item),
     ToggleBodies,
     SelectBody(oxyde_model::BodyId),
+    BodyAppearance(oxyde_model::BodyId),
 }
 
 pub fn feature_icon(kind: &FeatureKind) -> Icon {
@@ -295,13 +296,17 @@ impl OxydeApp {
                                 if row.response.hovered() {
                                     hover_body = Some(id);
                                 }
-                                if row
-                                    .response
-                                    .on_hover_text(format!("Made by {maker}"))
-                                    .clicked()
-                                {
+                                let response =
+                                    row.response.on_hover_text(format!("Made by {maker}"));
+                                if response.clicked() {
                                     action = Some(Action::SelectBody(id));
                                 }
+                                response.context_menu(|ui| {
+                                    if ui.button("Appearance…").clicked() {
+                                        action = Some(Action::BodyAppearance(id));
+                                        ui.close_menu();
+                                    }
+                                });
                             }
                         }
                     }
@@ -598,6 +603,7 @@ impl OxydeApp {
                 self.selected_plane = None;
                 self.selection.clear();
             }
+            Action::BodyAppearance(id) => self.begin_body_appearance(id),
             Action::Edit(id) => self.edit_feature(id),
             Action::Rename(feature) => {
                 let name = self

@@ -556,7 +556,12 @@ impl AssemblyDoc {
 
     /// Records the current state as one undo step.
     pub fn checkpoint(&mut self) {
-        self.undo.push(self.assembly.clone());
+        self.checkpoint_from(self.assembly.clone());
+    }
+
+    /// Records `before`, the assembly just before a change already made, as one undo step.
+    pub fn checkpoint_from(&mut self, before: Assembly) {
+        self.undo.push(before);
         if self.undo.len() > UNDO_LIMIT {
             self.undo.remove(0);
         }

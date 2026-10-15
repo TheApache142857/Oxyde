@@ -26,6 +26,7 @@ pub enum Icon {
     ReferenceGeometry,
     Imported,
     Combine,
+    Appearance,
     // Bodies
     Bodies,
     Intersect,
@@ -654,6 +655,19 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.solid(2.0, 11.0, 11.0, 10.0, 4.0);
             pen.block(9.0, 7.0, 11.0, 10.0, 4.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
             pen.fill(&[(9.0, 11.0), (13.0, 11.0), (13.0, 17.0), (9.0, 17.0)], ADD);
+        }
+        Appearance => {
+            // A shaded sphere with a highlight, and three paint dots.
+            pen.circle(12.0, 13.5, 7.5, BODY_SIDE, Some((1.2, INK)));
+            let cap: Vec<(f32, f32)> = Pen::arc_points(12.0, 13.5, 7.5, 7.5, PI + 0.35, 2.0 * PI - 0.35)
+                .into_iter()
+                .chain(Pen::arc_points(12.0, 13.5, 7.5, 4.5, 2.0 * PI - 0.35, PI + 0.35))
+                .collect();
+            pen.fill(&cap, BODY_TOP);
+            pen.circle(9.5, 10.5, 1.8, WHITE, None);
+            pen.circle(4.5, 4.5, 2.6, ACCENT, Some((1.0, INK)));
+            pen.circle(11.0, 3.2, 2.6, SKETCH, Some((1.0, INK)));
+            pen.circle(17.5, 4.5, 2.6, ADD, Some((1.0, INK)));
         }
         Bodies => {
             // A stack of separate solids.

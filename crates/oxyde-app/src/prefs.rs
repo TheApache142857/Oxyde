@@ -95,6 +95,10 @@ pub struct Graphics {
     pub mesh_quality: MeshQuality,
     /// The small X/Y/Z triad in the corner.
     pub show_triad: bool,
+    /// The part's reflection in a floor under it (View › Floor reflections).
+    pub floor_reflections: bool,
+    /// How strong the reflection is, 0..1.
+    pub reflection_strength: f32,
 }
 
 impl Default for Graphics {
@@ -116,6 +120,8 @@ impl Default for Graphics {
             highlight_width: 0.0,
             mesh_quality: MeshQuality::Normal,
             show_triad: true,
+            floor_reflections: true,
+            reflection_strength: 0.35,
         };
         g.set_style(&g.ui_theme.viewport());
         g
@@ -136,6 +142,11 @@ impl Graphics {
             show_edges: self.show_edges,
             edge_width: self.edge_width.clamp(0.5, 8.0),
             highlight_width: self.highlight_width.clamp(0.5, 12.0),
+            floor_reflection: if self.floor_reflections {
+                self.reflection_strength.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
         }
     }
 
@@ -155,9 +166,58 @@ impl Graphics {
     }
 }
 
+/// Which mouse button turns the view. The left button always selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseScheme {
+    /// Right-drag orbits, middle-drag (or Shift+right-drag) pans; left-drag draws a
+    /// selection box.
+    #[default]
+    RightTurns,
+    /// SolidWorks: middle-drag orbits, Ctrl+middle-drag or right-drag pans; left-drag draws
+    /// a selection box.
+    MiddleTurns,
+    /// Left-drag orbits; right-drag, middle-drag or Shift+left-drag pans. No selection box.
+    LeftTurns,
+}
+
+impl MouseScheme {
+    pub const ALL: [(MouseScheme, &'static str); 3] = [
+        (MouseScheme::RightTurns, "Right button turns (Creo-like)"),
+        (MouseScheme::MiddleTurns, "Middle button turns (SolidWorks)"),
+        (MouseScheme::LeftTurns, "Left button turns"),
+    ];
+
+    /// How the buttons are used, for the help table: orbit, pan, select, and in sketch mode.
+    pub fn help(self) -> [(&'static str, &'static str); 4] {
+        match self {
+            MouseScheme::RightTurns => [
+                ("Orbit", "right-drag, about the point under the pointer"),
+                ("Pan", "middle-drag, or Shift+right-drag"),
+                ("Select", "click; Ctrl+click adds; drag a box (left to right: inside it, right to left: touching it)"),
+                ("Sketch mode", "right-drag orbits, middle-drag pans"),
+            ],
+            MouseScheme::MiddleTurns => [
+                ("Orbit", "middle-drag, about the point under the pointer"),
+                ("Pan", "Ctrl+middle-drag, or right-drag"),
+                ("Select", "click; Ctrl+click adds; drag a box (left to right: inside it, right to left: touching it)"),
+                ("Sketch mode", "Ctrl+middle-drag orbits, middle-drag or right-drag pans"),
+            ],
+            MouseScheme::LeftTurns => [
+                ("Orbit", "left-drag, about the point under the pointer"),
+                ("Pan", "right-drag, middle-drag, or Shift+left-drag"),
+                ("Select", "click; Ctrl+click adds"),
+                ("Sketch mode", "right-drag or middle-drag pans, Ctrl+middle-drag orbits"),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Navigation {
+    /// Which button turns the view.
+    pub mouse: MouseScheme,
     /// 1 = default speed.
     pub orbit_speed: f64,
     pub zoom_speed: f64,
@@ -175,6 +235,7 @@ pub struct Navigation {
 impl Default for Navigation {
     fn default() -> Self {
         Self {
+            mouse: MouseScheme::default(),
             orbit_speed: 1.0,
             zoom_speed: 1.0,
             invert_zoom: false,

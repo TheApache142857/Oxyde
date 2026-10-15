@@ -7,9 +7,11 @@ use oxyde_geom::Vec3;
 use oxyde_model::{StandardAxis, StandardPlane};
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use crate::schema::{
-    EdgeRefDto, FaceRefDto, StandardAxisDto, StandardPlaneDto, edge_dto, edge_from, face_dto,
-    face_from,
+    AppearanceDto, EdgeRefDto, FaceRefDto, StandardAxisDto, StandardPlaneDto, TextureTable,
+    appearance_dto, appearance_from, edge_dto, edge_from, face_dto, face_from,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +38,9 @@ pub(crate) struct ComponentDto {
     pub fixed: bool,
     #[serde(default)]
     pub hidden: bool,
+    /// Drawn with this instead of the part's own appearances, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<AppearanceDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,7 +95,7 @@ pub(crate) enum TargetDto {
 }
 
 impl AssemblyModel {
-    pub fn from_assembly(assembly: &Assembly) -> Self {
+    pub fn from_assembly(assembly: &Assembly, textures: &TextureTable) -> Self {
         AssemblyModel {
             next_component_id: assembly.next_component_id,
             next_mate_id: assembly.next_mate_id,
@@ -110,6 +115,7 @@ impl AssemblyModel {
                     ],
                     fixed: c.fixed,
                     hidden: c.hidden,
+                    appearance: c.appearance.as_ref().map(|a| appearance_dto(a, textures)),
                 })
                 .collect(),
             mates: assembly
@@ -136,7 +142,8 @@ impl AssemblyModel {
     }
 
     /// The assembly, checked: unique ids and names, mates between existing components.
-    pub fn into_assembly(self) -> Result<Assembly, String> {
+    /// `files` holds the archive's `textures/` entries by name.
+    pub fn into_assembly(self, files: &HashMap<String, Vec<u8>>) -> Result<Assembly, String> {
         let components: Vec<Component> = self
             .components
             .into_iter()
@@ -154,6 +161,13 @@ impl AssemblyModel {
                             c.name
                         )
                     })?;
+                let appearance = match c.appearance {
+                    Some(a) => Some(
+                        appearance_from(a, files)
+                            .map_err(|e| format!("component {}: {e}", c.name))?,
+                    ),
+                    None => None,
+                };
                 Ok(Component {
                     id: ComponentId(c.id),
                     name: c.name,
@@ -162,6 +176,7 @@ impl AssemblyModel {
                     placement,
                     fixed: c.fixed,
                     hidden: c.hidden,
+                    appearance,
                 })
             })
             .collect::<Result<_, String>>()?;
