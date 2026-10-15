@@ -134,6 +134,7 @@ pub struct OxydeApp {
     pub(crate) debug_stats: crate::prefs_ui::DebugStats,
     /// Where the viewport was last drawn, for the debug overlay.
     pub(crate) viewport_rect: egui::Rect,
+    pub(crate) splash: crate::splash::Splash,
 }
 
 impl OxydeApp {
@@ -173,6 +174,8 @@ impl OxydeApp {
             prefs_window: Default::default(),
             debug_stats: Default::default(),
             viewport_rect: egui::Rect::NOTHING,
+            // The file to open, if any, is opened by the splash screen's last step.
+            splash: crate::splash::Splash::new(file.clone()),
         };
         app.apply_preferences(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
@@ -189,9 +192,7 @@ impl OxydeApp {
                 format!("GPU: {} ({:?})", info.name, info.backend),
             );
         }
-        if let Some(path) = file {
-            app.open_path(&path);
-        }
+        let _ = file;
         app
     }
 
@@ -684,6 +685,7 @@ impl OxydeApp {
         match loaded {
             Ok(doc) => {
                 self.replace_document(doc);
+                self.remember_recent(path);
                 self.status = format!("Opened {}", path.display());
                 self.report_errors();
             }
@@ -793,6 +795,7 @@ impl OxydeApp {
         match oxyde_format::save_part(path, &file) {
             Ok(()) => {
                 self.doc.path = Some(path.to_path_buf());
+                self.remember_recent(path);
                 self.doc.properties.volume_mm3 = file.properties.volume_mm3;
                 self.doc.modified = false;
                 self.status = format!("Saved {}", path.display());
@@ -1489,6 +1492,7 @@ pub(crate) fn deflection(topology: &Topology, fraction: f64) -> f64 {
 impl eframe::App for OxydeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        self.splash_step(ctx);
         if self.asm.is_some() {
             self.assembly_shortcuts(ctx);
             egui::TopBottomPanel::top("menu").show(ctx, |ui| self.assembly_menu_bar(ui));
@@ -1506,6 +1510,7 @@ impl eframe::App for OxydeApp {
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
             self.dialogs_ui(ctx);
+            self.splash_ui(ctx);
             self.update_title(ctx);
             return;
         }
@@ -1532,6 +1537,7 @@ impl eframe::App for OxydeApp {
         self.preferences_window(ctx);
         self.debug_overlay(ctx, self.viewport_rect);
         self.dialogs_ui(ctx);
+        self.splash_ui(ctx);
         self.update_title(ctx);
     }
 }

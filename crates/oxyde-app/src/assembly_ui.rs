@@ -285,6 +285,7 @@ impl OxydeApp {
         match oxyde_format::load_assembly(path) {
             Ok(file) => {
                 self.enter_assembly(AssemblyDoc::from_file(file, Some(path.to_path_buf())));
+                self.remember_recent(path);
                 self.return_to = None;
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
@@ -322,6 +323,7 @@ impl OxydeApp {
             Ok(()) => {
                 doc.path = Some(path.clone());
                 doc.modified = false;
+                self.remember_recent(&path);
                 self.status = format!("Saved {}", path.display());
                 true
             }

@@ -22,6 +22,7 @@ mod prefs;
 mod prefs_ui;
 mod property_manager;
 mod sketch_mode;
+mod splash;
 mod theme;
 mod timeline;
 mod viewport;

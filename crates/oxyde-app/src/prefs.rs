@@ -21,6 +21,8 @@ pub struct Preferences {
     /// Shortcuts changed from their defaults, by action id: a key combination such as
     /// `"Ctrl+Shift+Z"`, or `""` for none.
     pub shortcuts: BTreeMap<String, String>,
+    /// Documents opened or saved lately, newest first.
+    pub recent: Vec<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -30,6 +32,7 @@ impl Default for Preferences {
             navigation: Navigation::default(),
             debug: Debug::default(),
             shortcuts: BTreeMap::new(),
+            recent: Vec::new(),
         }
     }
 }
