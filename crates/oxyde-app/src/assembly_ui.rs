@@ -188,7 +188,11 @@ fn describe_ref(doc: &AssemblyDoc, r: &MateRef) -> String {
     let owner = doc
         .component(r.component)
         .map_or("(missing)", |c| c.name.as_str());
-    format!("{what} of {owner}")
+    // A part inside a sub-assembly: "Face of Pin<2> in Arm<1>".
+    match doc.inner_names(r.component, &r.path).last() {
+        Some(inner) => format!("{what} of {inner} in {owner}"),
+        None => format!("{what} of {owner}"),
+    }
 }
 
 /// A selection box of the Mate command.
@@ -335,7 +339,7 @@ impl OxydeApp {
         let Some(path) = doc.sources.get(&id).cloned() else {
             return;
         };
-        if doc.part_error(id).is_some() {
+        if doc.load_error(id).is_some() {
             self.status = format!("{} cannot be opened", path.display());
             return;
         }
@@ -355,9 +359,10 @@ impl OxydeApp {
     pub(crate) fn insert_component(&mut self) {
         let Some(paths) = rfd::FileDialog::new()
             .add_filter(
-                "Oxyde part",
+                "Oxyde part or assembly",
                 &[
                     oxyde_format::PART_EXTENSION,
+                    oxyde_format::ASSEMBLY_EXTENSION,
                     oxyde_format::LEGACY_PART_EXTENSION,
                 ],
             )
@@ -374,23 +379,26 @@ impl OxydeApp {
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
-        let loaded = match crate::assembly::load(path, &mut self.kernel) {
-            Ok(loaded) => loaded,
-            Err(e) => {
-                self.status = format!("Could not insert: {e}");
-                return;
-            }
-        };
-        let placement = doc.free_spot(&loaded);
-        let document_id = loaded.document_id.clone();
-        // Keep the part loaded: the new component uses it.
-        if let Some(Ok(mut old)) = doc.parts.insert(path.to_path_buf(), Ok(loaded)) {
+        // Read again from disk: the file may have changed since it was last used.
+        if let Some(Ok(crate::assembly::Loaded::Part(mut old))) = doc.docs.remove(path) {
             old.part.release(&mut self.kernel);
         }
+        if let Err(e) = doc.load_file(path, &mut self.kernel) {
+            self.status = format!("Could not insert: {e}");
+            return;
+        }
+        let placement = doc.free_spot(doc.file_bounds(path));
+        let document_id = doc
+            .docs
+            .get(path)
+            .and_then(|d| d.as_ref().ok())
+            .map(|d| d.document_id().to_owned())
+            .unwrap_or_default();
         doc.checkpoint();
-        let stem = path
-            .file_stem()
-            .map_or_else(|| "Part".to_owned(), |s| s.to_string_lossy().into_owned());
+        let stem = path.file_stem().map_or_else(
+            || "Component".to_owned(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         let stored = doc.stored_path(path);
         let id = doc
             .assembly
@@ -1069,13 +1077,21 @@ impl OxydeApp {
                     } else {
                         ""
                     };
-                    let error = doc.part_error(c.id);
+                    let error = doc.load_error(c.id);
                     let selected = doc.selection.contains(&AsmSelected::Component(c.id));
                     let expanded = doc.expanded.contains(&c.id);
+                    let sub = match doc.loaded(c.id) {
+                        Some(crate::assembly::Loaded::Assembly(sub)) => Some(sub),
+                        _ => None,
+                    };
                     let row = tree_row(
                         ui,
                         Row {
-                            icon: Icon::Part,
+                            icon: if sub.is_some() {
+                                Icon::Assembly
+                            } else {
+                                Icon::Part
+                            },
                             cut: false,
                             text: RichText::new(format!("{prefix}{}", c.name)),
                             highlighted: selected,
@@ -1107,7 +1123,12 @@ impl OxydeApp {
                     }
                     let response = row.response.on_hover_text(hover);
                     response.context_menu(|ui| {
-                        if ui.button("Open part").clicked() {
+                        let open = if sub.is_some() {
+                            "Open sub-assembly"
+                        } else {
+                            "Open part"
+                        };
+                        if ui.button(open).clicked() {
                             action = Some(TreeAction::OpenPart(id));
                             ui.close_menu();
                         }
@@ -1146,11 +1167,12 @@ impl OxydeApp {
                                 row.response
                             };
                             if response.clicked() && mating {
-                                action = Some(TreeAction::Target(MateRef {
-                                    component: id,
-                                    target,
-                                }));
+                                action = Some(TreeAction::Target(MateRef::new(id, target)));
                             }
+                        }
+                        // What the sub-assembly holds, as it was saved: edited by opening it.
+                        if let Some(sub) = sub {
+                            sub_tree(ui, doc, sub, 16.0, 0);
                         }
                     }
                 }
@@ -1427,16 +1449,13 @@ impl OxydeApp {
         }
         let v = |a: [f64; 3]| Vec3::new(a[0], a[1], a[2]);
         let (right, up) = (v(grab.right), v(grab.up));
-        let center = doc
-            .part_of(id)
-            .and_then(|p| p.bounds)
-            .map_or(Point3::ORIGIN, |(lo, hi)| {
-                Point3::new(
-                    (lo.x + hi.x) / 2.0,
-                    (lo.y + hi.y) / 2.0,
-                    (lo.z + hi.z) / 2.0,
-                )
-            });
+        let center = doc.component_bounds(id).map_or(Point3::ORIGIN, |(lo, hi)| {
+            Point3::new(
+                (lo.x + hi.x) / 2.0,
+                (lo.y + hi.y) / 2.0,
+                (lo.z + hi.z) / 2.0,
+            )
+        });
         let center = placement.apply_point(center);
         let moved = if grab.rotate {
             // About a full turn for a drag across the assembly.
@@ -1529,25 +1548,25 @@ impl OxydeApp {
             .map(str::to_owned)
             .to_vec(),
         ];
-        for line in bom::lines(&doc.assembly) {
+        let open = |c: &oxyde_assembly::Component, parent: &str| doc.bom_open(c, parent);
+        for row in bom::rows(&doc.assembly, "", self.bom_mode, &open) {
             let properties = doc
-                .assembly
-                .components
-                .iter()
-                .find(|c| c.path == line.path || c.document_id == line.document_id)
-                .and_then(|c| doc.part_of(c.id))
-                .map(|p| p.properties.clone())
+                .docs
+                .get(Path::new(&row.key))
+                .and_then(|d| d.as_ref().ok())
+                .map(|d| d.properties().clone())
                 .unwrap_or_default();
-            let file = Path::new(&line.path)
+            let file = Path::new(&row.key)
                 .file_name()
-                .map_or_else(|| line.path.clone(), |n| n.to_string_lossy().into_owned());
+                .map_or_else(|| row.key.clone(), |n| n.to_string_lossy().into_owned());
+            let indent = "    ".repeat(row.level);
             rows.push(vec![
-                line.item.to_string(),
+                format!("{indent}{}", row.item),
                 properties.part_number,
                 properties.description,
                 properties.material,
                 file,
-                line.quantity.to_string(),
+                row.quantity.to_string(),
             ]);
         }
         rows
@@ -1565,6 +1584,19 @@ impl OxydeApp {
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    use bom::BomMode;
+                    ui.label("Show");
+                    ui.radio_value(&mut self.bom_mode, BomMode::TopLevel, "Top level")
+                        .on_hover_text("Sub-assemblies as one line");
+                    ui.radio_value(&mut self.bom_mode, BomMode::PartsOnly, "Parts only")
+                        .on_hover_text(
+                            "Every part, through every sub-assembly, with total quantities",
+                        );
+                    ui.radio_value(&mut self.bom_mode, BomMode::Indented, "Indented")
+                        .on_hover_text("Sub-assemblies followed by their own parts");
+                });
+                ui.add_space(4.0);
                 egui::Grid::new("bom")
                     .striped(true)
                     .num_columns(6)
@@ -1614,6 +1646,52 @@ impl OxydeApp {
                     Err(e) => format!("Could not write {}: {e}", path.display()),
                 };
             }
+        }
+    }
+}
+
+/// The components of a sub-assembly, indented under it in the tree (read only).
+fn sub_tree(
+    ui: &mut egui::Ui,
+    doc: &AssemblyDoc,
+    sub: &crate::assembly::LoadedAssembly,
+    indent: f32,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    for c in &sub.assembly.components {
+        let inner = sub
+            .sources
+            .get(&c.id)
+            .and_then(|p| doc.docs.get(p))
+            .and_then(|d| d.as_ref().ok());
+        let nested = match inner {
+            Some(crate::assembly::Loaded::Assembly(a)) => Some(a),
+            _ => None,
+        };
+        tree_row(
+            ui,
+            Row {
+                icon: if nested.is_some() {
+                    Icon::Assembly
+                } else {
+                    Icon::Part
+                },
+                cut: false,
+                text: RichText::new(&c.name).weak(),
+                highlighted: false,
+                badge: inner.is_none().then_some(Icon::Error),
+                indent,
+                expander: None,
+                eye: None,
+            },
+        )
+        .response
+        .on_hover_text("Part of the sub-assembly: open the sub-assembly to change it");
+        if let Some(nested) = nested {
+            sub_tree(ui, doc, nested, indent + 16.0, depth + 1);
         }
     }
 }

@@ -72,6 +72,9 @@ pub(crate) enum MateKindDto {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MateRefDto {
     pub component: u32,
+    /// Inside a sub-assembly: its component ids down to the part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<u32>,
     #[serde(flatten)]
     pub target: TargetDto,
 }
@@ -218,6 +221,7 @@ impl AssemblyModel {
 fn ref_dto(r: &MateRef) -> MateRefDto {
     MateRefDto {
         component: r.component.0,
+        path: r.path.iter().map(|c| c.0).collect(),
         target: match &r.target {
             MateTarget::Face(f) => TargetDto::Face(face_dto(f)),
             MateTarget::Edge(e) => TargetDto::Edge(edge_dto(e)),
@@ -239,6 +243,7 @@ fn ref_dto(r: &MateRef) -> MateRefDto {
 fn ref_from(dto: MateRefDto) -> MateRef {
     MateRef {
         component: ComponentId(dto.component),
+        path: dto.path.into_iter().map(ComponentId).collect(),
         target: match dto.target {
             TargetDto::Face(f) => MateTarget::Face(face_from(f)),
             TargetDto::Edge(e) => MateTarget::Edge(edge_from(e)),

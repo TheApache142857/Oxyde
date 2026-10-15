@@ -46,6 +46,15 @@ impl Placement {
         )
     }
 
+    /// `inner` (a placement inside a sub-assembly) seen from where this one puts the
+    /// sub-assembly: `self(inner(p))`.
+    pub fn compose(&self, inner: &Placement) -> Placement {
+        Placement {
+            rotation: multiply(&self.rotation, &inner.rotation),
+            translation: self.apply_vector(inner.translation) + self.translation,
+        }
+    }
+
     /// Rotated by `rotation_vector` (axis × angle, radians) about `center`, then moved by
     /// `shift`, all in assembly coordinates.
     pub fn moved(&self, rotation_vector: Vec3, center: Point3, shift: Vec3) -> Placement {

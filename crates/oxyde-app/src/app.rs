@@ -120,6 +120,7 @@ pub struct OxydeApp {
     pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
     pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
     pub(crate) show_bom: bool,
+    pub(crate) bom_mode: oxyde_assembly::bom::BomMode,
     /// Assembly revision the viewport shows.
     pub(crate) asm_scene: Option<u64>,
     /// The component being moved with Alt+drag.
@@ -158,6 +159,7 @@ impl OxydeApp {
             mate_dialog: None,
             mate_preview: None,
             show_bom: false,
+            bom_mode: oxyde_assembly::bom::BomMode::TopLevel,
             asm_scene: None,
             grabbing: None,
             pending_open_component: None,

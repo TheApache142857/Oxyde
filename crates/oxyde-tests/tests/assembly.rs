@@ -94,10 +94,7 @@ fn a_pin_goes_into_a_hole() {
             Vec3::new(80.0, 10.0, 25.0),
         ),
     );
-    let side = |component, face: &FaceName| MateRef {
-        component,
-        target: MateTarget::Face(face.clone()),
-    };
+    let side = |component, face: &FaceName| MateRef::new(component, MateTarget::Face(face.clone()));
     let concentric = asm.add_mate(MateKind::Concentric, side(a, &hole), side(b, &round), true);
     // The pin's bottom flush with the block's top: the faces face each other.
     let flush = asm.add_mate(MateKind::Coincident, side(a, &top), side(b, &bottom), false);

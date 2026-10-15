@@ -5,6 +5,8 @@
 //!   edited in its own document, the assembly just places it.
 //! - [`solve`] moves the components that are not fixed until every mate holds, and tells
 //!   which mates cannot be met and which components can still move.
+//! - Components can be sub-assemblies: rigid inside their parent, with mates reaching the
+//!   faces of the parts inside them through [`MateRef::path`].
 //! - [`bom`] counts the parts for a bill of materials, [`scene`] puts the parts' meshes
 //!   together for display and maps picks back to components, [`paths`] stores part paths
 //!   relative to the assembly.

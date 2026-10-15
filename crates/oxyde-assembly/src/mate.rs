@@ -80,10 +80,27 @@ pub enum MateTarget {
 }
 
 /// A mate reference: geometry of one component.
+///
+/// When the component is a sub-assembly, `path` leads to the part inside it that holds
+/// the face or edge: a component of the sub-assembly, then a component of that one if it
+/// is itself an assembly, and so on. Empty for a part, or for a sub-assembly's own planes
+/// and origin.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MateRef {
     pub component: ComponentId,
+    pub path: Vec<ComponentId>,
     pub target: MateTarget,
+}
+
+impl MateRef {
+    /// Geometry of the component itself.
+    pub fn new(component: ComponentId, target: MateTarget) -> Self {
+        Self {
+            component,
+            path: Vec::new(),
+            target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

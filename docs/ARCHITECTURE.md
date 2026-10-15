@@ -158,12 +158,13 @@ The groundwork for equations, SolidWorks-style:
 
 ## 8. Assemblies (`oxyde-assembly`) and drawings (later)
 
-- **Bottom-up**: an assembly only places parts and mates them; a part is edited in its own document (*Open part* from the assembly, then *File › Back to assembly*, which reloads the parts). Sub-assemblies are not supported yet.
+- **Bottom-up**: an assembly only places parts and sub-assemblies and mates them; a component is edited in its own document (*Open part* / *Open sub-assembly*, then *File › Back to assembly*, which reloads the files).
+- **Sub-assemblies** are rigid, as in SolidWorks: their components stay where their own file put them, and only the top-level components are unknowns of the solver. A mate may still reach a face or edge of a part deep inside one: `MateRef::path` lists the component ids from the sub-assembly down to that part, and the app composes the placements along it (`Placement::compose`) to give the solver the geometry in the top-level component's coordinates. Loading follows sub-assemblies recursively with a stack of open files, so an assembly that contains itself is refused.
 - **Components** reference part files by path relative to the assembly + document UUID, so a part moved within the assembly's folder is found again by its id (see `FORMAT.md` §6). Each component has a placement (rotation + translation, never a mirror). The first one inserted is **fixed**; any can be fixed or floated.
 - **Mates** (coincident, concentric, parallel, perpendicular, distance, angle) name geometry the way features do: persistent face and edge names in the part, or the part's standard planes, axes and origin. `resolve` turns a reference into a primitive in part coordinates using the part's rebuilt body: a flat face is a plane (outward normal), a cylindrical or conical face its axis, a straight edge a line, a circular edge a circle (centre and normal). Each mate kind writes residuals that vanish when it holds; directions are scaled by the assembly size so that they weigh like lengths. A mate between oriented geometry is *aligned* or *anti-aligned*; a new mate starts with whichever is closest to how the parts sit.
 - **Solver**: Levenberg–Marquardt over a small rotation and a shift per free component, from the current placements, so the answer is the nearest one (which is what dragging needs). When the mates cannot all hold, they are added back one at a time in order and each one that cannot hold with those before it is reported, as SolidWorks blames the newest mate. Degrees of freedom left per component come from the rank of its Jacobian columns: the tree shows `(f)` fixed, `(-)` under-defined.
-- **BOM**: the components grouped by part (same path or same document id), with part number, description and material from each part's `properties.json`, exported as CSV.
-- **Display**: the part meshes are moved to their placements and combined into one mesh for the viewport; the face and edge ranges of each component map picks back to a component and a persistent name.
+- **BOM**: components grouped by file (same path or same document id), with part number, description and material from each file's `properties.json`, in three views: top level (a sub-assembly is one line), parts only (through every level, quantities multiplied) and indented (`2`, `2.1`, `2.2`…); exported as CSV.
+- **Display**: every part occurrence (a top-level component plus its path inside sub-assemblies) is moved to its placement and the meshes are combined into one for the viewport; the face and edge ranges of each occurrence map picks back to it and a persistent name.
 - Drawings: views computed by the kernel's hidden-line removal (OCCT `HLRBRep`), annotations and dimensions in Rust, export to PDF/SVG/DXF.
 
 ## 9. Application (`oxyde-app`) and viewport (`oxyde-render`)
@@ -207,5 +208,5 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 | **M4** (done) | Viewport, interactive sketch mode, selection, fillet/chamfer with persistent naming |
 | **M5** (done) | Linear and circular patterns, mirror (tool-body copies with instance names) |
 | **GPU** (done) | wgpu viewport with GPU picking, software renderer as fallback |
-| **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files, mates with a 3D solver, fixed/floating, Alt+drag, BOM export (CSV); parts renamed `.oxyprt` |
+| **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files and sub-assemblies, mates with a 3D solver (reaching into sub-assemblies), fixed/floating, Alt+drag, BOM (top level, parts only, indented) exported as CSV; parts renamed `.oxyprt` |
 | **M7** | Drawings: views, dimensions, PDF/DXF |

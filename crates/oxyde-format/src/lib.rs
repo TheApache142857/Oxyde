@@ -789,10 +789,12 @@ mod tests {
             MateKind::Concentric,
             MateRef {
                 component: base,
+                path: Vec::new(),
                 target: MateTarget::Face(face.clone()),
             },
             MateRef {
                 component: pin,
+                path: Vec::new(),
                 target: MateTarget::Axis(StandardAxis::Z),
             },
             true,
@@ -801,10 +803,12 @@ mod tests {
             MateKind::Distance(4.5),
             MateRef {
                 component: base,
+                path: Vec::new(),
                 target: MateTarget::Plane(StandardPlane::Top),
             },
             MateRef {
                 component: pin,
+                path: Vec::new(),
                 target: MateTarget::Origin,
             },
             false,
@@ -813,10 +817,15 @@ mod tests {
             MateKind::Angle(0.5),
             MateRef {
                 component: base,
+                path: Vec::new(),
                 target: MateTarget::Edge(EdgeName::between(face, FaceName::start_cap(feature))),
             },
             MateRef {
                 component: pin,
+                path: vec![
+                    oxyde_assembly::ComponentId(3),
+                    oxyde_assembly::ComponentId(1),
+                ],
                 target: MateTarget::Plane(StandardPlane::Right),
             },
             true,

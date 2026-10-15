@@ -26,7 +26,7 @@ fn two() -> (Assembly, ComponentId, ComponentId) {
 }
 
 fn r(component: ComponentId, target: MateTarget) -> MateRef {
-    MateRef { component, target }
+    MateRef::new(component, target)
 }
 
 fn run(asm: &mut Assembly) -> Solution {
@@ -300,8 +300,107 @@ fn combined_meshes_map_picks_back_to_components() {
         scene::combine([(ComponentId(1), &a, &mesh), (ComponentId(2), &b, &mesh)]);
     assert_eq!((combined.faces.len(), combined.edges.len()), (4, 6));
     assert_eq!(combined.faces[2].positions[1], [11.0, 0.0, 0.0]);
-    assert_eq!(scene::face_owner(&ranges, 3), Some((ComponentId(2), 1)));
-    assert_eq!(scene::edge_owner(&ranges, 2), Some((ComponentId(1), 2)));
-    assert_eq!(scene::face_index(&ranges, ComponentId(2), 0), Some(2));
-    assert_eq!(scene::edge_index(&ranges, ComponentId(1), 5), None);
+    assert_eq!(scene::face_owner(&ranges, 3), Some((&ComponentId(2), 1)));
+    assert_eq!(scene::edge_owner(&ranges, 2), Some((&ComponentId(1), 2)));
+    assert_eq!(scene::face_index(&ranges, &ComponentId(2), 0), Some(2));
+    assert_eq!(scene::edge_index(&ranges, &ComponentId(1), 5), None);
+}
+
+#[test]
+fn bill_of_materials_through_sub_assemblies() {
+    use bom::{BomMode, rows};
+    // A robot: one base, two arms. An arm: two links and four pins.
+    let mut arm = Assembly::new();
+    for (stem, n) in [("Link", 2), ("Pin", 4)] {
+        for _ in 0..n {
+            arm.add_component(
+                stem,
+                format!("{}.oxyprt", stem.to_lowercase()),
+                stem.into(),
+                Placement::IDENTITY,
+            );
+        }
+    }
+    let mut robot = Assembly::new();
+    robot.add_component(
+        "Base",
+        "base.oxyprt".into(),
+        "Base".into(),
+        Placement::IDENTITY,
+    );
+    for _ in 0..2 {
+        robot.add_component(
+            "Arm",
+            "arm/arm.oxyasm".into(),
+            "Arm".into(),
+            Placement::IDENTITY,
+        );
+    }
+    robot.add_component(
+        "Pin",
+        "arm/pin.oxyprt".into(),
+        "Pin".into(),
+        Placement::IDENTITY,
+    );
+    // Keys: the file path relative to the robot; the arm's parts live in arm/.
+    let open = |c: &Component, parent: &str| -> (String, Option<&Assembly>) {
+        let folder = parent.rsplit_once('/').map_or("", |(f, _)| f);
+        let key = if folder.is_empty() {
+            c.path.clone()
+        } else {
+            format!("{folder}/{}", c.path)
+        };
+        let sub = (c.document_id == "Arm").then_some(&arm);
+        (key, sub)
+    };
+    let top = rows(&robot, "robot.oxyasm", BomMode::TopLevel, &open);
+    let summary = |rows: &[bom::BomRow]| {
+        rows.iter()
+            .map(|r| format!("{} {} x{}", r.item, r.key, r.quantity))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        summary(&top),
+        [
+            "1 base.oxyprt x1",
+            "2 arm/arm.oxyasm x2",
+            "3 arm/pin.oxyprt x1"
+        ]
+    );
+    assert!(top[1].is_assembly);
+    let indented = rows(&robot, "robot.oxyasm", BomMode::Indented, &open);
+    assert_eq!(
+        summary(&indented),
+        [
+            "1 base.oxyprt x1",
+            "2 arm/arm.oxyasm x2",
+            "2.1 arm/link.oxyprt x2",
+            "2.2 arm/pin.oxyprt x4",
+            "3 arm/pin.oxyprt x1",
+        ]
+    );
+    assert_eq!(indented[2].level, 1);
+    // Parts only: the pins inside both arms and the loose one add up.
+    let parts = rows(&robot, "robot.oxyasm", BomMode::PartsOnly, &open);
+    assert_eq!(
+        summary(&parts),
+        [
+            "1 base.oxyprt x1",
+            "2 arm/link.oxyprt x4",
+            "3 arm/pin.oxyprt x9"
+        ]
+    );
+}
+
+#[test]
+fn placements_compose_like_nested_frames() {
+    let outer = placed(
+        Vec3::new(5.0, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, std::f64::consts::FRAC_PI_2),
+    );
+    let inner = placed(Vec3::new(1.0, 2.0, 3.0), Vec3::new(0.3, 0.0, 0.1));
+    let p = Point3::new(0.5, -1.0, 2.0);
+    let expected = outer.apply_point(inner.apply_point(p));
+    let got = outer.compose(&inner).apply_point(p);
+    assert!((got - expected).length() < 1e-12, "{got:?} {expected:?}");
 }
