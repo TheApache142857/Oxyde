@@ -437,9 +437,10 @@ mod tests {
     use std::f64::consts::{PI, TAU};
 
     use oxyde_model::{
-        AxisRef, CircularPattern, EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
-        FaceName, FeatureKind, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
-        RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane,
+        AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, Extrude,
+        ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, FeatureKind, LinearPattern, Mirror,
+        PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
+        SketchPlane, StandardAxis, StandardPlane,
     };
     use oxyde_sketch::Constraint;
 
@@ -474,6 +475,7 @@ mod tests {
             op: ExtrudeOp::Cut,
             extent: ExtrudeExtent::MidPlane { depth: 4.0 },
             reverse: true,
+            bodies: vec![BodyId::new(boss, 0)],
         }));
 
         let edge = EdgeName::between(FaceName::profile(boss, 2), FaceName::end_cap(boss));
@@ -509,11 +511,12 @@ mod tests {
         let s3 = part.add_feature(FeatureKind::Sketch(profile));
         let ring = part.add_feature(FeatureKind::Revolve(Revolve {
             sketch: s3,
-            op: ExtrudeOp::Boss,
+            op: ExtrudeOp::NewBody,
             axis: RevolveAxis::SketchLine(centerline.0),
             angle: PI,
             mid_plane: true,
             reverse: false,
+            bodies: Vec::new(),
         }));
         let row = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
             seeds: vec![hole],
@@ -544,6 +547,13 @@ mod tests {
         part.add_feature(FeatureKind::Mirror(Mirror {
             seeds: vec![hole, ring],
             plane: PlaneRef::Face(FaceName::start_cap(boss)),
+        }));
+        // Bodies: the ring was made as a body of its own; combined into the first.
+        part.add_feature(FeatureKind::Combine(Combine {
+            target: BodyId::new(boss, 0),
+            tools: vec![BodyId::new(ring, 0)],
+            op: CombineOp::Join,
+            keep_tools: true,
         }));
         let shell = part.add_feature(FeatureKind::Shell(Shell {
             faces: vec![FaceName::new(FaceKey::Instance {

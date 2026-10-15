@@ -7,9 +7,9 @@
 //! viewport or the timeline while the command is open adds to the lists.
 
 use oxyde_model::{
-    AxisRef, CircularPattern, ExtrudeOp, FaceName, Feature, FeatureId, FeatureKind,
-    FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane,
-    Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane,
+    AxisRef, BodyId, CircularPattern, Combine, CombineOp, ExtrudeOp, FaceName, Feature, FeatureId,
+    FeatureKind, FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
+    RefPlane, Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane,
 };
 use oxyde_sketch::Geometry;
 
@@ -34,6 +34,19 @@ pub struct RevolveDialog {
     pub angle: f64,
     pub mid_plane: bool,
     pub reverse: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic.
+    pub bodies: Vec<BodyId>,
+}
+
+/// Combine: a target body and the tool bodies joined to, cut from or intersected with it.
+pub struct CombineDialog {
+    pub editing: Option<FeatureId>,
+    pub target: Option<BodyId>,
+    pub tools: Vec<BodyId>,
+    pub op: CombineOp,
+    pub keep_tools: bool,
+    /// Clicks fill the tools box rather than the target.
+    pub tools_next: bool,
 }
 
 pub struct ShellDialog {
@@ -307,6 +320,7 @@ impl OxydeApp {
             angle: existing.map_or(360.0, |r| r.angle.to_degrees()),
             mid_plane: existing.is_some_and(|r| r.mid_plane),
             reverse: existing.is_some_and(|r| r.reverse),
+            bodies: existing.map(|r| r.bodies.clone()).unwrap_or_default(),
         }));
     }
 
@@ -549,6 +563,7 @@ impl OxydeApp {
             angle: d.angle.to_radians(),
             mid_plane: d.mid_plane,
             reverse: d.reverse,
+            bodies: d.bodies,
         });
         self.add_or_replace(d.editing, kind);
     }
@@ -629,6 +644,67 @@ impl OxydeApp {
             }
         };
         self.add_or_replace(d.editing, kind);
+    }
+
+    pub(crate) fn open_combine(&mut self, editing: Option<FeatureId>, existing: Option<&Combine>) {
+        // A new Combine starts from the body selected in the tree, if any.
+        let target = existing.map(|c| c.target).or(self.selected_body);
+        self.dialog = Some(Dialog::Combine(CombineDialog {
+            editing,
+            tools_next: target.is_some(),
+            target,
+            tools: existing.map(|c| c.tools.clone()).unwrap_or_default(),
+            op: existing.map_or(CombineOp::Join, |c| c.op),
+            keep_tools: existing.is_some_and(|c| c.keep_tools),
+        }));
+        if self.body_count() < 2 && existing.is_none() {
+            self.status = "Combine needs two bodies: make one with Extrude › New body".to_owned();
+        }
+    }
+
+    pub(crate) fn apply_combine(&mut self, d: CombineDialog) {
+        let Some(target) = d.target else {
+            self.status = "Choose the target body".to_owned();
+            return;
+        };
+        if d.tools.is_empty() {
+            self.status = "Choose the tool bodies".to_owned();
+            return;
+        }
+        let kind = FeatureKind::Combine(Combine {
+            target,
+            tools: d.tools,
+            op: d.op,
+            keep_tools: d.keep_tools,
+        });
+        self.add_or_replace(d.editing, kind);
+    }
+
+    /// How many bodies the part has now.
+    pub(crate) fn body_count(&self) -> usize {
+        self.doc.part.body().map_or(0, |b| b.solids.len())
+    }
+
+    /// "Body 2": bodies are numbered in the order their features come in the timeline.
+    pub(crate) fn body_label(&self, id: BodyId) -> String {
+        let mut ids: Vec<BodyId> = self
+            .doc
+            .part
+            .body()
+            .map(|b| b.solids.iter().map(|s| s.id).collect())
+            .unwrap_or_default();
+        ids.sort_by_key(|b| (self.doc.part.index_of(b.feature), b.index));
+        match ids.iter().position(|b| *b == id) {
+            Some(i) => format!("Body {}", i + 1),
+            None => format!("Body {id} (gone)"),
+        }
+    }
+
+    /// The body a face of the part is on.
+    pub(crate) fn body_of_face(&self, face: &FaceName) -> Option<BodyId> {
+        let body = self.doc.part.body()?;
+        let index = body.naming.find_face(face)?;
+        body.solid_of_face(index).map(|s| s.id)
     }
 
     pub(crate) fn apply_ref_plane(&mut self, d: PlaneDialog) {

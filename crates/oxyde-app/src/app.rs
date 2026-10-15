@@ -60,6 +60,7 @@ pub enum Command {
     Blend(bool),
     Shell,
     Pattern(PatternKind),
+    Combine,
     RefPlane,
     RefAxis,
 }
@@ -93,6 +94,10 @@ pub struct OxydeApp {
     pub(crate) viewport: Viewport,
     pub(crate) selected_feature: Option<FeatureId>,
     pub(crate) selected_plane: Option<StandardPlane>,
+    /// A body selected in the Solid Bodies folder.
+    pub(crate) selected_body: Option<oxyde_model::BodyId>,
+    /// The Solid Bodies folder is open in the timeline.
+    pub(crate) bodies_expanded: bool,
     pub(crate) selection: Vec<Selected>,
     pub(crate) dialog: Option<Dialog>,
     /// The sketch being edited, when in sketch mode.
@@ -146,6 +151,8 @@ impl OxydeApp {
             viewport: Viewport::new(),
             selected_feature: None,
             selected_plane: None,
+            selected_body: None,
+            bodies_expanded: true,
             selection: Vec::new(),
             dialog: None,
             sketch: None,
@@ -285,13 +292,18 @@ impl OxydeApp {
         let Some(body) = self.doc.part.body() else {
             return Vec::new();
         };
-        self.selection
+        let mut picks: Vec<Pick> = self
+            .selection
             .iter()
             .filter_map(|s| match s {
                 Selected::Face(name) => body.naming.find_face(name).map(Pick::Face),
                 Selected::Edge(name) => body.naming.find_edge(name).map(Pick::Edge),
             })
-            .collect()
+            .collect();
+        if let Some(solid) = self.selected_body.and_then(|id| body.solid(id)) {
+            picks.extend(solid.faces.clone().map(Pick::Face));
+        }
+        picks
     }
 
     fn click(&mut self, pick: Option<Pick>, additive: bool) {
@@ -536,6 +548,7 @@ impl OxydeApp {
             depth: 10.0,
             mid_plane: false,
             reverse: false,
+            bodies: Vec::new(),
         }));
         if sketch.is_none() {
             self.status = "Select the sketch to extrude in the tree".to_owned();
@@ -573,6 +586,7 @@ impl OxydeApp {
             Command::Blend(fillet) => self.begin_blend(fillet),
             Command::Shell => self.begin_shell(),
             Command::Pattern(kind) => self.begin_pattern(kind),
+            Command::Combine => self.open_combine(None, None),
             Command::RefPlane => self.open_ref_plane(None, None),
             Command::RefAxis => self.open_ref_axis(None, None),
         }
@@ -791,7 +805,7 @@ impl OxydeApp {
             .doc
             .part
             .body()
-            .and_then(|body| self.kernel.volume(body.shape).ok());
+            .and_then(|body| bodies_volume(&self.kernel, body).ok());
         match oxyde_format::save_part(path, &file) {
             Ok(()) => {
                 self.doc.path = Some(path.to_path_buf());
@@ -809,7 +823,7 @@ impl OxydeApp {
     }
 
     pub(crate) fn export_step(&mut self) {
-        let Some(shape) = self.doc.part.body().map(|b| b.shape) else {
+        let Some(shapes) = self.doc.part.body().map(|b| b.shapes()) else {
             self.status = "Nothing to export".to_owned();
             return;
         };
@@ -820,7 +834,7 @@ impl OxydeApp {
         else {
             return;
         };
-        self.status = match self.kernel.export_step(&[shape], &path) {
+        self.status = match self.kernel.export_step(&shapes, &path) {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };
@@ -833,9 +847,7 @@ impl OxydeApp {
         if self.summary.as_ref().map(|(r, _)| *r) != Some(revision) {
             let text = match self.doc.part.body() {
                 Some(body) => {
-                    let volume = self
-                        .kernel
-                        .volume(body.shape)
+                    let volume = bodies_volume(&self.kernel, body)
                         .map_or_else(|_| "?".to_owned(), |v| format!("{v:.1}"));
                     format!(
                         "Volume {volume} mm³   Faces {}   Edges {}",
@@ -1305,10 +1317,7 @@ impl OxydeApp {
             self.viewport.set_scene(Scene::default(), false);
             return;
         };
-        match self
-            .kernel
-            .tessellate(body.shape, deflection(&body.topology, self.mesh_fraction()))
-        {
+        match tessellate_bodies(&self.kernel, body, self.mesh_fraction()) {
             Ok(mesh) => self.viewport.set_scene(Scene::from_mesh(&mesh), first),
             Err(e) => self.status = format!("Display failed: {e}"),
         }
@@ -1466,6 +1475,34 @@ fn overlay_at(
 }
 
 /// Mesh precision: about a thousandth of the part size.
+/// The meshes of every body of a part, one after the other, so that faces and edges are
+/// numbered as in `body.topology`.
+pub(crate) fn tessellate_bodies<K: Kernel>(
+    kernel: &K,
+    body: &oxyde_model::Body,
+    fraction: f64,
+) -> Result<oxyde_kernel::Mesh, K::Error> {
+    let deflection = deflection(&body.topology, fraction);
+    let mut out = oxyde_kernel::Mesh {
+        faces: Vec::new(),
+        edges: Vec::new(),
+    };
+    for solid in &body.solids {
+        let mesh = kernel.tessellate(solid.shape, deflection)?;
+        out.faces.extend(mesh.faces);
+        out.edges.extend(mesh.edges);
+    }
+    Ok(out)
+}
+
+/// Volume of every body together, mm³.
+pub(crate) fn bodies_volume<K: Kernel>(
+    kernel: &K,
+    body: &oxyde_model::Body,
+) -> Result<f64, K::Error> {
+    body.solids.iter().map(|s| kernel.volume(s.shape)).sum()
+}
+
 /// Mesh precision: `fraction` of the part size (about a thousandth by default).
 pub(crate) fn deflection(topology: &Topology, fraction: f64) -> f64 {
     let mut lo = [f64::INFINITY; 3];

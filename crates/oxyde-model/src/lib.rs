@@ -13,6 +13,7 @@
 //! Depends on the `Kernel` trait only, never on a concrete backend.
 //! See `docs/ARCHITECTURE.md` §6.
 
+mod bodies;
 mod dimensions;
 mod equations;
 mod error;
@@ -21,6 +22,7 @@ mod feature;
 mod naming;
 mod part;
 
+pub use bodies::{Body, Solid};
 pub use dimensions::{
     Dimension, DimensionKey, DimensionRef, DimensionUnit, full_name, split_full_name,
 };
@@ -30,12 +32,12 @@ pub use equations::{
 pub use error::ModelError;
 pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};
 pub use feature::{
-    AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
-    FeatureKind, FeatureParameter, FileData, Import, LinearPattern, Mirror, PatternDirection,
-    PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
-    StandardPlane,
+    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
+    ExtrudeOp, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, Import, LinearPattern,
+    Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
+    SketchPlane, StandardAxis, StandardPlane,
 };
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
-    Body, FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,
+    FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,
 };

@@ -54,7 +54,7 @@ fn assert_all_ok(part: &Part) {
 
 fn volume(part: &Part, kernel: &OcctKernel) -> f64 {
     kernel
-        .volume(part.body().expect("part has a body").shape)
+        .volume(part.body().expect("part has a body").solids[0].shape)
         .unwrap()
 }
 
@@ -112,7 +112,7 @@ fn fillet_stays_on_its_edge_through_upstream_edits() {
     // The result exports cleanly.
     let path = std::env::temp_dir().join(format!("oxyde-fillet-{}.step", std::process::id()));
     kernel
-        .export_step(&[part.body().unwrap().shape], &path)
+        .export_step(&[part.body().unwrap().solids[0].shape], &path)
         .unwrap();
     let _ = std::fs::remove_file(&path);
 
@@ -169,7 +169,9 @@ fn boss_on_top_merges_into_one_body() {
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
     assert_close(volume(&part, &kernel), 8000.0 + 500.0);
-    let counts = kernel.topology_counts(part.body().unwrap().shape).unwrap();
+    let counts = kernel
+        .topology_counts(part.body().unwrap().solids[0].shape)
+        .unwrap();
     assert_eq!(counts.solids, 1);
 
     part.release(&mut kernel);
@@ -262,7 +264,9 @@ fn profile_with_a_hole_and_separate_regions() {
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
     assert_close(volume(&part, &kernel), 2.0 * 500.0);
-    let counts = kernel.topology_counts(part.body().unwrap().shape).unwrap();
+    let counts = kernel
+        .topology_counts(part.body().unwrap().solids[0].shape)
+        .unwrap();
     assert_eq!(counts.solids, 2);
     part.release(&mut kernel);
 }

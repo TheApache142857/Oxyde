@@ -121,8 +121,8 @@ Rules:
 | `type` | Fields |
 |---|---|
 | `sketch` | `plane` (PlaneRef); `entities` and `relations`, see below |
-| `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse` |
-| `revolve` | `sketch`, `operation`, `axis` (`{"sketch_line": entity id}` \| `{"axis": AxisRef}`), `angle` (radians, up to 2π), `mid_plane`, `reverse` |
+| `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut` \| `intersect` \| `new_body`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse`, `bodies` (optional, see Bodies below) |
+| `revolve` | `sketch`, `operation`, `axis` (`{"sketch_line": entity id}` \| `{"axis": AxisRef}`), `angle` (radians, up to 2π), `mid_plane`, `reverse`, `bodies` (optional) |
 | `fillet` | `edges` (list of EdgeRef), `radius` |
 | `chamfer` | `edges` (list of EdgeRef), `distance` |
 | `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
@@ -131,12 +131,23 @@ Rules:
 | `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
 | `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
 | `mirror` | `seeds`, `plane` (PlaneRef) |
-| `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are added to the body. |
+| `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). |
+| `combine` | `target` (body), `tools` (bodies), `operation` (`join` \| `cut` \| `intersect`), `keep_tools` (optional, default false) |
 
 Counts include the seed. Seeds of patterns and mirrors are extrusions and revolves (their tool bodies are copied).
 
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
 **AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
+
+### Bodies
+
+A part may hold several separate solid bodies (as in Fusion 360 or Creo). A body is named by the feature that made it and which of that feature's bodies it is: `{"feature": 7, "index": 0}` (`index` optional, default 0; a pattern of a `new_body` feature makes one body per copy, numbered in order).
+
+- `operation` of an extrusion or a revolve: `boss` joins the swept solid to a body (the first `boss` of a part makes its first body), `cut` removes it from bodies, `intersect` keeps only what it shares with a body, `new_body` keeps it as a body of its own.
+- `bodies` lists the bodies a `boss`, `cut` or `intersect` works on. Absent or empty means automatic: a `boss` or an `intersect` goes into the body the sketch's face is on (else the newest body), a `cut` goes through every body. Several bodies in a `boss` are joined into the first.
+- Fillets, chamfers and shells work on the bodies their edges or faces are on. Pattern and mirror copies do what their seed did, to the same bodies.
+- A `combine` changes its `target` body by its `tools`, which disappear unless `keep_tools`.
+- A body cut away entirely disappears. Face and edge names stay unique across all bodies.
 
 Every feature may also carry `dimension_names` (optional, default empty): custom names of its own dimensions, keyed by parameter: `depth` (extrude), `angle` (revolve, circular pattern), `radius` (fillet), `distance` (chamfer), `thickness` (shell), `offset` (reference plane), `spacing`, `count`, `spacing2`, `count2` (patterns). Unlisted parameters have default names numbered in that order within the feature: `D1`, `D2`…
 

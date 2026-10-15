@@ -30,6 +30,26 @@ impl fmt::Display for FeatureId {
     }
 }
 
+/// Stable identity of a solid body of a part: the feature that created it, and which of
+/// the bodies that feature created (a pattern of a new-body feature makes several).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BodyId {
+    pub feature: FeatureId,
+    pub index: u32,
+}
+
+impl BodyId {
+    pub const fn new(feature: FeatureId, index: u32) -> Self {
+        Self { feature, index }
+    }
+}
+
+impl fmt::Display for BodyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.feature, self.index)
+    }
+}
+
 /// A numeric parameter of a feature that is a dimension in its own right, e.g. the depth
 /// of an extrusion ("D1@Boss-Extrude1").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -225,6 +245,7 @@ pub enum FeatureKind {
     CircularPattern(CircularPattern),
     Mirror(Mirror),
     Import(Import),
+    Combine(Combine),
 }
 
 impl FeatureKind {
@@ -233,12 +254,14 @@ impl FeatureKind {
         match self {
             FeatureKind::Sketch(_) => "Sketch",
             FeatureKind::Extrude(e) => match e.op {
-                ExtrudeOp::Boss => "Boss-Extrude",
+                ExtrudeOp::Boss | ExtrudeOp::NewBody => "Boss-Extrude",
                 ExtrudeOp::Cut => "Cut-Extrude",
+                ExtrudeOp::Intersect => "Intersect-Extrude",
             },
             FeatureKind::Revolve(r) => match r.op {
-                ExtrudeOp::Boss => "Revolve",
+                ExtrudeOp::Boss | ExtrudeOp::NewBody => "Revolve",
                 ExtrudeOp::Cut => "Cut-Revolve",
+                ExtrudeOp::Intersect => "Intersect-Revolve",
             },
             FeatureKind::Fillet(_) => "Fillet",
             FeatureKind::Chamfer(_) => "Chamfer",
@@ -249,6 +272,7 @@ impl FeatureKind {
             FeatureKind::CircularPattern(_) => "CirPattern",
             FeatureKind::Mirror(_) => "Mirror",
             FeatureKind::Import(_) => "Imported",
+            FeatureKind::Combine(_) => "Combine",
         }
     }
 
@@ -260,7 +284,8 @@ impl FeatureKind {
             FeatureKind::Sketch(_)
             | FeatureKind::Axis(_)
             | FeatureKind::Mirror(_)
-            | FeatureKind::Import(_) => Vec::new(),
+            | FeatureKind::Import(_)
+            | FeatureKind::Combine(_) => Vec::new(),
             FeatureKind::Extrude(e) => vec![(P::Depth, e.extent.depth())],
             FeatureKind::Revolve(r) => vec![(P::Angle, r.angle)],
             FeatureKind::Fillet(b) => vec![(P::Radius, b.size)],
@@ -344,9 +369,13 @@ impl FeatureKind {
                 SketchPlane::Face(face) => face.key.collect_features(&mut out),
                 SketchPlane::Reference(plane) => out.push(*plane),
             },
-            FeatureKind::Extrude(e) => out.push(e.sketch),
+            FeatureKind::Extrude(e) => {
+                out.push(e.sketch);
+                out.extend(e.bodies.iter().map(|b| b.feature));
+            }
             FeatureKind::Revolve(r) => {
                 out.push(r.sketch);
+                out.extend(r.bodies.iter().map(|b| b.feature));
                 if let RevolveAxis::Axis(axis) = &r.axis {
                     axis.collect_features(&mut out);
                 }
@@ -379,6 +408,10 @@ impl FeatureKind {
                 m.plane.collect_features(&mut out);
             }
             FeatureKind::Import(_) => {}
+            FeatureKind::Combine(c) => {
+                out.push(c.target.feature);
+                out.extend(c.tools.iter().map(|b| b.feature));
+            }
         }
         out.sort();
         out.dedup();
@@ -517,13 +550,25 @@ impl Sketch {
     }
 }
 
-/// Whether an extrusion or a revolve adds or removes material.
+/// What an extrusion or a revolve does with the solid it sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtrudeOp {
-    /// Adds material, merged with the existing body.
+    /// Adds material: joined to a body (the first boss of a part makes the first body).
     Boss,
-    /// Removes material from the existing body.
+    /// Removes material from bodies.
     Cut,
+    /// Keeps only what the sweep and a body share.
+    Intersect,
+    /// A separate body, joined to nothing.
+    NewBody,
+}
+
+impl ExtrudeOp {
+    /// Whether the feature adds material in some way (its sweep goes along the sketch
+    /// normal by default; cuts go against it).
+    pub fn adds(self) -> bool {
+        matches!(self, ExtrudeOp::Boss | ExtrudeOp::NewBody)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -550,6 +595,10 @@ pub struct Extrude {
     /// Blind direction: bosses go along the sketch normal and cuts against it (into the
     /// face they are sketched on); `reverse` flips that.
     pub reverse: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic (see [`ExtrudeOp`]): a join
+    /// or intersection goes to the body the sketch is on, else the newest body; a cut goes
+    /// through every body.
+    pub bodies: Vec<BodyId>,
 }
 
 impl Extrude {
@@ -559,6 +608,7 @@ impl Extrude {
             op,
             extent: ExtrudeExtent::Blind { depth },
             reverse: false,
+            bodies: Vec::new(),
         }
     }
 }
@@ -590,6 +640,29 @@ pub struct Revolve {
     pub mid_plane: bool,
     /// Turn the other way.
     pub reverse: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic, as for [`Extrude`].
+    pub bodies: Vec<BodyId>,
+}
+
+/// How a Combine feature puts bodies together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombineOp {
+    /// The tools are added to the target.
+    Join,
+    /// The tools are removed from the target.
+    Cut,
+    /// Only what the target and the tools share is kept.
+    Intersect,
+}
+
+/// Boolean operation between bodies of the part (Fusion's Combine): the target body is
+/// changed by the tool bodies, which disappear unless kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Combine {
+    pub target: BodyId,
+    pub tools: Vec<BodyId>,
+    pub op: CombineOp,
+    pub keep_tools: bool,
 }
 
 /// Hollows the part: removes the selected faces and leaves walls of the given thickness.

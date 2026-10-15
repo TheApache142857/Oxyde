@@ -7,11 +7,11 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    AxisRef, CircularPattern, EdgeBlend, EdgeName, EquationText, Equations, EquationsText, Extrude,
-    ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId, FeatureKind, FeatureParameter,
-    FileData, GlobalText, Import, LinearPattern, Mirror, PartDefinition, PatternDirection,
-    PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
-    StandardPlane, VertexName,
+    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText,
+    Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
+    FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Mirror,
+    PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
+    Sketch, SketchPlane, StandardAxis, StandardPlane, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -138,6 +138,9 @@ pub(crate) enum KindDto {
         extent: ExtentDto,
         #[serde(default)]
         reverse: bool,
+        /// Bodies it works on; absent or empty = automatic.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
     },
     Revolve {
         sketch: u32,
@@ -149,6 +152,8 @@ pub(crate) enum KindDto {
         mid_plane: bool,
         #[serde(default)]
         reverse: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
     },
     Fillet {
         edges: Vec<EdgeRefDto>,
@@ -202,6 +207,41 @@ pub(crate) enum KindDto {
         file_name: String,
         file: String,
     },
+    /// Boolean between bodies of the part.
+    Combine {
+        target: BodyIdDto,
+        tools: Vec<BodyIdDto>,
+        operation: CombineOpDto,
+        #[serde(default)]
+        keep_tools: bool,
+    },
+}
+
+/// A body: the feature that made it, and which of its bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct BodyIdDto {
+    pub feature: u32,
+    #[serde(default)]
+    pub index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CombineOpDto {
+    Join,
+    Cut,
+    Intersect,
+}
+
+fn body_dto(id: &BodyId) -> BodyIdDto {
+    BodyIdDto {
+        feature: id.feature.raw(),
+        index: id.index,
+    }
+}
+
+fn body_from(dto: BodyIdDto) -> BodyId {
+    BodyId::new(FeatureId::from_raw(dto.feature), dto.index)
 }
 
 /// Where the STEP file of an import feature is kept in the archive.
@@ -320,6 +360,8 @@ pub(crate) enum RelationDto {
 pub(crate) enum OperationDto {
     Boss,
     Cut,
+    Intersect,
+    NewBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -461,6 +503,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                 ExtrudeExtent::MidPlane { depth } => ExtentDto::MidPlane { depth },
             },
             reverse: extrude.reverse,
+            bodies: extrude.bodies.iter().map(body_dto).collect(),
         },
         FeatureKind::Revolve(revolve) => KindDto::Revolve {
             sketch: revolve.sketch.raw(),
@@ -472,6 +515,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             angle: revolve.angle,
             mid_plane: revolve.mid_plane,
             reverse: revolve.reverse,
+            bodies: revolve.bodies.iter().map(body_dto).collect(),
         },
         FeatureKind::Fillet(blend) => KindDto::Fillet {
             edges: blend.edges.iter().map(edge_dto).collect(),
@@ -518,6 +562,16 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             file_name: import.file_name.clone(),
             file: import_entry(feature.id()),
         },
+        FeatureKind::Combine(combine) => KindDto::Combine {
+            target: body_dto(&combine.target),
+            tools: combine.tools.iter().map(body_dto).collect(),
+            operation: match combine.op {
+                CombineOp::Join => CombineOpDto::Join,
+                CombineOp::Cut => CombineOpDto::Cut,
+                CombineOp::Intersect => CombineOpDto::Intersect,
+            },
+            keep_tools: combine.keep_tools,
+        },
     };
     FeatureDto {
         id: feature.id().raw(),
@@ -540,6 +594,8 @@ fn operation_dto(op: ExtrudeOp) -> OperationDto {
     match op {
         ExtrudeOp::Boss => OperationDto::Boss,
         ExtrudeOp::Cut => OperationDto::Cut,
+        ExtrudeOp::Intersect => OperationDto::Intersect,
+        ExtrudeOp::NewBody => OperationDto::NewBody,
     }
 }
 
@@ -866,6 +922,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             operation,
             extent,
             reverse,
+            bodies,
         } => FeatureKind::Extrude(Extrude {
             sketch: FeatureId::from_raw(sketch),
             op: operation_from(operation),
@@ -874,6 +931,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
                 ExtentDto::MidPlane { depth } => ExtrudeExtent::MidPlane { depth },
             },
             reverse,
+            bodies: bodies.into_iter().map(body_from).collect(),
         }),
         KindDto::Fillet { edges, radius } => FeatureKind::Fillet(EdgeBlend {
             edges: edges.into_iter().map(edge_from).collect(),
@@ -890,6 +948,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             angle,
             mid_plane,
             reverse,
+            bodies,
         } => FeatureKind::Revolve(Revolve {
             sketch: FeatureId::from_raw(sketch),
             op: operation_from(operation),
@@ -900,6 +959,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             angle,
             mid_plane,
             reverse,
+            bodies: bodies.into_iter().map(body_from).collect(),
         }),
         KindDto::Shell {
             faces,
@@ -956,6 +1016,21 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
                 data: FileData::new(bytes.clone()),
             })
         }
+        KindDto::Combine {
+            target,
+            tools,
+            operation,
+            keep_tools,
+        } => FeatureKind::Combine(Combine {
+            target: body_from(target),
+            tools: tools.into_iter().map(body_from).collect(),
+            op: match operation {
+                CombineOpDto::Join => CombineOp::Join,
+                CombineOpDto::Cut => CombineOp::Cut,
+                CombineOpDto::Intersect => CombineOp::Intersect,
+            },
+            keep_tools,
+        }),
     };
     let mut parameter_names = BTreeMap::new();
     for (key, name) in dto.dimension_names {
@@ -977,6 +1052,8 @@ fn operation_from(operation: OperationDto) -> ExtrudeOp {
     match operation {
         OperationDto::Boss => ExtrudeOp::Boss,
         OperationDto::Cut => ExtrudeOp::Cut,
+        OperationDto::Intersect => ExtrudeOp::Intersect,
+        OperationDto::NewBody => ExtrudeOp::NewBody,
     }
 }
 

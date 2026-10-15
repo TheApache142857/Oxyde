@@ -146,7 +146,8 @@ impl OxydeApp {
             ui.menu_button("Insert", |ui| {
                 let (sketch, body, seeds) =
                     (self.has_sketch(), self.has_body(), self.has_patternable());
-                let commands: [(Icon, &str, bool, Command); 11] = [
+                let bodies = self.body_count() >= 2;
+                let commands: [(Icon, &str, bool, Command); 12] = [
                     (Icon::Sketch, "Sketch", true, Command::Sketch),
                     (Icon::Extrude, "Extrude", sketch, Command::Extrude),
                     (Icon::Revolve, "Revolve", sketch, Command::Revolve),
@@ -171,6 +172,7 @@ impl OxydeApp {
                         seeds,
                         Command::Pattern(PatternKind::Mirror),
                     ),
+                    (Icon::Combine, "Combine bodies", bodies, Command::Combine),
                     (Icon::RefPlane, "Reference Plane", true, Command::RefPlane),
                     (Icon::RefAxis, "Reference Axis", true, Command::RefAxis),
                 ];
@@ -336,6 +338,7 @@ impl OxydeApp {
             (Some(Dialog::Pattern(d)), Command::Pattern(kind)) => {
                 d.editing.is_none() && d.kind == kind
             }
+            (Some(Dialog::Combine(d)), Command::Combine) => d.editing.is_none(),
             (Some(Dialog::ChoosePlane), Command::Sketch) => true,
             _ => false,
         }
@@ -408,6 +411,15 @@ impl OxydeApp {
             seeds,
             "Mirror features about a plane or a flat face.",
             Command::Pattern(PatternKind::Mirror),
+        );
+        let bodies = self.body_count() >= 2;
+        self.command(
+            ui,
+            Icon::Combine,
+            "Combine",
+            bodies,
+            "Join, cut or intersect bodies of the part.\nMake bodies with Extrude › New body.",
+            Command::Combine,
         );
         group_separator(ui);
         let response = command_button(

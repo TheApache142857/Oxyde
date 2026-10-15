@@ -19,8 +19,6 @@ use oxyde_kernel::{Kernel, Mesh};
 use oxyde_model::{EdgeName, FaceName, Part};
 use oxyde_render::Pick;
 
-use crate::app::deflection;
-
 const UNDO_LIMIT: usize = 200;
 
 /// A part file used by the assembly, rebuilt.
@@ -264,10 +262,6 @@ impl AssemblyDoc {
             // Never stored: it is this assembly, or holds it.
             None => Some("this file contains the assembly itself"),
         }
-    }
-
-    pub fn is_sub_assembly(&self, component: ComponentId) -> bool {
-        matches!(self.loaded(component), Some(Loaded::Assembly(_)))
     }
 
     /// Follows `path` down from a top-level component: the file reached, the placement of
@@ -804,9 +798,7 @@ pub fn load<K: Kernel>(path: &Path, kernel: &mut K, fraction: f64) -> Result<Loa
     part.rebuild(kernel);
     let (mesh, bounds) = match part.body() {
         Some(body) => {
-            let mesh = kernel
-                .tessellate(body.shape, deflection(&body.topology, fraction))
-                .ok();
+            let mesh = crate::app::tessellate_bodies(kernel, body, fraction).ok();
             let bounds = mesh.as_ref().and_then(mesh_bounds);
             (mesh, bounds)
         }

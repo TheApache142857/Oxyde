@@ -8,15 +8,16 @@
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use oxyde_model::{
-    AxisRef, EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, PlaneRef, RevolveAxis,
-    SketchPlane, StandardPlane,
+    AxisRef, CombineOp, EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, PlaneRef,
+    RevolveAxis, SketchPlane, StandardPlane,
 };
 use oxyde_render::Pick;
 
 use crate::app::OxydeApp;
 use crate::dialogs::{Answer, BlendDialog, Dialog, ExtrudeDialog, plane_name, positive_length};
 use crate::features_ui::{
-    AxisDialog, Choices, PatternDialog, PatternKind, PlaneDialog, RevolveDialog, ShellDialog,
+    AxisDialog, Choices, CombineDialog, PatternDialog, PatternKind, PlaneDialog, RevolveDialog,
+    ShellDialog,
 };
 use crate::icons::{self, Icon};
 
@@ -24,6 +25,8 @@ use crate::icons::{self, Icon};
 #[derive(Debug, Clone)]
 pub enum PanelPick {
     Feature(FeatureId),
+    /// A body, from the Solid Bodies folder.
+    Body(oxyde_model::BodyId),
     Plane(StandardPlane),
     Face(FaceName),
     Edge(EdgeName),
@@ -195,45 +198,73 @@ fn dimension_note(ui: &mut egui::Ui, name: Option<&String>) {
     }
 }
 
-/// Add or remove material, with icons.
-fn operation(ui: &mut egui::Ui, op: &mut ExtrudeOp, can_remove: bool) {
-    ui.horizontal(|ui| {
-        for (value, icon, label) in [
-            (ExtrudeOp::Boss, Icon::Add, "Add material"),
-            (ExtrudeOp::Cut, Icon::Remove, "Remove material"),
-        ] {
-            let enabled = value == ExtrudeOp::Boss || can_remove || *op == value;
-            let selected = *op == value;
-            let response = ui
-                .add_enabled_ui(enabled, |ui| {
-                    egui::Frame::none()
-                        .fill(if selected {
-                            ui.visuals().selection.bg_fill.gamma_multiply(0.35)
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .rounding(3.0)
-                        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                icons::small(ui, icon, 16.0);
-                                ui.label(label);
-                            });
-                        })
-                        .response
-                        .interact(egui::Sense::click())
-                })
-                .inner;
-            let response = if enabled {
-                response
-            } else {
-                response.on_hover_text("There is no material to remove yet")
-            };
-            if enabled && response.clicked() {
-                *op = value;
+/// What an extrusion or a revolve does: join, cut, intersect or a new body (Fusion's
+/// operations), with icons.
+fn operation(ui: &mut egui::Ui, op: &mut ExtrudeOp, has_body: bool) {
+    let options = [
+        (ExtrudeOp::Boss, Icon::Add, "Join"),
+        (ExtrudeOp::Cut, Icon::Remove, "Cut"),
+        (ExtrudeOp::Intersect, Icon::Intersect, "Intersect"),
+        (ExtrudeOp::NewBody, Icon::NewBody, "New body"),
+    ];
+    egui::Grid::new(ui.next_auto_id())
+        .num_columns(2)
+        .spacing([4.0, 2.0])
+        .show(ui, |ui| {
+            for (i, (value, icon, label)) in options.into_iter().enumerate() {
+                let needs_body = matches!(value, ExtrudeOp::Cut | ExtrudeOp::Intersect);
+                let enabled = !needs_body || has_body || *op == value;
+                let selected = *op == value;
+                let response = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        egui::Frame::none()
+                            .fill(if selected {
+                                ui.visuals().selection.bg_fill
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .rounding(4.0)
+                            .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                            .show(ui, |ui| {
+                                ui.set_min_width(96.0);
+                                ui.horizontal(|ui| {
+                                    icons::small(ui, icon, 16.0);
+                                    ui.label(label);
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click())
+                    })
+                    .inner;
+                let hint = match value {
+                    ExtrudeOp::Boss => "Add material to a body",
+                    ExtrudeOp::Cut => "Remove material from bodies",
+                    ExtrudeOp::Intersect => "Keep only what it shares with a body",
+                    ExtrudeOp::NewBody => "A separate body, joined to nothing",
+                };
+                let response = if enabled {
+                    response.on_hover_text(hint)
+                } else {
+                    response.on_hover_text("There is no body yet")
+                };
+                if enabled && response.clicked() {
+                    *op = value;
+                }
+                if i % 2 == 1 {
+                    ui.end_row();
+                }
             }
+        });
+}
+
+/// Adds `value` to the list, or takes it out.
+fn toggle<T: PartialEq>(list: &mut Vec<T>, value: T) {
+    match list.iter().position(|v| *v == value) {
+        Some(i) => {
+            list.remove(i);
         }
-    });
+        None => list.push(value),
+    }
 }
 
 /// Puts `value` in `choices` (labelled `label` if new) and returns its index.
@@ -358,6 +389,15 @@ impl OxydeApp {
         }
     }
 
+    /// The body a click stands for: a body in the tree, or the body of a face.
+    fn body_of_pick(&self, pick: &PanelPick) -> Option<oxyde_model::BodyId> {
+        match pick {
+            PanelPick::Body(id) => Some(*id),
+            PanelPick::Face(f) => self.body_of_face(f),
+            _ => None,
+        }
+    }
+
     fn plane_of_pick(
         &self,
         pick: &PanelPick,
@@ -420,11 +460,42 @@ impl OxydeApp {
                     d.sketch = Some(id);
                     true
                 }
-                _ => false,
+                // A body, or a face of one: in or out of the feature's scope.
+                other => match self.body_of_pick(&other) {
+                    Some(body) if d.op != ExtrudeOp::NewBody => {
+                        toggle(&mut d.bodies, body);
+                        true
+                    }
+                    _ => false,
+                },
+            },
+            Dialog::Combine(d) => match self.body_of_pick(&pick) {
+                Some(body) => {
+                    if d.tools_next {
+                        if Some(body) != d.target {
+                            toggle(&mut d.tools, body);
+                        }
+                    } else {
+                        d.tools.retain(|t| *t != body);
+                        d.target = Some(body);
+                        d.tools_next = true;
+                    }
+                    true
+                }
+                None => false,
             },
             Dialog::Revolve(d) => match &pick {
                 PanelPick::Feature(id) if self.is_sketch(*id) && self.usable(*id, d.editing) => {
                     d.sketch = Some(*id);
+                    true
+                }
+                PanelPick::Face(_) | PanelPick::Body(_)
+                    if d.op != ExtrudeOp::NewBody
+                        && self.body_of_pick(&pick).is_some()
+                        && self.axis_of_pick(&pick, d.editing).is_none() =>
+                {
+                    let body = self.body_of_pick(&pick).expect("checked");
+                    toggle(&mut d.bodies, body);
                     true
                 }
                 _ => match self.axis_of_pick(&pick, d.editing) {
@@ -725,6 +796,11 @@ impl OxydeApp {
                 let directions = d.kind != PatternKind::Linear || !d.second || d.axis2.is_some();
                 (icon, title, !d.seeds.is_empty() && directions)
             }
+            Dialog::Combine(d) => (
+                Icon::Combine,
+                editing(d.editing, "Combine", "Edit Combine"),
+                d.target.is_some() && !d.tools.is_empty(),
+            ),
             Dialog::RefPlane(_) => (Icon::RefPlane, "Plane", true),
             Dialog::RefAxis(_) => (Icon::RefAxis, "Axis", true),
             _ => (Icon::Part, "", false),
@@ -740,6 +816,7 @@ impl OxydeApp {
             Dialog::Blend(d) => self.blend_body(ui, d),
             Dialog::Shell(d) => self.shell_body(ui, d),
             Dialog::Pattern(d) => self.pattern_body(ui, d),
+            Dialog::Combine(d) => self.combine_body(ui, d),
             Dialog::RefPlane(d) => ref_plane_body(ui, d),
             Dialog::RefAxis(d) => ref_axis_body(ui, d),
             _ => {}
@@ -792,8 +869,9 @@ impl OxydeApp {
         if selection_box(ui, &items, "Select a sketch in the tree").is_some() {
             d.sketch = None;
         }
-        section(ui, "Material");
+        section(ui, "Operation");
         operation(ui, &mut d.op, self.doc.part.body().is_some());
+        self.bodies_box(ui, d.op, &mut d.bodies);
         section(ui, "Direction");
         egui::Grid::new("extrude_panel")
             .num_columns(2)
@@ -826,8 +904,9 @@ impl OxydeApp {
         if selection_box(ui, &items, "Select a sketch in the tree").is_some() {
             d.sketch = None;
         }
-        section(ui, "Material");
+        section(ui, "Operation");
         operation(ui, &mut d.op, self.doc.part.body().is_some());
+        self.bodies_box(ui, d.op, &mut d.bodies);
         section(ui, "Axis");
         reference_box_set(
             ui,
@@ -851,6 +930,79 @@ impl OxydeApp {
         if !d.mid_plane {
             ui.checkbox(&mut d.reverse, "Reverse direction");
         }
+    }
+
+    /// The bodies a join, cut or intersection works on, when the part has several.
+    fn bodies_box(&self, ui: &mut egui::Ui, op: ExtrudeOp, bodies: &mut Vec<oxyde_model::BodyId>) {
+        if op == ExtrudeOp::NewBody || self.body_count() < 2 {
+            return;
+        }
+        section(ui, "Bodies");
+        let items: Vec<(String, String)> = bodies
+            .iter()
+            .map(|b| (self.body_label(*b), String::new()))
+            .collect();
+        let hint = match op {
+            ExtrudeOp::Cut => "Automatic: every body. Click faces to choose",
+            _ => "Automatic: the body under the sketch. Click faces to choose",
+        };
+        if let Some(i) = selection_box(ui, &items, hint) {
+            bodies.remove(i);
+        }
+    }
+
+    fn combine_body(&self, ui: &mut egui::Ui, d: &mut CombineDialog) {
+        section(ui, "Target body");
+        let target: Vec<(String, String)> = d
+            .target
+            .map(|b| (self.body_label(b), String::new()))
+            .into_iter()
+            .collect();
+        let active = |ui: &mut egui::Ui, on: bool, items: &[(String, String)], hint: &str| {
+            let frame = egui::Frame::none()
+                .stroke(Stroke::new(if on { 2.0 } else { 0.0 }, box_active()))
+                .rounding(4.0);
+            frame.show(ui, |ui| selection_box(ui, items, hint)).inner
+        };
+        if active(
+            ui,
+            !d.tools_next,
+            &target,
+            "Click a face of the body to change",
+        )
+        .is_some()
+        {
+            d.target = None;
+            d.tools_next = false;
+        }
+        if ui
+            .small_button("Pick the target")
+            .on_hover_text("The next click sets the target body")
+            .clicked()
+        {
+            d.tools_next = false;
+        }
+        section(ui, "Tool bodies");
+        let tools: Vec<(String, String)> = d
+            .tools
+            .iter()
+            .map(|b| (self.body_label(*b), String::new()))
+            .collect();
+        if let Some(i) = active(ui, d.tools_next, &tools, "Click faces of the other bodies") {
+            d.tools.remove(i);
+        }
+        section(ui, "Operation");
+        ui.horizontal(|ui| {
+            for (op, icon, label) in [
+                (CombineOp::Join, Icon::Add, "Join"),
+                (CombineOp::Cut, Icon::Remove, "Cut"),
+                (CombineOp::Intersect, Icon::Intersect, "Intersect"),
+            ] {
+                icons::small(ui, icon, 16.0);
+                ui.radio_value(&mut d.op, op, label);
+            }
+        });
+        ui.checkbox(&mut d.keep_tools, "Keep the tool bodies");
     }
 
     fn blend_body(&self, ui: &mut egui::Ui, d: &mut BlendDialog) {

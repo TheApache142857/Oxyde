@@ -21,9 +21,12 @@ fn assert_all_ok(part: &Part) {
 }
 
 fn volume(part: &Part, kernel: &OcctKernel) -> f64 {
-    kernel
-        .volume(part.body().expect("part has a body").shape)
-        .unwrap()
+    part.body()
+        .expect("part has a body")
+        .solids
+        .iter()
+        .map(|s| kernel.volume(s.shape).unwrap())
+        .sum()
 }
 
 fn assert_close(actual: f64, expected: f64) {
@@ -70,6 +73,7 @@ fn revolve(sketch: FeatureId, op: ExtrudeOp, axis: RevolveAxis, angle: f64) -> F
         angle,
         mid_plane: false,
         reverse: false,
+        bodies: Vec::new(),
     })
 }
 

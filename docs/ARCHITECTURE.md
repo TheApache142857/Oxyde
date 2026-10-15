@@ -112,6 +112,10 @@ In the model (M2b): a `Sketch` feature holds a `ConstrainedSketch`, solved durin
 - **References to planes and axes** are `PlaneRef` (standard plane, flat face, reference plane) and `AxisRef` (model axis, reference axis, edge, face), resolved at rebuild against the body before the feature, like every other reference. Reference features produce no body, only a `ReferenceGeometry` (plane or axis) that later features and the viewport use.
 - **Patterns and mirrors copy tool bodies**, as SolidWorks patterns features rather than bodies: an extrusion or a revolve keeps the solid it added or removed (`ToolBody`), and a pattern transforms a copy of that tool to each instance and fuses or cuts it, seed by seed. So a pattern of a hole cuts holes, even where the seed's surroundings differ. Only extrusions and revolves can be seeds for now.
 
+### Bodies (implemented in `bodies.rs`)
+
+A part's geometry is a list of solid bodies (`Solid`: a `BodyId`, its kernel shape and its own topology), seen together as one `Body` whose topology concatenates theirs (faces of the first solid, then the second…) and whose `BodyNaming` names all of them at once. Everything that reads geometry by name or index (references, picking, highlighting, sketches on faces, assemblies) works on that merged view unchanged; `Body::solid_of_face` / `solid_of_edge` say which body something is on, and kernel operations run on one solid with local indices (`Solid::local_face`). Each feature result keeps the whole set of bodies after it; bodies it did not touch are shared with the previous result (not owned), so their shapes are freed once, by the feature that made them. Extrusions and revolves join, cut, intersect or add a new body (`ExtrudeOp`), on chosen bodies or automatically; *Combine* is a boolean between bodies. See `FORMAT.md`, *Bodies*.
+
 ### Persistent naming (implemented in `naming.rs`)
 
 The problem: a fillet stores "edge #17"; after an upstream edit, numbering changes and the fillet attaches to the wrong edge or fails. FreeCAD spent years on this; we designed for it from day one.
@@ -209,5 +213,6 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 | **M4** (done) | Viewport, interactive sketch mode, selection, fillet/chamfer with persistent naming |
 | **M5** (done) | Linear and circular patterns, mirror (tool-body copies with instance names) |
 | **GPU** (done) | wgpu viewport with GPU picking, software renderer as fallback |
+| **Bodies** (code written, awaiting first Windows build) | Multi-body parts: join / cut / intersect / new body, Combine, Solid Bodies folder |
 | **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files and sub-assemblies, mates with a 3D solver (reaching into sub-assemblies), fixed/floating, Alt+drag, BOM (top level, parts only, indented) exported as CSV; parts renamed `.oxyprt` |
 | **M7** | Drawings: views, dimensions, PDF/DXF |

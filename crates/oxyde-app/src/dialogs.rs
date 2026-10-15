@@ -23,6 +23,8 @@ pub struct ExtrudeDialog {
     pub depth: f64,
     pub mid_plane: bool,
     pub reverse: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic.
+    pub bodies: Vec<oxyde_model::BodyId>,
 }
 
 pub struct BlendDialog {
@@ -52,6 +54,7 @@ pub enum Dialog {
     Shell(ShellDialog),
     /// Linear pattern, circular pattern or mirror.
     Pattern(PatternDialog),
+    Combine(crate::features_ui::CombineDialog),
     RefPlane(PlaneDialog),
     RefAxis(AxisDialog),
     /// Pick the plane of a new sketch, in the timeline or the viewport.
@@ -87,6 +90,7 @@ impl Dialog {
                 | Dialog::Blend(_)
                 | Dialog::Shell(_)
                 | Dialog::Pattern(_)
+                | Dialog::Combine(_)
                 | Dialog::RefPlane(_)
                 | Dialog::RefAxis(_)
                 | Dialog::ChoosePlane
@@ -197,6 +201,7 @@ impl OxydeApp {
             | Dialog::Blend(_)
             | Dialog::Shell(_)
             | Dialog::Pattern(_)
+            | Dialog::Combine(_)
             | Dialog::RefPlane(_)
             | Dialog::RefAxis(_) => Answer::Open,
             Dialog::ChoosePlane => Answer::Open,
@@ -331,6 +336,7 @@ impl OxydeApp {
                     op: d.op,
                     extent,
                     reverse: d.reverse && !d.mid_plane,
+                    bodies: d.bodies,
                 });
                 match d.editing {
                     Some(id) => self.replace_feature(id, kind),
@@ -359,6 +365,7 @@ impl OxydeApp {
             Dialog::Revolve(d) => self.apply_revolve(d),
             Dialog::Shell(d) => self.apply_shell(d),
             Dialog::Pattern(d) => self.apply_pattern(d),
+            Dialog::Combine(d) => self.apply_combine(d),
             Dialog::RefPlane(d) => self.apply_ref_plane(d),
             Dialog::RefAxis(d) => self.apply_ref_axis(d),
             Dialog::ChoosePlane => {}

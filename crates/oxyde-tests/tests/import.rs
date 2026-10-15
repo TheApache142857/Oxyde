@@ -46,7 +46,7 @@ fn imported_box_is_named_and_can_be_built_on() {
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
     assert_eq!(part.feature(imported).unwrap().name(), "Imported1");
-    let volume = kernel.volume(part.body().unwrap().shape).unwrap();
+    let volume = kernel.volume(part.body().unwrap().solids[0].shape).unwrap();
     assert!((volume - 8000.0).abs() < 1e-3, "{volume}");
 
     // Every face is named after the import; round one of its edges.
@@ -73,7 +73,7 @@ fn imported_box_is_named_and_can_be_built_on() {
     )));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
-    let volume = kernel.volume(part.body().unwrap().shape).unwrap();
+    let volume = kernel.volume(part.body().unwrap().solids[0].shape).unwrap();
     // The fillet removes (1 - π/4)·2²·length, with length 40, 20 or 10 depending on the edge.
     let boss = 500.0;
     let removed = |length: f64| (1.0 - std::f64::consts::FRAC_PI_4) * 4.0 * length;
@@ -96,7 +96,9 @@ fn imported_box_is_named_and_can_be_built_on() {
     let mut reloaded = Part::from_definition(loaded.definition).unwrap();
     reloaded.rebuild(&mut kernel);
     assert_all_ok(&reloaded);
-    let again = kernel.volume(reloaded.body().unwrap().shape).unwrap();
+    let again = kernel
+        .volume(reloaded.body().unwrap().solids[0].shape)
+        .unwrap();
     assert!((again - volume).abs() < 1e-6);
 }
 

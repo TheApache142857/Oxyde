@@ -47,6 +47,8 @@ enum Action {
     ToggleExpand(FeatureId),
     /// Show or hide an item in the viewport.
     ToggleItem(Item),
+    ToggleBodies,
+    SelectBody(oxyde_model::BodyId),
 }
 
 pub fn feature_icon(kind: &FeatureKind) -> Icon {
@@ -63,6 +65,7 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
         FeatureKind::Plane(_) => Icon::RefPlane,
         FeatureKind::Axis(_) => Icon::RefAxis,
         FeatureKind::Import(_) => Icon::Imported,
+        FeatureKind::Combine(_) => Icon::Combine,
     }
 }
 
@@ -187,6 +190,7 @@ impl OxydeApp {
 
         let mut action = None;
         let mut hover_feature = None;
+        let mut hover_body = None;
         let creator = self.selection_creator();
         let referenced = self.panel_features();
         let enabled = self.sketch.is_none();
@@ -235,6 +239,63 @@ impl OxydeApp {
                     );
                     if origin.eye_clicked {
                         action = Some(Action::ToggleItem(Item::Origin));
+                    }
+                    // Solid Bodies, when there is more than the one.
+                    if let Some(body) = self.doc.part.body().filter(|b| b.solids.len() > 1) {
+                        let folder = tree_row(
+                            ui,
+                            Row {
+                                icon: Icon::Bodies,
+                                cut: false,
+                                text: RichText::new(format!(
+                                    "Solid Bodies ({})",
+                                    body.solids.len()
+                                )),
+                                highlighted: false,
+                                badge: None,
+                                indent: 0.0,
+                                expander: Some(self.bodies_expanded),
+                                eye: None,
+                            },
+                        );
+                        if folder.response.clicked() {
+                            action = Some(Action::ToggleBodies);
+                        }
+                        if self.bodies_expanded {
+                            let mut ids: Vec<oxyde_model::BodyId> =
+                                body.solids.iter().map(|s| s.id).collect();
+                            ids.sort_by_key(|b| (self.doc.part.index_of(b.feature), b.index));
+                            for id in ids {
+                                let maker = self
+                                    .doc
+                                    .part
+                                    .feature(id.feature)
+                                    .map_or_else(String::new, |f| f.name().to_owned());
+                                let row = tree_row(
+                                    ui,
+                                    Row {
+                                        icon: Icon::Part,
+                                        cut: false,
+                                        text: RichText::new(self.body_label(id)),
+                                        highlighted: self.selected_body == Some(id),
+                                        badge: None,
+                                        indent: 16.0,
+                                        expander: None,
+                                        eye: None,
+                                    },
+                                );
+                                if row.response.hovered() {
+                                    hover_body = Some(id);
+                                }
+                                if row
+                                    .response
+                                    .on_hover_text(format!("Made by {maker}"))
+                                    .clicked()
+                                {
+                                    action = Some(Action::SelectBody(id));
+                                }
+                            }
+                        }
                     }
                     ui.add_space(3.0);
                     ui.separator();
@@ -331,9 +392,22 @@ impl OxydeApp {
         if let Some(id) = hover_feature {
             self.viewport.preselect = self.feature_picks(id);
         }
+        if let Some(id) = hover_body {
+            self.viewport.preselect = self.body_picks(id);
+        }
         if let Some(action) = action {
             self.apply_action(action);
         }
+    }
+
+    /// The faces of one body of the part, for highlighting.
+    pub(crate) fn body_picks(&self, id: oxyde_model::BodyId) -> Vec<oxyde_render::Pick> {
+        self.doc
+            .part
+            .body()
+            .and_then(|b| b.solid(id))
+            .map(|s| s.faces.clone().map(oxyde_render::Pick::Face).collect())
+            .unwrap_or_default()
     }
 
     /// The faces of the body a feature made or changed, for highlighting.
@@ -363,6 +437,7 @@ impl OxydeApp {
         let cut = feature.is_some_and(|f| match f.kind() {
             FeatureKind::Extrude(e) => e.op == ExtrudeOp::Cut,
             FeatureKind::Revolve(r) => r.op == ExtrudeOp::Cut,
+            FeatureKind::Combine(c) => c.op == oxyde_model::CombineOp::Cut,
             _ => false,
         });
         let label = if entry.under_defined {
@@ -478,6 +553,16 @@ impl OxydeApp {
                 self.selected_plane = None;
                 self.doc.end_edit();
             }
+            Action::ToggleBodies => self.bodies_expanded = !self.bodies_expanded,
+            Action::SelectBody(id) => {
+                if self.offer_to_panel(PanelPick::Body(id)) {
+                    return;
+                }
+                self.selected_body = (self.selected_body != Some(id)).then_some(id);
+                self.selected_feature = None;
+                self.selected_plane = None;
+                self.selection.clear();
+            }
             Action::Edit(id) => self.edit_feature(id),
             Action::Rename(feature) => {
                 let name = self
@@ -568,6 +653,7 @@ impl OxydeApp {
                     depth: e.extent.depth(),
                     mid_plane: matches!(e.extent, oxyde_model::ExtrudeExtent::MidPlane { .. }),
                     reverse: e.reverse,
+                    bodies: e.bodies.clone(),
                 }));
             }
             FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
@@ -587,6 +673,7 @@ impl OxydeApp {
             }
             FeatureKind::Revolve(r) => self.open_revolve(Some(id), Some(r.sketch), r.op, Some(&r)),
             FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
+            FeatureKind::Combine(c) => self.open_combine(Some(id), Some(&c)),
             FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),
             FeatureKind::Axis(axis) => self.open_ref_axis(Some(id), Some(&axis)),
             FeatureKind::LinearPattern(_) => {

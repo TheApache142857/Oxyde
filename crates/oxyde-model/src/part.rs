@@ -10,19 +10,18 @@ use std::collections::HashSet;
 use std::fmt;
 
 use oxyde_geom::{Axis, Plane, Profile, ProfileError, Transform};
-use oxyde_kernel::{
-    BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind, Topology,
-};
+use oxyde_kernel::{BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind};
 use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
+use crate::bodies::{Body, Solid, Working};
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
-    AxisRef, CircularPattern, EdgeBlend, Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId,
-    FeatureKind, Import, LinearPattern, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis,
-    Shell, Sketch, SketchPlane,
+    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
+    ExtrudeOp, Feature, FeatureId, FeatureKind, Import, LinearPattern, Mirror, PlaneRef, RefAxis,
+    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane,
 };
-use crate::naming::{BodyNaming, FaceKey, FaceName, Resolution};
+use crate::naming::{FaceKey, FaceName, Resolution};
 
 /// State of a feature as shown in the timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,14 +49,6 @@ pub struct TimelineEntry {
     pub under_defined: bool,
 }
 
-/// A solid produced by the timeline, with the persistent names of everything in it.
-#[derive(Debug, Clone)]
-pub struct Body {
-    pub shape: ShapeHandle,
-    pub topology: Topology,
-    pub naming: BodyNaming,
-}
-
 /// A sketch solved and resolved in model space.
 #[derive(Debug, Clone)]
 pub struct SketchResult {
@@ -78,16 +69,46 @@ pub enum ReferenceGeometry {
     Axis(Axis),
 }
 
-/// The solid an extrusion or a revolve added or removed, kept so that patterns and mirrors
-/// can copy it.
+/// What a swept tool does to the bodies (and what pattern copies of it do).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOp {
+    Join,
+    Cut,
+    Intersect,
+    NewBody,
+}
+
+impl ToolOp {
+    fn of(op: ExtrudeOp) -> Self {
+        match op {
+            ExtrudeOp::Boss => ToolOp::Join,
+            ExtrudeOp::Cut => ToolOp::Cut,
+            ExtrudeOp::Intersect => ToolOp::Intersect,
+            ExtrudeOp::NewBody => ToolOp::NewBody,
+        }
+    }
+
+    fn boolean(self) -> BooleanOp {
+        match self {
+            ToolOp::Join | ToolOp::NewBody => BooleanOp::Fuse,
+            ToolOp::Cut => BooleanOp::Cut,
+            ToolOp::Intersect => BooleanOp::Common,
+        }
+    }
+}
+
+/// The solid an extrusion or a revolve swept, kept so that patterns and mirrors can copy
+/// it and do the same with the copies.
 #[derive(Debug)]
 struct ToolBody {
     shape: ShapeHandle,
-    /// False when the tool is the feature's body itself (the first boss of a part).
+    /// False when the tool became a body itself (a new body), which owns the shape.
     owned: bool,
     /// Name of each face of the tool.
     names: Vec<Option<FaceName>>,
-    op: BooleanOp,
+    op: ToolOp,
+    /// The bodies it joined, cut or intersected.
+    targets: Vec<BodyId>,
 }
 
 #[derive(Debug)]
@@ -113,7 +134,7 @@ impl FeatureResult {
 
     fn release<K: Kernel>(self, kernel: &mut K) {
         if let Some(body) = self.produced {
-            kernel.release(body.shape);
+            body.release(kernel);
         }
         if let Some(tool) = self.tool {
             if tool.owned {
@@ -683,6 +704,9 @@ fn build_feature<K: Kernel>(
             FeatureKind::Import(import) => {
                 result.produced = Some(build_import(&ctx, import, kernel)?);
             }
+            FeatureKind::Combine(combine) => {
+                result.produced = Some(build_combine(&ctx, combine, kernel)?);
+            }
         }
         Ok(())
     })();
@@ -765,28 +789,6 @@ fn oldest(names: impl Iterator<Item = FaceName>) -> Option<FaceName> {
     names.min_by(|a, b| a.key.feature().cmp(&b.key.feature()).then_with(|| a.cmp(b)))
 }
 
-fn finish<K: Kernel>(
-    id: FeatureId,
-    shape: ShapeHandle,
-    face_names: Vec<Option<FaceName>>,
-    kernel: &mut K,
-) -> Result<Body, String> {
-    match kernel.topology(shape) {
-        Ok(topology) => {
-            let naming = BodyNaming::build(id, face_names, &topology);
-            Ok(Body {
-                shape,
-                topology,
-                naming,
-            })
-        }
-        Err(e) => {
-            kernel.release(shape);
-            Err(e.to_string())
-        }
-    }
-}
-
 /// Names of a swept tool's faces (extrusion or revolve).
 fn sweep_names(id: FeatureId, history: &OpHistory) -> Vec<Option<FaceName>> {
     history
@@ -803,21 +805,19 @@ fn sweep_names(id: FeatureId, history: &OpHistory) -> Vec<Option<FaceName>> {
         .collect()
 }
 
-/// Names after a boolean of `body` (input 0) with a tool (input 1) named `tool_names`.
+/// Names after a boolean of input 0 (its faces named `a`) and input 1 (named `b`).
 fn boolean_names(
     history: &OpHistory,
-    body: &Body,
-    tool_names: &[Option<FaceName>],
+    a: &[Option<FaceName>],
+    b: &[Option<FaceName>],
 ) -> Vec<Option<FaceName>> {
     history
         .faces
         .iter()
         .map(|sources| {
             oldest(sources.iter().filter_map(|source| match *source {
-                FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
-                FaceSource::InputFace { input: 1, face } => {
-                    tool_names.get(face as usize).cloned().flatten()
-                }
+                FaceSource::InputFace { input: 0, face } => a.get(face as usize).cloned().flatten(),
+                FaceSource::InputFace { input: 1, face } => b.get(face as usize).cloned().flatten(),
                 _ => None,
             }))
         })
@@ -825,100 +825,243 @@ fn boolean_names(
 }
 
 /// Names after an operation on one body (fillet, chamfer, shell): faces kept from the body,
-/// faces made from its edges and vertices, and offset copies of its faces.
-fn derived_names(id: FeatureId, history: &OpHistory, body: &Body) -> Vec<Option<FaceName>> {
+/// faces made from its edges and vertices, and offset copies of its faces. Inputs are
+/// numbered in `solid`'s own topology.
+fn derived_names(
+    id: FeatureId,
+    history: &OpHistory,
+    body: &Body,
+    solid: &Solid,
+) -> Vec<Option<FaceName>> {
+    let face = |f: u32| body.face_name(solid, f);
+    let edge = |e: u32| body.naming.edge(solid.edges.start + e).cloned();
+    let vertex = |v: u32| body.naming.vertex(solid.vertices.start + v).cloned();
     history
         .faces
         .iter()
         .map(|sources| {
-            oldest(sources.iter().filter_map(|source| {
-                match *source {
-                    FaceSource::InputFace { input: 0, face } => body.naming.face(face).cloned(),
-                    FaceSource::InputEdge { input: 0, edge } => body
-                        .naming
-                        .edge(edge)
-                        .map(|e| FaceName::from_edge(id, e.clone())),
-                    FaceSource::InputVertex { input: 0, vertex } => {
-                        body.naming.vertex(vertex).map(|v| {
-                            FaceName::new(FaceKey::FromVertex {
-                                feature: id,
-                                vertex: v.clone(),
-                            })
-                        })
-                    }
-                    FaceSource::OffsetFace { input: 0, face } => body.naming.face(face).map(|f| {
-                        FaceName::new(FaceKey::Offset {
-                            feature: id,
-                            face: Box::new(f.clone()),
-                        })
-                    }),
-                    _ => None,
+            oldest(sources.iter().filter_map(|source| match *source {
+                FaceSource::InputFace { input: 0, face: f } => face(f),
+                FaceSource::InputEdge { input: 0, edge: e } => {
+                    edge(e).map(|e| FaceName::from_edge(id, e))
                 }
+                FaceSource::InputVertex {
+                    input: 0,
+                    vertex: v,
+                } => vertex(v).map(|v| {
+                    FaceName::new(FaceKey::FromVertex {
+                        feature: id,
+                        vertex: v,
+                    })
+                }),
+                FaceSource::OffsetFace { input: 0, face: f } => face(f).map(|f| {
+                    FaceName::new(FaceKey::Offset {
+                        feature: id,
+                        face: Box::new(f),
+                    })
+                }),
+                _ => None,
             }))
         })
         .collect()
 }
 
-/// Adds or removes a swept tool: the body after the feature, and the tool kept for
-/// patterns.
+/// Booleans `tool` (faces named `tool_names`) into body `index` of `work`, in place.
+fn combine_into<K: Kernel>(
+    work: &mut Working,
+    index: usize,
+    op: BooleanOp,
+    tool: ShapeHandle,
+    tool_names: &[Option<FaceName>],
+    kernel: &mut K,
+) -> Result<(), String> {
+    let target = work.pieces[index].shape;
+    let result = kernel
+        .boolean(op, target, tool)
+        .map_err(|e| e.to_string())?;
+    let names = boolean_names(&result.history, work.names(index), tool_names);
+    work.replace(index, result.shape, names, kernel)
+}
+
+/// Booleans body `other` into body `target` and removes `other` (unless `keep`).
+fn merge_bodies<K: Kernel>(
+    work: &mut Working,
+    target: BodyId,
+    other: BodyId,
+    op: BooleanOp,
+    keep: bool,
+    kernel: &mut K,
+) -> Result<(), String> {
+    let o = work
+        .find(other)
+        .ok_or_else(|| format!("body {other} no longer exists"))?;
+    let (shape, names) = (work.pieces[o].shape, work.names(o).to_vec());
+    let t = work
+        .find(target)
+        .ok_or_else(|| "the target body was removed entirely".to_owned())?;
+    combine_into(work, t, op, shape, &names, kernel)?;
+    if !keep {
+        if let Some(o) = work.find(other) {
+            work.remove(o, kernel);
+        }
+    }
+    Ok(())
+}
+
+/// The body a join or an intersection goes into when none is chosen: the body the sketch
+/// is on, else the newest body.
+fn default_target(ctx: &Context<'_>, sketch: Option<FeatureId>) -> Option<BodyId> {
+    let body = ctx.body?;
+    let on_face =
+        sketch
+            .and_then(|id| ctx.earlier(id).ok())
+            .and_then(|(feature, _)| match &feature.kind {
+                FeatureKind::Sketch(Sketch {
+                    plane: SketchPlane::Face(name),
+                    ..
+                }) => match body.naming.resolve_face(name) {
+                    Resolution::Exact(i) | Resolution::Fallback(i) => body.solid_of_face(i),
+                    _ => None,
+                },
+                _ => None,
+            });
+    on_face.or(body.solids.last()).map(|s| s.id)
+}
+
+/// The bodies a tool works on: those chosen, else the default for its operation.
+fn tool_targets(
+    ctx: &Context<'_>,
+    op: ToolOp,
+    chosen: &[BodyId],
+    sketch: Option<FeatureId>,
+) -> Result<Vec<BodyId>, String> {
+    if !chosen.is_empty() {
+        for id in chosen {
+            if ctx.body.and_then(|b| b.solid(*id)).is_none() {
+                return Err(format!(
+                    "body {id} no longer exists: choose the bodies again"
+                ));
+            }
+        }
+        return Ok(chosen.to_vec());
+    }
+    Ok(match op {
+        ToolOp::NewBody => Vec::new(),
+        ToolOp::Cut => ctx
+            .body
+            .map(|b| b.solids.iter().map(|s| s.id).collect())
+            .unwrap_or_default(),
+        ToolOp::Join | ToolOp::Intersect => default_target(ctx, sketch).into_iter().collect(),
+    })
+}
+
+/// Joins, cuts, intersects or adds as a new body a swept tool: the bodies after the
+/// feature, and the tool kept for patterns.
 fn apply_tool<K: Kernel>(
-    id: FeatureId,
+    ctx: &Context<'_>,
     op: ExtrudeOp,
+    chosen: &[BodyId],
+    sketch: FeatureId,
     tool: OpResult,
-    body: Option<&Body>,
     kernel: &mut K,
 ) -> Result<(Body, ToolBody), String> {
+    let id = ctx.feature().id;
     let tool_names = sweep_names(id, &tool.history);
-    let boolean = match op {
-        ExtrudeOp::Boss => BooleanOp::Fuse,
-        ExtrudeOp::Cut => BooleanOp::Cut,
-    };
-    let Some(body) = body else {
-        return match op {
-            ExtrudeOp::Boss => {
-                let built = finish(id, tool.shape, tool_names.clone(), kernel)?;
-                Ok((
-                    built,
-                    ToolBody {
-                        shape: tool.shape,
-                        owned: false,
-                        names: tool_names,
-                        op: boolean,
-                    },
-                ))
-            }
-            ExtrudeOp::Cut => {
-                kernel.release(tool.shape);
-                Err("nothing to cut: the part has no body yet".to_owned())
-            }
-        };
-    };
-    let combined = match kernel.boolean(boolean, body.shape, tool.shape) {
-        Ok(combined) => combined,
+    let mut op = ToolOp::of(op);
+    let targets = match tool_targets(ctx, op, chosen, Some(sketch)) {
+        Ok(t) => t,
         Err(e) => {
             kernel.release(tool.shape);
-            return Err(e.to_string());
+            return Err(e);
         }
     };
-    let names = boolean_names(&combined.history, body, &tool_names);
-    match finish(id, combined.shape, names, kernel) {
-        Ok(built) => Ok((
-            built,
+    if targets.is_empty() {
+        match op {
+            // The first boss of a part makes its first body.
+            ToolOp::Join | ToolOp::NewBody => op = ToolOp::NewBody,
+            ToolOp::Cut | ToolOp::Intersect => {
+                kernel.release(tool.shape);
+                return Err("nothing to cut: the part has no body yet".to_owned());
+            }
+        }
+    }
+    let mut work = Working::from(ctx.body);
+    let outcome = (|| -> Result<(), String> {
+        match op {
+            ToolOp::NewBody => work.push(
+                BodyId::new(id, 0),
+                tool.shape,
+                tool_names.clone(),
+                true,
+                kernel,
+            ),
+            ToolOp::Join => {
+                let first = work
+                    .find(targets[0])
+                    .ok_or_else(|| format!("body {} no longer exists", targets[0]))?;
+                combine_into(
+                    &mut work,
+                    first,
+                    BooleanOp::Fuse,
+                    tool.shape,
+                    &tool_names,
+                    kernel,
+                )?;
+                // Joining several bodies makes them one.
+                for other in &targets[1..] {
+                    merge_bodies(
+                        &mut work,
+                        targets[0],
+                        *other,
+                        BooleanOp::Fuse,
+                        false,
+                        kernel,
+                    )?;
+                }
+                Ok(())
+            }
+            ToolOp::Cut | ToolOp::Intersect => {
+                for target in &targets {
+                    if let Some(index) = work.find(*target) {
+                        combine_into(
+                            &mut work,
+                            index,
+                            op.boolean(),
+                            tool.shape,
+                            &tool_names,
+                            kernel,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    })();
+    let new_body = op == ToolOp::NewBody;
+    match outcome {
+        Ok(()) => Ok((
+            work.finish(id),
             ToolBody {
                 shape: tool.shape,
-                owned: true,
+                owned: !new_body,
                 names: tool_names,
-                op: boolean,
+                op,
+                targets,
             },
         )),
         Err(e) => {
-            kernel.release(tool.shape);
+            // A new body's shape is the tool: freed with the bodies.
+            work.abort(kernel);
+            if !new_body {
+                kernel.release(tool.shape);
+            }
             Err(e)
         }
     }
 }
 
-/// Reads the stored STEP file and adds its solids to the body.
+/// Reads the stored STEP file and joins its solids to the newest body (or makes the first
+/// body).
 fn build_import<K: Kernel>(
     ctx: &Context<'_>,
     import: &Import,
@@ -938,14 +1081,23 @@ fn build_import<K: Kernel>(
     let names: Vec<Option<FaceName>> = (0..faces)
         .map(|index| Some(FaceName::new(FaceKey::Imported { feature: id, index })))
         .collect();
-    let Some(body) = ctx.body else {
-        return finish(id, shape, names, kernel);
+    let mut work = Working::from(ctx.body);
+    let target = default_target(ctx, None).and_then(|t| work.find(t));
+    let outcome = match target {
+        None => work.push(BodyId::new(id, 0), shape, names, true, kernel),
+        Some(index) => {
+            let joined = combine_into(&mut work, index, BooleanOp::Fuse, shape, &names, kernel);
+            kernel.release(shape);
+            joined
+        }
     };
-    let combined = kernel.boolean(BooleanOp::Fuse, body.shape, shape);
-    kernel.release(shape);
-    let combined = combined.map_err(|e| e.to_string())?;
-    let names = boolean_names(&combined.history, body, &names);
-    finish(id, combined.shape, names, kernel)
+    match outcome {
+        Ok(()) => Ok(work.finish(id)),
+        Err(e) => {
+            work.abort(kernel);
+            Err(e)
+        }
+    }
 }
 
 fn build_extrude<K: Kernel>(
@@ -959,10 +1111,7 @@ fn build_extrude<K: Kernel>(
         return Err("depth must be positive".to_owned());
     }
 
-    let mut along = match extrude.op {
-        ExtrudeOp::Boss => 1.0,
-        ExtrudeOp::Cut => -1.0,
-    };
+    let mut along = if extrude.op.adds() { 1.0 } else { -1.0 };
     if extrude.reverse {
         along = -along;
     }
@@ -977,7 +1126,14 @@ fn build_extrude<K: Kernel>(
     let tool = kernel
         .extrude(&plane, profile, vector)
         .map_err(|e| e.to_string())?;
-    apply_tool(ctx.feature().id, extrude.op, tool, ctx.body, kernel)
+    apply_tool(
+        ctx,
+        extrude.op,
+        &extrude.bodies,
+        extrude.sketch,
+        tool,
+        kernel,
+    )
 }
 
 fn build_revolve<K: Kernel>(
@@ -1027,7 +1183,14 @@ fn build_revolve<K: Kernel>(
     let tool = kernel
         .revolve(&plane, profile, &axis, angle)
         .map_err(|e| e.to_string())?;
-    apply_tool(ctx.feature().id, revolve.op, tool, ctx.body, kernel)
+    apply_tool(
+        ctx,
+        revolve.op,
+        &revolve.bodies,
+        revolve.sketch,
+        tool,
+        kernel,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1050,7 +1213,6 @@ fn build_blend<K: Kernel>(
     if !(blend.size > 0.0) {
         return Err("size must be positive".to_owned());
     }
-
     let mut edges = Vec::with_capacity(blend.edges.len());
     for name in &blend.edges {
         edges.push(resolve(
@@ -1060,17 +1222,35 @@ fn build_blend<K: Kernel>(
             warnings,
         )?);
     }
-    edges.sort_unstable();
-    edges.dedup();
-
-    let result = match kind {
-        Blend::Fillet => kernel.fillet(body.shape, &edges, blend.size),
-        Blend::Chamfer => kernel.chamfer(body.shape, &edges, blend.size),
-    }
-    .map_err(|e| e.to_string())?;
+    // Each body is filleted on its own, with its own edges.
     let id = ctx.feature().id;
-    let names = derived_names(id, &result.history, body);
-    finish(id, result.shape, names, kernel)
+    let mut work = Working::from(ctx.body);
+    let outcome = (|| -> Result<(), String> {
+        for solid in &body.solids {
+            let mut local: Vec<u32> = edges.iter().filter_map(|e| solid.local_edge(*e)).collect();
+            if local.is_empty() {
+                continue;
+            }
+            local.sort_unstable();
+            local.dedup();
+            let result = match kind {
+                Blend::Fillet => kernel.fillet(solid.shape, &local, blend.size),
+                Blend::Chamfer => kernel.chamfer(solid.shape, &local, blend.size),
+            }
+            .map_err(|e| e.to_string())?;
+            let names = derived_names(id, &result.history, body, solid);
+            let index = work.find(solid.id).expect("the bodies before the feature");
+            work.replace(index, result.shape, names, kernel)?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(work.finish(id)),
+        Err(e) => {
+            work.abort(kernel);
+            Err(e)
+        }
+    }
 }
 
 fn build_shell<K: Kernel>(
@@ -1092,19 +1272,94 @@ fn build_shell<K: Kernel>(
             warnings,
         )?);
     }
-    faces.sort_unstable();
-    faces.dedup();
+    // One body is shelled: the one the faces are on, or the only one.
+    let solid = match faces.first() {
+        Some(f) => body.solid_of_face(*f).ok_or("face not found")?,
+        None if body.solids.len() == 1 => &body.solids[0],
+        None => {
+            return Err(
+                "the part has several bodies: select a face to remove on the one to shell"
+                    .to_owned(),
+            );
+        }
+    };
+    let mut local = Vec::with_capacity(faces.len());
+    for f in &faces {
+        local.push(
+            solid
+                .local_face(*f)
+                .ok_or("the faces are on several bodies: shell one body at a time")?,
+        );
+    }
+    local.sort_unstable();
+    local.dedup();
     let offset = if shell.outward {
         shell.thickness
     } else {
         -shell.thickness
     };
     let result = kernel
-        .shell(body.shape, &faces, offset)
+        .shell(solid.shape, &local, offset)
         .map_err(|e| e.to_string())?;
     let id = ctx.feature().id;
-    let names = derived_names(id, &result.history, body);
-    finish(id, result.shape, names, kernel)
+    let names = derived_names(id, &result.history, body, solid);
+    let mut work = Working::from(ctx.body);
+    let index = work.find(solid.id).expect("the bodies before the feature");
+    match work.replace(index, result.shape, names, kernel) {
+        Ok(()) => Ok(work.finish(id)),
+        Err(e) => {
+            work.abort(kernel);
+            Err(e)
+        }
+    }
+}
+
+/// Combine: the target body joined with, cut by or intersected with the tool bodies.
+fn build_combine<K: Kernel>(
+    ctx: &Context<'_>,
+    combine: &Combine,
+    kernel: &mut K,
+) -> Result<Body, String> {
+    let body = ctx.body()?;
+    if body.solid(combine.target).is_none() {
+        return Err(format!(
+            "the target body {} no longer exists: choose it again",
+            combine.target
+        ));
+    }
+    if combine.tools.is_empty() {
+        return Err("choose the tool bodies".to_owned());
+    }
+    if combine.tools.contains(&combine.target) {
+        return Err("the target body cannot also be a tool".to_owned());
+    }
+    let op = match combine.op {
+        CombineOp::Join => BooleanOp::Fuse,
+        CombineOp::Cut => BooleanOp::Cut,
+        CombineOp::Intersect => BooleanOp::Common,
+    };
+    let id = ctx.feature().id;
+    let mut work = Working::from(ctx.body);
+    let outcome = (|| -> Result<(), String> {
+        for tool in &combine.tools {
+            merge_bodies(
+                &mut work,
+                combine.target,
+                *tool,
+                op,
+                combine.keep_tools,
+                kernel,
+            )?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(work.finish(id)),
+        Err(e) => {
+            work.abort(kernel);
+            Err(e)
+        }
+    }
 }
 
 fn build_ref_plane(
@@ -1226,8 +1481,9 @@ fn mirror_instances(
     Ok(vec![([1, 0], Transform::mirror(&plane))])
 }
 
-/// Copies the tools of `seeds` to every instance and adds or removes each copy, seed by
-/// seed. Faces of a copy are named after the seed's face and the instance.
+/// Copies the tools of `seeds` to every instance and does with each copy what the seed
+/// did: joined to or cut from the same bodies, or a new body. Faces of a copy are named
+/// after the seed's face and the instance.
 fn build_instances<K: Kernel>(
     ctx: &Context<'_>,
     seeds: &[FeatureId],
@@ -1235,9 +1491,11 @@ fn build_instances<K: Kernel>(
     kernel: &mut K,
 ) -> Result<Body, String> {
     let id = ctx.feature().id;
-    let body = ctx.body()?;
     if seeds.is_empty() {
         return Err("no features to copy".to_owned());
+    }
+    if instances.is_empty() {
+        return Err("the pattern has a single instance".to_owned());
     }
     let mut tools = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -1255,8 +1513,8 @@ fn build_instances<K: Kernel>(
         tools.push(tool);
     }
 
-    // The body being built, once it differs from the one before this feature.
-    let mut current: Option<Body> = None;
+    let mut work = Working::from(ctx.body);
+    let mut new_bodies = 0;
     let outcome = (|| -> Result<(), String> {
         for tool in &tools {
             for (key, transform) in instances {
@@ -1284,25 +1542,55 @@ fn build_instances<K: Kernel>(
                             })
                         })
                         .collect();
-                let base = current.as_ref().unwrap_or(body);
-                let combined = kernel.boolean(tool.op, base.shape, copy.shape);
+                let applied = match tool.op {
+                    ToolOp::NewBody => {
+                        let body = BodyId::new(id, new_bodies);
+                        new_bodies += 1;
+                        // The copy is the new body's shape.
+                        work.push(body, copy.shape, copy_names, true, kernel)?;
+                        continue;
+                    }
+                    ToolOp::Join => match tool.targets.first().and_then(|t| work.find(*t)) {
+                        Some(index) => combine_into(
+                            &mut work,
+                            index,
+                            BooleanOp::Fuse,
+                            copy.shape,
+                            &copy_names,
+                            kernel,
+                        ),
+                        None => Err("the body the seed joined no longer exists".to_owned()),
+                    },
+                    ToolOp::Cut | ToolOp::Intersect => {
+                        let mut done = Ok(());
+                        for target in &tool.targets {
+                            if let Some(index) = work.find(*target) {
+                                done = combine_into(
+                                    &mut work,
+                                    index,
+                                    tool.op.boolean(),
+                                    copy.shape,
+                                    &copy_names,
+                                    kernel,
+                                );
+                                if done.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        done
+                    }
+                };
                 kernel.release(copy.shape);
-                let combined = combined.map_err(|e| e.to_string())?;
-                let names = boolean_names(&combined.history, base, &copy_names);
-                let built = finish(id, combined.shape, names, kernel)?;
-                if let Some(old) = current.replace(built) {
-                    kernel.release(old.shape);
-                }
+                applied?;
             }
         }
         Ok(())
     })();
     match outcome {
-        Ok(()) => current.ok_or_else(|| "the pattern has a single instance".to_owned()),
+        Ok(()) => Ok(work.finish(id)),
         Err(e) => {
-            if let Some(partial) = current {
-                kernel.release(partial.shape);
-            }
+            work.abort(kernel);
             Err(e)
         }
     }

@@ -65,7 +65,6 @@ pub struct Tokens {
     pub accent_bg: Color32,
     pub warn: Color32,
     pub err: Color32,
-    pub ok: Color32,
 }
 
 const fn hex(rgb: u32) -> Color32 {
@@ -83,7 +82,6 @@ pub const FLUX: Tokens = Tokens {
     accent_bg: hex(0x1f4a63),
     warn: hex(0xffb74d),
     err: hex(0xef5350),
-    ok: hex(0x66bb6a),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -97,7 +95,6 @@ pub const LIGHT: Tokens = Tokens {
     accent_bg: hex(0xd6e9fb),
     warn: hex(0xc77700),
     err: hex(0xd32f2f),
-    ok: hex(0x2e7d32),
 };
 
 static DARK_UI: AtomicBool = AtomicBool::new(true);

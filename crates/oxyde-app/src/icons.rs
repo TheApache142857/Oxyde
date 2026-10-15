@@ -25,6 +25,11 @@ pub enum Icon {
     RefAxis,
     ReferenceGeometry,
     Imported,
+    Combine,
+    // Bodies
+    Bodies,
+    Intersect,
+    NewBody,
     // Assemblies
     Assembly,
     InsertComponent,
@@ -644,6 +649,33 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.badge(17.0, 17.0, REMOVE);
             pen.cross(17.0, 17.0, 2.2, WHITE);
         }
+        Combine => {
+            // Two bodies overlapping, the overlap in the accent colour.
+            pen.solid(2.0, 11.0, 11.0, 10.0, 4.0);
+            pen.block(9.0, 7.0, 11.0, 10.0, 4.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
+            pen.fill(&[(9.0, 11.0), (13.0, 11.0), (13.0, 17.0), (9.0, 17.0)], ADD);
+        }
+        Bodies => {
+            // A stack of separate solids.
+            pen.solid(3.0, 15.0, 9.0, 7.0, 3.0);
+            pen.solid(13.0, 15.0, 8.0, 7.0, 3.0);
+            pen.block(7.0, 7.0, 9.0, 6.0, 3.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
+        }
+        Intersect => {
+            pen.ring(9.0, 12.0, 6.5, 1.6, INK);
+            pen.ring(15.0, 12.0, 6.5, 1.6, INK);
+            let lens: Vec<(f32, f32)> = Pen::arc_points(9.0, 12.0, 6.5, 6.5, -1.05, 1.05)
+                .into_iter()
+                .chain(Pen::arc_points(15.0, 12.0, 6.5, 6.5, PI - 1.05, PI + 1.05))
+                .collect();
+            pen.fill(&lens, ACCENT);
+        }
+        NewBody => {
+            pen.solid(2.0, 12.0, 11.0, 10.0, 5.0);
+            pen.badge(18.0, 6.0, SKETCH);
+            pen.line(&[(15.0, 6.0), (21.0, 6.0)], 1.8, WHITE);
+            pen.line(&[(18.0, 3.0), (18.0, 9.0)], 1.8, WHITE);
+        }
         Assembly => {
             // Two parts, one resting on the other.
             pen.solid(2.0, 13.0, 12.0, 9.0, 5.0);
@@ -895,7 +927,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 53] = {
+pub const ALL: [Icon; 57] = {
     use Icon::*;
     [
         Sketch,
@@ -911,6 +943,10 @@ pub const ALL: [Icon; 53] = {
         RefAxis,
         ReferenceGeometry,
         Imported,
+        Combine,
+        Bodies,
+        Intersect,
+        NewBody,
         Assembly,
         InsertComponent,
         Mate,

@@ -102,6 +102,7 @@ pub fn flange() -> Part {
         angle: std::f64::consts::TAU,
         mid_plane: false,
         reverse: false,
+        bodies: Vec::new(),
     }));
 
     // One bolt hole through the disc, sketched on its top face (swept from line 2).
@@ -140,7 +141,6 @@ mod tests {
     use std::io::Cursor;
 
     use oxyde_format::{PartFile, Properties, read_part, write_part};
-    use oxyde_kernel::Kernel;
     use oxyde_model::{FeatureStatus, Part};
     use oxyde_occt::OcctKernel;
 
@@ -151,7 +151,7 @@ mod tests {
         for entry in part.timeline() {
             assert_eq!(entry.status, FeatureStatus::Ok, "{}", entry.name);
         }
-        kernel.volume(part.body().unwrap().shape).unwrap()
+        crate::app::bodies_volume(kernel, part.body().unwrap()).unwrap()
     }
 
     #[test]

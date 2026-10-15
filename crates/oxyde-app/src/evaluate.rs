@@ -2,7 +2,7 @@
 //! and edges selected in the viewport.
 
 use eframe::egui;
-use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, Kernel, SurfaceKind};
+use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, SurfaceKind};
 
 use crate::app::{OxydeApp, Selected};
 
@@ -62,7 +62,7 @@ impl OxydeApp {
             ui.label("There is no solid yet.");
             return;
         };
-        let volume = self.kernel.volume(body.shape).ok();
+        let volume = crate::app::bodies_volume(&self.kernel, body).ok();
         let topology = &body.topology;
         let area: f64 = topology.faces.iter().map(|f| f.area).sum();
         let mut lo = [f64::INFINITY; 3];
