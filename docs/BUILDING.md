@@ -1,6 +1,6 @@
 # Building Oxyde
 
-**Supported platform: Windows 10/11, x64, MSVC toolchain.** macOS and Linux will come later; on any other target the build script stops with an explicit error.
+**Main platform: Windows 10/11, x64, MSVC toolchain.** Linux builds too, with the OpenCASCADE 7.8 of Debian and Ubuntu (see [Linux](#linux)). The build script also accepts macOS, untested so far; on any other target it stops with an explicit error.
 
 ## 1. Prerequisites
 
@@ -62,9 +62,9 @@ Cargo must be run from the repository folder (`cd C:\path\to\Oxyde`); a new term
 
 ```powershell
 cargo run --release -p oxyde-app               # the application
-cargo run --release -p oxyde-app -- part.oxy   # ... opening a file
+cargo run --release -p oxyde-app -- part.oxyprt   # ... opening a file
 cargo test --workspace                         # everything
-cargo test -p oxyde-geom -p oxyde-sketch -p oxyde-model -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
+cargo test -p oxyde-geom -p oxyde-sketch -p oxyde-kernel -p oxyde-model -p oxyde-assembly -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
 cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end tests
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```
@@ -73,7 +73,7 @@ On a machine without OpenCASCADE (Linux, macOS), the whole workspace can still b
 
 Open `box.step` in SolidWorks, FreeCAD or eDrawings: you should see a 40 × 20 × 10 mm box.
 
-In the application, **File › Open demo bracket** builds a part using every feature type. The viewport is software-rendered: use `--release` for smooth navigation (the renderer crate is optimized even in debug builds, the rest is not).
+In the application, **File › Open demo bracket** builds a part using every feature type. Use `--release` for smooth interaction: the renderer crate is optimized even in debug builds, the rest of the application is not.
 
 The viewport draws with the GPU (wgpu). If it shows nothing or crashes on startup on your machine, run with the software renderer and report the GPU and driver:
 
@@ -91,7 +91,7 @@ sudo apt install g++ libocct-foundation-dev libocct-modeling-data-dev \
 cargo run --release -p oxyde-app
 ```
 
-Without root, the same packages in a `debian:trixie` container work too, with the host's Rust toolchain mounted. `cargo run -p oxyde-tests --example step_to_oxyde -- file.step out/` converts a STEP assembly into Oxyde files from the command line.
+Without root, the same packages in a `debian:trixie` container work too, with the host's Rust toolchain mounted. Tests run as on Windows. On a small machine such as a Raspberry Pi, test in `--release` and a few packages at a time (`cargo test --release -p oxyde-tests`): a debug build of the whole workspace takes gigabytes of disk. `cargo run -p oxyde-tests --example step_to_oxyde -- file.step out/` converts a STEP assembly into Oxyde files from the command line.
 
 ## 3. Bundling for Windows
 
@@ -116,4 +116,4 @@ The script checks the bundle by running `Oxyde.exe --version`, which loads OpenC
 | `LNK2019: unresolved external symbol` | Library directory from a different OCCT version than the headers, or a missing toolkit. Report the symbol name. |
 | `C1083` for a `*Iterator*.hxx` header, or `'DynamicType': is not a member of 'Standard_Failure'` | OCCT 8 removed legacy typedef headers and changed its exception class. The shim handles both 7.x and 8.x; if a new error of this kind appears, report it with the OCCT version. |
 | Tests exit with `0xc0000135` (`STATUS_DLL_NOT_FOUND`) | OCCT DLLs (or their third-party DLLs) are not on `PATH`. |
-| Build script says only Windows with MSVC is supported | You are on another OS, or using the `x86_64-pc-windows-gnu` toolchain. Run `rustup default stable-x86_64-pc-windows-msvc`. |
+| Build script says oxyde-occt supports Windows (MSVC), Linux and macOS | On Windows, you are using the `x86_64-pc-windows-gnu` toolchain: run `rustup default stable-x86_64-pc-windows-msvc`. |
