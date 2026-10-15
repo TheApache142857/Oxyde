@@ -156,7 +156,7 @@ impl AssemblyDoc {
             document_id: file.document_id,
             path,
             modified: false,
-            revision: 0,
+            revision: crate::document::next_revision(),
             docs: HashMap::new(),
             sources: HashMap::new(),
             solution: None,
@@ -228,7 +228,7 @@ impl AssemblyDoc {
             );
             self.sources.insert(component.id, path);
         }
-        self.revision += 1;
+        self.revision = crate::document::next_revision();
         notes
     }
 
@@ -397,7 +397,7 @@ impl AssemblyDoc {
         self.assembly = assembly;
         self.solution = Some(solution);
         self.last_solve = Some(start.elapsed().as_secs_f64());
-        self.revision += 1;
+        self.revision = crate::document::next_revision();
     }
 
     // ---- Display -------------------------------------------------------------------------

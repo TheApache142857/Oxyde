@@ -154,3 +154,22 @@ fn mirrored_and_rotated_faces_still_face_outward() {
         []
     );
 }
+
+#[test]
+fn bounds_are_exact() {
+    let mut kernel = OcctKernel::new();
+    let shape = kernel
+        .make_box(Point3::new(5.0, -3.0, 1.0), Vec3::new(10.0, 20.0, 30.0))
+        .unwrap();
+    let (lo, hi) = kernel.bounds(shape).unwrap();
+    for (got, want) in [
+        (lo.x, 5.0),
+        (lo.y, -3.0),
+        (lo.z, 1.0),
+        (hi.x, 15.0),
+        (hi.y, 17.0),
+        (hi.z, 31.0),
+    ] {
+        assert!((got - want).abs() < 1e-9, "{got} vs {want}");
+    }
+}

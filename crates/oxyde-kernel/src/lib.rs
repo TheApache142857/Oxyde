@@ -311,6 +311,10 @@ pub trait Kernel {
     /// Volume of a solid, in mm³.
     fn volume(&self, shape: ShapeHandle) -> Result<f64, Self::Error>;
 
+    /// The smallest box along the model axes holding the shape, `(min, max)`: exact, not
+    /// from a mesh, and without tolerance added.
+    fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), Self::Error>;
+
     fn topology_counts(&self, shape: ShapeHandle) -> Result<TopologyCounts, Self::Error>;
 
     /// Writes `shapes` to a STEP file at `path`, in millimetres.

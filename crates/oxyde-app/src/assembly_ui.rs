@@ -567,7 +567,7 @@ impl OxydeApp {
             Some(p) if p.assembly.mate(id).is_some() => {
                 doc.assembly = p.assembly;
                 doc.solution = Some(p.solution);
-                doc.revision += 1;
+                doc.revision = crate::document::next_revision();
             }
             _ => doc.solve(),
         }
@@ -620,7 +620,7 @@ impl OxydeApp {
 
     fn bump_asm(&mut self) {
         if let Some(doc) = self.asm.as_mut() {
-            doc.revision += 1;
+            doc.revision = crate::document::next_revision();
         }
     }
 
@@ -1339,7 +1339,7 @@ impl OxydeApp {
                     if let Some(c) = doc.assembly.component_mut(id) {
                         c.hidden = !c.hidden;
                     }
-                    doc.revision += 1;
+                    doc.revision = crate::document::next_revision();
                 }
             }
             TreeAction::Fix(id, fixed) => self.toggle_fixed(id, fixed),

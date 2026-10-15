@@ -8,6 +8,14 @@ use oxyde_model::{FeatureId, Part, PartDefinition};
 
 const UNDO_LIMIT: usize = 200;
 
+/// A revision number no other state of any document has had: views caching what they show
+/// by revision can never take a newly opened document for the one before it.
+pub(crate) fn next_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Document {
     pub part: Part,
     pub properties: Properties,
@@ -17,7 +25,8 @@ pub struct Document {
     pub untitled_name: Option<String>,
     /// Changed since the last save.
     pub modified: bool,
-    /// Incremented by every rebuild, so views know when to refresh.
+    /// Changed by every rebuild, so views know when to refresh; never the same for two
+    /// documents (see [`next_revision`]).
     pub revision: u64,
     undo: Vec<PartDefinition>,
     redo: Vec<PartDefinition>,
@@ -40,7 +49,7 @@ impl Document {
             path,
             untitled_name: None,
             modified: false,
-            revision: 0,
+            revision: next_revision(),
             undo: Vec::new(),
             redo: Vec::new(),
             editing: None,
@@ -146,7 +155,7 @@ impl Document {
 
     pub fn rebuild<K: Kernel>(&mut self, kernel: &mut K) {
         self.part.rebuild(kernel);
-        self.revision += 1;
+        self.revision = next_revision();
     }
 
     /// Frees the kernel shapes held by this document.

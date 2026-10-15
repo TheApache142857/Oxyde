@@ -3,10 +3,12 @@
 
 #include <BRepAdaptor_Curve.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <Bnd_Box.hxx>
 #include <BRepAlgoAPI_BooleanOperation.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeShape.hxx>
@@ -1321,6 +1323,20 @@ double Session::volume(std::uint64_t shape) const {
         GProp_GProps props;
         BRepGProp::VolumeProperties(get(shape), props);
         return props.Mass();
+    });
+}
+
+BoundsData Session::bounds(std::uint64_t shape) const {
+    return guarded("bounds", [&] {
+        Bnd_Box box;
+        // From the geometry, not a triangulation, and without the shape's tolerance.
+        BRepBndLib::AddOptimal(get(shape), box, Standard_False, Standard_False);
+        if (box.IsVoid()) {
+            throw std::runtime_error("the shape is empty");
+        }
+        BoundsData out{};
+        box.Get(out.xmin, out.ymin, out.zmin, out.xmax, out.ymax, out.zmax);
+        return out;
     });
 }
 

@@ -188,6 +188,14 @@ impl Kernel for OcctKernel {
         Ok(self.session.volume(shape.raw())?)
     }
 
+    fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), OcctError> {
+        let b = self.session.bounds(shape.raw())?;
+        Ok((
+            Point3::new(b.xmin, b.ymin, b.zmin),
+            Point3::new(b.xmax, b.ymax, b.zmax),
+        ))
+    }
+
     fn topology_counts(&self, shape: ShapeHandle) -> Result<TopologyCounts, OcctError> {
         let c = self.session.topology_counts(shape.raw())?;
         Ok(TopologyCounts {

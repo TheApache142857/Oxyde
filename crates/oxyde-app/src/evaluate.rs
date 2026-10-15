@@ -2,7 +2,7 @@
 //! and edges selected in the viewport.
 
 use eframe::egui;
-use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, SurfaceKind};
+use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, Kernel, SurfaceKind};
 
 use crate::app::{OxydeApp, Selected};
 
@@ -65,25 +65,18 @@ impl OxydeApp {
         let volume = crate::app::bodies_volume(&self.kernel, body).ok();
         let topology = &body.topology;
         let area: f64 = topology.faces.iter().map(|f| f.area).sum();
-        // The displayed mesh follows the surfaces: vertices, centroids and edge middles alone
-        // all lie on one diameter of a cylinder, which then measured 0 across.
-        let (lo, hi) = self.viewport.scene_bounds().unwrap_or_else(|| {
-            let mut lo = [f64::INFINITY; 3];
-            let mut hi = [f64::NEG_INFINITY; 3];
-            for p in topology
-                .vertices
-                .iter()
-                .map(|v| v.point)
-                .chain(topology.faces.iter().map(|f| f.centroid))
-                .chain(topology.edges.iter().map(|e| e.midpoint))
-            {
-                for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
-                    lo[k] = lo[k].min(value);
-                    hi[k] = hi[k].max(value);
+        // The kernel's exact box: vertices, centroids and edge middles all lie on one
+        // diameter of a cylinder, which then measured 0 across.
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for solid in &body.solids {
+            if let Ok((a, b)) = self.kernel.bounds(solid.shape) {
+                for (k, (a, b)) in [(a.x, b.x), (a.y, b.y), (a.z, b.z)].into_iter().enumerate() {
+                    lo[k] = lo[k].min(a);
+                    hi[k] = hi[k].max(b);
                 }
             }
-            (lo, hi)
-        });
+        }
         egui::Grid::new("mass_properties")
             .num_columns(2)
             .spacing([16.0, 4.0])

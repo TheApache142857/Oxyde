@@ -177,6 +177,16 @@ pub(crate) mod bridge {
         edges: Vec<EdgeLineData>,
     }
 
+    /// An axis-aligned box.
+    struct BoundsData {
+        xmin: f64,
+        ymin: f64,
+        zmin: f64,
+        xmax: f64,
+        ymax: f64,
+        zmax: f64,
+    }
+
     // ---- STEP assemblies --------------------------------------------------------------------
 
     struct StepInstanceData {
@@ -279,6 +289,8 @@ pub(crate) mod bridge {
         fn tessellate(self: &Session, shape: u64, deflection: f64) -> Result<MeshData>;
 
         fn volume(self: &Session, shape: u64) -> Result<f64>;
+
+        fn bounds(self: &Session, shape: u64) -> Result<BoundsData>;
 
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
 

@@ -250,6 +250,27 @@ fn a_shell_with_no_face_removed_is_hollow() {
 }
 
 #[test]
+fn a_cylinder_is_as_wide_as_its_diameter() {
+    let mut kernel = OcctKernel::new();
+    let (mut part, _, shell) = shelled_cylinder(|_| Vec::new(), 1.0, false);
+    part.set_suppressed(shell, true).unwrap();
+    part.rebuild(&mut kernel);
+    let body = part.body().unwrap();
+    let (lo, hi) = kernel.bounds(body.solids[0].shape).unwrap();
+    for (got, want) in [
+        (lo.x, -10.0),
+        (lo.y, -10.0),
+        (lo.z, 0.0),
+        (hi.x, 10.0),
+        (hi.y, 10.0),
+        (hi.z, 20.0),
+    ] {
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+    }
+    part.release(&mut kernel);
+}
+
+#[test]
 fn a_shell_thicker_than_the_part_is_an_error() {
     let mut kernel = OcctKernel::new();
     // 12 mm walls in a 10 mm radius: OpenCASCADE turns the wall inside out.
