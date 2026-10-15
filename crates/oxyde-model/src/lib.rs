@@ -22,6 +22,7 @@ mod equations;
 mod error;
 mod expression;
 mod feature;
+mod material;
 mod naming;
 mod part;
 
@@ -41,6 +42,7 @@ pub use feature::{
     Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
     SketchPlane, StandardAxis, StandardPlane,
 };
+pub use material::{Material, MaterialLibrary};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
     FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,

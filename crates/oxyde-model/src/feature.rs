@@ -251,6 +251,21 @@ pub struct Import {
     /// Name of the original file, for display.
     pub file_name: String,
     pub data: FileData,
+    /// Whether the colours the file gives its solids and faces are still to be turned
+    /// into appearances of the part: true for a fresh import, false once the first
+    /// rebuild has done it (the appearances are then the user's to change or remove).
+    pub apply_colors: bool,
+}
+
+impl Import {
+    /// A fresh import of `data`, whose colours become appearances on the first rebuild.
+    pub fn new(file_name: impl Into<String>, data: FileData) -> Self {
+        Self {
+            file_name: file_name.into(),
+            data,
+            apply_colors: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

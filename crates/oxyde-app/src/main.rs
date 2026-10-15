@@ -18,6 +18,7 @@ mod evaluate;
 mod features_ui;
 mod gpu;
 mod icons;
+mod materials;
 mod model_refs;
 mod prefs;
 mod prefs_ui;

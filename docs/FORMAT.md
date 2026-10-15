@@ -133,7 +133,7 @@ Rules:
 | `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
 | `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
 | `mirror` | `seeds`, `plane` (PlaneRef) |
-| `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). |
+| `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). `apply_colors` (optional, default false): the colours the STEP file gives its solids and faces are still to become appearances (see *Appearances*); Oxyde writes it only for a part it has not rebuilt yet, such as the parts of an imported assembly. |
 | `combine` | `target` (body), `tools` (bodies), `operation` (`join` \| `cut` \| `intersect`), `keep_tools` (optional, default false) |
 
 Counts include the seed. Seeds of patterns and mirrors are extrusions and revolves (their tool bodies are copied).
@@ -241,6 +241,38 @@ How the part looks, optional (absent = the viewport's part colour everywhere); d
 - `part` is the appearance of the whole part; `bodies` and `faces` override it for single bodies (by the feature that made them, see *Bodies*) and single faces (by persistent name, see *References*). The most specific wins: face over body over part.
 - An appearance has a `color` (sRGB, 0–255), a `transparency` from 0 (opaque, the default when absent) to 1 (invisible), and optionally a `texture`: an image in the archive (`file`), its original name (`file_name`, display only) and `scale`, the millimetres one repeat of the image covers along its width. The image is mapped automatically along the part's axes (projected along X, Y and Z and blended by the surface's orientation), so no texture coordinates are stored; it replaces the colour where it is.
 - Appearances of bodies and faces that no longer exist are kept and ignored; a `texture.file` missing from the archive is an error.
+- **STEP colours.** When an `import` feature is first rebuilt, the colours its STEP file carries (AP214/AP242 colour and transparency per solid and per face, as SolidWorks, Fusion and FreeCAD write them) become appearances: a body appearance for a single solid that makes a body of its own, and face appearances (named `imported` faces) where faces differ from it or when the solids join an existing body. They are ordinary appearances from then on (the feature's `apply_colors` is cleared), so the user can change or remove them. STEP has no textures. Export STEP writes the appearances back the same way: each solid's colour (its body's, else the part's, else the material's) and the faces that differ.
+
+### Material
+
+What the part is made of, optional (absent = no material):
+
+```json
+"material": {
+  "name": "Aluminium 6061-T6",
+  "category": "Aluminium",
+  "density": 2700,
+  "appearance": { "color": [200, 203, 208] }
+}
+```
+
+- A part has at most one material. It is a **copy** of a library entry, so the file never depends on a library: `name` (unique in a library; `properties.json` gets it as `material`, for the bill of materials), `category` (for grouping; optional), `density` in kg/m³ (0 when unknown; mass = volume × density) and an `appearance` (same shape as in *Appearances*; its texture image goes under `textures/` like the others).
+- The material's appearance is what the part is drawn with where nothing more specific applies: face over body over part appearance over material.
+
+**Material library.** The user's library is a plain JSON file outside any document, `materials.json` next to the preferences (`%APPDATA%\Oxyde\materials.json` on Windows, `~/.config/oxyde/materials.json` elsewhere), with texture images in a `textures/` folder beside it:
+
+```json
+{
+  "format": "oxyde-materials",
+  "format_version": 1,
+  "materials": [
+    { "name": "Oak", "category": "Wood", "density": 750,
+      "appearance": { "color": [170, 120, 70], "texture": { "file": "textures/1.png", "file_name": "oak.png", "scale": 80 } } }
+  ]
+}
+```
+
+Entries have the same shape as a part's `material`, `texture.file` relative to the library file's folder. Readers refuse another `format` or a higher `format_version`; a material whose image is missing is kept without it. Oxyde writes the file the first time a material is saved to the library; until then it uses its built-in starter set (steels, aluminium alloys, brass, copper, titanium, ABS, PLA, nylon, polycarbonate, acrylic, rubber, glass, woods, FR-4, carbon fibre).
 
 ### Names
 
@@ -261,7 +293,7 @@ Readable by BOM tools without understanding geometry:
 }
 ```
 
-All fields are optional when reading. `volume_mm3` is computed at save time and informational only.
+All fields are optional when reading. `volume_mm3` is computed at save time and informational only. `material` is free text; when the part has a material in `model.json`, Oxyde keeps this equal to its name.
 
 ## 5. Reading rules
 

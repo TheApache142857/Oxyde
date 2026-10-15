@@ -181,11 +181,40 @@ enum TreeAction {
     Fix(ComponentId, bool),
     OpenPart(ComponentId),
     Appearance(ComponentId),
+    /// Gives the parts of these components a material of the library (`None`: none).
+    Material(Vec<ComponentId>, Option<String>),
+    /// Selects every component whose part has this material.
+    SelectMaterial(String),
     DeleteComponent(ComponentId),
     EditMate(MateId),
     FlipMate(MateId),
     SuppressMate(MateId, bool),
     DeleteMate(MateId),
+}
+
+/// The entries of a Material menu: the library's materials and "None". Returns the choice
+/// (`Some(None)` for no material) once one is clicked.
+fn material_menu(ui: &mut egui::Ui, names: &[String]) -> Option<Option<String>> {
+    let mut choice = None;
+    egui::ScrollArea::vertical()
+        .max_height(300.0)
+        .show(ui, |ui| {
+            for name in names {
+                if ui.button(name).clicked() {
+                    choice = Some(Some(name.clone()));
+                    ui.close_menu();
+                }
+            }
+            if names.is_empty() {
+                ui.label(RichText::new("The library is empty").weak());
+            }
+            ui.separator();
+            if ui.button("None").clicked() {
+                choice = Some(None);
+                ui.close_menu();
+            }
+        });
+    choice
 }
 
 fn standard_targets() -> [(MateTarget, &'static str, Icon); 4] {
@@ -737,6 +766,104 @@ impl OxydeApp {
             c.fixed = fixed;
         }
         doc.solve();
+    }
+
+    /// Right-click › Material on components: gives every part under them the library
+    /// material `name` (or no material), in memory and in their files, since parts are
+    /// documents of their own.
+    pub(crate) fn apply_component_material(&mut self, targets: &[ComponentId], name: Option<String>) {
+        let material = match &name {
+            Some(n) => match self.materials.get(n) {
+                Some(m) => Some(m.clone()),
+                None => {
+                    self.status = format!("{n} is not in the material library");
+                    return;
+                }
+            },
+            None => None,
+        };
+        let Some(doc) = self.asm.as_mut() else {
+            return;
+        };
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for id in targets {
+            for p in doc.part_paths_under(*id) {
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+        if paths.is_empty() {
+            self.status = "No part file to give a material to".to_owned();
+            return;
+        }
+        let mut done = 0;
+        let mut failed = Vec::new();
+        for path in &paths {
+            // The file first: a part that cannot be saved is left as it was.
+            let saved = oxyde_format::load_part(path).and_then(|mut file| {
+                let old_name = file.definition.material.as_ref().map(|m| m.name.clone());
+                file.definition.material = material.clone();
+                file.properties.material = match &material {
+                    Some(m) => m.name.clone(),
+                    // A removed material clears the property only when it was the
+                    // material's own name.
+                    None if old_name.as_deref() == Some(file.properties.material.as_str()) => {
+                        String::new()
+                    }
+                    None => file.properties.material.clone(),
+                };
+                oxyde_format::save_part(path, &file)
+            });
+            match saved {
+                Ok(()) => {
+                    if let Some(Ok(crate::assembly::Loaded::Part(p))) = doc.docs.get_mut(path) {
+                        let old_name = p.part.material().map(|m| m.name.clone());
+                        p.part.set_material(material.clone());
+                        match &material {
+                            Some(m) => p.properties.material = m.name.clone(),
+                            None if old_name.as_deref() == Some(p.properties.material.as_str()) => {
+                                p.properties.material.clear();
+                            }
+                            None => {}
+                        }
+                    }
+                    done += 1;
+                }
+                Err(e) => failed.push(format!("{}: {e}", path.display())),
+            }
+        }
+        doc.revision = crate::document::next_revision();
+        self.refresh_materials();
+        self.status = match (&name, failed.is_empty()) {
+            (Some(n), true) => format!("{n} applied to {done} part file(s)"),
+            (None, true) => format!("Material removed from {done} part file(s)"),
+            (_, false) => format!("{done} part file(s) changed; failed: {}", failed.join("; ")),
+        };
+    }
+
+    /// Selects every top-level component that is, or holds, a part made of `name`.
+    pub(crate) fn select_parts_with_material(&mut self, name: &str) {
+        let Some(doc) = self.asm.as_mut() else {
+            return;
+        };
+        let mut selection = Vec::new();
+        for c in &doc.assembly.components {
+            let has = doc.part_paths_under(c.id).iter().any(|p| {
+                matches!(
+                    doc.docs.get(p),
+                    Some(Ok(crate::assembly::Loaded::Part(part)))
+                        if part.part.material().is_some_and(|m| m.name == name)
+                )
+            });
+            if has {
+                selection.push(AsmSelected::Component(c.id));
+            }
+        }
+        let count = selection.len();
+        doc.selection = selection;
+        doc.revision = crate::document::next_revision();
+        self.status = format!("{count} component(s) made of {name}");
     }
 
     pub(crate) fn delete_selected(&mut self) {
@@ -1361,6 +1488,12 @@ impl OxydeApp {
         });
         ui.add_space(2.0);
         let mating = self.mate_dialog.is_some();
+        let material_names: Vec<String> = self
+            .materials
+            .materials()
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
         let mut action = None;
         // What the pointer is over in the tree, lit up in the viewport.
         let mut hovered: Vec<AsmSelected> = Vec::new();
@@ -1533,6 +1666,36 @@ impl OxydeApp {
                         if ui.button("Appearance…").clicked() {
                             action = Some(TreeAction::Appearance(id));
                             ui.close_menu();
+                        }
+                        // Material: for every selected component, and this one.
+                        let mut targets: Vec<ComponentId> = doc
+                            .selection
+                            .iter()
+                            .filter_map(AsmSelected::component)
+                            .collect();
+                        if !targets.contains(&id) {
+                            targets.push(id);
+                        }
+                        let count = targets.len();
+                        ui.menu_button("Material", |ui| {
+                            if count > 1 {
+                                ui.label(
+                                    RichText::new(format!("{count} components")).small().weak(),
+                                );
+                            }
+                            if let Some(choice) = material_menu(ui, &material_names) {
+                                action = Some(TreeAction::Material(targets.clone(), choice));
+                            }
+                        });
+                        if let Some(name) = doc.component_material(id) {
+                            if ui
+                                .button("Select parts with this material")
+                                .on_hover_text(name)
+                                .clicked()
+                            {
+                                action = Some(TreeAction::SelectMaterial(name.to_owned()));
+                                ui.close_menu();
+                            }
                         }
                         ui.separator();
                         if ui.button("Delete").clicked() {
@@ -1715,6 +1878,8 @@ impl OxydeApp {
             TreeAction::Fix(id, fixed) => self.toggle_fixed(id, fixed),
             TreeAction::OpenPart(id) => self.pending_open_component = Some(id),
             TreeAction::Appearance(id) => self.begin_component_appearance(id),
+            TreeAction::Material(targets, name) => self.apply_component_material(&targets, name),
+            TreeAction::SelectMaterial(name) => self.select_parts_with_material(&name),
             TreeAction::DeleteComponent(id) => {
                 if let Some(doc) = self.asm.as_mut() {
                     doc.checkpoint();
@@ -1874,6 +2039,50 @@ impl OxydeApp {
                 if ui.button("Appearance…").clicked() {
                     self.begin_component_appearance(id);
                     ui.close_menu();
+                }
+                let targets: Vec<ComponentId> = self
+                    .asm
+                    .as_ref()
+                    .map(|d| {
+                        d.selection
+                            .iter()
+                            .filter_map(AsmSelected::component)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let names: Vec<String> = self
+                    .materials
+                    .materials()
+                    .iter()
+                    .map(|m| m.name.clone())
+                    .collect();
+                let mut choice = None;
+                ui.menu_button("Material", |ui| {
+                    if targets.len() > 1 {
+                        ui.label(
+                            RichText::new(format!("{} components", targets.len()))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    choice = material_menu(ui, &names);
+                });
+                if let Some(choice) = choice {
+                    self.apply_component_material(&targets, choice);
+                }
+                let material = self
+                    .asm
+                    .as_ref()
+                    .and_then(|d| d.component_material(id).map(str::to_owned));
+                if let Some(name) = material {
+                    if ui
+                        .button("Select parts with this material")
+                        .on_hover_text(&name)
+                        .clicked()
+                    {
+                        self.select_parts_with_material(&name);
+                        ui.close_menu();
+                    }
                 }
             }
             None => {

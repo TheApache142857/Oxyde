@@ -220,6 +220,8 @@ pub struct OxydeApp {
     pub(crate) splash: crate::splash::Splash,
     /// Decoded texture images of the open documents.
     pub(crate) texture_cache: crate::appearance_ui::TextureCache,
+    /// The user's material library (`materials.json` next to the preferences).
+    pub(crate) materials: oxyde_model::MaterialLibrary,
 }
 
 impl OxydeApp {
@@ -268,7 +270,13 @@ impl OxydeApp {
             // The file to open, if any, is opened by the splash screen's last step.
             splash: crate::splash::Splash::new(file.clone()),
             texture_cache: Default::default(),
+            materials: oxyde_model::MaterialLibrary::standard(),
         };
+        let (materials, problem) = crate::materials::load();
+        app.materials = materials;
+        if let Some(problem) = problem {
+            app.status = problem;
+        }
         app.apply_preferences(&cc.egui_ctx);
         if let Some(state) = &cc.wgpu_render_state {
             let info = state.adapter.get_info();
@@ -952,10 +960,10 @@ impl OxydeApp {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "import.step".to_owned());
-        let id = self.add_feature(FeatureKind::Import(Import {
-            file_name: file_name.clone(),
-            data: FileData::new(bytes),
-        }));
+        let id = self.add_feature(FeatureKind::Import(Import::new(
+            file_name.clone(),
+            FileData::new(bytes),
+        )));
         self.viewport.request_fit();
         match self.doc.part.status(id) {
             Some(FeatureStatus::Error(message)) => {
@@ -1045,8 +1053,15 @@ impl OxydeApp {
         }
     }
 
+    /// File › Export STEP: the body's solids with their colours (appearances and material)
+    /// as STEP colours, which other CAD systems read back.
     pub(crate) fn export_step(&mut self) {
-        let Some(shapes) = self.doc.part.body().map(|b| b.shapes()) else {
+        let Some((shapes, colors)) = self
+            .doc
+            .part
+            .body()
+            .map(|b| (b.shapes(), self.doc.part.step_colors(b)))
+        else {
             self.status = "Nothing to export".to_owned();
             return;
         };
@@ -1057,7 +1072,7 @@ impl OxydeApp {
         else {
             return;
         };
-        self.status = match self.kernel.export_step(&shapes, &path) {
+        self.status = match self.kernel.export_step(&shapes, &colors, &path) {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };
@@ -1200,6 +1215,14 @@ impl OxydeApp {
             {
                 ui.close_menu();
                 self.begin_appearance();
+            }
+            if ui
+                .add_enabled(has_body, egui::Button::new("Material…"))
+                .on_hover_text("What the part is made of: its look and its density")
+                .clicked()
+            {
+                ui.close_menu();
+                self.begin_material();
             }
             ui.separator();
             if ui.button("Zoom to fit").clicked() {

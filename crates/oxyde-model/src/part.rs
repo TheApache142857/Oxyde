@@ -14,6 +14,8 @@ use oxyde_kernel::{BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHand
 use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
 use crate::appearance::{Appearance, Appearances};
+use crate::material::Material;
+use oxyde_kernel::{StepColor, StepColors};
 use crate::bodies::{Body, Solid, Working};
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
@@ -120,6 +122,16 @@ struct FeatureResult {
     sketch: Option<SketchResult>,
     tool: Option<ToolBody>,
     reference: Option<ReferenceGeometry>,
+    /// Appearances an import feature read from its file, to be put on the part once.
+    import_appearances: Option<ImportAppearances>,
+}
+
+/// The colours a STEP file gave the solids and faces an import feature added, as the
+/// appearances they become.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct ImportAppearances {
+    body: Option<(BodyId, Appearance)>,
+    faces: Vec<(FaceName, Appearance)>,
 }
 
 impl FeatureResult {
@@ -130,6 +142,7 @@ impl FeatureResult {
             sketch: None,
             tool: None,
             reference: None,
+            import_appearances: None,
         }
     }
 
@@ -158,6 +171,9 @@ pub struct PartDefinition {
     pub equations: Equations,
     /// Colours, transparency and textures of the part, its bodies and faces.
     pub appearances: Appearances,
+    /// What the part is made of: its look where no appearance overrides it, and its
+    /// density.
+    pub material: Option<Material>,
 }
 
 /// A part document: its timeline and the cached results of the last rebuild.
@@ -173,6 +189,7 @@ pub struct Part {
     pub(crate) equations: Equations,
     pub(crate) equation_results: EquationResults,
     appearances: Appearances,
+    material: Option<Material>,
     results: Vec<FeatureResult>,
     /// Results from this index on are stale.
     dirty_from: usize,
@@ -193,6 +210,7 @@ impl Part {
             equations: Equations::default(),
             equation_results: EquationResults::default(),
             appearances: Appearances::default(),
+            material: None,
             results: Vec::new(),
             dirty_from: 0,
         }
@@ -264,6 +282,7 @@ impl Part {
             equations: definition.equations,
             equation_results: EquationResults::default(),
             appearances: definition.appearances,
+            material: definition.material.map(Material::clamped),
             results: Vec::new(),
             dirty_from: 0,
         })
@@ -277,10 +296,11 @@ impl Part {
             next_id: self.next_id,
             equations: self.equations.clone(),
             appearances: self.appearances.clone(),
+            material: self.material.clone(),
         }
     }
 
-    // ---- Appearances -------------------------------------------------------------------------
+    // ---- Appearances and material ------------------------------------------------------------
 
     /// Colours, transparency and textures of the part, its bodies and faces.
     pub fn appearances(&self) -> &Appearances {
@@ -292,15 +312,67 @@ impl Part {
         &mut self.appearances
     }
 
-    /// The appearance face `index` of `body` (the part's current body) is drawn with:
-    /// `None` for the viewport's default.
+    /// What the part is made of, if it has been given a material.
+    pub fn material(&self) -> Option<&Material> {
+        self.material.as_ref()
+    }
+
+    /// Gives the part a material (a copy of a library entry), or takes it away with
+    /// `None`. Needs no rebuild.
+    pub fn set_material(&mut self, material: Option<Material>) {
+        self.material = material.map(Material::clamped);
+    }
+
+    /// Whether anything changes how the part is drawn: an appearance or a material.
+    pub fn has_appearances(&self) -> bool {
+        !self.appearances.is_empty() || self.material.is_some()
+    }
+
+    /// The colours to write with the current body's solids to a STEP file, indexed like
+    /// [`Body::shapes`]: each solid's appearance (its body's, else the part's, else the
+    /// material's), and the faces whose appearance differs from it.
+    pub fn step_colors(&self, body: &Body) -> Vec<StepColors> {
+        let to_color = |a: &Appearance| StepColor {
+            rgb: a.color,
+            transparency: a.transparency,
+        };
+        body.solids
+            .iter()
+            .map(|solid| {
+                let solid_color = self
+                    .appearances
+                    .body(solid.id)
+                    .or(self.appearances.part.as_ref())
+                    .or(self.material.as_ref().map(|m| &m.appearance))
+                    .map(to_color);
+                let faces = solid
+                    .faces
+                    .clone()
+                    .map(|index| {
+                        let face = self.face_appearance(body, index).map(to_color);
+                        if face == solid_color { None } else { face }
+                    })
+                    .collect();
+                StepColors {
+                    solids: vec![solid_color],
+                    faces,
+                }
+            })
+            .collect()
+    }
+
+    /// The appearance face `index` of `body` (the part's current body) is drawn with: its
+    /// own, else its body's, else the part's, else the material's; `None` for the
+    /// viewport's default.
     pub fn face_appearance(&self, body: &Body, index: u32) -> Option<&Appearance> {
-        if self.appearances.is_empty() {
+        if !self.has_appearances() {
             return None;
         }
         let name = body.naming.face(index);
         let solid = body.solid_of_face(index).map(|s| s.id);
-        self.appearances.of_face(name, solid)
+        self.appearances
+            .of_face(name, solid)
+            .or(self.material.as_ref().map(|m| &m.appearance))
     }
 
     // ---- Timeline editing --------------------------------------------------------------------
@@ -453,14 +525,36 @@ impl Part {
             stale.release(kernel);
         }
         for index in start..end {
-            let result = if self.features[index].suppressed {
+            let mut result = if self.features[index].suppressed {
                 FeatureResult::with_status(FeatureStatus::Suppressed)
             } else {
                 build_feature(&self.features, &self.results, index, kernel)
             };
+            if let Some(imported) = result.import_appearances.take() {
+                self.apply_import_appearances(index, imported);
+            }
             self.results.push(result);
         }
         self.dirty_from = end;
+    }
+
+    /// Puts the colours an import feature read from its file on the part, once: a body
+    /// appearance for the solid and face appearances where faces differ from it. Faces and
+    /// bodies that already have an appearance keep it.
+    fn apply_import_appearances(&mut self, index: usize, imported: ImportAppearances) {
+        if let FeatureKind::Import(import) = &mut self.features[index].kind {
+            import.apply_colors = false;
+        }
+        if let Some((body, appearance)) = imported.body {
+            if self.appearances.body(body).is_none() {
+                self.appearances.set_body(body, Some(appearance));
+            }
+        }
+        for (face, appearance) in imported.faces {
+            if self.appearances.face(&face).is_none() {
+                self.appearances.set_face(&face, Some(appearance));
+            }
+        }
     }
 
     /// Frees every cached kernel shape. The next rebuild starts from scratch.
@@ -758,7 +852,9 @@ fn build_feature<K: Kernel>(
                 result.produced = Some(build_instances(&ctx, &mirror.seeds, &instances, kernel)?);
             }
             FeatureKind::Import(import) => {
-                result.produced = Some(build_import(&ctx, import, kernel)?);
+                let (body, appearances) = build_import(&ctx, import, kernel)?;
+                result.produced = Some(body);
+                result.import_appearances = appearances;
             }
             FeatureKind::Combine(combine) => {
                 result.produced = Some(build_combine(&ctx, combine, kernel)?);
@@ -1148,16 +1244,18 @@ fn apply_tool<K: Kernel>(
 }
 
 /// Reads the stored STEP file and joins its solids to the newest body (or makes the first
-/// body).
+/// body). With `apply_colors`, the colours the file gives its solids and faces come back
+/// as the appearances they should become.
 fn build_import<K: Kernel>(
     ctx: &Context<'_>,
     import: &Import,
     kernel: &mut K,
-) -> Result<Body, String> {
+) -> Result<(Body, Option<ImportAppearances>), String> {
     let id = ctx.feature().id;
-    let shape = kernel
+    let imported = kernel
         .import_step(import.data.bytes())
         .map_err(|e| format!("{}: {e}", import.file_name))?;
+    let shape = imported.shape;
     let faces = match kernel.topology(shape) {
         Ok(topology) => topology.faces.len() as u32,
         Err(e) => {
@@ -1170,6 +1268,9 @@ fn build_import<K: Kernel>(
         .collect();
     let mut work = Working::from(ctx.body);
     let target = default_target(ctx, None).and_then(|t| work.find(t));
+    let appearances = import
+        .apply_colors
+        .then(|| import_appearances(id, &imported.colors, target.is_none()));
     let outcome = match target {
         None => work.push(BodyId::new(id, 0), shape, names, true, kernel),
         Some(index) => {
@@ -1179,12 +1280,50 @@ fn build_import<K: Kernel>(
         }
     };
     match outcome {
-        Ok(()) => Ok(work.finish(id)),
+        Ok(()) => Ok((work.finish(id), appearances)),
         Err(e) => {
             work.abort(kernel);
             Err(e)
         }
     }
+}
+
+/// The appearances STEP colours become. A single solid that makes a body of its own gets
+/// a body appearance, and its faces an appearance only where they differ from it; otherwise
+/// (several solids, or solids fused into an existing body) every coloured face gets its
+/// own, so nothing else is recoloured.
+fn import_appearances(
+    feature: FeatureId,
+    colors: &StepColors,
+    new_body: bool,
+) -> ImportAppearances {
+    let appearance = |c: &StepColor| Appearance {
+        color: c.rgb,
+        transparency: c.transparency,
+        texture: None,
+    };
+    let mut out = ImportAppearances::default();
+    let whole = match (new_body, colors.solids.as_slice()) {
+        (true, [Some(solid)]) => Some(*solid),
+        _ => None,
+    };
+    if let Some(solid) = whole {
+        out.body = Some((BodyId::new(feature, 0), appearance(&solid)));
+    }
+    for (index, color) in colors.faces.iter().enumerate() {
+        let Some(color) = color else {
+            continue;
+        };
+        if whole.is_some_and(|w| w == *color) {
+            continue;
+        }
+        let name = FaceName::new(FaceKey::Imported {
+            feature,
+            index: index as u32,
+        });
+        out.faces.push((name, appearance(color)));
+    }
+    out
 }
 
 fn build_extrude<K: Kernel>(

@@ -11,6 +11,7 @@
 //! See `docs/FORMAT.md` for the specification.
 
 mod assembly_schema;
+pub mod material_library;
 mod schema;
 pub mod step_import;
 
@@ -123,6 +124,8 @@ pub enum FormatError {
     InvalidModel(ModelError),
     /// The assembly in the file is inconsistent.
     InvalidAssembly(String),
+    /// A material library file is inconsistent.
+    InvalidLibrary(String),
     /// What would be saved does not read back (nothing was written).
     Unreadable(Box<FormatError>),
 }
@@ -143,6 +146,7 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidModel(e) => write!(f, "{e}"),
             FormatError::InvalidAssembly(e) => write!(f, "invalid assembly: {e}"),
+            FormatError::InvalidLibrary(e) => write!(f, "invalid material library: {e}"),
             FormatError::Unreadable(e) => {
                 write!(f, "the file would not open again, so it was not saved: {e}")
             }
@@ -255,7 +259,7 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
-    let textures = TextureTable::new(part.definition.appearances.textures());
+    let textures = TextureTable::new(part_textures(&part.definition));
     // The manifest goes first so readers can identify the file cheaply.
     for (entry, bytes) in [
         (MANIFEST, to_json(MANIFEST, &manifest)?),
@@ -280,6 +284,21 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
 }
 
 /// Texture images are already compressed: stored as they are.
+/// Every texture image a part uses: in its appearances and in its material.
+fn part_textures(definition: &PartDefinition) -> Vec<&oxyde_model::Texture> {
+    let mut out = definition.appearances.textures();
+    if let Some(t) = definition
+        .material
+        .as_ref()
+        .and_then(|m| m.appearance.texture.as_ref())
+    {
+        if !out.iter().any(|o| o.data == t.data) {
+            out.push(t);
+        }
+    }
+    out
+}
+
 fn write_textures<W: Write + Seek>(
     zip: &mut ZipWriter<W>,
     textures: &TextureTable,
@@ -974,6 +993,44 @@ mod tests {
             Err(FormatError::WrongKind { found, .. }) => assert_eq!(found, "assembly"),
             other => panic!("expected the wrong kind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn material_round_trips_in_model_json() {
+        use oxyde_model::{Appearance, FileData, Material, Texture};
+        let mut file = sample();
+        file.definition.material = Some(Material::new(
+            "Oak",
+            "Wood",
+            Appearance {
+                color: [170, 120, 70],
+                transparency: 0.0,
+                texture: Some(Texture {
+                    file_name: "oak.png".into(),
+                    data: FileData::new(b"PNG, not really".to_vec()),
+                    scale: 80.0,
+                }),
+            },
+            750.0,
+        ));
+        let bytes = write_part(Cursor::new(Vec::new()), &file).unwrap().into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let mut model = String::new();
+        archive.by_name(MODEL).unwrap().read_to_string(&mut model).unwrap();
+        assert!(model.contains("\"material\": {"), "{model}");
+        assert!(model.contains("\"density\": 750"), "{model}");
+        assert!(model.contains("\"file\": \"textures/1.png\""), "{model}");
+        drop(archive);
+        let back = read_part(Cursor::new(&bytes)).unwrap();
+        assert_eq!(back.definition.material, file.definition.material);
+
+        // A part without a material writes none.
+        let plain = sample();
+        let bytes = write_part(Cursor::new(Vec::new()), &plain).unwrap().into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let mut model = String::new();
+        archive.by_name(MODEL).unwrap().read_to_string(&mut model).unwrap();
+        assert!(!model.contains("material"));
     }
 
     #[test]

@@ -45,6 +45,13 @@
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
 #include <STEPCAFControl_Reader.hxx>
+#include <STEPCAFControl_Writer.hxx>
+#include <Quantity_Color.hxx>
+#include <Quantity_ColorRGBA.hxx>
+#include <TopLoc_Location.hxx>
+#include <TopTools_DataMapOfShapeShape.hxx>
+#include <XCAFDoc_ColorTool.hxx>
+#include <XCAFDoc_ColorType.hxx>
 #include <TCollection_AsciiString.hxx>
 #include <TCollection_ExtendedString.hxx>
 #include <TDF_Label.hxx>
@@ -94,6 +101,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <stdexcept>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -153,7 +161,9 @@ std::mutex& step_mutex() {
 
 // The solids of `all` as one shape (a compound when there are several), repaired and
 // facing outward. Sewn surfaces count when they close a volume. Null when there is none.
-TopoDS_Shape solid_body(const TopoDS_Shape& all) {
+// `origin`, when given, maps every solid and face the repair replaced to the shape it came
+// from, so that colours can still be looked up on the original.
+TopoDS_Shape solid_body(const TopoDS_Shape& all, TopTools_DataMapOfShapeShape* origin = nullptr) {
     TopTools_IndexedMapOfShape solids;
     TopExp::MapShapes(all, TopAbs_SOLID, solids);
     if (solids.Extent() == 0) {
@@ -183,7 +193,26 @@ TopoDS_Shape solid_body(const TopoDS_Shape& all) {
     for (int i = 1; i <= solids.Extent(); ++i) {
         ShapeFix_Shape fix(solids(i));
         fix.Perform();
-        TopExp::MapShapes(fix.Shape(), TopAbs_SOLID, repaired);
+        const TopoDS_Shape fixed = fix.Shape();
+        if (origin != nullptr) {
+            TopTools_IndexedMapOfShape fixed_solids;
+            TopExp::MapShapes(fixed, TopAbs_SOLID, fixed_solids);
+            for (int j = 1; j <= fixed_solids.Extent(); ++j) {
+                if (!fixed_solids(j).IsSame(solids(i))) {
+                    origin->Bind(fixed_solids(j), solids(i));
+                }
+            }
+            TopTools_IndexedMapOfShape faces;
+            TopExp::MapShapes(solids(i), TopAbs_FACE, faces);
+            for (int j = 1; j <= faces.Extent(); ++j) {
+                const TopoDS_Shape replaced = fix.Context()->Apply(faces(j));
+                if (!replaced.IsNull() && replaced.ShapeType() == TopAbs_FACE &&
+                    !replaced.IsSame(faces(j))) {
+                    origin->Bind(replaced, faces(j));
+                }
+            }
+        }
+        TopExp::MapShapes(fixed, TopAbs_SOLID, repaired);
     }
     std::vector<TopoDS_Shape> body;
     for (int i = 1; i <= repaired.Extent(); ++i) {
@@ -210,16 +239,181 @@ TopoDS_Shape solid_body(const TopoDS_Shape& all) {
     return compound;
 }
 
-// `shape` written as a STEP file, in millimetres.
-rust::Vec<std::uint8_t> step_bytes(const TopoDS_Shape& shape) {
-    STEPControl_Writer writer;
-    if (writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone) {
-        throw std::runtime_error("transfer of a part failed");
+// ---- STEP colours --------------------------------------------------------------------------
+//
+// STEP carries a colour (and since AP242, a transparency) per solid and per face, which
+// OCCT's XDE layer keeps in an XCAF document: a label per shape, sub-shape labels for the
+// faces that have a colour of their own, and the colours as attributes on them. Files are
+// written and read through such a document, so colours travel with the geometry.
+
+// An XCAF document that is closed however the scope ends.
+class XcafDocument {
+public:
+    XcafDocument() : app_(XCAFApp_Application::GetApplication()) {
+        app_->NewDocument("MDTV-XCAF", doc_);
     }
+    ~XcafDocument() {
+        try {
+            if (!doc_.IsNull() && doc_->IsOpened()) {
+                app_->Close(doc_);
+            }
+        } catch (...) {
+        }
+    }
+    XcafDocument(const XcafDocument&) = delete;
+    XcafDocument& operator=(const XcafDocument&) = delete;
+
+    const Handle(TDocStd_Document)& handle() const { return doc_; }
+    Handle(XCAFDoc_ShapeTool) shapes() const {
+        return XCAFDoc_DocumentTool::ShapeTool(doc_->Main());
+    }
+    Handle(XCAFDoc_ColorTool) colors() const {
+        return XCAFDoc_DocumentTool::ColorTool(doc_->Main());
+    }
+
+private:
+    Handle(XCAFApp_Application) app_;
+    Handle(TDocStd_Document) doc_;
+};
+
+// STEP stores sRGB values; OCCT's Quantity_Color holds linear RGB and converts on request.
+StepColorData color_data(const Quantity_ColorRGBA& color) {
+    double r = 0.0;
+    double g = 0.0;
+    double b = 0.0;
+    color.GetRGB().Values(r, g, b, Quantity_TOC_sRGB);
+    const auto channel = [](double v) {
+        return static_cast<std::uint8_t>(std::lround(std::min(std::max(v, 0.0), 1.0) * 255.0));
+    };
+    StepColorData out{};
+    out.present = true;
+    out.r = channel(r);
+    out.g = channel(g);
+    out.b = channel(b);
+    const double alpha = std::min(std::max(static_cast<double>(color.Alpha()), 0.0), 1.0);
+    out.transparency = 1.0 - alpha;
+    return out;
+}
+
+Quantity_ColorRGBA rgba_of(const StepColorData& data) {
+    const Quantity_Color rgb(data.r / 255.0, data.g / 255.0, data.b / 255.0, Quantity_TOC_sRGB);
+    const double transparency = std::min(std::max(data.transparency, 0.0), 1.0);
+    return Quantity_ColorRGBA(rgb, static_cast<float>(1.0 - transparency));
+}
+
+// The colour an XCAF document gives `shape` (a solid or a face): its surface colour, else
+// its general one; looked up as the shape is, then without its location (a face of a
+// placed part is registered unplaced).
+bool xcaf_color(const Handle(XCAFDoc_ColorTool)& tool, const TopoDS_Shape& shape,
+                Quantity_ColorRGBA& out) {
+    if (tool->GetColor(shape, XCAFDoc_ColorSurf, out) ||
+        tool->GetColor(shape, XCAFDoc_ColorGen, out)) {
+        return true;
+    }
+    if (!shape.Location().IsIdentity()) {
+        const TopoDS_Shape bare = shape.Located(TopLoc_Location());
+        return tool->GetColor(bare, XCAFDoc_ColorSurf, out) ||
+               tool->GetColor(bare, XCAFDoc_ColorGen, out);
+    }
+    return false;
+}
+
+// The colours of the solids and faces of `body` as `tool` holds them (`origin` maps
+// repaired sub-shapes to the shapes the file had). Faces without a colour of their own
+// take their solid's, so every face ends up with the colour it is shown in.
+StepShapeColors colors_of(const TopoDS_Shape& body, const Handle(XCAFDoc_ColorTool)& tool,
+                          const TopTools_DataMapOfShapeShape& origin) {
+    const auto lookup = [&](const TopoDS_Shape& sub) {
+        const TopoDS_Shape& original = origin.IsBound(sub) ? origin.Find(sub) : sub;
+        Quantity_ColorRGBA color;
+        StepColorData data{};
+        if (xcaf_color(tool, original, color)) {
+            data = color_data(color);
+        }
+        return data;
+    };
+    StepShapeColors out{};
+    TopTools_IndexedMapOfShape solids;
+    TopExp::MapShapes(body, TopAbs_SOLID, solids);
+    for (int i = 1; i <= solids.Extent(); ++i) {
+        out.solids.push_back(lookup(solids(i)));
+    }
+    TopTools_IndexedMapOfShape faces;
+    TopExp::MapShapes(body, TopAbs_FACE, faces);
+    for (int i = 1; i <= faces.Extent(); ++i) {
+        out.faces.push_back(lookup(faces(i)));
+    }
+    for (int i = 1; i <= solids.Extent(); ++i) {
+        const StepColorData& solid = out.solids[static_cast<std::size_t>(i - 1)];
+        if (!solid.present) {
+            continue;
+        }
+        for (TopExp_Explorer it(solids(i), TopAbs_FACE); it.More(); it.Next()) {
+            const int k = faces.FindIndex(it.Current());
+            if (k >= 1 && !out.faces[static_cast<std::size_t>(k - 1)].present) {
+                out.faces[static_cast<std::size_t>(k - 1)] = solid;
+            }
+        }
+    }
+    return out;
+}
+
+// Gives the colour of a solid or a face of shape number `shape`; false when it has none.
+using ColorOf =
+    std::function<bool(std::size_t shape, const TopoDS_Shape& sub, Quantity_ColorRGBA& out)>;
+
+// Puts `shapes` into a fresh XCAF document (one product each), colours their solids and
+// faces as `color_of` says, and hands the document to `use` (which writes it).
+void with_colored_document(const std::vector<TopoDS_Shape>& shapes, const ColorOf& color_of,
+                           const std::function<void(const Handle(TDocStd_Document)&)>& use) {
+    XcafDocument doc;
+    const Handle(XCAFDoc_ShapeTool) shape_tool = doc.shapes();
+    const Handle(XCAFDoc_ColorTool) color_tool = doc.colors();
+    for (std::size_t i = 0; i < shapes.size(); ++i) {
+        const TopoDS_Shape& shape = shapes[i];
+        const TDF_Label label = shape_tool->AddShape(shape, false);
+        if (label.IsNull()) {
+            throw std::runtime_error("shape " + std::to_string(i) + " could not be registered");
+        }
+        Quantity_ColorRGBA color;
+        for (TopExp_Explorer it(shape, TopAbs_SOLID); it.More(); it.Next()) {
+            if (!color_of(i, it.Current(), color)) {
+                continue;
+            }
+            const TDF_Label target = it.Current().IsSame(shape)
+                                         ? label
+                                         : shape_tool->AddSubShape(label, it.Current());
+            if (!target.IsNull()) {
+                color_tool->SetColor(target, color, XCAFDoc_ColorSurf);
+            }
+        }
+        for (TopExp_Explorer it(shape, TopAbs_FACE); it.More(); it.Next()) {
+            if (!color_of(i, it.Current(), color)) {
+                continue;
+            }
+            const TDF_Label target = shape_tool->AddSubShape(label, it.Current());
+            if (!target.IsNull()) {
+                color_tool->SetColor(target, color, XCAFDoc_ColorSurf);
+            }
+        }
+    }
+    use(doc.handle());
+}
+
+// `shape` written as a STEP file, in millimetres, with the colours `color_of` gives its
+// solids and faces.
+rust::Vec<std::uint8_t> step_bytes(const TopoDS_Shape& shape, const ColorOf& color_of) {
     std::ostringstream stream;
-    if (writer.WriteStream(stream) != IFSelect_RetDone) {
-        throw std::runtime_error("could not write a part");
-    }
+    with_colored_document({shape}, color_of, [&](const Handle(TDocStd_Document)& doc) {
+        STEPCAFControl_Writer writer;
+        writer.SetColorMode(true);
+        if (!writer.Transfer(doc, STEPControl_AsIs)) {
+            throw std::runtime_error("transfer of a part failed");
+        }
+        if (writer.WriteStream(stream) != IFSelect_RetDone) {
+            throw std::runtime_error("could not write a part");
+        }
+    });
     const std::string text = stream.str();
     rust::Vec<std::uint8_t> out;
     out.reserve(text.size());
@@ -262,7 +456,8 @@ StepInstanceData instance_data(std::uint32_t node, const std::string& name, cons
 // Walks an XCAF document, adding each part and assembly to `out` once, children first.
 class StepTreeBuilder {
 public:
-    explicit StepTreeBuilder(StepAssemblyData& out) : out_(out) {}
+    StepTreeBuilder(StepAssemblyData& out, Handle(XCAFDoc_ColorTool) colors)
+        : out_(out), colors_(std::move(colors)) {}
 
     // Index of the node for a shape definition label.
     std::uint32_t node(const TDF_Label& label) {
@@ -316,9 +511,17 @@ private:
         node.name = rust::String(name);
         node.is_assembly = false;
         if (!shape.IsNull()) {
-            const TopoDS_Shape body = solid_body(shape);
+            TopTools_DataMapOfShapeShape origin;
+            const TopoDS_Shape body = solid_body(shape, &origin);
             if (!body.IsNull()) {
-                node.step = step_bytes(body);
+                // The part's own colours go with it: looked up on the shapes the file
+                // had, for the faces the repair replaced.
+                const ColorOf color_of = [&](std::size_t, const TopoDS_Shape& sub,
+                                             Quantity_ColorRGBA& out) {
+                    const TopoDS_Shape& original = origin.IsBound(sub) ? origin.Find(sub) : sub;
+                    return xcaf_color(colors_, original, out);
+                };
+                node.step = step_bytes(body, color_of);
             }
         }
         out_.nodes.push_back(std::move(node));
@@ -326,6 +529,7 @@ private:
     }
 
     StepAssemblyData& out_;
+    Handle(XCAFDoc_ColorTool) colors_;
     std::map<std::string, std::uint32_t> done_;
 };
 
@@ -1353,45 +1557,105 @@ TopologyCounts Session::topology_counts(std::uint64_t shape) const {
     });
 }
 
-void Session::export_step(rust::Slice<const std::uint64_t> shapes, rust::Str path) const {
+void Session::export_step(rust::Slice<const std::uint64_t> shapes,
+                          rust::Slice<const StepShapeColors> colors, rust::Str path) const {
     guarded("export_step", [&] {
         const std::lock_guard<std::mutex> lock(step_mutex());
         if (shapes.empty()) {
             throw std::invalid_argument("no shapes to export");
         }
-        STEPControl_Writer writer;
-        for (const std::uint64_t id : shapes) {
-            if (writer.Transfer(get(id), STEPControl_AsIs) != IFSelect_RetDone) {
-                throw std::runtime_error("transfer of shape " + std::to_string(id) + " failed");
-            }
+        if (!colors.empty() && colors.size() != shapes.size()) {
+            throw std::invalid_argument("colours do not match the shapes");
         }
+        std::vector<TopoDS_Shape> list;
+        std::vector<TopTools_IndexedMapOfShape> solid_maps(shapes.size());
+        std::vector<TopTools_IndexedMapOfShape> face_maps(shapes.size());
+        for (std::size_t i = 0; i < shapes.size(); ++i) {
+            list.push_back(get(shapes[i]));
+            TopExp::MapShapes(list.back(), TopAbs_SOLID, solid_maps[i]);
+            TopExp::MapShapes(list.back(), TopAbs_FACE, face_maps[i]);
+        }
+        // Colours are given by index in each shape's own solids and faces, as `topology`
+        // numbers them.
+        const ColorOf color_of = [&](std::size_t i, const TopoDS_Shape& sub,
+                                     Quantity_ColorRGBA& out) {
+            if (colors.empty()) {
+                return false;
+            }
+            const StepShapeColors& shape_colors = colors[i];
+            const StepColorData* data = nullptr;
+            if (sub.ShapeType() == TopAbs_SOLID) {
+                const int k = solid_maps[i].FindIndex(sub);
+                if (k >= 1 && static_cast<std::size_t>(k) <= shape_colors.solids.size()) {
+                    data = &shape_colors.solids[static_cast<std::size_t>(k - 1)];
+                }
+            } else if (sub.ShapeType() == TopAbs_FACE) {
+                const int k = face_maps[i].FindIndex(sub);
+                if (k >= 1 && static_cast<std::size_t>(k) <= shape_colors.faces.size()) {
+                    data = &shape_colors.faces[static_cast<std::size_t>(k - 1)];
+                }
+            }
+            if (data == nullptr || !data->present) {
+                return false;
+            }
+            out = rgba_of(*data);
+            return true;
+        };
         // OCCT interprets file names as UTF-8 on Windows.
         const std::string file(path);
-        if (writer.Write(file.c_str()) != IFSelect_RetDone) {
-            throw std::runtime_error("could not write " + file);
-        }
+        with_colored_document(list, color_of, [&](const Handle(TDocStd_Document)& doc) {
+            STEPCAFControl_Writer writer;
+            writer.SetColorMode(true);
+            if (!writer.Transfer(doc, STEPControl_AsIs)) {
+                throw std::runtime_error("transfer of the shapes failed");
+            }
+            if (writer.Write(file.c_str()) != IFSelect_RetDone) {
+                throw std::runtime_error("could not write " + file);
+            }
+        });
     });
 }
 
-std::uint64_t Session::import_step(rust::Slice<const std::uint8_t> data) {
+StepImportData Session::import_step(rust::Slice<const std::uint8_t> data) {
     return guarded("import_step", [&] {
         const std::lock_guard<std::mutex> lock(step_mutex());
         std::istringstream stream(
             std::string(reinterpret_cast<const char*>(data.data()), data.size()));
-        STEPControl_Reader reader;
-        if (reader.ReadStream("import.step", stream) != IFSelect_RetDone) {
+        XcafDocument doc;
+        STEPCAFControl_Reader reader;
+        reader.SetColorMode(true);
+        reader.SetNameMode(false);
+        if (reader.ChangeReader().ReadStream("import.step", stream) != IFSelect_RetDone) {
             throw std::runtime_error("not a readable STEP file");
         }
-        reader.TransferRoots();
-        const TopoDS_Shape all = reader.OneShape();
-        if (all.IsNull()) {
+        if (!reader.Transfer(doc.handle())) {
+            throw std::runtime_error("could not transfer the STEP file");
+        }
+        TDF_LabelSequence roots;
+        doc.shapes()->GetFreeShapes(roots);
+        TopoDS_Compound all;
+        BRep_Builder builder;
+        builder.MakeCompound(all);
+        bool any = false;
+        for (int i = 1; i <= roots.Length(); ++i) {
+            const TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(roots.Value(i));
+            if (!shape.IsNull()) {
+                builder.Add(all, shape);
+                any = true;
+            }
+        }
+        if (!any) {
             throw std::runtime_error("the STEP file holds no geometry");
         }
-        const TopoDS_Shape result = solid_body(all);
+        TopTools_DataMapOfShapeShape origin;
+        const TopoDS_Shape result = solid_body(all, &origin);
         if (result.IsNull()) {
             throw std::runtime_error("the STEP file has no solid body (open surfaces only)");
         }
-        return insert(result);
+        StepImportData out{};
+        out.colors = colors_of(result, doc.colors(), origin);
+        out.shape = insert(result);
+        return out;
     });
 }
 
@@ -1400,39 +1664,24 @@ StepAssemblyData Session::read_step_assembly(rust::Slice<const std::uint8_t> dat
         const std::lock_guard<std::mutex> lock(step_mutex());
         std::istringstream stream(
             std::string(reinterpret_cast<const char*>(data.data()), data.size()));
-        const Handle(XCAFApp_Application) app = XCAFApp_Application::GetApplication();
-        Handle(TDocStd_Document) doc;
-        app->NewDocument("MDTV-XCAF", doc);
-        // Closes the document however this function ends.
-        struct Closer {
-            const Handle(XCAFApp_Application)& app;
-            Handle(TDocStd_Document)& doc;
-            ~Closer() {
-                try {
-                    if (!doc.IsNull() && doc->IsOpened()) {
-                        app->Close(doc);
-                    }
-                } catch (...) {
-                }
-            }
-        } closer{app, doc};
-
+        XcafDocument doc;
         STEPCAFControl_Reader reader;
         reader.SetNameMode(true);
+        reader.SetColorMode(true);
         if (reader.ChangeReader().ReadStream("import.step", stream) != IFSelect_RetDone) {
             throw std::runtime_error("not a readable STEP file");
         }
-        if (!reader.Transfer(doc)) {
+        if (!reader.Transfer(doc.handle())) {
             throw std::runtime_error("could not transfer the STEP file");
         }
         TDF_LabelSequence roots;
-        XCAFDoc_DocumentTool::ShapeTool(doc->Main())->GetFreeShapes(roots);
+        doc.shapes()->GetFreeShapes(roots);
         if (roots.Length() == 0) {
             throw std::runtime_error("the STEP file holds no geometry");
         }
 
         StepAssemblyData out{};
-        StepTreeBuilder builder(out);
+        StepTreeBuilder builder(out, doc.colors());
         if (roots.Length() == 1) {
             out.root = builder.node(roots.Value(1));
         } else {

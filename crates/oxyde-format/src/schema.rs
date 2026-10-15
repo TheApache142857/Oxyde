@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText,
+    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText, Material,
     Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
     FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Mirror,
     PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
@@ -77,6 +77,48 @@ pub(crate) struct PartModel {
     /// Colours, transparency and textures; absent = the viewport's default everywhere.
     #[serde(default, skip_serializing_if = "AppearancesDto::is_empty")]
     pub appearances: AppearancesDto,
+    /// What the part is made of, copied from a material library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<MaterialDto>,
+}
+
+// ---- Materials -----------------------------------------------------------------------------
+
+/// A material: a named appearance with physical data. The same shape in a part's
+/// `model.json` and in a material library file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MaterialDto {
+    pub name: String,
+    #[serde(default)]
+    pub category: String,
+    /// kg/m³.
+    pub density: f64,
+    pub appearance: AppearanceDto,
+}
+
+pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto {
+    MaterialDto {
+        name: m.name.clone(),
+        category: m.category.clone(),
+        density: m.density,
+        appearance: appearance_dto(&m.appearance, textures),
+    }
+}
+
+pub(crate) fn material_from(
+    dto: MaterialDto,
+    files: &HashMap<String, Vec<u8>>,
+) -> Result<Material, String> {
+    if !Material::is_valid_name(&dto.name) {
+        return Err(format!("invalid material name \"{}\"", dto.name));
+    }
+    Ok(Material {
+        name: dto.name,
+        category: dto.category,
+        density: dto.density,
+        appearance: appearance_from(dto.appearance, files)?,
+    }
+    .clamped())
 }
 
 // ---- Appearances ---------------------------------------------------------------------------
@@ -149,6 +191,11 @@ pub struct TextureTable {
 
 impl TextureTable {
     pub fn new<'a>(textures: impl IntoIterator<Item = &'a Texture>) -> Self {
+        Self::in_folder("textures", textures)
+    }
+
+    /// Entries named `<folder>/<n>.<ext>`.
+    pub fn in_folder<'a>(folder: &str, textures: impl IntoIterator<Item = &'a Texture>) -> Self {
         let mut table = Self::default();
         for t in textures {
             if table.entries.iter().any(|(d, _)| *d == t.data) {
@@ -160,7 +207,7 @@ impl TextureTable {
                 .map(|e| e.to_ascii_lowercase())
                 .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg"))
                 .unwrap_or_else(|| "bin".to_owned());
-            let name = format!("textures/{}.{}", table.entries.len() + 1, extension);
+            let name = format!("{folder}/{}.{}", table.entries.len() + 1, extension);
             table.entries.push((t.data.clone(), name));
         }
         table
@@ -390,6 +437,10 @@ pub(crate) enum KindDto {
     Import {
         file_name: String,
         file: String,
+        /// The file's colours are still to become appearances (a part written before its
+        /// first rebuild, by the assembly import).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        apply_colors: bool,
     },
     /// Boolean between bodies of the part.
     Combine {
@@ -623,6 +674,10 @@ impl PartModel {
         let text = definition.equations_text();
         Self {
             appearances: appearances_dto(&definition.appearances, textures),
+            material: definition
+                .material
+                .as_ref()
+                .map(|m| material_dto(m, textures)),
             next_feature_id: definition.next_id,
             rollback: definition.rollback,
             features: definition.features.iter().map(feature_dto).collect(),
@@ -747,6 +802,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Import(import) => KindDto::Import {
             file_name: import.file_name.clone(),
             file: import_entry(feature.id()),
+            apply_colors: import.apply_colors,
         },
         FeatureKind::Combine(combine) => KindDto::Combine {
             target: body_dto(&combine.target),
@@ -984,6 +1040,11 @@ impl PartModel {
             equations: Equations::default(),
             appearances: appearances_from(self.appearances, files)
                 .map_err(|e| format!("appearances: {e}"))?,
+            material: self
+                .material
+                .map(|m| material_from(m, files))
+                .transpose()
+                .map_err(|e| format!("material: {e}"))?,
         };
         definition
             .set_equations_text(EquationsText {
@@ -1197,13 +1258,18 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             seeds: ids_from(seeds),
             plane: plane_from(plane),
         }),
-        KindDto::Import { file_name, file } => {
+        KindDto::Import {
+            file_name,
+            file,
+            apply_colors,
+        } => {
             let bytes = files
                 .get(&file)
                 .ok_or_else(|| format!("{}: the imported file {file} is missing", dto.name))?;
             FeatureKind::Import(Import {
                 file_name,
                 data: FileData::new(bytes.clone()),
+                apply_colors,
             })
         }
         KindDto::Combine {

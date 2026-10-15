@@ -164,10 +164,10 @@ pub fn plan_step_import(tree: &StepAssembly, source: &str) -> Result<ImportPlan,
         let (file_name, document) = match &n.content {
             StepNodeContent::Part { step } => {
                 let mut part = Part::new();
-                part.add_feature(FeatureKind::Import(Import {
-                    file_name: source.to_owned(),
-                    data: FileData::new(step.clone()),
-                }));
+                part.add_feature(FeatureKind::Import(Import::new(
+                    source,
+                    FileData::new(step.clone()),
+                )));
                 let mut file = PartFile::new();
                 file.definition = part.definition();
                 file.properties.part_number = n.name.trim().to_owned();

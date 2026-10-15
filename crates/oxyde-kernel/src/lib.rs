@@ -162,6 +162,38 @@ pub struct Mesh {
     pub edges: Vec<Vec<[f32; 3]>>,
 }
 
+/// A colour as STEP carries it: sRGB and how see-through it is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepColor {
+    /// sRGB, 0–255 per channel.
+    pub rgb: [u8; 3],
+    /// 0 = opaque, 1 = invisible.
+    pub transparency: f64,
+}
+
+/// The colours of one shape as a STEP file carries them: one per solid (in the order of
+/// the shape's solids) and one per face (indexed like the shape's [`Topology`]). `None`
+/// where the file gives none. A face without a colour of its own takes its solid's when
+/// read, so `faces` is the colour each face is drawn with.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StepColors {
+    pub solids: Vec<Option<StepColor>>,
+    pub faces: Vec<Option<StepColor>>,
+}
+
+impl StepColors {
+    pub fn is_empty(&self) -> bool {
+        self.solids.iter().all(Option::is_none) && self.faces.iter().all(Option::is_none)
+    }
+}
+
+/// What [`Kernel::import_step`] reads: the solids as one shape, and their colours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepImport {
+    pub shape: ShapeHandle,
+    pub colors: StepColors,
+}
+
 /// The product structure of a STEP file: its parts and (sub-)assemblies, each listed once
 /// however many times it is used. Read by [`Kernel::read_step_assembly`].
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -181,8 +213,8 @@ pub struct StepNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepNodeContent {
-    /// A part: its solids alone, in its own coordinates, written as a STEP file that
-    /// [`Kernel::import_step`] reads back.
+    /// A part: its solids alone, in its own coordinates, with their colours, written as
+    /// a STEP file that [`Kernel::import_step`] reads back.
     Part { step: Vec<u8> },
     /// An assembly: instances of other nodes.
     Assembly { instances: Vec<StepInstance> },
@@ -317,13 +349,20 @@ pub trait Kernel {
 
     fn topology_counts(&self, shape: ShapeHandle) -> Result<TopologyCounts, Self::Error>;
 
-    /// Writes `shapes` to a STEP file at `path`, in millimetres.
-    fn export_step(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), Self::Error>;
+    /// Writes `shapes` to a STEP file at `path`, in millimetres, with their colours
+    /// (`colors` is indexed like `shapes`; empty for none) as STEP colours per solid and
+    /// per face, which other CAD systems read back.
+    fn export_step(
+        &self,
+        shapes: &[ShapeHandle],
+        colors: &[StepColors],
+        path: &Path,
+    ) -> Result<(), Self::Error>;
 
-    /// Reads the solids of a STEP file (its contents, not its path), in millimetres. Several
-    /// solids come back as one compound shape; sewn surfaces are kept if they close a
-    /// volume.
-    fn import_step(&mut self, data: &[u8]) -> Result<ShapeHandle, Self::Error>;
+    /// Reads the solids of a STEP file (its contents, not its path), in millimetres, with
+    /// the colours the file gives them. Several solids come back as one compound shape;
+    /// sewn surfaces are kept if they close a volume.
+    fn import_step(&mut self, data: &[u8]) -> Result<StepImport, Self::Error>;
 
     /// Reads the product structure of a STEP file (its contents): every distinct part, with
     /// its solids as a STEP file of its own, and every assembly with the placed instances

@@ -11,7 +11,8 @@ use std::path::Path;
 use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
-    OpResult, ShapeHandle, StepAssembly, StepInstance, StepNode, StepNodeContent, SurfaceKind,
+    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
+    StepNode, StepNodeContent, SurfaceKind,
     Topology, TopologyCounts, VertexInfo,
 };
 
@@ -207,18 +208,34 @@ impl Kernel for OcctKernel {
         })
     }
 
-    fn export_step(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), OcctError> {
+    fn export_step(
+        &self,
+        shapes: &[ShapeHandle],
+        colors: &[StepColors],
+        path: &Path,
+    ) -> Result<(), OcctError> {
         let path = path
             .to_str()
             .ok_or_else(|| OcctError(format!("path is not valid UTF-8: {}", path.display())))?;
+        if !colors.is_empty() && colors.len() != shapes.len() {
+            return Err(OcctError(format!(
+                "{} colour sets for {} shapes",
+                colors.len(),
+                shapes.len()
+            )));
+        }
         let ids: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
-        self.session.export_step(&ids, path)?;
+        let colors: Vec<ffi::StepShapeColors> = colors.iter().map(shape_colors_data).collect();
+        self.session.export_step(&ids, &colors, path)?;
         Ok(())
     }
 
-    fn import_step(&mut self, data: &[u8]) -> Result<ShapeHandle, OcctError> {
-        let id = self.session.pin_mut().import_step(data)?;
-        Ok(ShapeHandle::from_raw(id))
+    fn import_step(&mut self, data: &[u8]) -> Result<StepImport, OcctError> {
+        let imported = self.session.pin_mut().import_step(data)?;
+        Ok(StepImport {
+            shape: ShapeHandle::from_raw(imported.shape),
+            colors: shape_colors(imported.colors),
+        })
     }
 
     fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, OcctError> {
@@ -228,6 +245,48 @@ impl Kernel for OcctKernel {
 
     fn release(&mut self, shape: ShapeHandle) {
         self.session.pin_mut().release(shape.raw());
+    }
+}
+
+// ---- STEP colours --------------------------------------------------------------------------
+
+fn color_data(color: Option<StepColor>) -> ffi::StepColorData {
+    match color {
+        Some(c) => ffi::StepColorData {
+            present: true,
+            r: c.rgb[0],
+            g: c.rgb[1],
+            b: c.rgb[2],
+            transparency: c.transparency,
+        },
+        None => ffi::StepColorData {
+            present: false,
+            r: 0,
+            g: 0,
+            b: 0,
+            transparency: 0.0,
+        },
+    }
+}
+
+fn color_from(data: &ffi::StepColorData) -> Option<StepColor> {
+    data.present.then(|| StepColor {
+        rgb: [data.r, data.g, data.b],
+        transparency: data.transparency.clamp(0.0, 1.0),
+    })
+}
+
+fn shape_colors_data(colors: &StepColors) -> ffi::StepShapeColors {
+    ffi::StepShapeColors {
+        solids: colors.solids.iter().map(|c| color_data(*c)).collect(),
+        faces: colors.faces.iter().map(|c| color_data(*c)).collect(),
+    }
+}
+
+fn shape_colors(data: ffi::StepShapeColors) -> StepColors {
+    StepColors {
+        solids: data.solids.iter().map(color_from).collect(),
+        faces: data.faces.iter().map(color_from).collect(),
     }
 }
 

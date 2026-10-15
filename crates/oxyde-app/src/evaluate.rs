@@ -37,6 +37,17 @@ fn row(ui: &mut egui::Ui, label: &str, value: String) {
     ui.end_row();
 }
 
+/// A mass in the unit that reads best.
+fn mass_text(kg: f64) -> String {
+    if kg >= 1.0 {
+        format!("{kg:.3} kg")
+    } else if kg >= 0.001 {
+        format!("{:.2} g", kg * 1000.0)
+    } else {
+        format!("{:.3} mg", kg * 1e6)
+    }
+}
+
 impl OxydeApp {
     pub(crate) fn evaluate_windows(&mut self, ctx: &egui::Context) {
         if self.show_mass_properties {
@@ -108,13 +119,27 @@ impl OxydeApp {
                 row(ui, "Faces", topology.faces.len().to_string());
                 row(ui, "Edges", topology.edges.len().to_string());
                 row(ui, "Vertices", topology.vertices.len().to_string());
+                if let Some(material) = self.doc.part.material() {
+                    row(ui, "Material", material.name.clone());
+                    row(ui, "Density", format!("{:.0} kg/m³", material.density));
+                    row(
+                        ui,
+                        "Mass",
+                        volume.map_or_else(|| "?".to_owned(), |v| mass_text(material.mass_kg(v))),
+                    );
+                }
             });
-        if !self.doc.properties.material.is_empty() {
-            ui.label(
-                egui::RichText::new(format!("Material: {}", self.doc.properties.material))
-                    .small()
-                    .weak(),
-            );
+        if self.doc.part.material().is_none() {
+            let note = if self.doc.properties.material.is_empty() {
+                "No material: give the part one (right-click › Material…) to get its mass."
+                    .to_owned()
+            } else {
+                format!(
+                    "Material property \"{}\" has no density; pick a library material for the mass.",
+                    self.doc.properties.material
+                )
+            };
+            ui.label(egui::RichText::new(note).small().weak());
         }
         ui.label(
             egui::RichText::new("The size is the bounding box along the model axes.")
@@ -152,7 +177,10 @@ impl OxydeApp {
         let leaves = doc.leaves(&doc.assembly);
         let parts = leaves.len();
         let mut volume = Some(0.0);
-        for (o, _, _) in &leaves {
+        // Mass of the parts that have a material; the others are counted.
+        let mut mass = 0.0;
+        let mut without_material = 0;
+        for (o, _, part) in &leaves {
             let v = doc
                 .path_at(o)
                 .and_then(|p| doc.volumes.get(&p).copied().flatten());
@@ -160,6 +188,10 @@ impl OxydeApp {
                 (Some(total), Some(v)) => Some(total + v),
                 _ => None,
             };
+            match (part.part.material(), v) {
+                (Some(m), Some(v)) => mass += m.mass_kg(v),
+                _ => without_material += 1,
+            }
         }
         let bounds = doc.bounds(&doc.assembly);
         let hidden = doc.assembly.components.iter().filter(|c| c.hidden).count();
@@ -184,13 +216,25 @@ impl OxydeApp {
                         ),
                     );
                 }
+                if parts > without_material {
+                    row(ui, "Mass", mass_text(mass));
+                }
                 row(ui, "Components", doc.assembly.components.len().to_string());
                 row(ui, "Parts (every level)", parts.to_string());
                 row(ui, "Mates", doc.assembly.mates.len().to_string());
             });
-        let mut notes = vec!["Volumes add up every part shown, through every sub-assembly."];
+        let mut notes = vec![
+            "Volumes add up every part shown, through every sub-assembly.".to_owned(),
+        ];
         if hidden > 0 {
-            notes.push("Hidden components are left out.");
+            notes.push("Hidden components are left out.".to_owned());
+        }
+        if without_material > 0 && parts > without_material {
+            notes.push(format!(
+                "{without_material} part(s) without a material are left out of the mass."
+            ));
+        } else if parts > 0 && without_material == parts {
+            notes.push("Give the parts materials (right-click › Material) to get the mass.".to_owned());
         }
         ui.label(egui::RichText::new(notes.join(" ")).small().weak());
     }

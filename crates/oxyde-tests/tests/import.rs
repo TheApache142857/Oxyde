@@ -17,7 +17,7 @@ fn box_step(kernel: &mut OcctKernel) -> Vec<u8> {
         .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
         .unwrap();
     let path = std::env::temp_dir().join(format!("oxyde-import-{}.step", std::process::id()));
-    kernel.export_step(&[shape], &path).unwrap();
+    kernel.export_step(&[shape], &[], &path).unwrap();
     kernel.release(shape);
     let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -25,10 +25,7 @@ fn box_step(kernel: &mut OcctKernel) -> Vec<u8> {
 }
 
 fn import(bytes: Vec<u8>) -> FeatureKind {
-    FeatureKind::Import(Import {
-        file_name: "box.step".to_owned(),
-        data: FileData::new(bytes),
-    })
+    FeatureKind::Import(Import::new("box.step", FileData::new(bytes)))
 }
 
 fn assert_all_ok(part: &Part) {

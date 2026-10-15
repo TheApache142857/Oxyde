@@ -3,16 +3,18 @@
 //! appearances into the viewport's materials.
 //!
 //! The panel edits one target at a time: the selected faces, a body, the whole part, or in
-//! an assembly a component (which then overrides the part's own appearances). Every change
-//! shows at once in the viewport; OK keeps it as one undo step, Cancel puts things back.
+//! an assembly a component (which then overrides the part's own appearances). Its Material
+//! page gives the part a material from the library (a look plus a density, see
+//! `oxyde_model::Material`) and edits the library. Every change shows at once in the
+//! viewport; OK keeps it as one undo step, Cancel puts things back.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, RichText};
 use oxyde_assembly::{Assembly, ComponentId};
-use oxyde_model::{Appearance, BodyId, FaceName, FileData, PartDefinition, Texture};
-use oxyde_render::{Material, TextureRef};
+use oxyde_model::{Appearance, BodyId, FaceName, FileData, Material, PartDefinition, Texture};
+use oxyde_render::{Material as RenderMaterial, TextureRef};
 
 use crate::app::{OxydeApp, Selected};
 use crate::dialogs::Dialog;
@@ -82,8 +84,8 @@ pub fn material(
     appearance: &Appearance,
     cache: &mut TextureCache,
     textures: &mut Vec<TextureRef>,
-) -> Material {
-    let mut m = Material {
+) -> RenderMaterial {
+    let mut m = RenderMaterial {
         color: Some(appearance.color),
         opacity: (1.0 - appearance.transparency as f32).clamp(0.0, 1.0),
         texture: None,
@@ -116,11 +118,24 @@ pub enum Scope {
     Component(ComponentId),
 }
 
+/// Which page of the panel is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Appearance,
+    Material,
+}
+
 pub struct AppearanceDialog {
+    pub page: Page,
     pub scope: Scope,
     /// The faces for [`Scope::Faces`], picked in the viewport.
     pub faces: Vec<FaceName>,
     pub appearance: Appearance,
+    /// Whether the appearance was changed in the panel: only then is it written to the
+    /// target, so that choosing a material alone does not also paint the part.
+    pub touched: bool,
+    /// The part's material as edited on the Material page (`None`: no material).
+    pub material: Option<Material>,
     /// The body the Body choice stands for: the one selected, or the one under the
     /// first selected face.
     pub body: Option<BodyId>,
@@ -161,7 +176,7 @@ const COLORS: [Preset; 12] = [
     preset("Black", [30, 30, 30], 0.0),
 ];
 
-const MATERIALS: [Preset; 12] = [
+const LOOKS: [Preset; 12] = [
     preset("Steel", [150, 152, 158], 0.0),
     preset("Aluminium", [200, 203, 208], 0.0),
     preset("Brass", [205, 170, 80], 0.0),
@@ -177,18 +192,112 @@ const MATERIALS: [Preset; 12] = [
 ];
 
 fn swatch(ui: &mut egui::Ui, p: &Preset) -> bool {
-    let [r, g, b] = p.color;
-    let fill = Color32::from_rgb(r, g, b);
-    let button = egui::Button::new("")
-        .fill(fill)
-        .min_size(egui::vec2(20.0, 20.0))
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color));
     let hover = if p.transparency > 0.0 {
         format!("{} ({:.0}% transparent)", p.name, p.transparency * 100.0)
     } else {
         p.name.to_owned()
     };
-    ui.add(button).on_hover_text(hover).clicked()
+    color_swatch(ui, p.color, 20.0).on_hover_text(hover).clicked()
+}
+
+/// A small square of colour.
+fn color_swatch(ui: &mut egui::Ui, color: [u8; 3], size: f32) -> egui::Response {
+    let [r, g, b] = color;
+    let button = egui::Button::new("")
+        .fill(Color32::from_rgb(r, g, b))
+        .min_size(egui::vec2(size, size))
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color));
+    ui.add(button)
+}
+
+/// The colour, preset, transparency and texture controls, shared by both pages.
+fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status: &mut String) {
+    section(ui, "Colour");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+        for p in &COLORS {
+            if swatch(ui, p) {
+                a.color = p.color;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.color_edit_button_srgb(&mut a.color);
+        ui.label(RichText::new("Custom").small());
+    });
+
+    section(ui, "Presets");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+        for p in &LOOKS {
+            if swatch(ui, p) {
+                a.color = p.color;
+                a.transparency = p.transparency;
+            }
+        }
+    });
+
+    section(ui, "Transparency");
+    let mut percent = (a.transparency * 100.0).round();
+    ui.add(egui::Slider::new(&mut percent, 0.0..=95.0).suffix("%"));
+    a.transparency = (percent / 100.0).clamp(0.0, 1.0);
+
+    section(ui, "Texture");
+    ui.horizontal(|ui| {
+        if ui
+            .button("Image…")
+            .on_hover_text("A PNG or JPEG repeated over the surface")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg"])
+                .pick_file()
+            {
+                match std::fs::read(&path) {
+                    Ok(bytes) if is_image(&bytes) => {
+                        let scale = a.texture.as_ref().map_or(Texture::DEFAULT_SCALE, |t| t.scale);
+                        a.texture = Some(Texture {
+                            file_name: path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            data: FileData::new(bytes),
+                            scale,
+                        });
+                    }
+                    Ok(_) => *status = "That file is not a PNG or JPEG image".to_owned(),
+                    Err(e) => *status = format!("Could not read the image: {e}"),
+                }
+            }
+        }
+        match &a.texture {
+            Some(t) => {
+                ui.label(&t.file_name);
+                if ui.small_button("✕").on_hover_text("Remove the texture").clicked() {
+                    a.texture = None;
+                }
+            }
+            None => {
+                ui.label(RichText::new("None").weak());
+            }
+        }
+    });
+    if let Some(t) = a.texture.as_mut() {
+        ui.horizontal(|ui| {
+            ui.label("Size");
+            ui.add(
+                egui::Slider::new(&mut t.scale, 1.0..=1000.0)
+                    .logarithmic(true)
+                    .suffix(" mm"),
+            )
+            .on_hover_text("Millimetres covered by one repeat of the image");
+        });
+        ui.label(
+            RichText::new("Mapped along the model's axes, so it needs no unwrapping.")
+                .small()
+                .weak(),
+        );
+    }
 }
 
 impl OxydeApp {
@@ -216,20 +325,29 @@ impl OxydeApp {
         } else {
             Scope::Part
         };
-        self.open_appearance(scope, faces);
+        self.open_appearance(scope, faces, Page::Appearance);
+    }
+
+    /// The Material page of the panel: what the part is made of.
+    pub(crate) fn begin_material(&mut self) {
+        if self.doc.part.body().is_none() {
+            self.status = "There is nothing to give a material to yet".to_owned();
+            return;
+        }
+        self.open_appearance(Scope::Part, Vec::new(), Page::Material);
     }
 
     /// Appearance from the Solid Bodies folder.
     pub(crate) fn begin_body_appearance(&mut self, id: BodyId) {
-        self.open_appearance(Scope::Body(id), Vec::new());
+        self.open_appearance(Scope::Body(id), Vec::new(), Page::Appearance);
     }
 
     /// Appearance of a component, from the assembly tree or the viewport.
     pub(crate) fn begin_component_appearance(&mut self, id: ComponentId) {
-        self.open_appearance(Scope::Component(id), Vec::new());
+        self.open_appearance(Scope::Component(id), Vec::new(), Page::Appearance);
     }
 
-    fn open_appearance(&mut self, scope: Scope, faces: Vec<FaceName>) {
+    fn open_appearance(&mut self, scope: Scope, faces: Vec<FaceName>, page: Page) {
         let body = match scope {
             Scope::Body(id) => Some(id),
             _ => self
@@ -245,10 +363,17 @@ impl OxydeApp {
             Scope::Component(_) => (None, self.asm.as_ref().map(|d| d.assembly.clone())),
             _ => (Some(self.doc.part.definition()), None),
         };
+        let material = match scope {
+            Scope::Component(_) => None,
+            _ => self.doc.part.material().cloned(),
+        };
         self.dialog = Some(Dialog::Appearance(AppearanceDialog {
+            page,
             scope,
             faces,
             appearance,
+            touched: false,
+            material,
             body,
             before,
             before_asm,
@@ -267,12 +392,21 @@ impl OxydeApp {
         let fallback = Appearance::colored(self.viewport.settings.style.face);
         let a = self.doc.part.appearances();
         let found = match scope {
-            Scope::Faces => faces.first().and_then(|f| {
-                let body = self.body_of_faces(faces);
-                a.of_face(Some(f), body)
-            }),
-            Scope::Body(id) => a.body(id).or(a.part.as_ref()),
-            Scope::Part => a.part.as_ref(),
+            Scope::Faces => faces
+                .first()
+                .and_then(|f| {
+                    let body = self.body_of_faces(faces);
+                    a.of_face(Some(f), body)
+                })
+                .or(self.doc.part.material().map(|m| &m.appearance)),
+            Scope::Body(id) => a
+                .body(id)
+                .or(a.part.as_ref())
+                .or(self.doc.part.material().map(|m| &m.appearance)),
+            Scope::Part => a
+                .part
+                .as_ref()
+                .or(self.doc.part.material().map(|m| &m.appearance)),
             Scope::Component(id) => self
                 .asm
                 .as_ref()
@@ -290,12 +424,33 @@ impl OxydeApp {
             Scope::Faces => !d.faces.is_empty(),
             _ => true,
         };
-        ("Appearance", ready)
+        let title = match d.page {
+            Page::Appearance => "Appearance",
+            Page::Material => "Material",
+        };
+        (title, ready)
     }
 
     /// The panel's contents; returns true when the panel finished by itself (the
     /// appearance was removed).
     pub(crate) fn appearance_body(&mut self, ui: &mut egui::Ui, d: &mut AppearanceDialog) -> bool {
+        if !matches!(d.scope, Scope::Component(_)) {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut d.page, Page::Appearance, "Appearance");
+                ui.selectable_value(&mut d.page, Page::Material, "Material");
+            });
+        }
+        match d.page {
+            Page::Appearance => self.appearance_page(ui, d),
+            Page::Material => {
+                self.material_page(ui, d);
+                false
+            }
+        }
+    }
+
+    /// The Appearance page: the target and its look.
+    fn appearance_page(&mut self, ui: &mut egui::Ui, d: &mut AppearanceDialog) -> bool {
         let before = (d.scope, d.faces.len(), d.appearance.clone());
         let mut finished = false;
 
@@ -345,96 +500,7 @@ impl OxydeApp {
             }
         }
 
-        section(ui, "Colour");
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-            for p in &COLORS {
-                if swatch(ui, p) {
-                    d.appearance.color = p.color;
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.color_edit_button_srgb(&mut d.appearance.color);
-            ui.label(RichText::new("Custom").small());
-        });
-
-        section(ui, "Materials");
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-            for p in &MATERIALS {
-                if swatch(ui, p) {
-                    d.appearance.color = p.color;
-                    d.appearance.transparency = p.transparency;
-                }
-            }
-        });
-
-        section(ui, "Transparency");
-        let mut percent = (d.appearance.transparency * 100.0).round();
-        ui.add(egui::Slider::new(&mut percent, 0.0..=95.0).suffix("%"));
-        d.appearance.transparency = (percent / 100.0).clamp(0.0, 1.0);
-
-        section(ui, "Texture");
-        ui.horizontal(|ui| {
-            if ui
-                .button("Image…")
-                .on_hover_text("A PNG or JPEG repeated over the surface")
-                .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg"])
-                    .pick_file()
-                {
-                    match std::fs::read(&path) {
-                        Ok(bytes) if is_image(&bytes) => {
-                            let scale = d
-                                .appearance
-                                .texture
-                                .as_ref()
-                                .map_or(Texture::DEFAULT_SCALE, |t| t.scale);
-                            d.appearance.texture = Some(Texture {
-                                file_name: path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default(),
-                                data: FileData::new(bytes),
-                                scale,
-                            });
-                        }
-                        Ok(_) => self.status = "That file is not a PNG or JPEG image".to_owned(),
-                        Err(e) => self.status = format!("Could not read the image: {e}"),
-                    }
-                }
-            }
-            match &d.appearance.texture {
-                Some(t) => {
-                    ui.label(&t.file_name);
-                    if ui.small_button("✕").on_hover_text("Remove the texture").clicked() {
-                        d.appearance.texture = None;
-                    }
-                }
-                None => {
-                    ui.label(RichText::new("None").weak());
-                }
-            }
-        });
-        if let Some(t) = d.appearance.texture.as_mut() {
-            ui.horizontal(|ui| {
-                ui.label("Size");
-                ui.add(
-                    egui::Slider::new(&mut t.scale, 1.0..=1000.0)
-                        .logarithmic(true)
-                        .suffix(" mm"),
-                )
-                .on_hover_text("Millimetres covered by one repeat of the image");
-            });
-            ui.label(
-                RichText::new("Mapped along the model's axes, so it needs no unwrapping.")
-                    .small()
-                    .weak(),
-            );
-        }
+        appearance_controls(ui, &mut d.appearance, &mut self.status);
 
         ui.add_space(8.0);
         let has_own = self.has_own_appearance(d);
@@ -450,9 +516,144 @@ impl OxydeApp {
         }
 
         if !finished && (d.scope, d.faces.len(), d.appearance.clone()) != before {
+            if d.appearance != before.2 {
+                d.touched = true;
+            }
             self.preview_appearance(d);
         }
         finished
+    }
+
+    /// The Material page: the part's material, the library to pick from, and the editor
+    /// that saves to the library.
+    fn material_page(&mut self, ui: &mut egui::Ui, d: &mut AppearanceDialog) {
+        let before = d.material.clone();
+
+        section(ui, "Part material");
+        match &d.material {
+            Some(m) => {
+                ui.horizontal(|ui| {
+                    color_swatch(ui, m.appearance.color, 16.0);
+                    ui.label(RichText::new(&m.name).strong());
+                });
+                ui.label(
+                    RichText::new(format!("{} · {:.0} kg/m³", m.category, m.density))
+                        .small()
+                        .weak(),
+                );
+            }
+            None => {
+                ui.label(RichText::new("None").weak());
+                ui.label(
+                    RichText::new("Pick one below: it gives the part its look and its mass.")
+                        .small()
+                        .weak(),
+                );
+            }
+        }
+        if ui
+            .add_enabled(d.material.is_some(), egui::Button::new("Remove material"))
+            .clicked()
+        {
+            d.material = None;
+        }
+
+        section(ui, "Library");
+        let selected = d.material.as_ref().map(|m| m.name.clone());
+        let mut pick: Option<Material> = None;
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let library = &self.materials;
+                for category in library.categories() {
+                    ui.label(RichText::new(category).small().weak());
+                    for m in library.materials().iter().filter(|m| m.category == category) {
+                        ui.horizontal(|ui| {
+                            color_swatch(ui, m.appearance.color, 14.0);
+                            let is_selected = selected.as_deref() == Some(m.name.as_str());
+                            let response = ui
+                                .selectable_label(is_selected, &m.name)
+                                .on_hover_text(format!("{:.0} kg/m³", m.density));
+                            if response.clicked() {
+                                pick = Some(m.clone());
+                            }
+                        });
+                    }
+                }
+                if library.is_empty() {
+                    ui.label(RichText::new("The library is empty.").weak());
+                }
+            });
+        if let Some(m) = pick {
+            d.material = Some(m);
+        }
+
+        if let Some(m) = d.material.as_mut() {
+            section(ui, "Edit");
+            egui::Grid::new("material_edit")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut m.name);
+                    ui.end_row();
+                    ui.label("Category");
+                    ui.text_edit_singleline(&mut m.category);
+                    ui.end_row();
+                    ui.label("Density");
+                    ui.add(
+                        egui::DragValue::new(&mut m.density)
+                            .range(0.0..=30000.0)
+                            .speed(10.0)
+                            .suffix(" kg/m³"),
+                    );
+                    ui.end_row();
+                });
+            appearance_controls(ui, &mut m.appearance, &mut self.status);
+            ui.add_space(8.0);
+            let valid = Material::is_valid_name(&m.name);
+            let in_library = self.materials.get(&m.name).is_some();
+            ui.horizontal(|ui| {
+                let save = if in_library {
+                    "Update in library"
+                } else {
+                    "Save to library"
+                };
+                if ui
+                    .add_enabled(valid, egui::Button::new(save))
+                    .on_hover_text("Keeps this material for every part, in materials.json")
+                    .clicked()
+                {
+                    self.materials.insert(m.clone());
+                    self.status = match crate::materials::save(&self.materials) {
+                        Ok(path) => format!("Saved {} to {}", m.name, path.display()),
+                        Err(e) => format!("Could not save the material library: {e}"),
+                    };
+                }
+                if ui
+                    .add_enabled(in_library, egui::Button::new("Delete from library"))
+                    .clicked()
+                {
+                    self.materials.remove(&m.name);
+                    self.status = match crate::materials::save(&self.materials) {
+                        Ok(_) => format!("{} removed from the library", m.name),
+                        Err(e) => format!("Could not save the material library: {e}"),
+                    };
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "The part keeps its own copy; appearances of faces and bodies stay on top.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+
+        if d.material != before {
+            self.preview_appearance(d);
+        }
     }
 
     /// A face, body or component clicked while the panel is open.
@@ -527,13 +728,25 @@ impl OxydeApp {
     /// panel opened with (so moving a face out of the list takes its colour back).
     fn preview_appearance(&mut self, d: &AppearanceDialog) {
         self.restore_appearance(d);
-        self.write_appearance(d, Some(d.appearance.clone()));
+        self.write_panel(d);
         self.refresh_materials();
+    }
+
+    /// Puts the panel's values on the part: the appearance when it was changed (or the
+    /// target had one already), and the material.
+    fn write_panel(&mut self, d: &AppearanceDialog) {
+        if d.touched || self.has_own_appearance(d) {
+            self.write_appearance(d, Some(d.appearance.clone()));
+        }
+        if !matches!(d.scope, Scope::Component(_)) {
+            self.doc.part.set_material(d.material.clone());
+        }
     }
 
     fn restore_appearance(&mut self, d: &AppearanceDialog) {
         if let Some(before) = &d.before {
             *self.doc.part.appearances_mut() = before.appearances.clone();
+            self.doc.part.set_material(before.material.clone());
         }
         if let (Some(before), Some(doc)) = (&d.before_asm, self.asm.as_mut()) {
             for c in &mut doc.assembly.components {
@@ -556,7 +769,10 @@ impl OxydeApp {
             }
             _ => {
                 if let Some(before) = &d.before {
-                    if before.appearances != *self.doc.part.appearances() {
+                    let part = &self.doc.part;
+                    if before.appearances != *part.appearances()
+                        || before.material.as_ref() != part.material()
+                    {
                         self.doc.checkpoint_from(before.clone());
                     }
                 }
@@ -572,10 +788,25 @@ impl OxydeApp {
             return;
         }
         self.restore_appearance(&d);
-        self.write_appearance(&d, Some(d.appearance.clone()));
+        self.write_panel(&d);
         self.commit_appearance(&d);
+        self.sync_material_property();
         self.refresh_materials();
-        self.status = "Appearance set".to_owned();
+        self.status = match (&d.material, d.page) {
+            (Some(m), Page::Material) => format!("Material: {}", m.name),
+            _ => "Appearance set".to_owned(),
+        };
+    }
+
+    /// Keeps `properties.material` (what the bill of materials shows) equal to the
+    /// material's name.
+    pub(crate) fn sync_material_property(&mut self) {
+        if let Some(m) = self.doc.part.material() {
+            if self.doc.properties.material != m.name {
+                self.doc.properties.material = m.name.clone();
+                self.doc.modified = true;
+            }
+        }
     }
 
     /// Cancel: back to how it was.
@@ -588,12 +819,12 @@ impl OxydeApp {
 
     /// The materials of the part's faces, in face order; empty when the part has no
     /// appearances.
-    pub(crate) fn part_materials(&mut self) -> (Vec<Material>, Vec<TextureRef>) {
+    pub(crate) fn part_materials(&mut self) -> (Vec<RenderMaterial>, Vec<TextureRef>) {
         let part = &self.doc.part;
         let Some(body) = part.body() else {
             return (Vec::new(), Vec::new());
         };
-        if part.appearances().is_empty() {
+        if !part.has_appearances() {
             return (Vec::new(), Vec::new());
         }
         let cache = &mut self.texture_cache;
@@ -601,7 +832,7 @@ impl OxydeApp {
         let materials = (0..body.topology.faces.len() as u32)
             .map(|i| match part.face_appearance(body, i) {
                 Some(a) => material(a, cache, &mut textures),
-                None => Material::default(),
+                None => RenderMaterial::default(),
             })
             .collect();
         (materials, textures)
@@ -612,13 +843,13 @@ impl OxydeApp {
     pub(crate) fn assembly_materials(
         &mut self,
         assembly: &Assembly,
-    ) -> (Vec<Material>, Vec<TextureRef>) {
+    ) -> (Vec<RenderMaterial>, Vec<TextureRef>) {
         let Some(doc) = self.asm.as_ref() else {
             return (Vec::new(), Vec::new());
         };
         let cache = &mut self.texture_cache;
         let total = doc.ranges.iter().map(|r| r.faces.end).max().unwrap_or(0) as usize;
-        let mut materials = vec![Material::default(); total];
+        let mut materials = vec![RenderMaterial::default(); total];
         let mut textures = Vec::new();
         for r in &doc.ranges {
             let own = assembly
@@ -626,7 +857,7 @@ impl OxydeApp {
                 .and_then(|c| c.appearance.as_ref());
             let part = doc.part_at(&r.owner).map(|p| &p.part);
             let body = part.and_then(|p| p.body());
-            if own.is_none() && part.is_none_or(|p| p.appearances().is_empty()) {
+            if own.is_none() && part.is_none_or(|p| !p.has_appearances()) {
                 continue;
             }
             for (local, index) in r.faces.clone().enumerate() {

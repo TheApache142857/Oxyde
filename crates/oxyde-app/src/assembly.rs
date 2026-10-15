@@ -298,6 +298,44 @@ impl AssemblyDoc {
         }
     }
 
+    /// The part files under a top-level component: its own file, or every part file a
+    /// sub-assembly uses (each once).
+    pub fn part_paths_under(&self, component: ComponentId) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Some(path) = self.sources.get(&component) else {
+            return out;
+        };
+        self.collect_part_paths(path, 0, &mut out);
+        out
+    }
+
+    fn collect_part_paths(&self, path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        match self.docs.get(path) {
+            Some(Ok(Loaded::Part(_))) => {
+                if !out.iter().any(|p| p == path) {
+                    out.push(path.to_path_buf());
+                }
+            }
+            Some(Ok(Loaded::Assembly(sub))) => {
+                for inner in sub.sources.values() {
+                    self.collect_part_paths(inner, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The material of the part a component is (its name), when it is a part with one.
+    pub fn component_material(&self, component: ComponentId) -> Option<&str> {
+        match self.loaded(component)? {
+            Loaded::Part(p) => p.part.material().map(|m| m.name.as_str()),
+            Loaded::Assembly(_) => None,
+        }
+    }
+
     /// The file an occurrence shows.
     pub fn path_at(&self, o: &Occurrence) -> Option<PathBuf> {
         let mut path = self.sources.get(&o.top)?.clone();

@@ -5,6 +5,36 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### STEP colours and materials (October 2026)
+
+- **STEP colours come in and go out.** Import STEP (and New part from STEP, and the
+  assembly import) reads the colour and transparency that STEP files carry per solid and
+  per face, as SolidWorks, Fusion and FreeCAD write them, and turns them into appearances
+  of the Imported feature: the body's colour, and face appearances where faces differ.
+  They are ordinary appearances afterwards (change or remove them as usual; they are not
+  re-applied). Export STEP writes the part's appearances back as STEP colours, so a
+  coloured part survives a round trip through another CAD system. Textures stay in
+  Oxyde: STEP has none.
+- **Materials.** A part can be given a material: a look plus a density, as in SolidWorks'
+  and Fusion's material libraries. Right-click › Material… (or the Material page of the
+  Appearance panel) lists the library by category; a pick shows at once, OK is one undo
+  step. The material's look is what the part is drawn with underneath any face, body or
+  part appearance, its density gives **Mass** in Mass Properties (parts and whole
+  assemblies; parts without a material are counted apart), and its name fills the
+  `material` property the bill of materials shows. The page edits name, category,
+  density and look, and saves to the library (or deletes from it).
+- **Material library**: a starter set (steels, aluminium alloys, brass, bronze, copper,
+  titanium, ABS, PLA, nylon, polycarbonate, acrylic, rubber, glass, woods, FR-4, carbon
+  fibre) until the user saves a material, then `materials.json` next to the preferences,
+  a plain JSON file ([FORMAT.md](docs/FORMAT.md) §3) that can be edited or shared.
+- **Materials in assemblies**: right-click › Material on a component applies a library
+  material to every selected component at once, down into sub-assemblies; the part files
+  are updated, since parts are documents of their own. *Select parts with this material*
+  selects every component made of the same material.
+- **File format**: optional `material` in `model.json` (a copy of the library entry, so
+  files never depend on a library) and `apply_colors` on an `import` feature whose
+  colours have not been applied yet. Files without them read as before.
+
 ### Appearances (October 2026)
 
 - **Appearances.** Faces, bodies, the whole part, or a component of an assembly can be

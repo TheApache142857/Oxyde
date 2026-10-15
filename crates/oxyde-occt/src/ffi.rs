@@ -187,6 +187,30 @@ pub(crate) mod bridge {
         zmax: f64,
     }
 
+    // ---- STEP colours -----------------------------------------------------------------------
+
+    /// A colour of a solid or a face in a STEP file; `present` false where there is none.
+    struct StepColorData {
+        present: bool,
+        r: u8,
+        g: u8,
+        b: u8,
+        /// 0 = opaque, 1 = invisible.
+        transparency: f64,
+    }
+
+    /// The colours of one shape: per solid (in `TopExp` order) and per face (indexed like
+    /// the shape's topology).
+    struct StepShapeColors {
+        solids: Vec<StepColorData>,
+        faces: Vec<StepColorData>,
+    }
+
+    struct StepImportData {
+        shape: u64,
+        colors: StepShapeColors,
+    }
+
     // ---- STEP assemblies --------------------------------------------------------------------
 
     struct StepInstanceData {
@@ -294,10 +318,17 @@ pub(crate) mod bridge {
 
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
 
-        fn export_step(self: &Session, shapes: &[u64], path: &str) -> Result<()>;
+        /// Writes the shapes with their colours (`colors` indexed like `shapes`, or empty).
+        fn export_step(
+            self: &Session,
+            shapes: &[u64],
+            colors: &[StepShapeColors],
+            path: &str,
+        ) -> Result<()>;
 
-        /// Reads the solids of a STEP file held in memory, in millimetres.
-        fn import_step(self: Pin<&mut Session>, data: &[u8]) -> Result<u64>;
+        /// Reads the solids of a STEP file held in memory, in millimetres, with their
+        /// colours.
+        fn import_step(self: Pin<&mut Session>, data: &[u8]) -> Result<StepImportData>;
 
         /// Reads the product structure of a STEP file held in memory: every part once, as
         /// its own STEP file, and every assembly with its placed instances. Children come
