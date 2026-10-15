@@ -25,6 +25,11 @@ pub enum Icon {
     RefAxis,
     ReferenceGeometry,
     Imported,
+    // Assemblies
+    Assembly,
+    InsertComponent,
+    Mate,
+    BillOfMaterials,
     // Timeline
     Part,
     Plane,
@@ -624,6 +629,36 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.badge(17.0, 17.0, REMOVE);
             pen.cross(17.0, 17.0, 2.2, WHITE);
         }
+        Assembly => {
+            // Two parts, one resting on the other.
+            pen.solid(2.0, 13.0, 12.0, 9.0, 5.0);
+            pen.block(10.0, 7.0, 7.0, 6.0, 4.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
+        }
+        InsertComponent => {
+            pen.solid(2.0, 12.0, 11.0, 10.0, 5.0);
+            pen.badge(18.0, 6.0, ADD);
+            pen.line(&[(15.0, 6.0), (21.0, 6.0)], 1.8, WHITE);
+            pen.line(&[(18.0, 3.0), (18.0, 9.0)], 1.8, WHITE);
+        }
+        Mate => {
+            // Two faces brought together.
+            pen.block(1.0, 12.0, 9.0, 10.0, 4.0, [BODY_TOP, BODY, BODY_SIDE]);
+            pen.block(13.0, 6.0, 8.0, 9.0, 4.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
+            pen.arrow((7.0, 4.0), (12.0, 9.0), 1.8, SKETCH);
+            pen.arrow((19.0, 21.0), (13.0, 17.0), 1.8, SKETCH);
+        }
+        BillOfMaterials => {
+            pen.poly(
+                &[(4.0, 2.0), (20.0, 2.0), (20.0, 22.0), (4.0, 22.0)],
+                WHITE,
+                INK,
+            );
+            for y in [7.0, 12.0, 17.0] {
+                pen.line(&[(4.0, y), (20.0, y)], 1.0, INK);
+            }
+            pen.line(&[(9.0, 2.0), (9.0, 22.0)], 1.0, INK);
+            pen.fill(&[(4.0, 2.0), (20.0, 2.0), (20.0, 7.0), (4.0, 7.0)], BODY);
+        }
         MassProperties => {
             pen.ring(12.0, 6.0, 2.6, 1.6, INK);
             pen.poly(
@@ -845,7 +880,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 49] = {
+pub const ALL: [Icon; 53] = {
     use Icon::*;
     [
         Sketch,
@@ -861,6 +896,10 @@ pub const ALL: [Icon; 49] = {
         RefAxis,
         ReferenceGeometry,
         Imported,
+        Assembly,
+        InsertComponent,
+        Mate,
+        BillOfMaterials,
         Part,
         Plane,
         Origin,

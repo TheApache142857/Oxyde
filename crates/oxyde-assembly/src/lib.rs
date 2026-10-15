@@ -5,7 +5,9 @@
 //!   edited in its own document, the assembly just places it.
 //! - [`solve`] moves the components that are not fixed until every mate holds, and tells
 //!   which mates cannot be met and which components can still move.
-//! - [`bom`] counts the parts for a bill of materials.
+//! - [`bom`] counts the parts for a bill of materials, [`scene`] puts the parts' meshes
+//!   together for display and maps picks back to components, [`paths`] stores part paths
+//!   relative to the assembly.
 //!
 //! Pure Rust: mate references are persistent face and edge names from `oxyde-model`, and
 //! [`resolve`] turns them into geometry using a part's rebuilt body.
@@ -13,7 +15,9 @@
 
 pub mod bom;
 mod mate;
+pub mod paths;
 mod placement;
+pub mod scene;
 mod solve;
 
 pub use mate::{Mate, MateKind, MateRef, MateTarget, Primitive, PrimitiveKind, resolve};

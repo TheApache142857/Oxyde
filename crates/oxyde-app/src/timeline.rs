@@ -59,29 +59,29 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
 }
 
 /// One row of the tree.
-struct Row {
-    icon: Icon,
+pub(crate) struct Row {
+    pub(crate) icon: Icon,
     /// A cut extrusion or revolve: red badge on the icon.
-    cut: bool,
-    text: RichText,
-    highlighted: bool,
+    pub(crate) cut: bool,
+    pub(crate) text: RichText,
+    pub(crate) highlighted: bool,
     /// Error or warning, on the right.
-    badge: Option<Icon>,
+    pub(crate) badge: Option<Icon>,
     /// Children are indented.
-    indent: f32,
+    pub(crate) indent: f32,
     /// `Some(expanded)` for a row that absorbs a sketch.
-    expander: Option<bool>,
+    pub(crate) expander: Option<bool>,
     /// `Some(shown)` for an item that can be hidden.
-    eye: Option<bool>,
+    pub(crate) eye: Option<bool>,
 }
 
-struct RowResponse {
-    response: egui::Response,
-    expand_clicked: bool,
-    eye_clicked: bool,
+pub(crate) struct RowResponse {
+    pub(crate) response: egui::Response,
+    pub(crate) expand_clicked: bool,
+    pub(crate) eye_clicked: bool,
 }
 
-fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
+pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
     let height = 22.0;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());

@@ -29,8 +29,8 @@ pub enum PanelPick {
     Edge(EdgeName),
 }
 
-const BOX_FILL: Color32 = Color32::from_rgb(232, 241, 252);
-const BOX_ACTIVE: Color32 = Color32::from_rgb(70, 130, 220);
+pub(crate) const BOX_FILL: Color32 = Color32::from_rgb(232, 241, 252);
+pub(crate) const BOX_ACTIVE: Color32 = Color32::from_rgb(70, 130, 220);
 
 /// A selection box: what the command acts on, filled by clicking in the viewport or the
 /// timeline. Items are (label, hover text). Returns the index of an item the user removed.

@@ -17,6 +17,7 @@ oxyde-kernel = { workspace = true }
 oxyde-occt = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-sketch = { workspace = true }
+oxyde-assembly = { workspace = true }
 oxyde-format = { workspace = true }
 oxyde-render = { workspace = true }
 eframe = { workspace = true }

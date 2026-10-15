@@ -5,6 +5,9 @@
 //!
 //! Sketch mode keeps the left button for drawing: middle-drag pans, Ctrl+middle-drag orbits,
 //! and picking of the 3D model is off.
+//!
+//! In an assembly, Alt+left-drag grabs what is under the pointer instead of orbiting
+//! (Alt+Shift+left-drag to turn it); see [`Grab`].
 
 use eframe::egui;
 use oxyde_geom::{Plane, Point2, Point3};
@@ -20,6 +23,22 @@ pub struct ViewportOutput {
     /// Where the viewport is on screen, and the screen scale, for overlays.
     pub rect: egui::Rect,
     pub pixels_per_point: f32,
+    /// An Alt+drag in progress, when grabbing is enabled.
+    pub grab: Option<Grab>,
+}
+
+/// An Alt+left-drag this frame: what was under the pointer when it started, and how far
+/// the pointer moved, in model terms.
+#[derive(Debug, Clone, Copy)]
+pub struct Grab {
+    pub start: Option<Pick>,
+    /// Movement this frame in mm, along the screen's right and up directions…
+    pub along: [f64; 2],
+    /// …which are these model directions.
+    pub right: [f64; 3],
+    pub up: [f64; 3],
+    /// Shift held: turn rather than slide.
+    pub rotate: bool,
 }
 
 impl ViewportOutput {
@@ -104,6 +123,10 @@ pub struct Viewport {
     last_pick: Option<([f64; 2], Option<Pick>)>,
     /// "GPU (adapter)" or "software", for the About window.
     renderer: String,
+    /// Alt+left-drag grabs instead of orbiting (set by the assembly each frame).
+    pub grab_enabled: bool,
+    /// The pick under the pointer when the current grab started.
+    grabbed: Option<Option<Pick>>,
 }
 
 impl Viewport {
@@ -123,6 +146,8 @@ impl Viewport {
             gpu_texture: None,
             last_pick: None,
             renderer: "software".to_owned(),
+            grab_enabled: false,
+            grabbed: None,
         }
     }
 
@@ -272,10 +297,36 @@ impl Viewport {
         }
 
         // Navigation.
-        let (shift, ctrl) = ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl));
+        let (shift, ctrl, alt) =
+            ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl, i.modifiers.alt));
         let delta = response.drag_delta();
         let middle = response.dragged_by(egui::PointerButton::Middle);
-        let primary = response.dragged_by(egui::PointerButton::Primary);
+        let mut primary = response.dragged_by(egui::PointerButton::Primary);
+        // Alt+drag grabs; it keeps grabbing until the button is released.
+        if self.grab_enabled
+            && alt
+            && response.drag_started_by(egui::PointerButton::Primary)
+            && self.grabbed.is_none()
+        {
+            self.grabbed = Some(self.hovered);
+        }
+        if !primary || !self.grab_enabled {
+            self.grabbed = None;
+        }
+        let grab = match self.grabbed {
+            Some(start) if primary => {
+                primary = false;
+                let scale = ppp as f64 / self.camera.pixels_per_mm(h);
+                Some(Grab {
+                    start,
+                    along: [delta.x as f64 * scale, -(delta.y as f64) * scale],
+                    right: self.camera.right(),
+                    up: self.camera.up(),
+                    rotate: shift,
+                })
+            }
+            _ => None,
+        };
         let (panning, orbiting) = if sketching {
             (middle && !ctrl, middle && ctrl)
         } else {
@@ -313,7 +364,8 @@ impl Viewport {
             .rendered
             .as_ref()
             .is_some_and(|k| k.size == [width, height]);
-        self.hovered = match (pointer, panning || orbiting || sketching || !same_size) {
+        let busy = panning || orbiting || grab.is_some() || sketching || !same_size;
+        self.hovered = match (pointer, busy) {
             (Some(cursor), false) => match (&self.gpu, &self.frame) {
                 (Some(gpu), _) => match self.last_pick {
                     Some((at, pick)) if at == cursor => pick,
@@ -394,6 +446,7 @@ impl Viewport {
             additive,
             rect,
             pixels_per_point: ppp,
+            grab,
         }
     }
 

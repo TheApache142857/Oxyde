@@ -2433,6 +2433,7 @@ name = "oxyde-app"
 version = "0.0.1"
 dependencies = [
  "eframe",
+ "oxyde-assembly",
  "oxyde-format",
  "oxyde-geom",
  "oxyde-kernel",
@@ -2515,6 +2516,7 @@ dependencies = [
 name = "oxyde-tests"
 version = "0.0.1"
 dependencies = [
+ "oxyde-assembly",
  "oxyde-format",
  "oxyde-geom",
  "oxyde-kernel",

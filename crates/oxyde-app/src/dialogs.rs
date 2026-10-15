@@ -253,11 +253,12 @@ impl OxydeApp {
             Dialog::Discard(_) => {
                 let mut answer = Answer::Open;
                 let mut save = false;
+                let name = match &self.asm {
+                    Some(asm) => asm.display_name(),
+                    None => self.doc.display_name(),
+                };
                 window("Unsaved changes").show(ctx, |ui| {
-                    ui.label(format!(
-                        "Save the changes to {} first?",
-                        self.doc.display_name()
-                    ));
+                    ui.label(format!("Save the changes to {name} first?"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -272,7 +273,12 @@ impl OxydeApp {
                         }
                     });
                 });
-                if save && !self.save() {
+                let saved = if self.asm.is_some() {
+                    save && self.save_assembly(false)
+                } else {
+                    save && self.save()
+                };
+                if save && !saved {
                     // Saving failed or was cancelled: stay where we are.
                     answer = Answer::Cancel;
                 }

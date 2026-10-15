@@ -36,7 +36,12 @@ pub enum Selected {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingAction {
     New,
+    NewAssembly,
     Open,
+    /// Leave the assembly to edit a component's part.
+    OpenComponent(oxyde_assembly::ComponentId),
+    /// Back to the assembly a part was opened from.
+    BackToAssembly,
     /// A new part from a STEP file.
     OpenStep,
     Demo,
@@ -105,11 +110,24 @@ pub struct OxydeApp {
     /// Features expanded in the timeline (showing the sketch they absorb).
     pub(crate) expanded: std::collections::HashSet<FeatureId>,
     /// Document revision the viewport currently shows.
-    scene_revision: Option<u64>,
+    pub(crate) scene_revision: Option<u64>,
     /// Status-bar summary, cached per document revision.
     summary: Option<(u64, String)>,
     window_title: String,
     allow_close: bool,
+    /// The open assembly; the app is in assembly mode while there is one.
+    pub(crate) asm: Option<crate::assembly::AssemblyDoc>,
+    pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
+    pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
+    pub(crate) show_bom: bool,
+    /// Assembly revision the viewport shows.
+    pub(crate) asm_scene: Option<u64>,
+    /// The component being moved with Alt+drag.
+    pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
+    /// A component whose part should open once unsaved changes are dealt with.
+    pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
+    /// The assembly a part was opened from, to go back to.
+    pub(crate) return_to: Option<PathBuf>,
 }
 
 impl OxydeApp {
@@ -136,6 +154,14 @@ impl OxydeApp {
             summary: None,
             window_title: String::new(),
             allow_close: false,
+            asm: None,
+            mate_dialog: None,
+            mate_preview: None,
+            show_bom: false,
+            asm_scene: None,
+            grabbing: None,
+            pending_open_component: None,
+            return_to: None,
         };
         if let Some(state) = &cc.wgpu_render_state {
             let info = state.adapter.get_info();
@@ -533,7 +559,7 @@ impl OxydeApp {
     // ---- Files -------------------------------------------------------------------------------
 
     pub(crate) fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
-        if self.doc.modified {
+        if self.is_modified() {
             self.dialog = Some(Dialog::Discard(action));
         } else {
             self.perform(action, ctx);
@@ -541,27 +567,51 @@ impl OxydeApp {
     }
 
     pub(crate) fn perform(&mut self, action: PendingAction, ctx: &egui::Context) {
+        use oxyde_format::{ASSEMBLY_EXTENSION, LEGACY_PART_EXTENSION, PART_EXTENSION};
         match action {
             PendingAction::New => {
+                self.leave_assembly();
                 self.replace_document(Document::new());
                 self.status = "New part".to_owned();
             }
+            PendingAction::NewAssembly => {
+                self.enter_assembly(crate::assembly::AssemblyDoc::new());
+                self.status = "New assembly: Insert Component adds a part file".to_owned();
+            }
             PendingAction::Open => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Oxyde part or STEP", &["oxy", "step", "stp"])
-                    .add_filter("Oxyde part", &["oxy"])
+                    .add_filter(
+                        "Oxyde document or STEP",
+                        &[
+                            PART_EXTENSION,
+                            ASSEMBLY_EXTENSION,
+                            LEGACY_PART_EXTENSION,
+                            "step",
+                            "stp",
+                        ],
+                    )
+                    .add_filter("Oxyde part", &[PART_EXTENSION, LEGACY_PART_EXTENSION])
+                    .add_filter("Oxyde assembly", &[ASSEMBLY_EXTENSION])
                     .add_filter("STEP", &["step", "stp"])
                     .pick_file()
                 {
                     self.open_path(&path);
                 }
             }
+            PendingAction::OpenComponent(id) => self.open_component(id),
+            PendingAction::BackToAssembly => {
+                if let Some(path) = self.return_to.clone() {
+                    self.open_assembly(&path);
+                }
+            }
             PendingAction::OpenStep => {
                 if let Some(path) = pick_step() {
+                    self.leave_assembly();
                     self.open_step_as_part(&path);
                 }
             }
             PendingAction::DemoFlange => {
+                self.leave_assembly();
                 let mut doc = Document::new();
                 doc.part = crate::demo::flange();
                 self.replace_document(doc);
@@ -569,6 +619,7 @@ impl OxydeApp {
                 self.report_errors();
             }
             PendingAction::Demo => {
+                self.leave_assembly();
                 let mut doc = Document::new();
                 doc.part = crate::demo::bracket();
                 self.replace_document(doc);
@@ -597,6 +648,11 @@ impl OxydeApp {
     }
 
     pub(crate) fn open_path(&mut self, path: &Path) {
+        if crate::assembly_ui::is_assembly(path) {
+            self.open_assembly(path);
+            return;
+        }
+        self.leave_assembly();
         if is_step(path) {
             self.open_step_as_part(path);
             return;
@@ -689,19 +745,19 @@ impl OxydeApp {
     }
 
     pub(crate) fn save_as(&mut self) -> bool {
+        use oxyde_format::{LEGACY_PART_EXTENSION, PART_EXTENSION};
         let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("Oxyde part", &["oxy"])
-            .set_file_name(format!("{}.oxy", self.doc.display_name()))
+            .add_filter("Oxyde part", &[PART_EXTENSION])
+            .set_file_name(format!("{}.{PART_EXTENSION}", self.doc.display_name()))
             .save_file()
         else {
             return false;
         };
-        let has_extension = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("oxy"));
-        if !has_extension {
-            path.set_extension("oxy");
+        let known = [PART_EXTENSION, LEGACY_PART_EXTENSION]
+            .iter()
+            .any(|e| crate::assembly_ui::has_extension(&path, e));
+        if !known {
+            path.set_extension(PART_EXTENSION);
         }
         self.save_to(&path)
     }
@@ -1333,17 +1389,21 @@ impl OxydeApp {
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.doc.modified && !self.allow_close {
+        if ctx.input(|i| i.viewport().close_requested()) && self.is_modified() && !self.allow_close
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dialog = Some(Dialog::Discard(PendingAction::Exit));
         }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
+        let name = match &self.asm {
+            Some(doc) => doc.display_name(),
+            None => self.doc.display_name(),
+        };
         let title = format!(
-            "{}{} - Oxyde",
-            self.doc.display_name(),
-            if self.doc.modified { " *" } else { "" }
+            "{name}{} - Oxyde",
+            if self.is_modified() { " *" } else { "" }
         );
         if title != self.window_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -1424,7 +1484,7 @@ fn overlay_at(
 }
 
 /// Mesh precision: about a thousandth of the part size.
-fn deflection(topology: &Topology) -> f64 {
+pub(crate) fn deflection(topology: &Topology) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     let points = topology
@@ -1449,6 +1509,25 @@ fn deflection(topology: &Topology) -> f64 {
 impl eframe::App for OxydeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        if self.asm.is_some() {
+            self.assembly_shortcuts(ctx);
+            egui::TopBottomPanel::top("menu").show(ctx, |ui| self.assembly_menu_bar(ui));
+            egui::TopBottomPanel::top("commands").show(ctx, |ui| self.assembly_command_bar(ui));
+            egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.assembly_status_bar(ui));
+            egui::SidePanel::left("feature_manager")
+                .resizable(true)
+                .default_width(290.0)
+                .min_width(220.0)
+                .show(ctx, |ui| self.assembly_panel(ui));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| self.assembly_viewport(ui));
+            self.bom_window(ctx);
+            self.dialogs_ui(ctx);
+            self.update_title(ctx);
+            return;
+        }
+        self.viewport.grab_enabled = false;
         self.handle_shortcuts(ctx);
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
@@ -1475,6 +1554,7 @@ impl eframe::App for OxydeApp {
 
 impl Drop for OxydeApp {
     fn drop(&mut self) {
+        self.leave_assembly();
         self.doc.release(&mut self.kernel);
     }
 }

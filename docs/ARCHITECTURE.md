@@ -156,11 +156,14 @@ The groundwork for equations, SolidWorks-style:
 - Display units are a per-document preference; conversion happens only at the UI and file boundary.
 - One central tolerance policy in `oxyde-geom` (linear `1e-6 mm`, angular `1e-9 rad` as starting values) passed to the kernel explicitly.
 
-## 8. Assemblies and drawings (later)
+## 8. Assemblies (`oxyde-assembly`) and drawings (later)
 
-- Bottom-up: an assembly only places parts (and sub-assemblies) and mates them; editing a part happens in the part's own timeline.
-- Assemblies reference parts by relative path + document UUID; mates are solved by a 3D constraint solver sharing infrastructure with `oxyde-sketch`.
-- The assembly tree is the BOM source: quantities, part numbers and custom properties come straight from each part's `properties.json` (see `FORMAT.md`).
+- **Bottom-up**: an assembly only places parts and mates them; a part is edited in its own document (*Open part* from the assembly, then *File › Back to assembly*, which reloads the parts). Sub-assemblies are not supported yet.
+- **Components** reference part files by path relative to the assembly + document UUID, so a part moved within the assembly's folder is found again by its id (see `FORMAT.md` §6). Each component has a placement (rotation + translation, never a mirror). The first one inserted is **fixed**; any can be fixed or floated.
+- **Mates** (coincident, concentric, parallel, perpendicular, distance, angle) name geometry the way features do: persistent face and edge names in the part, or the part's standard planes, axes and origin. `resolve` turns a reference into a primitive in part coordinates using the part's rebuilt body: a flat face is a plane (outward normal), a cylindrical or conical face its axis, a straight edge a line, a circular edge a circle (centre and normal). Each mate kind writes residuals that vanish when it holds; directions are scaled by the assembly size so that they weigh like lengths. A mate between oriented geometry is *aligned* or *anti-aligned*; a new mate starts with whichever is closest to how the parts sit.
+- **Solver**: Levenberg–Marquardt over a small rotation and a shift per free component, from the current placements, so the answer is the nearest one (which is what dragging needs). When the mates cannot all hold, they are added back one at a time in order and each one that cannot hold with those before it is reported, as SolidWorks blames the newest mate. Degrees of freedom left per component come from the rank of its Jacobian columns: the tree shows `(f)` fixed, `(-)` under-defined.
+- **BOM**: the components grouped by part (same path or same document id), with part number, description and material from each part's `properties.json`, exported as CSV.
+- **Display**: the part meshes are moved to their placements and combined into one mesh for the viewport; the face and edge ranges of each component map picks back to a component and a persistent name.
 - Drawings: views computed by the kernel's hidden-line removal (OCCT `HLRBRep`), annotations and dimensions in Rust, export to PDF/SVG/DXF.
 
 ## 9. Application (`oxyde-app`) and viewport (`oxyde-render`)
@@ -173,6 +176,7 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 - **GPU rendering** (`gpu.rs`): the viewport is drawn with wgpu (Direct3D 12, Vulkan or Metal, through eframe's wgpu backend). The part goes into an off-screen texture with 4× multisampling and a depth buffer, which egui shows like any image; sketches and annotations are painted over it by egui. Edges are screen-space quads (1.25 px, 3 px when highlighted); a second pass writes face and edge ids into an integer texture, and picking reads back the few pixels under the cursor. Shading, colours and pick rules match the software renderer, which a test checks pixel by pixel (`gpu_picking_matches_the_software_renderer`, ignored without a GPU). When the GPU cannot start, or with `OXYDE_RENDERER=cpu`, the window falls back to OpenGL and the viewport to the software renderer; Help › About tells which is in use.
 - **Software rendering**: `oxyde-render` is a software rasterizer (orthographic, Y-up like SolidWorks). It draws shaded faces (normals smooth within a face, crisp between faces) and edges with a depth buffer, and fills **id buffers** in the same pass, so picking the face or edge under the mouse is exact; edges win within a few pixels. The image is shown as an egui texture and re-rendered only when the camera, size, highlight or scene changes. It is the fallback when no GPU is available, and the reference the GPU renderer is tested against.
 - Navigation: left-drag orbit, middle-drag or Shift+left-drag pan, wheel zoom at cursor, `F` zoom to fit; Front/Top/Right/Isometric views.
+- **Assembly mode** (`assembly.rs`, `assembly_ui.rs`): the app holds either a part or an assembly. In an assembly the command bar has one *Assembly* tab (Insert Component, Mate, Fix/Float, Reload Parts, Bill of Materials); the tree lists components (`(f)` fixed, `(-)` can still move, a red badge when the part file cannot be opened; expand one to pick its planes or origin) and the mates (red when they cannot hold). *Mate* opens in the PropertyManager with two selection boxes filled by clicking faces and edges in the viewport or planes in the tree (two faces or edges selected beforehand fill them); the type follows the geometry (round faces and circular edges: concentric, otherwise coincident) until chosen, and the viewport previews the solved result. Alt+left-drag moves a free component, Alt+Shift+left-drag turns it, and the mates are re-solved as it moves. Undo/redo keep snapshots of the assembly.
 - **Selection is held by persistent name** (`FaceName`/`EdgeName`), not index, so it survives rebuilds.
 - **Select, then command.** Commands start from what is selected: Extrude and Revolve take the sketch selected in the timeline (else the latest sketch no feature uses yet), Fillet/Chamfer the selected edges, Shell the selected faces, patterns the selected feature, Sketch the selected plane or flat face (else it asks for one, drawing the three standard planes in the viewport to click). Extrude and Revolve are one command each, with *Add material* / *Remove material* (the feature names still follow SolidWorks: `Boss-Extrude1`, `Cut-Extrude1`; cuts carry a red badge in the timeline).
 - **Undo/redo** stores `PartDefinition` snapshots (the same data that is saved); one drag of a value (in a feature window or the Dimensions window) is one step.
@@ -191,16 +195,17 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 
 | Milestone | Content |
 |---|---|
-| **M0** | Workspace, docs, CI (format, clippy, tests) |
-| **M1** (code written, awaiting first Windows build) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
-| **Engine** (code written, awaiting first Windows build) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
-| **M2** (code written, awaiting first build) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
-| **M2b** (code written, awaiting first build) | Solver in the model and the file format; interactive sketch mode; timeline without properties panel, draggable rollback bar, creator highlight |
-| **App** (code written, awaiting first Windows build) | Timeline panel, software-rendered viewport with picking, `.oxy` save/load, STEP export, undo/redo |
-| **Naming** (code written, awaiting first build) | Stable relation ids, SolidWorks-style dimension names (`D1@Sketch1`), unique feature names, Dimensions window |
-| **Equations** (code written, awaiting first build) | Global variables and equations, evaluated in dependency order before every rebuild; Equations window |
-| **M3** (code written, awaiting first build) | Revolve (boss/cut), shell, reference planes and axes |
-| **M4** (done in App and M2b) | Viewport, interactive sketch mode, selection, fillet/chamfer with persistent naming |
-| **M5** (code written, awaiting first build) | Linear and circular patterns, mirror (tool-body copies with instance names) |
-| **M6** | Assemblies with basic mates; BOM export |
+| **M0** (CI not set up yet) | Workspace, docs, CI (format, clippy, tests) |
+| **M1** (done) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
+| **Engine** (done) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
+| **M2** (done) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
+| **M2b** (done) | Solver in the model and the file format; interactive sketch mode; timeline without properties panel, draggable rollback bar, creator highlight |
+| **App** (done) | Timeline panel, viewport with picking, part save/load, STEP export, undo/redo |
+| **Naming** (done) | Stable relation ids, SolidWorks-style dimension names (`D1@Sketch1`), unique feature names, Dimensions window |
+| **Equations** (done) | Global variables and equations, evaluated in dependency order before every rebuild; Equations window |
+| **M3** (done) | Revolve (boss/cut), shell, reference planes and axes |
+| **M4** (done) | Viewport, interactive sketch mode, selection, fillet/chamfer with persistent naming |
+| **M5** (done) | Linear and circular patterns, mirror (tool-body copies with instance names) |
+| **GPU** (done) | wgpu viewport with GPU picking, software renderer as fallback |
+| **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files, mates with a 3D solver, fixed/floating, Alt+drag, BOM export (CSV); parts renamed `.oxyprt` |
 | **M7** | Drawings: views, dimensions, PDF/DXF |

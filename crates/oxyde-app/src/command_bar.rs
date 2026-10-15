@@ -47,13 +47,27 @@ impl OxydeApp {
         let ctx = ui.ctx().clone();
         egui::menu::bar(ui, |ui| {
             ui.menu_button("File", |ui| {
-                if ui.button("New").clicked() {
+                if ui.button("New part").clicked() {
                     ui.close_menu();
                     self.guard(PendingAction::New, &ctx);
+                }
+                if ui.button("New assembly").clicked() {
+                    ui.close_menu();
+                    self.guard(PendingAction::NewAssembly, &ctx);
                 }
                 if ui.button("Open…").clicked() {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
+                }
+                if let Some(path) = self.return_to.clone() {
+                    let name = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if ui.button(format!("Back to assembly {name}")).clicked() {
+                        ui.close_menu();
+                        self.guard(PendingAction::BackToAssembly, &ctx);
+                    }
                 }
                 if ui.button("New part from STEP…").clicked() {
                     ui.close_menu();

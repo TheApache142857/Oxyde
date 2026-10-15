@@ -280,3 +280,28 @@ fn bill_of_materials_counts_instances() {
     let csv = bom::to_csv(&[vec!["a,b".into(), "say \"hi\"".into(), "c".into()]]);
     assert_eq!(csv, "\"a,b\",\"say \"\"hi\"\"\",c\r\n");
 }
+
+#[test]
+fn combined_meshes_map_picks_back_to_components() {
+    use oxyde_kernel::{FaceMesh, Mesh};
+    let mesh = Mesh {
+        faces: vec![
+            FaceMesh {
+                positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                triangles: vec![[0, 1, 2]],
+            };
+            2
+        ],
+        edges: vec![vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]; 3],
+    };
+    let a = Placement::IDENTITY;
+    let b = Placement::from_translation(Vec3::new(10.0, 0.0, 0.0));
+    let (combined, ranges) =
+        scene::combine([(ComponentId(1), &a, &mesh), (ComponentId(2), &b, &mesh)]);
+    assert_eq!((combined.faces.len(), combined.edges.len()), (4, 6));
+    assert_eq!(combined.faces[2].positions[1], [11.0, 0.0, 0.0]);
+    assert_eq!(scene::face_owner(&ranges, 3), Some((ComponentId(2), 1)));
+    assert_eq!(scene::edge_owner(&ranges, 2), Some((ComponentId(1), 2)));
+    assert_eq!(scene::face_index(&ranges, ComponentId(2), 0), Some(2));
+    assert_eq!(scene::edge_index(&ranges, ComponentId(1), 5), None);
+}
