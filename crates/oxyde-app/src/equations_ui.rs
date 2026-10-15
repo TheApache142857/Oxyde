@@ -441,11 +441,15 @@ fn dimensions_tab(
                     .on_hover_text("Driven by an equation (Equations tab)");
                 } else {
                     let mut edited = shown;
+                    let max = crate::dialogs::MAX_LENGTH;
                     let drag = match d.unit {
-                        DimensionUnit::Count => {
-                            egui::DragValue::new(&mut edited).speed(0.1).max_decimals(0)
-                        }
-                        _ => egui::DragValue::new(&mut edited).speed(0.1),
+                        DimensionUnit::Count => egui::DragValue::new(&mut edited)
+                            .speed(0.1)
+                            .max_decimals(0)
+                            .range(1.0..=1000.0),
+                        _ => egui::DragValue::new(&mut edited)
+                            .speed(0.1)
+                            .range(-max..=max),
                     }
                     .suffix(d.unit.suffix());
                     let response = ui.add(drag);

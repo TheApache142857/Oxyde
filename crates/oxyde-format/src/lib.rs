@@ -16,7 +16,7 @@ pub mod step_import;
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::Path;
 
 use std::collections::HashMap;
@@ -123,6 +123,8 @@ pub enum FormatError {
     InvalidModel(ModelError),
     /// The assembly in the file is inconsistent.
     InvalidAssembly(String),
+    /// What would be saved does not read back (nothing was written).
+    Unreadable(Box<FormatError>),
 }
 
 impl fmt::Display for FormatError {
@@ -141,6 +143,9 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidModel(e) => write!(f, "{e}"),
             FormatError::InvalidAssembly(e) => write!(f, "invalid assembly: {e}"),
+            FormatError::Unreadable(e) => {
+                write!(f, "the file would not open again, so it was not saved: {e}")
+            }
         }
     }
 }
@@ -152,6 +157,7 @@ impl std::error::Error for FormatError {
             FormatError::Archive(e) => Some(e),
             FormatError::Json { source, .. } => Some(source),
             FormatError::InvalidModel(e) => Some(e),
+            FormatError::Unreadable(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -316,30 +322,35 @@ fn read_entry<R: Read + Seek>(
     Ok(bytes)
 }
 
-/// Saves a part to `path`. The file is written next to the target first and then moved
-/// into place, so a failed save never destroys the previous version.
+/// Saves a part to `path`. What is written is read back first: a part that would not open
+/// again (a value that JSON cannot hold, an inconsistent timeline) is refused before the
+/// previous version is touched. The file is then written next to the target, flushed to
+/// disk and moved into place, so a failed save never destroys the previous version.
 pub fn save_part(path: &Path, part: &PartFile) -> Result<(), FormatError> {
-    save_with(path, |file| write_part(file, part))
+    let bytes = write_part(Cursor::new(Vec::new()), part)?.into_inner();
+    read_part(Cursor::new(&bytes)).map_err(|e| FormatError::Unreadable(Box::new(e)))?;
+    write_file(path, &bytes)
 }
 
 /// Saves an assembly to `path`, safely like [`save_part`].
 pub fn save_assembly(path: &Path, assembly: &AssemblyFile) -> Result<(), FormatError> {
-    save_with(path, |file| write_assembly(file, assembly))
+    let bytes = write_assembly(Cursor::new(Vec::new()), assembly)?.into_inner();
+    read_assembly(Cursor::new(&bytes)).map_err(|e| FormatError::Unreadable(Box::new(e)))?;
+    write_file(path, &bytes)
 }
 
-type Writer = BufWriter<File>;
-
-fn save_with(
-    path: &Path,
-    write: impl FnOnce(Writer) -> Result<Writer, FormatError>,
-) -> Result<(), FormatError> {
+/// Writes `bytes` to `path` through a temporary file in the same folder, synced to disk
+/// before it replaces the previous version.
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = std::path::PathBuf::from(temporary);
 
     let result = (|| {
-        let mut file = write(BufWriter::new(File::create(&temporary)?))?;
-        file.flush()?;
+        let mut file = BufWriter::new(File::create(&temporary)?);
+        file.write_all(bytes)?;
+        let file = file.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
         drop(file);
         std::fs::rename(&temporary, path)?;
         Ok(())
@@ -771,6 +782,38 @@ mod tests {
         let loaded = load_part(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, part);
+    }
+
+    #[test]
+    fn a_part_that_would_not_open_again_is_not_saved() {
+        let path = std::env::temp_dir().join(format!(
+            "oxyde-format-unreadable-{}.oxyprt",
+            std::process::id()
+        ));
+        let good = sample();
+        save_part(&path, &good).unwrap();
+        // JSON has no infinity: serde_json would write null, which does not read back.
+        let mut part = Part::from_definition(good.definition.clone()).unwrap();
+        let boss = part.features()[1].id();
+        if let Ok(FeatureKind::Extrude(e)) = part.edit(boss) {
+            e.extent = ExtrudeExtent::Blind {
+                depth: f64::INFINITY,
+            };
+        }
+        let bad = PartFile {
+            definition: part.definition(),
+            ..good.clone()
+        };
+        assert!(matches!(
+            save_part(&path, &bad),
+            Err(FormatError::Unreadable(_))
+        ));
+        // The previous version is untouched, and no temporary file is left behind.
+        assert_eq!(load_part(&path).unwrap(), good);
+        let mut temporary = path.clone().into_os_string();
+        temporary.push(".tmp");
+        assert!(!std::path::Path::new(&temporary).exists());
+        let _ = std::fs::remove_file(&path);
     }
 
     fn sample_assembly() -> AssemblyFile {

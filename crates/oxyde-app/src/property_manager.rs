@@ -183,13 +183,16 @@ pub(crate) fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 fn degrees(ui: &mut egui::Ui, value: &mut f64) {
-    ui.add(egui::DragValue::new(value).speed(1.0).suffix("°"));
-    *value = value.clamp(0.01, 360.0);
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(1.0)
+            .range(0.01..=360.0)
+            .suffix("°"),
+    );
 }
 
 fn count(ui: &mut egui::Ui, value: &mut u32) {
-    ui.add(egui::DragValue::new(value).speed(0.1));
-    *value = (*value).clamp(1, 1000);
+    ui.add(egui::DragValue::new(value).speed(0.1).range(1..=1000));
 }
 
 fn dimension_note(ui: &mut egui::Ui, name: Option<&String>) {
@@ -1195,7 +1198,12 @@ fn ref_plane_body(ui: &mut egui::Ui, d: &mut PlaneDialog) {
     );
     section(ui, "Distance");
     ui.horizontal(|ui| {
-        ui.add(egui::DragValue::new(&mut d.offset).speed(0.1).suffix(" mm"));
+        ui.add(
+            egui::DragValue::new(&mut d.offset)
+                .speed(0.1)
+                .range(-crate::dialogs::MAX_LENGTH..=crate::dialogs::MAX_LENGTH)
+                .suffix(" mm"),
+        );
         dimension_note(ui, d.dimension.as_ref());
     });
     ui.checkbox(&mut d.flip, "Flip offset");

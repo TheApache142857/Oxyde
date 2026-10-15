@@ -133,6 +133,7 @@ impl Expr {
         let mut parser = Parser {
             tokens,
             position: 0,
+            depth: 0,
             resolve,
         };
         let expr = parser.expression()?;
@@ -445,9 +446,16 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
 
 // ---- Parser --------------------------------------------------------------------------------
 
+/// Deepest nesting of parentheses, signs and powers an expression may have. Parsing,
+/// evaluating and printing recurse that deep: a file holding thousands of nested
+/// parentheses must be refused, not overflow the stack.
+const MAX_DEPTH: usize = 200;
+
 struct Parser<'a> {
     tokens: Vec<Token>,
     position: usize,
+    /// Nesting of the `unary` rule being parsed, which every recursion goes through.
+    depth: usize,
     resolve: &'a dyn Fn(&str) -> Option<Operand>,
 }
 
@@ -516,6 +524,16 @@ impl Parser<'_> {
 
     /// unary := ('-' | '+') unary | power
     fn unary(&mut self) -> Result<Expr, String> {
+        if self.depth >= MAX_DEPTH {
+            return Err("the expression is nested too deeply".to_owned());
+        }
+        self.depth += 1;
+        let result = self.signed();
+        self.depth -= 1;
+        result
+    }
+
+    fn signed(&mut self) -> Result<Expr, String> {
         if self.eat('-') {
             return Ok(Expr::Neg(Box::new(self.unary()?)));
         }
@@ -638,6 +656,12 @@ mod tests {
         assert!(eval("sqrt(-1)").is_err());
         assert!(eval("min(1)").unwrap_err().contains("argument"));
         assert!(eval("\"Width").unwrap_err().contains("quote"));
+        // Deep nesting is refused instead of overflowing the stack.
+        let deep = format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(eval(&deep).unwrap_err().contains("nested"));
+        assert!(eval(&"-".repeat(100_000)).unwrap_err().contains("nested"));
+        let fine = format!("{}1{}", "(".repeat(50), ")".repeat(50));
+        assert_eq!(eval(&fine).unwrap(), 1.0);
     }
 
     #[test]

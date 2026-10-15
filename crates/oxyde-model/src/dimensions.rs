@@ -202,6 +202,9 @@ impl Part {
     /// gets its value back from the equation on the next rebuild.
     pub fn set_dimension(&mut self, reference: DimensionRef, value: f64) -> Result<(), ModelError> {
         let unknown = || ModelError::UnknownDimension(format!("{reference:?}"));
+        if !value.is_finite() {
+            return Err(ModelError::Expression(format!("{value} is not a number")));
+        }
         let kind = self.edit(reference.feature)?;
         let changed = match (kind, reference.key) {
             (FeatureKind::Sketch(sketch), DimensionKey::Sketch(id)) => {

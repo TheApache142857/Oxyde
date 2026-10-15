@@ -157,6 +157,12 @@ pub(crate) fn parse_value(text: &str) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
+/// The largest length a value field takes, in mm (a kilometre). Every value field has a
+/// finite range: egui reads typed text with Rust's number parser, which accepts "inf" and
+/// "NaN", and only a finite range brings those back to numbers (a file holding them would
+/// not open again).
+pub(crate) const MAX_LENGTH: f64 = 1.0e6;
+
 /// A value shown for editing: up to four decimals, without trailing zeros.
 pub(crate) fn format_value(value: f64) -> String {
     let text = format!("{value:.4}");
@@ -187,10 +193,12 @@ fn value_field(ui: &mut egui::Ui, text: &mut String, fresh: &mut bool) {
 }
 
 pub(crate) fn positive_length(ui: &mut egui::Ui, value: &mut f64) {
-    ui.add(egui::DragValue::new(value).speed(0.1).suffix(" mm"));
-    if *value < 0.001 {
-        *value = 0.001;
-    }
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.1)
+            .range(0.001..=MAX_LENGTH)
+            .suffix(" mm"),
+    );
 }
 
 pub fn plane_name(plane: StandardPlane) -> &'static str {

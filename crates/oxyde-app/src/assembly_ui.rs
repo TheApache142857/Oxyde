@@ -1016,16 +1016,20 @@ impl OxydeApp {
                             ui.add(
                                 egui::DragValue::new(&mut d.distance)
                                     .speed(0.1)
+                                    .range(0.0..=crate::dialogs::MAX_LENGTH)
                                     .suffix(" mm"),
                             );
-                            d.distance = d.distance.max(0.0);
                         });
                     }
                     MateChoice::Angle => {
                         ui.horizontal(|ui| {
                             ui.label("Angle");
-                            ui.add(egui::DragValue::new(&mut d.angle).speed(0.5).suffix("°"));
-                            d.angle = d.angle.clamp(0.0, 180.0);
+                            ui.add(
+                                egui::DragValue::new(&mut d.angle)
+                                    .speed(0.5)
+                                    .range(0.0..=180.0)
+                                    .suffix("°"),
+                            );
                         });
                     }
                     _ => {}
