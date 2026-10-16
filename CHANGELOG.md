@@ -5,6 +5,25 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Sketch Fillet and Offset Entities (unreleased, October 2026)
+
+- **Sketch Fillet** (Sketch tab): rounds the corner where two lines meet. Set the radius in
+  the tool's window, then click the corner point, or the two lines one after the other; the
+  arc to come is previewed under the cursor. The lines are cut back and an arc tangent to
+  both is put between them, with its radius as a dimension (the next fillets of the same
+  radius are made *equal* to the first instead, as SolidWorks does). A corner that relations
+  or a length dimension refer to is kept as a construction point on both lines (a virtual
+  sharp), and the length goes on measuring to it.
+- **Offset Entities** (Sketch tab): copies of a contour at a distance, as a wall thickness.
+  Click a curve to select the curves joined to it end to end (Ctrl+click adds or removes a
+  chain), set the distance, and click on the side the copy should go, following the dashed
+  preview. Each line is kept parallel to its original, each arc and circle concentric,
+  lines tangent to an arc stay so, and one distance dimension moves the whole offset: the
+  other lines follow it through a new *equal distance* relation (file format:
+  `equal_distance`, FORMAT.md). A closed contour comes out fully defined when its original
+  is; the ends of an open chain are free, to be dimensioned as needed. An arc smaller than
+  the distance, or three selected curves meeting at a point, are refused with a message.
+
 ### Section along a face, parts inside sub-assemblies kept after editing in place (0.0.5, October 2026)
 
 - **Section View along a selected face.** Select a flat face, then Evaluate › Section

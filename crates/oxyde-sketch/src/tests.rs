@@ -645,3 +645,269 @@ fn perpendicular_and_parallel_from_lines_that_start_the_other_way() {
         assert!(off.abs() < 1e-7, "{wanted:?}: {u:?} {v:?}");
     }
 }
+
+// ---- Sketch Fillet and Offset Entities ----------------------------------------------------
+
+fn lines_of(s: &ConstrainedSketch) -> Vec<EntityId> {
+    s.entities()
+        .iter()
+        .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+        .map(|e| e.id)
+        .collect()
+}
+
+fn arcs_of(s: &ConstrainedSketch) -> Vec<EntityId> {
+    s.entities()
+        .iter()
+        .filter(|e| matches!(e.geometry, Geometry::Arc { .. }))
+        .map(|e| e.id)
+        .collect()
+}
+
+#[test]
+fn a_fillet_rounds_a_corner_with_an_arc_tangent_to_both_lines() {
+    let mut s = ConstrainedSketch::new();
+    let [_, right, top, _] = s.rectangle(Point2::ORIGIN, 10.0, 5.0);
+    let corner = s.shared_corner(right, top).unwrap();
+    assert_eq!(s.corner_lines(corner), Some((right, top)));
+    let preview = s.fillet_preview(right, top, 2.0).unwrap();
+    assert!(
+        preview
+            .iter()
+            .all(|p| (p.distance(Point2::new(8.0, 3.0)) - 2.0).abs() < 1e-9)
+    );
+
+    let arc = s.fillet(right, top, 2.0).unwrap();
+    assert!(s.entity(corner).is_none(), "a free corner goes");
+    let Geometry::Arc { center, start, end } = s.entity(arc).unwrap().geometry else {
+        panic!("not an arc");
+    };
+    assert!(close(s.position(center).unwrap(), 8.0, 3.0));
+    // Counter-clockwise from the right line's new end to the top line's.
+    assert!(close(s.position(start).unwrap(), 10.0, 3.0));
+    assert!(close(s.position(end).unwrap(), 8.0, 5.0));
+    assert_eq!(s.endpoints(right).unwrap().1, start);
+    assert_eq!(s.endpoints(top).unwrap().0, end);
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == Tangent(right, arc))
+    );
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == Tangent(top, arc))
+    );
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    // Position, size, and the radius.
+    assert_eq!(report.degrees_of_freedom, 5);
+    s.constrain(Radius(arc, 2.0));
+    assert_eq!(s.solve().unwrap().degrees_of_freedom, 4);
+    // Too big for the lines, or lines that do not meet: refused.
+    assert!(s.fillet(right, top, 20.0).is_none());
+    let [bottom, ..] = s.rectangle(Point2::new(50.0, 50.0), 4.0, 4.0);
+    assert!(s.fillet(right, bottom, 1.0).is_none());
+}
+
+#[test]
+fn a_fillet_keeps_a_dimensioned_corner_as_a_virtual_sharp() {
+    let mut s = ConstrainedSketch::new();
+    let [bottom, right, ..] = anchored_rectangle(&mut s);
+    s.constrain(Length(bottom, 40.0));
+    s.constrain(Length(right, 20.0));
+    assert_eq!(s.solve().unwrap().degrees_of_freedom, 0);
+    let corner = s.shared_corner(bottom, right).unwrap();
+    let (origin, _) = s.endpoints(bottom).unwrap();
+
+    let arc = s.fillet(bottom, right, 5.0).unwrap();
+    let sharp = s.entity(corner).expect("kept");
+    assert!(sharp.construction);
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == PointOnLine(corner, bottom))
+    );
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == PointOnLine(corner, right))
+    );
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == Distance(origin, corner, 40.0)),
+        "the length goes on measuring to the corner"
+    );
+    assert!(
+        !s.relations()
+            .iter()
+            .any(|r| matches!(r.constraint, Length(..)))
+    );
+    s.constrain(Radius(arc, 5.0));
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    assert!(close(s.position(corner).unwrap(), 40.0, 0.0));
+    let (_, cut) = s.endpoints(bottom).unwrap();
+    assert!(close(s.position(cut).unwrap(), 35.0, 0.0));
+}
+
+#[test]
+fn offsetting_a_rectangle_makes_a_fully_defined_copy_one_value_moves() {
+    let mut s = ConstrainedSketch::new();
+    let lines = anchored_rectangle(&mut s);
+    s.constrain(Length(lines[0], 40.0));
+    s.constrain(Length(lines[1], 20.0));
+    s.solve().unwrap();
+    assert_eq!(s.chain_of(lines[2]).len(), 4);
+    // Left of the bottom line, walked from the origin: inside.
+    let created = s.offset(&lines, 3.0).unwrap();
+    assert_eq!(created.len(), 4);
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    let corners: Vec<Point2> = s
+        .entities()
+        .iter()
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert!(corners.iter().any(|p| close(*p, 3.0, 3.0)));
+    assert!(corners.iter().any(|p| close(*p, 37.0, 17.0)));
+    // The one distance dimension moves every line.
+    let dimension = s
+        .relations()
+        .iter()
+        .find(|r| matches!(r.constraint, LineDistance(..)))
+        .unwrap()
+        .id;
+    assert_eq!(
+        s.relations()
+            .iter()
+            .filter(|r| matches!(r.constraint, EqualDistance(..)))
+            .count(),
+        3
+    );
+    assert!(s.set_dimension(dimension, 5.0));
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    let corners: Vec<Point2> = s
+        .entities()
+        .iter()
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert!(corners.iter().any(|p| close(*p, 5.0, 5.0)));
+    assert!(corners.iter().any(|p| close(*p, 35.0, 15.0)));
+    // The other way: outside.
+    let outside = s.offset(&lines, -2.0).unwrap();
+    assert_eq!(outside.len(), 4);
+    assert!(s.solve().unwrap().converged);
+    assert!(
+        s.entities()
+            .iter()
+            .any(|e| matches!(e.geometry, Geometry::Point(p) if close(p, -2.0, -2.0)))
+    );
+}
+
+#[test]
+fn offsetting_a_rounded_contour_keeps_it_tangent_and_concentric() {
+    let mut s = ConstrainedSketch::new();
+    let [bottom, right, top, left] = anchored_rectangle(&mut s);
+    s.constrain(Length(bottom, 40.0));
+    s.constrain(Length(right, 20.0));
+    let arc = s.fillet(right, top, 5.0).unwrap();
+    s.constrain(Radius(arc, 5.0));
+    assert_eq!(s.solve().unwrap().degrees_of_freedom, 0);
+    let contour = [bottom, right, arc, top, left];
+    assert_eq!(s.chain_of(arc).len(), 5);
+    let before = s.entities().len();
+    let created = s.offset(&contour, 2.0).unwrap();
+    assert_eq!(created.len(), 5);
+    assert_eq!(
+        s.entities().len(),
+        before + 5 + 5,
+        "five curves and five points: the centre is shared"
+    );
+    let report = s.solve().unwrap();
+    assert!(
+        report.converged && report.degrees_of_freedom == 0,
+        "{report:?}"
+    );
+    let inner = arcs_of(&s).into_iter().find(|a| *a != arc).unwrap();
+    let Geometry::Arc { center, start, .. } = s.entity(inner).unwrap().geometry else {
+        panic!()
+    };
+    assert_eq!(center, center_of(&s, arc), "concentric");
+    assert!(
+        (s.position(center)
+            .unwrap()
+            .distance(s.position(start).unwrap())
+            - 3.0)
+            .abs()
+            < 1e-9
+    );
+    assert_eq!(
+        s.relations()
+            .iter()
+            .filter(|r| matches!(r.constraint, Tangent(_, a) if a == inner))
+            .count(),
+        2
+    );
+    // An arc smaller than the offset cannot be made.
+    assert!(s.offset(&contour, 6.0).is_none());
+}
+
+#[test]
+fn offsetting_a_circle_and_an_open_chain() {
+    let mut s = ConstrainedSketch::new();
+    let circle = s.circle(Point2::new(5.0, 5.0), 10.0);
+    assert_eq!(s.chain_of(circle), vec![circle]);
+    // Negative: outwards.
+    let created = s.offset(&[circle], -4.0).unwrap();
+    let Geometry::Circle { center, radius } = s.entity(created[0]).unwrap().geometry else {
+        panic!()
+    };
+    assert_eq!(center, center_of(&s, circle));
+    assert!((radius - 14.0).abs() < 1e-9);
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == Radius(created[0], 14.0))
+    );
+
+    // An L of two lines, offset to the outside of the corner: the lines are extended to meet.
+    let a = s.line(Point2::new(100.0, 0.0), Point2::new(110.0, 0.0));
+    let tip = s.point(Point2::new(110.0, 10.0));
+    let b = s.line_between(s.endpoints(a).unwrap().1, tip);
+    assert_eq!(s.chain_of(a).len(), 2);
+    let created = s.offset(&[a, b], -2.0).unwrap();
+    assert_eq!(created.len(), 2);
+    assert!(s.solve().unwrap().converged);
+    assert!(
+        s.entities()
+            .iter()
+            .any(|e| matches!(e.geometry, Geometry::Point(p) if close(p, 112.0, -2.0))),
+        "the corner of the offset"
+    );
+    assert_eq!(lines_of(&s).len(), 4);
+
+    // Three curves meeting at a point cannot be offset together; a point is no chain.
+    let away = s.point(Point2::new(120.0, -5.0));
+    let c = s.line_between(s.endpoints(a).unwrap().1, away);
+    assert!(s.offset(&[a, b, c], 1.0).is_none());
+    assert_eq!(s.chain_of(a), vec![a], "the chain stops at the junction");
+    assert!(s.chain_of(s.endpoints(a).unwrap().0).is_empty());
+}

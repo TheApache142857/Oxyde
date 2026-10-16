@@ -102,13 +102,15 @@ pub enum Tool {
     Circle,
     Arc,
     Trim,
+    Fillet,
+    Offset,
     Convert,
     Mirror,
 }
 
 impl Tool {
     /// The tools of the Sketch tab, in order, with icon and label.
-    pub const ALL: [(Tool, Icon, &'static str); 11] = [
+    pub const ALL: [(Tool, Icon, &'static str); 13] = [
         (Tool::Select, Icon::Select, "Select"),
         (Tool::Dimension, Icon::SmartDimension, "Smart Dimension"),
         (Tool::Line, Icon::Line, "Line"),
@@ -122,6 +124,8 @@ impl Tool {
         (Tool::Circle, Icon::Circle, "Circle"),
         (Tool::Arc, Icon::Arc, "Arc"),
         (Tool::Trim, Icon::Trim, "Trim"),
+        (Tool::Fillet, Icon::SketchFillet, "Sketch Fillet"),
+        (Tool::Offset, Icon::Offset, "Offset Entities"),
         (Tool::Convert, Icon::Convert, "Convert Entities"),
         (Tool::Mirror, Icon::Mirror, "Mirror Entities"),
     ];
@@ -153,6 +157,12 @@ impl Tool {
             Tool::Circle => "Click the centre, then a point on the circle",
             Tool::Arc => "Click the centre, the start, then the end (counter-clockwise)",
             Tool::Trim => "Click the piece of a curve to remove, up to the nearest crossings",
+            Tool::Fillet => {
+                "Click the corner point where two lines meet, or the two lines one after the other"
+            }
+            Tool::Offset => {
+                "Click a curve to select its chain (Ctrl+click adds), then click on the side to offset to"
+            }
             Tool::Convert => {
                 "Click an edge of the part lying in the sketch plane to copy it into the sketch"
             }
@@ -245,6 +255,14 @@ pub struct SketchSession {
     drag: Option<Drag>,
     labels: Vec<(Rect, RelationId)>,
     history: Vec<ConstrainedSketch>,
+    /// The radius and distance typed in the Sketch Fillet and Offset Entities windows.
+    pub fillet_text: String,
+    pub offset_text: String,
+    /// The last fillet arc and its radius: the next fillet of the same radius is made
+    /// equal to it instead of getting a dimension of its own.
+    last_fillet: Option<(EntityId, f64)>,
+    /// What the tool would make at the cursor, drawn dashed.
+    preview: Vec<Vec<Point2>>,
 }
 
 impl SketchSession {
@@ -286,6 +304,10 @@ impl SketchSession {
             drag: None,
             labels: Vec::new(),
             history: Vec::new(),
+            fillet_text: "5".to_owned(),
+            offset_text: "10".to_owned(),
+            last_fillet: None,
+            preview: Vec::new(),
         };
         session.solve();
         session
@@ -340,8 +362,10 @@ impl SketchSession {
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending.clear();
-        // Mirror keeps the selection: it is what gets mirrored.
-        if tool == Tool::Dimension || tool.draws() || tool == Tool::Trim {
+        self.preview.clear();
+        self.last_fillet = None;
+        // Mirror and Offset keep the selection: it is what gets mirrored or offset.
+        if tool == Tool::Dimension || tool.draws() || matches!(tool, Tool::Trim | Tool::Fillet) {
             self.selection.clear();
         }
     }
@@ -561,6 +585,176 @@ impl SketchSession {
             self.message = Some("Trimming there conflicts with the existing relations".to_owned());
         }
         self.selection.clear();
+    }
+
+    /// The radius typed in the Sketch Fillet window.
+    fn fillet_radius(&self) -> Option<f64> {
+        parse_length(&self.fillet_text)
+    }
+
+    /// The distance typed in the Offset Entities window.
+    fn offset_distance(&self) -> Option<f64> {
+        parse_length(&self.offset_text)
+    }
+
+    /// What Sketch Fillet works on under the cursor: a corner point where two lines meet,
+    /// else a line.
+    fn fillet_hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<EntityId> {
+        if let Some(point) = self.nearest_point(pos, to_screen)
+            && self.sketch.corner_lines(point).is_some()
+        {
+            return Some(point);
+        }
+        self.curve_hit(pos, to_screen).filter(|id| {
+            matches!(
+                self.sketch.entity(*id).map(|e| e.geometry),
+                Some(Geometry::Line { .. })
+            )
+        })
+    }
+
+    /// The arc Sketch Fillet would make for the entity under the cursor.
+    fn fillet_preview_for(&self, hit: EntityId) -> Vec<Vec<Point2>> {
+        let Some(radius) = self.fillet_radius() else {
+            return Vec::new();
+        };
+        let pair = match self.sketch.corner_lines(hit) {
+            Some(pair) => Some(pair),
+            None => self
+                .selection
+                .first()
+                .copied()
+                .filter(|first| self.sketch.shared_corner(*first, hit).is_some())
+                .map(|first| (first, hit)),
+        };
+        pair.and_then(|(a, b)| self.sketch.fillet_preview(a, b, radius))
+            .into_iter()
+            .collect()
+    }
+
+    /// Sketch Fillet: a click on a corner point rounds it; a click on a line, then on a
+    /// line meeting it, rounds their corner.
+    fn click_fillet(&mut self, hit: Option<EntityId>) {
+        let Some(id) = hit else {
+            self.selection.clear();
+            return;
+        };
+        if let Some((a, b)) = self.sketch.corner_lines(id) {
+            self.selection.clear();
+            self.apply_fillet(a, b);
+            return;
+        }
+        match self.selection.first().copied() {
+            Some(first) if first != id && self.sketch.shared_corner(first, id).is_some() => {
+                self.selection.clear();
+                self.apply_fillet(first, id);
+            }
+            _ => self.selection = vec![id],
+        }
+    }
+
+    fn apply_fillet(&mut self, first: EntityId, second: EntityId) {
+        let Some(radius) = self.fillet_radius() else {
+            self.message = Some("Type a radius in the Sketch Fillet window".to_owned());
+            return;
+        };
+        self.checkpoint();
+        let previous = self.sketch.clone();
+        let Some(arc) = self.sketch.fillet(first, second, radius) else {
+            self.history.pop();
+            self.message = Some("No room there for a fillet of that radius".to_owned());
+            return;
+        };
+        // The first fillet gets the radius as a dimension; the next ones of the same radius
+        // are made equal to it, as SolidWorks does.
+        match self.last_fillet {
+            Some((earlier, r)) if r == radius && self.sketch.entity(earlier).is_some() => {
+                self.sketch.constrain(Constraint::EqualRadius(earlier, arc));
+            }
+            _ => {
+                self.sketch.constrain(Constraint::Radius(arc, radius));
+                self.last_fillet = Some((arc, radius));
+            }
+        }
+        if !self.solve() {
+            self.sketch = previous;
+            self.history.pop();
+            self.solve();
+            self.message = Some("That fillet conflicts with the existing relations".to_owned());
+        }
+    }
+
+    /// Offset Entities: a click on a curve selects the curves joined to it (Ctrl+click adds
+    /// or removes a chain); a click elsewhere makes the offset on that side of the selection.
+    fn click_offset(&mut self, hit: Option<EntityId>, additive: bool, cursor: Option<Point2>) {
+        match hit {
+            Some(id) => {
+                let chain = self.sketch.chain_of(id);
+                if chain.is_empty() {
+                    return;
+                }
+                if !additive {
+                    self.selection = chain;
+                } else if chain.iter().all(|c| self.selection.contains(c)) {
+                    self.selection.retain(|s| !chain.contains(s));
+                } else {
+                    for c in chain {
+                        if !self.selection.contains(&c) {
+                            self.selection.push(c);
+                        }
+                    }
+                }
+            }
+            None => {
+                if let (false, Some(at)) = (self.selection.is_empty(), cursor) {
+                    self.apply_offset(at);
+                }
+            }
+        }
+    }
+
+    /// The signed distance that puts the offset of the selection on the cursor's side.
+    fn offset_towards(&self, cursor: Point2) -> Option<f64> {
+        let by = self.offset_distance()?;
+        let nearest = |sign: f64| -> Option<f64> {
+            self.sketch
+                .offset_preview(&self.selection, sign * by)?
+                .iter()
+                .flat_map(|polyline| polyline.windows(2))
+                .map(|w| plane_segment_distance(cursor, w[0], w[1]))
+                .min_by(f64::total_cmp)
+        };
+        match (nearest(1.0), nearest(-1.0)) {
+            (Some(left), Some(right)) => Some(if left <= right { by } else { -by }),
+            (Some(_), None) => Some(by),
+            (None, Some(_)) => Some(-by),
+            (None, None) => None,
+        }
+    }
+
+    fn apply_offset(&mut self, cursor: Point2) {
+        let Some(by) = self.offset_towards(cursor) else {
+            self.message = Some(if self.offset_distance().is_none() {
+                "Type a distance in the Offset Entities window".to_owned()
+            } else {
+                "Those entities cannot be offset: select curves joined end to end".to_owned()
+            });
+            return;
+        };
+        self.checkpoint();
+        let previous = self.sketch.clone();
+        match self.sketch.offset(&self.selection, by) {
+            Some(created) if self.solve() => {
+                self.message = Some(format!("Offset {} entities", created.len()));
+                self.selection.clear();
+            }
+            _ => {
+                self.sketch = previous;
+                self.history.pop();
+                self.solve();
+                self.message = Some("That offset conflicts with the existing relations".to_owned());
+            }
+        }
     }
 
     /// Selected points, lines, and circles/arcs.
@@ -906,7 +1100,13 @@ impl SketchSession {
     fn click_tool(&mut self, p: Pending) {
         let relations_before = self.sketch.relations().len();
         match self.tool {
-            Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert | Tool::Mirror => {}
+            Tool::Select
+            | Tool::Dimension
+            | Tool::Trim
+            | Tool::Fillet
+            | Tool::Offset
+            | Tool::Convert
+            | Tool::Mirror => {}
             Tool::CenterRectangle => match self.pending.first().copied() {
                 None => self.pending = vec![p],
                 Some(center) => {
@@ -1374,6 +1574,17 @@ impl SketchSession {
             ));
         }
 
+        // Sketch Fillet's arc, or Offset Entities' copies, as they would be made.
+        for polyline in &self.preview {
+            let path: Vec<Pos2> = polyline.iter().map(|p| to_screen(*p)).collect();
+            painter.extend(Shape::dashed_line(
+                &path,
+                Stroke::new(1.5_f32, ink_preview()),
+                5.0,
+                3.0,
+            ));
+        }
+
         // The shape in progress.
         let cursor = snapped.map(|(p, _)| p).or(cursor);
         let dashed = Stroke::new(1.2_f32, ink_preview());
@@ -1446,7 +1657,13 @@ impl SketchSession {
                     };
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                 }
-                Tool::Select | Tool::Dimension | Tool::Trim | Tool::Convert | Tool::Mirror => {}
+                Tool::Select
+                | Tool::Dimension
+                | Tool::Trim
+                | Tool::Fillet
+                | Tool::Offset
+                | Tool::Convert
+                | Tool::Mirror => {}
             }
         }
 
@@ -1888,7 +2105,8 @@ pub fn interact(
     };
     session.hover = match (session.drag, pointer, session.tool) {
         (_, _, Tool::Convert) => None,
-        (None, Some(p), Tool::Trim) => session.curve_hit(p, &to_screen),
+        (None, Some(p), Tool::Trim | Tool::Offset) => session.curve_hit(p, &to_screen),
+        (None, Some(p), Tool::Fillet) => session.fillet_hit(p, &to_screen),
         (None, Some(p), tool) if !tool.draws() => session.hit(p, &to_screen),
         _ => None,
     };
@@ -1902,6 +2120,15 @@ pub fn interact(
     let trimmed = match (session.tool, session.hover, cursor) {
         (Tool::Trim, Some(curve), Some(at)) => session.sketch.trim_preview(curve, at),
         _ => None,
+    };
+
+    session.preview = match (session.tool, session.hover, cursor) {
+        (Tool::Fillet, Some(id), _) => session.fillet_preview_for(id),
+        (Tool::Offset, _, Some(at)) if !session.selection.is_empty() => session
+            .offset_towards(at)
+            .and_then(|by| session.sketch.offset_preview(&session.selection, by))
+            .unwrap_or_default(),
+        _ => Vec::new(),
     };
 
     // Dimension labels: a click selects, a double click edits the value.
@@ -1952,6 +2179,14 @@ pub fn interact(
                     let hit = session.hit(pos, &to_screen);
                     session.click_mirror(hit, additive);
                 }
+                Tool::Fillet => {
+                    let hit = session.hover;
+                    session.click_fillet(hit);
+                }
+                Tool::Offset => {
+                    let hit = session.hover;
+                    session.click_offset(hit, additive, cursor);
+                }
                 _ => {
                     if let Some((at, snap)) = snapped {
                         session.click_tool(Pending { at, snap });
@@ -1961,9 +2196,72 @@ pub fn interact(
         }
     }
 
+    tool_window(session, ui.ctx(), out.rect);
     let painter = ui.painter_at(out.rect);
     session.draw(&painter, &to_screen, cursor, pointer, snapped, trimmed);
     request
+}
+
+/// The window of a tool with a value: the fillet radius or the offset distance.
+fn tool_window(session: &mut SketchSession, ctx: &egui::Context, viewport: Rect) {
+    let (title, label, hint) = match session.tool {
+        Tool::Fillet => (
+            "Sketch Fillet",
+            "Radius",
+            "Click a corner point, or two lines meeting there",
+        ),
+        Tool::Offset => (
+            "Offset Entities",
+            "Distance",
+            "Click a curve for its chain, then the side to offset to",
+        ),
+        _ => return,
+    };
+    let text = match session.tool {
+        Tool::Fillet => &mut session.fillet_text,
+        _ => &mut session.offset_text,
+    };
+    egui::Window::new(title)
+        .id(egui::Id::new("sketch_tool_window"))
+        .fixed_pos(viewport.left_top() + Vec2::new(12.0, 12.0))
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.add(egui::TextEdit::singleline(text).desired_width(70.0));
+                ui.label("mm");
+            });
+            if parse_length(text).is_none() {
+                ui.label(
+                    egui::RichText::new("Type a length")
+                        .small()
+                        .color(ui.visuals().error_fg_color),
+                );
+            }
+            ui.label(egui::RichText::new(hint).weak().small());
+        });
+}
+
+/// A length typed by the user, in mm; a decimal comma is accepted.
+fn parse_length(text: &str) -> Option<f64> {
+    text.trim()
+        .replace(',', ".")
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// Distance from a point to a segment, in the sketch plane.
+fn plane_segment_distance(p: Point2, a: Point2, b: Point2) -> f64 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 < 1e-24 {
+        0.0
+    } else {
+        (((p.x - a.x) * dx + (p.y - a.y) * dy) / length2).clamp(0.0, 1.0)
+    };
+    p.distance(Point2::new(a.x + dx * t, a.y + dy * t))
 }
 
 #[cfg(test)]
@@ -2305,6 +2603,85 @@ mod tests {
             .count();
         assert_eq!(circles, 2);
         assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn sketch_fillet_dimensions_the_first_arc_and_makes_the_next_equal() {
+        let mut s = ConstrainedSketch::new();
+        let [bottom, right, top, left] = s.rectangle(Point2::ORIGIN, 20.0, 10.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Fillet);
+        session.fillet_text = "3".to_owned();
+        let corner = session.sketch.shared_corner(right, top).unwrap();
+        session.click_fillet(Some(corner));
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::Radius(_, r) if (*r - 3.0).abs() < 1e-9)
+        ));
+        // Two lines, one after the other.
+        session.click_fillet(Some(left));
+        assert_eq!(session.selection, vec![left]);
+        session.click_fillet(Some(bottom));
+        assert!(session.selection.is_empty());
+        assert!(has(&session, |c| matches!(c, Constraint::EqualRadius(..))));
+        let arcs = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Arc { .. }))
+            .count();
+        assert_eq!(arcs, 2);
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        assert_eq!(
+            report.degrees_of_freedom, 4,
+            "position and size; the fillets are tied"
+        );
+        // No room: refused, nothing changed.
+        let before = session.sketch.clone();
+        session.fillet_text = "50".to_owned();
+        session.click_fillet(Some(session.sketch.shared_corner(bottom, right).unwrap()));
+        assert_eq!(session.sketch, before);
+        assert!(session.message.is_some());
+    }
+
+    #[test]
+    fn offset_tool_selects_a_chain_and_offsets_towards_the_click() {
+        let mut s = ConstrainedSketch::new();
+        let [_, _, top, _] = s.rectangle(Point2::ORIGIN, 20.0, 10.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Offset);
+        session.offset_text = "2".to_owned();
+        session.click_offset(Some(top), false, None);
+        assert_eq!(session.selection.len(), 4);
+        // Ctrl+click on a selected chain takes it out again, and back in.
+        session.click_offset(Some(top), true, None);
+        assert!(session.selection.is_empty());
+        session.click_offset(Some(top), true, None);
+        assert_eq!(session.selection.len(), 4);
+        // A click inside: the copy goes inside.
+        session.click_offset(None, false, Some(Point2::new(10.0, 5.0)));
+        assert!(session.selection.is_empty());
+        let lines = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .count();
+        assert_eq!(lines, 8);
+        assert!(session.sketch.entities().iter().any(
+            |e| matches!(e.geometry, Geometry::Point(p) if p.distance(Point2::new(2.0, 2.0)) < 1e-9)
+        ));
+        assert!(has(&session, |c| matches!(c, Constraint::LineDistance(..))));
+        assert!(session.report.as_ref().unwrap().converged);
+        assert!(session.undo());
+        let lines = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .count();
+        assert_eq!(lines, 4);
     }
 
     #[test]

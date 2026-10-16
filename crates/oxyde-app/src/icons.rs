@@ -54,6 +54,8 @@ pub enum Icon {
     Arc,
     SmartDimension,
     Trim,
+    SketchFillet,
+    Offset,
     Convert,
     Construction,
     ExitSketch,
@@ -626,6 +628,37 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.line(&[(16.0, 16.8), (20.5, 9.0)], 1.4, INK);
             pen.line(&[(19.0, 16.8), (14.5, 9.0)], 1.4, INK);
         }
+        SketchFillet => {
+            // A corner cut back to a tangent arc; the sharp corner it replaced, dashed.
+            pen.dashed(
+                &[(10.0, 20.0), (3.0, 20.0), (3.0, 13.0)],
+                1.0,
+                INK,
+                2.0,
+                1.5,
+            );
+            pen.line(&[(21.0, 20.0), (10.0, 20.0)], 2.0, SKETCH);
+            pen.line(&[(3.0, 13.0), (3.0, 3.0)], 2.0, SKETCH);
+            pen.arc(10.0, 13.0, 7.0, FRAC_PI_2, PI, 2.0, ACCENT);
+            pen.vertex(10.0, 20.0, INK);
+            pen.vertex(3.0, 13.0, INK);
+        }
+        Offset => {
+            // A contour and its copy at a distance inside it.
+            pen.closed(
+                &[(2.0, 3.0), (22.0, 3.0), (22.0, 21.0), (2.0, 21.0)],
+                2.0,
+                SKETCH,
+            );
+            pen.closed(
+                &[(7.0, 8.0), (17.0, 8.0), (17.0, 16.0), (7.0, 16.0)],
+                1.8,
+                ACCENT,
+            );
+            pen.line(&[(2.0, 12.0), (7.0, 12.0)], 1.0, INK);
+            pen.head((2.5, 12.0), -1.0, 0.0, 3.0, INK);
+            pen.head((6.5, 12.0), 1.0, 0.0, 3.0, INK);
+        }
         Construction => {
             pen.dashed(
                 &Pen::arc_points(12.0, 12.0, 8.5, 8.5, 0.0, TAU),
@@ -791,9 +824,21 @@ fn draw(pen: &Pen, icon: Icon) {
         SectionView => {
             // The kept half of a block, its cut face in the section colour, and the
             // plane as a line where the other half was.
-            pen.poly(&[(3.0, 9.0), (12.0, 9.0), (12.0, 21.0), (3.0, 21.0)], BODY, INK);
-            pen.poly(&[(3.0, 9.0), (7.0, 4.0), (16.0, 4.0), (12.0, 9.0)], BODY_TOP, INK);
-            pen.poly(&[(12.0, 9.0), (16.0, 4.0), (16.0, 16.0), (12.0, 21.0)], ACCENT, INK);
+            pen.poly(
+                &[(3.0, 9.0), (12.0, 9.0), (12.0, 21.0), (3.0, 21.0)],
+                BODY,
+                INK,
+            );
+            pen.poly(
+                &[(3.0, 9.0), (7.0, 4.0), (16.0, 4.0), (12.0, 9.0)],
+                BODY_TOP,
+                INK,
+            );
+            pen.poly(
+                &[(12.0, 9.0), (16.0, 4.0), (16.0, 16.0), (12.0, 21.0)],
+                ACCENT,
+                INK,
+            );
             pen.line(&[(19.5, 2.0), (19.5, 22.0)], 1.2, INK);
         }
         Equations => {
@@ -1011,7 +1056,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 60] = {
+pub const ALL: [Icon; 62] = {
     use Icon::*;
     [
         Sketch,
@@ -1049,6 +1094,8 @@ pub const ALL: [Icon; 60] = {
         Arc,
         SmartDimension,
         Trim,
+        SketchFillet,
+        Offset,
         Convert,
         Construction,
         ExitSketch,

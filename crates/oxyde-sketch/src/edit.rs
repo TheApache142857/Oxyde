@@ -9,22 +9,22 @@ use oxyde_geom::Point2;
 use crate::sketch::{ConstrainedSketch, Constraint, Entity, EntityId, Geometry, curve_points};
 
 /// Two points closer than this are the same point.
-const TOLERANCE: f64 = 1e-6;
+pub(crate) const TOLERANCE: f64 = 1e-6;
 
 /// A curve as plain geometry, for intersection and projection.
 #[derive(Debug, Clone, Copy)]
-enum Curve {
+pub(crate) enum Curve {
     Segment(Point2, Point2),
     Circle(Point2, f64),
     /// Centre, radius, start angle and counter-clockwise sweep.
     Arc(Point2, f64, f64, f64),
 }
 
-fn angle_of(center: Point2, p: Point2) -> f64 {
+pub(crate) fn angle_of(center: Point2, p: Point2) -> f64 {
     (p.y - center.y).atan2(p.x - center.x)
 }
 
-fn on_circle(center: Point2, radius: f64, angle: f64) -> Point2 {
+pub(crate) fn on_circle(center: Point2, radius: f64, angle: f64) -> Point2 {
     Point2::new(
         center.x + radius * angle.cos(),
         center.y + radius * angle.sin(),
@@ -132,20 +132,20 @@ impl Curve {
     }
 }
 
-enum Carrier {
+pub(crate) enum Carrier {
     /// Point and direction.
     Line(Point2, (f64, f64)),
     Circle(Point2, f64),
 }
 
-fn carrier(curve: &Curve) -> Carrier {
+pub(crate) fn carrier(curve: &Curve) -> Carrier {
     match *curve {
         Curve::Segment(a, b) => Carrier::Line(a, (b.x - a.x, b.y - a.y)),
         Curve::Circle(c, r) | Curve::Arc(c, r, _, _) => Carrier::Circle(c, r),
     }
 }
 
-fn line_line(p: Point2, d: (f64, f64), q: Point2, e: (f64, f64)) -> Vec<Point2> {
+pub(crate) fn line_line(p: Point2, d: (f64, f64), q: Point2, e: (f64, f64)) -> Vec<Point2> {
     let cross = d.0 * e.1 - d.1 * e.0;
     let scale = (d.0.hypot(d.1) * e.0.hypot(e.1)).max(1e-24);
     if cross.abs() < 1e-12 * scale {
@@ -155,7 +155,7 @@ fn line_line(p: Point2, d: (f64, f64), q: Point2, e: (f64, f64)) -> Vec<Point2> 
     vec![Point2::new(p.x + d.0 * t, p.y + d.1 * t)]
 }
 
-fn line_circle(p: Point2, d: (f64, f64), c: Point2, r: f64) -> Vec<Point2> {
+pub(crate) fn line_circle(p: Point2, d: (f64, f64), c: Point2, r: f64) -> Vec<Point2> {
     let length = d.0.hypot(d.1);
     if length < 1e-12 {
         return Vec::new();
@@ -178,7 +178,7 @@ fn line_circle(p: Point2, d: (f64, f64), c: Point2, r: f64) -> Vec<Point2> {
     }
 }
 
-fn circle_circle(c1: Point2, r1: f64, c2: Point2, r2: f64) -> Vec<Point2> {
+pub(crate) fn circle_circle(c1: Point2, r1: f64, c2: Point2, r2: f64) -> Vec<Point2> {
     let d = c1.distance(c2);
     if d < 1e-12 || d > r1 + r2 + TOLERANCE || d < (r1 - r2).abs() - TOLERANCE {
         return Vec::new();

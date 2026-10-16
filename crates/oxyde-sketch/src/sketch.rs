@@ -87,6 +87,9 @@ pub enum Constraint {
     LineDistance(EntityId, EntityId, f64),
     /// Two points mirror images of each other about a line (its infinite extension).
     Symmetric(EntityId, EntityId, EntityId),
+    /// Line `a` lies as far from line `b` as line `c` from line `d` (each measured as
+    /// `LineDistance`): the lines of an offset keep one distance.
+    EqualDistance(EntityId, EntityId, EntityId, EntityId),
 }
 
 impl Constraint {
@@ -111,6 +114,7 @@ impl Constraint {
             | PointLineDistance(a, b, _)
             | LineDistance(a, b, _) => vec![a, b],
             Symmetric(a, b, line) => vec![a, b, line],
+            EqualDistance(a, b, c, d) => vec![a, b, c, d],
         }
     }
 }
@@ -813,6 +817,11 @@ impl ConstrainedSketch {
                     layout.expect(l, Kind::Line, i)?;
                     layout.expect(r, Kind::Round, i)?;
                 }
+                EqualDistance(a, b, c, d) => {
+                    for l in [a, b, c, d] {
+                        layout.expect(l, Kind::Line, i)?;
+                    }
+                }
             }
             if let Fixed(p) = *c {
                 layout.fixed.push(p);
@@ -1189,6 +1198,16 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
         }
     }
 
+    /// The end point a line and an arc share, if any.
+    fn shared_end(&self, line: EntityId, round: EntityId) -> Option<EntityId> {
+        match (self.layout.kind[&line], self.layout.kind[&round]) {
+            (Geometry::Line { start: s, end: e }, Geometry::Arc { start, end, .. }) => {
+                [s, e].into_iter().find(|p| *p == start || *p == end)
+            }
+            _ => None,
+        }
+    }
+
     /// The implicit equation of an arc: its two ends at the same distance from its centre.
     pub fn arc(&self, id: EntityId, out: &mut Vec<T>) {
         if let Geometry::Arc { center, start, end } = self.layout.kind[&id] {
@@ -1260,7 +1279,17 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
             Tangent(l, r) => {
                 let (s, e) = self.line(l);
                 let (c, radius) = self.round(r);
-                out.push(across(c, s, (e.0 - s.0, e.1 - s.1)).abs() - radius);
+                let d = (e.0 - s.0, e.1 - s.1);
+                match self.shared_end(l, r) {
+                    // Where the line ends on the arc, the distance from the centre to the
+                    // line is at its largest there, the radius, with no slope: the radius
+                    // to that end is made square to the line instead.
+                    Some(p) => {
+                        let p = self.point(p);
+                        out.push((d.0 * (p.0 - c.0) + d.1 * (p.1 - c.1)) / length(d));
+                    }
+                    None => out.push(across(c, s, d).abs() - radius),
+                }
             }
             PointLineDistance(p, l, value) => {
                 let (s, e) = self.line(l);
@@ -1282,6 +1311,16 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
                 let m = ((a0.0 + a1.0) * half, (a0.1 + a1.1) * half);
                 let (s, e) = self.line(b);
                 out.push(across(m, s, (e.0 - s.0, e.1 - s.1)).abs() - k(value));
+            }
+            EqualDistance(a, b, c, d) => {
+                let gap = |first: EntityId, second: EntityId| {
+                    let (a0, a1) = self.line(first);
+                    let half = k(0.5);
+                    let m = ((a0.0 + a1.0) * half, (a0.1 + a1.1) * half);
+                    let (s, e) = self.line(second);
+                    across(m, s, (e.0 - s.0, e.1 - s.1)).abs()
+                };
+                out.push(gap(a, b) - gap(c, d));
             }
         }
     }

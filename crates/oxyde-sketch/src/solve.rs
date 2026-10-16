@@ -577,7 +577,14 @@ mod tests {
         );
         let p = s.point(Point2::new(3.5, -1.5));
         let q = s.point(Point2::new(-2.0, -4.5));
+        // A line ending on the arc: tangent there is measured differently.
+        let crate::Geometry::Arc { end, .. } = s.entity(arc).unwrap().geometry else {
+            panic!()
+        };
+        let tip = s.point(Point2::new(-12.0, 3.0));
+        let joined = s.line_between(end, tip);
         for constraint in [
+            Tangent(joined, arc),
             Coincident(p, q),
             Horizontal(a),
             Vertical(b),
@@ -599,6 +606,7 @@ mod tests {
             PointLineDistance(q, b, 1.5),
             LineDistance(a, b, 2.0),
             Symmetric(p, q, a),
+            EqualDistance(a, b, b, a),
         ] {
             s.constrain(constraint);
         }

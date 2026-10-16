@@ -7,12 +7,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText, Material,
-    MaterialSource,
-    Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
-    FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Mirror,
-    PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
-    Sketch, SketchPlane, StandardAxis, StandardPlane, Texture, VertexName,
+    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend,
+    EdgeName, EquationText, Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
+    FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import,
+    LinearPattern, Material, MaterialSource, Mirror, PartDefinition, PatternDirection, PlaneRef,
+    RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
+    StandardPlane, Texture, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -310,10 +310,16 @@ pub(crate) fn appearances_from(
         out.set_part(Some(appearance_from(p, files)?));
     }
     for b in dto.bodies {
-        out.set_body(body_from(b.body), Some(appearance_from(b.appearance, files)?));
+        out.set_body(
+            body_from(b.body),
+            Some(appearance_from(b.appearance, files)?),
+        );
     }
     for f in dto.faces {
-        out.set_face(&face_from(f.face), Some(appearance_from(f.appearance, files)?));
+        out.set_face(
+            &face_from(f.face),
+            Some(appearance_from(f.appearance, files)?),
+        );
     }
     Ok(out)
 }
@@ -602,6 +608,7 @@ pub(crate) enum RelationDto {
     PointLineDistance { point: u32, line: u32, value: f64 },
     LineDistance { a: u32, b: u32, value: f64 },
     Symmetric { a: u32, b: u32, line: u32 },
+    EqualDistance { a: u32, b: u32, c: u32, d: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -973,6 +980,12 @@ fn relation_dto(c: &Constraint) -> RelationDto {
             b: b.0,
             line: line.0,
         },
+        C::EqualDistance(a, b, c, d) => R::EqualDistance {
+            a: a.0,
+            b: b.0,
+            c: c.0,
+            d: d.0,
+        },
     }
 }
 
@@ -1142,6 +1155,7 @@ fn relation_from(dto: RelationDto) -> Constraint {
         }
         R::LineDistance { a, b, value } => C::LineDistance(id(a), id(b), value),
         R::Symmetric { a, b, line } => C::Symmetric(id(a), id(b), id(line)),
+        R::EqualDistance { a, b, c, d } => C::EqualDistance(id(a), id(b), id(c), id(d)),
     }
 }
 
