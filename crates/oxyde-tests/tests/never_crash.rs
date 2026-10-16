@@ -90,6 +90,10 @@ impl Kernel for PanickingKernel {
         panic!("bounds has a bug")
     }
 
+    fn centre_of_mass(&self, _: ShapeHandle) -> Result<Point3, NeverError> {
+        panic!("centre_of_mass has a bug")
+    }
+
     fn topology_counts(&self, _: ShapeHandle) -> Result<TopologyCounts, NeverError> {
         panic!("topology_counts has a bug")
     }
