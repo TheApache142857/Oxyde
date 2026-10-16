@@ -5,6 +5,22 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Section along a face, parts inside sub-assemblies kept after editing in place (0.0.5, October 2026)
+
+- **Section View along a selected face.** Select a flat face, then Evaluate › Section
+  View: the cut is made along that face, in a part or in an assembly (the face where its
+  part sits), with the side the face looks to removed, as SolidWorks does with a face as
+  the section plane. Offset 0 is the face itself; the slider moves the plane into the
+  model, *Flip* keeps the other half. The face stays on offer as a fourth *Face* choice
+  next to Front, Top and Right while the window is open. With nothing selected the window
+  opens as before, and the *Face* choice says what to select.
+- **A part inside a sub-assembly no longer vanishes after editing in place.** Coming back
+  from a component edited in place reads again only the files that changed; a changed
+  part file used through a sub-assembly (its material changed from the tree or the
+  Materials window, or edited and saved) was dropped and never read again, so it
+  disappeared from the viewport with a warning in the tree until *Reload Parts*. Kept
+  sub-assemblies now have their files checked too.
+
 ### Section View, STEP materials, material lines in the tree, release builds (0.0.4, October 2026)
 
 - **Section View** (Evaluate tab, in a part and in an assembly): the model cut open by a

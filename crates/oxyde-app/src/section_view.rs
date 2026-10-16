@@ -6,25 +6,57 @@
 //! model back.
 //!
 //! Works in a part and in an assembly (every part shown, where it sits). The plane is one
-//! of the three standard planes, moved along its normal; *Flip* keeps the other half.
+//! of the three standard planes, or a flat face selected before the window was opened
+//! (the cut is then made along that face, the side it looks to removed), moved along its
+//! normal; *Flip* keeps the other half.
 
 use eframe::egui::{self, RichText};
-use oxyde_assembly::Placement;
+use oxyde_assembly::{Placement, Primitive};
 use oxyde_geom::{Plane, Point3, Transform, Vec3};
-use oxyde_kernel::{BooleanOp, FaceSource, Kernel, Mesh, ShapeHandle};
+use oxyde_kernel::{BooleanOp, FaceSource, Kernel, Mesh, ShapeHandle, SurfaceKind};
 use oxyde_model::{Appearance, Body, Part, StandardPlane};
 use oxyde_render::{Material as RenderMaterial, Scene, TextureRef};
 
-use crate::app::{OxydeApp, deflection};
+use crate::app::{OxydeApp, Selected, deflection};
 use crate::appearance_ui::{TextureCache, material};
+use crate::assembly::AsmSelected;
 use crate::dialogs::plane_name;
 use crate::icons::{self, Icon};
+
+/// The plane the section is made on, before it is moved along its normal.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SectionBase {
+    Standard(StandardPlane),
+    /// A flat face selected when the window was opened, in the document's coordinates (an
+    /// assembly's for a part placed in one), its normal pointing out of the solid.
+    Face {
+        plane: Plane,
+        label: String,
+    },
+}
+
+impl SectionBase {
+    pub fn plane(&self) -> Plane {
+        match self {
+            SectionBase::Standard(s) => s.plane(),
+            SectionBase::Face { plane, .. } => *plane,
+        }
+    }
+
+    /// The name shown for it: `Front`, or the face's label.
+    pub fn name(&self) -> String {
+        match self {
+            SectionBase::Standard(s) => plane_name(*s).to_owned(),
+            SectionBase::Face { label, .. } => label.clone(),
+        }
+    }
+}
 
 /// Where the cut is made.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SectionSettings {
-    pub plane: StandardPlane,
-    /// Distance of the section plane from the standard plane, along its normal (mm).
+    pub plane: SectionBase,
+    /// Distance of the section plane from the base plane, along its normal (mm).
     pub offset: f64,
     /// Keep the half the normal points away from, instead of removing it.
     pub flip: bool,
@@ -36,7 +68,7 @@ pub struct SectionSettings {
 impl Default for SectionSettings {
     fn default() -> Self {
         Self {
-            plane: StandardPlane::Front,
+            plane: SectionBase::Standard(StandardPlane::Front),
             offset: 0.0,
             flip: false,
             color_caps: true,
@@ -46,7 +78,7 @@ impl Default for SectionSettings {
 }
 
 impl SectionSettings {
-    /// The section plane: the standard plane moved by `offset`, its normal pointing to the
+    /// The section plane: the base plane moved by `offset`, its normal pointing to the
     /// half that is removed.
     pub fn section_plane(&self) -> Plane {
         let base = self.plane.plane();
@@ -77,6 +109,9 @@ pub struct SectionReport {
 /// The Section View window, while it is open.
 pub struct SectionView {
     pub settings: SectionSettings,
+    /// The flat face selected when the window was opened, offered next to the standard
+    /// planes.
+    face: Option<SectionBase>,
     /// The settings and document revision the viewport shows the section of.
     shown: Option<(SectionSettings, u64)>,
     /// Where the model is along the plane's normal, for the slider.
@@ -89,6 +124,7 @@ impl SectionView {
     fn new() -> Self {
         Self {
             settings: SectionSettings::default(),
+            face: None,
             shown: None,
             range: None,
             report: None,
@@ -96,14 +132,15 @@ impl SectionView {
         }
     }
 
-    /// Where the box `lo..hi` lies along the plane's normal: the offsets that go through it.
-    fn offsets_through(plane: StandardPlane, lo: Point3, hi: Point3) -> (f64, f64) {
-        let n = plane.plane().normal;
+    /// Where the box `lo..hi` lies along the plane's normal, as offsets from the plane:
+    /// the offsets that go through it.
+    fn offsets_through(plane: &Plane, lo: Point3, hi: Point3) -> (f64, f64) {
+        let n = plane.normal;
         let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
         for x in [lo.x, hi.x] {
             for y in [lo.y, hi.y] {
                 for z in [lo.z, hi.z] {
-                    let d = Vec3::new(x, y, z).dot(n);
+                    let d = (Point3::new(x, y, z) - plane.origin).dot(n);
                     min = min.min(d);
                     max = max.max(d);
                 }
@@ -187,7 +224,12 @@ fn cut_body<K: Kernel>(
         let mut materials = Vec::with_capacity(topology.faces.len());
         let mut cap_area = 0.0;
         for (i, face) in topology.faces.iter().enumerate() {
-            let sources = result.history.faces.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let sources = result
+                .history
+                .faces
+                .get(i)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             // A face of the tool is a face the cut made; one of the solid keeps its look.
             let from_tool = sources
                 .iter()
@@ -202,10 +244,9 @@ fn cut_body<K: Kernel>(
             let m = if from_tool && settings.color_caps {
                 cap.clone()
             } else {
-                let look = own.cloned().or_else(|| {
-                    from_solid
-                        .and_then(|local| appearance(solid.faces.start + local))
-                });
+                let look = own
+                    .cloned()
+                    .or_else(|| from_solid.and_then(|local| appearance(solid.faces.start + local)));
                 match look {
                     Some(a) => material(&a, cache, textures),
                     None => RenderMaterial::default(),
@@ -259,15 +300,81 @@ impl OxydeApp {
             return;
         }
         let mut view = SectionView::new();
-        if let Some((lo, hi)) = self.model_bounds() {
-            let (a, b) = SectionView::offsets_through(view.settings.plane, lo, hi);
-            view.range = Some((a, b));
-            view.settings.offset = (a + b) / 2.0;
+        // A flat face selected first: the cut is made along it, the side it looks to
+        // removed, as SolidWorks does with a face as the section plane.
+        view.face = self.selected_section_face();
+        if let Some(face) = &view.face {
+            view.settings.plane = face.clone();
+            view.settings.offset = 0.0;
         }
+        if let Some((lo, hi)) = self.model_bounds() {
+            let (a, b) = SectionView::offsets_through(&view.settings.plane.plane(), lo, hi);
+            view.range = Some((a, b));
+            if view.face.is_none() {
+                view.settings.offset = (a + b) / 2.0;
+            }
+        }
+        self.status = match &view.face {
+            Some(face) => format!(
+                "Section View along the {}: move the plane with the slider, Flip keeps the \
+                 other half; close the window to see the whole model again",
+                face.name().to_lowercase()
+            ),
+            None => "Section View: move the plane with the slider (select a flat face first \
+                     to cut along it); close the window to see the whole model again"
+                .to_owned(),
+        };
         self.section = Some(view);
-        self.status = "Section View: move the plane with the slider; close the window to see \
-                       the whole model again"
-            .to_owned();
+    }
+
+    /// The first flat face selected, as a section plane in the document's coordinates:
+    /// in a part, one of its faces; in an assembly, a face of a part where it sits.
+    fn selected_section_face(&self) -> Option<SectionBase> {
+        if let Some(doc) = self.asm.as_ref() {
+            return doc.selection.iter().find_map(|item| {
+                let AsmSelected::Face(o, name) = item else {
+                    return None;
+                };
+                let body = doc.part_at(o)?.part.body()?;
+                let face = body
+                    .topology
+                    .faces
+                    .get(body.naming.find_face(name)? as usize)?;
+                if face.surface != SurfaceKind::Plane {
+                    return None;
+                }
+                let Primitive::Plane { origin, normal } =
+                    doc.placed(&doc.assembly, &item.mate_ref()?)?
+                else {
+                    return None;
+                };
+                let plane = Plane::from_point_normal(origin, normal)?;
+                let mut names = vec![doc.assembly.component(o.top)?.name.clone()];
+                names.extend(doc.inner_names(o.top, &o.path));
+                Some(SectionBase::Face {
+                    plane,
+                    label: format!("Face of {}", names.join(" › ")),
+                })
+            });
+        }
+        let body = self.doc.part.body()?;
+        self.selection.iter().find_map(|s| {
+            let Selected::Face(name) = s else {
+                return None;
+            };
+            let face = body
+                .topology
+                .faces
+                .get(body.naming.find_face(name)? as usize)?;
+            if face.surface != SurfaceKind::Plane {
+                return None;
+            }
+            let plane = Plane::from_point_normal(face.centroid, face.normal?)?;
+            Some(SectionBase::Face {
+                plane,
+                label: "Selected face".to_owned(),
+            })
+        })
     }
 
     pub(crate) fn close_section_view(&mut self) {
@@ -314,7 +421,11 @@ impl OxydeApp {
             return;
         };
         if let Some((lo, hi)) = bounds {
-            view.range = Some(SectionView::offsets_through(view.settings.plane, lo, hi));
+            view.range = Some(SectionView::offsets_through(
+                &view.settings.plane.plane(),
+                lo,
+                hi,
+            ));
         }
         egui::Window::new("Section View")
             .open(&mut open)
@@ -322,20 +433,53 @@ impl OxydeApp {
             .default_pos(ctx.screen_rect().right_top() + egui::vec2(-340.0, 220.0))
             .show(ctx, |ui| {
                 let s = &mut view.settings;
+                let face = view.face.as_ref();
                 egui::Grid::new("section_view")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
                         ui.label("Plane");
                         ui.horizontal(|ui| {
-                            for plane in [StandardPlane::Front, StandardPlane::Top, StandardPlane::Right] {
+                            for plane in [
+                                StandardPlane::Front,
+                                StandardPlane::Top,
+                                StandardPlane::Right,
+                            ] {
+                                let base = SectionBase::Standard(plane);
                                 if ui
-                                    .selectable_label(s.plane == plane, plane_name(plane))
+                                    .selectable_label(s.plane == base, plane_name(plane))
                                     .clicked()
-                                    && s.plane != plane
+                                    && s.plane != base
                                 {
-                                    s.plane = plane;
+                                    s.plane = base;
                                     centre = true;
+                                }
+                            }
+                            match face {
+                                Some(face) => {
+                                    if ui
+                                        .selectable_label(s.plane == *face, "Face")
+                                        .on_hover_text(format!(
+                                            "{}: the flat face selected when the window \
+                                             was opened; the side it looks to is removed",
+                                            face.name()
+                                        ))
+                                        .clicked()
+                                        && s.plane != *face
+                                    {
+                                        s.plane = face.clone();
+                                        s.offset = 0.0;
+                                    }
+                                }
+                                None => {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::SelectableLabel::new(false, "Face"),
+                                    )
+                                    .on_disabled_hover_text(
+                                        "Select a flat face before opening Section View \
+                                             to cut along it",
+                                    );
                                 }
                             }
                         });
@@ -349,11 +493,7 @@ impl OxydeApp {
                                     .show_value(false),
                             )
                             .on_hover_text("Where the model is along the plane's normal");
-                            ui.add(
-                                egui::DragValue::new(&mut s.offset)
-                                    .speed(0.5)
-                                    .suffix(" mm"),
-                            );
+                            ui.add(egui::DragValue::new(&mut s.offset).speed(0.5).suffix(" mm"));
                         });
                         ui.end_row();
                         ui.label("Side");
@@ -393,7 +533,10 @@ impl OxydeApp {
                 ui.add_space(6.0);
                 match (&view.report, &view.error) {
                     (_, Some(e)) => {
-                        ui.label(RichText::new(format!("Could not cut: {e}")).color(egui::Color32::LIGHT_RED));
+                        ui.label(
+                            RichText::new(format!("Could not cut: {e}"))
+                                .color(egui::Color32::LIGHT_RED),
+                        );
                     }
                     (Some(r), None) => {
                         egui::Grid::new("section_report")
@@ -596,8 +739,7 @@ impl OxydeApp {
                 placed.push((placement, c.mesh));
             }
         }
-        let (mesh, _) =
-            oxyde_assembly::scene::combine(placed.iter().map(|(p, m)| ((), p, m)));
+        let (mesh, _) = oxyde_assembly::scene::combine(placed.iter().map(|(p, m)| ((), p, m)));
         Ok((mesh, materials, textures, report))
     }
 
@@ -625,7 +767,7 @@ mod tests {
     #[test]
     fn the_section_plane_moves_along_its_normal_and_flips() {
         let mut s = SectionSettings {
-            plane: StandardPlane::Top,
+            plane: SectionBase::Standard(StandardPlane::Top),
             offset: 12.0,
             ..SectionSettings::default()
         };
@@ -644,7 +786,7 @@ mod tests {
     #[test]
     fn the_half_space_frame_is_the_planes_frame() {
         let plane = SectionSettings {
-            plane: StandardPlane::Right,
+            plane: SectionBase::Standard(StandardPlane::Right),
             offset: 5.0,
             ..SectionSettings::default()
         }
@@ -654,8 +796,33 @@ mod tests {
         let on_axis = t.apply_point(Point3::new(0.0, 0.0, 3.0));
         assert!((on_axis - (plane.origin + plane.normal * 3.0)).length() < 1e-12);
         let (lo, hi) = (Point3::new(-10.0, 0.0, 0.0), Point3::new(30.0, 20.0, 10.0));
-        let (a, b) = SectionView::offsets_through(StandardPlane::Right, lo, hi);
+        let (a, b) = SectionView::offsets_through(&StandardPlane::Right.plane(), lo, hi);
         assert_eq!((a, b), (-10.0, 30.0));
         assert!(reach(&plane, (lo, hi)) > 40.0);
+    }
+
+    #[test]
+    fn a_face_is_cut_along_at_offset_zero_and_the_range_is_measured_from_it() {
+        // The top face of a 20 mm tall block: its outward normal is +Y, the plane sits at
+        // y = 20, so offset 0 cuts along the face and the block lies at offsets -20..0.
+        let face = SectionBase::Face {
+            plane: Plane::from_point_normal(Point3::new(5.0, 20.0, 5.0), Vec3::Y).unwrap(),
+            label: "Selected face".to_owned(),
+        };
+        let s = SectionSettings {
+            plane: face.clone(),
+            offset: 0.0,
+            ..SectionSettings::default()
+        };
+        let p = s.section_plane();
+        assert_eq!(p.normal, Vec3::Y);
+        assert!((p.origin.y - 20.0).abs() < 1e-12);
+        let (lo, hi) = (Point3::new(0.0, 0.0, 0.0), Point3::new(10.0, 20.0, 10.0));
+        let (a, b) = SectionView::offsets_through(&face.plane(), lo, hi);
+        assert!((a + 20.0).abs() < 1e-12 && b.abs() < 1e-12, "{a}..{b}");
+        // Moved 5 mm into the block, the plane is at y = 15.
+        let inside = SectionSettings { offset: -5.0, ..s }.section_plane();
+        assert!((inside.origin.y - 15.0).abs() < 1e-12);
+        assert_eq!(face.name(), "Selected face");
     }
 }

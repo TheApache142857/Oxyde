@@ -1001,6 +1001,23 @@ impl<'a> Walk<'a> {
             return;
         }
         if self.known(path) {
+            // A sub-assembly kept from the last load: a file it holds may have been
+            // dropped to be read again (a part changed inside it, see
+            // [`AssemblyDoc::reload_changed_with`]), so its files are met all the same.
+            let kept: Vec<(String, PathBuf)> = match self.docs.get(path) {
+                Some(Ok(Loaded::Assembly(sub))) => sub
+                    .assembly
+                    .components
+                    .iter()
+                    .filter_map(|c| Some((c.name.clone(), sub.sources.get(&c.id)?.clone())))
+                    .collect(),
+                _ => return,
+            };
+            self.stack.push(path.to_path_buf());
+            for (inner_name, inner) in kept {
+                self.visit(&inner, &format!("{name} › {inner_name}"));
+            }
+            self.stack.pop();
             return;
         }
         if !crate::assembly_ui::is_assembly(path) {
