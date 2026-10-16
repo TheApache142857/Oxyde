@@ -256,6 +256,10 @@ pub struct OxydeApp {
     pub(crate) confirm: Option<crate::materials_ui::Confirm>,
     /// Work going on off the UI thread, with its progress window.
     pub(crate) job: Option<crate::jobs::Job>,
+    /// A bug caught (a panic in a rebuild or in a frame), shown until dismissed.
+    pub(crate) internal_error: Option<crate::dialogs::InternalErrorReport>,
+    /// Frames in a row that ended in a caught panic.
+    failed_frames: u32,
 }
 
 impl OxydeApp {
@@ -316,6 +320,8 @@ impl OxydeApp {
             materials_window: Default::default(),
             confirm: None,
             job: None,
+            internal_error: None,
+            failed_frames: 0,
         };
         let (materials, problem) = crate::materials::load();
         app.materials = materials;
@@ -345,7 +351,9 @@ impl OxydeApp {
 
     pub(crate) fn rebuild(&mut self) {
         let start = std::time::Instant::now();
-        self.doc.rebuild(&mut self.kernel);
+        if let Err(e) = self.doc.rebuild(&mut self.kernel) {
+            self.report_internal_error(e);
+        }
         self.debug_stats.rebuild = Some(start.elapsed().as_secs_f64());
     }
 
@@ -430,14 +438,18 @@ impl OxydeApp {
     }
 
     pub(crate) fn undo(&mut self) {
-        if self.doc.undo(&mut self.kernel) {
-            self.status = "Undone".to_owned();
+        match self.doc.undo(&mut self.kernel) {
+            Ok(true) => self.status = "Undone".to_owned(),
+            Ok(false) => {}
+            Err(e) => self.report_internal_error(e),
         }
     }
 
     pub(crate) fn redo(&mut self) {
-        if self.doc.redo(&mut self.kernel) {
-            self.status = "Redone".to_owned();
+        match self.doc.redo(&mut self.kernel) {
+            Ok(true) => self.status = "Redone".to_owned(),
+            Ok(false) => {}
+            Err(e) => self.report_internal_error(e),
         }
     }
 
@@ -1930,7 +1942,46 @@ pub(crate) fn deflection(topology: &Topology, fraction: f64) -> f64 {
 }
 
 impl eframe::App for OxydeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The last net: a panic anywhere in a frame (a command applied, a panel drawn)
+        // ends the frame, not the application. See `recover_frame`.
+        let undo_before = self.doc.undo_depth();
+        match oxyde_kernel::catch_panic(|| self.frame(ctx, frame)) {
+            Ok(()) => self.failed_frames = 0,
+            Err(message) => {
+                self.recover_frame(message, undo_before);
+                ctx.request_repaint();
+            }
+        }
+        self.internal_error_window(ctx);
+    }
+}
+
+impl OxydeApp {
+    /// After a panic got out of a frame: takes back the change the frame recorded, if it
+    /// recorded one before failing, and tells the user. A frame that fails again and
+    /// again fails because of what is open, so the sketch session and the command are
+    /// closed on the third time, which leaves the menus to save from.
+    fn recover_frame(&mut self, message: String, undo_before: usize) {
+        self.failed_frames += 1;
+        let undone = self.doc.undo_depth() > undo_before
+            && matches!(
+                oxyde_kernel::catch_panic(|| self.doc.discard_last_change(&mut self.kernel)),
+                Ok(Ok(true))
+            );
+        if self.failed_frames >= 3 {
+            if oxyde_kernel::catch_panic(|| self.finish_sketch(false)).is_err() {
+                self.sketch = None;
+            }
+            if oxyde_kernel::catch_panic(|| self.close_dialog()).is_err() {
+                self.dialog = None;
+            }
+            self.confirm = None;
+        }
+        self.report_internal_error(crate::document::InternalError { message, undone });
+    }
+
+    fn frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
         self.splash_step(ctx);
         self.sync_locks();

@@ -164,7 +164,8 @@ fn open_part(
     let file = oxyde_format::load_part(path).map_err(|e| e.to_string())?;
     progress.say(format!("Rebuilding {}", name_of(path)));
     let mut doc = Document::from_file(file, Some(path.to_path_buf()))?;
-    doc.rebuild(kernel);
+    doc.rebuild(kernel)
+        .map_err(|e| format!("internal error while rebuilding: {}", e.message))?;
     Ok(doc)
 }
 

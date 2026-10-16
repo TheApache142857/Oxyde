@@ -123,6 +123,14 @@ impl Dialog {
     }
 }
 
+/// A bug caught (a panic in a rebuild or in a frame), shown in a window until dismissed.
+pub(crate) struct InternalErrorReport {
+    /// The panic's message.
+    pub message: String,
+    /// The change that led to it was taken back.
+    pub undone: bool,
+}
+
 /// User's answer to a dialog this frame.
 pub(crate) enum Answer {
     Open,
@@ -234,6 +242,50 @@ impl OxydeApp {
             self.cancel_appearance(d);
         }
         self.dialog = None;
+    }
+
+    /// Tells the user about a caught bug: in the status bar, and in a window over
+    /// everything (`internal_error_window`) until dismissed.
+    pub(crate) fn report_internal_error(&mut self, error: crate::document::InternalError) {
+        self.status = if error.undone {
+            "Internal error: your last change was undone".to_owned()
+        } else {
+            "Internal error".to_owned()
+        };
+        self.internal_error = Some(InternalErrorReport {
+            message: error.message,
+            undone: error.undone,
+        });
+    }
+
+    pub(crate) fn internal_error_window(&mut self, ctx: &egui::Context) {
+        let Some(report) = &self.internal_error else {
+            return;
+        };
+        let mut close = false;
+        window("Internal error").show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.label(if report.undone {
+                "Oxyde hit a bug and undid your last change: the document is as it was \
+                 before it. Save it if you have not."
+            } else {
+                "Oxyde hit a bug. The document is still open: save it under a new name to \
+                 be safe, then try again."
+            });
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(&report.message).small().monospace());
+            ui.add_space(6.0);
+            ui.label("Please report it, with what you were doing.");
+            ui.add_space(6.0);
+            if ui.button("OK").clicked()
+                || ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape))
+            {
+                close = true;
+            }
+        });
+        if close {
+            self.internal_error = None;
+        }
     }
 
     pub(crate) fn dialogs_ui(&mut self, ctx: &egui::Context) {

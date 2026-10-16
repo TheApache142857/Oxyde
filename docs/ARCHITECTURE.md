@@ -51,6 +51,16 @@ Rules:
 
 Toolchain: `cxx` / `cxx-build` for the bridge and to compile the shim. **Windows/MSVC only for now.** `build.rs` locates OCCT through `OXYDE_OCCT_DIR`, `VCPKG_ROOT`, or explicit `OXYDE_OCCT_INCLUDE_DIR` + `OXYDE_OCCT_LIB_DIR` — see `BUILDING.md`.
 
+### Never crash
+
+A panic in a modelling or UI path would take the unsaved document with it, so not crashing outranks a feature. The C++ side already turns every OCCT exception into an `Err` (above); the Rust side has three layers under it, each catching what the one before let through:
+
+1. **No panics written.** Every production crate root denies `clippy::unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo` and `unimplemented` (and warns on `indexing_slicing`); tests are exempt. Where a value cannot be missing, the code still says what happens if it is: an error returned (`?`, `ok_or_else`), or a harmless fallback with a comment. `cargo clippy --workspace --all-targets` enforces it.
+2. **Kernel calls and feature builds run under a net.** `oxyde_kernel::catch_panic` runs a closure under `catch_unwind` and hands back the panic's message (the default hook still prints it to stderr). `OcctKernel` wraps every `Kernel` method in it, so a bug in the marshalling comes back as `OcctError::Internal`; `Part::rebuild` builds each feature under it too, so a panicking kernel of any kind, or a bug in a feature's own code, fails that one feature with `internal error: …` in the timeline and the rest is still built (`oxyde-tests/tests/never_crash.rs` drives the model with a kernel that panics in every operation).
+3. **The document is put back.** `Document::rebuild` (`oxyde-app`) runs the rebuild under the net; a panic that gets that far may have left the part half built, so the document goes back to the last undo snapshot, the state before the change that led to the bug, and rebuilds that (without a snapshot the timeline is kept with nothing built). `OxydeApp::update` runs the whole frame under the net as well: a panic anywhere in it ends the frame, the change the frame recorded is taken back (`recover_frame`), and a window says that an internal error happened and that the change was undone, with the panic's message to report. A frame that fails three times in a row fails because of what is open, so the sketch session and the open command are closed, which leaves the menus to save from. Work on job threads (`jobs.rs`) is already apart: a panic there ends the job, reported as failed.
+
+The guard is not a licence: a caught panic is a bug to fix, and tests still fail on it.
+
 ## 4. The `Kernel` trait (`oxyde-kernel`)
 
 Implemented (see `crates/oxyde-kernel/src/lib.rs` for the documented signatures):
