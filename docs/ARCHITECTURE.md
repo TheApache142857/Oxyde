@@ -207,7 +207,7 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 
 | Milestone | Content |
 |---|---|
-| **M0** (CI not set up yet) | Workspace, docs, CI (format, clippy, tests) |
+| **M0** (done) | Workspace, docs, CI (format, clippy, tests: `.github/workflows/ci.yml`, a quick Linux job for the pure-Rust crates and a Windows job with OpenCASCADE for the whole workspace); the dependency rules of §2 are a test (`crates/oxyde-tests/tests/layering.rs`); `CLAUDE.md` for agents and new contributors |
 | **M1** (done) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **Engine** (done) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
 | **M2** (done) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |
@@ -219,8 +219,8 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 | **M4** (done) | Viewport, interactive sketch mode, selection, fillet/chamfer with persistent naming |
 | **M5** (done) | Linear and circular patterns, mirror (tool-body copies with instance names) |
 | **GPU** (done) | wgpu viewport with GPU picking, software renderer as fallback |
-| **Bodies** (code written, awaiting first Windows build) | Multi-body parts: join / cut / intersect / new body, Combine, Solid Bodies folder |
-| **M6** (code written, awaiting first Windows build) | Assemblies (`.oxyasm`): components from part files and sub-assemblies, mates with a 3D solver (reaching into sub-assemblies), fixed/floating, Alt+drag, BOM (top level, parts only, indented) exported as CSV; parts renamed `.oxyprt` |
+| **Bodies** (done, 0.0.5) | Multi-body parts: join / cut / intersect / new body, Combine, Solid Bodies folder |
+| **M6** (done, 0.0.5) | Assemblies (`.oxyasm`): components from part files and sub-assemblies, mates with a 3D solver (reaching into sub-assemblies), fixed/floating, Alt+drag, BOM (top level, parts only, indented) exported as CSV; parts renamed `.oxyprt` |
 | **M7** | Drawings: views, dimensions, PDF/DXF |
 
 ## STEP assembly import

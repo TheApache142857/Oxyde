@@ -5,6 +5,23 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Agent guide, continuous integration, a layering test (unreleased, October 2026)
+
+Nothing changes in the application; this is for the people and agents working on it.
+
+- **`CLAUDE.md`** at the repository root: what to read first, the constraints of the build
+  machine, the checks to run before every commit, the architecture rules in short, the
+  conventions of the code, and the decisions that are the owner's to make.
+- **Continuous integration** (`.github/workflows/ci.yml`): on every push and pull request,
+  the pure-Rust crates are format-checked, linted and tested on Linux in minutes, and the
+  whole workspace on Windows with OpenCASCADE from vcpkg, kept in the Actions cache after
+  the first run. Written without a run: the repository has no Actions minutes yet.
+- **The crate layering is a test** (`crates/oxyde-tests/tests/layering.rs`): the "must
+  never depend on" column of ARCHITECTURE.md §2 is checked against every crate's
+  `Cargo.toml`, and a wrong dependency fails the test naming the edge.
+- ARCHITECTURE.md's roadmap now says what shipped: multi-body parts and assemblies are
+  done (0.0.5), and so is CI.
+
 ### Second bug hunt: unwanted behaviours (unreleased, October 2026)
 
 Read through the application and the modelling engine for what they do that nobody
