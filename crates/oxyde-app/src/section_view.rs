@@ -215,6 +215,32 @@ struct Unit<'a> {
     copies: Vec<Placed<'a>>,
 }
 
+impl Unit<'_> {
+    /// About how long the unit takes against `plane` (world coordinates): the faces of the
+    /// solids the plane goes through, at every place the body is shown; a solid the plane
+    /// misses costs next to nothing, and one whose box is unknown is counted as cut.
+    fn cost(&self, plane: &Plane) -> usize {
+        let mut cost = 0;
+        for placed in &self.copies {
+            let local = plane.transformed(&placed.placement.inverse().transform());
+            for (i, solid) in self.body.solids.iter().enumerate() {
+                let side = self
+                    .bounds
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map_or(Side::Through, |b| side_of(&local, b));
+                cost += match side {
+                    Side::Through => solid.faces.len().max(1),
+                    Side::Kept => 1,
+                    Side::Removed => 0,
+                };
+            }
+        }
+        cost
+    }
+}
+
 /// One place a unit's body is shown at.
 struct Placed<'a> {
     placement: Placement,
@@ -1033,6 +1059,9 @@ impl OxydeApp {
         if units.is_empty() {
             return Err("there is no solid".to_owned());
         }
+        // The slowest units first: handed out in tree order, a big part listed late ran
+        // alone at the end while the other cores had nothing left to do.
+        units.sort_by_key(|u| std::cmp::Reverse(u.cost(plane)));
         let results = cut_units(&mut self.kernel, plane, reach, &units);
 
         // ---- The looks, on this thread: the texture cache is the window's.

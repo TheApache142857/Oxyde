@@ -24,7 +24,8 @@ Evaluate › Section View does less work for the same picture:
   is left out. In an assembly, where the plane goes through a few parts of many, this is
   most of the work saved.
 - **An assembly's parts are cut on every core at once**, as they are rebuilt when the
-  assembly opens.
+  assembly opens, the slowest parts first so that a big part listed late in the tree does
+  not run alone at the end.
 - **The window no longer measures the model every frame.** The box around the model,
   which the slider's range comes from, is asked of the kernel once per change of the
   document; on a big imported part it took up to 0.2 s a frame while the window was open.
