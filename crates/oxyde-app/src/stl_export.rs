@@ -9,49 +9,11 @@
 //! fillets keep their shape at any part size.
 
 use eframe::egui;
-use oxyde_format::stl::{self, MeshReport, StlTriangle, StlUnit};
+use oxyde_format::stl::{self, MeshReport, StlQuality, StlTriangle, StlUnit};
 use oxyde_kernel::{Kernel, Mesh};
 use oxyde_render::Scene;
 
 use crate::app::OxydeApp;
-
-/// How fine the mesh is: presets scaled to the model's size, or custom numbers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StlQuality {
-    Coarse,
-    Normal,
-    Fine,
-    VeryFine,
-    Custom,
-}
-
-impl StlQuality {
-    pub const ALL: [(StlQuality, &'static str); 5] = [
-        (StlQuality::Coarse, "Coarse (draft prints, small files)"),
-        (StlQuality::Normal, "Normal"),
-        (StlQuality::Fine, "Fine"),
-        (StlQuality::VeryFine, "Very fine (large files)"),
-        (StlQuality::Custom, "Custom"),
-    ];
-
-    /// Maximum deviation (mm) and angle (degrees) for a model `diagonal` mm across.
-    fn settings(self, diagonal: f64) -> Option<(f64, f64)> {
-        let fraction = match self {
-            StlQuality::Coarse => 0.004,
-            StlQuality::Normal => 0.001,
-            StlQuality::Fine => 0.0003,
-            StlQuality::VeryFine => 0.0001,
-            StlQuality::Custom => return None,
-        };
-        let angle = match self {
-            StlQuality::Coarse => 30.0,
-            StlQuality::Normal => 20.0,
-            StlQuality::Fine => 10.0,
-            _ => 5.0,
-        };
-        Some(((diagonal * fraction).clamp(0.001, 5.0), angle))
-    }
-}
 
 pub struct StlDialog {
     pub quality: StlQuality,

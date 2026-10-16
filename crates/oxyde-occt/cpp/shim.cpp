@@ -1672,6 +1672,19 @@ double Session::volume(std::uint64_t shape) const {
     });
 }
 
+PointData Session::centre_of_mass(std::uint64_t shape) const {
+    return guarded("centre_of_mass", [&] {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(get(shape), props);
+        const gp_Pnt c = props.CentreOfMass();
+        PointData out{};
+        out.x = c.X();
+        out.y = c.Y();
+        out.z = c.Z();
+        return out;
+    });
+}
+
 BoundsData Session::bounds(std::uint64_t shape) const {
     return guarded("bounds", [&] {
         Bnd_Box box;

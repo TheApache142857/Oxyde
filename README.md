@@ -43,6 +43,7 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking |
 | `oxyde-app` | Desktop application (UI and viewport) |
+| `oxyde-cli` | Headless command line: rebuild a part and measure, check, export or picture it |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/FORMAT.md), and [`CHANGELOG.md`](CHANGELOG.md) for what changed recently.
@@ -55,6 +56,19 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/F
 cargo run --release -p oxyde-app              # the application (File › Open demo bracket)
 cargo test --workspace                        # unit + end-to-end tests
 ```
+
+## Command line
+
+`oxyde-cli` rebuilds a `.oxyprt` through OpenCASCADE without opening a window, for scripts, agents and continuous integration:
+
+```powershell
+cargo run -p oxyde-cli -- eval part.oxyprt [--json]           # feature statuses; per body volume, area, centre of mass, bounds, face/edge/vertex counts
+cargo run -p oxyde-cli -- check part.oxyprt --expect expected.json [--tol 1e-3]   # pass/fail table against expected measures
+cargo run -p oxyde-cli -- export part.oxyprt --out part.step   # or part.stl (binary, mm)
+cargo run -p oxyde-cli -- snapshot part.oxyprt --out part.png [--view iso|front|top|right] [--width 1024 --height 768]
+```
+
+Exit code 1 when a feature failed to rebuild or a check did not pass, 2 when the command could not run. `expected.json` holds any of `bodies`, `volume`, `area`, `centre_of_mass`, `bounds` (`min`, `max`), `faces`, `edges`, `vertices`; counts must match exactly, volume and area within the relative tolerance, coordinates within the tolerance times the part's size. `eval --json` writes the same object the tests in `crates/oxyde-tests/tests/cli.rs` read back.
 
 ## License
 

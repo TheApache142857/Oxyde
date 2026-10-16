@@ -204,6 +204,11 @@ impl Kernel for OcctKernel {
         Ok(self.session.volume(shape.raw())?)
     }
 
+    fn centre_of_mass(&self, shape: ShapeHandle) -> Result<Point3, OcctError> {
+        let c = self.session.centre_of_mass(shape.raw())?;
+        Ok(Point3::new(c.x, c.y, c.z))
+    }
+
     fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), OcctError> {
         let b = self.session.bounds(shape.raw())?;
         Ok((

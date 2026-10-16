@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use oxyde_geom::{Plane, Point3, Vec3};
-use oxyde_kernel::{Kernel, SurfaceKind, Topology};
+use oxyde_kernel::{Kernel, SurfaceKind};
 use oxyde_model::{
     EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry,
     Sketch, SketchPlane, StandardPlane,
@@ -1885,7 +1885,7 @@ pub(crate) fn tessellate_bodies<K: Kernel>(
     body: &oxyde_model::Body,
     fraction: f64,
 ) -> Result<oxyde_kernel::Mesh, K::Error> {
-    let deflection = deflection(&body.topology, fraction);
+    let deflection = oxyde_render::mesh_deflection(&body.topology, fraction);
     let mut out = oxyde_kernel::Mesh {
         faces: Vec::new(),
         edges: Vec::new(),
@@ -1904,29 +1904,6 @@ pub(crate) fn bodies_volume<K: Kernel>(
     body: &oxyde_model::Body,
 ) -> Result<f64, K::Error> {
     body.solids.iter().map(|s| kernel.volume(s.shape)).sum()
-}
-
-/// Mesh precision: `fraction` of the part size (about a thousandth by default).
-pub(crate) fn deflection(topology: &Topology, fraction: f64) -> f64 {
-    let mut lo = [f64::INFINITY; 3];
-    let mut hi = [f64::NEG_INFINITY; 3];
-    let points = topology
-        .vertices
-        .iter()
-        .map(|v| v.point)
-        .chain(topology.faces.iter().map(|f| f.centroid));
-    for p in points {
-        for (k, value) in [p.x, p.y, p.z].into_iter().enumerate() {
-            lo[k] = lo[k].min(value);
-            hi[k] = hi[k].max(value);
-        }
-    }
-    let diagonal = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
-    if diagonal.is_finite() && diagonal > 0.0 {
-        (diagonal * fraction).clamp(0.0005, 5.0)
-    } else {
-        0.05
-    }
 }
 
 impl eframe::App for OxydeApp {

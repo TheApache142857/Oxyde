@@ -5,6 +5,24 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Command line: `oxyde-cli` (unreleased, October 2026)
+
+- **A headless command line**, `oxyde-cli`, for scripts, agents and continuous
+  integration, which could not open a part without the window until now. `eval
+  part.oxyprt [--json]` rebuilds the part through OpenCASCADE as the application does
+  and prints every feature's status (ok, warning, error with its message, suppressed)
+  and, per body, volume, surface area, centre of mass, bounds and face, edge and vertex
+  counts (exit code 1 when a feature failed); `check part.oxyprt --expect expected.json
+  [--tol 1e-3]` compares those measures with a file of expected values and prints a
+  pass/fail table, the seed of a reference test suite; `export part.oxyprt --out
+  part.step|part.stl` writes the body as STEP (with colours and material) or binary STL
+  at the application's Normal quality; `snapshot part.oxyprt --out part.png [--view
+  iso|front|top|right]` draws it with the software renderer, 1024 x 768 by default.
+- The kernel gained a **centre of mass** query (`Kernel::centre_of_mass`), which the
+  command line reports and checks.
+- `cargo test --workspace` now also runs the command line on a filleted box whose
+  volume, area and centre of mass are known by hand, and on the STEP cart.
+
 ### Second bug hunt: unwanted behaviours (unreleased, October 2026)
 
 Read through the application and the modelling engine for what they do that nobody

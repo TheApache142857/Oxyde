@@ -177,6 +177,13 @@ pub(crate) mod bridge {
         edges: Vec<EdgeLineData>,
     }
 
+    /// A point, mm.
+    struct PointData {
+        x: f64,
+        y: f64,
+        z: f64,
+    }
+
     /// An axis-aligned box.
     struct BoundsData {
         xmin: f64,
@@ -336,6 +343,8 @@ pub(crate) mod bridge {
         ) -> Result<MeshData>;
 
         fn volume(self: &Session, shape: u64) -> Result<f64>;
+
+        fn centre_of_mass(self: &Session, shape: u64) -> Result<PointData>;
 
         fn bounds(self: &Session, shape: u64) -> Result<BoundsData>;
 
