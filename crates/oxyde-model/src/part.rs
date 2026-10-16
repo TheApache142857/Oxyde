@@ -132,6 +132,8 @@ struct FeatureResult {
 struct ImportAppearances {
     body: Option<(BodyId, Appearance)>,
     faces: Vec<(FaceName, Appearance)>,
+    /// The material the file names for the part, as the part's when it has none yet.
+    material: Option<Material>,
 }
 
 impl FeatureResult {
@@ -553,6 +555,11 @@ impl Part {
         for (face, appearance) in imported.faces {
             if self.appearances.face(&face).is_none() {
                 self.appearances.set_face(&face, Some(appearance));
+            }
+        }
+        if let Some(material) = imported.material {
+            if self.material.is_none() {
+                self.material = Some(material);
             }
         }
     }
@@ -1268,9 +1275,14 @@ fn build_import<K: Kernel>(
         .collect();
     let mut work = Working::from(ctx.body);
     let target = default_target(ctx, None).and_then(|t| work.find(t));
-    let appearances = import
-        .apply_colors
-        .then(|| import_appearances(id, &imported.colors, target.is_none()));
+    let appearances = import.apply_colors.then(|| {
+        let mut appearances = import_appearances(id, &imported.colors, target.is_none());
+        appearances.material = imported
+            .material
+            .as_ref()
+            .and_then(|m| Material::from_step(&m.name, m.density));
+        appearances
+    });
     let outcome = match target {
         None => work.push(BodyId::new(id, 0), shape, names, true, kernel),
         Some(index) => {

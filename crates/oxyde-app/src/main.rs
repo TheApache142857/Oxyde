@@ -27,6 +27,7 @@ mod model_refs;
 mod prefs;
 mod prefs_ui;
 mod property_manager;
+mod section_view;
 mod sketch_mode;
 mod splash;
 mod stl_export;

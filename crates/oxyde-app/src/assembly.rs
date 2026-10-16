@@ -456,8 +456,17 @@ impl AssemblyDoc {
 
     /// The material of the part a component is (its name), when it is a part with one.
     pub fn component_material(&self, component: ComponentId) -> Option<&str> {
+        self.component_material_details(component)
+            .map(|m| m.name.as_str())
+    }
+
+    /// The material of the part a component is, when it is a part with one.
+    pub fn component_material_details(
+        &self,
+        component: ComponentId,
+    ) -> Option<&oxyde_model::Material> {
         match self.loaded(component)? {
-            Loaded::Part(p) => p.part.material().map(|m| m.name.as_str()),
+            Loaded::Part(p) => p.part.material(),
             Loaded::Assembly(_) => None,
         }
     }

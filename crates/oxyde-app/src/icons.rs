@@ -61,6 +61,8 @@ pub enum Icon {
     // Evaluate
     MassProperties,
     Measure,
+    /// Section View: a block cut open, the cut face coloured.
+    SectionView,
     Equations,
     Rebuild,
     // View and edit
@@ -786,6 +788,14 @@ fn draw(pen: &Pen, icon: Icon) {
                 pen.line(&[(x, 9.0), (x, 9.0 + depth)], 1.0, INK);
             }
         }
+        SectionView => {
+            // The kept half of a block, its cut face in the section colour, and the
+            // plane as a line where the other half was.
+            pen.poly(&[(3.0, 9.0), (12.0, 9.0), (12.0, 21.0), (3.0, 21.0)], BODY, INK);
+            pen.poly(&[(3.0, 9.0), (7.0, 4.0), (16.0, 4.0), (12.0, 9.0)], BODY_TOP, INK);
+            pen.poly(&[(12.0, 9.0), (16.0, 4.0), (16.0, 16.0), (12.0, 21.0)], ACCENT, INK);
+            pen.line(&[(19.5, 2.0), (19.5, 22.0)], 1.2, INK);
+        }
         Equations => {
             pen.line(
                 &[
@@ -1001,7 +1011,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 59] = {
+pub const ALL: [Icon; 60] = {
     use Icon::*;
     [
         Sketch,
@@ -1045,6 +1055,7 @@ pub const ALL: [Icon; 59] = {
         Discard,
         MassProperties,
         Measure,
+        SectionView,
         Equations,
         Rebuild,
         ViewFront,

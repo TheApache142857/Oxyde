@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use oxyde_geom::Point2;
 use oxyde_model::{
     Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, EquationText, Material,
+    MaterialSource,
     Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
     FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Mirror,
     PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
@@ -94,6 +95,9 @@ pub(crate) struct MaterialDto {
     /// kg/m³.
     pub density: f64,
     pub appearance: AppearanceDto,
+    /// `"step"` for a material named by an imported STEP file; absent for the library's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto {
@@ -102,6 +106,10 @@ pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto
         category: m.category.clone(),
         density: m.density,
         appearance: appearance_dto(&m.appearance, textures),
+        source: match m.source {
+            MaterialSource::Library => None,
+            MaterialSource::Step => Some("step".to_owned()),
+        },
     }
 }
 
@@ -112,11 +120,17 @@ pub(crate) fn material_from(
     if !Material::is_valid_name(&dto.name) {
         return Err(format!("invalid material name \"{}\"", dto.name));
     }
+    let source = match dto.source.as_deref() {
+        None | Some("library") => MaterialSource::Library,
+        Some("step") => MaterialSource::Step,
+        Some(other) => return Err(format!("unknown material source \"{other}\"")),
+    };
     Ok(Material {
         name: dto.name,
         category: dto.category,
         density: dto.density,
         appearance: appearance_from(dto.appearance, files)?,
+        source,
     }
     .clamped())
 }

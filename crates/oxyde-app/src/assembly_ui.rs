@@ -182,6 +182,8 @@ enum TreeAction {
     Fix(Vec<ComponentId>, bool),
     OpenPart(ComponentId),
     Appearance(ComponentId),
+    /// Opens the Materials window on the material of this component's part.
+    EditMaterial(ComponentId),
     /// Gives the parts of these components a material of the library (`None`: none).
     Material(Vec<ComponentId>, Option<String>),
     /// Same for the part files inside a sub-assembly.
@@ -197,6 +199,56 @@ enum TreeAction {
     FlipMate(MateId),
     SuppressMate(MateId, bool),
     DeleteMate(MateId),
+}
+
+/// The row under a part saying what it is made of: `Material: Acier (STEP)`, or none.
+/// The hover gives the density and where the material comes from.
+fn material_row(
+    ui: &mut egui::Ui,
+    material: Option<&oxyde_model::Material>,
+    indent: f32,
+) -> crate::timeline::RowResponse {
+    let (text, hover) = match material {
+        Some(m) => {
+            let tag = if m.is_from_step() { " (STEP)" } else { "" };
+            let density = if m.has_density() {
+                format!("{:.0} kg/m³", m.density)
+            } else {
+                "density unknown: no mass".to_owned()
+            };
+            let from = if m.is_from_step() {
+                "named by the STEP file the part was imported from"
+            } else {
+                "from the Oxyde material library"
+            };
+            (
+                RichText::new(format!("Material: {}{tag}", m.name)),
+                format!("{}\n{density} · {from}\nSaved in the part file", m.name),
+            )
+        }
+        None => (
+            RichText::new("Material: none").weak().italics(),
+            "No material: right-click to give the part one. The mass needs it.".to_owned(),
+        ),
+    };
+    let row = tree_row(
+        ui,
+        Row {
+            icon: Icon::Materials,
+            cut: false,
+            text,
+            highlighted: false,
+            hovered: false,
+            badge: None,
+            indent,
+            expander: None,
+            eye: None,
+        },
+    );
+    crate::timeline::RowResponse {
+        response: row.response.on_hover_text(hover),
+        ..row
+    }
 }
 
 /// The entries of a Material menu: the library's materials and "None". Returns the choice
@@ -1359,6 +1411,7 @@ impl OxydeApp {
         {
             self.show_measure = !self.show_measure;
         }
+        self.section_view_button(ui, has_parts);
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -1924,6 +1977,34 @@ impl OxydeApp {
                                 action = Some(TreeAction::Target(MateRef::new(id, target)));
                             }
                         }
+                        // What the part is made of, as saved in its file.
+                        if sub.is_none() {
+                            let material = doc.component_material_details(id);
+                            let row = material_row(ui, material, 16.0);
+                            if row.response.double_clicked() {
+                                action = Some(TreeAction::EditMaterial(id));
+                            }
+                            row.response.context_menu(|ui| {
+                                ui.menu_button("Change material", |ui| {
+                                    if let Some(choice) = material_menu(ui, &material_names) {
+                                        action = Some(TreeAction::Material(vec![id], choice));
+                                    }
+                                });
+                                if let Some(m) = material {
+                                    if ui
+                                        .button("Edit in the Materials window…")
+                                        .clicked()
+                                    {
+                                        action = Some(TreeAction::EditMaterial(id));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Select parts with this material").clicked() {
+                                        action = Some(TreeAction::SelectMaterial(m.name.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        }
                         // What the sub-assembly holds, as it was saved: its parts take a
                         // material or an appearance from here, the rest by opening it.
                         if let Some(sub) = sub {
@@ -2049,6 +2130,16 @@ impl OxydeApp {
             TreeAction::Fix(ids, fixed) => self.set_fixed(&ids, fixed),
             TreeAction::OpenPart(id) => self.pending_open_component = Some(id),
             TreeAction::Appearance(id) => self.begin_component_appearance(id),
+            TreeAction::EditMaterial(id) => {
+                let material = self
+                    .asm
+                    .as_ref()
+                    .and_then(|doc| doc.component_material_details(id).cloned());
+                match material {
+                    Some(m) => self.edit_material(m),
+                    None => self.open_materials_window(),
+                }
+            }
             TreeAction::Material(targets, name) => self.apply_component_material(&targets, name),
             TreeAction::MaterialPaths(paths, name) => self.apply_material_to_paths(&paths, name),
             TreeAction::InnerAppearance(o) => self.begin_inner_appearance(o),
@@ -2749,12 +2840,12 @@ impl SubTree<'_> {
                 self.hovered
                     .push(Hovered::Picks(doc.picks_under(self.top, path)));
             }
-            let material = match inner {
-                Some(crate::assembly::Loaded::Part(p)) => {
-                    p.part.material().map(|m| m.name.as_str())
-                }
-                _ => None,
+            let (material, is_part) = match inner {
+                Some(crate::assembly::Loaded::Part(p)) => (p.part.material(), true),
+                _ => (None, false),
             };
+            let material_details = material;
+            let material = material.map(|m| m.name.as_str());
             let hover = match material {
                 Some(m) => format!("{}\nIn {sub_name}, made of {m}", c.path),
                 None => format!("{}\nIn {sub_name}", c.path),
@@ -2796,6 +2887,26 @@ impl SubTree<'_> {
                         .weak(),
                 );
             });
+            if is_part {
+                // What the part is made of, as saved in its file.
+                let row = material_row(ui, material_details, indent + 16.0);
+                row.response.context_menu(|ui| {
+                    ui.add_enabled_ui(!paths.is_empty(), |ui| {
+                        ui.menu_button("Change material", |ui| {
+                            if let Some(choice) = material_menu(ui, self.materials) {
+                                *self.action =
+                                    Some(TreeAction::MaterialPaths(paths.clone(), choice));
+                            }
+                        });
+                    });
+                    if let Some(name) = material {
+                        if ui.button("Select parts with this material").clicked() {
+                            *self.action = Some(TreeAction::SelectMaterial(name.to_owned()));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            }
             if let Some(nested) = nested {
                 self.show(ui, nested, &c.name, path, indent + 16.0, depth + 1);
             }

@@ -206,9 +206,20 @@ pub(crate) mod bridge {
         faces: Vec<StepColorData>,
     }
 
+    /// The material a STEP file gives a part (its `material name` and `density`
+    /// properties, as Fusion 360 and SolidWorks write them per body). `present` false: none.
+    struct StepMaterialData {
+        present: bool,
+        name: String,
+        description: String,
+        /// kg/m³; 0 when the file gives none.
+        density: f64,
+    }
+
     struct StepImportData {
         shape: u64,
         colors: StepShapeColors,
+        material: StepMaterialData,
     }
 
     // ---- STEP assemblies --------------------------------------------------------------------
@@ -226,6 +237,8 @@ pub(crate) mod bridge {
         is_assembly: bool,
         /// A part's solids as a STEP file; empty when it has none.
         step: Vec<u8>,
+        /// What the file says the part is made of.
+        material: StepMaterialData,
         instances: Vec<StepInstanceData>,
     }
 
@@ -328,11 +341,13 @@ pub(crate) mod bridge {
 
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
 
-        /// Writes the shapes with their colours (`colors` indexed like `shapes`, or empty).
+        /// Writes the shapes with their colours (`colors` indexed like `shapes`, or empty)
+        /// and materials (`materials` indexed like `shapes`, or empty).
         fn export_step(
             self: &Session,
             shapes: &[u64],
             colors: &[StepShapeColors],
+            materials: &[StepMaterialData],
             path: &str,
         ) -> Result<()>;
 

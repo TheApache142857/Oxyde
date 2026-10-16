@@ -187,11 +187,23 @@ impl StepColors {
     }
 }
 
-/// What [`Kernel::import_step`] reads: the solids as one shape, and their colours.
+/// The material a STEP file gives a part: its `material name` and `density` properties
+/// (AP214/AP242), as Fusion 360 and SolidWorks write them for every body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepMaterial {
+    pub name: String,
+    pub description: String,
+    /// kg/m³; 0 when the file gives none.
+    pub density: f64,
+}
+
+/// What [`Kernel::import_step`] reads: the solids as one shape, their colours, and the
+/// material the file names for them (the first product's, when there are several).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepImport {
     pub shape: ShapeHandle,
     pub colors: StepColors,
+    pub material: Option<StepMaterial>,
 }
 
 /// The product structure of a STEP file: its parts and (sub-)assemblies, each listed once
@@ -213,9 +225,13 @@ pub struct StepNode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StepNodeContent {
-    /// A part: its solids alone, in its own coordinates, with their colours, written as
-    /// a STEP file that [`Kernel::import_step`] reads back.
-    Part { step: Vec<u8> },
+    /// A part: its solids alone, in its own coordinates, with their colours and material,
+    /// written as a STEP file that [`Kernel::import_step`] reads back.
+    Part {
+        step: Vec<u8>,
+        /// What the file says the part is made of.
+        material: Option<StepMaterial>,
+    },
     /// An assembly: instances of other nodes.
     Assembly { instances: Vec<StepInstance> },
 }
@@ -365,11 +381,13 @@ pub trait Kernel {
 
     /// Writes `shapes` to a STEP file at `path`, in millimetres, with their colours
     /// (`colors` is indexed like `shapes`; empty for none) as STEP colours per solid and
-    /// per face, which other CAD systems read back.
+    /// per face, and their materials (`materials` indexed like `shapes`; empty for none) as
+    /// STEP material names and densities, which other CAD systems read back.
     fn export_step(
         &self,
         shapes: &[ShapeHandle],
         colors: &[StepColors],
+        materials: &[Option<StepMaterial>],
         path: &Path,
     ) -> Result<(), Self::Error>;
 

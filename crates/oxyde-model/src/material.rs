@@ -9,6 +9,18 @@
 
 use crate::appearance::Appearance;
 
+/// Where a material comes from, so that the ones Oxyde's library defines are told apart
+/// from the ones an imported STEP file merely names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaterialSource {
+    /// Oxyde's material library: the starter set, or one the user made or edited.
+    #[default]
+    Library,
+    /// Named by the STEP file a part was imported from (Fusion 360 and SolidWorks write
+    /// the material of each body, with its density), as that file gave it.
+    Step,
+}
+
 /// What a part is made of.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Material {
@@ -18,19 +30,55 @@ pub struct Material {
     pub category: String,
     /// How parts made of it look, unless an appearance overrides it.
     pub appearance: Appearance,
-    /// Density in kg/m³.
+    /// Density in kg/m³; 0 when unknown (no mass can be computed from it).
     pub density: f64,
+    /// Oxyde's library, or an imported STEP file.
+    pub source: MaterialSource,
 }
 
 impl Material {
+    /// The category imported STEP materials are filed under until the user changes it.
+    pub const STEP_CATEGORY: &'static str = "Imported from STEP";
+
     pub fn new(name: &str, category: &str, appearance: Appearance, density: f64) -> Self {
         Self {
             name: name.to_owned(),
             category: category.to_owned(),
             appearance,
             density,
+            source: MaterialSource::Library,
         }
         .clamped()
+    }
+
+    /// A material as a STEP file names it: `density` in kg/m³ (0 when the file gives
+    /// none), the default look (the file's colours become appearances, which win over it).
+    /// `None` when the name is unusable.
+    pub fn from_step(name: &str, density: f64) -> Option<Self> {
+        let name = name.trim();
+        if !Self::is_valid_name(name) {
+            return None;
+        }
+        Some(
+            Self {
+                name: name.to_owned(),
+                category: Self::STEP_CATEGORY.to_owned(),
+                appearance: Appearance::default(),
+                density,
+                source: MaterialSource::Step,
+            }
+            .clamped(),
+        )
+    }
+
+    /// Whether the material was named by an imported STEP file rather than the library.
+    pub fn is_from_step(&self) -> bool {
+        self.source == MaterialSource::Step
+    }
+
+    /// Whether a mass can be computed from it: a known, positive density.
+    pub fn has_density(&self) -> bool {
+        self.density > 0.0
     }
 
     /// The density kept positive and finite, the appearance in range.
@@ -189,5 +237,24 @@ mod tests {
         assert!(Material::is_valid_name("Oak"));
         assert!(!Material::is_valid_name(" Oak"));
         assert!(!Material::is_valid_name(""));
+    }
+
+    #[test]
+    fn step_materials_are_told_apart_from_the_library() {
+        let steel = Material::from_step(" Acier ", 7850.0).unwrap();
+        assert_eq!(steel.name, "Acier");
+        assert!(steel.is_from_step() && steel.has_density());
+        assert_eq!(steel.category, Material::STEP_CATEGORY);
+        let unknown = Material::from_step("Eau", 0.0).unwrap();
+        assert!(!unknown.has_density());
+        assert!(Material::from_step("  ", 1.0).is_none());
+        let library = Material::new("Oak", "Wood", Appearance::default(), 750.0);
+        assert!(!library.is_from_step());
+        // Both can live in one library, told apart by their source.
+        let mut lib = MaterialLibrary::default();
+        lib.insert(steel.clone());
+        lib.insert(library);
+        assert!(lib.get("Acier").unwrap().is_from_step());
+        assert!(!lib.get("Oak").unwrap().is_from_step());
     }
 }

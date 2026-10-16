@@ -52,7 +52,7 @@ fn colours_round_trip_through_step() {
     };
     colors.faces[2] = Some(BLUE_GLASS);
     let path = temp_step("colours");
-    kernel.export_step(&[shape], &[colors], &path).unwrap();
+    kernel.export_step(&[shape], &[colors], &[], &path).unwrap();
     kernel.release(shape);
     let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -143,7 +143,7 @@ fn colours_round_trip_through_step() {
     assert!(close(colors[0].solids[0], Some(StepColor { rgb: [60, 160, 70], transparency: 0.0 })));
     assert_eq!(colors[0].faces.iter().filter(|c| c.is_some()).count(), 1);
     let path = temp_step("colours-out");
-    kernel.export_step(&body.shapes(), &colors, &path).unwrap();
+    kernel.export_step(&body.shapes(), &colors, &[], &path).unwrap();
     let again = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     let reread = kernel.import_step(&again).unwrap();

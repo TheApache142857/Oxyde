@@ -5,6 +5,43 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Section View, STEP materials, material lines in the tree, release builds (0.0.4, October 2026)
+
+- **Section View** (Evaluate tab, in a part and in an assembly): the model cut open by a
+  plane to look inside it, as SolidWorks' Section View. The cut is made for real by the
+  kernel (every solid minus a half-space), so the section is exact: pick the Front, Top or
+  Right plane, move it along its normal with a slider (the range is where the model is),
+  *Flip* to keep the other half, *Centre* to put it through the middle, *Look at* to face
+  it. The cut faces are coloured (colour of your choice, or off) and the window gives the
+  section area and how many solids the plane goes through. It is a way of looking, not a
+  feature: nothing is changed, nothing can be picked while it is shown, and closing the
+  window shows the whole model again. On a big assembly the cut is made when the slider is
+  let go of.
+- **Materials from STEP files.** Fusion 360 and SolidWorks write the material of every body
+  into their STEP exports (its name and density); Oxyde now reads them. An imported part
+  gets that material (density converted to kg/m³, so masses are right at once), marked as
+  coming from a STEP file: *(STEP)* in the tree, *· STEP* in the Materials window, *Source:
+  Imported STEP file* in its editor, so Oxyde's own library materials and the ones a STEP
+  file named are always told apart. In the Materials window, *Add the N STEP materials to
+  the library* keeps them in `materials.json` (under *Imported from STEP*, still marked)
+  for other documents. A material whose file gave no density weighs nothing until one is
+  set; Mass Properties says so. Export STEP writes the part's material name and density
+  back. File format: a material's optional `"source": "step"` (FORMAT.md §3).
+- **Material line in the assembly tree.** Expanding a part shows what it is made of under
+  its planes and mates (`Material: Acier (STEP)`, or *Material: none*), with the density
+  and where it comes from on hover; right-click changes it (the part file is rewritten),
+  opens it in the Materials window (also a double-click) or selects every part made of it.
+  Parts inside sub-assemblies get the same line.
+- **Free orbit fixed**: dragging down now lifts the viewer over the model, as the
+  constrained orbit does; it turned the other way. Turning the constrained orbit back on
+  from Preferences › Navigation levels the view too (only View › Constrained orbit did).
+- **Release builds.** `.github/workflows/release.yml` builds Windows x64 (zip and
+  installer) and macOS Apple Silicon (`.app` in a `.dmg`, and a zip) on GitHub's runners,
+  tests first; pushing a tag `v*` attaches them to a draft release. New
+  `packaging/bundle-macos.sh` makes the macOS bundle (dylibs relocated into the app, icon,
+  document types, ad hoc signing; `OXYDE_SIGN_IDENTITY` for a Developer ID). Building on a
+  Mac: `brew install opencascade` (docs/BUILDING.md).
+
 ### Materials window, free orbit, Move Component, work off the UI thread (0.0.3, October 2026)
 
 - **Materials window** (Tools › Materials…, the *Materials* button of an assembly's

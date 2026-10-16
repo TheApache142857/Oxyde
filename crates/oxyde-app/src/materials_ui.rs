@@ -2,7 +2,11 @@
 //! material library edited in one place, and the materials of the open documents.
 //!
 //! A material is a look plus a density; a part made of it is drawn with the material's
-//! appearance. Editing a material here changes every open part made of it: the open part,
+//! appearance. Materials named by an imported STEP file (Fusion 360 and SolidWorks write
+//! the material and density of every body) are listed with the documents that use them,
+//! marked *STEP*, and can be added to the library in one go; they keep that mark there,
+//! so the library tells Oxyde's own materials from the ones a STEP file brought.
+//! Editing a material here changes every open part made of it: the open part,
 //! or in an assembly every part file whose material has that name (the files are
 //! rewritten, as parts are documents of their own). Applying a material to a part that
 //! has appearances of its own asks first, since the material's look replaces them
@@ -41,6 +45,15 @@ pub enum Confirm {
     },
 }
 
+/// `7850 kg/m³`, or that the density is unknown.
+fn density_text(m: &Material) -> String {
+    if m.has_density() {
+        format!("{:.0} kg/m³", m.density)
+    } else {
+        "density unknown".to_owned()
+    }
+}
+
 /// Where a material in use was found, for the list.
 struct InUse {
     material: Material,
@@ -52,6 +65,14 @@ struct InUse {
 impl OxydeApp {
     pub(crate) fn open_materials_window(&mut self) {
         self.materials_window.open = true;
+    }
+
+    /// Opens the Materials window on `material` (a part's, from the tree), ready to edit.
+    pub(crate) fn edit_material(&mut self, material: Material) {
+        self.materials_window.open = true;
+        self.materials_window.status.clear();
+        let name = material.name.clone();
+        self.materials_window.draft = Some((material, name));
     }
 
     /// The materials the open documents use, by name: the open part's, or those of every
@@ -139,6 +160,12 @@ impl OxydeApp {
         let mut update_parts = false;
         let mut new_material = false;
         let mut duplicate = false;
+        let mut add_step_materials = false;
+        // The STEP materials in use that the library does not have yet.
+        let step_to_add = in_use
+            .iter()
+            .filter(|u| u.material.is_from_step() && !u.in_library)
+            .count();
         let target = match &self.asm {
             Some(doc) => {
                 let n = doc
@@ -197,18 +224,25 @@ impl OxydeApp {
                                             color_swatch(ui, u.material.appearance.color, 14.0);
                                             let selected =
                                                 current.as_deref() == Some(u.material.name.as_str());
-                                            let label = if self.asm.is_some() {
+                                            let mut label = if self.asm.is_some() {
                                                 format!("{} ({})", u.material.name, u.count)
                                             } else {
                                                 u.material.name.clone()
                                             };
-                                            let hover = if u.in_library {
-                                                format!("{:.0} kg/m³", u.material.density)
-                                            } else {
-                                                format!(
-                                                    "{:.0} kg/m³ · not in the library",
-                                                    u.material.density
-                                                )
+                                            if u.material.is_from_step() {
+                                                label.push_str(" · STEP");
+                                            }
+                                            let density = density_text(&u.material);
+                                            let hover = match (u.material.is_from_step(), u.in_library) {
+                                                (true, false) => format!(
+                                                    "{density} · named by the STEP file the part was \
+                                                     imported from; not in the library yet"
+                                                ),
+                                                (true, true) => {
+                                                    format!("{density} · from a STEP file, in the library")
+                                                }
+                                                (false, false) => format!("{density} · not in the library"),
+                                                (false, true) => density,
                                             };
                                             let text = if u.in_library {
                                                 RichText::new(label)
@@ -220,6 +254,24 @@ impl OxydeApp {
                                             }
                                         });
                                     }
+                                    if step_to_add > 0 {
+                                        let label = if step_to_add == 1 {
+                                            "Add the STEP material to the library".to_owned()
+                                        } else {
+                                            format!("Add the {step_to_add} STEP materials to the library")
+                                        };
+                                        if ui
+                                            .button(label)
+                                            .on_hover_text(
+                                                "Keeps them in materials.json, with their densities, \
+                                                 under Imported from STEP, still marked as coming from \
+                                                 a STEP file",
+                                            )
+                                            .clicked()
+                                        {
+                                            add_step_materials = true;
+                                        }
+                                    }
                                 }
                                 section(ui, "Library");
                                 let library = &self.materials;
@@ -230,15 +282,22 @@ impl OxydeApp {
                                             color_swatch(ui, m.appearance.color, 14.0);
                                             let selected = current.as_deref() == Some(m.name.as_str());
                                             let used = in_use.iter().find(|u| u.material.name == m.name);
-                                            let hover = match used {
+                                            let density = density_text(m);
+                                            let mut hover = match used {
                                                 Some(u) if self.asm.is_some() => format!(
-                                                    "{:.0} kg/m³ · {} part file(s) made of it",
-                                                    m.density, u.count
+                                                    "{density} · {} part file(s) made of it",
+                                                    u.count
                                                 ),
-                                                Some(_) => format!("{:.0} kg/m³ · the part's material", m.density),
-                                                None => format!("{:.0} kg/m³", m.density),
+                                                Some(_) => format!("{density} · the part's material"),
+                                                None => density,
                                             };
-                                            if ui.selectable_label(selected, &m.name).on_hover_text(hover).clicked() {
+                                            let label = if m.is_from_step() {
+                                                hover.push_str(" · brought in by a STEP file");
+                                                format!("{} · STEP", m.name)
+                                            } else {
+                                                m.name.clone()
+                                            };
+                                            if ui.selectable_label(selected, label).on_hover_text(hover).clicked() {
                                                 pick = Some((m.clone(), m.name.clone()));
                                             }
                                         });
@@ -287,7 +346,21 @@ impl OxydeApp {
                                                 .range(0.0..=30000.0)
                                                 .speed(10.0)
                                                 .suffix(" kg/m³"),
-                                        );
+                                        )
+                                        .on_hover_text("0: unknown, so parts made of it have no mass");
+                                        ui.end_row();
+                                        ui.label("Source");
+                                        let source = if m.is_from_step() {
+                                            "Imported STEP file"
+                                        } else {
+                                            "Oxyde library"
+                                        };
+                                        ui.label(source).on_hover_text(if m.is_from_step() {
+                                            "Named by the STEP file a part was imported from, with the \
+                                             density it gave. Saving it to the library keeps this mark."
+                                        } else {
+                                            "Oxyde's starter set, or made or edited here."
+                                        });
                                         ui.end_row();
                                     });
                                 appearance_controls(ui, &mut m.appearance, &mut self.materials_window.status);
@@ -350,6 +423,19 @@ impl OxydeApp {
             });
         self.materials_window.open = open;
 
+        if add_step_materials {
+            let mut added = 0;
+            for u in &in_use {
+                if u.material.is_from_step() && !u.in_library {
+                    self.materials.insert(u.material.clone());
+                    added += 1;
+                }
+            }
+            self.materials_window.status = match crate::materials::save(&self.materials) {
+                Ok(path) => format!("{added} STEP material(s) added to {}", path.display()),
+                Err(e) => format!("Could not save the material library: {e}"),
+            };
+        }
         if new_material {
             let m = Material::new("New material", "", Default::default(), 1000.0);
             self.materials_window.draft = Some((m.clone(), m.name));

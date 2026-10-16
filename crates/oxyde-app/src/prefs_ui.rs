@@ -149,6 +149,11 @@ impl OxydeApp {
             }
             self.apply_preferences(ctx);
             self.save_preferences();
+            // Back to the constrained orbit: Y up again, as View › Constrained orbit does,
+            // or the view would stay tilted and the change would not show.
+            if self.prefs.navigation.constrained_orbit && !before.navigation.constrained_orbit {
+                self.viewport.level();
+            }
         }
     }
 
@@ -320,7 +325,7 @@ impl OxydeApp {
             .on_hover_text(
                 "Orbiting keeps the model's vertical axis up the screen, as in SolidWorks. \
                  Off, the view turns freely about the screen's axes and can be tilted, as \
-                 Fusion 360's free orbit (also in View)",
+                 Fusion 360's free orbit (also in View). Turning it back on levels the view.",
             );
         ui.checkbox(&mut n.animate_views, "Animate view changes");
         ui.add_enabled_ui(n.animate_views, |ui| {

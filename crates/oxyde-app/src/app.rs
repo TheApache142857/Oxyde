@@ -194,6 +194,8 @@ pub struct OxydeApp {
     pub(crate) pending_tool: Option<Tool>,
     pub(crate) show_mass_properties: bool,
     pub(crate) show_measure: bool,
+    /// Evaluate › Section View, while its window is open.
+    pub(crate) section: Option<crate::section_view::SectionView>,
     /// Which planes, axes, sketches and origins are drawn.
     pub(crate) visibility: crate::display::Visibility,
     /// Features expanded in the timeline (showing the sketch they absorb).
@@ -273,6 +275,7 @@ impl OxydeApp {
             pending_tool: None,
             show_mass_properties: false,
             show_measure: false,
+            section: None,
             visibility: Default::default(),
             expanded: Default::default(),
             scroll_to_feature: None,
@@ -1180,7 +1183,17 @@ impl OxydeApp {
         else {
             return;
         };
-        self.status = match self.kernel.export_step(&shapes, &colors, &path) {
+        // The part's material goes with every solid, as its name and density.
+        let material = self.doc.part.material().map(|m| oxyde_kernel::StepMaterial {
+            name: m.name.clone(),
+            description: m.category.clone(),
+            density: m.density,
+        });
+        let materials = vec![material; shapes.len()];
+        self.status = match self
+            .kernel
+            .export_step(&shapes, &colors, &materials, &path)
+        {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };

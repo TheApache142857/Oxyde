@@ -203,8 +203,10 @@ impl Camera {
         let (right, up, eye) = (self.right(), self.up(), self.eye_direction());
         // Dragging right turns the model to the right (the viewer goes the other way);
         // dragging down brings the viewer up over the model, as in the constrained orbit.
+        // Turning the eye about `right` by a positive angle takes it towards -up (right ×
+        // eye = -up), so a downward drag (dy > 0) needs the negative angle.
         let eye = rotate(eye, up, -dx * RADIANS_PER_PIXEL);
-        let eye = rotate(eye, right, dy * RADIANS_PER_PIXEL);
+        let eye = rotate(eye, right, -dy * RADIANS_PER_PIXEL);
         let right = rotate(right, up, -dx * RADIANS_PER_PIXEL);
         let eye = unit(eye);
         // Keep the basis orthonormal whatever rounding did.
@@ -353,9 +355,16 @@ mod tests {
         assert!(close(camera.up(), [0.0, 1.0, 0.0]));
         let after = camera.project(pivot, w, h);
         assert!((after[0] - before[0]).abs() < 1e-9 && (after[1] - before[1]).abs() < 1e-9);
-        // Then about the screen's horizontal, then the vertical again: the model's Y is
-        // no longer up the screen, which a constrained orbit can never do.
+        // Dragging down lifts the viewer over the model, exactly as the constrained orbit
+        // does from the same view (the free orbit must not feel upside down).
+        let mut constrained = Camera::default();
+        constrained.set_view(StandardView::Front);
+        constrained.orbit_about(50.0, 60.0, pivot);
         camera.orbit_free_about(0.0, 60.0, pivot);
+        assert!(camera.eye_direction()[1] > 0.1);
+        assert!(close(camera.eye_direction(), constrained.eye_direction()));
+        // Then about the vertical again: the model's Y is no longer up the screen, which
+        // a constrained orbit can never do.
         camera.orbit_free_about(70.0, 0.0, pivot);
         assert!(camera.is_tilted());
         assert!(!close(camera.up(), [0.0, 1.0, 0.0]));

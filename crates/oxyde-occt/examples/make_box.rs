@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let path = Path::new("box.step");
-    kernel.export_step(&[shape], &[], path)?;
+    kernel.export_step(&[shape], &[], &[], path)?;
     println!("wrote {}", path.display());
     Ok(())
 }

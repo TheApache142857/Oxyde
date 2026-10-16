@@ -89,6 +89,7 @@ impl OxydeApp {
                 .show(ctx, |ui| self.measure_ui(ui));
             self.show_measure = open;
         }
+        self.section_window(ctx);
     }
 
     fn mass_properties_ui(&mut self, ui: &mut egui::Ui) {
@@ -141,15 +142,39 @@ impl OxydeApp {
                 row(ui, "Edges", topology.edges.len().to_string());
                 row(ui, "Vertices", topology.vertices.len().to_string());
                 if let Some(material) = self.doc.part.material() {
-                    row(ui, "Material", material.name.clone());
-                    row(ui, "Density", format!("{:.0} kg/m³", material.density));
-                    row(
-                        ui,
-                        "Mass",
-                        volume.map_or_else(|| "?".to_owned(), |v| mass_text(material.mass_kg(v))),
-                    );
+                    let name = if material.is_from_step() {
+                        format!("{} (from STEP)", material.name)
+                    } else {
+                        material.name.clone()
+                    };
+                    row(ui, "Material", name);
+                    if material.has_density() {
+                        row(ui, "Density", format!("{:.0} kg/m³", material.density));
+                        row(
+                            ui,
+                            "Mass",
+                            volume.map_or_else(|| "?".to_owned(), |v| mass_text(material.mass_kg(v))),
+                        );
+                    } else {
+                        row(ui, "Density", "unknown".to_owned());
+                    }
                 }
             });
+        if self
+            .doc
+            .part
+            .material()
+            .is_some_and(|m| !m.has_density())
+        {
+            ui.label(
+                egui::RichText::new(
+                    "The material has no density (the file it came from gave none): set one in \
+                     Tools › Materials to get the mass.",
+                )
+                .small()
+                .weak(),
+            );
+        }
         if self.doc.part.material().is_none() {
             let note = if self.doc.properties.material.is_empty() {
                 "No material: give the part one (right-click › Material…) to get its mass."
@@ -198,9 +223,10 @@ impl OxydeApp {
         let leaves = doc.leaves(&doc.assembly);
         let parts = leaves.len();
         let mut volume = Some(0.0);
-        // Mass of the parts that have a material; the others are counted.
+        // Mass of the parts that have a material with a density; the others are counted.
         let mut mass = 0.0;
         let mut without_material = 0;
+        let mut without_density = 0;
         for (o, _, part) in &leaves {
             let v = doc
                 .path_at(o)
@@ -210,10 +236,12 @@ impl OxydeApp {
                 _ => None,
             };
             match (part.part.material(), v) {
-                (Some(m), Some(v)) => mass += m.mass_kg(v),
+                (Some(m), Some(v)) if m.has_density() => mass += m.mass_kg(v),
+                (Some(_), _) => without_density += 1,
                 _ => without_material += 1,
             }
         }
+        let without_material = without_material + without_density;
         let bounds = doc.bounds(&doc.assembly);
         let hidden = doc.assembly.components.iter().filter(|c| c.hidden).count();
         egui::Grid::new("asm_mass_properties")
@@ -253,7 +281,14 @@ impl OxydeApp {
             notes.push(format!(
                 "{without_material} part(s) without a material are left out of the mass."
             ));
-        } else if parts > 0 && without_material == parts {
+        }
+        if without_density > 0 {
+            notes.push(format!(
+                "{without_density} of them have a material without a density (their STEP file \
+                 gave none): set one in Tools › Materials."
+            ));
+        }
+        if parts > 0 && without_material == parts && without_density == 0 {
             notes.push(
                 "Give the parts materials (right-click › Material) to get the mass.".to_owned(),
             );

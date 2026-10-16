@@ -49,7 +49,7 @@ fn box_exports_to_step() {
         .unwrap();
 
     let path = temp_step_path("box");
-    kernel.export_step(&[shape], &[], &path).unwrap();
+    kernel.export_step(&[shape], &[], &[], &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
 
@@ -89,7 +89,7 @@ fn foreign_handle_is_an_error() {
 #[test]
 fn exporting_nothing_is_an_error() {
     let kernel = OcctKernel::new();
-    assert!(kernel.export_step(&[], &[], &temp_step_path("empty")).is_err());
+    assert!(kernel.export_step(&[], &[], &[], &temp_step_path("empty")).is_err());
 }
 
 #[test]

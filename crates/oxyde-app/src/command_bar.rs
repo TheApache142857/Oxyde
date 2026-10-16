@@ -621,6 +621,7 @@ impl OxydeApp {
         {
             self.show_measure = !self.show_measure;
         }
+        self.section_view_button(ui, body);
         group_separator(ui);
         if command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
             .on_hover_text("Equations, global variables and dimensions")
