@@ -1,0 +1,123 @@
+# Continuous integration: format check, clippy and tests on every push and pull request.
+#
+# Two jobs:
+#   pure-rust    the crates that need no OpenCASCADE, on Linux, in a few minutes. This is the
+#                quick signal.
+#   windows-occt the whole workspace on Windows (the main platform) with OpenCASCADE from
+#                vcpkg. A cold run builds OCCT, which takes 30 minutes or more; the install is
+#                kept in the Actions cache, keyed on the pinned vcpkg commit, so later runs
+#                skip it. This job may take long; do not wait for it to merge a doc change.
+#
+# Written from the action docs without being run: the repository had no Actions minutes when
+# it was added (see the commit that dropped release.yml). Treat the first green run as the
+# verification.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are large and useless on a runner that starts cold.
+  CARGO_INCREMENTAL: 0
+  # The crates that compile without OpenCASCADE (docs/BUILDING.md §2).
+  PURE_CRATES: -p oxyde-geom -p oxyde-sketch -p oxyde-kernel -p oxyde-model -p oxyde-assembly -p oxyde-format -p oxyde-render
+
+jobs:
+  pure-rust:
+    name: Pure Rust crates (no OpenCASCADE)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, with rustfmt and clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check, per crate
+        run: cargo fmt $PURE_CRATES --check
+
+      - name: Clippy (warnings shown, not yet errors)
+        # The workspace carries about 90 warnings from clippy 1.98 (mostly collapsible_if).
+        # Add `-- -D warnings` once a sweep has removed them.
+        run: cargo clippy $PURE_CRATES --all-targets
+
+      - name: Tests (debug)
+        run: cargo test $PURE_CRATES
+
+  windows-occt:
+    name: Whole workspace on Windows with OpenCASCADE (slow on a cold cache)
+    runs-on: windows-latest
+    timeout-minutes: 300
+    env:
+      # ports/opencascade at 8.0.1, the version Oxyde is tested against (docs/BUILDING.md §1).
+      # Bump this to move OCCT; the cache key below follows it.
+      VCPKG_COMMIT: f89a4a1da4e3176a8d1a14c1825b9b2f98e48843
+      # Release libraries only: Rust links the release C runtime even in debug builds, and a
+      # debug OCCT would double the build time and the cache.
+      VCPKG_TRIPLET: x64-windows-release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out vcpkg at the pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: vcpkg
+
+      - name: Restore the OpenCASCADE install from the cache
+        id: occt-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg/installed
+          key: occt-${{ runner.os }}-${{ env.VCPKG_TRIPLET }}-${{ env.VCPKG_COMMIT }}-v1
+
+      - name: Build OpenCASCADE with vcpkg (cache miss only; 30 minutes or more)
+        if: steps.occt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          .\vcpkg\vcpkg.exe install "opencascade:$env:VCPKG_TRIPLET" --clean-after-build
+
+      - name: Point the build at OpenCASCADE
+        # crates/oxyde-occt/build.rs reads OXYDE_OCCT_DIR (an install root holding
+        # include/opencascade and lib); the tests need the DLLs in bin on PATH.
+        shell: pwsh
+        run: |
+          $occt = Join-Path $env:GITHUB_WORKSPACE "vcpkg\installed\$env:VCPKG_TRIPLET"
+          "OXYDE_OCCT_DIR=$occt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          (Join-Path $occt "bin") | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install Rust (stable, with rustfmt and clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check, per crate
+        shell: pwsh
+        run: |
+          cargo fmt -p oxyde-geom -p oxyde-sketch -p oxyde-kernel -p oxyde-occt -p oxyde-model `
+            -p oxyde-assembly -p oxyde-format -p oxyde-render -p oxyde-app -p oxyde-tests --check
+
+      - name: Clippy (warnings shown, not yet errors; see the Linux job)
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests (debug, the whole workspace including the OpenCASCADE end-to-end tests)
+        run: cargo test --workspace
