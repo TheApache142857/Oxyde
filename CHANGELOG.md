@@ -5,6 +5,16 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Booleans on every core (unreleased, October 2026)
+
+- **Booleans use every core.** A fuse, cut or intersection (an extrusion joining or
+  cutting a body, a pattern of holes, Combine, the Section View's cut) now runs on every
+  core of the machine for the parts of its work that can be shared out; a section cut
+  through a big imported solid takes up to a third less time. The result is the same
+  shape with the same faces in the same order and the same names as before: a new test
+  rebuilds parts made of several booleans ten times and checks every face, edge, name and
+  history against the first rebuild.
+
 ### Section View, faster (unreleased, October 2026)
 
 Evaluate › Section View does less work for the same picture:
