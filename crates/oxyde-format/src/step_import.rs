@@ -44,8 +44,9 @@ pub struct ImportPlan {
 }
 
 impl ImportPlan {
-    pub fn top(&self) -> &ImportedFile {
-        self.files.last().expect("a plan has at least one file")
+    /// `None` only for a plan without files, which [`plan`] never makes.
+    pub fn top(&self) -> Option<&ImportedFile> {
+        self.files.last()
     }
 
     pub fn part_count(&self) -> usize {
@@ -79,7 +80,10 @@ impl ImportPlan {
                 ImportedDocument::Assembly(assembly) => save_assembly(&path, assembly)?,
             }
         }
-        Ok(dir.join(&self.top().file_name))
+        let top = self.top().ok_or_else(|| {
+            FormatError::InvalidAssembly("the import plan has no files".to_owned())
+        })?;
+        Ok(dir.join(&top.file_name))
     }
 }
 
@@ -316,7 +320,8 @@ fn unique(base: &str, taken: &mut HashSet<String>) -> String {
             }
         })
         .find(|name| !taken.contains(&name.to_lowercase()))
-        .expect("some suffix is free");
+        // The search is unbounded, so this is never reached.
+        .unwrap_or_else(|| base.to_owned());
     taken.insert(name.to_lowercase());
     name
 }
@@ -405,7 +410,7 @@ mod tests {
         );
         assert_eq!((plan.part_count(), plan.assembly_count()), (4, 2));
 
-        let top = as_assembly(plan.top());
+        let top = as_assembly(plan.top().unwrap());
         let components = &top.assembly.components;
         assert_eq!(components.len(), 4);
         assert_eq!(components[1].name, "M6x20 Screw<1>");
@@ -485,7 +490,10 @@ mod tests {
         }
         let plan = plan_step_import(&tree, "g.step").unwrap();
         assert_eq!(plan.files.len(), 3);
-        assert_eq!(as_assembly(plan.top()).assembly.components.len(), 3);
+        assert_eq!(
+            as_assembly(plan.top().unwrap()).assembly.components.len(),
+            3
+        );
 
         let single = StepAssembly {
             nodes: vec![part("")],

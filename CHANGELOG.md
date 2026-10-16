@@ -22,6 +22,16 @@ Nothing changes in the application; this is for the people and agents working on
 - ARCHITECTURE.md's roadmap now says what shipped: multi-body parts and assemblies are
   done (0.0.5), and so is CI.
 
+### Never crash (unreleased, October 2026)
+
+A bug in Oxyde no longer takes the unsaved part with it. A panic in a kernel call or
+in the building of a feature fails that feature alone, with `internal error: …` in the
+tree, and the rest of the timeline is still built; a panic in a rebuild or anywhere in a
+frame of the window ends that frame, not the application: the change that led to it is
+undone and a window says so, with the message to report. Every production crate now
+refuses `unwrap`, `expect`, `panic!` and friends at compile time (21 such places were
+replaced by errors or harmless fallbacks). See `docs/ARCHITECTURE.md`, "Never crash".
+
 ### Second bug hunt: unwanted behaviours (unreleased, October 2026)
 
 Read through the application and the modelling engine for what they do that nobody

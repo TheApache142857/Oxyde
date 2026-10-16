@@ -8,6 +8,15 @@ use oxyde_model::{FeatureId, Part, PartDefinition};
 
 const UNDO_LIMIT: usize = 200;
 
+/// A panic caught while rebuilding: a bug, not a modelling error. The document was put
+/// back to the state before the change that led to it when `undone`, else left with the
+/// same timeline and nothing built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalError {
+    pub message: String,
+    pub undone: bool,
+}
+
 /// A revision number no other state of any document has had: views caching what they show
 /// by revision can never take a newly opened document for the one before it.
 pub(crate) fn next_revision() -> u64 {
@@ -39,7 +48,24 @@ pub struct Document {
 
 impl Document {
     pub fn new() -> Self {
-        Self::from_file(PartFile::new(), None).expect("an empty part is valid")
+        let PartFile {
+            document_id,
+            properties,
+            ..
+        } = PartFile::new();
+        Self {
+            part: Part::new(),
+            properties,
+            document_id,
+            path: None,
+            untitled_name: None,
+            modified: false,
+            read_only: false,
+            revision: next_revision(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            editing: None,
+        }
     }
 
     pub fn from_file(file: PartFile, path: Option<PathBuf>) -> Result<Self, String> {
@@ -143,25 +169,50 @@ impl Document {
         !self.redo.is_empty()
     }
 
-    pub fn undo<K: Kernel>(&mut self, kernel: &mut K) -> bool {
+    /// How many undo steps are recorded: a frame compares before and after to know
+    /// whether the change it began was recorded (see `OxydeApp::recover_frame`).
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Whether anything happened; an error when the rebuild of the restored state hit a
+    /// bug (see [`Document::rebuild`]).
+    pub fn undo<K: Kernel>(&mut self, kernel: &mut K) -> Result<bool, InternalError> {
         let Some(previous) = self.undo.pop() else {
-            return false;
+            return Ok(false);
         };
         self.redo.push(self.part.definition());
-        self.restore(previous, kernel);
-        true
+        self.restore(previous, kernel)?;
+        Ok(true)
     }
 
-    pub fn redo<K: Kernel>(&mut self, kernel: &mut K) -> bool {
+    pub fn redo<K: Kernel>(&mut self, kernel: &mut K) -> Result<bool, InternalError> {
         let Some(next) = self.redo.pop() else {
-            return false;
+            return Ok(false);
         };
         self.undo.push(self.part.definition());
-        self.restore(next, kernel);
-        true
+        self.restore(next, kernel)?;
+        Ok(true)
     }
 
-    fn restore<K: Kernel>(&mut self, definition: PartDefinition, kernel: &mut K) {
+    /// Takes the last change back without keeping it for Redo: for a change that hit a
+    /// bug half-way, whose state is not worth coming back to.
+    pub fn discard_last_change<K: Kernel>(
+        &mut self,
+        kernel: &mut K,
+    ) -> Result<bool, InternalError> {
+        let Some(previous) = self.undo.pop() else {
+            return Ok(false);
+        };
+        self.restore(previous, kernel)?;
+        Ok(true)
+    }
+
+    fn restore<K: Kernel>(
+        &mut self,
+        definition: PartDefinition,
+        kernel: &mut K,
+    ) -> Result<(), InternalError> {
         // Snapshots come from valid parts, so this cannot fail in practice.
         if let Ok(part) = Part::from_definition(definition) {
             self.part.release(kernel);
@@ -169,12 +220,41 @@ impl Document {
         }
         self.editing = None;
         self.modified = true;
-        self.rebuild(kernel);
+        self.rebuild(kernel)
     }
 
-    pub fn rebuild<K: Kernel>(&mut self, kernel: &mut K) {
-        self.part.rebuild(kernel);
+    /// Rebuilds the part. A panic in the rebuild (a bug the nets below let through, in
+    /// the model's own bookkeeping say) does not get out: the part may be half built
+    /// then, so the document goes back to the last undo snapshot, the state before the
+    /// change that led to the bug, which is rebuilt in turn; without a snapshot, the same
+    /// timeline is kept with nothing built. The error says which.
+    pub fn rebuild<K: Kernel>(&mut self, kernel: &mut K) -> Result<(), InternalError> {
         self.revision = next_revision();
+        let Err(message) = oxyde_kernel::catch_panic(|| self.part.rebuild(kernel)) else {
+            return Ok(());
+        };
+        let (definition, undone) = match self.undo.pop() {
+            Some(previous) => (previous, true),
+            None => (self.part.definition(), false),
+        };
+        self.editing = None;
+        if let Ok(part) = Part::from_definition(definition) {
+            let mut broken = std::mem::replace(&mut self.part, part);
+            // Its shapes are leaked if freeing them is what fails: not worth a crash.
+            let _ = oxyde_kernel::catch_panic(|| broken.release(kernel));
+        }
+        // The restored state was built before without trouble; if it fails all the same,
+        // it is left unbuilt (a fresh part from its definition, nothing half built) rather
+        // than going back further and further.
+        let mut undone = undone;
+        if undone && oxyde_kernel::catch_panic(|| self.part.rebuild(kernel)).is_err() {
+            if let Ok(part) = Part::from_definition(self.part.definition()) {
+                self.part = part;
+            }
+            undone = false;
+        }
+        self.revision = next_revision();
+        Err(InternalError { message, undone })
     }
 
     /// Frees the kernel shapes held by this document.

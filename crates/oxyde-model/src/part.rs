@@ -810,7 +810,9 @@ fn build_feature<K: Kernel>(
     let mut warnings = Vec::new();
     let mut result = FeatureResult::with_status(FeatureStatus::Ok);
 
-    let outcome = (|| -> Result<(), String> {
+    // A panic while building (in the kernel or here) fails the feature like any other
+    // error, with the rest of the timeline still built; the document stays whole.
+    let outcome = oxyde_kernel::catch_panic(|| -> Result<(), String> {
         match &feature.kind {
             FeatureKind::Sketch(sketch) => match build_sketch(&ctx, sketch, &mut warnings) {
                 Ok(built) => result.sketch = Some(built),
@@ -878,7 +880,8 @@ fn build_feature<K: Kernel>(
             }
         }
         Ok(())
-    })();
+    })
+    .unwrap_or_else(|message| Err(format!("internal error: {message}")));
 
     match outcome {
         Ok(()) => {
@@ -1570,7 +1573,11 @@ fn build_blend<K: Kernel>(
             }
             .map_err(|e| e.to_string())?;
             let names = derived_names(id, &result.history, body, solid);
-            let index = work.find(solid.id).expect("the bodies before the feature");
+            let Some(index) = work.find(solid.id) else {
+                // The pieces come from the same body as `solid`: cannot happen.
+                kernel.release(result.shape);
+                return Err("internal error: the blended body is missing".to_owned());
+            };
             work.replace(index, result.shape, names, kernel)?;
         }
         Ok(())
@@ -1635,7 +1642,12 @@ fn build_shell<K: Kernel>(
     let id = ctx.feature().id;
     let names = derived_names(id, &result.history, body, solid);
     let mut work = Working::from(ctx.body);
-    let index = work.find(solid.id).expect("the bodies before the feature");
+    let Some(index) = work.find(solid.id) else {
+        // The pieces come from the same body as `solid`: cannot happen.
+        kernel.release(result.shape);
+        work.abort(kernel);
+        return Err("internal error: the shelled body is missing".to_owned());
+    };
     match work.replace(index, result.shape, names, kernel) {
         Ok(()) => Ok(work.finish(id)),
         Err(e) => {

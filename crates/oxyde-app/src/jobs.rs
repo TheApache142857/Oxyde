@@ -164,7 +164,8 @@ fn open_part(
     let file = oxyde_format::load_part(path).map_err(|e| e.to_string())?;
     progress.say(format!("Rebuilding {}", name_of(path)));
     let mut doc = Document::from_file(file, Some(path.to_path_buf()))?;
-    doc.rebuild(kernel);
+    doc.rebuild(kernel)
+        .map_err(|e| format!("internal error while rebuilding: {}", e.message))?;
     Ok(doc)
 }
 
@@ -293,15 +294,11 @@ impl OxydeApp {
             &format!("Importing {file_name}"),
             move |kernel, progress| {
                 progress.say(format!("Reading {file_name}"));
-                let mut part = match Part::from_definition(definition) {
-                    Ok(part) => part,
-                    Err(e) => {
-                        // Cannot happen for the definition of a live part; reported anyway.
-                        progress.say(e.to_string());
-                        Part::from_definition(oxyde_format::PartFile::new().definition)
-                            .expect("an empty part")
-                    }
-                };
+                let mut part = Part::from_definition(definition).unwrap_or_else(|e| {
+                    // Cannot happen for the definition of a live part; reported anyway.
+                    progress.say(e.to_string());
+                    Part::new()
+                });
                 part.add_feature(oxyde_model::FeatureKind::Import(Import::new(
                     file_name.clone(),
                     FileData::new(bytes),

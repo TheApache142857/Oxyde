@@ -66,7 +66,7 @@ fn materials_round_trip_through_step() {
         .expect("the part node names its material");
     assert_eq!(node_material.name, "Acier");
     let plan = plan_step_import(&tree, "Bar.step").unwrap();
-    let ImportedDocument::Part(file) = &plan.top().document else {
+    let ImportedDocument::Part(file) = &plan.top().unwrap().document else {
         panic!("a single part");
     };
     let material = file.definition.material.as_ref().expect("the part is made of it");
@@ -94,7 +94,7 @@ fn materials_round_trip_through_step() {
     kernel.release(imported.shape);
     let tree = kernel.read_step_assembly(&plain).unwrap();
     let plan = plan_step_import(&tree, "Plain.step").unwrap();
-    let ImportedDocument::Part(file) = &plan.top().document else {
+    let ImportedDocument::Part(file) = &plan.top().unwrap().document else {
         panic!("a single part");
     };
     assert!(file.definition.material.is_none());

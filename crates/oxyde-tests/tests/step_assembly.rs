@@ -152,8 +152,8 @@ fn a_plain_part_file_imports_as_one_part() {
     let plan = plan_step_import(&tree, "Cube.step").unwrap();
     assert_eq!(plan.files.len(), 1);
     assert!(
-        plan.top().file_name.ends_with(".oxyprt"),
+        plan.top().unwrap().file_name.ends_with(".oxyprt"),
         "{}",
-        plan.top().file_name
+        plan.top().unwrap().file_name
     );
 }

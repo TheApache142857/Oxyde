@@ -1178,23 +1178,33 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
     }
 
     fn line(&self, id: EntityId) -> (Point<T>, Point<T>) {
-        match self.layout.kind[&id] {
-            Geometry::Line { start, end } => (self.point(start), self.point(end)),
-            _ => unreachable!("validated by layout()"),
+        match self.layout.kind.get(&id) {
+            Some(Geometry::Line { start, end }) => (self.point(*start), self.point(*end)),
+            // `layout()` checked that every constrained entity is of the right kind; a
+            // zero-length line at the origin is the harmless answer if it ever is not.
+            _ => {
+                let zero = T::constant(0.0);
+                ((zero, zero), (zero, zero))
+            }
         }
     }
 
     /// Centre and radius of a circle or arc.
     fn round(&self, id: EntityId) -> (Point<T>, T) {
-        match self.layout.kind[&id] {
-            Geometry::Circle { center, .. } => {
-                (self.point(center), (self.param)(self.layout.radius[&id]))
+        match (self.layout.kind.get(&id), self.layout.radius.get(&id)) {
+            (Some(Geometry::Circle { center, .. }), Some(radius)) => {
+                (self.point(*center), (self.param)(*radius))
             }
-            Geometry::Arc { center, start, .. } => {
-                let c = self.point(center);
-                (c, distance(c, self.point(start)))
+            (Some(Geometry::Arc { center, start, .. }), _) => {
+                let c = self.point(*center);
+                (c, distance(c, self.point(*start)))
             }
-            _ => unreachable!("validated by layout()"),
+            // `layout()` checked that every constrained entity is of the right kind; a
+            // point circle at the origin is the harmless answer if it ever is not.
+            _ => {
+                let zero = T::constant(0.0);
+                ((zero, zero), zero)
+            }
         }
     }
 

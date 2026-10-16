@@ -529,8 +529,9 @@ impl OxydeApp {
                         && self.body_of_pick(&pick).is_some()
                         && self.axis_of_pick(&pick, d.editing).is_none() =>
                 {
-                    let body = self.body_of_pick(&pick).expect("checked");
-                    toggle(&mut d.bodies, body);
+                    if let Some(body) = self.body_of_pick(&pick) {
+                        toggle(&mut d.bodies, body);
+                    }
                     true
                 }
                 _ => match self.axis_of_pick(&pick, d.editing) {
