@@ -23,6 +23,7 @@ struct BoundsData;
 struct MeshData;
 struct OpResultData;
 struct PlaneData;
+struct PointData;
 struct RegionData;
 struct StepAssemblyData;
 struct StepImportData;
@@ -53,6 +54,7 @@ public:
     MeshData tessellate(std::uint64_t shape, double deflection) const;
     MeshData tessellate_with(std::uint64_t shape, double deflection, double angle) const;
     double volume(std::uint64_t shape) const;
+    PointData centre_of_mass(std::uint64_t shape) const;
     BoundsData bounds(std::uint64_t shape) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;
 

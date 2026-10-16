@@ -419,6 +419,9 @@ pub trait Kernel {
     /// Volume of a solid, in mm³.
     fn volume(&self, shape: ShapeHandle) -> Result<f64, Self::Error>;
 
+    /// Centre of mass of a solid of uniform density, in mm.
+    fn centre_of_mass(&self, shape: ShapeHandle) -> Result<Point3, Self::Error>;
+
     /// The smallest box along the model axes holding the shape, `(min, max)`: exact, not
     /// from a mesh, and without tolerance added.
     fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), Self::Error>;

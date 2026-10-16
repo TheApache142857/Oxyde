@@ -15,3 +15,5 @@ oxyde-occt = { workspace = true }
 oxyde-sketch = { workspace = true }
 oxyde-format = { workspace = true }
 oxyde-assembly = { workspace = true }
+oxyde-cli = { workspace = true }
+serde_json = { workspace = true }

@@ -23,9 +23,12 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-format` | `geom`, `model`, `assembly`, `kernel` (STEP structure types only) | `occt`, `app` |
 | `oxyde-render` | `kernel` (mesh types only) | `occt`, `model`, `app` |
 | `oxyde-app` | all of the above | — |
-| `oxyde-tests` | `model`, `occt` (dev only) | — |
+| `oxyde-cli` | `format`, `model`, `occt`, `kernel`, `render` | `app`, `eframe` |
+| `oxyde-tests` | `model`, `occt`, `cli` (dev only) | — |
 
-`oxyde-app` is the only place where a concrete kernel backend is chosen. `oxyde-tests` holds end-to-end tests that drive the model through OCCT, so neither crate has to depend on the other.
+`oxyde-app` and `oxyde-cli` are the only places where a concrete kernel backend is chosen. `oxyde-tests` holds end-to-end tests that drive the model through OCCT, so neither crate has to depend on the other.
+
+`oxyde-cli` (`eval`, `check`, `export`, `snapshot`) is the headless path through the same code as the application: `oxyde_format::load_part`, `Part::from_definition`, `Part::rebuild` with an `OcctKernel`, the kernel's `volume`, `centre_of_mass`, `bounds` and `topology_counts`, `Kernel::export_step` and `oxyde_format::stl`, and `oxyde_render::snapshot` (the software renderer, with `oxyde_render::mesh_deflection` for the application's display precision). It is a library with a thin `main`, so `oxyde-tests` runs the commands in-process (`crates/oxyde-tests/tests/cli.rs`: a filleted box whose measures are known by hand, and the STEP cart). Its JSON (`Evaluation`: `file`, `ok`, `features[name, type, status, message]`, `bodies[name, created_by, volume, area, centre_of_mass, bounds, faces, edges, vertices]`, `total`) and `expected.json` (`Expected`) are interfaces for scripts and the reference oracle, so their field names stay put.
 
 ## 3. The Rust ⇄ C++ boundary (`oxyde-occt`)
 
@@ -68,7 +71,7 @@ Implemented (see `crates/oxyde-kernel/src/lib.rs` for the documented signatures)
 | Group | Methods |
 |---|---|
 | Construction | `make_box`, `extrude(plane, profile, vector)`, `revolve(plane, profile, axis, angle)`, `boolean(Fuse/Cut/Common, target, tool)` and `boolean_many` (several tools in one operation), `fillet(shape, edges, radius)`, `chamfer(shape, edges, distance)`, `shell(shape, removed faces, signed offset)`, `transform(shape, rigid motion or mirror)` |
-| Queries | `topology` (faces, edges, vertices with adjacency, surface/curve kind, area, centroid, planar normal, axis of a surface of revolution, line or circle axis of an edge, edge midpoint), `tessellate` (display mesh: triangles per face, polyline per edge, indexed like the topology), `volume`, `bounds` (exact box along the model axes), `topology_counts` |
+| Queries | `topology` (faces, edges, vertices with adjacency, surface/curve kind, area, centroid, planar normal, axis of a surface of revolution, line or circle axis of an edge, edge midpoint), `tessellate` (display mesh: triangles per face, polyline per edge, indexed like the topology), `volume`, `centre_of_mass`, `bounds` (exact box along the model axes), `topology_counts` |
 | Exchange | `export_step(shapes, colors, path)` (colours per solid and per face go out as STEP colours), `import_step(data)` (the solids as one shape, and the colours the file gives them: `StepImport { shape, colors }`), `read_step_assembly(data)` (product structure: each part once as its own STEP file with its colours, assemblies with placed instances) |
 | Lifetime | `release` |
 

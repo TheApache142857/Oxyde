@@ -17,7 +17,7 @@ use oxyde_kernel::{BooleanOp, FaceSource, Kernel, Mesh, ShapeHandle, SurfaceKind
 use oxyde_model::{Appearance, Body, Part, StandardPlane};
 use oxyde_render::{Material as RenderMaterial, Scene, TextureRef};
 
-use crate::app::{OxydeApp, Selected, deflection};
+use crate::app::{OxydeApp, Selected};
 use crate::appearance_ui::{TextureCache, material};
 use crate::assembly::AsmSelected;
 use crate::dialogs::plane_name;
@@ -218,7 +218,8 @@ fn cut_body<K: Kernel>(
             kernel.release(result.shape);
             continue;
         }
-        let mesh = kernel.tessellate(result.shape, deflection(&topology, fraction));
+        let deflection = oxyde_render::mesh_deflection(&topology, fraction);
+        let mesh = kernel.tessellate(result.shape, deflection);
         kernel.release(result.shape);
         let mesh = mesh.map_err(|e| e.to_string())?;
         let mut materials = Vec::with_capacity(topology.faces.len());

@@ -12,6 +12,9 @@
 //!
 //! The projection is orthographic, as is customary in mechanical CAD, and the world is
 //! Y-up like SolidWorks: the Front view looks down −Z with X to the right.
+//!
+//! Without the application, [`mesh_deflection`] gives the display precision it would use
+//! and [`snapshot`] draws a mesh from a standard view, fitted to the image.
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -36,12 +39,14 @@
 )]
 
 mod camera;
+mod headless;
 mod material;
 mod raster;
 mod style;
 mod vec3;
 
 pub use camera::{Camera, StandardView};
+pub use headless::{NORMAL_MESH_FRACTION, mesh_deflection, snapshot};
 pub use material::{Material, Texture, TextureRef};
 pub use raster::{
     AO_RADIUS, AO_REACH, Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render,
