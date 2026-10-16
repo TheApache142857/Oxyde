@@ -9,16 +9,26 @@
 //! of the three standard planes, or a flat face selected before the window was opened
 //! (the cut is then made along that face, the side it looks to removed), moved along its
 //! normal; *Flip* keeps the other half.
+//!
+//! Only the solids the plane goes through are cut: from the box around each, a solid
+//! wholly on the kept side is shown as it is, with the display mesh it already has, and
+//! one wholly on the removed side is left out. The cut solids are meshed at the display's
+//! precision, so the faces the cut leaves alone keep their triangulation. In an assembly
+//! the part files are cut on every core at once, as they are rebuilt when it opens
+//! ([`Kernel::open_worker`]).
+
+use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use eframe::egui::{self, RichText};
 use oxyde_assembly::{Placement, Primitive};
 use oxyde_geom::{Plane, Point3, Transform, Vec3};
 use oxyde_kernel::{BooleanOp, FaceSource, Kernel, Mesh, ShapeHandle, SurfaceKind};
-use oxyde_model::{Appearance, Body, Part, StandardPlane};
+use oxyde_model::{Appearance, Body, Part, Solid, StandardPlane};
 use oxyde_render::{Material as RenderMaterial, Scene, TextureRef};
 
 use crate::app::{OxydeApp, Selected};
-use crate::appearance_ui::{TextureCache, material};
+use crate::appearance_ui::material;
 use crate::assembly::AsmSelected;
 use crate::dialogs::plane_name;
 use crate::icons::{self, Icon};
@@ -116,6 +126,8 @@ pub struct SectionView {
     shown: Option<(SectionSettings, u64)>,
     /// Where the model is along the plane's normal, for the slider.
     range: Option<(f64, f64)>,
+    /// The boxes around the model, at the document revision they were measured at.
+    bounds: Option<Bounds>,
     report: Option<SectionReport>,
     error: Option<String>,
 }
@@ -127,6 +139,7 @@ impl SectionView {
             face: None,
             shown: None,
             range: None,
+            bounds: None,
             report: None,
             error: None,
         }
@@ -135,25 +148,144 @@ impl SectionView {
     /// Where the box `lo..hi` lies along the plane's normal, as offsets from the plane:
     /// the offsets that go through it.
     fn offsets_through(plane: &Plane, lo: Point3, hi: Point3) -> (f64, f64) {
-        let n = plane.normal;
-        let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
-        for x in [lo.x, hi.x] {
-            for y in [lo.y, hi.y] {
-                for z in [lo.z, hi.z] {
-                    let d = (Point3::new(x, y, z) - plane.origin).dot(n);
-                    min = min.min(d);
-                    max = max.max(d);
-                }
-            }
-        }
-        (min, max)
+        extent_along(plane, corners(lo, hi))
     }
 }
 
-/// One solid cut open: its mesh, in the solid's own coordinates, with a material per face.
-struct CutSolid {
+/// The eight corners of the box `lo..hi`.
+fn corners(lo: Point3, hi: Point3) -> [Point3; 8] {
+    let mut out = [lo; 8];
+    for (i, corner) in out.iter_mut().enumerate() {
+        *corner = Point3::new(
+            if i & 1 == 0 { lo.x } else { hi.x },
+            if i & 2 == 0 { lo.y } else { hi.y },
+            if i & 4 == 0 { lo.z } else { hi.z },
+        );
+    }
+    out
+}
+
+/// Where `points` lie along the plane's normal, as offsets from the plane: the least and
+/// the greatest.
+fn extent_along(plane: &Plane, points: impl IntoIterator<Item = Point3>) -> (f64, f64) {
+    let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in points {
+        let d = (p - plane.origin).dot(plane.normal);
+        min = min.min(d);
+        max = max.max(d);
+    }
+    (min, max)
+}
+
+/// Where a solid lies against the section plane, whose normal points to the removed half,
+/// from the box around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Wholly on the kept side: shown as it is, no cut made.
+    Kept,
+    /// Wholly on the removed side: not shown.
+    Removed,
+    /// The plane goes through the box: cut.
+    Through,
+}
+
+fn side_of(plane: &Plane, (lo, hi): (Point3, Point3)) -> Side {
+    let (min, max) = extent_along(plane, corners(lo, hi));
+    if max <= 0.0 {
+        Side::Kept
+    } else if min >= 0.0 {
+        Side::Removed
+    } else {
+        Side::Through
+    }
+}
+
+/// One body to cut, and where it is shown: a part's body once, at the origin; in an
+/// assembly, the body of a part file at every place the file is used. Units are cut on
+/// several cores at once, so a unit holds everything that shares shapes: a whole body.
+struct Unit<'a> {
+    part: &'a Part,
+    body: &'a Body,
+    /// The box around each solid of the body, by index, when known on the main thread; a
+    /// solid without one is asked of the kernel.
+    bounds: Vec<Option<(Point3, Point3)>>,
+    /// The display precision of the body, the same as the whole model is drawn at: the
+    /// faces the cut leaves as they were keep the triangulation the display made.
+    deflection: f64,
+    copies: Vec<Placed<'a>>,
+}
+
+/// One place a unit's body is shown at.
+struct Placed<'a> {
+    placement: Placement,
+    /// The display mesh of the whole body, faces numbered as its topology, reused for the
+    /// solids the plane misses.
+    mesh: Option<&'a Mesh>,
+    /// What the whole part is drawn with when it has one (a component appearance in an
+    /// assembly).
+    own: Option<Appearance>,
+}
+
+/// What a face of a piece is: one the cut made, or a face of the part (its index in the
+/// part's topology, when the kernel says which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PieceFace {
+    Cap,
+    Of(Option<u32>),
+}
+
+/// The boxes around the model at a document revision. They are wanted every frame (the
+/// slider's range) and at every cut (which solids the plane goes through), and asking the
+/// kernel for an exact box takes a fifth of a second on a big imported part.
+struct Bounds {
+    revision: u64,
+    /// Around the whole model, in world coordinates.
+    all: Option<(Point3, Point3)>,
+    /// Around each solid of the part, by its index in the body; empty in an assembly, where
+    /// the parts' display meshes give them.
+    solids: Vec<Option<(Point3, Point3)>>,
+}
+
+/// The box around a solid from the display mesh of its body (faces numbered as the body's
+/// topology), grown by `margin`: the mesh's points lie on the surface, so the true box is
+/// within the mesh's deflection of the mesh's.
+fn mesh_solid_bounds(
+    mesh: &Mesh,
+    body: &Body,
+    solid: &Solid,
+    margin: f64,
+) -> Option<(Point3, Point3)> {
+    if mesh.faces.len() != body.topology.faces.len() {
+        return None;
+    }
+    let faces = mesh
+        .faces
+        .get(solid.faces.start as usize..solid.faces.end as usize)?;
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in faces.iter().flat_map(|f| f.positions.iter()) {
+        for ((l, h), &v) in lo.iter_mut().zip(hi.iter_mut()).zip(p) {
+            *l = l.min(f64::from(v));
+            *h = h.max(f64::from(v));
+        }
+    }
+    if lo[0] > hi[0] {
+        return None;
+    }
+    Some((
+        Point3::new(lo[0] - margin, lo[1] - margin, lo[2] - margin),
+        Point3::new(hi[0] + margin, hi[1] + margin, hi[2] + margin),
+    ))
+}
+
+/// One solid as the section shows it: its mesh in the body's own coordinates, and where
+/// it sits.
+struct Piece {
+    placement: Placement,
+    own: Option<Appearance>,
     mesh: Mesh,
-    materials: Vec<RenderMaterial>,
+    /// One per face of the mesh.
+    faces: Vec<PieceFace>,
     /// Area of its cut faces, mm²; 0 when the plane misses it.
     cap_area: f64,
 }
@@ -183,103 +315,216 @@ fn half_space<K: Kernel>(kernel: &mut K, plane: &Plane, reach: f64) -> Result<Sh
     Ok(placed.map_err(|e| e.to_string())?.shape)
 }
 
-/// Cuts every solid of `body` by `tool`, meshing what is left. `appearance(face)` is the
-/// look of a face of the body (by its index in the body's topology), `own` what the
-/// whole part is drawn with when it has one (a component appearance in an assembly).
-fn cut_body<K: Kernel>(
-    kernel: &mut K,
-    body: &Body,
-    tool: ShapeHandle,
-    fraction: f64,
-    settings: &SectionSettings,
-    own: Option<&Appearance>,
-    appearance: &dyn Fn(u32) -> Option<Appearance>,
-    cache: &mut TextureCache,
-    textures: &mut Vec<TextureRef>,
-) -> Result<Vec<CutSolid>, String> {
-    let cap = RenderMaterial {
-        color: Some(settings.cap_color),
-        ..RenderMaterial::default()
+/// A solid the plane misses, as the display shows it: from the body's display mesh when
+/// the unit has it, else meshed again (the kernel keeps the triangulation the display
+/// made, so this is quick).
+fn whole_piece<K: Kernel>(
+    kernel: &K,
+    unit: &Unit,
+    placed: &Placed,
+    solid: &Solid,
+) -> Result<Piece, String> {
+    let topology = &unit.body.topology;
+    let range = |r: &Range<u32>| r.start as usize..r.end as usize;
+    let shown = placed
+        .mesh
+        .filter(|m| m.faces.len() == topology.faces.len() && m.edges.len() == topology.edges.len())
+        .and_then(|m| {
+            Some(Mesh {
+                faces: m.faces.get(range(&solid.faces))?.to_vec(),
+                edges: m.edges.get(range(&solid.edges))?.to_vec(),
+            })
+        });
+    let mesh = match shown {
+        Some(mesh) => mesh,
+        None => kernel
+            .tessellate(solid.shape, unit.deflection)
+            .map_err(|e| e.to_string())?,
     };
-    let mut out = Vec::new();
-    for solid in &body.solids {
-        let result = kernel
-            .boolean(BooleanOp::Cut, solid.shape, tool)
-            .map_err(|e| e.to_string())?;
-        let topology = match kernel.topology(result.shape) {
-            Ok(t) => t,
-            Err(e) => {
-                kernel.release(result.shape);
-                return Err(e.to_string());
-            }
-        };
-        if topology.faces.is_empty() {
-            // The whole solid was on the removed side.
-            kernel.release(result.shape);
-            continue;
-        }
-        let deflection = oxyde_render::mesh_deflection(&topology, fraction);
-        let mesh = kernel.tessellate(result.shape, deflection);
-        kernel.release(result.shape);
-        let mesh = mesh.map_err(|e| e.to_string())?;
-        let mut materials = Vec::with_capacity(topology.faces.len());
-        let mut cap_area = 0.0;
-        for (i, face) in topology.faces.iter().enumerate() {
-            let sources = result
-                .history
-                .faces
-                .get(i)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            // A face of the tool is a face the cut made; one of the solid keeps its look.
-            let from_tool = sources
-                .iter()
-                .any(|s| matches!(s, FaceSource::InputFace { input: 1, .. }));
+    let faces = (0..mesh.faces.len() as u32)
+        .map(|i| PieceFace::Of(Some(solid.faces.start + i)))
+        .collect();
+    Ok(Piece {
+        placement: placed.placement,
+        own: placed.own.clone(),
+        mesh,
+        faces,
+        cap_area: 0.0,
+    })
+}
+
+/// A solid the plane goes through, cut by `tool` (in the body's coordinates) and meshed;
+/// `None` when nothing of it is left.
+fn cut_piece<K: Kernel>(
+    kernel: &mut K,
+    unit: &Unit,
+    placed: &Placed,
+    solid: &Solid,
+    tool: ShapeHandle,
+) -> Result<Option<Piece>, String> {
+    let result = kernel
+        .boolean(BooleanOp::Cut, solid.shape, tool)
+        .map_err(|e| e.to_string())?;
+    let topology = kernel.topology(result.shape);
+    let mesh = match &topology {
+        Ok(t) if !t.faces.is_empty() => Some(kernel.tessellate(result.shape, unit.deflection)),
+        _ => None,
+    };
+    kernel.release(result.shape);
+    let topology = topology.map_err(|e| e.to_string())?;
+    let Some(mesh) = mesh else {
+        // The whole solid was on the removed side.
+        return Ok(None);
+    };
+    let mesh = mesh.map_err(|e| e.to_string())?;
+    let mut faces = Vec::with_capacity(topology.faces.len());
+    let mut cap_area = 0.0;
+    for (i, face) in topology.faces.iter().enumerate() {
+        let sources = result
+            .history
+            .faces
+            .get(i)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        // A face of the tool is a face the cut made; one of the solid keeps its look.
+        let from_tool = sources
+            .iter()
+            .any(|s| matches!(s, FaceSource::InputFace { input: 1, .. }));
+        if from_tool {
+            cap_area += face.area;
+            faces.push(PieceFace::Cap);
+        } else {
             let from_solid = sources.iter().find_map(|s| match s {
-                FaceSource::InputFace { input: 0, face } => Some(*face),
+                FaceSource::InputFace { input: 0, face } => Some(solid.faces.start + *face),
                 _ => None,
             });
-            if from_tool {
-                cap_area += face.area;
-            }
-            let m = if from_tool && settings.color_caps {
-                cap.clone()
-            } else {
-                let look = own
-                    .cloned()
-                    .or_else(|| from_solid.and_then(|local| appearance(solid.faces.start + local)));
-                match look {
-                    Some(a) => material(&a, cache, textures),
-                    None => RenderMaterial::default(),
-                }
-            };
-            materials.push(m);
+            faces.push(PieceFace::Of(from_solid));
         }
-        out.push(CutSolid {
-            mesh,
-            materials,
-            cap_area,
-        });
+    }
+    Ok(Some(Piece {
+        placement: placed.placement,
+        own: placed.own.clone(),
+        mesh,
+        faces,
+        cap_area,
+    }))
+}
+
+/// The pieces of a unit's solids at one place: the tool is brought into the body's
+/// coordinates rather than the body into the world, and made only if a solid needs it.
+fn cut_placed<K: Kernel>(
+    kernel: &mut K,
+    plane: &Plane,
+    reach: f64,
+    unit: &Unit,
+    placed: &Placed,
+    solids: &[(&Solid, Option<(Point3, Point3)>)],
+    out: &mut Vec<Piece>,
+) -> Result<(), String> {
+    let local = plane.transformed(&placed.placement.inverse().transform());
+    let mut tool: Option<ShapeHandle> = None;
+    let mut cut_all = || -> Result<(), String> {
+        for (solid, bounds) in solids {
+            // A solid whose box the kernel cannot give is cut, which is right for it too.
+            match bounds.map_or(Side::Through, |b| side_of(&local, b)) {
+                Side::Removed => {}
+                Side::Kept => out.push(whole_piece(kernel, unit, placed, solid)?),
+                Side::Through => {
+                    let tool = match tool {
+                        Some(t) => t,
+                        None => *tool.insert(half_space(kernel, &local, reach)?),
+                    };
+                    if let Some(piece) = cut_piece(kernel, unit, placed, solid, tool)? {
+                        out.push(piece);
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    let outcome = cut_all();
+    if let Some(t) = tool {
+        kernel.release(t);
+    }
+    outcome
+}
+
+/// Every piece of a unit: its solids at each of its places, those the plane misses as
+/// they are, those it goes through cut by the half-space on the plane's normal side.
+fn cut_unit<K: Kernel>(
+    kernel: &mut K,
+    plane: &Plane,
+    reach: f64,
+    unit: &Unit,
+) -> Result<Vec<Piece>, String> {
+    let solids: Vec<(&Solid, Option<(Point3, Point3)>)> = unit
+        .body
+        .solids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let known = unit.bounds.get(i).copied().flatten();
+            (s, known.or_else(|| kernel.bounds(s.shape).ok()))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for placed in &unit.copies {
+        cut_placed(kernel, plane, reach, unit, placed, &solids, &mut out)?;
     }
     Ok(out)
 }
 
-/// The box around every solid of a part, in its own coordinates.
-fn part_bounds<K: Kernel>(kernel: &K, body: &Body) -> Option<(Point3, Point3)> {
-    let mut out: Option<(Point3, Point3)> = None;
-    for solid in &body.solids {
-        let Ok((a, b)) = kernel.bounds(solid.shape) else {
-            continue;
-        };
-        out = Some(match out {
-            None => (a, b),
-            Some((lo, hi)) => (
-                Point3::new(lo.x.min(a.x), lo.y.min(a.y), lo.z.min(a.z)),
-                Point3::new(hi.x.max(b.x), hi.y.max(b.y), hi.z.max(b.z)),
-            ),
-        });
-    }
-    out
+/// Cuts every unit, shared out between the calling thread and one worker per further
+/// core, each worker with a kernel of its own ([`Kernel::open_worker`]) that shares the
+/// shapes; a kernel that cannot open workers cuts them one by one. The results are in
+/// unit order.
+fn cut_units<K: Kernel>(
+    kernel: &mut K,
+    plane: &Plane,
+    reach: f64,
+    units: &[Unit],
+) -> Vec<Result<Vec<Piece>, String>> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(units.len());
+    let next = AtomicUsize::new(0);
+    // Takes units from the queue until it is empty.
+    let work = |kernel: &mut K| {
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(unit) = units.get(i) else {
+                break;
+            };
+            done.push((i, cut_unit(kernel, plane, reach, unit)));
+        }
+        done
+    };
+    let mut results: Vec<Option<Result<Vec<Piece>, String>>> = units.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (1..threads)
+            .map(|_| {
+                scope.spawn(|| match K::open_worker() {
+                    Some(mut kernel) => work(&mut kernel),
+                    None => Vec::new(),
+                })
+            })
+            .collect();
+        let mut done = work(kernel);
+        for worker in workers {
+            // A worker that panicked leaves its units uncut; they are reported below.
+            done.extend(worker.join().unwrap_or_default());
+        }
+        for (i, result) in done {
+            if let Some(slot) = results.get_mut(i) {
+                *slot = Some(result);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or_else(|| Err("the solid could not be cut".to_owned())))
+        .collect()
 }
 
 /// How far the half-space must reach from the plane's origin to cover the box.
@@ -308,7 +553,10 @@ impl OxydeApp {
             view.settings.plane = face.clone();
             view.settings.offset = 0.0;
         }
-        if let Some((lo, hi)) = self.model_bounds() {
+        let bounds = self.model_bounds();
+        let all = bounds.all;
+        view.bounds = Some(bounds);
+        if let Some((lo, hi)) = all {
             let (a, b) = SectionView::offsets_through(&view.settings.plane.plane(), lo, hi);
             view.range = Some((a, b));
             if view.face.is_none() {
@@ -388,12 +636,47 @@ impl OxydeApp {
         self.asm_scene = None;
     }
 
-    /// The box around the open document: the part's solids, or every part of the assembly
-    /// where it sits.
-    fn model_bounds(&self) -> Option<(Point3, Point3)> {
+    /// The boxes around the open document: the part's solids, or every part of the
+    /// assembly where it sits.
+    fn model_bounds(&self) -> Bounds {
+        let revision = self.section_revision();
         match &self.asm {
-            Some(doc) => doc.bounds(&doc.assembly),
-            None => part_bounds(&self.kernel, self.doc.part.body()?),
+            Some(doc) => Bounds {
+                revision,
+                all: doc.bounds(&doc.assembly),
+                solids: Vec::new(),
+            },
+            None => {
+                let solids: Vec<Option<(Point3, Point3)>> = self
+                    .doc
+                    .part
+                    .body()
+                    .map(|body| {
+                        body.solids
+                            .iter()
+                            .map(|s| self.kernel.bounds(s.shape).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let all =
+                    solids
+                        .iter()
+                        .flatten()
+                        .fold(None, |all: Option<(Point3, Point3)>, &(a, b)| {
+                            Some(match all {
+                                None => (a, b),
+                                Some((lo, hi)) => (
+                                    Point3::new(lo.x.min(a.x), lo.y.min(a.y), lo.z.min(a.z)),
+                                    Point3::new(hi.x.max(b.x), hi.y.max(b.y), hi.z.max(b.z)),
+                                ),
+                            })
+                        });
+                Bounds {
+                    revision,
+                    all,
+                    solids,
+                }
+            }
         }
     }
 
@@ -402,6 +685,25 @@ impl OxydeApp {
             Some(asm) => asm.revision,
             None => self.doc.revision,
         }
+    }
+
+    /// The box around the open document, measured once per document revision.
+    fn section_bounds(&mut self) -> Option<(Point3, Point3)> {
+        let revision = self.section_revision();
+        let measured = self
+            .section
+            .as_ref()
+            .and_then(|v| v.bounds.as_ref())
+            .filter(|b| b.revision == revision);
+        if let Some(bounds) = measured {
+            return bounds.all;
+        }
+        let bounds = self.model_bounds();
+        let all = bounds.all;
+        if let Some(view) = self.section.as_mut() {
+            view.bounds = Some(bounds);
+        }
+        all
     }
 
     /// The Section View window, and the section in the viewport while it is open.
@@ -417,7 +719,7 @@ impl OxydeApp {
         let mut open = true;
         let mut look = false;
         let mut centre = false;
-        let bounds = self.model_bounds();
+        let bounds = self.section_bounds();
         let Some(view) = self.section.as_mut() else {
             return;
         };
@@ -572,10 +874,8 @@ impl OxydeApp {
                     .weak(),
                 );
             });
-        if centre {
-            if let Some((lo, hi)) = view.range {
-                view.settings.offset = (lo + hi) / 2.0;
-            }
+        if let Some((lo, hi)) = view.range.filter(|_| centre) {
+            view.settings.offset = (lo + hi) / 2.0;
         }
         let plane = view.settings.section_plane();
         let revision = self.section_revision();
@@ -612,18 +912,11 @@ impl OxydeApp {
         let plane = settings.section_plane();
         let fraction = self.mesh_fraction();
         let start = std::time::Instant::now();
-        let result = match self.model_bounds() {
+        let result = match self.section_bounds() {
             None => Err("there is no solid".to_owned()),
             Some(bounds) => {
                 let reach = reach(&plane, bounds);
-                match half_space(&mut self.kernel, &plane, reach) {
-                    Err(e) => Err(e),
-                    Ok(tool) => {
-                        let outcome = self.cut_document(tool, &settings, fraction);
-                        self.kernel.release(tool);
-                        outcome
-                    }
-                }
+                self.cut_document(&plane, reach, &settings, fraction)
             }
         };
         let took = start.elapsed().as_secs_f64();
@@ -658,89 +951,127 @@ impl OxydeApp {
         }
     }
 
-    /// Every solid of the document cut by `tool` (in world coordinates), as one mesh with
-    /// a material per face, and the report.
+    /// Every solid of the document against `plane` (in world coordinates, its normal to
+    /// the removed half), as one mesh with a material per face, and the report.
     #[allow(clippy::type_complexity)]
     fn cut_document(
         &mut self,
-        tool: ShapeHandle,
+        plane: &Plane,
+        reach: f64,
         settings: &SectionSettings,
         fraction: f64,
     ) -> Result<(Mesh, Vec<RenderMaterial>, Vec<TextureRef>, SectionReport), String> {
-        let mut textures = Vec::new();
-        let mut report = SectionReport::default();
-        let Some(doc) = self.asm.as_ref() else {
-            // ---- A part: its solids, in place.
-            let part: &Part = &self.doc.part;
-            let Some(body) = part.body() else {
-                return Err("there is no solid".to_owned());
-            };
-            report.solids = body.solids.len();
-            let appearance = |face: u32| part.face_appearance(body, face).cloned();
-            let cuts = cut_body(
-                &mut self.kernel,
-                body,
-                tool,
-                fraction,
-                settings,
-                None,
-                &appearance,
-                &mut self.texture_cache,
-                &mut textures,
-            )?;
-            let mut mesh = Mesh::default();
-            let mut materials = Vec::new();
-            for c in cuts {
-                if c.cap_area > 0.0 {
-                    report.cut += 1;
+        // ---- The units: a part's body, or every part file of the assembly with the
+        // places it is shown at.
+        let mut units: Vec<Unit> = Vec::new();
+        match &self.asm {
+            Some(doc) => {
+                for (occurrence, placement, loaded) in doc.leaves(&doc.assembly) {
+                    let Some(body) = loaded.part.body() else {
+                        continue;
+                    };
+                    // The boxes from the display meshes, grown by their deflection.
+                    let margin = oxyde_render::mesh_deflection(&body.topology, doc.mesh_fraction);
+                    let bounds = body
+                        .solids
+                        .iter()
+                        .map(|s| {
+                            loaded
+                                .mesh
+                                .as_ref()
+                                .and_then(|m| mesh_solid_bounds(m, body, s, margin))
+                        })
+                        .collect();
+                    let placed = Placed {
+                        placement,
+                        mesh: loaded.mesh.as_ref(),
+                        own: doc
+                            .occurrence_appearance(&doc.assembly, &occurrence)
+                            .cloned(),
+                    };
+                    match units
+                        .iter_mut()
+                        .find(|u| std::ptr::eq(u.part, &loaded.part))
+                    {
+                        Some(unit) => unit.copies.push(placed),
+                        None => units.push(Unit {
+                            part: &loaded.part,
+                            body,
+                            bounds,
+                            deflection: oxyde_render::mesh_deflection(&body.topology, fraction),
+                            copies: vec![placed],
+                        }),
+                    }
                 }
-                report.area += c.cap_area;
-                mesh.faces.extend(c.mesh.faces);
-                mesh.edges.extend(c.mesh.edges);
-                materials.extend(c.materials);
             }
-            return Ok((mesh, materials, textures, report));
-        };
-        // ---- An assembly: every part shown, cut where it sits. The tool is brought into
-        // each part's own coordinates rather than the part into the world.
-        let assembly = doc.assembly.clone();
-        let leaves = doc.leaves(&assembly);
-        let mut placed: Vec<(Placement, Mesh)> = Vec::new();
-        let mut materials = Vec::new();
-        for (occurrence, placement, part) in leaves {
-            let Some(body) = part.part.body() else {
-                continue;
-            };
-            report.solids += body.solids.len();
-            let own = doc.occurrence_appearance(&assembly, &occurrence).cloned();
-            let local_tool = self
-                .kernel
-                .transform(tool, &placement.inverse().transform())
-                .map_err(|e| e.to_string())?
-                .shape;
-            let appearance = |face: u32| part.part.face_appearance(body, face).cloned();
-            let cuts = cut_body(
-                &mut self.kernel,
-                body,
-                local_tool,
-                fraction,
-                settings,
-                own.as_ref(),
-                &appearance,
-                &mut self.texture_cache,
-                &mut textures,
-            );
-            self.kernel.release(local_tool);
-            for c in cuts? {
-                if c.cap_area > 0.0 {
-                    report.cut += 1;
+            None => {
+                let part: &Part = &self.doc.part;
+                if let Some(body) = part.body() {
+                    // The exact boxes measured with the model's (`section_bounds`).
+                    let known = self
+                        .section
+                        .as_ref()
+                        .and_then(|v| v.bounds.as_ref())
+                        .map(|b| b.solids.as_slice())
+                        .unwrap_or(&[]);
+                    units.push(Unit {
+                        part,
+                        body,
+                        bounds: (0..body.solids.len())
+                            .map(|i| known.get(i).copied().flatten())
+                            .collect(),
+                        deflection: oxyde_render::mesh_deflection(&body.topology, fraction),
+                        copies: vec![Placed {
+                            placement: Placement::IDENTITY,
+                            mesh: None,
+                            own: None,
+                        }],
+                    });
                 }
-                report.area += c.cap_area;
-                materials.extend(c.materials);
-                placed.push((placement, c.mesh));
             }
         }
-        let (mesh, _) = oxyde_assembly::scene::combine(placed.iter().map(|(p, m)| ((), p, m)));
+        if units.is_empty() {
+            return Err("there is no solid".to_owned());
+        }
+        let results = cut_units(&mut self.kernel, plane, reach, &units);
+
+        // ---- The looks, on this thread: the texture cache is the window's.
+        let cap = RenderMaterial {
+            color: Some(settings.cap_color),
+            ..RenderMaterial::default()
+        };
+        let mut textures = Vec::new();
+        let mut report = SectionReport::default();
+        let mut materials = Vec::new();
+        let mut pieces = Vec::new();
+        for (unit, result) in units.iter().zip(results) {
+            report.solids += unit.body.solids.len() * unit.copies.len();
+            for piece in result? {
+                if piece.cap_area > 0.0 {
+                    report.cut += 1;
+                }
+                report.area += piece.cap_area;
+                for face in &piece.faces {
+                    let look = match face {
+                        PieceFace::Cap if settings.color_caps => {
+                            materials.push(cap.clone());
+                            continue;
+                        }
+                        PieceFace::Cap => piece.own.clone(),
+                        PieceFace::Of(index) => piece.own.clone().or_else(|| {
+                            index.and_then(|i| unit.part.face_appearance(unit.body, i).cloned())
+                        }),
+                    };
+                    materials.push(match look {
+                        Some(a) => material(&a, &mut self.texture_cache, &mut textures),
+                        None => RenderMaterial::default(),
+                    });
+                }
+                pieces.push(piece);
+            }
+        }
+        let (mesh, _) =
+            oxyde_assembly::scene::combine(pieces.iter().map(|p| ((), &p.placement, &p.mesh)));
         Ok((mesh, materials, textures, report))
     }
 
@@ -800,6 +1131,33 @@ mod tests {
         let (a, b) = SectionView::offsets_through(&StandardPlane::Right.plane(), lo, hi);
         assert_eq!((a, b), (-10.0, 30.0));
         assert!(reach(&plane, (lo, hi)) > 40.0);
+    }
+
+    #[test]
+    fn a_solid_is_cut_only_where_the_plane_goes_through_its_box() {
+        // The Top plane raised to y = 10, its normal +Y: what is above is removed.
+        let plane = StandardPlane::Top.plane().offset(10.0);
+        let below = (Point3::new(0.0, 0.0, 0.0), Point3::new(5.0, 10.0, 5.0));
+        let above = (Point3::new(-3.0, 10.0, -3.0), Point3::new(5.0, 30.0, 5.0));
+        let through = (Point3::new(0.0, 5.0, 0.0), Point3::new(5.0, 15.0, 5.0));
+        assert_eq!(side_of(&plane, below), Side::Kept);
+        assert_eq!(side_of(&plane, above), Side::Removed);
+        assert_eq!(side_of(&plane, through), Side::Through);
+        // Flipped, the halves swap.
+        let flipped = Plane {
+            origin: plane.origin,
+            x_dir: plane.y_dir(),
+            normal: plane.normal * -1.0,
+        };
+        assert_eq!(side_of(&flipped, below), Side::Removed);
+        assert_eq!(side_of(&flipped, above), Side::Kept);
+        assert_eq!(side_of(&flipped, through), Side::Through);
+        // A plane at an angle sees the corners, not the axes.
+        let slanted =
+            Plane::from_point_normal(Point3::new(5.0, 10.0, 0.0), Vec3::new(1.0, 1.0, 0.0))
+                .unwrap();
+        assert_eq!(side_of(&slanted, below), Side::Through);
+        assert_eq!(corners(below.0, below.1).len(), 8);
     }
 
     #[test]

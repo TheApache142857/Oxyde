@@ -5,6 +5,22 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Section View, faster (unreleased, October 2026)
+
+Evaluate › Section View does less work for the same picture:
+
+- **Only the solids the plane goes through are cut.** A solid wholly on the kept side is
+  shown as it is, from the mesh the display already has; one wholly on the removed side
+  is left out. In an assembly, where the plane goes through a few parts of many, this is
+  most of the work saved.
+- **An assembly's parts are cut on every core at once**, as they are rebuilt when the
+  assembly opens.
+- **The window no longer measures the model every frame.** The box around the model,
+  which the slider's range comes from, is asked of the kernel once per change of the
+  document; on a big imported part it took up to 0.2 s a frame while the window was open.
+- The cut solids are meshed at the display's precision, so a part looks the same cut and
+  whole.
+
 ### Agent guide, continuous integration, a layering test (unreleased, October 2026)
 
 Nothing changes in the application; this is for the people and agents working on it.
