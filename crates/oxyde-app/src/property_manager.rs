@@ -51,7 +51,7 @@ pub(crate) fn selection_box(
     let mut removed = None;
     egui::Frame::none()
         .fill(box_fill())
-        .stroke(Stroke::new(1.0, box_active()))
+        .stroke(Stroke::new(1.0_f32, box_active()))
         .rounding(3.0)
         .inner_margin(egui::Margin::symmetric(6.0, 4.0))
         .show(ui, |ui| {
@@ -99,9 +99,9 @@ fn reference_box<T>(
         .and_then(|i| choices.get(i))
         .map(|(label, _)| label);
     let stroke = if active {
-        Stroke::new(2.0, box_active())
+        Stroke::new(2.0_f32, box_active())
     } else {
-        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
     let (mut clicked, mut chosen) = (false, false);
     ui.push_id(id, |ui| {
@@ -741,7 +741,7 @@ impl OxydeApp {
         egui::Frame::none()
             .fill(ui.visuals().faint_bg_color)
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 ui.visuals().widgets.noninteractive.bg_stroke.color,
             ))
             .rounding(4.0)
@@ -1010,7 +1010,7 @@ impl OxydeApp {
             .collect();
         let active = |ui: &mut egui::Ui, on: bool, items: &[(String, String)], hint: &str| {
             let frame = egui::Frame::none()
-                .stroke(Stroke::new(if on { 2.0 } else { 0.0 }, box_active()))
+                .stroke(Stroke::new(if on { 2.0_f32 } else { 0.0_f32 }, box_active()))
                 .rounding(4.0);
             frame.show(ui, |ui| selection_box(ui, items, hint)).inner
         };

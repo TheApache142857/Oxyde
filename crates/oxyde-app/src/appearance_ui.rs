@@ -220,7 +220,7 @@ pub(crate) fn color_swatch(ui: &mut egui::Ui, color: [u8; 3], size: f32) -> egui
         .fill(Color32::from_rgb(r, g, b))
         .min_size(egui::vec2(size, size))
         .stroke(egui::Stroke::new(
-            1.0,
+            1.0_f32,
             ui.visuals().widgets.inactive.bg_stroke.color,
         ));
     ui.add(button)

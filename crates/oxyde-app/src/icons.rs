@@ -934,7 +934,7 @@ pub fn command_button(
                 rect.shrink(1.0),
                 4.0,
                 visuals.selection.bg_fill.gamma_multiply(0.35),
-                Stroke::new(1.0, visuals.selection.stroke.color),
+                Stroke::new(1.0_f32, visuals.selection.stroke.color),
             );
         } else if enabled && response.hovered() {
             painter.rect_filled(rect.shrink(1.0), 4.0, visuals.widgets.hovered.weak_bg_fill);
@@ -984,10 +984,10 @@ pub fn dropdown_marker(ui: &Ui, button: &Response) {
 pub fn cut_badge(painter: &egui::Painter, icon_rect: Rect) {
     let r = icon_rect.width() * 0.24;
     let c = icon_rect.right_bottom() - Vec2::splat(r * 0.9);
-    painter.circle(c, r, REMOVE, Stroke::new(1.0, WHITE));
+    painter.circle(c, r, REMOVE, Stroke::new(1.0_f32, WHITE));
     painter.line_segment(
         [c - Vec2::new(r * 0.55, 0.0), c + Vec2::new(r * 0.55, 0.0)],
-        Stroke::new(1.6, WHITE),
+        Stroke::new(1.6_f32, WHITE),
     );
 }
 

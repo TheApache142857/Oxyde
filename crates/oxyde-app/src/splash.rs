@@ -215,7 +215,7 @@ impl OxydeApp {
                         painter.vline(
                             x,
                             y0..=y0 + art.height() / 4.0,
-                            Stroke::new(1.0, Color32::from_rgba_unmultiplied(79, 195, 247, alpha)),
+                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(79, 195, 247, alpha)),
                         );
                     }
                     x += 24.0;
@@ -227,7 +227,7 @@ impl OxydeApp {
                     painter.hline(
                         art.x_range(),
                         y,
-                        Stroke::new(1.0, Color32::from_rgba_unmultiplied(79, 195, 247, alpha)),
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(79, 195, 247, alpha)),
                     );
                     y += 24.0;
                 }

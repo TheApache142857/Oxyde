@@ -142,7 +142,7 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
     v.extreme_bg_color = t.bg;
     v.faint_bg_color = t.panel2;
     v.code_bg_color = t.panel2;
-    v.window_stroke = egui::Stroke::new(1.0, t.line);
+    v.window_stroke = egui::Stroke::new(1.0_f32, t.line);
     v.window_rounding = Rounding::same(8.0);
     v.menu_rounding = radius;
     v.window_shadow = egui::epaint::Shadow {
@@ -161,7 +161,7 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
     v.warn_fg_color = t.warn;
     v.error_fg_color = t.err;
     v.selection.bg_fill = t.accent_bg;
-    v.selection.stroke = egui::Stroke::new(1.0, if dark { t.fg } else { t.accent });
+    v.selection.stroke = egui::Stroke::new(1.0_f32, if dark { t.fg } else { t.accent });
     v.striped = true;
     v.slider_trailing_fill = true;
 
@@ -178,24 +178,24 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
     }
     w.noninteractive.bg_fill = t.panel;
     w.noninteractive.weak_bg_fill = t.panel;
-    w.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.line);
-    w.noninteractive.fg_stroke = egui::Stroke::new(1.0, t.fg);
+    w.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, t.line);
+    w.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, t.fg);
     w.inactive.bg_fill = t.panel2;
     w.inactive.weak_bg_fill = t.panel2;
-    w.inactive.bg_stroke = egui::Stroke::new(1.0, t.line);
-    w.inactive.fg_stroke = egui::Stroke::new(1.0, t.fg);
+    w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, t.line);
+    w.inactive.fg_stroke = egui::Stroke::new(1.0_f32, t.fg);
     w.hovered.bg_fill = t.panel2;
     w.hovered.weak_bg_fill = t.panel2;
-    w.hovered.bg_stroke = egui::Stroke::new(1.0, t.accent);
-    w.hovered.fg_stroke = egui::Stroke::new(1.5, t.fg);
+    w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, t.accent);
+    w.hovered.fg_stroke = egui::Stroke::new(1.5_f32, t.fg);
     w.active.bg_fill = t.accent_bg;
     w.active.weak_bg_fill = t.accent_bg;
-    w.active.bg_stroke = egui::Stroke::new(1.0, t.accent);
-    w.active.fg_stroke = egui::Stroke::new(1.5, t.fg);
+    w.active.bg_stroke = egui::Stroke::new(1.0_f32, t.accent);
+    w.active.fg_stroke = egui::Stroke::new(1.5_f32, t.fg);
     w.open.bg_fill = t.panel2;
     w.open.weak_bg_fill = t.panel2;
-    w.open.bg_stroke = egui::Stroke::new(1.0, t.accent);
-    w.open.fg_stroke = egui::Stroke::new(1.0, t.fg);
+    w.open.bg_stroke = egui::Stroke::new(1.0_f32, t.accent);
+    w.open.fg_stroke = egui::Stroke::new(1.0_f32, t.fg);
     ctx.set_visuals(v);
 
     ctx.style_mut(|s| {

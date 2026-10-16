@@ -638,7 +638,7 @@ impl Viewport {
             let color = egui::Color32::from_rgb(79, 195, 247);
             let r = egui::Rect::from_two_pos(start, end);
             painter.rect_filled(r, 0.0, color.gamma_multiply(0.12));
-            let stroke = egui::Stroke::new(1.0, color);
+            let stroke = egui::Stroke::new(1.0_f32, color);
             if end.x < start.x {
                 // Right to left: what the box touches.
                 let corners = [
@@ -706,7 +706,7 @@ impl Viewport {
         ];
         for (axis, label, color) in axes {
             let d = egui::vec2(dot(axis, right) as f32, -dot(axis, up) as f32) * 30.0;
-            painter.line_segment([origin, origin + d], egui::Stroke::new(2.0, color));
+            painter.line_segment([origin, origin + d], egui::Stroke::new(2.0_f32, color));
             painter.text(
                 origin + d * 1.3,
                 egui::Align2::CENTER_CENTER,

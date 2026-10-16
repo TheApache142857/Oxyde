@@ -409,7 +409,7 @@ impl OxydeApp {
                                 ui.painter().hline(
                                     bar.rect.x_range(),
                                     pos.y,
-                                    Stroke::new(2.0, rollback().gamma_multiply(0.5)),
+                                    Stroke::new(2.0_f32, rollback().gamma_multiply(0.5)),
                                 );
                             }
                         }
@@ -888,7 +888,7 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 12.0), Sense::drag());
     let y = rect.center().y;
     let painter = ui.painter();
-    painter.hline(rect.x_range(), y, Stroke::new(2.0, rollback()));
+    painter.hline(rect.x_range(), y, Stroke::new(2.0_f32, rollback()));
     painter.circle_filled(egui::pos2(rect.left() + 6.0, y), 4.5, rollback());
     let cursor = if response.dragged() {
         CursorIcon::Grabbing

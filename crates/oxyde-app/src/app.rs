@@ -135,7 +135,7 @@ pub(crate) fn paint_plane(
     painter.add(egui::Shape::convex_polygon(
         corners,
         color.gamma_multiply(0.12),
-        egui::Stroke::new(if strong { 2.0 } else { 1.0 }, color),
+        egui::Stroke::new(if strong { 2.0_f32 } else { 1.0_f32 }, color),
     ));
     painter.text(
         quad[3],
@@ -158,14 +158,14 @@ pub(crate) fn paint_origin(painter: &egui::Painter, to_screen: &dyn Fn(Point3) -
         let d = to_screen(Point3::ORIGIN + axis) - o;
         if d.length() > 1e-6 {
             let tip = o + d.normalized() * 22.0;
-            painter.line_segment([o, tip], egui::Stroke::new(1.6, color));
+            painter.line_segment([o, tip], egui::Stroke::new(1.6_f32, color));
         }
     }
     painter.circle(
         o,
         3.0,
         egui::Color32::from_rgb(200, 60, 60),
-        egui::Stroke::new(1.0, egui::Color32::WHITE),
+        egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
     );
 }
 
@@ -1585,7 +1585,7 @@ impl OxydeApp {
                     let b = to_screen(c + axis.direction * size);
                     painter.extend(egui::Shape::dashed_line(
                         &[a, b],
-                        egui::Stroke::new(if selected { 2.0 } else { 1.2 }, color),
+                        egui::Stroke::new(if selected { 2.0_f32 } else { 1.2_f32 }, color),
                         10.0,
                         4.0,
                     ));
@@ -1630,7 +1630,7 @@ impl OxydeApp {
                         egui::Color32::from_rgb(40, 70, 150)
                     }
                 };
-                let stroke = egui::Stroke::new(if selected { 2.0 } else { 1.3 }, color);
+                let stroke = egui::Stroke::new(if selected { 2.0_f32 } else { 1.3_f32 }, color);
                 if construction {
                     painter.extend(egui::Shape::dashed_line(&path, stroke, 6.0, 4.0));
                 } else {

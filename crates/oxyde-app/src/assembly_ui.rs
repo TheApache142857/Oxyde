@@ -348,9 +348,9 @@ fn describe_draft(doc: &AssemblyDoc, d: &Draft) -> String {
 /// A selection box of the Mate command.
 fn mate_box(ui: &mut egui::Ui, text: Option<String>, active: bool, hint: &str) -> (bool, bool) {
     let stroke = if active {
-        Stroke::new(2.0, box_active())
+        Stroke::new(2.0_f32, box_active())
     } else {
-        Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+        Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
     };
     let (mut clicked, mut cleared) = (false, false);
     egui::Frame::none()
@@ -1498,7 +1498,7 @@ impl OxydeApp {
         egui::Frame::none()
             .fill(ui.visuals().faint_bg_color)
             .stroke(Stroke::new(
-                1.0,
+                1.0_f32,
                 ui.visuals().widgets.noninteractive.bg_stroke.color,
             ))
             .rounding(4.0)

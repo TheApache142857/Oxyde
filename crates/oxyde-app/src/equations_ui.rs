@@ -355,7 +355,7 @@ fn equations_tab(
                 .new_equation_target
                 .and_then(|t| free.iter().find(|d| d.reference == t))
                 .map_or_else(|| "Dimension…".to_owned(), |d| d.full_name.clone());
-            egui::ComboBox::from_id_source("new_equation_target")
+            egui::ComboBox::from_id_salt("new_equation_target")
                 .selected_text(selected)
                 .width(150.0)
                 .show_ui(ui, |ui| {

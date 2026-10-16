@@ -1204,14 +1204,14 @@ impl SketchSession {
         for (p, kind) in &self.model.points {
             if *kind == ModelPointKind::Center {
                 let c = to_screen(*p);
-                let stroke = Stroke::new(1.0, ink_model());
+                let stroke = Stroke::new(1.0_f32, ink_model());
                 painter.line_segment([c - Vec2::new(5.0, 0.0), c + Vec2::new(5.0, 0.0)], stroke);
                 painter.line_segment([c - Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 5.0)], stroke);
             }
         }
         if let Some(curve) = self.model_hover.and_then(|i| self.model.curves.get(i)) {
             let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
-            painter.add(Shape::line(path, Stroke::new(3.0, ink_hovered())));
+            painter.add(Shape::line(path, Stroke::new(3.0_f32, ink_hovered())));
         }
 
         // Sketch origin: a point that can be picked, with its axes.
@@ -1227,7 +1227,7 @@ impl SketchSession {
             if d.length() > 1e-6 {
                 painter.line_segment(
                     [origin, origin + d.normalized() * 18.0],
-                    Stroke::new(1.5, color),
+                    Stroke::new(1.5_f32, color),
                 );
             }
         }
@@ -1239,15 +1239,15 @@ impl SketchSession {
             } else {
                 Color32::from_rgb(200, 60, 60)
             };
-            painter.circle(origin, 3.5, color, Stroke::new(1.0, Color32::WHITE));
+            painter.circle(origin, 3.5, color, Stroke::new(1.0_f32, Color32::WHITE));
         }
 
         for e in self.sketch.entities() {
             let color = self.color(e.id, e.construction, &conflicting);
             let width = if self.selection.contains(&e.id) || self.hover == Some(e.id) {
-                2.5
+                2.5_f32
             } else {
-                1.6
+                1.6_f32
             };
             let stroke = Stroke::new(width, color);
             let path: Vec<Pos2> = match e.geometry {
@@ -1316,7 +1316,7 @@ impl SketchSession {
             let Some(graphics) = self.dimension_graphics(&relation.constraint, to_screen) else {
                 continue;
             };
-            let stroke = Stroke::new(1.0, ink_dimension());
+            let stroke = Stroke::new(1.0_f32, ink_dimension());
             for segment in &graphics.lines {
                 painter.line_segment(*segment, stroke);
             }
@@ -1338,9 +1338,9 @@ impl SketchSession {
             let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
             painter.rect_filled(rect, 3.0, label_background());
             let border = if selected {
-                Stroke::new(2.0, ink_selected())
+                Stroke::new(2.0_f32, ink_selected())
             } else {
-                Stroke::new(1.0, label_border())
+                Stroke::new(1.0_f32, label_border())
             };
             painter.rect_stroke(rect, 3.0, border);
             painter.galley(rect.center() - galley.size() / 2.0, galley, ink);
@@ -1368,7 +1368,7 @@ impl SketchSession {
             let path: Vec<Pos2> = piece.into_iter().map(to_screen).collect();
             painter.extend(Shape::dashed_line(
                 &path,
-                Stroke::new(2.5, ink_trimmed()),
+                Stroke::new(2.5_f32, ink_trimmed()),
                 5.0,
                 3.0,
             ));
@@ -1376,7 +1376,7 @@ impl SketchSession {
 
         // The shape in progress.
         let cursor = snapped.map(|(p, _)| p).or(cursor);
-        let dashed = Stroke::new(1.2, ink_preview());
+        let dashed = Stroke::new(1.2_f32, ink_preview());
         if let (Some(first), Some(cursor)) = (self.pending.first(), cursor) {
             match self.tool {
                 Tool::Line | Tool::Centerline => {
@@ -1401,7 +1401,7 @@ impl SketchSession {
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                     painter.extend(Shape::dashed_line(
                         &[path[0], path[2]],
-                        Stroke::new(1.0, ink_construction()),
+                        Stroke::new(1.0_f32, ink_construction()),
                         4.0,
                         3.0,
                     ));
@@ -1754,7 +1754,7 @@ fn arrow_head(painter: &egui::Painter, tip: Pos2, direction: Vec2, color: Color3
 
 /// Marks what the cursor snapped to, as SolidWorks' inference glyphs do.
 fn draw_snap(painter: &egui::Painter, at: Pos2, snap: Snap) {
-    let stroke = Stroke::new(1.8, ink_snapped());
+    let stroke = Stroke::new(1.8_f32, ink_snapped());
     match snap {
         Snap::Point(_) => {
             painter.rect_stroke(Rect::from_center_size(at, Vec2::splat(11.0)), 0.0, stroke);
