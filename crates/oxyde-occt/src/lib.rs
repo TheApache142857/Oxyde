@@ -33,24 +33,40 @@ use std::path::Path;
 use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
-    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepMaterial, StepInstance,
-    StepNode, StepNodeContent, SurfaceKind,
-    Topology, TopologyCounts, VertexInfo,
+    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
+    StepMaterial, StepNode, StepNodeContent, SurfaceKind, Topology, TopologyCounts, VertexInfo,
 };
 
 /// Error reported by OCCT or by the shim around it.
-#[derive(Debug, Clone)]
-pub struct OcctError(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OcctError {
+    /// OpenCASCADE refused or failed the operation (its exception message), or the shim
+    /// found the arguments unusable.
+    Occt(String),
+    /// A Rust panic inside the kernel call, caught at the `Kernel` boundary: a bug, not a
+    /// geometric failure. The message is the panic's.
+    Internal(String),
+}
 
 impl OcctError {
     pub fn message(&self) -> &str {
-        &self.0
+        match self {
+            OcctError::Occt(message) | OcctError::Internal(message) => message,
+        }
+    }
+
+    /// Whether this is a caught panic rather than a geometric failure.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, OcctError::Internal(_))
     }
 }
 
 impl fmt::Display for OcctError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "OpenCASCADE: {}", self.0)
+        match self {
+            OcctError::Occt(message) => write!(f, "OpenCASCADE: {message}"),
+            OcctError::Internal(message) => write!(f, "internal error in the kernel: {message}"),
+        }
     }
 }
 
@@ -58,7 +74,7 @@ impl std::error::Error for OcctError {}
 
 impl From<cxx::Exception> for OcctError {
     fn from(e: cxx::Exception) -> Self {
-        Self(e.what().to_owned())
+        Self::Occt(e.what().to_owned())
     }
 }
 
@@ -92,15 +108,25 @@ impl Default for OcctKernel {
     }
 }
 
+/// Runs one kernel operation with a net under it: a Rust panic inside (an index out of
+/// range in the data marshalled to or from the shim, say) comes back as
+/// [`OcctError::Internal`] instead of unwinding into the caller. OCCT's own exceptions
+/// never get this far: the shim turns them into `Err` already.
+fn guarded<T>(f: impl FnOnce() -> Result<T, OcctError>) -> Result<T, OcctError> {
+    oxyde_kernel::catch_panic(f).unwrap_or_else(|message| Err(OcctError::Internal(message)))
+}
+
 impl Kernel for OcctKernel {
     type Error = OcctError;
 
     fn make_box(&mut self, corner: Point3, size: Vec3) -> Result<ShapeHandle, OcctError> {
-        let id = self
-            .session
-            .pin_mut()
-            .make_box(corner.x, corner.y, corner.z, size.x, size.y, size.z)?;
-        Ok(ShapeHandle::from_raw(id))
+        guarded(|| {
+            let id = self
+                .session
+                .pin_mut()
+                .make_box(corner.x, corner.y, corner.z, size.x, size.y, size.z)?;
+            Ok(ShapeHandle::from_raw(id))
+        })
     }
 
     fn extrude(
@@ -109,15 +135,17 @@ impl Kernel for OcctKernel {
         profile: &Profile,
         vector: Vec3,
     ) -> Result<OpResult, OcctError> {
-        let regions = regions_data(profile);
-        let data = self.session.pin_mut().extrude(
-            &plane_data(plane),
-            &regions,
-            vector.x,
-            vector.y,
-            vector.z,
-        )?;
-        Ok(op_result(data))
+        guarded(|| {
+            let regions = regions_data(profile);
+            let data = self.session.pin_mut().extrude(
+                &plane_data(plane),
+                &regions,
+                vector.x,
+                vector.y,
+                vector.z,
+            )?;
+            Ok(op_result(data))
+        })
     }
 
     fn revolve(
@@ -127,14 +155,16 @@ impl Kernel for OcctKernel {
         axis: &Axis,
         angle: f64,
     ) -> Result<OpResult, OcctError> {
-        let regions = regions_data(profile);
-        let data = self.session.pin_mut().revolve(
-            &plane_data(plane),
-            &regions,
-            &axis_data(axis),
-            angle,
-        )?;
-        Ok(op_result(data))
+        guarded(|| {
+            let regions = regions_data(profile);
+            let data = self.session.pin_mut().revolve(
+                &plane_data(plane),
+                &regions,
+                &axis_data(axis),
+                angle,
+            )?;
+            Ok(op_result(data))
+        })
     }
 
     fn shell(
@@ -143,11 +173,13 @@ impl Kernel for OcctKernel {
         removed_faces: &[u32],
         offset: f64,
     ) -> Result<OpResult, OcctError> {
-        let data = self
-            .session
-            .pin_mut()
-            .shell(shape.raw(), removed_faces, offset)?;
-        Ok(op_result(data))
+        guarded(|| {
+            let data = self
+                .session
+                .pin_mut()
+                .shell(shape.raw(), removed_faces, offset)?;
+            Ok(op_result(data))
+        })
     }
 
     fn transform(
@@ -155,9 +187,11 @@ impl Kernel for OcctKernel {
         shape: ShapeHandle,
         transform: &Transform,
     ) -> Result<OpResult, OcctError> {
-        let rows: Vec<f64> = transform.rows.iter().flatten().copied().collect();
-        let data = self.session.pin_mut().transform(shape.raw(), &rows)?;
-        Ok(op_result(data))
+        guarded(|| {
+            let rows: Vec<f64> = transform.rows.iter().flatten().copied().collect();
+            let data = self.session.pin_mut().transform(shape.raw(), &rows)?;
+            Ok(op_result(data))
+        })
     }
 
     fn boolean_many(
@@ -166,17 +200,19 @@ impl Kernel for OcctKernel {
         target: ShapeHandle,
         tools: &[ShapeHandle],
     ) -> Result<OpResult, OcctError> {
-        let kind = match op {
-            BooleanOp::Fuse => 0,
-            BooleanOp::Cut => 1,
-            BooleanOp::Common => 2,
-        };
-        let tools: Vec<u64> = tools.iter().map(|t| t.raw()).collect();
-        let data = self
-            .session
-            .pin_mut()
-            .boolean_op(kind, target.raw(), &tools)?;
-        Ok(op_result(data))
+        guarded(|| {
+            let kind = match op {
+                BooleanOp::Fuse => 0,
+                BooleanOp::Cut => 1,
+                BooleanOp::Common => 2,
+            };
+            let tools: Vec<u64> = tools.iter().map(|t| t.raw()).collect();
+            let data = self
+                .session
+                .pin_mut()
+                .boolean_op(kind, target.raw(), &tools)?;
+            Ok(op_result(data))
+        })
     }
 
     fn fillet(
@@ -185,8 +221,10 @@ impl Kernel for OcctKernel {
         edges: &[u32],
         radius: f64,
     ) -> Result<OpResult, OcctError> {
-        let data = self.session.pin_mut().fillet(shape.raw(), edges, radius)?;
-        Ok(op_result(data))
+        guarded(|| {
+            let data = self.session.pin_mut().fillet(shape.raw(), edges, radius)?;
+            Ok(op_result(data))
+        })
     }
 
     fn chamfer(
@@ -195,19 +233,21 @@ impl Kernel for OcctKernel {
         edges: &[u32],
         distance: f64,
     ) -> Result<OpResult, OcctError> {
-        let data = self
-            .session
-            .pin_mut()
-            .chamfer(shape.raw(), edges, distance)?;
-        Ok(op_result(data))
+        guarded(|| {
+            let data = self
+                .session
+                .pin_mut()
+                .chamfer(shape.raw(), edges, distance)?;
+            Ok(op_result(data))
+        })
     }
 
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, OcctError> {
-        Ok(topology_from(self.session.topology(shape.raw())?))
+        guarded(|| Ok(topology_from(self.session.topology(shape.raw())?)))
     }
 
     fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, OcctError> {
-        Ok(mesh_from(self.session.tessellate(shape.raw(), deflection)?))
+        guarded(|| Ok(mesh_from(self.session.tessellate(shape.raw(), deflection)?)))
     }
 
     fn tessellate_for_export(
@@ -216,32 +256,39 @@ impl Kernel for OcctKernel {
         deflection: f64,
         angle: f64,
     ) -> Result<Mesh, OcctError> {
-        Ok(mesh_from(
-            self.session
-                .tessellate_with(shape.raw(), deflection, angle)?,
-        ))
+        guarded(|| {
+            Ok(mesh_from(self.session.tessellate_with(
+                shape.raw(),
+                deflection,
+                angle,
+            )?))
+        })
     }
 
     fn volume(&self, shape: ShapeHandle) -> Result<f64, OcctError> {
-        Ok(self.session.volume(shape.raw())?)
+        guarded(|| Ok(self.session.volume(shape.raw())?))
     }
 
     fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), OcctError> {
-        let b = self.session.bounds(shape.raw())?;
-        Ok((
-            Point3::new(b.xmin, b.ymin, b.zmin),
-            Point3::new(b.xmax, b.ymax, b.zmax),
-        ))
+        guarded(|| {
+            let b = self.session.bounds(shape.raw())?;
+            Ok((
+                Point3::new(b.xmin, b.ymin, b.zmin),
+                Point3::new(b.xmax, b.ymax, b.zmax),
+            ))
+        })
     }
 
     fn topology_counts(&self, shape: ShapeHandle) -> Result<TopologyCounts, OcctError> {
-        let c = self.session.topology_counts(shape.raw())?;
-        Ok(TopologyCounts {
-            solids: c.solids as usize,
-            shells: c.shells as usize,
-            faces: c.faces as usize,
-            edges: c.edges as usize,
-            vertices: c.vertices as usize,
+        guarded(|| {
+            let c = self.session.topology_counts(shape.raw())?;
+            Ok(TopologyCounts {
+                solids: c.solids as usize,
+                shells: c.shells as usize,
+                faces: c.faces as usize,
+                edges: c.edges as usize,
+                vertices: c.vertices as usize,
+            })
         })
     }
 
@@ -252,51 +299,60 @@ impl Kernel for OcctKernel {
         materials: &[Option<StepMaterial>],
         path: &Path,
     ) -> Result<(), OcctError> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| OcctError(format!("path is not valid UTF-8: {}", path.display())))?;
-        if !colors.is_empty() && colors.len() != shapes.len() {
-            return Err(OcctError(format!(
-                "{} colour sets for {} shapes",
-                colors.len(),
-                shapes.len()
-            )));
-        }
-        if !materials.is_empty() && materials.len() != shapes.len() {
-            return Err(OcctError(format!(
-                "{} materials for {} shapes",
-                materials.len(),
-                shapes.len()
-            )));
-        }
-        let ids: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
-        let colors: Vec<ffi::StepShapeColors> = colors.iter().map(shape_colors_data).collect();
-        let materials: Vec<ffi::StepMaterialData> =
-            materials.iter().map(|m| material_data(m.as_ref())).collect();
-        self.session.export_step(&ids, &colors, &materials, path)?;
-        Ok(())
+        guarded(|| {
+            let path = path.to_str().ok_or_else(|| {
+                OcctError::Occt(format!("path is not valid UTF-8: {}", path.display()))
+            })?;
+            if !colors.is_empty() && colors.len() != shapes.len() {
+                return Err(OcctError::Occt(format!(
+                    "{} colour sets for {} shapes",
+                    colors.len(),
+                    shapes.len()
+                )));
+            }
+            if !materials.is_empty() && materials.len() != shapes.len() {
+                return Err(OcctError::Occt(format!(
+                    "{} materials for {} shapes",
+                    materials.len(),
+                    shapes.len()
+                )));
+            }
+            let ids: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
+            let colors: Vec<ffi::StepShapeColors> = colors.iter().map(shape_colors_data).collect();
+            let materials: Vec<ffi::StepMaterialData> = materials
+                .iter()
+                .map(|m| material_data(m.as_ref()))
+                .collect();
+            self.session.export_step(&ids, &colors, &materials, path)?;
+            Ok(())
+        })
     }
 
     fn import_step(&mut self, data: &[u8]) -> Result<StepImport, OcctError> {
-        let imported = self.session.pin_mut().import_step(data)?;
-        Ok(StepImport {
-            shape: ShapeHandle::from_raw(imported.shape),
-            colors: shape_colors(imported.colors),
-            material: material_from(imported.material),
+        guarded(|| {
+            let imported = self.session.pin_mut().import_step(data)?;
+            Ok(StepImport {
+                shape: ShapeHandle::from_raw(imported.shape),
+                colors: shape_colors(imported.colors),
+                material: material_from(imported.material),
+            })
         })
     }
 
     fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, OcctError> {
-        let tree = self.session.pin_mut().read_step_assembly(data)?;
-        step_assembly(tree)
+        guarded(|| {
+            let tree = self.session.pin_mut().read_step_assembly(data)?;
+            step_assembly(tree)
+        })
     }
 
     fn release(&mut self, shape: ShapeHandle) {
-        self.session.pin_mut().release(shape.raw());
+        // Nothing to report to: a shape that could not be freed is leaked, not fatal.
+        let _ = oxyde_kernel::catch_panic(|| self.session.pin_mut().release(shape.raw()));
     }
 
     fn open_worker() -> Option<Self> {
-        Some(Self::new())
+        oxyde_kernel::catch_panic(Self::new).ok()
     }
 }
 
@@ -406,7 +462,7 @@ fn step_assembly(tree: ffi::StepAssemblyData) -> Result<StepAssembly, OcctError>
         if i < count {
             Ok(i)
         } else {
-            Err(OcctError(format!("STEP node {i} out of {count}")))
+            Err(OcctError::Occt(format!("STEP node {i} out of {count}")))
         }
     };
     let root = index(tree.root)?;
@@ -417,7 +473,10 @@ fn step_assembly(tree: ffi::StepAssemblyData) -> Result<StepAssembly, OcctError>
             for instance in node.instances {
                 let r = &instance.rows;
                 if r.len() != 12 {
-                    return Err(OcctError(format!("placement with {} values", r.len())));
+                    return Err(OcctError::Occt(format!(
+                        "placement with {} values",
+                        r.len()
+                    )));
                 }
                 instances.push(StepInstance {
                     node: index(instance.node)?,

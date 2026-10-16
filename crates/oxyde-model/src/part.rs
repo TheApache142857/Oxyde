@@ -810,7 +810,9 @@ fn build_feature<K: Kernel>(
     let mut warnings = Vec::new();
     let mut result = FeatureResult::with_status(FeatureStatus::Ok);
 
-    let outcome = (|| -> Result<(), String> {
+    // A panic while building (in the kernel or here) fails the feature like any other
+    // error, with the rest of the timeline still built; the document stays whole.
+    let outcome = oxyde_kernel::catch_panic(|| -> Result<(), String> {
         match &feature.kind {
             FeatureKind::Sketch(sketch) => match build_sketch(&ctx, sketch, &mut warnings) {
                 Ok(built) => result.sketch = Some(built),
@@ -878,7 +880,8 @@ fn build_feature<K: Kernel>(
             }
         }
         Ok(())
-    })();
+    })
+    .unwrap_or_else(|message| Err(format!("internal error: {message}")));
 
     match outcome {
         Ok(()) => {

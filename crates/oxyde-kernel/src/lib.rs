@@ -33,6 +33,30 @@ use std::path::Path;
 
 use oxyde_geom::{Axis, Plane, Point3, Profile, Transform, Vec3};
 
+/// Runs `f`, turning a panic inside it into an error carrying the panic's message.
+///
+/// The net under every kernel call and every feature build: a bug in a backend or in the
+/// modelling code becomes an error the caller reports, instead of unwinding through the
+/// application and taking the unsaved document with it. The panic is still printed to
+/// stderr by the default hook, so nothing is hidden from a developer. See
+/// `docs/ARCHITECTURE.md`, "Never crash".
+pub fn catch_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|payload| panic_message(payload.as_ref()))
+}
+
+/// The message a panic carried: the text of `panic!("…")`, of a failed `unwrap` or of an
+/// index out of range, or a stand-in when it carried something else.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "panic without a message".to_owned()
+    }
+}
+
 /// Opaque reference to a shape owned by a kernel backend.
 ///
 /// Handles are only meaningful for the kernel instance that issued them.
