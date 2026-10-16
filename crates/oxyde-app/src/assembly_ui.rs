@@ -512,7 +512,9 @@ impl OxydeApp {
                 return false;
             }
         }
-        let doc = self.asm.as_mut().expect("checked above");
+        let Some(doc) = self.asm.as_mut() else {
+            return false;
+        };
         // Under another name it is another document (see `save_as` for parts).
         let original_id = doc.document_id.clone();
         if doc.path.as_deref().is_some_and(|p| p != path) {

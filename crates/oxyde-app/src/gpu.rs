@@ -429,8 +429,9 @@ fn material_bytes(
     for i in 0..count.max(1) {
         let m = materials.get(i).unwrap_or(&default);
         let c = m.color.unwrap_or(style.face);
-        let (layer, aspect) = match m.texture.and_then(|t| textures.get(t)) {
-            Some(t) => (m.texture.unwrap() as f32, t.aspect()),
+        let texture = m.texture.and_then(|t| textures.get(t).map(|tex| (t, tex)));
+        let (layer, aspect) = match texture {
+            Some((t, tex)) => (t as f32, tex.aspect()),
             None => (-1.0, 1.0),
         };
         out.extend(bytes_f32([
@@ -1094,7 +1095,8 @@ impl GpuViewport {
             self.targets = Some(targets);
         }
         let Some(targets) = &self.targets else {
-            unreachable!("created above");
+            // Made just above when missing; the last texture shown is the safe answer.
+            return self.texture.unwrap_or_default();
         };
 
         // The view: millimetres to clip space, and a depth range covering the scene.
@@ -1233,7 +1235,10 @@ impl GpuViewport {
                 storage("oxyde edge flags", edge_flags),
             ));
         }
-        let (_, face_buffer, edge_buffer) = self.flags_cache.as_ref().expect("made above");
+        let Some((_, face_buffer, edge_buffer)) = self.flags_cache.as_ref() else {
+            // Made just above when missing; the last texture shown is the safe answer.
+            return self.texture.unwrap_or_default();
+        };
         // Without a mesh, placeholder material and texture bindings.
         let empty_materials;
         let empty_textures;

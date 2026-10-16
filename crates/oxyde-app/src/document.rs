@@ -39,7 +39,24 @@ pub struct Document {
 
 impl Document {
     pub fn new() -> Self {
-        Self::from_file(PartFile::new(), None).expect("an empty part is valid")
+        let PartFile {
+            document_id,
+            properties,
+            ..
+        } = PartFile::new();
+        Self {
+            part: Part::new(),
+            properties,
+            document_id,
+            path: None,
+            untitled_name: None,
+            modified: false,
+            read_only: false,
+            revision: next_revision(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            editing: None,
+        }
     }
 
     pub fn from_file(file: PartFile, path: Option<PathBuf>) -> Result<Self, String> {

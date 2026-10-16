@@ -1570,7 +1570,11 @@ fn build_blend<K: Kernel>(
             }
             .map_err(|e| e.to_string())?;
             let names = derived_names(id, &result.history, body, solid);
-            let index = work.find(solid.id).expect("the bodies before the feature");
+            let Some(index) = work.find(solid.id) else {
+                // The pieces come from the same body as `solid`: cannot happen.
+                kernel.release(result.shape);
+                return Err("internal error: the blended body is missing".to_owned());
+            };
             work.replace(index, result.shape, names, kernel)?;
         }
         Ok(())
@@ -1635,7 +1639,12 @@ fn build_shell<K: Kernel>(
     let id = ctx.feature().id;
     let names = derived_names(id, &result.history, body, solid);
     let mut work = Working::from(ctx.body);
-    let index = work.find(solid.id).expect("the bodies before the feature");
+    let Some(index) = work.find(solid.id) else {
+        // The pieces come from the same body as `solid`: cannot happen.
+        kernel.release(result.shape);
+        work.abort(kernel);
+        return Err("internal error: the shelled body is missing".to_owned());
+    };
     match work.replace(index, result.shape, names, kernel) {
         Ok(()) => Ok(work.finish(id)),
         Err(e) => {

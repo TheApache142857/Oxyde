@@ -3,6 +3,28 @@
 //! Talks to OCCT through a thin C++ shim (`cpp/`) bridged with `cxx`. No OCCT type crosses
 //! the boundary: Rust holds opaque shape handles. See `docs/ARCHITECTURE.md` §3.
 
+// Never crash: a panic in a modelling or UI path would take the unsaved document with it.
+// Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing
+    )
+)]
+
 mod ffi;
 
 use std::fmt;

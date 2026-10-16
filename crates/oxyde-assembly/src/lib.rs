@@ -15,6 +15,28 @@
 //! [`resolve`] turns them into geometry using a part's rebuilt body.
 //! See `docs/ARCHITECTURE.md` §8.
 
+// Never crash: a panic in a modelling or UI path would take the unsaved document with it.
+// Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing
+    )
+)]
+
 pub mod bom;
 mod mate;
 pub mod paths;
@@ -135,7 +157,8 @@ impl Assembly {
         let name = (1..)
             .map(|n| format!("{stem}<{n}>"))
             .find(|name| self.components.iter().all(|c| &c.name != name))
-            .expect("some instance number is free");
+            // The search is unbounded, so this is never reached.
+            .unwrap_or_else(|| format!("{stem}<{}>", id.0));
         let fixed = self.components.is_empty();
         self.components.push(Component {
             id,
@@ -161,7 +184,8 @@ impl Assembly {
         let name = (1..)
             .map(|n| format!("{}{n}", kind.label()))
             .find(|name| self.mates.iter().all(|m| &m.name != name))
-            .expect("some mate number is free");
+            // The search is unbounded, so this is never reached.
+            .unwrap_or_else(|| format!("{}{}", kind.label(), id.0));
         self.mates.push(Mate {
             id,
             name,

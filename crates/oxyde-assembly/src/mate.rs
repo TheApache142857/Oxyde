@@ -446,7 +446,9 @@ pub(crate) fn residuals(
             }
         }
         MateKind::Parallel | MateKind::Perpendicular => {
-            let (u, v) = (a.direction().unwrap(), b.direction().unwrap());
+            let (Some(u), Some(v)) = (a.direction(), b.direction()) else {
+                return invalid();
+            };
             let has = |k: PrimitiveKind| a.kind() == k || b.kind() == k;
             // A line and a plane compare the line with the plane's normal: the other way
             // round.
@@ -492,7 +494,9 @@ pub(crate) fn residuals(
             _ => apart(out, b.anchor() - a.anchor(), d),
         },
         MateKind::Angle(angle) => {
-            let (u, v) = (a.direction().unwrap(), b.direction().unwrap());
+            let (Some(u), Some(v)) = (a.direction(), b.direction()) else {
+                return invalid();
+            };
             // Between directions, 200° is 160°.
             let angle = angle.rem_euclid(TAU);
             let angle = if angle > PI { TAU - angle } else { angle };

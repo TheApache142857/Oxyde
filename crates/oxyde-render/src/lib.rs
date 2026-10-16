@@ -13,6 +13,28 @@
 //! The projection is orthographic, as is customary in mechanical CAD, and the world is
 //! Y-up like SolidWorks: the Front view looks down −Z with X to the right.
 
+// Never crash: a panic in a modelling or UI path would take the unsaved document with it.
+// Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing
+    )
+)]
+
 mod camera;
 mod material;
 mod raster;

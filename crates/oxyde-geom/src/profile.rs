@@ -261,10 +261,15 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
         }
     }
 
+    // Only segments with two ends were kept in `open`; a closed one would be degenerate.
     let ends: Vec<(Point2, Point2)> = open
         .iter()
-        .map(|s| s.curve.endpoints().expect("open segments have endpoints"))
-        .collect();
+        .map(|s| {
+            s.curve
+                .endpoints()
+                .ok_or(ProfileError::Degenerate { segment: s.id })
+        })
+        .collect::<Result<_, _>>()?;
 
     // Every end must meet exactly one other end.
     for (i, &(a, b)) in ends.iter().enumerate() {
@@ -316,7 +321,13 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                     curve: open[j].curve.reversed(),
                 }
             };
-            cursor = segment.curve.endpoints().expect("open segment").1;
+            cursor = segment
+                .curve
+                .endpoints()
+                .ok_or(ProfileError::Degenerate {
+                    segment: segment.id,
+                })?
+                .1;
             segments.push(segment);
         }
         loops.push(Loop { segments });
