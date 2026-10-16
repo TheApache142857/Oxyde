@@ -24,10 +24,10 @@ pub struct Style {
     /// Strength of the part's reflection in a floor just under it, 0 (none) to 1: a
     /// mirrored, faded copy drawn below the part.
     pub floor_reflection: f32,
-    /// Subsurface scattering, 0 (none) to 1: light wraps round the shadow side and glows
-    /// through near the silhouette, in the material's colour, so parts look like wax,
-    /// resin or printed plastic rather than painted metal.
-    pub subsurface: f32,
+    /// Ambient occlusion, 0 (none) to 1: creases, inner corners and the foot of a wall
+    /// are darkened, since less ambient light reaches them, so the shape reads better
+    /// than with the plain shading. Screen-space, from the depth buffer.
+    pub ambient_occlusion: f32,
 }
 
 impl Style {
@@ -45,7 +45,7 @@ impl Style {
         edge_width: 1.25,
         highlight_width: 3.0,
         floor_reflection: 0.0,
-        subsurface: 0.0,
+        ambient_occlusion: 0.0,
     };
 
     /// Dark background, light part.

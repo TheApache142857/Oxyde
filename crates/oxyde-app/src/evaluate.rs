@@ -38,6 +38,27 @@ fn row(ui: &mut egui::Ui, label: &str, value: String) {
 }
 
 /// A mass in the unit that reads best.
+/// What a circular edge measures: "R 5.000 (Ø 10.000)" for an arc, "Ø 10.000" for a full
+/// circle. The radius is the distance of an end point from the axis; a full circle has
+/// one vertex at most, and its radius also follows from its length.
+fn circle_text(e: &EdgeInfo, topology: &oxyde_kernel::Topology) -> Option<String> {
+    if e.curve != CurveKind::Circle {
+        return None;
+    }
+    let from_vertex = e.axis.as_ref().and_then(|axis| {
+        let v = topology.vertices.get(*e.vertices.first()? as usize)?;
+        let d = v.point - axis.origin;
+        let along = d.dot(axis.direction);
+        Some((d - axis.direction * along).length())
+    });
+    let radius = from_vertex.unwrap_or(e.length / std::f64::consts::TAU);
+    Some(if e.vertices.len() < 2 {
+        format!("Ø {:.3}", radius * 2.0)
+    } else {
+        format!("R {:.3} (Ø {:.3})", radius, radius * 2.0)
+    })
+}
+
 fn mass_text(kg: f64) -> String {
     if kg >= 1.0 {
         format!("{kg:.3} kg")
@@ -223,9 +244,8 @@ impl OxydeApp {
                 row(ui, "Parts (every level)", parts.to_string());
                 row(ui, "Mates", doc.assembly.mates.len().to_string());
             });
-        let mut notes = vec![
-            "Volumes add up every part shown, through every sub-assembly.".to_owned(),
-        ];
+        let mut notes =
+            vec!["Volumes add up every part shown, through every sub-assembly.".to_owned()];
         if hidden > 0 {
             notes.push("Hidden components are left out.".to_owned());
         }
@@ -234,7 +254,9 @@ impl OxydeApp {
                 "{without_material} part(s) without a material are left out of the mass."
             ));
         } else if parts > 0 && without_material == parts {
-            notes.push("Give the parts materials (right-click › Material) to get the mass.".to_owned());
+            notes.push(
+                "Give the parts materials (right-click › Material) to get the mass.".to_owned(),
+            );
         }
         ui.label(egui::RichText::new(notes.join(" ")).small().weak());
     }
@@ -273,7 +295,9 @@ impl OxydeApp {
             }
         }
         if faces.is_empty() && edges.is_empty() {
-            ui.label("Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).");
+            ui.label(
+                "Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).",
+            );
             return;
         }
         egui::Grid::new("measure")
@@ -289,9 +313,8 @@ impl OxydeApp {
                 }
                 for (i, e) in edges.iter().enumerate() {
                     let mut text = format!("{:.3} mm", e.length);
-                    // A full circle: its radius follows from its length.
-                    if e.curve == CurveKind::Circle && e.vertices.len() < 2 {
-                        text.push_str(&format!("  (Ø {:.3})", e.length / std::f64::consts::PI));
+                    if let Some(circle) = circle_text(e, &body.topology) {
+                        text.push_str(&format!("  {circle}"));
                     }
                     row(
                         ui,
@@ -353,9 +376,7 @@ impl OxydeApp {
             let Some(body) = part.part.body() else {
                 continue;
             };
-            let placed = item
-                .mate_ref()
-                .and_then(|r| doc.placed(&doc.assembly, &r));
+            let placed = item.mate_ref().and_then(|r| doc.placed(&doc.assembly, &r));
             match item {
                 AsmSelected::Face(_, name) => {
                     if let Some(f) = body
@@ -373,11 +394,8 @@ impl OxydeApp {
                         .and_then(|i| body.topology.edges.get(i as usize))
                     {
                         let mut text = format!("{:.3} mm", e.length);
-                        if e.curve == CurveKind::Circle && e.vertices.len() < 2 {
-                            text.push_str(&format!(
-                                "  (Ø {:.3})",
-                                e.length / std::f64::consts::PI
-                            ));
+                        if let Some(circle) = circle_text(e, &body.topology) {
+                            text.push_str(&format!("  {circle}"));
                         }
                         edges.push((curve_name(e.curve).to_owned(), text, placed));
                     }
@@ -386,7 +404,9 @@ impl OxydeApp {
             }
         }
         if faces.is_empty() && edges.is_empty() {
-            ui.label("Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).");
+            ui.label(
+                "Click faces or edges in the graphics area (Ctrl+click or Shift+click for more).",
+            );
             return;
         }
         egui::Grid::new("asm_measure")
@@ -394,7 +414,11 @@ impl OxydeApp {
             .spacing([16.0, 4.0])
             .show(ui, |ui| {
                 for (i, (kind, area, _)) in faces.iter().enumerate() {
-                    row(ui, &format!("Face {} ({kind})", i + 1), format!("{area:.3} mm²"));
+                    row(
+                        ui,
+                        &format!("Face {} ({kind})", i + 1),
+                        format!("{area:.3} mm²"),
+                    );
                 }
                 for (i, (kind, text, _)) in edges.iter().enumerate() {
                     row(ui, &format!("Edge {} ({kind})", i + 1), text.clone());

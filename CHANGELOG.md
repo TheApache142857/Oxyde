@@ -5,6 +5,58 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Materials window, free orbit, Move Component, work off the UI thread (0.0.3, October 2026)
+
+- **Materials window** (Tools › Materials…, the *Materials* button of an assembly's
+  command bar, *Edit library…* on the Material page): the library edited in one place,
+  with the materials the open part or assembly uses listed first (in italics when they
+  are not in the library). Editing a material and saving it changes every open part made
+  of it: the open part, or in an assembly every part file whose material has that name,
+  rewritten. *Apply to the part* / *Apply to the selected components* gives the
+  selection the material being edited.
+- **A material replaces a part's own appearances.** Applying a material to a part that
+  has appearances of its own (on faces, bodies or the whole part) asks first, since the
+  material's look takes their place; cancelling leaves everything as it was. Editing a
+  material a part is already made of never touches its appearances.
+- **Sub-assemblies in the tree are no longer greyed out.** Their parts and nested
+  sub-assemblies can be given a material or an appearance from the top assembly's tree
+  (right-click; an appearance goes into the sub-assembly's file), and hovering one lights
+  it up in the viewport. Their own mates are listed under them. Editing in place is for
+  the rest: mates, placement, a part's timeline.
+- **Appearances set inside a sub-assembly now show in the assembly that uses it**: an
+  occurrence takes the outermost component appearance on the way to it (the top
+  assembly's wins), then the part's own.
+- **Mates listed under their components**: expand a component to see the mates it takes
+  part in, with the same menu as the Mates list.
+- **Move Component** (command bar, right-click a component): while it is on, a plain
+  left-drag moves the component under the pointer and Shift+drag turns it, as
+  SolidWorks' Move Component, to place parts before mating them. Esc or the button ends
+  it. Alt+drag still works at any time.
+- **Free orbit** (View › *Constrained orbit (Y up)*, also in Preferences › Navigation):
+  off, the view turns about the screen's own axes and can be tilted any way, as Fusion
+  360's free orbit; on (the default), the model's Y axis stays up the screen, as in
+  SolidWorks. Turning it back on levels the view.
+- **Measure gives the radius and diameter of arcs** (`R 5.000 (Ø 10.000)`), not only
+  their length; full circles show the diameter as before.
+- **Ambient occlusion** replaces subsurface scattering (View menu, Preferences ›
+  Graphics with a strength slider; on by default): creases, inner corners and the foot
+  of walls are darkened, so the shape reads better. Screen-space, from the depth buffer,
+  in both renderers. The old `subsurface_scattering` preference is read as it.
+- **Long work no longer freezes the window.** Opening a part or an assembly, reading a
+  STEP file (New part from STEP, Import STEP, Import STEP assembly), Reload Parts and
+  coming back from editing in place run off the UI thread, behind a progress window that
+  says what is being read, how far it got and how long it has taken.
+- **Coming back from editing in place reads only what changed**: the files whose
+  modification time changed since they were loaded (the edited one, usually), not every
+  part of the assembly.
+- **Faster ghosted assemblies.** The see-through faces (the ghosted rest of the
+  assembly while editing in place, transparent appearances) are sorted again only when
+  the view direction changes, not every frame, and the highlight buffers only when the
+  highlight changes.
+- **Editing an appearance while editing in place keeps the rest of the assembly
+  ghosted** (it used to turn opaque while the panel was open).
+- Version 0.0.3.
+
 ### Editing in place, STL export, multi-selection (October 2026)
 
 - **Edit a component in place.** Right-click a component › *Edit part in place* (or
@@ -40,7 +92,7 @@ release yet; the git history has every detail.
   and its sketch go together.
 - **Subsurface scattering** (View menu, and Preferences › Graphics with a strength
   slider): soft, translucent-looking shading, as of wax, resin or printed plastic, in
-  both renderers.
+  both renderers. (Replaced by ambient occlusion in 0.0.3.)
 
 ### STEP colours and materials (October 2026)
 

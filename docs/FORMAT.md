@@ -40,7 +40,7 @@ Rules:
   "kind": "part",
   "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
   "units": { "length": "mm", "angle": "deg" },
-  "created_by": "oxyde 0.0.2"
+  "created_by": "oxyde 0.0.3"
 }
 ```
 
@@ -257,7 +257,7 @@ What the part is made of, optional (absent = no material):
 ```
 
 - A part has at most one material. It is a **copy** of a library entry, so the file never depends on a library: `name` (unique in a library; `properties.json` gets it as `material`, for the bill of materials), `category` (for grouping; optional), `density` in kg/m³ (0 when unknown; mass = volume × density) and an `appearance` (same shape as in *Appearances*; its texture image goes under `textures/` like the others).
-- The material's appearance is what the part is drawn with where nothing more specific applies: face over body over part appearance over material.
+- The material's appearance is what the part is drawn with where nothing more specific applies: face over body over part appearance over material. Oxyde clears a part's own appearances when it applies a material to it (after asking), so a part normally has either; both can still be stored.
 
 **Material library.** The user's library is a plain JSON file outside any document, `materials.json` next to the preferences (`%APPDATA%\Oxyde\materials.json` on Windows, `~/.config/oxyde/materials.json` elsewhere), with texture images in a `textures/` folder beside it:
 
@@ -337,7 +337,7 @@ An assembly stores no geometry and no copy of its parts: it refers to part files
 }
 ```
 
-- **Components** are instances of part files or of other assemblies (sub-assemblies; the file's manifest says which). `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only. An optional `appearance` (same shape as a part's, see §3 *Appearances*; its texture images go under `textures/` in the assembly file) is drawn instead of the part's own appearances for that component, as in SolidWorks.
+- **Components** are instances of part files or of other assemblies (sub-assemblies; the file's manifest says which). `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only. An optional `appearance` (same shape as a part's, see §3 *Appearances*; its texture images go under `textures/` in the assembly file) is drawn instead of the part's own appearances for that component, as in SolidWorks. Through sub-assemblies, the outermost component appearance on the way to a part wins: the top assembly's component, else the sub-assembly's, else the part's own.
 - **Mates**: `type` is `coincident`, `concentric`, `parallel`, `perpendicular`, `distance` (`value` in mm) or `angle` (`value` in radians, 0 to π; an angle with a line is read as at most π/2, and between a line and a plane it is measured from the plane). `a` and `b` name a component, an optional `path` and one of: `face` or `edge` (persistent names, as in a part's `model.json`, resolved in that part's rebuilt body), `plane` (`front`, `top`, `right`: the part's standard planes), `axis` (`x`, `y`, `z`) or `origin` (`true`). `aligned`: normals or axes point the same way (otherwise they face each other). `suppressed` mates are kept but not solved. When the component is a sub-assembly, `path` lists component ids inside it, level by level, down to the part holding the face or edge (`"path": [3, 1]`: component 3 of the sub-assembly, then component 1 of that one); without `path`, `plane`, `axis` and `origin` are the sub-assembly's own.
 - Placements are the solved result, saved so that a reader without a solver sees the assembly as it was. Oxyde re-solves on open, starting from them.
 - Readers check that component and mate ids are unique and below the `next_…` counters, that component names are unique, and that mates refer to existing components. Component `0` in a mate is the assembly itself: its own `plane`, `axis` or `origin`, fixed at the identity (components are numbered from 1).

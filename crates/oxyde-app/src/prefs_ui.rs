@@ -63,6 +63,7 @@ impl OxydeApp {
             zoom_speed: p.navigation.zoom_speed,
             invert_zoom: p.navigation.invert_zoom,
             orbit_about_pointer: p.navigation.orbit_about_pointer,
+            constrained_orbit: p.navigation.constrained_orbit,
             animation_time: if p.navigation.animate_views {
                 p.navigation.animation_time
             } else {
@@ -234,15 +235,18 @@ impl OxydeApp {
                 ui.add(egui::Slider::new(&mut g.reflection_strength, 0.05..=1.0));
             });
         });
-        ui.checkbox(&mut g.subsurface_scattering, "Subsurface scattering")
+        ui.checkbox(&mut g.ambient_occlusion, "Ambient occlusion")
             .on_hover_text(
-                "Soft, translucent-looking shading, as of wax, resin or printed plastic: light \
-                 wraps round the shadow side and glows near the silhouette (also in View)",
+                "Creases, inner corners and the foot of walls are darkened, as less ambient \
+                 light reaches them: the shape reads better (also in View)",
             );
-        ui.add_enabled_ui(g.subsurface_scattering, |ui| {
+        ui.add_enabled_ui(g.ambient_occlusion, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Scattering strength");
-                ui.add(egui::Slider::new(&mut g.subsurface_strength, 0.05..=1.0));
+                ui.label("Occlusion strength");
+                ui.add(egui::Slider::new(
+                    &mut g.ambient_occlusion_strength,
+                    0.05..=1.0,
+                ));
             });
         });
         ui.horizontal(|ui| {
@@ -312,6 +316,12 @@ impl OxydeApp {
             "The model point under the pointer when the drag starts stays put on screen; \
              off, the view turns about its centre",
         );
+        ui.checkbox(&mut n.constrained_orbit, "Constrained orbit: keep Y up")
+            .on_hover_text(
+                "Orbiting keeps the model's vertical axis up the screen, as in SolidWorks. \
+                 Off, the view turns freely about the screen's axes and can be tilted, as \
+                 Fusion 360's free orbit (also in View)",
+            );
         ui.checkbox(&mut n.animate_views, "Animate view changes");
         ui.add_enabled_ui(n.animate_views, |ui| {
             ui.horizontal(|ui| {

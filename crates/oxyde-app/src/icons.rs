@@ -36,6 +36,10 @@ pub enum Icon {
     InsertComponent,
     Mate,
     BillOfMaterials,
+    /// Move Component: a part with a four-way arrow.
+    Move,
+    /// The material library: swatches.
+    Materials,
     // Timeline
     Part,
     Plane,
@@ -659,10 +663,18 @@ fn draw(pen: &Pen, icon: Icon) {
         Appearance => {
             // A shaded sphere with a highlight, and three paint dots.
             pen.circle(12.0, 13.5, 7.5, BODY_SIDE, Some((1.2, INK)));
-            let cap: Vec<(f32, f32)> = Pen::arc_points(12.0, 13.5, 7.5, 7.5, PI + 0.35, 2.0 * PI - 0.35)
-                .into_iter()
-                .chain(Pen::arc_points(12.0, 13.5, 7.5, 4.5, 2.0 * PI - 0.35, PI + 0.35))
-                .collect();
+            let cap: Vec<(f32, f32)> =
+                Pen::arc_points(12.0, 13.5, 7.5, 7.5, PI + 0.35, 2.0 * PI - 0.35)
+                    .into_iter()
+                    .chain(Pen::arc_points(
+                        12.0,
+                        13.5,
+                        7.5,
+                        4.5,
+                        2.0 * PI - 0.35,
+                        PI + 0.35,
+                    ))
+                    .collect();
             pen.fill(&cap, BODY_TOP);
             pen.circle(9.5, 10.5, 1.8, WHITE, None);
             pen.circle(4.5, 4.5, 2.6, ACCENT, Some((1.0, INK)));
@@ -707,6 +719,40 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.block(13.0, 6.0, 8.0, 9.0, 4.0, [BODY_TOP, ACCENT_LIGHT, ACCENT]);
             pen.arrow((7.0, 4.0), (12.0, 9.0), 1.8, SKETCH);
             pen.arrow((19.0, 21.0), (13.0, 17.0), 1.8, SKETCH);
+        }
+        Move => {
+            pen.solid(2.0, 11.0, 10.0, 9.0, 4.0);
+            let c = (17.0, 8.0);
+            pen.arrow(c, (17.0, 1.5), 1.6, SKETCH);
+            pen.arrow(c, (17.0, 14.5), 1.6, SKETCH);
+            pen.arrow(c, (10.5, 8.0), 1.6, SKETCH);
+            pen.arrow(c, (23.0, 8.0), 1.6, SKETCH);
+        }
+        Materials => {
+            // Four swatches, one textured.
+            pen.poly(
+                &[(2.0, 2.0), (11.0, 2.0), (11.0, 11.0), (2.0, 11.0)],
+                BODY,
+                INK,
+            );
+            pen.poly(
+                &[(13.0, 2.0), (22.0, 2.0), (22.0, 11.0), (13.0, 11.0)],
+                ACCENT,
+                INK,
+            );
+            pen.poly(
+                &[(2.0, 13.0), (11.0, 13.0), (11.0, 22.0), (2.0, 22.0)],
+                ADD,
+                INK,
+            );
+            pen.poly(
+                &[(13.0, 13.0), (22.0, 13.0), (22.0, 22.0), (13.0, 22.0)],
+                BODY_TOP,
+                INK,
+            );
+            for k in [15.5, 18.0, 20.5] {
+                pen.line(&[(13.0, k + 2.0), (k + 2.0, 13.0)], 1.0, BODY_SIDE);
+            }
         }
         BillOfMaterials => {
             pen.poly(
@@ -955,7 +1001,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 57] = {
+pub const ALL: [Icon; 59] = {
     use Icon::*;
     [
         Sketch,
@@ -979,6 +1025,8 @@ pub const ALL: [Icon; 57] = {
         InsertComponent,
         Mate,
         BillOfMaterials,
+        Move,
+        Materials,
         Part,
         Plane,
         Origin,

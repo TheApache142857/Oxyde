@@ -105,6 +105,9 @@ pub struct ViewSettings {
     pub invert_zoom: bool,
     /// Orbit about the point under the pointer rather than the centre of the view.
     pub orbit_about_pointer: bool,
+    /// Keep the model's Y axis up the screen while orbiting (SolidWorks); off, the view
+    /// turns freely about the screen's axes and can be tilted (Fusion 360's free orbit).
+    pub constrained_orbit: bool,
     /// Seconds a view change takes; 0 = at once.
     pub animation_time: f64,
 }
@@ -119,6 +122,7 @@ impl Default for ViewSettings {
             zoom_speed: 1.0,
             invert_zoom: false,
             orbit_about_pointer: true,
+            constrained_orbit: true,
             animation_time: 0.45,
         }
     }
@@ -138,6 +142,7 @@ fn interpolate(from: &Camera, to: &Camera, t: f64) -> Camera {
         ],
         yaw: from.yaw + turn * t,
         pitch: lerp(from.pitch, to.pitch),
+        roll: from.roll + ((to.roll - from.roll + PI).rem_euclid(TAU) - PI) * t,
         height: (lerp(from.height.ln(), to.height.ln())).exp(),
     }
 }
@@ -172,6 +177,8 @@ pub struct Viewport {
     renderer: String,
     /// Alt+left-drag grabs instead of orbiting (set by the assembly each frame).
     pub grab_enabled: bool,
+    /// Move Component is on: a plain left-drag grabs too, and draws no selection box.
+    pub grab_without_alt: bool,
     /// The pick under the pointer when the current grab started.
     grabbed: Option<Option<Pick>>,
     /// The model point an orbit drag turns about, from the press to the release.
@@ -206,6 +213,7 @@ impl Viewport {
             last_pick: None,
             renderer: "software".to_owned(),
             grab_enabled: false,
+            grab_without_alt: false,
             grabbed: None,
             pivot: None,
             settings: ViewSettings::default(),
@@ -276,6 +284,12 @@ impl Viewport {
 
     pub fn request_fit(&mut self) {
         self.fit_pending = true;
+    }
+
+    /// Puts the model's Y axis back up the screen, after a free orbit tilted the view.
+    pub fn level(&mut self) {
+        self.animation = None;
+        self.camera.level();
     }
 
     /// Turns smoothly to a standard view, framing the part.
@@ -418,15 +432,14 @@ impl Viewport {
                     let pick = self.hovered?;
                     let pos = response.interact_pointer_pos()?;
                     let local = (pos - rect.min) * ppp;
-                    let (origin, direction) =
-                        self.camera.ray(local.x as f64, local.y as f64, w, h);
+                    let (origin, direction) = self.camera.ray(local.x as f64, local.y as f64, w, h);
                     self.scene.hit(pick, origin, direction)
                 })
                 .flatten();
         }
         // Alt+drag grabs; it keeps grabbing until the button is released.
         if self.grab_enabled
-            && alt
+            && (alt || self.grab_without_alt)
             && response.drag_started_by(egui::PointerButton::Primary)
             && self.grabbed.is_none()
         {
@@ -462,13 +475,18 @@ impl Viewport {
             }
         };
         // The selection box: the left button, where it neither turns nor grabs.
-        let boxing = scheme != MouseScheme::LeftTurns && !sketching && self.grabbed.is_none();
+        let boxing = scheme != MouseScheme::LeftTurns
+            && !sketching
+            && self.grabbed.is_none()
+            && !(self.grab_enabled && self.grab_without_alt);
         if boxing && started(Primary) && !alt {
             self.box_start = response.interact_pointer_pos();
         }
         let mut box_select = None;
         if let Some(start) = self.box_start {
-            let end = response.interact_pointer_pos().or_else(|| response.hover_pos());
+            let end = response
+                .interact_pointer_pos()
+                .or_else(|| response.hover_pos());
             if response.drag_stopped_by(Primary) || !primary || !boxing {
                 self.box_start = None;
                 if let Some(end) = end.filter(|_| boxing && response.drag_stopped_by(Primary)) {
@@ -494,9 +512,11 @@ impl Viewport {
         } else if orbiting {
             let k = self.settings.orbit_speed;
             let (dx, dy) = (delta.x as f64 * k, delta.y as f64 * k);
-            match self.pivot {
-                Some(pivot) => self.camera.orbit_about(dx, dy, pivot),
-                None => self.camera.orbit(dx, dy),
+            let pivot = self.pivot.unwrap_or(self.camera.target);
+            if self.settings.constrained_orbit {
+                self.camera.orbit_about(dx, dy, pivot);
+            } else {
+                self.camera.orbit_free_about(dx, dy, pivot);
             }
         } else {
             self.pivot = None;
@@ -547,8 +567,7 @@ impl Viewport {
             });
         }
         let clicked = (response.clicked() && !sketching).then_some(self.hovered);
-        let additive =
-            ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift);
+        let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift);
 
         let key = RenderKey {
             camera: self.camera,
@@ -622,7 +641,12 @@ impl Viewport {
             let stroke = egui::Stroke::new(1.0, color);
             if end.x < start.x {
                 // Right to left: what the box touches.
-                let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                ];
                 for k in 0..4 {
                     painter.add(egui::Shape::dashed_line(
                         &[corners[k], corners[(k + 1) % 4]],

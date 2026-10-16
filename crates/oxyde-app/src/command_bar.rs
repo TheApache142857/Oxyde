@@ -222,8 +222,10 @@ impl OxydeApp {
                     self.viewport.request_fit();
                 }
                 ui.separator();
+                self.constrained_orbit_item(ui);
+                ui.separator();
                 self.floor_reflections_item(ui);
-                self.subsurface_item(ui);
+                self.ambient_occlusion_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
             });
             ui.menu_button("Tools", |ui| {
@@ -239,6 +241,17 @@ impl OxydeApp {
                 if ui.button("Dimensions…").clicked() {
                     ui.close_menu();
                     self.equations.show(EquationsTab::Dimensions);
+                }
+                ui.separator();
+                if ui
+                    .button("Materials…")
+                    .on_hover_text(
+                        "The material library; editing a material changes the part made of it",
+                    )
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.open_materials_window();
                 }
                 ui.separator();
                 if ui.button("Mass properties…").clicked() {
@@ -436,11 +449,17 @@ impl OxydeApp {
             Command::Combine,
         );
         group_separator(ui);
-        if command_button(ui, Icon::Appearance, "Appearance", body, self.command_is_appearance())
-            .on_hover_text(
-                "Colour, transparency or a texture for the selected faces, a body or the part.",
-            )
-            .clicked()
+        if command_button(
+            ui,
+            Icon::Appearance,
+            "Appearance",
+            body,
+            self.command_is_appearance(),
+        )
+        .on_hover_text(
+            "Colour, transparency or a texture for the selected faces, a body or the part.",
+        )
+        .clicked()
         {
             self.begin_appearance();
         }
@@ -622,8 +641,13 @@ impl OxydeApp {
     /// View › Floor reflections: the part mirrored in a floor under it.
     pub(crate) fn floor_reflections_item(&mut self, ui: &mut egui::Ui) {
         if ui
-            .checkbox(&mut self.prefs.graphics.floor_reflections, "Floor reflections")
-            .on_hover_text("The part mirrored in a floor just under it. Strength: Preferences › Graphics.")
+            .checkbox(
+                &mut self.prefs.graphics.floor_reflections,
+                "Floor reflections",
+            )
+            .on_hover_text(
+                "The part mirrored in a floor just under it. Strength: Preferences › Graphics.",
+            )
             .changed()
         {
             let ctx = ui.ctx().clone();
@@ -632,16 +656,39 @@ impl OxydeApp {
         }
     }
 
-    /// View › Subsurface scattering: soft, translucent-looking shading.
-    pub(crate) fn subsurface_item(&mut self, ui: &mut egui::Ui) {
+    /// View › Constrained orbit: Y up the screen while orbiting, or a free orbit.
+    pub(crate) fn constrained_orbit_item(&mut self, ui: &mut egui::Ui) {
         if ui
             .checkbox(
-                &mut self.prefs.graphics.subsurface_scattering,
-                "Subsurface scattering",
+                &mut self.prefs.navigation.constrained_orbit,
+                "Constrained orbit (Y up)",
             )
             .on_hover_text(
-                "Light scattered under the surface, as in wax, resin or printed plastic. \
-                 Strength: Preferences › Graphics.",
+                "On: orbiting keeps the model's vertical axis up the screen, as SolidWorks. \
+                 Off: the view turns freely about the screen's axes and can be tilted, as \
+                 Fusion 360's free orbit.",
+            )
+            .changed()
+        {
+            let ctx = ui.ctx().clone();
+            self.apply_preferences(&ctx);
+            self.save_preferences();
+            if self.prefs.navigation.constrained_orbit {
+                self.viewport.level();
+            }
+        }
+    }
+
+    /// View › Ambient occlusion: creases and corners darkened.
+    pub(crate) fn ambient_occlusion_item(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(
+                &mut self.prefs.graphics.ambient_occlusion,
+                "Ambient occlusion",
+            )
+            .on_hover_text(
+                "Creases, inner corners and the foot of walls darkened, as less ambient \
+                 light reaches them. Strength: Preferences › Graphics.",
             )
             .changed()
         {

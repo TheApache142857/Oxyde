@@ -17,6 +17,7 @@ use oxyde_model::{Appearance, BodyId, FaceName, FileData, Material, PartDefiniti
 use oxyde_render::{Material as RenderMaterial, TextureRef};
 
 use crate::app::{OxydeApp, Selected};
+use crate::assembly::Occurrence;
 use crate::dialogs::Dialog;
 use crate::property_manager::{PanelPick, section};
 
@@ -73,9 +74,8 @@ fn decode(bytes: &[u8]) -> Option<oxyde_render::Texture> {
 
 /// Whether `bytes` are an image Oxyde can use as a texture.
 pub fn is_image(bytes: &[u8]) -> bool {
-    image::guess_format(bytes).is_ok_and(|f| {
-        matches!(f, image::ImageFormat::Png | image::ImageFormat::Jpeg)
-    })
+    image::guess_format(bytes)
+        .is_ok_and(|f| matches!(f, image::ImageFormat::Png | image::ImageFormat::Jpeg))
 }
 
 /// The material of an appearance; its texture is added to `textures` (once) when it
@@ -116,6 +116,9 @@ pub enum Scope {
     Part,
     /// A top-level component of the assembly.
     Component(ComponentId),
+    /// A component inside a sub-assembly ([`AppearanceDialog::inner`]): the appearance
+    /// goes into the sub-assembly's file.
+    Inner,
 }
 
 /// Which page of the panel is shown.
@@ -125,17 +128,23 @@ pub enum Page {
     Material,
 }
 
+#[derive(Clone)]
 pub struct AppearanceDialog {
     pub page: Page,
     pub scope: Scope,
     /// The faces for [`Scope::Faces`], picked in the viewport.
     pub faces: Vec<FaceName>,
+    /// The component for [`Scope::Inner`].
+    pub inner: Option<Occurrence>,
     pub appearance: Appearance,
     /// Whether the appearance was changed in the panel: only then is it written to the
     /// target, so that choosing a material alone does not also paint the part.
     pub touched: bool,
     /// The part's material as edited on the Material page (`None`: no material).
     pub material: Option<Material>,
+    /// The part's own appearances go when the material is applied (the user agreed to
+    /// it, see [`crate::materials_ui::Confirm`]).
+    pub clear_appearances: bool,
     /// The body the Body choice stands for: the one selected, or the one under the
     /// first selected face.
     pub body: Option<BodyId>,
@@ -144,6 +153,8 @@ pub struct AppearanceDialog {
     before: Option<PartDefinition>,
     /// Same for an assembly.
     before_asm: Option<Assembly>,
+    /// The inner component's appearance when the panel opened.
+    before_inner: Option<Appearance>,
 }
 
 /// A named colour or material to click.
@@ -197,21 +208,26 @@ fn swatch(ui: &mut egui::Ui, p: &Preset) -> bool {
     } else {
         p.name.to_owned()
     };
-    color_swatch(ui, p.color, 20.0).on_hover_text(hover).clicked()
+    color_swatch(ui, p.color, 20.0)
+        .on_hover_text(hover)
+        .clicked()
 }
 
 /// A small square of colour.
-fn color_swatch(ui: &mut egui::Ui, color: [u8; 3], size: f32) -> egui::Response {
+pub(crate) fn color_swatch(ui: &mut egui::Ui, color: [u8; 3], size: f32) -> egui::Response {
     let [r, g, b] = color;
     let button = egui::Button::new("")
         .fill(Color32::from_rgb(r, g, b))
         .min_size(egui::vec2(size, size))
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color));
+        .stroke(egui::Stroke::new(
+            1.0,
+            ui.visuals().widgets.inactive.bg_stroke.color,
+        ));
     ui.add(button)
 }
 
 /// The colour, preset, transparency and texture controls, shared by both pages.
-fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status: &mut String) {
+pub(crate) fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status: &mut String) {
     section(ui, "Colour");
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
@@ -255,7 +271,10 @@ fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status: &mut Strin
             {
                 match std::fs::read(&path) {
                     Ok(bytes) if is_image(&bytes) => {
-                        let scale = a.texture.as_ref().map_or(Texture::DEFAULT_SCALE, |t| t.scale);
+                        let scale = a
+                            .texture
+                            .as_ref()
+                            .map_or(Texture::DEFAULT_SCALE, |t| t.scale);
                         a.texture = Some(Texture {
                             file_name: path
                                 .file_name()
@@ -273,7 +292,11 @@ fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status: &mut Strin
         match &a.texture {
             Some(t) => {
                 ui.label(&t.file_name);
-                if ui.small_button("✕").on_hover_text("Remove the texture").clicked() {
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Remove the texture")
+                    .clicked()
+                {
                     a.texture = None;
                 }
             }
@@ -347,6 +370,37 @@ impl OxydeApp {
         self.open_appearance(Scope::Component(id), Vec::new(), Page::Appearance);
     }
 
+    /// Appearance of a component inside a sub-assembly, from the tree: written into the
+    /// sub-assembly's file on OK.
+    pub(crate) fn begin_inner_appearance(&mut self, o: Occurrence) {
+        let Some(doc) = self.asm.as_ref() else {
+            return;
+        };
+        let Some((path, component)) = doc.inner_component(&o) else {
+            return;
+        };
+        if !path.exists() || doc.read_only {
+            self.status = "The sub-assembly's file cannot be written".to_owned();
+            return;
+        }
+        let fallback = Appearance::colored(self.viewport.settings.style.face);
+        let appearance = component.appearance.clone().unwrap_or(fallback);
+        self.dialog = Some(Dialog::Appearance(AppearanceDialog {
+            page: Page::Appearance,
+            scope: Scope::Inner,
+            faces: Vec::new(),
+            inner: Some(o.clone()),
+            appearance,
+            touched: false,
+            material: None,
+            clear_appearances: false,
+            body: None,
+            before: None,
+            before_asm: None,
+            before_inner: component.appearance.clone(),
+        }));
+    }
+
     fn open_appearance(&mut self, scope: Scope, faces: Vec<FaceName>, page: Page) {
         let body = match scope {
             Scope::Body(id) => Some(id),
@@ -371,12 +425,15 @@ impl OxydeApp {
             page,
             scope,
             faces,
+            inner: None,
             appearance,
             touched: false,
             material,
+            clear_appearances: false,
             body,
             before,
             before_asm,
+            before_inner: None,
         }));
     }
 
@@ -399,10 +456,11 @@ impl OxydeApp {
                     a.of_face(Some(f), body)
                 })
                 .or(self.doc.part.material().map(|m| &m.appearance)),
-            Scope::Body(id) => a
-                .body(id)
-                .or(a.part.as_ref())
-                .or(self.doc.part.material().map(|m| &m.appearance)),
+            Scope::Body(id) => {
+                a.body(id)
+                    .or(a.part.as_ref())
+                    .or(self.doc.part.material().map(|m| &m.appearance))
+            }
             Scope::Part => a
                 .part
                 .as_ref()
@@ -412,6 +470,7 @@ impl OxydeApp {
                 .as_ref()
                 .and_then(|d| d.assembly.component(id))
                 .and_then(|c| c.appearance.as_ref()),
+            Scope::Inner => None,
         };
         found.cloned().unwrap_or(fallback)
     }
@@ -434,7 +493,7 @@ impl OxydeApp {
     /// The panel's contents; returns true when the panel finished by itself (the
     /// appearance was removed).
     pub(crate) fn appearance_body(&mut self, ui: &mut egui::Ui, d: &mut AppearanceDialog) -> bool {
-        if !matches!(d.scope, Scope::Component(_)) {
+        if !matches!(d.scope, Scope::Component(_) | Scope::Inner) {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut d.page, Page::Appearance, "Appearance");
                 ui.selectable_value(&mut d.page, Page::Material, "Material");
@@ -467,6 +526,30 @@ impl OxydeApp {
                     RichText::new("Overrides the part's own appearances in this assembly.")
                         .small()
                         .weak(),
+                );
+            }
+            Scope::Inner => {
+                let (name, file) = d
+                    .inner
+                    .as_ref()
+                    .zip(self.asm.as_ref())
+                    .and_then(|(o, doc)| {
+                        let (path, c) = doc.inner_component(o)?;
+                        let file = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        Some((c.name.clone(), file))
+                    })
+                    .unwrap_or_default();
+                ui.label(format!("Component {name} in {file}"));
+                ui.label(
+                    RichText::new(format!(
+                        "Written into {file} on OK (not undoable here). An appearance on \
+                         the top-level component wins over it."
+                    ))
+                    .small()
+                    .weak(),
                 );
             }
             _ => {
@@ -506,7 +589,9 @@ impl OxydeApp {
         let has_own = self.has_own_appearance(d);
         if ui
             .add_enabled(has_own, egui::Button::new("Remove appearance"))
-            .on_hover_text("Back to what it inherits: the body's, the part's, or the viewport's colour")
+            .on_hover_text(
+                "Back to what it inherits: the body's, the part's, or the viewport's colour",
+            )
             .clicked()
         {
             self.write_appearance(d, None);
@@ -568,7 +653,11 @@ impl OxydeApp {
                 let library = &self.materials;
                 for category in library.categories() {
                     ui.label(RichText::new(category).small().weak());
-                    for m in library.materials().iter().filter(|m| m.category == category) {
+                    for m in library
+                        .materials()
+                        .iter()
+                        .filter(|m| m.category == category)
+                    {
                         ui.horizontal(|ui| {
                             color_swatch(ui, m.appearance.color, 14.0);
                             let is_selected = selected.as_deref() == Some(m.name.as_str());
@@ -586,8 +675,28 @@ impl OxydeApp {
                 }
             });
         if let Some(m) = pick {
-            d.material = Some(m);
+            // A part with appearances of its own: the material's look would replace
+            // them, so ask first (the answer comes back through `confirm_window`).
+            let own = d.before.as_ref().is_some_and(|b| !b.appearances.is_empty());
+            if own && !d.clear_appearances && self.materials.get(&m.name).is_some() {
+                self.confirm = Some(crate::materials_ui::Confirm::Material {
+                    paths: Vec::new(),
+                    name: m.name.clone(),
+                    with_appearances: 1,
+                });
+            } else {
+                d.material = Some(m);
+            }
         }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Edit library…")
+                .on_hover_text("The Materials window: edit a material for every part made of it")
+                .clicked()
+            {
+                self.open_materials_window();
+            }
+        });
 
         if let Some(m) = d.material.as_mut() {
             section(ui, "Edit");
@@ -660,7 +769,7 @@ impl OxydeApp {
     pub(crate) fn appearance_pick(&mut self, d: &mut AppearanceDialog, pick: PanelPick) -> bool {
         match pick {
             PanelPick::Face(f) => {
-                if matches!(d.scope, Scope::Component(_)) {
+                if matches!(d.scope, Scope::Component(_) | Scope::Inner) {
                     return false;
                 }
                 match d.faces.iter().position(|x| *x == f) {
@@ -698,6 +807,12 @@ impl OxydeApp {
                 .as_ref()
                 .and_then(|x| x.assembly.component(id))
                 .is_some_and(|c| c.appearance.is_some()),
+            Scope::Inner => d
+                .inner
+                .as_ref()
+                .zip(self.asm.as_ref())
+                .and_then(|(o, doc)| doc.inner_component(o))
+                .is_some_and(|(_, c)| c.appearance.is_some()),
         }
     }
 
@@ -713,12 +828,13 @@ impl OxydeApp {
             Scope::Body(id) => self.doc.part.appearances_mut().set_body(id, appearance),
             Scope::Part => self.doc.part.appearances_mut().set_part(appearance),
             Scope::Component(id) => {
-                if let Some(c) = self
-                    .asm
-                    .as_mut()
-                    .and_then(|x| x.assembly.component_mut(id))
-                {
+                if let Some(c) = self.asm.as_mut().and_then(|x| x.assembly.component_mut(id)) {
                     c.appearance = appearance.map(Appearance::clamped);
+                }
+            }
+            Scope::Inner => {
+                if let (Some(o), Some(doc)) = (&d.inner, self.asm.as_mut()) {
+                    doc.set_inner_appearance(o, appearance);
                 }
             }
         }
@@ -726,7 +842,7 @@ impl OxydeApp {
 
     /// Shows the panel's current values in the viewport, starting from the state the
     /// panel opened with (so moving a face out of the list takes its colour back).
-    fn preview_appearance(&mut self, d: &AppearanceDialog) {
+    pub(crate) fn preview_appearance(&mut self, d: &AppearanceDialog) {
         self.restore_appearance(d);
         self.write_panel(d);
         self.refresh_materials();
@@ -735,10 +851,12 @@ impl OxydeApp {
     /// Puts the panel's values on the part: the appearance when it was changed (or the
     /// target had one already), and the material.
     fn write_panel(&mut self, d: &AppearanceDialog) {
-        if d.touched || self.has_own_appearance(d) {
+        if d.clear_appearances && d.material.is_some() {
+            *self.doc.part.appearances_mut() = Default::default();
+        } else if d.touched || self.has_own_appearance(d) {
             self.write_appearance(d, Some(d.appearance.clone()));
         }
-        if !matches!(d.scope, Scope::Component(_)) {
+        if !matches!(d.scope, Scope::Component(_) | Scope::Inner) {
             self.doc.part.set_material(d.material.clone());
         }
     }
@@ -755,11 +873,39 @@ impl OxydeApp {
                 }
             }
         }
+        if let (Scope::Inner, Some(o), Some(doc)) = (d.scope, &d.inner, self.asm.as_mut()) {
+            doc.set_inner_appearance(o, d.before_inner.clone());
+        }
     }
 
     /// Records the change as one undo step.
     fn commit_appearance(&mut self, d: &AppearanceDialog) {
         match d.scope {
+            Scope::Inner => {
+                // Into the sub-assembly's file: parts and sub-assemblies are documents of
+                // their own, so this is not part of the assembly's undo history.
+                let Some((o, doc)) = d.inner.as_ref().zip(self.asm.as_ref()) else {
+                    return;
+                };
+                let Some((path, component)) = doc.inner_component(o) else {
+                    return;
+                };
+                if component.appearance == d.before_inner {
+                    return;
+                }
+                let appearance = component.appearance.clone();
+                let id = component.id;
+                let written = oxyde_format::load_assembly(&path).and_then(|mut file| {
+                    if let Some(c) = file.assembly.component_mut(id) {
+                        c.appearance = appearance;
+                    }
+                    oxyde_format::save_assembly(&path, &file)
+                });
+                self.status = match written {
+                    Ok(()) => format!("Appearance written to {}", path.display()),
+                    Err(e) => format!("Could not write {}: {e}", path.display()),
+                };
+            }
             Scope::Component(_) => {
                 if let (Some(before), Some(doc)) = (&d.before_asm, self.asm.as_mut()) {
                     if *before != doc.assembly {
@@ -792,10 +938,12 @@ impl OxydeApp {
         self.commit_appearance(&d);
         self.sync_material_property();
         self.refresh_materials();
-        self.status = match (&d.material, d.page) {
-            (Some(m), Page::Material) => format!("Material: {}", m.name),
-            _ => "Appearance set".to_owned(),
-        };
+        if d.scope != Scope::Inner {
+            self.status = match (&d.material, d.page) {
+                (Some(m), Page::Material) => format!("Material: {}", m.name),
+                _ => "Appearance set".to_owned(),
+            };
+        }
     }
 
     /// Keeps `properties.material` (what the bill of materials shows) equal to the
@@ -852,9 +1000,7 @@ impl OxydeApp {
         let mut materials = vec![RenderMaterial::default(); total];
         let mut textures = Vec::new();
         for r in &doc.ranges {
-            let own = assembly
-                .component(r.owner.top)
-                .and_then(|c| c.appearance.as_ref());
+            let own = doc.occurrence_appearance(assembly, &r.owner);
             let part = doc.part_at(&r.owner).map(|p| &p.part);
             let body = part.and_then(|p| p.body());
             if own.is_none() && part.is_none_or(|p| !p.has_appearances()) {
@@ -875,15 +1021,25 @@ impl OxydeApp {
 
     /// Gives the viewport the current materials without re-meshing.
     pub(crate) fn refresh_materials(&mut self) {
-        let (materials, textures) = if self.asm.is_some() {
+        let (mut materials, textures) = if self.asm.is_some() {
             let assembly = match &self.mate_preview {
                 Some(p) => p.assembly.clone(),
-                None => self.asm.as_ref().map(|d| d.assembly.clone()).unwrap_or_default(),
+                None => self
+                    .asm
+                    .as_ref()
+                    .map(|d| d.assembly.clone())
+                    .unwrap_or_default(),
             };
             self.assembly_materials(&assembly)
         } else {
             self.part_materials()
         };
+        // While editing in place, the ghosted rest of the assembly keeps its look.
+        let own = match self.asm.as_ref() {
+            Some(doc) => doc.ranges.iter().map(|r| r.faces.end).max().unwrap_or(0) as usize,
+            None => self.doc.part.body().map_or(0, |b| b.topology.faces.len()),
+        };
+        self.add_context_materials(own, &mut materials);
         self.viewport.set_materials(materials, textures);
     }
 }
