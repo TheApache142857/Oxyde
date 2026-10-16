@@ -10,8 +10,8 @@ use eframe::egui;
 use oxyde_geom::{Plane, Point3, Vec3};
 use oxyde_kernel::{Kernel, SurfaceKind, Topology};
 use oxyde_model::{
-    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, FileData, Import,
-    ReferenceGeometry, Sketch, SketchPlane, StandardPlane,
+    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry,
+    Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Pick, Scene};
@@ -55,7 +55,10 @@ impl PendingAction {
     /// Whether the action closes every open document, including the assemblies set
     /// aside while a component is edited in place: those are finished first.
     pub fn leaves_everything(self) -> bool {
-        !matches!(self, PendingAction::OpenComponent(_) | PendingAction::FinishEdit)
+        !matches!(
+            self,
+            PendingAction::OpenComponent(_) | PendingAction::FinishEdit
+        )
     }
 }
 
@@ -191,6 +194,8 @@ pub struct OxydeApp {
     pub(crate) pending_tool: Option<Tool>,
     pub(crate) show_mass_properties: bool,
     pub(crate) show_measure: bool,
+    /// Evaluate › Section View, while its window is open.
+    pub(crate) section: Option<crate::section_view::SectionView>,
     /// Which planes, axes, sketches and origins are drawn.
     pub(crate) visibility: crate::display::Visibility,
     /// Features expanded in the timeline (showing the sketch they absorb).
@@ -219,6 +224,8 @@ pub struct OxydeApp {
     pub(crate) asm_scene: Option<u64>,
     /// The component being moved with Alt+drag.
     pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
+    /// Move Component is on: a plain left-drag moves a component (Shift turns it).
+    pub(crate) move_mode: bool,
     /// A component whose part should open once unsaved changes are dealt with.
     pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
     /// The assemblies set aside while a component is edited in place, outermost first.
@@ -239,6 +246,12 @@ pub struct OxydeApp {
     pub(crate) texture_cache: crate::appearance_ui::TextureCache,
     /// The user's material library (`materials.json` next to the preferences).
     pub(crate) materials: oxyde_model::MaterialLibrary,
+    /// Tools › Materials…: the library editor.
+    pub(crate) materials_window: crate::materials_ui::MaterialsWindow,
+    /// A question asked before something is done (over every other window).
+    pub(crate) confirm: Option<crate::materials_ui::Confirm>,
+    /// Work going on off the UI thread, with its progress window.
+    pub(crate) job: Option<crate::jobs::Job>,
 }
 
 impl OxydeApp {
@@ -262,6 +275,7 @@ impl OxydeApp {
             pending_tool: None,
             show_mass_properties: false,
             show_measure: false,
+            section: None,
             visibility: Default::default(),
             expanded: Default::default(),
             scroll_to_feature: None,
@@ -279,6 +293,7 @@ impl OxydeApp {
             bom_mode: oxyde_assembly::bom::BomMode::TopLevel,
             asm_scene: None,
             grabbing: None,
+            move_mode: false,
             pending_open_component: None,
             edit_stack: Vec::new(),
             after_unwind: None,
@@ -292,6 +307,9 @@ impl OxydeApp {
             splash: crate::splash::Splash::new(file.clone()),
             texture_cache: Default::default(),
             materials: oxyde_model::MaterialLibrary::standard(),
+            materials_window: Default::default(),
+            confirm: None,
+            job: None,
         };
         let (materials, problem) = crate::materials::load();
         app.materials = materials;
@@ -885,6 +903,12 @@ impl OxydeApp {
     }
 
     fn replace_document(&mut self, doc: Document) {
+        self.replace_document_built(doc);
+        self.rebuild();
+    }
+
+    /// Switches to `doc`, already rebuilt (by a job, or empty).
+    pub(crate) fn replace_document_built(&mut self, doc: Document) {
         self.doc.release(&mut self.kernel);
         self.doc = doc;
         self.sketch = None;
@@ -897,7 +921,6 @@ impl OxydeApp {
         self.scene_revision = None;
         self.tab = CommandTab::Features;
         self.viewport.request_fit();
-        self.rebuild();
     }
 
     pub(crate) fn open_path(&mut self, path: &Path) {
@@ -927,64 +950,72 @@ impl OxydeApp {
                 return;
             }
         };
-        let loaded = oxyde_format::load_part(path)
-            .map_err(|e| e.to_string())
-            .and_then(|file| Document::from_file(file, Some(path.to_path_buf())));
-        match loaded {
-            Ok(mut doc) => {
-                doc.read_only = read_only;
-                self.replace_document(doc);
-                self.remember_recent(path);
-                self.status = if read_only {
-                    format!("Opened {} read-only", path.display())
-                } else {
-                    format!("Opened {}", path.display())
-                };
-                self.report_errors();
-            }
-            Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
-        }
+        // Read and rebuilt off the UI thread; shown when done.
+        self.open_part_job(path, read_only);
     }
 
-    /// A new part whose first feature imports `path`.
+    /// A new part whose first feature imports `path`: read off the UI thread.
     fn open_step_as_part(&mut self, path: &Path) {
-        let mut doc = Document::new();
-        doc.untitled_name = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-        self.replace_document(doc);
-        if self.import_step_file(path) {
-            // Opening is not an edit: nothing to undo, nothing unsaved yet.
-            self.doc.modified = false;
-            self.doc.clear_history();
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".to_owned());
+        let empty = oxyde_format::PartFile::new().definition;
+        self.import_step_job(path, empty, Some(name));
+    }
+
+    /// A part rebuilt with an Imported feature, back from the job: a new document when
+    /// `fresh` names it, else the open part with the feature added as one undo step.
+    pub(crate) fn part_imported(
+        &mut self,
+        part: oxyde_model::Part,
+        file_name: &str,
+        fresh: Option<String>,
+    ) {
+        let id = part.timeline().last().map(|e| e.id);
+        match fresh {
+            Some(name) => {
+                let mut doc = Document::new();
+                doc.untitled_name = Some(name);
+                doc.part = part;
+                self.replace_document_built(doc);
+                // Opening is not an edit: nothing to undo, nothing unsaved yet.
+                self.doc.modified = false;
+                self.doc.clear_history();
+            }
+            None => {
+                let before = self.doc.part.definition();
+                self.doc.part.release(&mut self.kernel);
+                self.doc.part = part;
+                self.doc.checkpoint_from(before);
+                self.doc.revision = crate::document::next_revision();
+                self.selected_feature = id;
+                self.selection.clear();
+            }
         }
+        self.viewport.request_fit();
+        self.status = match id.and_then(|id| self.doc.part.status(id)) {
+            Some(FeatureStatus::Error(message)) => format!("Import failed: {message}"),
+            _ => format!("Imported {file_name}"),
+        };
     }
 
     /// File › Import STEP assembly: one part file per distinct part of `path` (an
     /// Imported feature holding its solids) and one assembly file per assembly, written
-    /// into a folder the user picks; then opens the top-level document.
+    /// into a folder the user picks; then opens the top-level document. The file is
+    /// read off the UI thread first.
     fn import_step_assembly(&mut self, path: &Path) {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.status = format!("Could not read {}: {e}", path.display());
-                return;
-            }
-        };
-        let source = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "import.step".to_owned());
-        let plan = match self.kernel.read_step_assembly(&bytes) {
-            Ok(tree) => oxyde_format::step_import::plan_step_import(&tree, &source)
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(e) => {
-                self.status = format!("Could not import {source}: {e}");
-                return;
-            }
-        };
+        self.plan_step_job(path);
+    }
+
+    /// The files of a STEP import, planned: asks for the folder, writes them and opens
+    /// the top-level document.
+    pub(crate) fn write_step_plan(
+        &mut self,
+        plan: &oxyde_format::step_import::ImportPlan,
+        path: &Path,
+        source: &str,
+    ) {
         let mut dialog = rfd::FileDialog::new().set_title(format!(
             "Folder for the {} part(s) and {} assembly file(s) of {source}",
             plan.part_count(),
@@ -1035,46 +1066,17 @@ impl OxydeApp {
         }
     }
 
-    /// File › Import STEP: adds the file's solids to the part as an "Imported" feature.
+    /// File › Import STEP: adds the file's solids to the part as an "Imported" feature at
+    /// the rollback bar, read and rebuilt off the UI thread.
     pub(crate) fn import_step(&mut self) {
         if let Some(path) = pick_step() {
             self.finish_sketch(true);
-            self.import_step_file(&path);
+            let definition = self.doc.part.definition();
+            self.import_step_job(&path, definition, None);
         }
     }
 
-    /// Reads `path` into an "Imported" feature at the rollback bar. Returns whether the
-    /// geometry could be read.
-    fn import_step_file(&mut self, path: &Path) -> bool {
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.status = format!("Could not read {}: {e}", path.display());
-                return false;
-            }
-        };
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "import.step".to_owned());
-        let id = self.add_feature(FeatureKind::Import(Import::new(
-            file_name.clone(),
-            FileData::new(bytes),
-        )));
-        self.viewport.request_fit();
-        match self.doc.part.status(id) {
-            Some(FeatureStatus::Error(message)) => {
-                self.status = format!("Import failed: {message}");
-                false
-            }
-            _ => {
-                self.status = format!("Imported {file_name}");
-                true
-            }
-        }
-    }
-
-    fn report_errors(&mut self) {
+    pub(crate) fn report_errors(&mut self) {
         let failed = self
             .doc
             .part
@@ -1181,7 +1183,17 @@ impl OxydeApp {
         else {
             return;
         };
-        self.status = match self.kernel.export_step(&shapes, &colors, &path) {
+        // The part's material goes with every solid, as its name and density.
+        let material = self.doc.part.material().map(|m| oxyde_kernel::StepMaterial {
+            name: m.name.clone(),
+            description: m.category.clone(),
+            density: m.density,
+        });
+        let materials = vec![material; shapes.len()];
+        self.status = match self
+            .kernel
+            .export_step(&shapes, &colors, &materials, &path)
+        {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };
@@ -1638,7 +1650,9 @@ impl OxydeApp {
 
     /// Re-tessellates the body after each rebuild.
     fn refresh_scene(&mut self) {
-        if self.scene_revision == Some(self.doc.revision) {
+        // While a job reads a document, the picture stays as it was (the assembly a
+        // component was edited in, say, until it is back).
+        if self.busy() || self.scene_revision == Some(self.doc.revision) {
             return;
         }
         self.scene_revision = Some(self.doc.revision);
@@ -1773,8 +1787,7 @@ pub(crate) fn plane_quad(
     let to_center = center - plane.origin;
     let c = center - plane.normal * to_center.dot(plane.normal);
     let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
-    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-        .map(|(a, b)| to_screen(c + u * a + v * b))
+    [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].map(|(a, b)| to_screen(c + u * a + v * b))
 }
 
 /// Whether `p` is inside a convex quad.
@@ -1893,8 +1906,11 @@ impl eframe::App for OxydeApp {
         self.handle_close_request(ctx);
         self.splash_step(ctx);
         self.sync_locks();
+        let busy = self.busy();
         if self.asm.is_some() {
-            self.assembly_shortcuts(ctx);
+            if !busy {
+                self.assembly_shortcuts(ctx);
+            }
             egui::TopBottomPanel::top("menu").show(ctx, |ui| self.assembly_menu_bar(ui));
             egui::TopBottomPanel::top("commands").show(ctx, |ui| self.assembly_command_bar(ui));
             egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.assembly_status_bar(ui));
@@ -1909,15 +1925,20 @@ impl eframe::App for OxydeApp {
             self.bom_window(ctx);
             self.evaluate_windows(ctx);
             self.stl_window(ctx);
+            self.materials_window(ctx);
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
             self.dialogs_ui(ctx);
+            self.confirm_window(ctx);
+            self.job_window(ctx);
             self.splash_ui(ctx);
             self.update_title(ctx);
             return;
         }
         self.viewport.grab_enabled = false;
-        self.handle_shortcuts(ctx);
+        if !busy {
+            self.handle_shortcuts(ctx);
+        }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("commands").show(ctx, |ui| self.command_bar(ui));
@@ -1937,9 +1958,12 @@ impl eframe::App for OxydeApp {
         self.equations_window(ctx);
         self.evaluate_windows(ctx);
         self.stl_window(ctx);
+        self.materials_window(ctx);
         self.preferences_window(ctx);
         self.debug_overlay(ctx, self.viewport_rect);
         self.dialogs_ui(ctx);
+        self.confirm_window(ctx);
+        self.job_window(ctx);
         self.splash_ui(ctx);
         self.update_title(ctx);
     }
@@ -1947,6 +1971,9 @@ impl eframe::App for OxydeApp {
 
 impl Drop for OxydeApp {
     fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.join();
+        }
         self.leave_assembly();
         self.drop_edit_stack();
         self.doc.release(&mut self.kernel);

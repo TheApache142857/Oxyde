@@ -369,7 +369,14 @@ impl Frame {
     /// `crossing`, everything with a visible pixel in it, otherwise only what lies
     /// entirely inside (every one of its visible pixels), as SolidWorks' box selection.
     pub fn picks_in(&self, min: [f64; 2], max: [f64; 2], crossing: bool) -> Vec<Pick> {
-        picks_in_rect(&self.face_ids, &self.edge_ids, self.width, min, max, crossing)
+        picks_in_rect(
+            &self.face_ids,
+            &self.edge_ids,
+            self.width,
+            min,
+            max,
+            crossing,
+        )
     }
 
     fn index(&self, x: i64, y: i64) -> Option<usize> {
@@ -441,7 +448,10 @@ pub fn picks_in_rect(
         ids.sort_unstable();
         ids
     };
-    let mut picks: Vec<Pick> = chosen(count(face_ids)).into_iter().map(Pick::Face).collect();
+    let mut picks: Vec<Pick> = chosen(count(face_ids))
+        .into_iter()
+        .map(Pick::Face)
+        .collect();
     picks.extend(chosen(count(edge_ids)).into_iter().map(Pick::Edge));
     picks
 }
@@ -482,15 +492,11 @@ struct Lights {
     eye: V3,
     /// Towards the key light.
     key: V3,
-    /// Subsurface scattering strength, 0..1 (see [`Style::subsurface`]).
-    subsurface: f64,
 }
 
 /// Brightness factor for a surface with unit normal `n`: ambient, plus a headlight so no
 /// face goes black, plus a key light so differently oriented faces get different shades.
-/// With subsurface scattering, the key light wraps round the shadow side and light glows
-/// out near the silhouette, where the part is thin as seen from the eye. The GPU shader
-/// (`gpu.rs` in the application) computes the same.
+/// The GPU shader (`gpu.rs` in the application) computes the same.
 fn shade(n: V3, lights: &Lights) -> f32 {
     // Closed solids are seen from outside: orient the normal towards the viewer, which also
     // tolerates meshes with inconsistent winding.
@@ -500,17 +506,64 @@ fn shade(n: V3, lights: &Lights) -> f32 {
         n
     };
     let facing = dot(n, lights.eye);
-    let towards_key = dot(n, lights.key);
-    let mut key = towards_key.max(0.0);
-    let mut rim = 0.0;
-    let s = lights.subsurface;
-    if s > 0.0 {
-        let wrap = 0.6 * s;
-        let soft = ((towards_key + wrap) / (1.0 + wrap)).max(0.0);
-        key += (soft - key) * s;
-        rim = (1.0 - facing).max(0.0).powi(3) * 0.45 * s;
+    let key = dot(n, lights.key).max(0.0);
+    (0.38 + 0.37 * facing + 0.40 * key) as f32
+}
+
+/// How far ambient occlusion looks around a pixel, as a fraction of the image's smaller
+/// side, and how deep (in multiples of that reach, in millimetres) a nearer neighbour
+/// still counts as hiding the ambient light.
+pub const AO_RADIUS: f64 = 0.035;
+pub const AO_REACH: f32 = 6.0;
+
+/// Darkens creases, inner corners and the foot of walls: a pixel whose neighbours within
+/// `radius_px` lie nearer the viewer than it, by up to [`AO_REACH`] × `radius_mm`, gets
+/// less ambient light. Screen-space, from the depth buffer, after the opaque faces and
+/// before the edges (which stay crisp); the GPU renderer does the same in a shader. The
+/// ids are untouched.
+fn ambient_occlusion(frame: &mut Frame, strength: f32, radius_px: f64, radius_mm: f32) {
+    let (w, h) = (frame.width, frame.height);
+    let depth = &frame.depth;
+    // Two rings of six directions.
+    let samples: Vec<(f64, f64)> = (0..12)
+        .map(|k| {
+            let a = k as f64 / 12.0 * std::f64::consts::TAU;
+            let r = if k % 2 == 0 { 1.0 } else { 0.55 } * radius_px;
+            (a.cos() * r, a.sin() * r)
+        })
+        .collect();
+    let reach = radius_mm * AO_REACH;
+    let bias = radius_mm * 0.05;
+    let mut factors = vec![1.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let d = depth[i];
+            if !d.is_finite() {
+                continue;
+            }
+            let mut occlusion = 0.0f32;
+            for (ox, oy) in &samples {
+                let (sx, sy) = (x as f64 + ox, y as f64 + oy);
+                if sx < 0.0 || sy < 0.0 || sx >= w as f64 || sy >= h as f64 {
+                    continue;
+                }
+                let sd = depth[sy as usize * w + sx as usize];
+                let diff = d - sd;
+                if diff > bias && diff < reach {
+                    occlusion += 1.0 - diff / reach;
+                }
+            }
+            factors[i] = 1.0 - 0.75 * strength * occlusion / samples.len() as f32;
+        }
     }
-    (0.38 + 0.37 * facing + 0.40 * key + rim) as f32
+    for (i, k) in factors.into_iter().enumerate() {
+        if k < 1.0 {
+            for v in &mut frame.rgba[i * 4..i * 4 + 3] {
+                *v = (f32::from(*v) * k).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }
 
 /// Renders `scene` seen through `camera` into a `width` × `height` pixel frame, in the
@@ -557,26 +610,26 @@ pub fn render_styled(
     let lights = Lights {
         eye: camera.eye_direction(),
         key: camera.key_light(),
-        subsurface: f64::from(style.subsurface.clamp(0.0, 1.0)),
     };
     let depth_of = |p: V3| -dot(sub(p, camera.target), camera.eye_direction());
-    let draw_face = |frame: &mut Frame, face: &SceneFace, world: &[V3], flip: bool, paint: &Paint| {
-        let projected: Vec<V3> = world.iter().map(|&p| camera.project(p, w, h)).collect();
-        for t in &face.triangles {
-            let normals = t.map(|i| {
-                let n = face.normals[i];
-                if flip { [n[0], -n[1], n[2]] } else { n }
-            });
-            raster_triangle(
-                frame,
-                t.map(|i| projected[i]),
-                t.map(|i| world[i]),
-                normals,
-                &lights,
-                paint,
-            );
-        }
-    };
+    let draw_face =
+        |frame: &mut Frame, face: &SceneFace, world: &[V3], flip: bool, paint: &Paint| {
+            let projected: Vec<V3> = world.iter().map(|&p| camera.project(p, w, h)).collect();
+            for t in &face.triangles {
+                let normals = t.map(|i| {
+                    let n = face.normals[i];
+                    if flip { [n[0], -n[1], n[2]] } else { n }
+                });
+                raster_triangle(
+                    frame,
+                    t.map(|i| projected[i]),
+                    t.map(|i| world[i]),
+                    normals,
+                    &lights,
+                    paint,
+                );
+            }
+        };
 
     // The reflection: the faces mirrored in the floor, faded with height, drawn first so
     // the part itself covers it. Front to back, so each pixel is blended once.
@@ -621,6 +674,13 @@ pub fn render_styled(
             id: index as u32 + 1,
         };
         draw_face(&mut frame, face, &face.positions, false, &paint);
+    }
+
+    let ao = style.ambient_occlusion.clamp(0.0, 1.0);
+    if ao > 0.0 && width > 0 && height > 0 {
+        let radius_px = (width.min(height) as f64 * AO_RADIUS).max(2.0);
+        let radius_mm = radius_px / camera.pixels_per_mm(h);
+        ambient_occlusion(&mut frame, ao, radius_px, radius_mm as f32);
     }
 
     // Edges are drawn over faces they lie on, but hidden behind faces in front of them.
@@ -912,7 +972,6 @@ mod tests {
         let lights = Lights {
             eye: camera.eye_direction(),
             key: camera.key_light(),
-            subsurface: 0.0,
         };
         let x = shade([1.0, 0.0, 0.0], &lights);
         let y = shade([0.0, 1.0, 0.0], &lights);
@@ -1019,10 +1078,16 @@ mod tests {
         assert!(scene.has_transparency());
         let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
         let corner = pixel(&frame, 5, 5);
-        assert!(corner[1] > 100 && corner[0] == 0 && corner[2] == 0, "{corner:?}");
+        assert!(
+            corner[1] > 100 && corner[0] == 0 && corner[2] == 0,
+            "{corner:?}"
+        );
         let middle = pixel(&frame, 50, 50);
         // Red over green, half and half: both channels present.
-        assert!(middle[0] > 60 && middle[1] > 60 && middle[2] == 0, "{middle:?}");
+        assert!(
+            middle[0] > 60 && middle[1] > 60 && middle[2] == 0,
+            "{middle:?}"
+        );
         assert_ne!(middle, pixel(&plain, 50, 50));
         // The transparent face is still what the cursor is on; the edges still show.
         assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(0)));
@@ -1098,7 +1163,12 @@ mod tests {
         let mut camera = Camera::default();
         camera.set_view(StandardView::Isometric);
         let (lo, hi) = scene.bounds().unwrap();
-        camera.fit([lo[0], lo[1] - 25.0, lo[2]], [hi[0], hi[1], hi[2]], w as f64, h as f64);
+        camera.fit(
+            [lo[0], lo[1] - 25.0, lo[2]],
+            [hi[0], hi[1], hi[2]],
+            w as f64,
+            h as f64,
+        );
         let plain = render_styled(&scene, &camera, w, h, &Highlight::default(), &Style::LIGHT);
         let mirrored = Style {
             floor_reflection: 0.5,
@@ -1123,35 +1193,42 @@ mod tests {
     }
 
     #[test]
-    fn subsurface_scattering_softens_the_shading() {
-        // A square facing the camera: its shading is flat, so the only change is that the
-        // key light wraps (no pixel gets darker, and a square turned away from the key
-        // light gets brighter), never the ids.
+    fn ambient_occlusion_darkens_the_foot_of_a_step() {
+        // Face 0 stands 5 mm in front of face 1: on face 1, the pixels next to face 0's
+        // edge lose ambient light; those far from it, and face 0 itself (nothing is in
+        // front of it), keep their shade. The ids never change.
         let scene = Scene::from_mesh(&mesh());
         let camera = front_camera();
-        let plain = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &Style::LIGHT);
-        let waxy = Style {
-            subsurface: 1.0,
+        let plain = render_styled(
+            &scene,
+            &camera,
+            100,
+            100,
+            &Highlight::default(),
+            &Style::LIGHT,
+        );
+        let occluded = Style {
+            ambient_occlusion: 1.0,
             ..Style::LIGHT
         };
-        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &waxy);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &occluded);
         assert_eq!(frame.face_ids, plain.face_ids);
-        let brighter = (0..100 * 100)
-            .filter(|i| frame.rgba[i * 4] > plain.rgba[i * 4])
-            .count();
+        let red = |f: &Frame, x: usize, y: usize| f.rgba[(y * 100 + x) * 4];
+        // 2.5 px per mm: face 0 spans pixels 25..75. Just outside it, on face 1.
+        assert!(red(&frame, 22, 50) < red(&plain, 22, 50));
+        // Far from the step, and on face 0 (seen through nothing) : unchanged.
+        assert_eq!(red(&frame, 5, 50), red(&plain, 5, 50));
+        assert_eq!(red(&frame, 50, 50), red(&plain, 50, 50));
         let darker = (0..100 * 100)
             .filter(|i| frame.rgba[i * 4] < plain.rgba[i * 4])
             .count();
-        assert!(brighter > 0 && darker == 0, "{brighter} brighter, {darker} darker");
-        // Lights wrapped: a normal turned 120° from the key light is still lit a little.
-        let lights = Lights {
-            eye: [0.0, 0.0, 1.0],
-            key: [0.0, 0.0, 1.0],
-            subsurface: 1.0,
-        };
-        let turned = normalize([0.0, 0.866, -0.5]).unwrap();
-        let unlit = shade(turned, &Lights { subsurface: 0.0, ..lights });
-        assert!(shade(turned, &lights) > unlit);
+        let brighter = (0..100 * 100)
+            .filter(|i| frame.rgba[i * 4] > plain.rgba[i * 4])
+            .count();
+        assert!(
+            darker > 0 && brighter == 0,
+            "{darker} darker, {brighter} brighter"
+        );
     }
 
     #[test]
@@ -1162,7 +1239,13 @@ mod tests {
         let inside = frame.picks_in([20.0, 20.0], [80.0, 80.0], false);
         assert_eq!(
             inside,
-            vec![Pick::Face(0), Pick::Edge(0), Pick::Edge(1), Pick::Edge(2), Pick::Edge(3)]
+            vec![
+                Pick::Face(0),
+                Pick::Edge(0),
+                Pick::Edge(1),
+                Pick::Edge(2),
+                Pick::Edge(3)
+            ]
         );
         // Crossing: the big face behind is touched too.
         let crossing = frame.picks_in([20.0, 20.0], [80.0, 80.0], true);
@@ -1173,7 +1256,10 @@ mod tests {
         let half = frame.picks_in([10.0, 10.0], [40.0, 90.0], true);
         assert!(half.contains(&Pick::Face(0)) && !half.contains(&Pick::Edge(1)));
         // Nothing in an empty corner... of face 1, which covers it.
-        assert_eq!(frame.picks_in([0.0, 0.0], [3.0, 3.0], true), vec![Pick::Face(1)]);
+        assert_eq!(
+            frame.picks_in([0.0, 0.0], [3.0, 3.0], true),
+            vec![Pick::Face(1)]
+        );
     }
 
     #[test]

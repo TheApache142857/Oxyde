@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use oxyde_assembly::Placement;
 use oxyde_kernel::{StepAssembly, StepNodeContent};
-use oxyde_model::{FeatureKind, FileData, Import, Part};
+use oxyde_model::{FeatureKind, FileData, Import, Material, Part};
 
 use crate::{
     ASSEMBLY_EXTENSION, AssemblyFile, FormatError, PART_EXTENSION, PartFile, save_assembly,
@@ -162,15 +162,24 @@ pub fn plan_step_import(tree: &StepAssembly, source: &str) -> Result<ImportPlan,
         let n = &tree.nodes[node];
         let stem = &stems[node];
         let (file_name, document) = match &n.content {
-            StepNodeContent::Part { step } => {
+            StepNodeContent::Part { step, material } => {
                 let mut part = Part::new();
                 part.add_feature(FeatureKind::Import(Import::new(
                     source,
                     FileData::new(step.clone()),
                 )));
+                // What the file says the part is made of, with the density it gives, so
+                // the assembly weighs right from the start.
+                let material = material
+                    .as_ref()
+                    .and_then(|m| Material::from_step(&m.name, m.density));
+                part.set_material(material);
                 let mut file = PartFile::new();
                 file.definition = part.definition();
                 file.properties.part_number = n.name.trim().to_owned();
+                if let Some(m) = part.material() {
+                    file.properties.material = m.name.clone();
+                }
                 (
                     format!("{stem}.{PART_EXTENSION}"),
                     ImportedDocument::Part(file),
@@ -241,7 +250,7 @@ fn visit(
     }
     state[node] = Visit::InProgress;
     let solid = match &tree.nodes[node].content {
-        StepNodeContent::Part { step } => !step.is_empty(),
+        StepNodeContent::Part { step, .. } => !step.is_empty(),
         StepNodeContent::Assembly { instances } => {
             let mut any = false;
             for instance in instances {
@@ -325,6 +334,7 @@ mod tests {
             name: name.to_owned(),
             content: StepNodeContent::Part {
                 step: format!("ISO-10303-21; {name}").into_bytes(),
+                material: None,
             },
         }
     }
@@ -468,7 +478,10 @@ mod tests {
         let mut tree = gearbox();
         // The sub-assembly's parts have no solid: it disappears.
         for node in [4, 5] {
-            tree.nodes[node].content = StepNodeContent::Part { step: Vec::new() };
+            tree.nodes[node].content = StepNodeContent::Part {
+                step: Vec::new(),
+                material: None,
+            };
         }
         let plan = plan_step_import(&tree, "g.step").unwrap();
         assert_eq!(plan.files.len(), 3);

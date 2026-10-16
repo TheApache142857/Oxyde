@@ -99,11 +99,13 @@ pub struct Graphics {
     pub floor_reflections: bool,
     /// How strong the reflection is, 0..1.
     pub reflection_strength: f32,
-    /// Subsurface scattering (View › Subsurface scattering): soft, translucent-looking
-    /// shading, as of wax, resin or printed plastic.
-    pub subsurface_scattering: bool,
+    /// Ambient occlusion (View › Ambient occlusion): creases and inner corners darkened,
+    /// so the shape reads better.
+    #[serde(alias = "subsurface_scattering")]
+    pub ambient_occlusion: bool,
     /// How strong it is, 0..1.
-    pub subsurface_strength: f32,
+    #[serde(alias = "subsurface_strength")]
+    pub ambient_occlusion_strength: f32,
 }
 
 impl Default for Graphics {
@@ -127,8 +129,8 @@ impl Default for Graphics {
             show_triad: true,
             floor_reflections: true,
             reflection_strength: 0.35,
-            subsurface_scattering: false,
-            subsurface_strength: 0.6,
+            ambient_occlusion: true,
+            ambient_occlusion_strength: 0.6,
         };
         g.set_style(&g.ui_theme.viewport());
         g
@@ -154,8 +156,8 @@ impl Graphics {
             } else {
                 0.0
             },
-            subsurface: if self.subsurface_scattering {
-                self.subsurface_strength.clamp(0.0, 1.0)
+            ambient_occlusion: if self.ambient_occlusion {
+                self.ambient_occlusion_strength.clamp(0.0, 1.0)
             } else {
                 0.0
             },
@@ -206,20 +208,32 @@ impl MouseScheme {
             MouseScheme::RightTurns => [
                 ("Orbit", "right-drag, about the point under the pointer"),
                 ("Pan", "middle-drag, or Shift+right-drag"),
-                ("Select", "click; Ctrl+click or Shift+click adds; drag a box (left to right: inside it, right to left: touching it)"),
+                (
+                    "Select",
+                    "click; Ctrl+click or Shift+click adds; drag a box (left to right: inside it, right to left: touching it)",
+                ),
                 ("Sketch mode", "right-drag orbits, middle-drag pans"),
             ],
             MouseScheme::MiddleTurns => [
                 ("Orbit", "middle-drag, about the point under the pointer"),
                 ("Pan", "Ctrl+middle-drag, or right-drag"),
-                ("Select", "click; Ctrl+click or Shift+click adds; drag a box (left to right: inside it, right to left: touching it)"),
-                ("Sketch mode", "Ctrl+middle-drag orbits, middle-drag or right-drag pans"),
+                (
+                    "Select",
+                    "click; Ctrl+click or Shift+click adds; drag a box (left to right: inside it, right to left: touching it)",
+                ),
+                (
+                    "Sketch mode",
+                    "Ctrl+middle-drag orbits, middle-drag or right-drag pans",
+                ),
             ],
             MouseScheme::LeftTurns => [
                 ("Orbit", "left-drag, about the point under the pointer"),
                 ("Pan", "right-drag, middle-drag, or Shift+left-drag"),
                 ("Select", "click; Ctrl+click or Shift+click adds"),
-                ("Sketch mode", "right-drag or middle-drag pans, Ctrl+middle-drag orbits"),
+                (
+                    "Sketch mode",
+                    "right-drag or middle-drag pans, Ctrl+middle-drag orbits",
+                ),
             ],
         }
     }
@@ -238,6 +252,10 @@ pub struct Navigation {
     /// Orbit about the point under the pointer where the drag started, rather than the
     /// centre of the view.
     pub orbit_about_pointer: bool,
+    /// Keep the model's Y axis up the screen while orbiting, as SolidWorks does (View ›
+    /// Constrained orbit). Off, the view turns freely about the screen's axes and can be
+    /// tilted, as Fusion 360's free orbit.
+    pub constrained_orbit: bool,
     /// Standard views and Normal To turn the camera smoothly.
     pub animate_views: bool,
     /// Seconds.
@@ -252,6 +270,7 @@ impl Default for Navigation {
             zoom_speed: 1.0,
             invert_zoom: false,
             orbit_about_pointer: true,
+            constrained_orbit: true,
             animate_views: true,
             animation_time: 0.45,
         }

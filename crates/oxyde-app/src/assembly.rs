@@ -16,8 +16,10 @@ use oxyde_assembly::{
 use oxyde_format::{AssemblyFile, Properties};
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{Kernel, Mesh};
-use oxyde_model::{EdgeName, FaceName, Part};
+use oxyde_model::{Appearance, EdgeName, FaceName, Part};
 use oxyde_render::Pick;
+
+use crate::jobs::Progress;
 
 const UNDO_LIMIT: usize = 200;
 
@@ -141,6 +143,9 @@ pub struct AssemblyDoc {
     pub last_solve: Option<f64>,
     /// Volume of each part file (mm³), computed when Mass Properties first asks.
     pub volumes: HashMap<PathBuf, Option<f64>>,
+    /// When each file in `docs` was last changed on disk as it was read, to read again
+    /// only what changed ([`AssemblyDoc::reload_changed_with`]).
+    stamps: HashMap<PathBuf, Option<std::time::SystemTime>>,
     undo: Vec<Assembly>,
     redo: Vec<Assembly>,
 }
@@ -171,6 +176,7 @@ impl AssemblyDoc {
             mesh_fraction: 0.001,
             last_solve: None,
             volumes: HashMap::new(),
+            stamps: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -206,8 +212,17 @@ impl AssemblyDoc {
     /// are rebuilt and meshed on every core at once when the kernel allows it. Returns
     /// messages about files found elsewhere or that could not be opened.
     pub fn load_parts<K: Kernel>(&mut self, kernel: &mut K) -> Vec<String> {
+        self.load_parts_with(kernel, None)
+    }
+
+    /// [`AssemblyDoc::load_parts`], telling `progress` how far it got.
+    pub fn load_parts_with<K: Kernel>(
+        &mut self,
+        kernel: &mut K,
+        progress: Option<&Progress>,
+    ) -> Vec<String> {
         let folder = self.folder();
-        let mut walk = Walk::new(&mut self.docs, self.path.as_deref());
+        let mut walk = Walk::new(&mut self.docs, &mut self.stamps, self.path.as_deref());
         for i in 0..self.assembly.components.len() {
             let component = &self.assembly.components[i];
             let (path, moved) = locate(component, folder.as_deref());
@@ -225,15 +240,46 @@ impl AssemblyDoc {
             walk.visit(&path, &component.name);
             self.sources.insert(component.id, path);
         }
-        let notes = walk.finish(kernel, self.mesh_fraction);
+        let notes = walk.finish(kernel, self.mesh_fraction, progress);
         self.revision = crate::document::next_revision();
         notes
     }
 
     /// Reads every file again: after a part or sub-assembly was edited and saved.
-    pub fn reload_parts<K: Kernel>(&mut self, kernel: &mut K) -> Vec<String> {
+    pub fn reload_parts_with<K: Kernel>(
+        &mut self,
+        kernel: &mut K,
+        progress: Option<&Progress>,
+    ) -> Vec<String> {
         self.release(kernel);
-        self.load_parts(kernel)
+        self.load_parts_with(kernel, progress)
+    }
+
+    /// Reads again only the files that changed on disk since they were read (and the
+    /// ones that could not be opened), keeping the rest as loaded: coming back from a
+    /// component edited in place, where one file changed out of hundreds.
+    pub fn reload_changed_with<K: Kernel>(
+        &mut self,
+        kernel: &mut K,
+        progress: Option<&Progress>,
+    ) -> Vec<String> {
+        let stale: Vec<PathBuf> = self
+            .docs
+            .iter()
+            .filter(|(path, loaded)| {
+                loaded.is_err() || self.stamps.get(*path).copied().flatten() != modified(path)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in &stale {
+            if let Some(Ok(Loaded::Part(mut part))) = self.docs.remove(path) {
+                part.part.release(kernel);
+            }
+            self.stamps.remove(path);
+            self.volumes.remove(path);
+        }
+        self.sources.clear();
+        self.load_parts_with(kernel, progress)
     }
 
     pub fn release<K: Kernel>(&mut self, kernel: &mut K) {
@@ -243,7 +289,36 @@ impl AssemblyDoc {
             }
         }
         self.sources.clear();
+        self.stamps.clear();
         self.volumes.clear();
+    }
+
+    /// The appearance an occurrence is drawn with before the part's own: the outermost
+    /// component on the way to it that has one (a top-level component's wins over a
+    /// sub-assembly's, as in SolidWorks).
+    pub fn occurrence_appearance<'a>(
+        &'a self,
+        assembly: &'a Assembly,
+        o: &Occurrence,
+    ) -> Option<&'a Appearance> {
+        if let Some(a) = assembly
+            .component(o.top)
+            .and_then(|c| c.appearance.as_ref())
+        {
+            return Some(a);
+        }
+        let mut loaded = self.loaded(o.top)?;
+        for id in &o.path {
+            let Loaded::Assembly(sub) = loaded else {
+                return None;
+            };
+            let c = sub.assembly.component(*id)?;
+            if let Some(a) = &c.appearance {
+                return Some(a);
+            }
+            loaded = self.docs.get(sub.sources.get(id)?)?.as_ref().ok()?;
+        }
+        None
     }
 
     /// The loaded file of a top-level component.
@@ -304,6 +379,28 @@ impl AssemblyDoc {
         out
     }
 
+    /// The part files under a component file: the file itself for a part, every part
+    /// file a sub-assembly uses (each once).
+    pub fn part_paths_at(&self, path: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        self.collect_part_paths(path, 0, &mut out);
+        out
+    }
+
+    /// The faces of every part occurrence under a component inside a sub-assembly (`path`
+    /// from the top-level component `top`), to light it up.
+    pub fn picks_under(&self, top: ComponentId, path: &[ComponentId]) -> Vec<Pick> {
+        let mut out = Vec::new();
+        for r in self
+            .ranges
+            .iter()
+            .filter(|r| r.owner.top == top && r.owner.path.starts_with(path))
+        {
+            out.extend(r.faces.clone().map(Pick::Face));
+        }
+        out
+    }
+
     fn collect_part_paths(&self, path: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth > MAX_DEPTH {
             return;
@@ -323,10 +420,53 @@ impl AssemblyDoc {
         }
     }
 
+    /// The component inside a sub-assembly that an occurrence stands for (the last of its
+    /// path), with the file of the sub-assembly holding it. `None` for a top-level part.
+    pub fn inner_component(&self, o: &Occurrence) -> Option<(PathBuf, &Component)> {
+        let (last, before) = o.path.split_last()?;
+        let mut path = self.sources.get(&o.top)?.clone();
+        for id in before {
+            let Some(Ok(Loaded::Assembly(sub))) = self.docs.get(&path) else {
+                return None;
+            };
+            path = sub.sources.get(id)?.clone();
+        }
+        let Some(Ok(Loaded::Assembly(sub))) = self.docs.get(&path) else {
+            return None;
+        };
+        Some((path, sub.assembly.component(*last)?))
+    }
+
+    /// Puts an appearance on a component inside a sub-assembly (in memory: the file is
+    /// written by the caller). Returns the sub-assembly file's path.
+    pub fn set_inner_appearance(
+        &mut self,
+        o: &Occurrence,
+        appearance: Option<Appearance>,
+    ) -> Option<PathBuf> {
+        let (path, _) = self.inner_component(o)?;
+        let last = *o.path.last()?;
+        let Some(Ok(Loaded::Assembly(sub))) = self.docs.get_mut(&path) else {
+            return None;
+        };
+        sub.assembly.component_mut(last)?.appearance = appearance.map(Appearance::clamped);
+        self.revision = crate::document::next_revision();
+        Some(path)
+    }
+
     /// The material of the part a component is (its name), when it is a part with one.
     pub fn component_material(&self, component: ComponentId) -> Option<&str> {
+        self.component_material_details(component)
+            .map(|m| m.name.as_str())
+    }
+
+    /// The material of the part a component is, when it is a part with one.
+    pub fn component_material_details(
+        &self,
+        component: ComponentId,
+    ) -> Option<&oxyde_model::Material> {
         match self.loaded(component)? {
-            Loaded::Part(p) => p.part.material().map(|m| m.name.as_str()),
+            Loaded::Part(p) => p.part.material(),
             Loaded::Assembly(_) => None,
         }
     }
@@ -680,9 +820,9 @@ impl AssemblyDoc {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut walk = Walk::new(&mut self.docs, self.path.as_deref());
+        let mut walk = Walk::new(&mut self.docs, &mut self.stamps, self.path.as_deref());
         walk.visit(path, &name);
-        walk.finish(kernel, self.mesh_fraction);
+        walk.finish(kernel, self.mesh_fraction, None);
         match self.docs.get(path) {
             Some(Ok(_)) => Ok(()),
             Some(Err(e)) => {
@@ -783,8 +923,14 @@ fn locate(component: &Component, folder: Option<&Path>) -> (PathBuf, Option<Path
 /// The walk over an assembly's files. Assembly files are read as they are met, so that
 /// the whole tree is known; the part files met are only listed, to be loaded together
 /// afterwards ([`load_many`]).
+/// When a file was last changed, as the file system tells it.
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 struct Walk<'a> {
     docs: &'a mut HashMap<PathBuf, Result<Loaded, String>>,
+    stamps: &'a mut HashMap<PathBuf, Option<std::time::SystemTime>>,
     /// The assemblies being read, to catch one that contains itself.
     stack: Vec<PathBuf>,
     /// The part files to load, each once, with the name of the component that first used it.
@@ -797,10 +943,12 @@ impl<'a> Walk<'a> {
     /// A walk from `assembly`, the file being edited: no component may contain it.
     fn new(
         docs: &'a mut HashMap<PathBuf, Result<Loaded, String>>,
+        stamps: &'a mut HashMap<PathBuf, Option<std::time::SystemTime>>,
         assembly: Option<&Path>,
     ) -> Self {
         Walk {
             docs,
+            stamps,
             stack: assembly.map(Path::to_path_buf).into_iter().collect(),
             parts: Vec::new(),
             listed: HashSet::new(),
@@ -810,14 +958,24 @@ impl<'a> Walk<'a> {
 
     /// Loads the part files met, on every core the kernel allows, and stores them. Returns
     /// the notes of the walk: files found elsewhere or that could not be opened.
-    fn finish<K: Kernel>(self, kernel: &mut K, fraction: f64) -> Vec<String> {
+    fn finish<K: Kernel>(
+        self,
+        kernel: &mut K,
+        fraction: f64,
+        progress: Option<&Progress>,
+    ) -> Vec<String> {
         let Walk {
             docs,
+            stamps,
             parts,
             mut notes,
             ..
         } = self;
-        let loaded = load_many(&parts, kernel, fraction);
+        // Stamped before reading, so a file changed while it was read counts as changed.
+        for (path, _) in &parts {
+            stamps.insert(path.clone(), modified(path));
+        }
+        let loaded = load_many(&parts, kernel, fraction, progress);
         for ((path, name), result) in parts.into_iter().zip(loaded) {
             if let Err(e) = &result {
                 notes.push(format!("{name}: {e}"));
@@ -850,6 +1008,7 @@ impl<'a> Walk<'a> {
             self.listed.insert(path.to_path_buf());
             return;
         }
+        self.stamps.insert(path.to_path_buf(), modified(path));
         let loaded = match oxyde_format::load_assembly(path) {
             Ok(file) => {
                 let folder = path.parent().map(Path::to_path_buf);
@@ -902,6 +1061,7 @@ fn load_many<K: Kernel>(
     parts: &[(PathBuf, String)],
     kernel: &mut K,
     fraction: f64,
+    progress: Option<&Progress>,
 ) -> Vec<Result<LoadedPart, String>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -909,6 +1069,9 @@ fn load_many<K: Kernel>(
         .map_or(1, |n| n.get())
         .min(parts.len());
     let next = AtomicUsize::new(0);
+    if let Some(p) = progress {
+        p.start(parts.len());
+    }
     // Takes files from the queue until it is empty.
     let work = |kernel: &mut K| {
         let mut done = Vec::new();
@@ -917,7 +1080,17 @@ fn load_many<K: Kernel>(
             let Some((path, _)) = parts.get(i) else {
                 break;
             };
+            if let Some(p) = progress {
+                p.say(format!(
+                    "Reading {}",
+                    path.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                ));
+            }
             done.push((i, load(path, kernel, fraction)));
+            if let Some(p) = progress {
+                p.step();
+            }
         }
         done
     };

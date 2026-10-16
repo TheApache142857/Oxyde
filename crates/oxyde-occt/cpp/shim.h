@@ -26,6 +26,7 @@ struct PlaneData;
 struct RegionData;
 struct StepAssemblyData;
 struct StepImportData;
+struct StepMaterialData;
 struct StepShapeColors;
 struct TopologyCounts;
 struct TopologyData;
@@ -56,7 +57,8 @@ public:
     TopologyCounts topology_counts(std::uint64_t shape) const;
 
     void export_step(rust::Slice<const std::uint64_t> shapes,
-                     rust::Slice<const StepShapeColors> colors, rust::Str path) const;
+                     rust::Slice<const StepShapeColors> colors,
+                     rust::Slice<const StepMaterialData> materials, rust::Str path) const;
     StepImportData import_step(rust::Slice<const std::uint8_t> data);
     StepAssemblyData read_step_assembly(rust::Slice<const std::uint8_t> data);
 

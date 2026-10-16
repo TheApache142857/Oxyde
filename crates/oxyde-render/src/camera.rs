@@ -1,6 +1,6 @@
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
-use crate::vec3::{V3, add, dot, length, scale, sub};
+use crate::vec3::{V3, add, cross, dot, length, scale, sub};
 
 /// Named orientations, as in SolidWorks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,12 @@ pub enum StandardView {
 ///
 /// The viewer sits in direction [`Camera::eye_direction`] from `target`, which is the point
 /// at the centre of the view. `height` is how many millimetres the view spans vertically.
+///
+/// The orientation is three angles: `yaw` and `pitch` place the viewer, and `roll` turns
+/// the view about the line of sight. With `roll` at 0 the model's Y axis points up the
+/// screen (a *constrained* orbit, as SolidWorks keeps it); a *free* orbit
+/// ([`Camera::orbit_free_about`]) turns about the screen's own axes and so can tilt the
+/// model any way, which `roll` records.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
     pub target: V3,
@@ -25,6 +31,8 @@ pub struct Camera {
     pub yaw: f64,
     /// Elevation, radians, from −π/2 (from below) to π/2 (from above).
     pub pitch: f64,
+    /// Rotation about the line of sight, radians; 0 keeps Y up the screen.
+    pub roll: f64,
     pub height: f64,
 }
 
@@ -34,6 +42,7 @@ impl Default for Camera {
             target: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
+            roll: 0.0,
             height: 100.0,
         };
         camera.set_view(StandardView::Isometric);
@@ -54,6 +63,7 @@ impl Camera {
         };
         self.yaw = yaw;
         self.pitch = pitch;
+        self.roll = 0.0;
     }
 
     /// Turns the camera to look against `normal` (the viewer ends up on the side `normal`
@@ -66,6 +76,17 @@ impl Camera {
         let n = scale(normal, 1.0 / len);
         self.pitch = n[1].clamp(-1.0, 1.0).asin();
         self.yaw = n[0].atan2(n[2]);
+        self.roll = 0.0;
+    }
+
+    /// Puts the model's Y axis back up the screen, undoing any tilt of a free orbit.
+    pub fn level(&mut self) {
+        self.roll = 0.0;
+    }
+
+    /// Whether the view is tilted (not level): a free orbit has rolled it.
+    pub fn is_tilted(&self) -> bool {
+        self.roll.abs() > 1e-9
     }
 
     /// The viewing ray through pixel (`x`, `y`): a point on it and its direction (away from
@@ -89,15 +110,39 @@ impl Camera {
         [cp * sy, sp, cp * cy]
     }
 
-    /// Unit vector pointing to the right of the screen.
-    pub fn right(&self) -> V3 {
+    /// The right direction of the level view (roll 0): horizontal in the model.
+    fn level_right(&self) -> V3 {
         let (sy, cy) = self.yaw.sin_cos();
         [cy, 0.0, -sy]
     }
 
+    /// Unit vector pointing to the right of the screen.
+    pub fn right(&self) -> V3 {
+        let right = self.level_right();
+        if self.roll == 0.0 {
+            return right;
+        }
+        let up = cross(self.eye_direction(), right);
+        let (s, c) = self.roll.sin_cos();
+        add(scale(right, c), scale(up, s))
+    }
+
     /// Unit vector pointing to the top of the screen.
     pub fn up(&self) -> V3 {
-        crate::vec3::cross(self.eye_direction(), self.right())
+        cross(self.eye_direction(), self.right())
+    }
+
+    /// Sets the three angles from an eye direction and a right direction (unit, at a
+    /// right angle to it).
+    fn set_basis(&mut self, eye: V3, right: V3) {
+        self.pitch = eye[1].clamp(-1.0, 1.0).asin();
+        self.yaw = eye[0].atan2(eye[2]);
+        let level_right = self.level_right();
+        let level_up = cross(eye, level_right);
+        self.roll = dot(right, level_up).atan2(dot(right, level_right));
+        if self.roll.abs() < 1e-12 {
+            self.roll = 0.0;
+        }
     }
 
     /// Direction towards the key light: above and to the left of the viewer, so that the
@@ -148,6 +193,28 @@ impl Camera {
         self.target = sub(pivot, add(scale(self.right(), sx), scale(self.up(), sy)));
     }
 
+    /// A free orbit: turns the view about the screen's own vertical and horizontal
+    /// axes (as Fusion 360 with the constrained orbit off, or a trackball), so the model
+    /// can be tilted any way. `pivot` stays where it is on screen.
+    pub fn orbit_free_about(&mut self, dx: f64, dy: f64, pivot: V3) {
+        const RADIANS_PER_PIXEL: f64 = 0.008;
+        let v = sub(pivot, self.target);
+        let (sx, sy) = (dot(v, self.right()), dot(v, self.up()));
+        let (right, up, eye) = (self.right(), self.up(), self.eye_direction());
+        // Dragging right turns the model to the right (the viewer goes the other way);
+        // dragging down brings the viewer up over the model, as in the constrained orbit.
+        // Turning the eye about `right` by a positive angle takes it towards -up (right ×
+        // eye = -up), so a downward drag (dy > 0) needs the negative angle.
+        let eye = rotate(eye, up, -dx * RADIANS_PER_PIXEL);
+        let eye = rotate(eye, right, -dy * RADIANS_PER_PIXEL);
+        let right = rotate(right, up, -dx * RADIANS_PER_PIXEL);
+        let eye = unit(eye);
+        // Keep the basis orthonormal whatever rounding did.
+        let right = unit(sub(right, scale(eye, dot(right, eye))));
+        self.set_basis(eye, right);
+        self.target = sub(pivot, add(scale(self.right(), sx), scale(self.up(), sy)));
+    }
+
     /// Moves the view so the model follows a drag of `dx`, `dy` pixels.
     pub fn pan(&mut self, dx: f64, dy: f64, viewport_height: f64) {
         let s = self.pixels_per_mm(viewport_height);
@@ -183,6 +250,20 @@ impl Camera {
         };
         self.height = diagonal * 1.15 * aspect;
     }
+}
+
+/// `v` turned by `angle` radians about the unit axis `axis` (Rodrigues).
+fn rotate(v: V3, axis: V3, angle: f64) -> V3 {
+    let (s, c) = angle.sin_cos();
+    add(
+        add(scale(v, c), scale(cross(axis, v), s)),
+        scale(axis, dot(axis, v) * (1.0 - c)),
+    )
+}
+
+fn unit(v: V3) -> V3 {
+    let len = length(v);
+    if len < 1e-12 { v } else { scale(v, 1.0 / len) }
 }
 
 #[cfg(test)]
@@ -259,6 +340,54 @@ mod tests {
         assert!((after[0] - before[0]).abs() < 1e-9 && (after[1] - before[1]).abs() < 1e-9);
         // And the view did turn.
         assert!((camera.yaw - FRAC_PI_4).abs() > 0.1);
+    }
+
+    #[test]
+    fn free_orbit_tilts_the_view_and_level_undoes_it() {
+        let mut camera = Camera::default();
+        camera.set_view(StandardView::Front);
+        let (w, h) = (300.0, 200.0);
+        let pivot = [12.0, -7.0, 30.0];
+        let before = camera.project(pivot, w, h);
+        // Turning about the screen's vertical from the front is a plain yaw: still level.
+        camera.orbit_free_about(50.0, 0.0, pivot);
+        assert!(!camera.is_tilted());
+        assert!(close(camera.up(), [0.0, 1.0, 0.0]));
+        let after = camera.project(pivot, w, h);
+        assert!((after[0] - before[0]).abs() < 1e-9 && (after[1] - before[1]).abs() < 1e-9);
+        // Dragging down lifts the viewer over the model, exactly as the constrained orbit
+        // does from the same view (the free orbit must not feel upside down).
+        let mut constrained = Camera::default();
+        constrained.set_view(StandardView::Front);
+        constrained.orbit_about(50.0, 60.0, pivot);
+        camera.orbit_free_about(0.0, 60.0, pivot);
+        assert!(camera.eye_direction()[1] > 0.1);
+        assert!(close(camera.eye_direction(), constrained.eye_direction()));
+        // Then about the vertical again: the model's Y is no longer up the screen, which
+        // a constrained orbit can never do.
+        camera.orbit_free_about(70.0, 0.0, pivot);
+        assert!(camera.is_tilted());
+        assert!(!close(camera.up(), [0.0, 1.0, 0.0]));
+        // The basis stays orthonormal.
+        let (r, u, e) = (camera.right(), camera.up(), camera.eye_direction());
+        assert!(dot(r, u).abs() < 1e-9 && dot(r, e).abs() < 1e-9 && dot(u, e).abs() < 1e-9);
+        assert!((length(r) - 1.0).abs() < 1e-9 && (length(u) - 1.0).abs() < 1e-9);
+        // Levelling keeps the viewer where it is and puts Y back up.
+        let eye = camera.eye_direction();
+        camera.level();
+        assert!(close(camera.eye_direction(), eye));
+        assert!(camera.up()[1] > 0.0 && camera.right()[1].abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rolled_view_round_trips_through_its_basis() {
+        let mut camera = Camera::default();
+        camera.roll = 0.7;
+        let (eye, right) = (camera.eye_direction(), camera.right());
+        let mut other = Camera::default();
+        other.set_basis(eye, right);
+        assert!((other.roll - 0.7).abs() < 1e-9);
+        assert!(close(other.right(), right) && close(other.eye_direction(), eye));
     }
 
     #[test]

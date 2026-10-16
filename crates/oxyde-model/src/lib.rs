@@ -42,7 +42,7 @@ pub use feature::{
     Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
     SketchPlane, StandardAxis, StandardPlane,
 };
-pub use material::{Material, MaterialLibrary};
+pub use material::{Material, MaterialLibrary, MaterialSource};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
     FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,

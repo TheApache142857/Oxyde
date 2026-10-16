@@ -1,6 +1,6 @@
 # Building Oxyde
 
-**Main platform: Windows 10/11, x64, MSVC toolchain.** Linux builds too, with the OpenCASCADE 7.8 of Debian and Ubuntu (see [Linux](#linux)). The build script also accepts macOS, untested so far; on any other target it stops with an explicit error.
+**Main platform: Windows 10/11, x64, MSVC toolchain.** Linux builds too, with the OpenCASCADE 7.8 of Debian and Ubuntu (see [Linux](#linux)), and macOS on Apple Silicon with Homebrew's OpenCASCADE (see [macOS](#macos-apple-silicon)). On any other target the build script stops with an explicit error. Executables for Windows and macOS are built by the [release workflow](#5-release-builds-github-actions).
 
 ## 1. Prerequisites
 
@@ -93,6 +93,18 @@ cargo run --release -p oxyde-app
 
 Without root, the same packages in a `debian:trixie` container work too, with the host's Rust toolchain mounted. Tests run as on Windows. On a small machine such as a Raspberry Pi, test in `--release` and a few packages at a time (`cargo test --release -p oxyde-tests`): a debug build of the whole workspace takes gigabytes of disk. `cargo run -p oxyde-tests --example step_to_oxyde -- file.step out/` converts a STEP assembly into Oxyde files from the command line.
 
+## macOS (Apple Silicon)
+
+Homebrew's OpenCASCADE (7.9 at the time of writing) is found in `/opt/homebrew/opt/opencascade` on its own:
+
+```sh
+xcode-select --install          # the C++ compiler, if not there yet
+brew install opencascade
+cargo run --release -p oxyde-app
+```
+
+Tests run as on Windows (`cargo test --workspace`). Another OpenCASCADE: set `OXYDE_OCCT_DIR` to its install prefix (the folder holding `include/opencascade` and `lib`). The dylibs are found through their install names, so nothing needs to be on a path. Only Apple Silicon (arm64) is built and tested; an Intel Mac needs Homebrew's x86_64 OpenCASCADE and has not been tried.
+
 ## 3. Bundling for Windows
 
 ```powershell
@@ -107,7 +119,31 @@ builds the release and writes:
 
 The script checks the bundle by running `Oxyde.exe --version`, which loads OpenCASCADE: a missing DLL fails the bundle rather than the user. The version comes from the workspace `Cargo.toml`. The icon is drawn by `packaging/make_icon.py` (Pillow); its outputs are committed.
 
-## 4. Troubleshooting
+## 4. Bundling for macOS
+
+```sh
+bash packaging/bundle-macos.sh
+```
+
+builds the release and writes:
+
+- `dist/Oxyde.app`: the executable with the OpenCASCADE dylibs it needs (followed with `otool -L`, copied into `Contents/Frameworks` and re-pointed through `@rpath`, so the app runs on a Mac without Homebrew), the icon (an `.icns` made from `packaging/oxyde.png` with `sips` and `iconutil`), the licences, and `.oxyprt` / `.oxyasm` declared as its document types (`packaging/Info.plist`);
+- `dist/Oxyde-<version>-macos-arm64.dmg`: the app with an *Applications* shortcut, to drag across;
+- `dist/Oxyde-<version>-macos-arm64.zip`: the same app zipped.
+
+The app is signed **ad hoc** (Apple Silicon runs no unsigned code) unless `OXYDE_SIGN_IDENTITY` names a Developer ID certificate. Ad hoc signed apps are not notarised, so on another Mac the first launch is refused with *"cannot be opened because the developer cannot be verified"*: open it with right-click › *Open*, or run `xattr -dr com.apple.quarantine /Applications/Oxyde.app`. Notarisation (a paid Apple developer account, `notarytool`) is the next step for a wider release. Opening a file by double-clicking it in the Finder is not wired yet (the app takes the file on its command line); drag it onto the window or use File › Open.
+
+## 5. Release builds (GitHub Actions)
+
+`.github/workflows/release.yml` builds both executables on GitHub's runners, running the tests first:
+
+- **Windows x64** (`windows-latest`): OpenCASCADE is built by the runner's vcpkg and cached between runs (an hour or so the first time, seconds afterwards; bump `OCCT_CACHE` in the workflow to rebuild it), then `packaging\bundle.ps1` makes the zip and the Inno Setup installer.
+- **macOS Apple Silicon** (`macos-latest`): `brew install opencascade`, then `packaging/bundle-macos.sh` makes the `.dmg` and the zip.
+
+Pushing a tag `v<version>` (e.g. `git tag v0.0.4 && git push origin v0.0.4`) builds both and attaches them to a **draft** GitHub release of that tag, to write the notes before publishing. *Run workflow* on the Actions page builds both without a release and keeps them as workflow artifacts, to try a build. The version in the file names comes from the workspace `Cargo.toml`; keep it and the tag in step.
+
+## 6. Troubleshooting
+
 
 | Symptom | Cause / fix |
 |---|---|

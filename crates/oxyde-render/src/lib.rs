@@ -21,5 +21,8 @@ mod vec3;
 
 pub use camera::{Camera, StandardView};
 pub use material::{Material, Texture, TextureRef};
-pub use raster::{Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render, render_styled};
+pub use raster::{
+    AO_RADIUS, AO_REACH, Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render,
+    render_styled,
+};
 pub use style::{Rgb, Style};

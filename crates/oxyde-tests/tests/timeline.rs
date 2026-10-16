@@ -112,7 +112,7 @@ fn fillet_stays_on_its_edge_through_upstream_edits() {
     // The result exports cleanly.
     let path = std::env::temp_dir().join(format!("oxyde-fillet-{}.step", std::process::id()));
     kernel
-        .export_step(&[part.body().unwrap().solids[0].shape], &[], &path)
+        .export_step(&[part.body().unwrap().solids[0].shape], &[], &[], &path)
         .unwrap();
     let _ = std::fs::remove_file(&path);
 

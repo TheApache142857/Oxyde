@@ -144,7 +144,7 @@ fn a_plain_part_file_imports_as_one_part() {
         )
         .unwrap();
     let path = std::env::temp_dir().join(format!("oxyde-cube-{}.step", std::process::id()));
-    kernel.export_step(&[shape], &[], &path).unwrap();
+    kernel.export_step(&[shape], &[], &[], &path).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
 

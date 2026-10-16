@@ -11,7 +11,7 @@ use std::path::Path;
 use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
-    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
+    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepMaterial, StepInstance,
     StepNode, StepNodeContent, SurfaceKind,
     Topology, TopologyCounts, VertexInfo,
 };
@@ -227,6 +227,7 @@ impl Kernel for OcctKernel {
         &self,
         shapes: &[ShapeHandle],
         colors: &[StepColors],
+        materials: &[Option<StepMaterial>],
         path: &Path,
     ) -> Result<(), OcctError> {
         let path = path
@@ -239,9 +240,18 @@ impl Kernel for OcctKernel {
                 shapes.len()
             )));
         }
+        if !materials.is_empty() && materials.len() != shapes.len() {
+            return Err(OcctError(format!(
+                "{} materials for {} shapes",
+                materials.len(),
+                shapes.len()
+            )));
+        }
         let ids: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
         let colors: Vec<ffi::StepShapeColors> = colors.iter().map(shape_colors_data).collect();
-        self.session.export_step(&ids, &colors, path)?;
+        let materials: Vec<ffi::StepMaterialData> =
+            materials.iter().map(|m| material_data(m.as_ref())).collect();
+        self.session.export_step(&ids, &colors, &materials, path)?;
         Ok(())
     }
 
@@ -250,6 +260,7 @@ impl Kernel for OcctKernel {
         Ok(StepImport {
             shape: ShapeHandle::from_raw(imported.shape),
             colors: shape_colors(imported.colors),
+            material: material_from(imported.material),
         })
     }
 
@@ -293,6 +304,61 @@ fn color_from(data: &ffi::StepColorData) -> Option<StepColor> {
         rgb: [data.r, data.g, data.b],
         transparency: data.transparency.clamp(0.0, 1.0),
     })
+}
+
+fn material_data(material: Option<&StepMaterial>) -> ffi::StepMaterialData {
+    match material {
+        Some(m) => ffi::StepMaterialData {
+            present: true,
+            name: m.name.clone(),
+            description: m.description.clone(),
+            density: if m.density.is_finite() && m.density > 0.0 {
+                m.density
+            } else {
+                0.0
+            },
+        },
+        None => ffi::StepMaterialData {
+            present: false,
+            name: String::new(),
+            description: String::new(),
+            density: 0.0,
+        },
+    }
+}
+
+/// The material the reader found, its density settled in kg/m³.
+///
+/// A STEP file carries the density with its unit (Fusion 360 and SolidWorks write
+/// kilograms per cubic metre) and OpenCASCADE's reader converts it to its own grams per
+/// cubic millimetre: steel's 7850 kg/m³ arrives as 0.00785. A file OpenCASCADE itself
+/// wrote comes back unconverted. The unit is told from the size of the number, which works
+/// for every material denser than air and lighter than anything (10 to 30 000 kg/m³):
+/// under 0.03 it is g/mm³, under 50 g/cm³, above kg/m³.
+fn material_from(data: ffi::StepMaterialData) -> Option<StepMaterial> {
+    if !data.present || data.name.trim().is_empty() {
+        return None;
+    }
+    let density = density_kg_per_m3(data.density);
+    Some(StepMaterial {
+        name: data.name,
+        description: data.description,
+        density,
+    })
+}
+
+/// A density as a STEP reader may give it (g/mm³, g/cm³ or kg/m³), in kg/m³; 0 when
+/// unknown or absurd.
+fn density_kg_per_m3(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        0.0
+    } else if value < 0.03 {
+        value * 1e6
+    } else if value < 50.0 {
+        value * 1e3
+    } else {
+        value
+    }
 }
 
 fn shape_colors_data(colors: &StepColors) -> ffi::StepShapeColors {
@@ -345,7 +411,10 @@ fn step_assembly(tree: ffi::StepAssemblyData) -> Result<StepAssembly, OcctError>
             }
             StepNodeContent::Assembly { instances }
         } else {
-            StepNodeContent::Part { step: node.step }
+            StepNodeContent::Part {
+                step: node.step,
+                material: material_from(node.material),
+            }
         };
         nodes.push(StepNode {
             name: node.name,
@@ -556,5 +625,23 @@ fn curve_kind(kind: ffi::CurveKind) -> CurveKind {
         ffi::CurveKind::BSpline => CurveKind::BSpline,
         ffi::CurveKind::Degenerate => CurveKind::Degenerate,
         _ => CurveKind::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::density_kg_per_m3;
+
+    #[test]
+    fn densities_come_back_in_kilograms_per_cubic_metre() {
+        // Steel, as OpenCASCADE converts a Fusion 360 file (g/mm³), as g/cm³, and as is.
+        assert!((density_kg_per_m3(0.00785) - 7850.0).abs() < 1e-6);
+        assert!((density_kg_per_m3(7.85) - 7850.0).abs() < 1e-9);
+        assert!((density_kg_per_m3(7850.0) - 7850.0).abs() < 1e-9);
+        // Water and a light foam.
+        assert!((density_kg_per_m3(0.0009983) - 998.3).abs() < 1e-6);
+        assert!((density_kg_per_m3(0.00003) - 30.0).abs() < 1e-6);
+        assert_eq!(density_kg_per_m3(0.0), 0.0);
+        assert_eq!(density_kg_per_m3(f64::NAN), 0.0);
     }
 }

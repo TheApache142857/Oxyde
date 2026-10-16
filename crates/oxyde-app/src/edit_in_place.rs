@@ -93,6 +93,11 @@ impl OxydeApp {
     /// Releases the locks of documents no longer open: the lock of the current document
     /// (unless read-only) and of every assembly set aside are kept.
     pub(crate) fn sync_locks(&mut self) {
+        // A job holds a document meanwhile (an assembly being read again): its lock
+        // stays until it is back.
+        if self.busy() {
+            return;
+        }
         let mut keep: Vec<PathBuf> = self
             .edit_stack
             .iter()
@@ -166,10 +171,24 @@ impl OxydeApp {
     }
 
     /// Back to the assembly a component was opened from, reading its files again.
-    pub(crate) fn finish_edit(&mut self, ctx: &egui::Context) {
+    pub(crate) fn finish_edit(&mut self, _ctx: &egui::Context) {
         let Some(suspended) = self.edit_stack.pop() else {
             return;
         };
+        // The edited document stays on screen while the assembly's changed files (the
+        // edited one, usually) are read again off the UI thread; `assembly_back` follows.
+        self.sketch = None;
+        self.dialog = None;
+        self.assembly_back_job(suspended);
+    }
+
+    /// The assembly set aside is back, its changed files read again.
+    pub(crate) fn assembly_back(
+        &mut self,
+        suspended: Suspended,
+        notes: Vec<String>,
+        ctx: &egui::Context,
+    ) {
         if self.asm.is_some() {
             self.leave_assembly();
         } else {
@@ -185,10 +204,7 @@ impl OxydeApp {
             self.scene_revision = None;
         }
         self.viewport.pickable = None;
-        let mut parent = suspended.asm;
-        let notes = parent.reload_parts(&mut self.kernel);
-        parent.solve();
-        parent.revision = crate::document::next_revision();
+        let parent = suspended.asm;
         let name = parent.display_name();
         // Still there after the reload: a component the user deleted from the sub-assembly
         // file is gone from `sources`, which `loaded` tolerates.
@@ -229,8 +245,21 @@ impl OxydeApp {
         if s.context.faces.is_empty() {
             return;
         }
-        materials.resize(mesh.faces.len(), Material::default());
+        let own = mesh.faces.len();
         mesh.faces.extend(s.context.faces.iter().cloned());
+        self.add_context_materials(own, materials);
+    }
+
+    /// The ghost materials after the document's own `own_faces`: for refreshing the
+    /// materials without re-meshing (the Appearance panel), so the ghosts stay ghosts.
+    pub(crate) fn add_context_materials(&self, own_faces: usize, materials: &mut Vec<Material>) {
+        let Some(s) = self.edit_stack.last() else {
+            return;
+        };
+        if s.context.faces.is_empty() {
+            return;
+        }
+        materials.resize(own_faces, Material::default());
         materials.extend(std::iter::repeat_n(ghost(), s.context.faces.len()));
     }
 
@@ -293,7 +322,9 @@ impl OxydeApp {
         };
         if ui
             .button(format!("Finish editing {component}"))
-            .on_hover_text(format!("Back to {parent}, which reads the edited file again"))
+            .on_hover_text(format!(
+                "Back to {parent}, which reads the edited file again"
+            ))
             .clicked()
         {
             ui.close_menu();
@@ -364,9 +395,8 @@ impl AssemblyDoc {
             .filter(|(o, _, _)| o.top != except)
             .filter_map(|(_, p, part)| Some((0, inverse.compose(p), part.mesh.as_ref()?)))
             .collect();
-        let (mut mesh, _) = oxyde_assembly::scene::combine(
-            placed.iter().map(|(k, p, m)| (*k, p, *m)),
-        );
+        let (mut mesh, _) =
+            oxyde_assembly::scene::combine(placed.iter().map(|(k, p, m)| (*k, p, *m)));
         // Ghosts show their shape by their faces alone.
         mesh.edges.clear();
         mesh

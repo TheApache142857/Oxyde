@@ -54,6 +54,10 @@
 #include <XCAFDoc_ColorType.hxx>
 #include <TCollection_AsciiString.hxx>
 #include <TCollection_ExtendedString.hxx>
+#include <TCollection_HAsciiString.hxx>
+#include <TDataStd_TreeNode.hxx>
+#include <XCAFDoc.hxx>
+#include <XCAFDoc_MaterialTool.hxx>
 #include <TDF_Label.hxx>
 #include <TDF_LabelSequence.hxx>
 #include <TDF_Tool.hxx>
@@ -271,6 +275,9 @@ public:
     Handle(XCAFDoc_ColorTool) colors() const {
         return XCAFDoc_DocumentTool::ColorTool(doc_->Main());
     }
+    Handle(XCAFDoc_MaterialTool) materials() const {
+        return XCAFDoc_DocumentTool::MaterialTool(doc_->Main());
+    }
 
 private:
     Handle(XCAFApp_Application) app_;
@@ -363,9 +370,49 @@ StepShapeColors colors_of(const TopoDS_Shape& body, const Handle(XCAFDoc_ColorTo
 using ColorOf =
     std::function<bool(std::size_t shape, const TopoDS_Shape& sub, Quantity_ColorRGBA& out)>;
 
+// A material without a name: what shapes get when the file names none.
+StepMaterialData no_material() {
+    StepMaterialData out{};
+    out.present = false;
+    out.density = 0.0;
+    return out;
+}
+
+// The material XCAF attached to a shape label when the STEP file was read with materials
+// on: the `material name` property and the `density` measure (Fusion 360 and SolidWorks
+// write them for every body). The density comes back as the reader converted it; the Rust
+// side settles its unit.
+StepMaterialData material_of(const TDF_Label& label) {
+    StepMaterialData out = no_material();
+    if (label.IsNull()) {
+        return out;
+    }
+    Handle(TDataStd_TreeNode) node;
+    if (!label.FindAttribute(XCAFDoc::MaterialRefGUID(), node) || !node->HasFather()) {
+        return out;
+    }
+    Handle(TCollection_HAsciiString) name, description, density_name, density_type;
+    double density = 0.0;
+    if (!XCAFDoc_MaterialTool::GetMaterial(node->Father()->Label(), name, description, density,
+                                           density_name, density_type)) {
+        return out;
+    }
+    if (name.IsNull() || name->IsEmpty()) {
+        return out;
+    }
+    out.present = true;
+    out.name = rust::String::lossy(name->ToCString());
+    out.description =
+        description.IsNull() ? rust::String() : rust::String::lossy(description->ToCString());
+    out.density = (std::isfinite(density) && density > 0.0) ? density : 0.0;
+    return out;
+}
+
 // Puts `shapes` into a fresh XCAF document (one product each), colours their solids and
-// faces as `color_of` says, and hands the document to `use` (which writes it).
+// faces as `color_of` says, gives each the material `materials` names for it (indexed like
+// `shapes`, or empty), and hands the document to `use` (which writes it).
 void with_colored_document(const std::vector<TopoDS_Shape>& shapes, const ColorOf& color_of,
+                           const std::vector<StepMaterialData>& materials,
                            const std::function<void(const Handle(TDocStd_Document)&)>& use) {
     XcafDocument doc;
     const Handle(XCAFDoc_ShapeTool) shape_tool = doc.shapes();
@@ -375,6 +422,17 @@ void with_colored_document(const std::vector<TopoDS_Shape>& shapes, const ColorO
         const TDF_Label label = shape_tool->AddShape(shape, false);
         if (label.IsNull()) {
             throw std::runtime_error("shape " + std::to_string(i) + " could not be registered");
+        }
+        if (i < materials.size() && materials[i].present) {
+            const StepMaterialData& m = materials[i];
+            const std::string name(m.name);
+            const std::string description(m.description);
+            // Written as Fusion 360 does: a `density measure` in kilograms per cubic metre.
+            doc.materials()->SetMaterial(
+                label, new TCollection_HAsciiString(name.c_str()),
+                new TCollection_HAsciiString(description.c_str()), m.density,
+                new TCollection_HAsciiString("density measure"),
+                new TCollection_HAsciiString("POSITIVE_RATIO_MEASURE"));
         }
         Quantity_ColorRGBA color;
         for (TopExp_Explorer it(shape, TopAbs_SOLID); it.More(); it.Next()) {
@@ -402,12 +460,14 @@ void with_colored_document(const std::vector<TopoDS_Shape>& shapes, const ColorO
 }
 
 // `shape` written as a STEP file, in millimetres, with the colours `color_of` gives its
-// solids and faces.
-rust::Vec<std::uint8_t> step_bytes(const TopoDS_Shape& shape, const ColorOf& color_of) {
+// solids and faces and the material `material` names.
+rust::Vec<std::uint8_t> step_bytes(const TopoDS_Shape& shape, const ColorOf& color_of,
+                                   const StepMaterialData& material) {
     std::ostringstream stream;
-    with_colored_document({shape}, color_of, [&](const Handle(TDocStd_Document)& doc) {
+    with_colored_document({shape}, color_of, {material}, [&](const Handle(TDocStd_Document)& doc) {
         STEPCAFControl_Writer writer;
         writer.SetColorMode(true);
+        writer.SetMaterialMode(true);
         if (!writer.Transfer(doc, STEPControl_AsIs)) {
             throw std::runtime_error("transfer of a part failed");
         }
@@ -492,25 +552,28 @@ public:
                     const TopoDS_Shape moved =
                         BRepBuilderAPI_Transform(XCAFDoc_ShapeTool::GetShape(referred), trsf, true)
                             .Shape();
-                    const std::uint32_t child =
-                        part(label_name(referred) + " (mirrored)", moved);
+                    const std::uint32_t child = part(label_name(referred) + " (mirrored)",
+                                                     moved, material_of(referred));
                     node.instances.push_back(instance_data(child, label_name(component), gp_Trsf()));
                 }
             }
             index = static_cast<std::uint32_t>(out_.nodes.size());
             out_.nodes.push_back(std::move(node));
         } else {
-            index = part(label_name(label), XCAFDoc_ShapeTool::GetShape(label));
+            index = part(label_name(label), XCAFDoc_ShapeTool::GetShape(label),
+                         material_of(label));
         }
         done_.emplace(key, index);
         return index;
     }
 
 private:
-    std::uint32_t part(const std::string& name, const TopoDS_Shape& shape) {
+    std::uint32_t part(const std::string& name, const TopoDS_Shape& shape,
+                       const StepMaterialData& material) {
         StepNodeData node{};
         node.name = rust::String(name);
         node.is_assembly = false;
+        node.material = material;
         if (!shape.IsNull()) {
             TopTools_DataMapOfShapeShape origin;
             const TopoDS_Shape body = solid_body(shape, &origin);
@@ -522,7 +585,7 @@ private:
                     const TopoDS_Shape& original = origin.IsBound(sub) ? origin.Find(sub) : sub;
                     return xcaf_color(colors_, original, out);
                 };
-                node.step = step_bytes(body, color_of);
+                node.step = step_bytes(body, color_of, material);
             }
         }
         out_.nodes.push_back(std::move(node));
@@ -1637,7 +1700,8 @@ TopologyCounts Session::topology_counts(std::uint64_t shape) const {
 }
 
 void Session::export_step(rust::Slice<const std::uint64_t> shapes,
-                          rust::Slice<const StepShapeColors> colors, rust::Str path) const {
+                          rust::Slice<const StepShapeColors> colors,
+                          rust::Slice<const StepMaterialData> materials, rust::Str path) const {
     guarded("export_step", [&] {
         const std::lock_guard<std::mutex> lock(step_mutex());
         if (shapes.empty()) {
@@ -1646,6 +1710,10 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes,
         if (!colors.empty() && colors.size() != shapes.size()) {
             throw std::invalid_argument("colours do not match the shapes");
         }
+        if (!materials.empty() && materials.size() != shapes.size()) {
+            throw std::invalid_argument("materials do not match the shapes");
+        }
+        const std::vector<StepMaterialData> material_list(materials.begin(), materials.end());
         std::vector<TopoDS_Shape> list;
         std::vector<TopTools_IndexedMapOfShape> solid_maps(shapes.size());
         std::vector<TopTools_IndexedMapOfShape> face_maps(shapes.size());
@@ -1682,9 +1750,10 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes,
         };
         // OCCT interprets file names as UTF-8 on Windows.
         const std::string file(path);
-        with_colored_document(list, color_of, [&](const Handle(TDocStd_Document)& doc) {
+        with_colored_document(list, color_of, material_list, [&](const Handle(TDocStd_Document)& doc) {
             STEPCAFControl_Writer writer;
             writer.SetColorMode(true);
+            writer.SetMaterialMode(true);
             if (!writer.Transfer(doc, STEPControl_AsIs)) {
                 throw std::runtime_error("transfer of the shapes failed");
             }
@@ -1704,6 +1773,7 @@ StepImportData Session::import_step(rust::Slice<const std::uint8_t> data) {
         STEPCAFControl_Reader reader;
         reader.SetColorMode(true);
         reader.SetNameMode(false);
+        reader.SetMatMode(true);
         if (reader.ChangeReader().ReadStream("import.step", stream) != IFSelect_RetDone) {
             throw std::runtime_error("not a readable STEP file");
         }
@@ -1733,6 +1803,12 @@ StepImportData Session::import_step(rust::Slice<const std::uint8_t> data) {
         }
         StepImportData out{};
         out.colors = colors_of(result, doc.colors(), origin);
+        // The material of the first product that names one: a file with several solids
+        // of different materials becomes one body here, which has one material.
+        out.material = no_material();
+        for (int i = 1; i <= roots.Length() && !out.material.present; ++i) {
+            out.material = material_of(roots.Value(i));
+        }
         out.shape = insert(result);
         return out;
     });
@@ -1747,6 +1823,7 @@ StepAssemblyData Session::read_step_assembly(rust::Slice<const std::uint8_t> dat
         STEPCAFControl_Reader reader;
         reader.SetNameMode(true);
         reader.SetColorMode(true);
+        reader.SetMatMode(true);
         if (reader.ChangeReader().ReadStream("import.step", stream) != IFSelect_RetDone) {
             throw std::runtime_error("not a readable STEP file");
         }

@@ -30,8 +30,10 @@ const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const EDGE_BIT: u32 = 0x8000_0000;
 /// Every colour texture is resampled to this size, so they fit one texture array.
 const TEXTURE_SIZE: u32 = 512;
-/// Bytes of the `View` uniform: 16 vec4s.
-const VIEW_BYTES: u64 = 16 * 16;
+/// Bytes of the `View` uniform: 17 vec4s.
+const VIEW_BYTES: u64 = 17 * 16;
+/// The ambient occlusion image: one occlusion value per pixel.
+const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 const SHADER: &str = r#"
 struct View {
@@ -39,7 +41,7 @@ struct View {
     right: vec4<f32>,
     up: vec4<f32>,
     eye: vec4<f32>,
-    // xyz: towards the key light; w: subsurface scattering strength, 0..1.
+    // xyz: towards the key light.
     key: vec4<f32>,
     // x, y: millimetres to clip space; z: depth scale; w: edge depth bias (mm).
     scale: vec4<f32>,
@@ -51,6 +53,9 @@ struct View {
     // x: floor height (mm), y: reflection strength, z: fade height (mm), w: 1 when this
     // pass draws the reflection (faces mirrored in the floor).
     floor: vec4<f32>,
+    // Ambient occlusion: x: strength 0..1, y: radius in pixels, z: the same radius in
+    // depth units (0..1 across the scene).
+    ao: vec4<f32>,
 };
 
 struct FaceMaterial {
@@ -67,6 +72,10 @@ struct FaceMaterial {
 @group(0) @binding(3) var<storage, read> materials: array<FaceMaterial>;
 @group(0) @binding(4) var textures: texture_2d_array<f32>;
 @group(0) @binding(5) var texture_sampler: sampler;
+// The depth of the opaque faces, for the ambient occlusion pass.
+@group(0) @binding(6) var ao_depth: texture_depth_2d;
+// The occlusion per pixel: raw for the blur pass, blurred for the faces.
+@group(0) @binding(7) var ao_image: texture_2d<f32>;
 
 fn project(p: vec3<f32>, bias: f32) -> vec4<f32> {
     let v = p - view.center.xyz;
@@ -161,21 +170,15 @@ fn face_fs(in: FaceOut) -> @location(0) vec4<f32> {
     if (dot(n, view.eye.xyz) < 0.0) {
         n = -n;
     }
-    // As `shade` in the software renderer: ambient, headlight, key light, and with
-    // subsurface scattering a wrapped key light and a glow near the silhouette.
+    // As `shade` in the software renderer: ambient, headlight, key light; then the
+    // ambient occlusion of this pixel (not for the reflection).
     let facing = dot(n, view.eye.xyz);
-    let towards_key = dot(n, view.key.xyz);
-    var key = max(towards_key, 0.0);
-    var rim = 0.0;
-    let s = view.key.w;
-    if (s > 0.0) {
-        let wrap = 0.6 * s;
-        let soft = max((towards_key + wrap) / (1.0 + wrap), 0.0);
-        key = key + (soft - key) * s;
-        let edge = max(1.0 - facing, 0.0);
-        rim = edge * edge * edge * 0.45 * s;
+    let key = max(dot(n, view.key.xyz), 0.0);
+    var light = 0.38 + 0.37 * facing + 0.40 * key;
+    if (view.ao.x > 0.0 && view.floor.w < 0.5) {
+        let occlusion = textureLoad(ao_image, vec2<i32>(in.position.xy), 0).x;
+        light = light * (1.0 - 0.75 * view.ao.x * occlusion);
     }
-    let light = 0.38 + 0.37 * facing + 0.40 * key + rim;
     let flags = face_flags[in.face];
     let material = materials[in.face];
     var base = material.color.xyz;
@@ -197,6 +200,58 @@ fn face_fs(in: FaceOut) -> @location(0) vec4<f32> {
 @fragment
 fn face_id_fs(in: FaceOut) -> @location(0) u32 {
     return in.face + 1u;
+}
+
+// ---- Ambient occlusion, screen-space from the depth of the opaque faces --------------------
+
+// As `ambient_occlusion` in the software renderer: two rings of six neighbours; each one
+// nearer the viewer by up to the reach hides some ambient light. The ring is turned per
+// pixel (interleaved gradient noise) and the result blurred, so no pattern shows.
+@fragment
+fn ao_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
+    let px = vec2<i32>(in.position.xy);
+    let size = vec2<i32>(view.viewport.xy);
+    let d = textureLoad(ao_depth, px, 0);
+    if (d >= 1.0) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    let noise = fract(52.9829189 * fract(0.06711056 * in.position.x + 0.00583715 * in.position.y));
+    let turn = noise * 6.2831853;
+    let c = cos(turn);
+    let s = sin(turn);
+    let reach = view.ao.z * 6.0;
+    let bias = view.ao.z * 0.05;
+    var occlusion = 0.0;
+    for (var k = 0; k < 12; k = k + 1) {
+        let a = f32(k) / 12.0 * 6.2831853;
+        var r = 1.0;
+        if ((k & 1) == 1) {
+            r = 0.55;
+        }
+        let o = vec2<f32>(cos(a), sin(a)) * r * view.ao.y;
+        let turned = vec2<f32>(o.x * c - o.y * s, o.x * s + o.y * c);
+        let sp = clamp(px + vec2<i32>(turned), vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+        let sd = textureLoad(ao_depth, sp, 0);
+        let diff = d - sd;
+        if (diff > bias && diff < reach) {
+            occlusion = occlusion + 1.0 - diff / reach;
+        }
+    }
+    return vec4<f32>(occlusion / 12.0, 0.0, 0.0, 1.0);
+}
+
+@fragment
+fn ao_blur_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
+    let px = vec2<i32>(in.position.xy);
+    let size = vec2<i32>(view.viewport.xy);
+    var sum = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            let sp = clamp(px + vec2<i32>(x, y), vec2<i32>(0, 0), size - vec2<i32>(1, 1));
+            sum = sum + textureLoad(ao_image, sp, 0).x;
+        }
+    }
+    return vec4<f32>(sum / 9.0, 0.0, 0.0, 1.0);
 }
 
 // ---- Edges, as screen-space quads -------------------------------------------------------
@@ -276,6 +331,11 @@ struct Targets {
     ids: wgpu::Texture,
     ids_view: wgpu::TextureView,
     ids_depth: wgpu::TextureView,
+    /// The depth of the opaque faces alone, read by the ambient occlusion pass.
+    ao_depth: wgpu::TextureView,
+    /// The occlusion per pixel, raw and blurred.
+    ao_raw: wgpu::TextureView,
+    ao: wgpu::TextureView,
 }
 
 impl Targets {
@@ -315,6 +375,10 @@ impl Targets {
             attachment | wgpu::TextureUsages::COPY_SRC,
         );
         let ids_depth = make("oxyde id depth", DEPTH_FORMAT, 1, attachment);
+        let readable = attachment | wgpu::TextureUsages::TEXTURE_BINDING;
+        let ao_depth = make("oxyde occlusion depth", DEPTH_FORMAT, 1, readable);
+        let ao_raw = make("oxyde occlusion", AO_FORMAT, 1, readable);
+        let ao = make("oxyde occlusion blurred", AO_FORMAT, 1, readable);
         Self {
             width,
             height,
@@ -325,6 +389,9 @@ impl Targets {
             ids_view: view(&ids),
             ids,
             ids_depth: view(&ids_depth),
+            ao_depth: view(&ao_depth),
+            ao_raw: view(&ao_raw),
+            ao: view(&ao),
         }
     }
 }
@@ -351,7 +418,12 @@ struct MeshBuffers {
 }
 
 /// The face materials as the shader reads them: 32 bytes each.
-fn material_bytes(materials: &[Material], textures: &[TextureRef], count: usize, style: &Style) -> Vec<u8> {
+fn material_bytes(
+    materials: &[Material],
+    textures: &[TextureRef],
+    count: usize,
+    style: &Style,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(count.max(1) * 32);
     let default = Material::default();
     for i in 0..count.max(1) {
@@ -377,7 +449,11 @@ fn material_bytes(materials: &[Material], textures: &[TextureRef], count: usize,
 
 /// Every texture resampled to `TEXTURE_SIZE` square, as the layers of one array; one
 /// white layer when there are none.
-fn texture_array(device: &wgpu::Device, queue: &wgpu::Queue, textures: &[TextureRef]) -> wgpu::TextureView {
+fn texture_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures: &[TextureRef],
+) -> wgpu::TextureView {
     let layers = textures.len().max(1) as u32;
     let size = if textures.is_empty() { 1 } else { TEXTURE_SIZE };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -402,7 +478,10 @@ fn texture_array(device: &wgpu::Device, queue: &wgpu::Queue, textures: &[Texture
             Some(t) => {
                 for y in 0..size {
                     for x in 0..size {
-                        let c = t.sample((x as f32 + 0.5) / size as f32, (y as f32 + 0.5) / size as f32);
+                        let c = t.sample(
+                            (x as f32 + 0.5) / size as f32,
+                            (y as f32 + 0.5) / size as f32,
+                        );
                         pixels.extend([c[0] as u8, c[1] as u8, c[2] as u8, 255]);
                     }
                 }
@@ -413,7 +492,11 @@ fn texture_array(device: &wgpu::Device, queue: &wgpu::Queue, textures: &[Texture
             wgpu::ImageCopyTexture {
                 texture: &texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             &pixels,
@@ -454,6 +537,14 @@ pub struct GpuViewport {
     edges: wgpu::RenderPipeline,
     face_ids: wgpu::RenderPipeline,
     edge_ids: wgpu::RenderPipeline,
+    /// Ambient occlusion: the opaque faces' depth alone, the occlusion from it, blurred.
+    ao_depth_pass: wgpu::RenderPipeline,
+    ao: wgpu::RenderPipeline,
+    ao_blur: wgpu::RenderPipeline,
+    /// Bound where the occlusion depth is being written (a bind group cannot hold a
+    /// pass's own attachment).
+    dummy_depth: wgpu::TextureView,
+    dummy_ao: wgpu::TextureView,
     mesh: Option<MeshBuffers>,
     /// The style the material buffer was built with (it holds the default face colour).
     material_style: Option<Style>,
@@ -464,6 +555,20 @@ pub struct GpuViewport {
     targets: Option<Targets>,
     texture: Option<egui::TextureId>,
     samples: u32,
+    /// The see-through faces' triangles sorted for the last camera direction, kept
+    /// while the camera only pans or zooms (sorting a large ghosted assembly every frame
+    /// is what the CPU spent its time on).
+    transparent_cache: Option<(TransparentKey, wgpu::Buffer, u32)>,
+    /// The face and edge flag buffers of the last highlight, kept while it is the same.
+    flags_cache: Option<(Highlight, wgpu::Buffer, wgpu::Buffer)>,
+}
+
+/// What the order of the see-through faces depends on: the view direction, and the
+/// target along it (a pan across the view does not change the order).
+#[derive(Clone, Copy, PartialEq)]
+struct TransparentKey {
+    eye: [f64; 3],
+    along: f64,
 }
 
 impl GpuViewport {
@@ -517,8 +622,48 @@ impl GpuViewport {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
+        let dummy = |label, format| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: 1,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        let dummy_depth = dummy("oxyde placeholder depth", DEPTH_FORMAT);
+        let dummy_ao = dummy("oxyde placeholder occlusion", AO_FORMAT);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("oxyde textures"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -714,6 +859,44 @@ impl GpuViewport {
             1,
             depth(true, less_equal),
         );
+        let ao_depth_pass = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("occlusion depth"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "face_vs",
+                buffers: &face_buffers,
+                compilation_options: Default::default(),
+            },
+            fragment: None,
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: depth(true, less),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let ao = pipeline(
+            "ambient occlusion",
+            "background_vs",
+            "ao_fs",
+            &[],
+            opaque(AO_FORMAT),
+            1,
+            None,
+        );
+        let ao_blur = pipeline(
+            "ambient occlusion blur",
+            "background_vs",
+            "ao_blur_fs",
+            &[],
+            opaque(AO_FORMAT),
+            1,
+            None,
+        );
         let uniform = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -740,6 +923,11 @@ impl GpuViewport {
             edges,
             face_ids,
             edge_ids,
+            ao_depth_pass,
+            ao,
+            ao_blur,
+            dummy_depth,
+            dummy_ao,
             mesh: None,
             material_style: None,
             materials_cpu: (Vec::new(), Vec::new()),
@@ -747,6 +935,8 @@ impl GpuViewport {
             targets: None,
             texture: None,
             samples,
+            transparent_cache: None,
+            flags_cache: None,
         }
     }
 
@@ -754,6 +944,8 @@ impl GpuViewport {
     pub fn set_mesh(&mut self, mesh: &GpuMesh, bounds: Option<([f64; 3], [f64; 3])>) {
         use wgpu::util::DeviceExt;
         self.bounds = bounds;
+        self.transparent_cache = None;
+        self.flags_cache = None;
         if mesh.indices.is_empty() && mesh.segments.is_empty() {
             self.mesh = None;
             return;
@@ -801,7 +993,11 @@ impl GpuViewport {
         let mut transparent = Vec::new();
         for (face, &range) in mesh.triangle_ranges.iter().enumerate() {
             let (a, b) = (range.0 as usize, range.1 as usize);
-            if mesh.materials.get(face).is_some_and(Material::is_transparent) {
+            if mesh
+                .materials
+                .get(face)
+                .is_some_and(Material::is_transparent)
+            {
                 transparent.push((face, range));
             } else {
                 opaque.extend_from_slice(&mesh.indices[a..b]);
@@ -851,15 +1047,11 @@ impl GpuViewport {
         let mut faces: Vec<(f64, (u32, u32))> = mesh
             .transparent
             .iter()
-            .map(|(face, range)| {
-                (
-                    mesh.centroids.get(*face).map_or(0.0, |c| depth(*c)),
-                    *range,
-                )
-            })
+            .map(|(face, range)| (mesh.centroids.get(*face).map_or(0.0, |c| depth(*c)), *range))
             .collect();
-        faces.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let mut out = Vec::new();
+        faces.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        let total: usize = faces.iter().map(|(_, (a, b))| (b - a) as usize).sum();
+        let mut out = Vec::with_capacity(total);
         for (_, (a, b)) in faces {
             out.extend_from_slice(&mesh.indices_cpu[a as usize..b as usize]);
         }
@@ -956,12 +1148,7 @@ impl GpuViewport {
         view.extend(v4(right));
         view.extend(v4(up));
         view.extend(v4(eye));
-        view.extend([
-            key[0] as f32,
-            key[1] as f32,
-            key[2] as f32,
-            style.subsurface.clamp(0.0, 1.0),
-        ]);
+        view.extend([key[0] as f32, key[1] as f32, key[2] as f32, 0.0]);
         view.extend([
             (2.0 / (camera.height * aspect)) as f32,
             (2.0 / camera.height) as f32,
@@ -988,28 +1175,29 @@ impl GpuViewport {
         }
         let (floor_y, fade) = floor.map_or((0.0, 1.0), |f| (f.y as f32, f.fade as f32));
         view.extend([floor_y, style.floor_reflection.clamp(0.0, 1.0), fade, 0.0]);
-        self.queue.write_buffer(&self.uniforms, 0, &bytes_f32(view.clone()));
+        // Ambient occlusion: the same reach as the software renderer, in pixels and in
+        // depth units (depth is linear: mm × scale.z).
+        let ao_strength = style.ambient_occlusion.clamp(0.0, 1.0);
+        let radius_px = (f64::from(width.min(height)) * oxyde_render::AO_RADIUS).max(2.0);
+        let radius_mm = radius_px / camera.pixels_per_mm(f64::from(height));
+        view.extend([
+            ao_strength,
+            radius_px as f32,
+            (radius_mm / (2.0 * reach)) as f32,
+            0.0,
+        ]);
+        self.queue
+            .write_buffer(&self.uniforms, 0, &bytes_f32(view.clone()));
+        // The reflection pass: flagged, and without occlusion.
         let n = view.len();
-        view[n - 1] = 1.0;
-        self.queue.write_buffer(&self.mirror_uniforms, 0, &bytes_f32(view));
+        view[n - 5] = 1.0;
+        self.queue
+            .write_buffer(&self.mirror_uniforms, 0, &bytes_f32(view));
 
         let (faces, edges) = self
             .mesh
             .as_ref()
             .map_or((0, 0), |m| (m.face_count, m.edge_count));
-        let mut face_flags = vec![0u32; faces.max(1)];
-        let mut edge_flags = vec![0u32; edges.max(1)];
-        let mut flag = |pick: Pick, bit: u32| match pick {
-            Pick::Face(i) if (i as usize) < faces => face_flags[i as usize] |= bit,
-            Pick::Edge(i) if (i as usize) < edges => edge_flags[i as usize] |= bit,
-            _ => {}
-        };
-        for pick in &highlight.selected {
-            flag(*pick, 2);
-        }
-        for pick in highlight.hovered.iter().chain(&highlight.preselected) {
-            flag(*pick, 1);
-        }
         use wgpu::util::DeviceExt;
         let storage = |label, data: Vec<u32>| {
             self.device
@@ -1019,8 +1207,33 @@ impl GpuViewport {
                     usage: wgpu::BufferUsages::STORAGE,
                 })
         };
-        let face_buffer = storage("oxyde face flags", face_flags);
-        let edge_buffer = storage("oxyde edge flags", edge_flags);
+        // The flags of the hovered and selected faces and edges: made again only when
+        // the highlight changes.
+        if self
+            .flags_cache
+            .as_ref()
+            .is_none_or(|(h, _, _)| h != highlight)
+        {
+            let mut face_flags = vec![0u32; faces.max(1)];
+            let mut edge_flags = vec![0u32; edges.max(1)];
+            let mut flag = |pick: Pick, bit: u32| match pick {
+                Pick::Face(i) if (i as usize) < faces => face_flags[i as usize] |= bit,
+                Pick::Edge(i) if (i as usize) < edges => edge_flags[i as usize] |= bit,
+                _ => {}
+            };
+            for pick in &highlight.selected {
+                flag(*pick, 2);
+            }
+            for pick in highlight.hovered.iter().chain(&highlight.preselected) {
+                flag(*pick, 1);
+            }
+            self.flags_cache = Some((
+                highlight.clone(),
+                storage("oxyde face flags", face_flags),
+                storage("oxyde edge flags", edge_flags),
+            ));
+        }
+        let (_, face_buffer, edge_buffer) = self.flags_cache.as_ref().expect("made above");
         // Without a mesh, placeholder material and texture bindings.
         let empty_materials;
         let empty_textures;
@@ -1032,64 +1245,174 @@ impl GpuViewport {
                 (&empty_materials, &empty_textures)
             }
         };
-        let bind = |label, uniforms: &wgpu::Buffer| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniforms.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: face_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: edge_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: materials.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(textures),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            })
+        let bind =
+            |label, uniforms: &wgpu::Buffer, depth: &wgpu::TextureView, ao: &wgpu::TextureView| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: uniforms.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: face_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: edge_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: materials.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(textures),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(ao),
+                        },
+                    ],
+                })
+            };
+        let bind_group = bind("oxyde view", &self.uniforms, &targets.ao_depth, &targets.ao);
+        let mirror_group = bind(
+            "oxyde mirrored view",
+            &self.mirror_uniforms,
+            &targets.ao_depth,
+            &targets.ao,
+        );
+        // While the occlusion depth is drawn it cannot be bound; while the blur reads the
+        // raw occlusion it is what binding 7 holds.
+        let depth_group = bind(
+            "oxyde occlusion depth",
+            &self.uniforms,
+            &self.dummy_depth,
+            &self.dummy_ao,
+        );
+        let blur_group = bind(
+            "oxyde occlusion blur",
+            &self.uniforms,
+            &targets.ao_depth,
+            &targets.ao_raw,
+        );
+        // The see-through faces, sorted for this view direction: kept from the last
+        // frame while the view only pans or zooms.
+        let key = TransparentKey {
+            eye,
+            along: camera.target[0] * eye[0]
+                + camera.target[1] * eye[1]
+                + camera.target[2] * eye[2],
         };
-        let bind_group = bind("oxyde view", &self.uniforms);
-        let mirror_group = bind("oxyde mirrored view", &self.mirror_uniforms);
-        let transparent = self
-            .mesh
+        if self
+            .transparent_cache
             .as_ref()
-            .filter(|m| !m.transparent.is_empty())
-            .map(|m| Self::sorted_transparent(m, camera))
-            .filter(|t| !t.is_empty())
-            .map(|t| {
-                let count = t.len() as u32;
-                (
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("oxyde transparent indices"),
-                            contents: &bytes_u32(t),
-                            usage: wgpu::BufferUsages::INDEX,
-                        }),
-                    count,
-                )
-            });
+            .is_none_or(|(k, _, _)| *k != key)
+        {
+            self.transparent_cache = self
+                .mesh
+                .as_ref()
+                .filter(|m| !m.transparent.is_empty())
+                .map(|m| Self::sorted_transparent(m, camera))
+                .filter(|t| !t.is_empty())
+                .map(|t| {
+                    let count = t.len() as u32;
+                    let buffer =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("oxyde transparent indices"),
+                                contents: &bytes_u32(t),
+                                usage: wgpu::BufferUsages::INDEX,
+                            });
+                    (key, buffer, count)
+                });
+        }
+        let transparent = self
+            .transparent_cache
+            .as_ref()
+            .map(|(_, buffer, count)| (buffer, *count));
 
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("oxyde viewport"),
             });
+        if ao_strength > 0.0 {
+            // The depth of the opaque faces, then the occlusion from it, then blurred.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("oxyde occlusion depth"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &targets.ao_depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_bind_group(0, &depth_group, &[]);
+                if let Some(mesh) = &self.mesh {
+                    pass.set_pipeline(&self.ao_depth_pass);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.opaque.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.opaque_count, 0, 0..1);
+                }
+            }
+            let full_screen = |encoder: &mut wgpu::CommandEncoder,
+                               label,
+                               target: &wgpu::TextureView,
+                               group: &wgpu::BindGroup,
+                               pipeline: &wgpu::RenderPipeline| {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some(label),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_bind_group(0, group, &[]);
+                pass.set_pipeline(pipeline);
+                pass.draw(0..3, 0..1);
+            };
+            // The occlusion pass writes the raw image, so it binds the blurred one
+            // (which it does not read).
+            full_screen(
+                &mut encoder,
+                "oxyde occlusion",
+                &targets.ao_raw,
+                &bind_group,
+                &self.ao,
+            );
+            full_screen(
+                &mut encoder,
+                "oxyde occlusion blur",
+                &targets.ao,
+                &blur_group,
+                &self.ao_blur,
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("oxyde image"),
@@ -1136,11 +1459,11 @@ impl GpuViewport {
                     pass.set_vertex_buffer(0, mesh.segments.slice(..));
                     pass.draw(0..6, 0..mesh.segment_count);
                 }
-                if let Some((buffer, count)) = &transparent {
+                if let Some((buffer, count)) = transparent {
                     pass.set_pipeline(&self.faces_blend);
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..*count, 0, 0..1);
+                    pass.draw_indexed(0..count, 0, 0..1);
                 }
             }
         }
@@ -1195,7 +1518,13 @@ impl GpuViewport {
             .collect();
         let edges: Vec<u32> = ids
             .iter()
-            .map(|&id| if id & EDGE_BIT != 0 { id & !EDGE_BIT } else { 0 })
+            .map(|&id| {
+                if id & EDGE_BIT != 0 {
+                    id & !EDGE_BIT
+                } else {
+                    0
+                }
+            })
             .collect();
         oxyde_render::picks_in_rect(&faces, &edges, w as usize, min, max, crossing)
     }
@@ -1449,7 +1778,7 @@ mod tests {
         );
         let style = Style {
             floor_reflection: 0.4,
-            subsurface: 0.5,
+            ambient_occlusion: 0.5,
             ..Style::LIGHT
         };
         let mut gpu = GpuViewport::new(&state, super::DEFAULT_SAMPLES);
@@ -1478,8 +1807,14 @@ mod tests {
             [rgba[i], rgba[i + 1], rgba[i + 2]]
         };
         let plain = render_styled(&scene, &camera, w, h, &Highlight::default(), &Style::LIGHT);
-        assert_ne!(at(&gpu_rgba, below[0], below[1]), at(&plain.rgba, below[0], below[1]));
-        assert_ne!(at(&cpu.rgba, below[0], below[1]), at(&plain.rgba, below[0], below[1]));
+        assert_ne!(
+            at(&gpu_rgba, below[0], below[1]),
+            at(&plain.rgba, below[0], below[1])
+        );
+        assert_ne!(
+            at(&cpu.rgba, below[0], below[1]),
+            at(&plain.rgba, below[0], below[1])
+        );
     }
 
     /// A headless GPU, or `None` on machines without one.

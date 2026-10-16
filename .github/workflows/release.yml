@@ -1,0 +1,124 @@
+# Builds the executables people run: Windows x64 (zip and installer) and macOS on Apple
+# Silicon (.app in a .dmg and a zip). Runs the tests on both first.
+#
+# - Pushing a tag `v*` (e.g. `v0.0.4`) builds both and attaches them to a GitHub release
+#   of that tag (a draft, to write the notes before publishing).
+# - "Run workflow" (workflow_dispatch) builds both and keeps them as workflow artifacts,
+#   to try a build without releasing.
+#
+# OpenCASCADE: on Windows it is built once with vcpkg and cached (an hour or so the first
+# time, seconds after); on macOS Homebrew's bottle is used. Bump OCCT_CACHE to rebuild the
+# Windows cache (a new vcpkg baseline, a new OCCT version).
+
+name: Release builds
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  OCCT_CACHE: "1"
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # vcpkg comes with the runner image (VCPKG_INSTALLATION_ROOT, usually C:\vcpkg).
+      - name: Restore OpenCASCADE built by vcpkg
+        id: occt
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_INSTALLATION_ROOT }}\installed
+          key: occt-windows-x64-${{ env.OCCT_CACHE }}
+
+      - name: Build OpenCASCADE with vcpkg
+        if: steps.occt.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install opencascade:x64-windows --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+      - name: Point the build at OpenCASCADE
+        shell: pwsh
+        run: |
+          $occt = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          "OXYDE_OCCT_DIR=$occt" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$occt\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --workspace
+
+      - name: Bundle (zip and installer)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging\bundle.ps1
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxyde-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS Apple Silicon
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install OpenCASCADE
+        run: brew install opencascade
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Bundle (.app, .dmg and zip)
+        run: bash packaging/bundle-macos.sh
+
+      - name: Keep the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxyde-macos-arm64
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Draft the release with both builds attached
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            dist/*.zip
+            dist/*.exe
+            dist/*.dmg
+          fail_on_unmatched_files: true
