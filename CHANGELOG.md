@@ -35,12 +35,11 @@ release yet; the git history has every detail.
 - **Free orbit fixed**: dragging down now lifts the viewer over the model, as the
   constrained orbit does; it turned the other way. Turning the constrained orbit back on
   from Preferences › Navigation levels the view too (only View › Constrained orbit did).
-- **Release builds.** `.github/workflows/release.yml` builds Windows x64 (zip and
-  installer) and macOS Apple Silicon (`.app` in a `.dmg`, and a zip) on GitHub's runners,
-  tests first; pushing a tag `v*` attaches them to a draft release. New
-  `packaging/bundle-macos.sh` makes the macOS bundle (dylibs relocated into the app, icon,
-  document types, ad hoc signing; `OXYDE_SIGN_IDENTITY` for a Developer ID). Building on a
-  Mac: `brew install opencascade` (docs/BUILDING.md).
+- **macOS builds.** New `packaging/bundle-macos.sh` makes the macOS (Apple Silicon)
+  bundle: `Oxyde.app` with the OpenCASCADE dylibs relocated into it, the icon, the
+  document types, ad hoc signing (`OXYDE_SIGN_IDENTITY` for a Developer ID), in a `.dmg`
+  and a zip. Building on a Mac: `brew install opencascade`; releasing both platforms:
+  docs/BUILDING.md.
 
 ### Materials window, free orbit, Move Component, work off the UI thread (0.0.3, October 2026)
 
