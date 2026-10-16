@@ -431,7 +431,11 @@ fn dimensions_tab(
                 }
                 let feature = d.full_name.split_once('@').map_or("", |(_, f)| f);
                 ui.label(format!("@{feature}"));
+                // Angles read unsigned, as on the sketch; which way round they go (the
+                // sign the model keeps) stays as it is when a value is typed.
+                let angle = d.unit == DimensionUnit::Angle;
                 let shown = d.unit.to_display(d.value);
+                let shown = if angle { shown.abs() } else { shown };
                 if d.driven {
                     ui.label(format!(
                         "Σ {}{}",
@@ -455,6 +459,11 @@ fn dimensions_tab(
                     let response = ui.add(drag);
                     if response.changed() {
                         if let Ok(value) = d.unit.from_display(edited) {
+                            let value = if angle && d.value < 0.0 {
+                                -value
+                            } else {
+                                value
+                            };
                             changes.push(Change::SetDimension(d.reference, value));
                         }
                     }

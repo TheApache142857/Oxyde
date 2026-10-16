@@ -30,9 +30,16 @@ asked for, and fixed:
   centre as each other), and a snap to a middle, a crossing or a curve is kept as the
   matching relation.
 - **Angle dimensions read without a sign.** An angle measured clockwise showed as
-  "-45.0°" on the sketch and in the value window; typing 45 then swung the line to the
-  other side. The label and the window show 45°; a value typed keeps the angle on the
-  side it is, and a negative value puts it on the other side.
+  "-45.0°" on the sketch, in the value window and in the Dimensions tab of the
+  Equations window; typing 45 then swung the line to the other side. They show 45°; a
+  value typed keeps the angle on the side it is, and a negative value puts it on the
+  other side. (An equation driving an angle still sets the signed value.)
+- **Arcs can be dragged** in a sketch, as lines are: the whole arc moves with the
+  pointer. Dragging one did nothing.
+- **Concentric** is offered in the sketch's right-click menu for two circles or arcs
+  (their centres made one), next to Equal.
+- **Flip alignment** is no longer offered on concentric and perpendicular mates, where
+  it changed nothing.
 - **A rolled-back reference plane cannot be picked for a new sketch** from the tree
   while the Sketch command asks for a plane: the sketch went in before the plane it
   was drawn on, failed, and the file was refused at Save ("would not open again").

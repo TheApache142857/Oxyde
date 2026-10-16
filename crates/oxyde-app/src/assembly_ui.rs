@@ -2866,6 +2866,11 @@ fn mate_row(
     let id = m.id;
     let hovered = row.response.hovered();
     let suppressed = m.suppressed;
+    // A concentric or perpendicular mate holds either way round: nothing to flip.
+    let flippable = match (doc.local(&m.a), doc.local(&m.b)) {
+        (Ok(a), Ok(b)) => m.kind.has_alignment(a.kind(), b.kind()),
+        _ => true,
+    };
     if row.response.double_clicked() {
         action = Some(TreeAction::EditMate(id));
     } else if row.response.clicked() && !mating {
@@ -2880,7 +2885,7 @@ fn mate_row(
             action = Some(TreeAction::EditMate(id));
             ui.close_menu();
         }
-        if ui.button("Flip alignment").clicked() {
+        if flippable && ui.button("Flip alignment").clicked() {
             action = Some(TreeAction::FlipMate(id));
             ui.close_menu();
         }

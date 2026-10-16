@@ -198,6 +198,8 @@ struct Pending {
 enum DragKind {
     Point(EntityId),
     Line(EntityId, EntityId),
+    /// Centre, start and end: the whole arc moves.
+    Arc(EntityId, EntityId, EntityId),
     Radius(EntityId),
 }
 
@@ -791,7 +793,16 @@ impl SketchSession {
                 ("Perpendicular", Perpendicular(l[0], l[1])),
                 ("Equal", EqualLength(l[0], l[1])),
             ],
-            (0, 0, 2) => vec![("Equal", EqualRadius(r[0], r[1]))],
+            (0, 0, 2) => {
+                let mut out = vec![("Equal", EqualRadius(r[0], r[1]))];
+                // Concentric: one centre, as SolidWorks ties the two centre points.
+                if let (Some(a), Some(b)) = (self.center_of(r[0]), self.center_of(r[1])) {
+                    if a != b {
+                        out.push(("Concentric", Coincident(a, b)));
+                    }
+                }
+                out
+            }
             (0, 1, 1) => vec![("Tangent", Tangent(l[0], r[0]))],
             (1, 1, 0) => vec![
                 ("On line", PointOnLine(p[0], l[0])),
@@ -991,6 +1002,7 @@ impl SketchSession {
         let kind = match self.sketch.entity(id).map(|e| e.geometry) {
             Some(Geometry::Point(_)) if !self.sketch.is_fixed(id) => DragKind::Point(id),
             Some(Geometry::Line { start, end }) => DragKind::Line(start, end),
+            Some(Geometry::Arc { center, start, end }) => DragKind::Arc(center, start, end),
             Some(Geometry::Circle { .. }) => DragKind::Radius(id),
             _ => return,
         };
@@ -1011,9 +1023,14 @@ impl SketchSession {
                 self.sketch.move_point(p, to);
                 moved.push(p);
             }
-            DragKind::Line(a, b) => {
+            DragKind::Line(..) | DragKind::Arc(..) => {
+                let points = match drag.kind {
+                    DragKind::Line(a, b) => vec![a, b],
+                    DragKind::Arc(c, s, e) => vec![c, s, e],
+                    _ => Vec::new(),
+                };
                 let (dx, dy) = (to.x - drag.last.x, to.y - drag.last.y);
-                for p in [a, b] {
+                for p in points {
                     if self.sketch.is_fixed(p) {
                         continue;
                     }
@@ -2794,6 +2811,34 @@ mod tests {
         assert!((typed_value(&counter, 30.0) - 30f64.to_radians()).abs() < 1e-12);
         // Lengths are what they are.
         assert_eq!(typed_value(&Constraint::Length(EntityId(1), 4.0), 7.0), 7.0);
+    }
+
+    #[test]
+    fn an_arc_is_dragged_as_a_whole() {
+        let mut s = ConstrainedSketch::new();
+        let arc = s.arc(
+            Point2::new(10.0, 0.0),
+            Point2::new(15.0, 0.0),
+            Point2::new(10.0, 5.0),
+        );
+        let Geometry::Arc { center, start, end } = s.entity(arc).unwrap().geometry else {
+            panic!("not an arc");
+        };
+        let mut moving = session(s);
+        moving.start_drag(arc, Point2::new(13.5, 3.5));
+        moving.drag_to(Point2::new(23.5, 1.5));
+        assert_eq!(
+            moving.sketch.position(center),
+            Some(Point2::new(20.0, -2.0))
+        );
+        assert_eq!(moving.sketch.position(start), Some(Point2::new(25.0, -2.0)));
+        assert_eq!(moving.sketch.position(end), Some(Point2::new(20.0, 3.0)));
+        // Two circles offer Concentric: their centres made one.
+        moving.sketch.circle(Point2::new(0.0, 0.0), 2.0);
+        let circle = moving.sketch.circle(Point2::new(1.0, 1.0), 3.0);
+        moving.selection = vec![arc, circle];
+        let options = moving.relation_options();
+        assert!(options.iter().any(|(label, _)| *label == "Concentric"));
     }
 
     #[test]
