@@ -1,6 +1,6 @@
 # Building Oxyde
 
-**Main platform: Windows 10/11, x64, MSVC toolchain.** Linux builds too, with the OpenCASCADE 7.8 of Debian and Ubuntu (see [Linux](#linux)), and macOS on Apple Silicon with Homebrew's OpenCASCADE (see [macOS](#macos-apple-silicon)). On any other target the build script stops with an explicit error. Executables for Windows and macOS are built by the [release workflow](#5-release-builds-github-actions).
+**Main platform: Windows 10/11, x64, MSVC toolchain.** Linux builds too, with the OpenCASCADE 7.8 of Debian and Ubuntu (see [Linux](#linux)), and macOS on Apple Silicon with Homebrew's OpenCASCADE (see [macOS](#macos-apple-silicon)). On any other target the build script stops with an explicit error. Executables for Windows and macOS are bundled by the scripts in `packaging/` (see [Releasing](#5-releasing)).
 
 ## 1. Prerequisites
 
@@ -133,14 +133,9 @@ builds the release and writes:
 
 The app is signed **ad hoc** (Apple Silicon runs no unsigned code) unless `OXYDE_SIGN_IDENTITY` names a Developer ID certificate. Ad hoc signed apps are not notarised, so on another Mac the first launch is refused with *"cannot be opened because the developer cannot be verified"*: open it with right-click › *Open*, or run `xattr -dr com.apple.quarantine /Applications/Oxyde.app`. Notarisation (a paid Apple developer account, `notarytool`) is the next step for a wider release. Opening a file by double-clicking it in the Finder is not wired yet (the app takes the file on its command line); drag it onto the window or use File › Open.
 
-## 5. Release builds (GitHub Actions)
+## 5. Releasing
 
-`.github/workflows/release.yml` builds both executables on GitHub's runners, running the tests first:
-
-- **Windows x64** (`windows-latest`): OpenCASCADE is built by the runner's vcpkg and cached between runs (an hour or so the first time, seconds afterwards; bump `OCCT_CACHE` in the workflow to rebuild it), then `packaging\bundle.ps1` makes the zip and the Inno Setup installer.
-- **macOS Apple Silicon** (`macos-latest`): `brew install opencascade`, then `packaging/bundle-macos.sh` makes the `.dmg` and the zip.
-
-Pushing a tag `v<version>` (e.g. `git tag v0.0.4 && git push origin v0.0.4`) builds both and attaches them to a **draft** GitHub release of that tag, to write the notes before publishing. *Run workflow* on the Actions page builds both without a release and keeps them as workflow artifacts, to try a build. The version in the file names comes from the workspace `Cargo.toml`; keep it and the tag in step.
+Executables are built by hand, on a machine of each kind (no hosted build service is used): `packagingundle.ps1` on a Windows PC gives the zip and the installer, `packaging/bundle-macos.sh` on an Apple Silicon Mac gives the `.dmg` and the zip. Both read the version from the workspace `Cargo.toml` and check the bundle by running it with `--version`. To release: bump the version, run both scripts, tag the commit (`git tag v0.0.4`) and attach the four files to a GitHub release of that tag.
 
 ## 6. Troubleshooting
 
