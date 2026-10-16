@@ -226,6 +226,10 @@ pub struct OxydeApp {
     pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
     /// Move Component is on: a plain left-drag moves a component (Shift turns it).
     pub(crate) move_mode: bool,
+    /// An arrow of the move handle being dragged.
+    pub(crate) move_handle: Option<crate::assembly_ui::HandleDrag>,
+    /// The move handle's arrows as drawn last frame, to know what the pointer is on.
+    pub(crate) handle_shapes: Vec<crate::assembly_ui::HandleArrow>,
     /// A component whose part should open once unsaved changes are dealt with.
     pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
     /// The assemblies set aside while a component is edited in place, outermost first.
@@ -294,6 +298,8 @@ impl OxydeApp {
             asm_scene: None,
             grabbing: None,
             move_mode: false,
+            move_handle: None,
+            handle_shapes: Vec::new(),
             pending_open_component: None,
             edit_stack: Vec::new(),
             after_unwind: None,

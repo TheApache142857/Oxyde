@@ -181,6 +181,9 @@ pub struct Viewport {
     pub grab_without_alt: bool,
     /// The pick under the pointer when the current grab started.
     grabbed: Option<Option<Pick>>,
+    /// The pointer is on an overlay the assembly handles itself (the move handle): the
+    /// left button neither turns, grabs, boxes nor clicks this frame.
+    pub pointer_taken: bool,
     /// The model point an orbit drag turns about, from the press to the release.
     pivot: Option<[f64; 3]>,
     pub settings: ViewSettings,
@@ -215,6 +218,7 @@ impl Viewport {
             grab_enabled: false,
             grab_without_alt: false,
             grabbed: None,
+            pointer_taken: false,
             pivot: None,
             settings: ViewSettings::default(),
             preselect: Vec::new(),
@@ -410,12 +414,14 @@ impl Viewport {
         let delta = response.drag_delta();
         let middle = response.dragged_by(egui::PointerButton::Middle);
         let secondary = response.dragged_by(egui::PointerButton::Secondary);
-        let mut primary = response.dragged_by(egui::PointerButton::Primary);
+        let taken = self.pointer_taken;
+        let mut primary = response.dragged_by(egui::PointerButton::Primary) && !taken;
         if response.double_clicked_by(egui::PointerButton::Middle) {
             self.fit_pending = true;
         }
         let scheme = self.settings.mouse;
-        let started = |b| response.drag_started_by(b);
+        let started =
+            |b| response.drag_started_by(b) && !(taken && b == egui::PointerButton::Primary);
         use egui::PointerButton::{Middle, Primary, Secondary};
         // An orbit drag turns about what was under the pointer when it started.
         let orbit_started = match scheme {
@@ -440,7 +446,7 @@ impl Viewport {
         // Alt+drag grabs; it keeps grabbing until the button is released.
         if self.grab_enabled
             && (alt || self.grab_without_alt)
-            && response.drag_started_by(egui::PointerButton::Primary)
+            && started(egui::PointerButton::Primary)
             && self.grabbed.is_none()
         {
             self.grabbed = Some(self.hovered);
@@ -566,7 +572,7 @@ impl Viewport {
                 Pick::Edge(i) => *i < edges,
             });
         }
-        let clicked = (response.clicked() && !sketching).then_some(self.hovered);
+        let clicked = (response.clicked() && !sketching && !taken).then_some(self.hovered);
         let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command || i.modifiers.shift);
 
         let key = RenderKey {

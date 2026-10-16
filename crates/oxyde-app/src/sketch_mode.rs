@@ -2043,7 +2043,7 @@ fn arc_path(center: Point2, start: Point2, end: Point2) -> Vec<Point2> {
     arc_points(center, center.distance(start), a0, sweep, 48)
 }
 
-fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+pub(crate) fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let t = if ab.length_sq() > 0.0 {
         ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0)

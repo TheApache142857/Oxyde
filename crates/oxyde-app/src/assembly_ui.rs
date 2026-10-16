@@ -851,8 +851,12 @@ impl OxydeApp {
     /// component under the pointer (Shift+drag turns it), as SolidWorks' Move Component.
     pub(crate) fn toggle_move_mode(&mut self) {
         self.move_mode = !self.move_mode;
+        self.move_handle = None;
+        self.handle_shapes.clear();
         self.status = if self.move_mode {
-            "Move Component: drag a component, Shift+drag turns it; Esc ends".to_owned()
+            "Move Component: drag a component, or an arrow of its handle along X, Y or Z; \
+             Shift+drag turns it; Esc ends"
+                .to_owned()
         } else {
             "Move Component ended".to_owned()
         };
@@ -2228,9 +2232,14 @@ impl OxydeApp {
         if self.move_mode && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.toggle_move_mode();
         }
+        // A press on the move handle (as drawn last frame) is the handle's, not the view's.
+        let hover = ui.ctx().pointer_hover_pos();
+        self.viewport.pointer_taken = self.move_handle.is_some()
+            || hover.is_some_and(|p| handle_arrow_at(&self.handle_shapes, p).is_some());
         let output = self.viewport.ui(ui, picks, hint, false);
         self.viewport_rect = output.rect;
         let overlays = self.draw_assembly_references(ui, &output);
+        self.move_handle_ui(ui, &output);
 
         if let Some(grab) = output.grab {
             self.grab_component(&grab);
@@ -2466,6 +2475,107 @@ impl OxydeApp {
             crate::app::paint_origin(&painter, &to_screen);
         }
         overlays
+    }
+
+    /// The XYZ handle of Move Component, as Creo's drag handle or Cura's: three arrows
+    /// along the assembly's axes at the selected component (the one being dragged, else
+    /// the first selected free one). Dragging an arrow slides the component along that
+    /// axis alone, the mates pulling it back as with a plain drag.
+    fn move_handle_ui(&mut self, ui: &egui::Ui, output: &crate::viewport::ViewportOutput) {
+        self.handle_shapes.clear();
+        if !self.move_mode || self.mate_dialog.is_some() {
+            self.move_handle = None;
+            return;
+        }
+        let Some(doc) = self.asm.as_ref() else {
+            return;
+        };
+        let id = match self.move_handle {
+            Some(drag) => Some(drag.component),
+            None => self.grabbing.or_else(|| {
+                doc.selection
+                    .iter()
+                    .filter_map(|s| s.component())
+                    .find(|c| *c != ComponentId::ASSEMBLY)
+            }),
+        };
+        let Some(id) = id else {
+            return;
+        };
+        let (Some(component), Some((lo, hi))) = (doc.component(id), doc.component_bounds(id))
+        else {
+            self.move_handle = None;
+            return;
+        };
+        if component.fixed {
+            return;
+        }
+        let center = component.placement.apply_point(Point3::new(
+            (lo.x + hi.x) / 2.0,
+            (lo.y + hi.y) / 2.0,
+            (lo.z + hi.z) / 2.0,
+        ));
+        let to_screen = |p: Point3| self.viewport.to_screen(p, output);
+        let origin = to_screen(center);
+        // Arrows of a fixed length on screen; an axis seen end-on is left out.
+        let mut arrows = Vec::new();
+        for (axis, direction) in HANDLE_AXES.into_iter().enumerate() {
+            let d = to_screen(center + direction) - origin;
+            if d.length() < 1e-4 {
+                continue;
+            }
+            arrows.push(HandleArrow {
+                axis,
+                from: origin,
+                to: origin + d.normalized() * HANDLE_LENGTH,
+            });
+        }
+        let response = &output.response;
+        let pointer = response
+            .hover_pos()
+            .or_else(|| response.interact_pointer_pos());
+        let hot = match self.move_handle {
+            Some(drag) => Some(drag.axis),
+            None => pointer
+                .and_then(|p| handle_arrow_at(&arrows, p))
+                .map(|a| a.axis),
+        };
+
+        // Dragging an arrow.
+        if self.move_handle.is_none()
+            && response.drag_started_by(egui::PointerButton::Primary)
+            && let (Some(axis), Some(at)) = (hot, response.interact_pointer_pos())
+        {
+            if let Some(doc) = self.asm.as_mut() {
+                doc.checkpoint();
+            }
+            self.move_handle = Some(HandleDrag {
+                component: id,
+                axis,
+                last: at,
+            });
+        }
+        if let Some(mut drag) = self.move_handle {
+            match response.interact_pointer_pos() {
+                Some(at) if response.dragged_by(egui::PointerButton::Primary) => {
+                    let direction = HANDLE_AXES[drag.axis];
+                    let mm = axis_shift(at - drag.last, to_screen(center + direction) - origin);
+                    drag.last = at;
+                    self.move_handle = Some(drag);
+                    if let Some(doc) = self.asm.as_mut() {
+                        if let Some(c) = doc.assembly.component_mut(id) {
+                            c.placement = c.placement.moved(Vec3::ZERO, center, direction * mm);
+                        }
+                        doc.solve();
+                    }
+                }
+                _ => self.move_handle = None,
+            }
+        }
+
+        let painter = ui.painter_at(output.rect);
+        paint_move_handle(&painter, &arrows, hot);
+        self.handle_shapes = arrows;
     }
 
     /// Alt+drag: slides (or turns) the grabbed component, then lets the mates pull it back.
@@ -3019,8 +3129,146 @@ pub(crate) fn has_extension(path: &Path, extension: &str) -> bool {
 }
 
 /// Whether a file is an assembly: by extension, else by its manifest.
+/// The axes of the move handle, in assembly coordinates.
+const HANDLE_AXES: [Vec3; 3] = [Vec3::X, Vec3::Y, Vec3::Z];
+/// Length of the handle's arrows on screen, in points.
+const HANDLE_LENGTH: f32 = 80.0;
+/// How near the pointer must be to an arrow to take it, in points.
+const HANDLE_REACH: f32 = 9.0;
+
+/// An arrow of the move handle as drawn, for hit testing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HandleArrow {
+    /// 0, 1, 2 for X, Y, Z.
+    pub axis: usize,
+    pub from: egui::Pos2,
+    pub to: egui::Pos2,
+}
+
+/// A drag of one arrow of the move handle.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandleDrag {
+    pub component: ComponentId,
+    pub axis: usize,
+    /// Where the pointer was when the component was last moved.
+    pub last: egui::Pos2,
+}
+
+/// The arrow under a screen position, the nearest when several are.
+pub(crate) fn handle_arrow_at(arrows: &[HandleArrow], at: egui::Pos2) -> Option<HandleArrow> {
+    arrows
+        .iter()
+        .map(|a| (a, crate::sketch_mode::segment_distance(at, a.from, a.to)))
+        .filter(|(_, d)| *d <= HANDLE_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(a, _)| *a)
+}
+
+/// How far a pointer movement slides along an axis, in mm: the movement projected on the
+/// axis as it appears on screen, where `per_mm` is one millimetre of the axis on screen.
+pub(crate) fn axis_shift(delta: egui::Vec2, per_mm: egui::Vec2) -> f64 {
+    let length2 = per_mm.length_sq();
+    if length2 < 1e-12 {
+        return 0.0;
+    }
+    (delta.dot(per_mm) / length2) as f64
+}
+
+fn handle_color(axis: usize, hot: bool) -> Color32 {
+    if hot {
+        return Color32::from_rgb(255, 190, 40);
+    }
+    match axis {
+        0 => Color32::from_rgb(210, 50, 50),
+        1 => Color32::from_rgb(40, 150, 60),
+        _ => Color32::from_rgb(50, 90, 220),
+    }
+}
+
+/// Draws the move handle: arrows with heads and letters, the held or hovered one in
+/// yellow, and a knob at the centre.
+fn paint_move_handle(painter: &egui::Painter, arrows: &[HandleArrow], hot: Option<usize>) {
+    let halo = Color32::from_rgba_unmultiplied(255, 255, 255, 150);
+    for arrow in arrows {
+        let d = (arrow.to - arrow.from).normalized();
+        let side = egui::vec2(-d.y, d.x);
+        let is_hot = hot == Some(arrow.axis);
+        let color = handle_color(arrow.axis, is_hot);
+        let width = if is_hot { 4.5_f32 } else { 3.0_f32 };
+        let shaft = arrow.to - d * 10.0;
+        painter.line_segment([arrow.from, shaft], Stroke::new(width + 2.5, halo));
+        painter.line_segment([arrow.from, shaft], Stroke::new(width, color));
+        painter.add(egui::Shape::convex_polygon(
+            vec![arrow.to, shaft + side * 5.5, shaft - side * 5.5],
+            color,
+            Stroke::new(1.0_f32, halo),
+        ));
+        painter.text(
+            arrow.to + d * 11.0,
+            egui::Align2::CENTER_CENTER,
+            ["X", "Y", "Z"][arrow.axis.min(2)],
+            egui::FontId::proportional(13.0),
+            color,
+        );
+    }
+    if let Some(first) = arrows.first() {
+        painter.circle(
+            first.from,
+            4.5,
+            Color32::WHITE,
+            Stroke::new(1.5_f32, Color32::from_gray(70)),
+        );
+    }
+}
+
 pub(crate) fn is_assembly(path: &Path) -> bool {
     has_extension(path, oxyde_format::ASSEMBLY_EXTENSION)
         || oxyde_format::document_kind(path)
             .is_ok_and(|(kind, _)| kind == oxyde_format::DocumentKind::Assembly)
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn the_nearest_arrow_within_reach_is_taken() {
+        let o = egui::pos2(100.0, 100.0);
+        let arrows = [
+            HandleArrow {
+                axis: 0,
+                from: o,
+                to: egui::pos2(180.0, 100.0),
+            },
+            HandleArrow {
+                axis: 1,
+                from: o,
+                to: egui::pos2(100.0, 20.0),
+            },
+        ];
+        assert_eq!(
+            handle_arrow_at(&arrows, egui::pos2(150.0, 104.0)).map(|a| a.axis),
+            Some(0)
+        );
+        assert_eq!(
+            handle_arrow_at(&arrows, egui::pos2(97.0, 50.0)).map(|a| a.axis),
+            Some(1)
+        );
+        assert_eq!(handle_arrow_at(&arrows, egui::pos2(150.0, 120.0)), None);
+        // At the shared origin the first arrow wins the tie.
+        assert_eq!(handle_arrow_at(&arrows, o).map(|a| a.axis), Some(0));
+    }
+
+    #[test]
+    fn a_pointer_movement_slides_by_its_projection_on_the_axis() {
+        // One millimetre is 4 points to the right and 3 down.
+        let per_mm = egui::vec2(4.0, 3.0);
+        assert!((axis_shift(egui::vec2(8.0, 6.0), per_mm) - 2.0).abs() < 1e-9);
+        assert!(
+            (axis_shift(egui::vec2(-3.0, 4.0), per_mm)).abs() < 1e-9,
+            "across: nothing"
+        );
+        assert!((axis_shift(egui::vec2(-4.0, -3.0), per_mm) + 1.0).abs() < 1e-9);
+        assert_eq!(axis_shift(egui::vec2(5.0, 5.0), egui::Vec2::ZERO), 0.0);
+    }
 }

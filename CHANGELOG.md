@@ -5,7 +5,12 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### Sketch Fillet and Offset Entities (unreleased, October 2026)
+### Sketch Fillet, Offset Entities, a move handle (unreleased, October 2026)
+
+- **XYZ move handle.** While Move Component is on, the selected component (or the one
+  being dragged) shows three arrows along the assembly's X, Y and Z axes, as Creo's drag
+  handle or Cura's; dragging an arrow slides the part along that axis alone, with the
+  mates pulling it back as with a plain drag. A fixed component shows none.
 
 - **Sketch Fillet** (Sketch tab): rounds the corner where two lines meet. Set the radius in
   the tool's window, then click the corner point, or the two lines one after the other; the
