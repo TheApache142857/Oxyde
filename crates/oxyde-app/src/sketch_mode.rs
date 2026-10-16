@@ -243,6 +243,9 @@ pub struct SketchSession {
     pub selected_dimensions: Vec<RelationId>,
     /// Created by the "Sketch" command (as opposed to editing an existing sketch).
     pub new_sketch: bool,
+    /// Whether the document had unsaved changes before a new sketch was started: what it
+    /// goes back to when the sketch is left with nothing drawn.
+    pub unsaved_before: bool,
     /// Where the rollback bar was before editing started.
     pub restore_rollback: Option<FeatureId>,
     pub message: Option<String>,
@@ -295,6 +298,7 @@ impl SketchSession {
             selection: Vec::new(),
             selected_dimensions: Vec::new(),
             new_sketch,
+            unsaved_before: false,
             restore_rollback,
             message: None,
             driven: HashSet::new(),
@@ -1255,9 +1259,29 @@ impl SketchSession {
                     );
                     let c = self.realize(center);
                     let s = self.realize(start);
-                    let e = self.sketch.point(end_at);
-                    self.sketch.arc_between(c, s, e);
-                    self.solve_new_shape(relations_before);
+                    // The end joins the point it snapped to, as a line's end does, when
+                    // the relations allow it (the arc's ends must stay at one distance
+                    // from its centre); else it is a new point, tied to what it snapped
+                    // to (the middle of a line, a curve…) where that is.
+                    let before = self.sketch.clone();
+                    let joined = match p.snap {
+                        Some(Snap::Point(q)) if q != c && q != s => {
+                            self.sketch.arc_between(c, s, q);
+                            self.solve()
+                        }
+                        _ => false,
+                    };
+                    if !joined {
+                        self.sketch = before;
+                        let (at, snap) = match p.snap {
+                            Some(Snap::Point(_)) | None => (end_at, None),
+                            other => (p.at, other),
+                        };
+                        let e = self.sketch.point(at);
+                        self.attach(e, snap);
+                        self.sketch.arc_between(c, s, e);
+                        self.solve_new_shape(relations_before);
+                    }
                 }
                 self.pending.clear();
             }
@@ -1812,7 +1836,7 @@ impl SketchSession {
                 let m = s.midpoint_of(first)?;
                 Some(DimensionGraphics {
                     anchor: to_screen(m) + Vec2::new(16.0, -16.0),
-                    text: format!("{:.1}°", value.to_degrees()),
+                    text: format!("{:.1}°", value.to_degrees().abs()),
                     lines: Vec::new(),
                     arrows: Vec::new(),
                 })
@@ -1898,7 +1922,12 @@ fn dimension_options(s: &ConstrainedSketch, selection: &[EntityId]) -> Vec<Dimen
             (Some(Geometry::Line { .. }), Some(Geometry::Line { .. })) => {
                 let angle = s.angle_between(*a, *b).unwrap_or(0.0);
                 let folded = angle.abs().min(std::f64::consts::PI - angle.abs());
-                let angle_option = option("Angle…", Angle(*a, *b, angle), angle.to_degrees(), true);
+                let angle_option = option(
+                    "Angle…",
+                    Angle(*a, *b, angle),
+                    angle.to_degrees().abs(),
+                    true,
+                );
                 if folded < PARALLEL {
                     let distance = s.midpoint_of(*a).and_then(|m| {
                         let (p, q) = s.endpoints(*b)?;
@@ -2011,13 +2040,29 @@ fn draw_snap(painter: &egui::Painter, at: Pos2, snap: Snap) {
     }
 }
 
-/// The value of a dimension, as shown to the user (degrees for angles).
+/// The value of a dimension, as shown to the user: degrees for angles, without the
+/// sign the model keeps for which way round the angle goes (see [`typed_value`]).
 pub fn dimension_value(c: &Constraint) -> Option<(f64, bool)> {
     let value = c.value()?;
     if c.is_angle() {
-        Some((value.to_degrees(), true))
+        Some((value.to_degrees().abs(), true))
     } else {
         Some((value, false))
+    }
+}
+
+/// A value typed for a dimension, in the model's units: radians for an angle, on the
+/// same side as `current` (the value the dimension has now), since the angle is shown
+/// unsigned; a negative number typed puts it on the other side.
+pub fn typed_value(c: &Constraint, typed: f64) -> f64 {
+    if !c.is_angle() {
+        return typed;
+    }
+    let radians = typed.to_radians();
+    if c.value().is_some_and(|current| current < 0.0) {
+        -radians
+    } else {
+        radians
     }
 }
 
@@ -2682,6 +2727,73 @@ mod tests {
             .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
             .count();
         assert_eq!(lines, 4);
+    }
+
+    #[test]
+    fn an_arc_ends_on_the_point_it_snapped_to() {
+        let mut s = ConstrainedSketch::new();
+        // A slot's straight sides; the arc closes one end onto the top line's end.
+        let bottom = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let top = s.line(Point2::new(0.0, 6.0), Point2::new(10.0, 6.0));
+        let (_, bottom_end) = s.endpoints(bottom).unwrap();
+        let (_, top_end) = s.endpoints(top).unwrap();
+        let mut slot = session(s);
+        slot.set_tool(Tool::Arc);
+        slot.click_tool(Pending {
+            at: Point2::new(10.0, 3.0),
+            snap: None,
+        });
+        slot.click_tool(Pending {
+            at: Point2::new(10.0, 0.0),
+            snap: Some(Snap::Point(bottom_end)),
+        });
+        slot.click_tool(Pending {
+            at: Point2::new(10.0, 6.0),
+            snap: Some(Snap::Point(top_end)),
+        });
+        let arc = slot
+            .sketch
+            .entities()
+            .iter()
+            .find_map(|e| match e.geometry {
+                Geometry::Arc { start, end, .. } => Some((start, end)),
+                _ => None,
+            })
+            .expect("an arc was drawn");
+        assert_eq!(arc, (bottom_end, top_end), "the arc shares the lines' ends");
+        assert!(slot.report.as_ref().unwrap().converged);
+
+        // Snapped to the middle of a line instead: a new point, kept there.
+        let mut s = ConstrainedSketch::new();
+        let side = s.line(Point2::new(5.0, -5.0), Point2::new(5.0, 5.0));
+        let mut other = session(s);
+        other.set_tool(Tool::Arc);
+        for (at, snap) in [
+            (Point2::ORIGIN, None),
+            (Point2::new(0.0, 5.0), None),
+            (Point2::new(5.0, 0.0), Some(Snap::Midpoint(side))),
+        ] {
+            other.click_tool(Pending { at, snap });
+        }
+        assert!(has(
+            &other,
+            |c| matches!(c, Constraint::Midpoint(_, l) if *l == side)
+        ));
+        assert!(other.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn angles_are_shown_and_typed_without_their_sign() {
+        use super::{dimension_value, typed_value};
+        let clockwise = Constraint::Angle(EntityId(1), EntityId(2), -0.5);
+        assert_eq!(dimension_value(&clockwise).unwrap().0, 0.5f64.to_degrees());
+        // Typed back, the angle stays on its side; a negative number flips it.
+        assert!((typed_value(&clockwise, 30.0) + 30f64.to_radians()).abs() < 1e-12);
+        assert!((typed_value(&clockwise, -30.0) - 30f64.to_radians()).abs() < 1e-12);
+        let counter = Constraint::Angle(EntityId(1), EntityId(2), 0.5);
+        assert!((typed_value(&counter, 30.0) - 30f64.to_radians()).abs() < 1e-12);
+        // Lengths are what they are.
+        assert_eq!(typed_value(&Constraint::Length(EntityId(1), 4.0), 7.0), 7.0);
     }
 
     #[test]

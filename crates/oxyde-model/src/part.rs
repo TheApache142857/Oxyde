@@ -639,6 +639,9 @@ impl Part {
             .collect()
     }
 
+    /// The solved sketch of a built sketch feature. A sketch whose relations conflict
+    /// (status [`FeatureStatus::Error`]) is kept as stored, unsolved, so that it can be
+    /// shown and opened again.
     pub fn sketch_result(&self, id: FeatureId) -> Option<&SketchResult> {
         let index = self.index_of(id)?;
         if index >= self.built() {
@@ -773,6 +776,9 @@ impl<'a> Context<'a> {
     fn profile_sketch(&self, sketch: FeatureId) -> Result<(&'a SketchResult, &'a Profile), String> {
         let (feature, result) = self.earlier(sketch)?;
         let name = &feature.name;
+        if matches!(result.status, FeatureStatus::Error(_)) {
+            return Err(format!("{name} has errors"));
+        }
         let solved = result
             .sketch
             .as_ref()
@@ -806,11 +812,15 @@ fn build_feature<K: Kernel>(
 
     let outcome = (|| -> Result<(), String> {
         match &feature.kind {
-            FeatureKind::Sketch(sketch) => {
-                result.sketch = Some(build_sketch(&ctx, sketch, &mut warnings)?);
-            }
+            FeatureKind::Sketch(sketch) => match build_sketch(&ctx, sketch, &mut warnings) {
+                Ok(built) => result.sketch = Some(built),
+                Err(failure) => {
+                    result.sketch = failure.partial;
+                    return Err(failure.message);
+                }
+            },
             FeatureKind::Extrude(extrude) => {
-                let (body, tool) = build_extrude(&ctx, extrude, kernel)?;
+                let (body, tool) = build_extrude(&ctx, extrude, kernel, &mut warnings)?;
                 result.produced = Some(body);
                 result.tool = Some(tool);
             }
@@ -864,7 +874,7 @@ fn build_feature<K: Kernel>(
                 result.import_appearances = appearances;
             }
             FeatureKind::Combine(combine) => {
-                result.produced = Some(build_combine(&ctx, combine, kernel)?);
+                result.produced = Some(build_combine(&ctx, combine, kernel, &mut warnings)?);
             }
         }
         Ok(())
@@ -878,9 +888,14 @@ fn build_feature<K: Kernel>(
             result
         }
         Err(message) => {
-            // Nothing is kept from a failed feature.
+            // Nothing is kept from a failed feature, but the geometry of a sketch whose
+            // relations conflict (as stored, unsolved): it is still shown, and can be
+            // opened to be repaired.
+            let sketch = result.sketch.take();
             result.release(kernel);
-            FeatureResult::with_status(FeatureStatus::Error(message))
+            let mut failed = FeatureResult::with_status(FeatureStatus::Error(message));
+            failed.sketch = sketch;
+            failed
         }
     }
 }
@@ -912,11 +927,28 @@ fn face_plane(body: &Body, index: u32) -> Option<Plane> {
     Plane::from_point_normal(face.centroid, face.normal?)
 }
 
+/// Why a sketch could not be built, and what could be kept of it: a sketch whose
+/// relations conflict keeps its geometry as stored, so that it is still drawn and can be
+/// opened to be repaired (a sketch without its plane keeps nothing).
+struct SketchFailure {
+    message: String,
+    partial: Option<SketchResult>,
+}
+
+impl From<String> for SketchFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            partial: None,
+        }
+    }
+}
+
 fn build_sketch(
     ctx: &Context<'_>,
     sketch: &Sketch,
     warnings: &mut Vec<String>,
-) -> Result<SketchResult, String> {
+) -> Result<SketchResult, SketchFailure> {
     let plane = match &sketch.plane {
         SketchPlane::Standard(standard) => standard.plane(),
         SketchPlane::Face(name) => ctx.plane(&PlaneRef::Face(name.clone()), warnings)?,
@@ -925,10 +957,20 @@ fn build_sketch(
     let mut solved = sketch.geometry.clone();
     let report = solved.solve().map_err(|e| e.to_string())?;
     if !report.converged {
-        return Err(format!(
-            "the sketch is over-defined: {} conflicting relation(s)",
-            report.count(ConstraintState::Conflicting).max(1)
-        ));
+        // The geometry is left as stored: an over-defined sketch must still be seen, and
+        // opened to take the conflicting relation away.
+        return Err(SketchFailure {
+            message: format!(
+                "the sketch is over-defined: {} conflicting relation(s)",
+                report.count(ConstraintState::Conflicting).max(1)
+            ),
+            partial: Some(SketchResult {
+                plane,
+                profile: Profile::from_curves(&solved.profile_segments()),
+                degrees_of_freedom: 0,
+                solved,
+            }),
+        });
     }
     let redundant = report.count(ConstraintState::Redundant);
     if redundant > 0 {
@@ -1139,6 +1181,14 @@ fn tool_targets(
 
 /// Joins, cuts, intersects or adds as a new body a swept tool: the bodies after the
 /// feature, and the tool kept for patterns.
+/// Whether a boolean left a body as it was, by its volume: a cut that missed it.
+fn same_volume(before: Option<f64>, after: Option<f64>) -> bool {
+    match (before, after) {
+        (Some(b), Some(a)) => (b - a).abs() <= 1e-9 * b.abs().max(1.0),
+        _ => false,
+    }
+}
+
 fn apply_tool<K: Kernel>(
     ctx: &Context<'_>,
     op: ExtrudeOp,
@@ -1146,6 +1196,7 @@ fn apply_tool<K: Kernel>(
     sketch: FeatureId,
     tool: OpResult,
     kernel: &mut K,
+    warnings: &mut Vec<String>,
 ) -> Result<(Body, ToolBody), String> {
     let id = ctx.feature().id;
     let tool_names = sweep_names(id, &tool.history);
@@ -1204,17 +1255,56 @@ fn apply_tool<K: Kernel>(
                 Ok(())
             }
             ToolOp::Cut | ToolOp::Intersect => {
+                let mut untouched = Vec::new();
                 for target in &targets {
-                    if let Some(index) = work.find(*target) {
-                        combine_into(
-                            &mut work,
-                            index,
-                            op.boolean(),
-                            tool.shape,
-                            &tool_names,
-                            kernel,
-                        )?;
+                    let Some(index) = work.find(*target) else {
+                        continue;
+                    };
+                    let before = kernel.volume(work.pieces[index].shape).ok();
+                    combine_into(
+                        &mut work,
+                        index,
+                        op.boolean(),
+                        tool.shape,
+                        &tool_names,
+                        kernel,
+                    )?;
+                    match work.find(*target) {
+                        // Nothing in common: the body would vanish without a word. (A cut
+                        // may take a whole body away: that is what it was for.)
+                        None if op == ToolOp::Intersect => {
+                            return Err(format!(
+                                "body {target} has nothing in common with the sketch's \
+                                 shape: the intersection is empty"
+                            ));
+                        }
+                        None => {}
+                        Some(index) if op == ToolOp::Cut => {
+                            let after = kernel.volume(work.pieces[index].shape).ok();
+                            if same_volume(before, after) {
+                                untouched.push(*target);
+                            }
+                        }
+                        Some(_) => {}
                     }
+                }
+                // A cut that misses every body does nothing, which is easy to miss: it
+                // usually goes the wrong way (away from the body) or lies beside it.
+                if !untouched.is_empty() {
+                    warnings.push(if untouched.len() == targets.len() {
+                        "the cut removed nothing: reverse its direction, or check that \
+                         the sketch lies on the body"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "the cut removed nothing from {}",
+                            untouched
+                                .iter()
+                                .map(|b| format!("body {b}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    });
                 }
                 Ok(())
             }
@@ -1342,6 +1432,7 @@ fn build_extrude<K: Kernel>(
     ctx: &Context<'_>,
     extrude: &Extrude,
     kernel: &mut K,
+    warnings: &mut Vec<String>,
 ) -> Result<(Body, ToolBody), String> {
     let (sketch, profile) = ctx.profile_sketch(extrude.sketch)?;
     let depth = extrude.extent.depth();
@@ -1371,6 +1462,7 @@ fn build_extrude<K: Kernel>(
         extrude.sketch,
         tool,
         kernel,
+        warnings,
     )
 }
 
@@ -1428,6 +1520,7 @@ fn build_revolve<K: Kernel>(
         revolve.sketch,
         tool,
         kernel,
+        warnings,
     )
 }
 
@@ -1557,6 +1650,7 @@ fn build_combine<K: Kernel>(
     ctx: &Context<'_>,
     combine: &Combine,
     kernel: &mut K,
+    warnings: &mut Vec<String>,
 ) -> Result<Body, String> {
     let body = ctx.body()?;
     if body.solid(combine.target).is_none() {
@@ -1579,6 +1673,11 @@ fn build_combine<K: Kernel>(
     let id = ctx.feature().id;
     let mut work = Working::from(ctx.body);
     let outcome = (|| -> Result<(), String> {
+        let volume = |work: &Working, kernel: &mut K| {
+            work.find(combine.target)
+                .and_then(|i| kernel.volume(work.pieces[i].shape).ok())
+        };
+        let before = volume(&work, kernel);
         for tool in &combine.tools {
             merge_bodies(
                 &mut work,
@@ -1588,6 +1687,20 @@ fn build_combine<K: Kernel>(
                 combine.keep_tools,
                 kernel,
             )?;
+            if work.find(combine.target).is_none() {
+                return Err(match combine.op {
+                    CombineOp::Intersect => {
+                        "the bodies have nothing in common: the intersection is empty"
+                    }
+                    _ => "nothing is left of the target body",
+                }
+                .to_owned());
+            }
+        }
+        if combine.op == CombineOp::Cut && same_volume(before, volume(&work, kernel)) {
+            warnings.push(
+                "the cut removed nothing: the tool bodies do not reach the target".to_owned(),
+            );
         }
         Ok(())
     })();

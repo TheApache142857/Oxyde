@@ -468,11 +468,14 @@ impl OxydeApp {
                     PanelPick::Face(f) if self.face_is_planar(f) => {
                         Some(SketchPlane::Face(f.clone()))
                     }
+                    // Only a plane before the rollback bar: the sketch goes there, and a
+                    // feature may only refer to what comes before it.
                     PanelPick::Feature(id)
-                        if matches!(
-                            self.doc.part.feature(*id).map(|f| f.kind()),
-                            Some(FeatureKind::Plane(_))
-                        ) =>
+                        if self.usable(*id, None)
+                            && matches!(
+                                self.doc.part.feature(*id).map(|f| f.kind()),
+                                Some(FeatureKind::Plane(_))
+                            ) =>
                     {
                         Some(SketchPlane::Reference(*id))
                     }

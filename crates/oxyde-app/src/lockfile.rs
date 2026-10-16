@@ -120,6 +120,12 @@ pub fn read(document: &Path) -> Option<LockInfo> {
     serde_json::from_str(&text).ok()
 }
 
+/// Who edits `document` in another running window, if anyone: a file that must not be
+/// written over from here.
+pub fn held_elsewhere(document: &Path) -> Option<LockInfo> {
+    read(document).filter(|lock| !lock.is_ours() && !lock.is_stale())
+}
+
 /// The locks this window holds.
 #[derive(Debug, Default)]
 pub struct Locks {

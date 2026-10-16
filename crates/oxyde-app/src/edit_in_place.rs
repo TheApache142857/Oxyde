@@ -75,7 +75,7 @@ impl OxydeApp {
 
     /// Asks what to do about a file another window is editing.
     pub(crate) fn ask_about_lock(&mut self, path: &Path, holder: LockInfo, request: OpenRequest) {
-        self.dialog = Some(Dialog::Locked {
+        self.open_dialog(Dialog::Locked {
             path: path.to_path_buf(),
             holder,
             request,
@@ -178,7 +178,7 @@ impl OxydeApp {
         // The edited document stays on screen while the assembly's changed files (the
         // edited one, usually) are read again off the UI thread; `assembly_back` follows.
         self.sketch = None;
-        self.dialog = None;
+        self.close_dialog();
         self.assembly_back_job(suspended);
     }
 
@@ -192,10 +192,10 @@ impl OxydeApp {
         if self.asm.is_some() {
             self.leave_assembly();
         } else {
+            self.close_dialog();
             self.doc.release(&mut self.kernel);
             self.doc = crate::document::Document::new();
             self.sketch = None;
-            self.dialog = None;
             self.stl = None;
             self.selection.clear();
             self.selected_feature = None;

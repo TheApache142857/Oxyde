@@ -5,6 +5,57 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Second bug hunt: unwanted behaviours (unreleased, October 2026)
+
+Read through the application and the modelling engine for what they do that nobody
+asked for, and fixed:
+
+- **An over-defined sketch can be opened again.** A sketch whose relations conflict
+  (two widths typed, an equation driving a dimension to an impossible value) failed
+  with an error and vanished from the viewport, and *Edit sketch* refused it with
+  "its plane is missing", so the conflict could not be taken away. The sketch now keeps
+  its geometry as stored: it is drawn, and opens in sketch mode with the conflicting
+  relations in red. Features built on it still fail until it is repaired.
+- **A cut that removes nothing says so.** A Cut-Extrude or Cut-Revolve that misses every
+  body (sketched on a standard plane, it goes against the plane's normal, away from a
+  boss built along it) rebuilt silently and changed nothing. It now gets a warning in
+  the tree, "the cut removed nothing: reverse its direction, or check that the sketch
+  lies on the body", named per body when only some were missed; Combine › Cut likewise.
+  An **Intersect** with nothing in common made the body vanish without a word; it is now
+  an error and the body stays. Same for Combine › Intersect.
+- **The arc's last click joins what it snapped to.** The Arc tool showed the snap
+  glyph on an existing point (the end of a line, to close a slot) and then put a new,
+  unrelated point there, so the contour stayed open. The arc now ends on that point,
+  as a line does, when the relations allow it (its two ends must stay as far from the
+  centre as each other), and a snap to a middle, a crossing or a curve is kept as the
+  matching relation.
+- **Angle dimensions read without a sign.** An angle measured clockwise showed as
+  "-45.0°" on the sketch and in the value window; typing 45 then swung the line to the
+  other side. The label and the window show 45°; a value typed keeps the angle on the
+  side it is, and a negative value puts it on the other side.
+- **A rolled-back reference plane cannot be picked for a new sketch** from the tree
+  while the Sketch command asks for a plane: the sketch went in before the plane it
+  was drawn on, failed, and the file was refused at Save ("would not open again").
+- **Leaving a new sketch with nothing drawn removes it**, whether by Exit Sketch,
+  Escape or Discard (only Discard did), and leaves neither an undo step nor an unsaved
+  mark behind: the document is as it was before the Sketch command.
+- **Opening another document forgets the one before**: what was selected in the Solid
+  Bodies folder, which features were expanded and which planes, sketches and axes were
+  hidden by hand stayed, by feature id, and applied to the new document's features of
+  the same id (a plane hidden in one part hid an unrelated sketch in the next).
+- **The Appearance panel's preview no longer leaks.** Opening another command or
+  window (double-clicking a feature, Rename, File › New…) over an Appearance panel
+  being previewed dropped the panel and left its preview on the part: a colour that was
+  never confirmed, with no undo step and no unsaved mark. The panel is cancelled first.
+- **Cancelling the lock question keeps the assembly.** Opening a part file that
+  another window edits, from an assembly, left the assembly before asking what to do;
+  Cancel then showed the part last open instead. The question comes first.
+- **Material and appearance changes respect other windows' edit locks.** Right-click ›
+  Material in an assembly rewrites the part files, and an appearance on a component
+  inside a sub-assembly rewrites that sub-assembly's file: a file being edited in
+  another Oxyde window was written over under it. Those files are skipped, with the
+  holder named, as Save refuses them.
+
 ### Sketch Fillet, Offset Entities, a move handle (unreleased, October 2026)
 
 - **XYZ move handle.** While Move Component is on, the selected component (or the one

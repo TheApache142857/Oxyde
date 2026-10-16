@@ -383,9 +383,17 @@ impl OxydeApp {
             self.status = "The sub-assembly's file cannot be written".to_owned();
             return;
         }
+        if let Some(holder) = crate::lockfile::held_elsewhere(&path) {
+            self.status = format!(
+                "{} is being edited by {}: its appearances are changed there",
+                path.display(),
+                holder.describe()
+            );
+            return;
+        }
         let fallback = Appearance::colored(self.viewport.settings.style.face);
         let appearance = component.appearance.clone().unwrap_or(fallback);
-        self.dialog = Some(Dialog::Appearance(AppearanceDialog {
+        self.open_dialog(Dialog::Appearance(AppearanceDialog {
             page: Page::Appearance,
             scope: Scope::Inner,
             faces: Vec::new(),
@@ -421,7 +429,7 @@ impl OxydeApp {
             Scope::Component(_) => None,
             _ => self.doc.part.material().cloned(),
         };
-        self.dialog = Some(Dialog::Appearance(AppearanceDialog {
+        self.open_dialog(Dialog::Appearance(AppearanceDialog {
             page,
             scope,
             faces,
@@ -895,6 +903,14 @@ impl OxydeApp {
                 }
                 let appearance = component.appearance.clone();
                 let id = component.id;
+                if let Some(holder) = crate::lockfile::held_elsewhere(&path) {
+                    self.status = format!(
+                        "Cannot write {}: it is being edited by {}",
+                        path.display(),
+                        holder.describe()
+                    );
+                    return;
+                }
                 let written = oxyde_format::load_assembly(&path).and_then(|mut file| {
                     if let Some(c) = file.assembly.component_mut(id) {
                         c.appearance = appearance;

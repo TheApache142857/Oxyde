@@ -88,6 +88,12 @@ impl Visibility {
     pub(crate) fn set_item_shown(&mut self, item: Item, shown: bool) {
         self.items.insert(item, shown);
     }
+
+    /// Forgets what was shown or hidden by hand: for another document, whose features
+    /// have other ids.
+    pub(crate) fn forget_items(&mut self) {
+        self.items.clear();
+    }
 }
 
 impl OxydeApp {

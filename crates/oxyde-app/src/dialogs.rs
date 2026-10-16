@@ -11,6 +11,7 @@ use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
 use crate::features_ui::{AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog};
+use crate::sketch_mode;
 
 pub struct ExtrudeDialog {
     /// The feature being edited, or `None` for a new one.
@@ -219,6 +220,22 @@ pub fn plane_name(plane: StandardPlane) -> &'static str {
 }
 
 impl OxydeApp {
+    /// Opens a command or a window in place of the one open. An Appearance panel is
+    /// cancelled first: its preview is on the part, and would otherwise stay there,
+    /// neither recorded for undo nor marked as a change.
+    pub(crate) fn open_dialog(&mut self, dialog: Dialog) {
+        self.close_dialog();
+        self.dialog = Some(dialog);
+    }
+
+    /// Closes the open command or window, cancelling an Appearance panel's preview.
+    pub(crate) fn close_dialog(&mut self) {
+        if let Some(Dialog::Appearance(d)) = self.dialog.take() {
+            self.cancel_appearance(d);
+        }
+        self.dialog = None;
+    }
+
     pub(crate) fn dialogs_ui(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.dialog.take() else {
             return;
@@ -416,25 +433,25 @@ impl OxydeApp {
             Dialog::Appearance(d) => self.apply_appearance(d),
             Dialog::ChoosePlane => {}
             Dialog::Dimension {
-                target,
-                name,
-                text,
-                angle,
-                ..
+                target, name, text, ..
             } => {
-                let Some(value) = parse_value(&text) else {
+                let Some(typed) = parse_value(&text) else {
                     return;
                 };
-                let value = if angle { value.to_radians() } else { value };
                 if let Some(session) = self.sketch.as_mut() {
                     match target {
                         DimensionTarget::New(relation) => {
+                            let value = sketch_mode::typed_value(&relation, typed);
                             session.add_dimension(relation, value);
                         }
                         DimensionTarget::Existing(id) => {
                             if let Some(name) = name {
                                 session.rename_dimension(id, name.trim());
                             }
+                            let Some(relation) = session.sketch.relation(id) else {
+                                return;
+                            };
+                            let value = sketch_mode::typed_value(&relation.constraint, typed);
                             session.set_dimension(id, value);
                         }
                     }

@@ -740,7 +740,7 @@ impl OxydeApp {
                     .feature(feature)
                     .map(|f| f.name().to_owned())
                     .unwrap_or_default();
-                self.dialog = Some(Dialog::Rename { feature, name });
+                self.open_dialog(Dialog::Rename { feature, name });
             }
             Action::Suppress(ids, suppressed) => {
                 self.doc.checkpoint();
@@ -829,7 +829,7 @@ impl OxydeApp {
         match kind.clone() {
             FeatureKind::Sketch(_) => self.edit_sketch(id, false),
             FeatureKind::Extrude(e) => {
-                self.dialog = Some(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
+                self.open_dialog(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
                     editing: Some(id),
                     dimension: self.parameter_full_name(id, FeatureParameter::Depth),
                     sketch: Some(e.sketch),
@@ -847,7 +847,7 @@ impl OxydeApp {
                 } else {
                     FeatureParameter::Distance
                 };
-                self.dialog = Some(Dialog::Blend(crate::dialogs::BlendDialog {
+                self.open_dialog(Dialog::Blend(crate::dialogs::BlendDialog {
                     editing: Some(id),
                     dimension: self.parameter_full_name(id, parameter),
                     fillet,

@@ -84,6 +84,22 @@ impl Document {
         self.editing = None;
     }
 
+    /// Drops the last undo step if it recorded the state the document is in now (but for
+    /// the ids handed out since): an edit taken back by hand, an empty sketch removed,
+    /// leaves no step behind. Returns whether it did.
+    pub fn drop_undo_if_current(&mut self) -> bool {
+        let Some(last) = self.undo.last() else {
+            return false;
+        };
+        let mut now = self.part.definition();
+        now.next_id = last.next_id;
+        if *last != now {
+            return false;
+        }
+        self.undo.pop();
+        true
+    }
+
     /// Records the current state before a change, as one undo step.
     pub fn checkpoint(&mut self) {
         self.push_undo(self.part.definition());

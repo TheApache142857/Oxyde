@@ -413,7 +413,7 @@ impl OxydeApp {
     /// Switches to `doc`, its parts loaded and its mates solved.
     pub(crate) fn enter_assembly_loaded(&mut self, doc: AssemblyDoc, notes: Vec<String>) {
         self.leave_assembly();
-        self.dialog = None;
+        self.close_dialog();
         self.stl = None;
         let errors = doc.solution.as_ref().map_or(0, Solution::errors);
         self.status = match (notes.first(), errors) {
@@ -962,6 +962,15 @@ impl OxydeApp {
         let mut done = 0;
         let mut failed = Vec::new();
         for path in paths {
+            // A part open for editing in another window is left to it, as Save is.
+            if let Some(holder) = crate::lockfile::held_elsewhere(path) {
+                failed.push(format!(
+                    "{}: being edited by {}",
+                    path.display(),
+                    holder.describe()
+                ));
+                continue;
+            }
             // The file first: a part that cannot be saved is left as it was.
             let saved = oxyde_format::load_part(path).and_then(|mut file| {
                 let old_name = file.definition.material.as_ref().map(|m| m.name.clone());
@@ -1240,7 +1249,7 @@ impl OxydeApp {
                 }
                 if ui.button("About Oxyde").clicked() {
                     ui.close_menu();
-                    self.dialog = Some(crate::dialogs::Dialog::About);
+                    self.open_dialog(crate::dialogs::Dialog::About);
                 }
             });
         });

@@ -622,14 +622,18 @@ impl OxydeApp {
         } else if let Some(id) = reference_plane {
             self.start_new_sketch(SketchPlane::Reference(id));
         } else {
-            self.dialog = Some(Dialog::ChoosePlane);
+            self.open_dialog(Dialog::ChoosePlane);
             self.status = "Select a plane or a flat face for the sketch".to_owned();
         }
     }
 
     pub(crate) fn start_new_sketch(&mut self, plane: SketchPlane) {
+        let unsaved = self.doc.modified;
         let id = self.add_feature(FeatureKind::Sketch(Sketch::new(plane)));
         self.edit_sketch(id, true);
+        if let Some(session) = self.sketch.as_mut() {
+            session.unsaved_before = unsaved;
+        }
     }
 
     /// Enters sketch mode on a sketch feature. Later features are rolled back while editing.
@@ -655,7 +659,11 @@ impl OxydeApp {
         let Some(plane) = self.doc.part.sketch_result(id).map(|r| r.plane) else {
             let _ = self.doc.part.roll_back_to(restore);
             self.rebuild();
-            self.status = format!("Cannot edit {name}: its plane is missing");
+            let why = match self.doc.part.status(id) {
+                Some(FeatureStatus::Error(message)) => message,
+                _ => "its plane is missing".to_owned(),
+            };
+            self.status = format!("Cannot edit {name}: {why}");
             return;
         };
         // Turn to the sketch and centre it, as SolidWorks does; an empty sketch frames the part.
@@ -681,7 +689,7 @@ impl OxydeApp {
         self.selection.clear();
         self.selected_plane = None;
         self.selected_feature = Some(id);
-        self.dialog = None;
+        self.close_dialog();
         let mut session = SketchSession::new(id, name, plane, sketch.geometry, new_sketch, restore);
         session.driven = self
             .doc
@@ -715,21 +723,29 @@ impl OxydeApp {
         };
         let _ = self.doc.part.roll_back_to(session.restore_rollback);
         let id = session.feature;
-        if keep && session.changed() {
+        // A brand-new sketch with nothing drawn (or whose drawing is discarded) goes, as
+        // SolidWorks removes a cancelled sketch: adding it was no edit either, so the
+        // undo step and the unsaved mark it left go with it.
+        let empty = session.new_sketch && session.original_empty && (!keep || !session.changed());
+        if keep && !empty && session.changed() {
             self.doc.checkpoint();
             if let Ok(FeatureKind::Sketch(sketch)) = self.doc.part.edit(id) {
                 sketch.geometry = session.sketch.clone();
             }
         }
-        if !keep && session.new_sketch && session.original_empty {
-            // Cancelling a brand-new sketch removes it, as SolidWorks does.
+        if empty {
             let _ = self.doc.part.delete(id);
+            if self.doc.drop_undo_if_current() {
+                self.doc.modified = session.unsaved_before;
+            }
             self.selected_feature = None;
         }
         self.rebuild();
         self.viewport.request_fit();
         self.tab = CommandTab::Features;
-        self.status = if keep {
+        self.status = if empty {
+            format!("Left {} with nothing drawn: it is removed", session.name)
+        } else if keep {
             format!(
                 "Closed {}. With it selected, click Extrude or Revolve to make a solid",
                 session.name
@@ -762,7 +778,7 @@ impl OxydeApp {
 
     fn begin_extrude(&mut self) {
         let sketch = self.sketch_to_use();
-        self.dialog = Some(Dialog::Extrude(ExtrudeDialog {
+        self.open_dialog(Dialog::Extrude(ExtrudeDialog {
             editing: None,
             dimension: None,
             sketch,
@@ -782,7 +798,7 @@ impl OxydeApp {
         if edges.is_empty() {
             self.status = "Click the edges to round in the graphics area".to_owned();
         }
-        self.dialog = Some(Dialog::Blend(BlendDialog {
+        self.open_dialog(Dialog::Blend(BlendDialog {
             editing: None,
             dimension: None,
             fillet,
@@ -830,7 +846,7 @@ impl OxydeApp {
             return;
         }
         if self.is_modified() {
-            self.dialog = Some(Dialog::Discard(action));
+            self.open_dialog(Dialog::Discard(action));
         } else {
             self.perform(action, ctx);
         }
@@ -915,15 +931,19 @@ impl OxydeApp {
 
     /// Switches to `doc`, already rebuilt (by a job, or empty).
     pub(crate) fn replace_document_built(&mut self, doc: Document) {
+        self.close_dialog();
         self.doc.release(&mut self.kernel);
         self.doc = doc;
         self.sketch = None;
-        self.dialog = None;
         self.stl = None;
         self.selection.clear();
         self.selected_feature = None;
         self.selected_features.clear();
         self.selected_plane = None;
+        self.selected_body = None;
+        // Feature ids mean something else in the new document.
+        self.expanded.clear();
+        self.visibility.forget_items();
         self.scene_revision = None;
         self.tab = CommandTab::Features;
         self.viewport.request_fit();
@@ -940,14 +960,15 @@ impl OxydeApp {
             self.open_assembly_with(path, mode);
             return;
         }
-        self.leave_assembly();
         if is_step(path) {
+            self.leave_assembly();
             self.open_step_as_part(path);
             return;
         }
         let read_only = match self.claim(path, mode) {
             Ok(read_only) => read_only,
             Err(holder) => {
+                // The assembly stays until the question is answered: Cancel keeps it.
                 self.ask_about_lock(
                     path,
                     holder,
@@ -956,6 +977,7 @@ impl OxydeApp {
                 return;
             }
         };
+        self.leave_assembly();
         // Read and rebuilt off the UI thread; shown when done.
         self.open_part_job(path, read_only);
     }
@@ -1250,7 +1272,7 @@ impl OxydeApp {
             match request {
                 Some(SketchRequest::EditDimension(index)) => self.open_dimension_editor(index),
                 Some(SketchRequest::NewDimension(option)) => {
-                    self.dialog = Some(Dialog::Dimension {
+                    self.open_dialog(Dialog::Dimension {
                         target: DimensionTarget::New(option.relation),
                         label: option.label.trim_end_matches('…').to_owned(),
                         name: None,
@@ -1382,7 +1404,7 @@ impl OxydeApp {
             );
             return;
         }
-        self.dialog = Some(Dialog::Dimension {
+        self.open_dialog(Dialog::Dimension {
             target: DimensionTarget::Existing(id),
             label: session
                 .dimension_full_name(id)

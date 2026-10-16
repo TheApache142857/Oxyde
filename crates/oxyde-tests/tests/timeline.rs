@@ -351,6 +351,52 @@ fn sketch_dimensions_drive_the_part() {
 }
 
 #[test]
+fn a_cut_that_misses_the_body_is_reported() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let s1 = part.add_feature(rectangle_on_front(40.0, 20.0));
+    let base = part.add_feature(boss(s1, 10.0));
+    // A cut sketched on the Front plane goes against its normal, away from the boss:
+    // it removes nothing, which the feature says rather than keeping quiet.
+    let mut hole = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    hole.circle(Point2::new(20.0, 10.0), 3.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(hole));
+    let miss = part.add_feature(cut(s2, 5.0));
+    part.rebuild(&mut kernel);
+    match part.status(miss) {
+        Some(FeatureStatus::Warning(message)) => assert!(message.contains("removed nothing")),
+        other => panic!("expected a warning, got {other:?}"),
+    }
+    assert_close(volume(&part, &kernel), 40.0 * 20.0 * 10.0);
+    // Reversed, it cuts the hole and the warning goes.
+    match part.edit(miss).unwrap() {
+        FeatureKind::Extrude(e) => e.reverse = true,
+        other => panic!("not an extrusion: {other:?}"),
+    }
+    part.rebuild(&mut kernel);
+    assert_eq!(part.status(miss), Some(FeatureStatus::Ok));
+    assert_close(volume(&part, &kernel), 40.0 * 20.0 * 10.0 - PI * 9.0 * 5.0);
+    // An intersection with nothing in common would make the body vanish: refused, the
+    // body kept.
+    let mut away = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    away.rectangle(Point2::new(100.0, 100.0), 10.0, 10.0);
+    let s3 = part.add_feature(FeatureKind::Sketch(away));
+    let empty = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+        s3,
+        ExtrudeOp::Intersect,
+        5.0,
+    )));
+    part.rebuild(&mut kernel);
+    match part.status(empty) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("nothing in common")),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    assert_eq!(part.status(base), Some(FeatureStatus::Ok));
+    assert_close(volume(&part, &kernel), 40.0 * 20.0 * 10.0 - PI * 9.0 * 5.0);
+    part.release(&mut kernel);
+}
+
+#[test]
 fn under_and_over_defined_sketches() {
     use oxyde_sketch::{Constraint, EntityId};
     let mut kernel = OcctKernel::new();
@@ -376,5 +422,12 @@ fn under_and_over_defined_sketches() {
     assert!(matches!(part.status(s1), Some(FeatureStatus::Error(_))));
     assert!(matches!(part.status(base), Some(FeatureStatus::Error(_))));
     assert!(part.body().is_none());
+    // The sketch is still there to be looked at and repaired: its plane and its
+    // geometry as stored, which is what the editor opens.
+    let kept = part
+        .sketch_result(s1)
+        .expect("an over-defined sketch keeps its result");
+    assert_eq!(kept.plane, StandardPlane::Front.plane());
+    assert_eq!(kept.solved.entities().len(), 8);
     part.release(&mut kernel);
 }

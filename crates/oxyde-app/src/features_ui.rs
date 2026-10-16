@@ -309,7 +309,7 @@ impl OxydeApp {
         let axes = self.revolve_axis_choices(sketch, editing);
         let axes = with_current(axes, existing.map(|r| &r.axis));
         let axis = position(&axes, existing.map(|r| &r.axis));
-        self.dialog = Some(Dialog::Revolve(RevolveDialog {
+        self.open_dialog(Dialog::Revolve(RevolveDialog {
             editing,
             dimension: editing.and_then(|id| self.parameter_full_name(id, FeatureParameter::Angle)),
             sketch,
@@ -334,7 +334,7 @@ impl OxydeApp {
             Some(shell) => shell.faces.clone(),
             None => self.selected_faces(),
         };
-        self.dialog = Some(Dialog::Shell(ShellDialog {
+        self.open_dialog(Dialog::Shell(ShellDialog {
             editing,
             dimension: editing
                 .and_then(|id| self.parameter_full_name(id, FeatureParameter::Thickness)),
@@ -460,7 +460,7 @@ impl OxydeApp {
                 d.axis = i;
             }
         }
-        self.dialog = Some(Dialog::Pattern(d));
+        self.open_dialog(Dialog::Pattern(d));
     }
 
     pub(crate) fn begin_pattern(&mut self, kind: PatternKind) {
@@ -489,7 +489,7 @@ impl OxydeApp {
                 base = i;
             }
         }
-        self.dialog = Some(Dialog::RefPlane(PlaneDialog {
+        self.open_dialog(Dialog::RefPlane(PlaneDialog {
             editing,
             dimension: editing
                 .and_then(|id| self.parameter_full_name(id, FeatureParameter::Offset)),
@@ -525,7 +525,7 @@ impl OxydeApp {
                 }
             }
         }
-        self.dialog = Some(Dialog::RefAxis(AxisDialog {
+        self.open_dialog(Dialog::RefAxis(AxisDialog {
             editing,
             two_planes,
             axes,
@@ -649,7 +649,7 @@ impl OxydeApp {
     pub(crate) fn open_combine(&mut self, editing: Option<FeatureId>, existing: Option<&Combine>) {
         // A new Combine starts from the body selected in the tree, if any.
         let target = existing.map(|c| c.target).or(self.selected_body);
-        self.dialog = Some(Dialog::Combine(CombineDialog {
+        self.open_dialog(Dialog::Combine(CombineDialog {
             editing,
             tools_next: target.is_some(),
             target,

@@ -108,7 +108,7 @@ impl OxydeApp {
                 ui.separator();
                 if ui.button("Part properties…").clicked() {
                     ui.close_menu();
-                    self.dialog = Some(Dialog::PartProperties(self.doc.properties.clone()));
+                    self.open_dialog(Dialog::PartProperties(self.doc.properties.clone()));
                 }
                 ui.separator();
                 if ui.button("Exit").clicked() {
@@ -270,7 +270,7 @@ impl OxydeApp {
                 }
                 if ui.button("About Oxyde").clicked() {
                     ui.close_menu();
-                    self.dialog = Some(Dialog::About);
+                    self.open_dialog(Dialog::About);
                 }
             });
         });
