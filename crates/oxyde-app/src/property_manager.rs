@@ -430,10 +430,14 @@ impl OxydeApp {
         }
     }
 
-    /// Whether a face, an edge or a body clicked in the finished part exists just before the
-    /// feature being edited, the only geometry that feature can use.
-    fn exists_before(&self, pick: &PanelPick, editing: FeatureId) -> bool {
-        let body = self.doc.part.body_before(editing);
+    /// Whether a face, an edge or a body clicked in the viewport exists just before the
+    /// feature being edited (or the one being made, at the rollback bar): the only
+    /// geometry that feature can use.
+    fn exists_before(&self, pick: &PanelPick, editing: Option<FeatureId>) -> bool {
+        let body = match editing {
+            Some(id) => self.doc.part.body_before(id),
+            None => self.doc.part.body(),
+        };
         match pick {
             PanelPick::Face(f) => body.is_some_and(|b| b.naming.find_face(f).is_some()),
             PanelPick::Edge(e) => body.is_some_and(|b| b.naming.find_edge(e).is_some()),
@@ -444,16 +448,21 @@ impl OxydeApp {
 
     /// Offers a click to the open command. Returns true when the command took it.
     pub(crate) fn offer_to_panel(&mut self, pick: PanelPick) -> bool {
-        // The viewport shows the finished part: geometry made or changed by later features
-        // cannot be used by the feature being edited (and would stop the file from opening).
-        if let Some(editing) = self.dialog.as_ref().and_then(Dialog::editing) {
-            if self.dialog.as_ref().is_some_and(Dialog::is_panel)
-                && !self.exists_before(&pick, editing)
-            {
-                self.status = format!(
-                    "That is made or changed by a feature after {}: pick geometry that exists before it",
-                    self.feature_name(editing)
-                );
+        let pick = self.unpreview_pick(pick);
+        // A feature can only use what exists before it: not what it makes itself (shown
+        // by its preview), nor, when it is edited in the finished part, what later
+        // features made or changed (which would stop the file from opening).
+        if let Some(dialog) = self.dialog.as_ref().filter(|d| d.is_feature()) {
+            let editing = dialog.editing();
+            if !self.exists_before(&pick, editing) {
+                self.status = match (self.preview_refusal(&pick), editing) {
+                    (Some(why), _) => why,
+                    (None, Some(id)) => format!(
+                        "That is made or changed by a feature after {}: pick geometry that exists before it",
+                        self.feature_name(id)
+                    ),
+                    (None, None) => "That is no longer in the part: pick it again".to_owned(),
+                };
                 return true;
             }
         }
@@ -666,7 +675,7 @@ impl OxydeApp {
     /// Faces and edges the open command refers to, highlighted in the viewport.
     pub(crate) fn panel_picks(&self) -> Option<Vec<Pick>> {
         let dialog = self.dialog.as_ref().filter(|d| d.is_panel())?;
-        let body = self.doc.part.body();
+        let body = self.shown_body();
         let face = |f: &FaceName| body.and_then(|b| b.naming.find_face(f)).map(Pick::Face);
         let edge = |e: &EdgeName| body.and_then(|b| b.naming.find_edge(e)).map(Pick::Edge);
         let axis = |a: Option<&AxisRef>| match a {
@@ -776,6 +785,9 @@ impl OxydeApp {
                 ui.separator();
                 if self.panel_body(ui, &mut dialog) {
                     finished = true;
+                }
+                if dialog.is_feature() {
+                    self.preview_footer(ui);
                 }
             });
         ui.add_space(6.0);

@@ -515,7 +515,7 @@ impl OxydeApp {
     /// The feature that created a face or edge of the viewport (for an edge, the later of
     /// the two features that made its faces).
     pub(crate) fn pick_creator(&self, pick: oxyde_render::Pick) -> Option<FeatureId> {
-        let body = self.doc.part.body()?;
+        let body = self.shown_body()?;
         let features = self.doc.part.features();
         let position = |id: FeatureId| features.iter().position(|f| f.id() == id);
         match pick {
@@ -532,9 +532,7 @@ impl OxydeApp {
 
     /// The faces of one body of the part, for highlighting.
     pub(crate) fn body_picks(&self, id: oxyde_model::BodyId) -> Vec<oxyde_render::Pick> {
-        self.doc
-            .part
-            .body()
+        self.shown_body()
             .and_then(|b| b.solid(id))
             .map(|s| s.faces.clone().map(oxyde_render::Pick::Face).collect())
             .unwrap_or_default()
@@ -542,7 +540,7 @@ impl OxydeApp {
 
     /// The faces of the body a feature made or changed, for highlighting.
     fn feature_picks(&self, id: FeatureId) -> Vec<oxyde_render::Pick> {
-        let Some(body) = self.doc.part.body() else {
+        let Some(body) = self.shown_body() else {
             return Vec::new();
         };
         (0..body.topology.faces.len() as u32)

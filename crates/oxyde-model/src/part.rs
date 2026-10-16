@@ -160,6 +160,51 @@ impl FeatureResult {
     }
 }
 
+/// A feature built on a part without being added to it ([`Part::preview`]): the body it
+/// would make, or the plane or axis, or why it cannot be built.
+///
+/// It holds kernel shapes, and may share others with the part's cached results: give it
+/// back with [`FeaturePreview::release`] before the part is rebuilt or released.
+#[derive(Debug)]
+pub struct FeaturePreview {
+    feature: FeatureId,
+    name: String,
+    result: FeatureResult,
+}
+
+impl FeaturePreview {
+    /// The id the feature has, or would get once added. Faces it makes are named after it
+    /// (`FaceKey::feature`).
+    pub fn feature(&self) -> FeatureId {
+        self.feature
+    }
+
+    /// The feature's name ("Boss-Extrude3"), as it is or would be.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Built (perhaps with a warning), or why not.
+    pub fn status(&self) -> &FeatureStatus {
+        &self.result.status
+    }
+
+    /// Every body of the part after the feature, when the feature changes them.
+    pub fn body(&self) -> Option<&Body> {
+        self.result.produced.as_ref()
+    }
+
+    /// The plane or axis of a reference feature.
+    pub fn reference(&self) -> Option<ReferenceGeometry> {
+        self.result.reference
+    }
+
+    /// Frees the shapes the preview made (not those it shares with the part).
+    pub fn release<K: Kernel>(self, kernel: &mut K) {
+        self.result.release(kernel);
+    }
+}
+
 /// Everything that defines a part, without any computed geometry: what gets saved, and what
 /// undo/redo snapshots hold.
 #[derive(Debug, Clone, PartialEq)]
@@ -530,7 +575,12 @@ impl Part {
             let mut result = if self.features[index].suppressed {
                 FeatureResult::with_status(FeatureStatus::Suppressed)
             } else {
-                build_feature(&self.features, &self.results, index, kernel)
+                build_feature(
+                    &self.features[..index],
+                    &self.features[index],
+                    &self.results,
+                    kernel,
+                )
             };
             if let Some(imported) = result.import_appearances.take() {
                 self.apply_import_appearances(index, imported);
@@ -570,6 +620,55 @@ impl Part {
             result.release(kernel);
         }
         self.dirty_from = 0;
+    }
+
+    /// Builds `kind` the way it would be built if it were added at the rollback bar
+    /// (`replacing` = `None`) or put in place of feature `replacing`, on the results of the
+    /// last rebuild, without changing the part: what the viewport shows while a feature's
+    /// command is open. Only that one feature is built, so features after the one replaced
+    /// are not (as SolidWorks rolls back to a feature while it is edited).
+    ///
+    /// `None` when the part is not rebuilt up to there, or `replacing` is not one of its
+    /// active features. The preview's body may share shapes with the part's results: it
+    /// is valid until the part is rebuilt or released, and must be given back with
+    /// [`FeaturePreview::release`] before then.
+    pub fn preview<K: Kernel>(
+        &self,
+        kind: FeatureKind,
+        replacing: Option<FeatureId>,
+        kernel: &mut K,
+    ) -> Option<FeaturePreview> {
+        let (index, feature) = match replacing {
+            Some(id) => {
+                let index = self.index_of(id)?;
+                if index >= self.active_end() {
+                    return None;
+                }
+                let mut feature = self.features[index].clone();
+                feature.kind = kind;
+                feature.suppressed = false;
+                (index, feature)
+            }
+            None => {
+                let id = FeatureId::from_raw(self.next_id);
+                let name = self.next_name(kind.type_name());
+                (self.active_end(), Feature::new(id, name, false, kind))
+            }
+        };
+        if index > self.built() {
+            return None;
+        }
+        let result = build_feature(
+            &self.features[..index],
+            &feature,
+            &self.results[..index],
+            kernel,
+        );
+        Some(FeaturePreview {
+            feature: feature.id,
+            name: feature.name,
+            result,
+        })
     }
 
     // ---- Queries -----------------------------------------------------------------------------
@@ -688,11 +787,11 @@ fn current_body(results: &[FeatureResult]) -> Option<&Body> {
 }
 
 /// What a feature being built can see: the features before it, their results, and the body
-/// as it is just before it.
+/// as it is just before it. The feature itself need not be in the timeline (a preview).
 struct Context<'a> {
-    features: &'a [Feature],
+    earlier: &'a [Feature],
+    feature: &'a Feature,
     previous: &'a [FeatureResult],
-    index: usize,
     body: Option<&'a Body>,
 }
 
@@ -702,16 +801,17 @@ const MAX_INSTANCES: u64 = 1000;
 
 impl<'a> Context<'a> {
     fn feature(&self) -> &'a Feature {
-        &self.features[self.index]
+        self.feature
     }
 
     /// An earlier feature and its result.
     fn earlier(&self, id: FeatureId) -> Result<(&'a Feature, &'a FeatureResult), String> {
-        let index = self.features[..self.index]
+        let index = self
+            .earlier
             .iter()
             .position(|f| f.id == id)
             .ok_or_else(|| format!("{id} must come before this feature"))?;
-        Ok((&self.features[index], &self.previous[index]))
+        Ok((&self.earlier[index], &self.previous[index]))
     }
 
     fn body(&self) -> Result<&'a Body, String> {
@@ -794,16 +894,17 @@ impl<'a> Context<'a> {
     }
 }
 
+/// Builds `feature` on the features `earlier` (with their results `previous`, one each).
 fn build_feature<K: Kernel>(
-    features: &[Feature],
+    earlier: &[Feature],
+    feature: &Feature,
     previous: &[FeatureResult],
-    index: usize,
     kernel: &mut K,
 ) -> FeatureResult {
     let ctx = Context {
-        features,
+        earlier,
+        feature,
         previous,
-        index,
         body: current_body(previous),
     };
     let feature = ctx.feature();

@@ -50,6 +50,38 @@ replaced by errors or harmless fallbacks). See `docs/ARCHITECTURE.md`, "Never cr
 - `cargo test --workspace` now also runs the command line on a filleted box whose
   volume, area and centre of mass are known by hand, and on the STEP cart.
 
+### Previews (unreleased, October 2026)
+
+Commands show what they will do before OK, as in every CAD system:
+
+- **Every feature command previews its result.** While Extrude, Revolve, Fillet,
+  Chamfer, Shell, Linear or Circular Pattern, Mirror or Combine is open, the viewport
+  shows the part as the feature would make it, updated as the options change: the faces
+  the feature makes are tinted amber, or red where it takes material away (cuts,
+  intersections, patterns of cuts). A new reference plane or axis is drawn where it
+  would go, and an edited one moves as its values change. Dragging a value updates the
+  preview live; a preview that takes long to build waits until the value is let go.
+- **Errors show before OK.** When the feature cannot be built (a fillet too large, a
+  sketch with no closed contour…), the PropertyManager says why, in red, under the
+  options; warnings show in amber. OK still adds the feature, as before.
+- **Editing a feature shows the part as it is at that feature**, as SolidWorks rolls
+  back while a feature is edited; the features after it come back on OK. Geometry made
+  by later features can therefore no longer be clicked by mistake.
+- **Picking works on the preview.** Faces and edges are clicked on the previewed part as
+  on the part itself. What the feature makes cannot be picked for it, and the status bar
+  says so; clicking a fillet or chamfer face of the preview takes its edge out of the
+  selection.
+- **Mates preview by default**: the parts go where the mates put them as soon as both
+  sides of a pair are picked, and move again as the type, distance, angle or alignment
+  changes. The *Preview* checkbox of the Mate command turns this off (every mate then
+  picked where the parts sit now, as before) and is remembered.
+- **Sketch**: Mirror Entities draws the mirrored copies dashed while the pointer is on a
+  line to mirror about; the dimension value window draws, dashed, where the value being
+  typed would move the geometry, and says when the other relations cannot meet it.
+- **Preferences › Graphics › Previews** turns feature previews and mate previews on and
+  off; the *Preview* switch at the bottom of each feature command does the same. The
+  performance overlay shows how long the last preview took.
+
 ### Second bug hunt: unwanted behaviours (unreleased, October 2026)
 
 Read through the application and the modelling engine for what they do that nobody

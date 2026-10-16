@@ -212,6 +212,8 @@ pub struct OxydeApp {
     pub(crate) asm: Option<crate::assembly::AssemblyDoc>,
     pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
     pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
+    /// The open feature command's feature, built and shown in the viewport.
+    pub(crate) preview: Option<crate::preview::Preview>,
     /// The assembly command bar's tab.
     pub(crate) asm_tab: crate::assembly_ui::AsmTab,
     /// The assembly's own plane selected in its tree or the viewport.
@@ -294,6 +296,7 @@ impl OxydeApp {
             asm: None,
             mate_dialog: None,
             mate_preview: None,
+            preview: None,
             asm_tab: Default::default(),
             asm_plane: None,
             asm_scroll_to: None,
@@ -479,7 +482,7 @@ impl OxydeApp {
     }
 
     fn selection_picks(&self) -> Vec<Pick> {
-        let Some(body) = self.doc.part.body() else {
+        let Some(body) = self.shown_body() else {
             return Vec::new();
         };
         let mut picks: Vec<Pick> = self
@@ -497,7 +500,7 @@ impl OxydeApp {
     }
 
     fn click(&mut self, pick: Option<Pick>, additive: bool) {
-        let item = self.doc.part.body().and_then(|body| match pick {
+        let item = self.shown_body().and_then(|body| match pick {
             Some(Pick::Face(i)) => body.naming.face(i).cloned().map(Selected::Face),
             Some(Pick::Edge(i)) => body.naming.edge(i).cloned().map(Selected::Edge),
             None => None,
@@ -541,7 +544,7 @@ impl OxydeApp {
             }
             return;
         }
-        let Some(body) = self.doc.part.body() else {
+        let Some(body) = self.shown_body() else {
             return;
         };
         let items: Vec<Selected> = picks
@@ -572,7 +575,7 @@ impl OxydeApp {
 
     /// A face or edge clicked in the viewport, as offered to an open command.
     fn panel_pick(&self, pick: Option<Pick>) -> Option<PanelPick> {
-        let body = self.doc.part.body()?;
+        let body = self.shown_body()?;
         match pick? {
             Pick::Face(i) => body.naming.face(i).cloned().map(PanelPick::Face),
             Pick::Edge(i) => body.naming.edge(i).cloned().map(PanelPick::Edge),
@@ -1273,8 +1276,15 @@ impl OxydeApp {
     }
 
     fn viewport_ui(&mut self, ui: &mut egui::Ui) {
+        self.sync_preview(ui.ctx());
         self.refresh_scene();
         if self.sketch.is_some() {
+            // A dimension's value is previewed only while its window is open.
+            if !matches!(self.dialog, Some(Dialog::Dimension { .. }))
+                && let Some(session) = self.sketch.as_mut()
+            {
+                session.clear_value_preview();
+            }
             let output = self.viewport.ui(ui, Vec::new(), None, true);
             self.viewport_rect = output.rect;
             let request = match self.sketch.as_mut() {
@@ -1598,25 +1608,9 @@ impl OxydeApp {
                 overlays.push((Overlay::Plane(standard), shape));
             }
         }
-        let highlighted = self.panel_features();
-        for (id, geometry) in self.doc.part.references() {
-            let selected = self.selected_feature == Some(id) || highlighted.contains(&id);
-            let shown = self.item_visible(crate::display::Item::Feature(id));
-            let wanted = matches!(geometry, ReferenceGeometry::Plane(_)) && all_planes;
-            if !(selected || shown || wanted) {
-                continue;
-            }
-            let name = self
-                .doc
-                .part
-                .feature(id)
-                .map(|f| f.name().to_owned())
-                .unwrap_or_default();
-            match geometry {
-                ReferenceGeometry::Plane(p) => {
-                    let shape = draw_plane(p, name, selected);
-                    overlays.push((Overlay::Reference(id), shape));
-                }
+        let draw_reference =
+            |geometry: ReferenceGeometry, name: String, selected: bool| match geometry {
+                ReferenceGeometry::Plane(p) => draw_plane(p, name, selected),
                 ReferenceGeometry::Axis(axis) => {
                     let color = overlay_color(selected);
                     let t = (center - axis.origin).dot(axis.direction);
@@ -1636,9 +1630,43 @@ impl OxydeApp {
                         label_font.clone(),
                         color,
                     );
-                    overlays.push((Overlay::Reference(id), OverlayShape::Segment(a, b)));
+                    OverlayShape::Segment(a, b)
                 }
+            };
+        // The plane or axis the open command makes, where it would be: in place of the
+        // one it edits, or as a new one (which cannot be clicked yet).
+        let references = self.doc.part.references();
+        let (previewed, new_reference) = match self.preview_reference() {
+            // An edited plane that does not build now is not among the references.
+            Some((Some(id), _, geometry)) if references.iter().any(|(r, _)| *r == id) => {
+                (Some((id, geometry)), None)
             }
+            Some((_, name, geometry)) => (None, Some((name, geometry))),
+            None => (None, None),
+        };
+        let highlighted = self.panel_features();
+        for (id, geometry) in references {
+            let (geometry, edited) = match previewed {
+                Some((edited, preview)) if edited == id => (preview, true),
+                _ => (geometry, false),
+            };
+            let selected = edited || self.selected_feature == Some(id) || highlighted.contains(&id);
+            let shown = self.item_visible(crate::display::Item::Feature(id));
+            let wanted = matches!(geometry, ReferenceGeometry::Plane(_)) && all_planes;
+            if !(selected || shown || wanted) {
+                continue;
+            }
+            let name = self
+                .doc
+                .part
+                .feature(id)
+                .map(|f| f.name().to_owned())
+                .unwrap_or_default();
+            let shape = draw_reference(geometry, name, selected);
+            overlays.push((Overlay::Reference(id), shape));
+        }
+        if let Some((name, geometry)) = new_reference {
+            draw_reference(geometry, name, true);
         }
 
         // Sketches: shown ones, the selected one and those the open command uses.
@@ -1688,16 +1716,18 @@ impl OxydeApp {
         overlays
     }
 
-    /// Re-tessellates the body after each rebuild.
+    /// Re-tessellates the body after each rebuild, and the open command's preview.
     fn refresh_scene(&mut self) {
         // While a job reads a document, the picture stays as it was (the assembly a
         // component was edited in, say, until it is back).
-        if self.busy() || self.scene_revision == Some(self.doc.revision) {
+        let wanted = self.scene_key();
+        if self.busy() || self.scene_revision == Some(wanted) {
             return;
         }
-        self.scene_revision = Some(self.doc.revision);
+        self.scene_revision = Some(wanted);
+        let start = std::time::Instant::now();
         let first = self.viewport.is_empty();
-        let Some(body) = self.doc.part.body() else {
+        let Some(body) = self.shown_body() else {
             self.viewport.pickable = None;
             self.viewport.set_scene(Scene::default(), false);
             return;
@@ -1712,6 +1742,10 @@ impl OxydeApp {
                 self.viewport.set_scene(scene, first);
             }
             Err(e) => self.status = format!("Display failed: {e}"),
+        }
+        // A preview slow to show is not built again while a value is dragged.
+        if wanted != self.doc.revision {
+            self.preview_shown_in(start.elapsed().as_secs_f64());
         }
     }
 
@@ -1964,6 +1998,7 @@ impl OxydeApp {
         self.sync_locks();
         let busy = self.busy();
         if self.asm.is_some() {
+            self.clear_preview();
             if !busy {
                 self.assembly_shortcuts(ctx);
             }
@@ -2032,6 +2067,7 @@ impl Drop for OxydeApp {
         }
         self.leave_assembly();
         self.drop_edit_stack();
+        self.clear_preview();
         self.doc.release(&mut self.kernel);
         self.locks.release_all();
     }

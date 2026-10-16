@@ -985,18 +985,28 @@ impl OxydeApp {
     /// appearances.
     pub(crate) fn part_materials(&mut self) -> (Vec<RenderMaterial>, Vec<TextureRef>) {
         let part = &self.doc.part;
-        let Some(body) = part.body() else {
+        // The body shown: the open feature command's preview, if any, whose new faces
+        // are tinted.
+        let preview = self.preview.as_ref();
+        let Some(body) = crate::preview::shown_body(&self.doc, preview) else {
             return (Vec::new(), Vec::new());
         };
-        if !part.has_appearances() {
+        let tint = crate::preview::tint(&self.doc, preview);
+        if !part.has_appearances() && tint.is_none() {
             return (Vec::new(), Vec::new());
         }
         let cache = &mut self.texture_cache;
         let mut textures = Vec::new();
         let materials = (0..body.topology.faces.len() as u32)
-            .map(|i| match part.face_appearance(body, i) {
-                Some(a) => material(a, cache, &mut textures),
-                None => RenderMaterial::default(),
+            .map(|i| match &tint {
+                Some((color, faces)) if faces[i as usize] => RenderMaterial {
+                    color: Some(*color),
+                    ..RenderMaterial::default()
+                },
+                _ => match part.face_appearance(body, i) {
+                    Some(a) => material(a, cache, &mut textures),
+                    None => RenderMaterial::default(),
+                },
             })
             .collect();
         (materials, textures)
@@ -1053,7 +1063,7 @@ impl OxydeApp {
         // While editing in place, the ghosted rest of the assembly keeps its look.
         let own = match self.asm.as_ref() {
             Some(doc) => doc.ranges.iter().map(|r| r.faces.end).max().unwrap_or(0) as usize,
-            None => self.doc.part.body().map_or(0, |b| b.topology.faces.len()),
+            None => self.shown_body().map_or(0, |b| b.topology.faces.len()),
         };
         self.add_context_materials(own, &mut materials);
         self.viewport.set_materials(materials, textures);

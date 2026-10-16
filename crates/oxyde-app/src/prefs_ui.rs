@@ -40,6 +40,8 @@ pub struct DebugStats {
     pub frame: f64,
     /// Last part rebuild, seconds.
     pub rebuild: Option<f64>,
+    /// Last feature preview built, seconds.
+    pub preview: Option<f64>,
     /// Last assembly solve, seconds.
     pub solve: Option<f64>,
 }
@@ -274,9 +276,25 @@ impl OxydeApp {
                 .small()
                 .weak(),
         );
+        crate::property_manager::section(ui, "Previews");
+        let p = &mut self.prefs.previews;
+        ui.checkbox(
+            &mut p.features,
+            "Preview features while their command is open",
+        )
+        .on_hover_text(
+            "Extrude, Fillet, Shell, patterns… show the part as the feature makes it, the \
+             faces it makes tinted (red where it removes material), before OK",
+        );
+        ui.checkbox(&mut p.mates, "Move the parts as mates are picked")
+            .on_hover_text(
+                "The Mate command places the parts as soon as both sides are picked; off, \
+                 they stay put until OK, so every mate is picked where the parts sit now",
+            );
         ui.add_space(8.0);
         if ui.button("Reset graphics to defaults").clicked() {
             self.prefs.graphics = Default::default();
+            self.prefs.previews = Default::default();
         }
     }
 
@@ -533,8 +551,9 @@ impl OxydeApp {
             ));
             lines.push(format!("{triangles} triangles · {edges} edge segments"));
             lines.push(format!(
-                "rebuild {} · solve {}",
+                "rebuild {} · preview {} · solve {}",
                 ms(self.debug_stats.rebuild),
+                ms(self.debug_stats.preview),
                 ms(self.debug_stats.solve)
             ));
             // Keep the frame time moving.
@@ -588,7 +607,7 @@ impl OxydeApp {
             );
             return format!("{pick:?}: {what}");
         }
-        let name = self.doc.part.body().and_then(|b| match pick {
+        let name = self.shown_body().and_then(|b| match pick {
             Pick::Face(i) => b.naming.face(i).map(|n| format!("face {n}")),
             Pick::Edge(i) => b.naming.edge(i).map(|n| format!("edge {n}")),
         });

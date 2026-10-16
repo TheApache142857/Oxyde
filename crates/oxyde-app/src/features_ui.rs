@@ -114,6 +114,134 @@ pub struct AxisDialog {
     pub next_b: bool,
 }
 
+// What each command makes, as it stands: previewed while it is open, added on OK. An
+// error says what the command still needs.
+
+impl RevolveDialog {
+    pub fn feature(&self) -> Result<FeatureKind, &'static str> {
+        let sketch = self.sketch.ok_or("Choose the sketch to revolve")?;
+        let (_, axis) = self
+            .axes
+            .get(self.axis)
+            .ok_or("Choose an axis to revolve about")?;
+        Ok(FeatureKind::Revolve(Revolve {
+            sketch,
+            op: self.op,
+            axis: axis.clone(),
+            angle: self.angle.to_radians(),
+            mid_plane: self.mid_plane,
+            reverse: self.reverse,
+            bodies: self.bodies.clone(),
+        }))
+    }
+}
+
+impl ShellDialog {
+    pub fn feature(&self) -> FeatureKind {
+        FeatureKind::Shell(Shell {
+            faces: self.faces.clone(),
+            thickness: self.thickness,
+            outward: self.outward,
+        })
+    }
+}
+
+impl PatternDialog {
+    /// `part` puts the seeds in timeline order.
+    pub fn feature(&self, part: &oxyde_model::Part) -> Result<FeatureKind, &'static str> {
+        if self.seeds.is_empty() {
+            return Err("Choose at least one feature to copy");
+        }
+        let mut seeds = self.seeds.clone();
+        seeds.sort_by_key(|id| part.index_of(*id));
+        let axis = |i: usize| self.axes.get(i).map(|(_, a)| a.clone());
+        Ok(match self.kind {
+            PatternKind::Linear => {
+                let first = axis(self.axis).ok_or("Choose a direction")?;
+                let second = if self.second {
+                    let axis2 = self
+                        .axis2
+                        .and_then(axis)
+                        .ok_or("Select the second direction: an edge, a face or an axis")?;
+                    Some(PatternDirection {
+                        axis: axis2,
+                        spacing: self.spacing2,
+                        count: self.count2,
+                        reverse: self.reverse2,
+                    })
+                } else {
+                    None
+                };
+                FeatureKind::LinearPattern(LinearPattern {
+                    seeds,
+                    first: PatternDirection {
+                        axis: first,
+                        spacing: self.spacing,
+                        count: self.count,
+                        reverse: self.reverse,
+                    },
+                    second,
+                })
+            }
+            PatternKind::Circular => FeatureKind::CircularPattern(CircularPattern {
+                seeds,
+                axis: axis(self.axis).ok_or("Choose an axis")?,
+                angle: self.angle.to_radians(),
+                count: self.count,
+                equal_spacing: self.equal_spacing,
+                reverse: self.reverse,
+            }),
+            PatternKind::Mirror => {
+                let (_, plane) = self.planes.get(self.plane).ok_or("Choose a mirror plane")?;
+                FeatureKind::Mirror(Mirror {
+                    seeds,
+                    plane: plane.clone(),
+                })
+            }
+        })
+    }
+}
+
+impl CombineDialog {
+    pub fn feature(&self) -> Result<FeatureKind, &'static str> {
+        let target = self.target.ok_or("Choose the target body")?;
+        if self.tools.is_empty() {
+            return Err("Choose the tool bodies");
+        }
+        Ok(FeatureKind::Combine(Combine {
+            target,
+            tools: self.tools.clone(),
+            op: self.op,
+            keep_tools: self.keep_tools,
+        }))
+    }
+}
+
+impl PlaneDialog {
+    pub fn feature(&self) -> Option<FeatureKind> {
+        let (_, base) = self.planes.get(self.base)?;
+        Some(FeatureKind::Plane(RefPlane {
+            base: base.clone(),
+            offset: self.offset,
+            flip: self.flip,
+        }))
+    }
+}
+
+impl AxisDialog {
+    pub fn feature(&self) -> Option<FeatureKind> {
+        let axis = if self.two_planes {
+            let (_, a) = self.planes.get(self.plane_a)?;
+            let (_, b) = self.planes.get(self.plane_b)?;
+            RefAxis::TwoPlanes(a.clone(), b.clone())
+        } else {
+            let (_, a) = self.axes.get(self.axis)?;
+            RefAxis::Along(a.clone())
+        };
+        Some(FeatureKind::Axis(axis))
+    }
+}
+
 /// Position of `value` in `choices`, or 0.
 fn position<T: PartialEq>(choices: &[(String, T)], value: Option<&T>) -> usize {
     value
@@ -539,7 +667,7 @@ impl OxydeApp {
 
     // ---- Applying ----------------------------------------------------------------------------
 
-    fn add_or_replace(&mut self, editing: Option<FeatureId>, kind: FeatureKind) {
+    pub(crate) fn add_or_replace(&mut self, editing: Option<FeatureId>, kind: FeatureKind) {
         match editing {
             Some(id) => self.replace_feature(id, kind),
             None => {
@@ -548,102 +676,27 @@ impl OxydeApp {
         }
     }
 
+    /// Adds or changes the feature a command describes, or says what it still needs.
+    fn apply_feature(&mut self, editing: Option<FeatureId>, kind: Result<FeatureKind, &str>) {
+        match kind {
+            Ok(kind) => self.add_or_replace(editing, kind),
+            Err(missing) => self.status = missing.to_owned(),
+        }
+    }
+
     pub(crate) fn apply_revolve(&mut self, d: RevolveDialog) {
-        let Some(sketch) = d.sketch else {
-            return;
-        };
-        let Some((_, axis)) = d.axes.get(d.axis) else {
-            self.status = "Choose an axis to revolve about".to_owned();
-            return;
-        };
-        let kind = FeatureKind::Revolve(Revolve {
-            sketch,
-            op: d.op,
-            axis: axis.clone(),
-            angle: d.angle.to_radians(),
-            mid_plane: d.mid_plane,
-            reverse: d.reverse,
-            bodies: d.bodies,
-        });
-        self.add_or_replace(d.editing, kind);
+        if d.sketch.is_some() {
+            self.apply_feature(d.editing, d.feature());
+        }
     }
 
     pub(crate) fn apply_shell(&mut self, d: ShellDialog) {
-        let kind = FeatureKind::Shell(Shell {
-            faces: d.faces,
-            thickness: d.thickness,
-            outward: d.outward,
-        });
-        self.add_or_replace(d.editing, kind);
+        self.apply_feature(d.editing, Ok(d.feature()));
     }
 
     pub(crate) fn apply_pattern(&mut self, d: PatternDialog) {
-        if d.seeds.is_empty() {
-            self.status = "Choose at least one feature to copy".to_owned();
-            return;
-        }
-        // Seeds in timeline order.
-        let mut seeds = d.seeds.clone();
-        seeds.sort_by_key(|id| self.doc.part.index_of(*id));
-        let axis = |i: usize| d.axes.get(i).map(|(_, a)| a.clone());
-        let kind = match d.kind {
-            PatternKind::Linear => {
-                let Some(first) = axis(d.axis) else {
-                    self.status = "Choose a direction".to_owned();
-                    return;
-                };
-                let second = if d.second {
-                    let Some(axis2) = d.axis2.and_then(axis) else {
-                        self.status =
-                            "Select the second direction: an edge, a face or an axis".to_owned();
-                        return;
-                    };
-                    Some(PatternDirection {
-                        axis: axis2,
-                        spacing: d.spacing2,
-                        count: d.count2,
-                        reverse: d.reverse2,
-                    })
-                } else {
-                    None
-                };
-                FeatureKind::LinearPattern(LinearPattern {
-                    seeds,
-                    first: PatternDirection {
-                        axis: first,
-                        spacing: d.spacing,
-                        count: d.count,
-                        reverse: d.reverse,
-                    },
-                    second,
-                })
-            }
-            PatternKind::Circular => {
-                let Some(axis) = axis(d.axis) else {
-                    self.status = "Choose an axis".to_owned();
-                    return;
-                };
-                FeatureKind::CircularPattern(CircularPattern {
-                    seeds,
-                    axis,
-                    angle: d.angle.to_radians(),
-                    count: d.count,
-                    equal_spacing: d.equal_spacing,
-                    reverse: d.reverse,
-                })
-            }
-            PatternKind::Mirror => {
-                let Some((_, plane)) = d.planes.get(d.plane) else {
-                    self.status = "Choose a mirror plane".to_owned();
-                    return;
-                };
-                FeatureKind::Mirror(Mirror {
-                    seeds,
-                    plane: plane.clone(),
-                })
-            }
-        };
-        self.add_or_replace(d.editing, kind);
+        let kind = d.feature(&self.doc.part);
+        self.apply_feature(d.editing, kind);
     }
 
     pub(crate) fn open_combine(&mut self, editing: Option<FeatureId>, existing: Option<&Combine>) {
@@ -663,21 +716,7 @@ impl OxydeApp {
     }
 
     pub(crate) fn apply_combine(&mut self, d: CombineDialog) {
-        let Some(target) = d.target else {
-            self.status = "Choose the target body".to_owned();
-            return;
-        };
-        if d.tools.is_empty() {
-            self.status = "Choose the tool bodies".to_owned();
-            return;
-        }
-        let kind = FeatureKind::Combine(Combine {
-            target,
-            tools: d.tools,
-            op: d.op,
-            keep_tools: d.keep_tools,
-        });
-        self.add_or_replace(d.editing, kind);
+        self.apply_feature(d.editing, d.feature());
     }
 
     /// How many bodies the part has now.
@@ -708,30 +747,15 @@ impl OxydeApp {
     }
 
     pub(crate) fn apply_ref_plane(&mut self, d: PlaneDialog) {
-        let Some((_, base)) = d.planes.get(d.base) else {
-            return;
-        };
-        let kind = FeatureKind::Plane(RefPlane {
-            base: base.clone(),
-            offset: d.offset,
-            flip: d.flip,
-        });
-        self.add_or_replace(d.editing, kind);
+        if let Some(kind) = d.feature() {
+            self.add_or_replace(d.editing, kind);
+        }
     }
 
     pub(crate) fn apply_ref_axis(&mut self, d: AxisDialog) {
-        let axis = if d.two_planes {
-            match (d.planes.get(d.plane_a), d.planes.get(d.plane_b)) {
-                (Some((_, a)), Some((_, b))) => RefAxis::TwoPlanes(a.clone(), b.clone()),
-                _ => return,
-            }
-        } else {
-            match d.axes.get(d.axis) {
-                Some((_, a)) => RefAxis::Along(a.clone()),
-                None => return,
-            }
-        };
-        self.add_or_replace(d.editing, FeatureKind::Axis(axis));
+        if let Some(kind) = d.feature() {
+            self.add_or_replace(d.editing, kind);
+        }
     }
 
     /// Keeps the revolve axis list in step with the chosen sketch.

@@ -268,6 +268,9 @@ pub struct SketchSession {
     last_fillet: Option<(EntityId, f64)>,
     /// What the tool would make at the cursor, drawn dashed.
     preview: Vec<Vec<Point2>>,
+    /// The curves a dimension value being typed would move, where it would move them,
+    /// drawn dashed.
+    value_preview: Vec<Vec<Point2>>,
 }
 
 impl SketchSession {
@@ -314,6 +317,7 @@ impl SketchSession {
             offset_text: "10".to_owned(),
             last_fillet: None,
             preview: Vec::new(),
+            value_preview: Vec::new(),
         };
         session.solve();
         session
@@ -499,6 +503,71 @@ impl SketchSession {
                 Some("That value cannot be reached with the existing relations".to_owned());
             false
         }
+    }
+
+    /// Shows, dashed, where a new dimension of `value` (mm, or radians for angles) would
+    /// move the geometry. Returns false when the relations cannot meet it.
+    pub fn preview_new_dimension(&mut self, relation: Constraint, value: f64) -> bool {
+        self.preview_change(|s| {
+            let id = s.constrain(relation);
+            s.set_dimension(id, value)
+        })
+    }
+
+    /// Shows, dashed, where dimension `id` set to `value` would move the geometry. Returns
+    /// false when the relations cannot meet it.
+    pub fn preview_set_dimension(&mut self, id: RelationId, value: f64) -> bool {
+        self.preview_change(|s| s.set_dimension(id, value))
+    }
+
+    /// The dimension value preview, as drawn.
+    pub fn value_preview(&self) -> &[Vec<Point2>] {
+        &self.value_preview
+    }
+
+    pub fn clear_value_preview(&mut self) {
+        self.value_preview.clear();
+    }
+
+    /// Solves a copy of the sketch with `change` made, and keeps the curves it moves as
+    /// the value preview.
+    fn preview_change(&mut self, change: impl FnOnce(&mut ConstrainedSketch) -> bool) -> bool {
+        let mut trial = self.sketch.clone();
+        let met = change(&mut trial) && trial.solve().is_ok_and(|r| r.converged);
+        self.value_preview = if met {
+            moved_curves(&self.sketch, &trial)
+        } else {
+            Vec::new()
+        };
+        met
+    }
+
+    /// The copies Mirror Entities would make of the selection, with `line` under the
+    /// cursor as the line to mirror about.
+    fn mirror_preview_for(&self, line: EntityId) -> Vec<Vec<Point2>> {
+        let is_line = matches!(
+            self.sketch.entity(line).map(|e| e.geometry),
+            Some(Geometry::Line { .. })
+        );
+        let entities: Vec<EntityId> = self
+            .selection
+            .iter()
+            .copied()
+            .filter(|s| *s != line)
+            .collect();
+        if !is_line || entities.is_empty() {
+            return Vec::new();
+        }
+        let mut trial = self.sketch.clone();
+        let Some(copies) = trial.mirror(&entities, line) else {
+            return Vec::new();
+        };
+        // Where the symmetric relations put the copies (as made, if they cannot).
+        let _ = trial.solve();
+        copies
+            .iter()
+            .filter_map(|id| curve_path(&trial, trial.entity(*id)?.geometry))
+            .collect()
     }
 
     /// Renames a dimension of this sketch ("D1" → "Width").
@@ -1438,7 +1507,6 @@ impl SketchSession {
         trimmed: Option<Vec<Point2>>,
     ) {
         let conflicting = self.conflicting();
-        let at = |id| self.sketch.position(id).unwrap_or_default();
         let origin_id = self.sketch.origin();
 
         // Part edges: centre marks, and the edge Convert Entities would copy.
@@ -1491,20 +1559,10 @@ impl SketchSession {
                 1.6_f32
             };
             let stroke = Stroke::new(width, color);
-            let path: Vec<Pos2> = match e.geometry {
-                Geometry::Point(_) => continue,
-                Geometry::Line { start, end } => vec![to_screen(at(start)), to_screen(at(end))],
-                Geometry::Circle { center, radius } => {
-                    arc_points(at(center), radius, 0.0, std::f64::consts::TAU, 72)
-                        .into_iter()
-                        .map(to_screen)
-                        .collect()
-                }
-                Geometry::Arc { center, start, end } => arc_path(at(center), at(start), at(end))
-                    .into_iter()
-                    .map(to_screen)
-                    .collect(),
+            let Some(path) = curve_path(&self.sketch, e.geometry) else {
+                continue;
             };
+            let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
             if e.construction {
                 painter.extend(Shape::dashed_line(&path, stroke, 6.0, 4.0));
             } else {
@@ -1615,8 +1673,9 @@ impl SketchSession {
             ));
         }
 
-        // Sketch Fillet's arc, or Offset Entities' copies, as they would be made.
-        for polyline in &self.preview {
+        // Sketch Fillet's arc, Offset or Mirror Entities' copies, as they would be made, and
+        // the curves a dimension value being typed would move.
+        for polyline in self.preview.iter().chain(&self.value_preview) {
             let path: Vec<Pos2> = polyline.iter().map(|p| to_screen(*p)).collect();
             painter.extend(Shape::dashed_line(
                 &path,
@@ -2105,6 +2164,42 @@ fn arc_path(center: Point2, start: Point2, end: Point2) -> Vec<Point2> {
     arc_points(center, center.distance(start), a0, sweep, 48)
 }
 
+/// The polyline of a curve of `sketch`, in plane coordinates; `None` for a point.
+fn curve_path(sketch: &ConstrainedSketch, geometry: Geometry) -> Option<Vec<Point2>> {
+    let at = |id| sketch.position(id).unwrap_or_default();
+    match geometry {
+        Geometry::Point(_) => None,
+        Geometry::Line { start, end } => Some(vec![at(start), at(end)]),
+        Geometry::Circle { center, radius } => Some(arc_points(
+            at(center),
+            radius,
+            0.0,
+            std::f64::consts::TAU,
+            72,
+        )),
+        Geometry::Arc { center, start, end } => Some(arc_path(at(center), at(start), at(end))),
+    }
+}
+
+/// The curves of `after` that are not where they are in `before` (or not in it at all),
+/// as polylines: what a change moves.
+fn moved_curves(before: &ConstrainedSketch, after: &ConstrainedSketch) -> Vec<Vec<Point2>> {
+    after
+        .entities()
+        .iter()
+        .filter_map(|e| {
+            let path = curve_path(after, e.geometry)?;
+            let old = before
+                .entity(e.id)
+                .and_then(|old| curve_path(before, old.geometry));
+            let same = old.is_some_and(|old| {
+                old.len() == path.len() && old.iter().zip(&path).all(|(a, b)| a.distance(*b) < 1e-7)
+            });
+            (!same).then_some(path)
+        })
+        .collect()
+}
+
 pub(crate) fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
     let t = if ab.length_sq() > 0.0 {
@@ -2186,6 +2281,7 @@ pub fn interact(
 
     session.preview = match (session.tool, session.hover, cursor) {
         (Tool::Fillet, Some(id), _) => session.fillet_preview_for(id),
+        (Tool::Mirror, Some(id), _) if !additive => session.mirror_preview_for(id),
         (Tool::Offset, _, Some(at)) if !session.selection.is_empty() => session
             .offset_towards(at)
             .and_then(|by| session.sketch.offset_preview(&session.selection, by))
@@ -2811,6 +2907,60 @@ mod tests {
         assert!((typed_value(&counter, 30.0) - 30f64.to_radians()).abs() < 1e-12);
         // Lengths are what they are.
         assert_eq!(typed_value(&Constraint::Length(EntityId(1), 4.0), 7.0), 7.0);
+    }
+
+    #[test]
+    fn mirror_shows_its_copies_before_the_click() {
+        let mut s = ConstrainedSketch::new();
+        let axis = s.line(Point2::new(0.0, -5.0), Point2::new(0.0, 5.0));
+        let circle = s.circle(Point2::new(4.0, 0.0), 1.0);
+        let mut session = session(s);
+        session.set_tool(Tool::Mirror);
+        session.click_mirror(Some(circle), false);
+        let before = session.sketch.clone();
+        let copies = session.mirror_preview_for(axis);
+        assert_eq!(copies.len(), 1);
+        // The circle on the other side of the line.
+        let (lo, hi) = copies[0]
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p.x), hi.max(p.x))
+            });
+        assert!(((lo + hi) / 2.0 + 4.0).abs() < 1e-6, "{lo}..{hi}");
+        // Nothing is made until the click, and only a line is mirrored about.
+        assert_eq!(session.sketch, before);
+        assert!(session.mirror_preview_for(circle).is_empty());
+    }
+
+    #[test]
+    fn a_dimension_value_is_shown_before_it_is_set() {
+        let mut s = ConstrainedSketch::new();
+        let line = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let mut session = session(s);
+        let before = session.sketch.clone();
+        let length = |path: &[Point2]| path[0].distance(path[1]);
+
+        assert!(session.preview_new_dimension(Constraint::Length(line, 10.0), 20.0));
+        let moved = session.value_preview();
+        assert_eq!(moved.len(), 1);
+        assert!((length(&moved[0]) - 20.0).abs() < 1e-6);
+        assert_eq!(session.sketch, before);
+        // The value it already has moves nothing.
+        assert!(session.preview_new_dimension(Constraint::Length(line, 10.0), 10.0));
+        assert!(session.value_preview().is_empty());
+
+        // An existing dimension, typed over.
+        assert!(session.add_dimension(Constraint::Length(line, 10.0), 10.0));
+        let id = session.sketch.relations().last().unwrap().id;
+        assert!(session.preview_set_dimension(id, 4.0));
+        assert!((length(&session.value_preview()[0]) - 4.0).abs() < 1e-6);
+
+        // Both ends fixed: no other length can be met, and nothing is shown.
+        let (a, b) = session.sketch.endpoints(line).unwrap();
+        assert!(session.add_relation(Constraint::Fixed(a)));
+        assert!(session.add_relation(Constraint::Fixed(b)));
+        assert!(!session.preview_set_dimension(id, 4.0));
+        assert!(session.value_preview().is_empty());
     }
 
     #[test]

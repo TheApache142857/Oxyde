@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub struct Preferences {
     pub graphics: Graphics,
     pub navigation: Navigation,
+    pub previews: Previews,
     pub debug: Debug,
     /// Shortcuts changed from their defaults, by action id: a key combination such as
     /// `"Ctrl+Shift+Z"`, or `""` for none.
@@ -30,6 +31,7 @@ impl Default for Preferences {
         Self {
             graphics: Graphics::default(),
             navigation: Navigation::default(),
+            previews: Previews::default(),
             debug: Debug::default(),
             shortcuts: BTreeMap::new(),
             recent: Vec::new(),
@@ -273,6 +275,25 @@ impl Default for Navigation {
             constrained_orbit: true,
             animate_views: true,
             animation_time: 0.45,
+        }
+    }
+}
+
+/// What commands show in the viewport before OK.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Previews {
+    /// Feature commands show the part as the feature would make it.
+    pub features: bool,
+    /// The Mate command moves the parts as mates are picked, rather than on OK.
+    pub mates: bool,
+}
+
+impl Default for Previews {
+    fn default() -> Self {
+        Self {
+            features: true,
+            mates: true,
         }
     }
 }

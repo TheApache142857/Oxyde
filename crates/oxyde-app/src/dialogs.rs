@@ -28,6 +28,24 @@ pub struct ExtrudeDialog {
     pub bodies: Vec<oxyde_model::BodyId>,
 }
 
+impl ExtrudeDialog {
+    /// The extrusion as it stands, once a sketch is chosen.
+    pub fn feature(&self) -> Option<FeatureKind> {
+        let extent = if self.mid_plane {
+            ExtrudeExtent::MidPlane { depth: self.depth }
+        } else {
+            ExtrudeExtent::Blind { depth: self.depth }
+        };
+        Some(FeatureKind::Extrude(Extrude {
+            sketch: self.sketch?,
+            op: self.op,
+            extent,
+            reverse: self.reverse && !self.mid_plane,
+            bodies: self.bodies.clone(),
+        }))
+    }
+}
+
 pub struct BlendDialog {
     pub editing: Option<FeatureId>,
     /// Full name of the radius or distance dimension, when editing.
@@ -36,6 +54,24 @@ pub struct BlendDialog {
     pub size: f64,
     /// Picked in the viewport while the command is open.
     pub edges: Vec<EdgeName>,
+}
+
+impl BlendDialog {
+    /// The fillet or chamfer as it stands, once it has edges.
+    pub fn feature(&self) -> Option<FeatureKind> {
+        if self.edges.is_empty() {
+            return None;
+        }
+        let blend = EdgeBlend {
+            edges: self.edges.clone(),
+            size: self.size,
+        };
+        Some(if self.fillet {
+            FeatureKind::Fillet(blend)
+        } else {
+            FeatureKind::Chamfer(blend)
+        })
+    }
 }
 
 /// Which dimension the dimension dialog sets.
@@ -104,6 +140,21 @@ impl Dialog {
                 | Dialog::RefAxis(_)
                 | Dialog::Appearance(_)
                 | Dialog::ChoosePlane
+        )
+    }
+
+    /// A command that adds or edits a feature of the part (and is previewed).
+    pub fn is_feature(&self) -> bool {
+        matches!(
+            self,
+            Dialog::Extrude(_)
+                | Dialog::Revolve(_)
+                | Dialog::Blend(_)
+                | Dialog::Shell(_)
+                | Dialog::Pattern(_)
+                | Dialog::Combine(_)
+                | Dialog::RefPlane(_)
+                | Dialog::RefAxis(_)
         )
     }
 
@@ -236,12 +287,14 @@ impl OxydeApp {
         self.dialog = Some(dialog);
     }
 
-    /// Closes the open command or window, cancelling an Appearance panel's preview.
+    /// Closes the open command or window, cancelling an Appearance panel's preview and
+    /// dropping a feature command's.
     pub(crate) fn close_dialog(&mut self) {
         if let Some(Dialog::Appearance(d)) = self.dialog.take() {
             self.cancel_appearance(d);
         }
         self.dialog = None;
+        self.clear_preview();
     }
 
     /// Tells the user about a caught bug: in the status bar, and in a window over
@@ -309,14 +362,15 @@ impl OxydeApp {
             | Dialog::Appearance(_) => Answer::Open,
             Dialog::ChoosePlane => Answer::Open,
             Dialog::Dimension {
+                target,
                 label,
                 name,
                 text,
                 angle,
                 fresh,
-                ..
             } => {
                 let mut answer = Answer::Open;
+                let sketch = &mut self.sketch;
                 window(label).show(ctx, |ui| {
                     let suffix = if *angle { "°" } else { "mm" };
                     egui::Grid::new("dimension_dialog")
@@ -335,9 +389,46 @@ impl OxydeApp {
                                 ui.end_row();
                             }
                         });
+                    // The sketch as the value would make it, drawn dashed over it.
+                    let met = match (parse_value(text), sketch.as_mut()) {
+                        (Some(typed), Some(session)) => {
+                            let before = session.value_preview().to_vec();
+                            let met = match target {
+                                DimensionTarget::New(relation) => session.preview_new_dimension(
+                                    *relation,
+                                    sketch_mode::typed_value(relation, typed),
+                                ),
+                                DimensionTarget::Existing(id) => {
+                                    match session.sketch.relation(*id).map(|r| r.constraint) {
+                                        Some(c) => session.preview_set_dimension(
+                                            *id,
+                                            sketch_mode::typed_value(&c, typed),
+                                        ),
+                                        None => true,
+                                    }
+                                }
+                            };
+                            if session.value_preview() != before.as_slice() {
+                                ui.ctx().request_repaint();
+                            }
+                            met
+                        }
+                        (_, session) => {
+                            if let Some(session) = session {
+                                session.clear_value_preview();
+                            }
+                            true
+                        }
+                    };
                     if parse_value(text).is_none() {
                         ui.label(
                             egui::RichText::new("Type a number")
+                                .small()
+                                .color(crate::theme::tokens().err),
+                        );
+                    } else if !met {
+                        ui.label(
+                            egui::RichText::new("The other relations cannot meet this value")
                                 .small()
                                 .color(crate::theme::tokens().err),
                         );
@@ -437,43 +528,13 @@ impl OxydeApp {
     pub(crate) fn apply_dialog(&mut self, dialog: Dialog, ctx: &egui::Context) {
         match dialog {
             Dialog::Extrude(d) => {
-                let Some(sketch) = d.sketch else {
-                    return;
-                };
-                let extent = if d.mid_plane {
-                    ExtrudeExtent::MidPlane { depth: d.depth }
-                } else {
-                    ExtrudeExtent::Blind { depth: d.depth }
-                };
-                let kind = FeatureKind::Extrude(Extrude {
-                    sketch,
-                    op: d.op,
-                    extent,
-                    reverse: d.reverse && !d.mid_plane,
-                    bodies: d.bodies,
-                });
-                match d.editing {
-                    Some(id) => self.replace_feature(id, kind),
-                    None => {
-                        self.add_feature(kind);
-                    }
+                if let Some(kind) = d.feature() {
+                    self.add_or_replace(d.editing, kind);
                 }
             }
             Dialog::Blend(d) => {
-                let blend = EdgeBlend {
-                    edges: d.edges,
-                    size: d.size,
-                };
-                let kind = if d.fillet {
-                    FeatureKind::Fillet(blend)
-                } else {
-                    FeatureKind::Chamfer(blend)
-                };
-                match d.editing {
-                    Some(id) => self.replace_feature(id, kind),
-                    None => {
-                        self.add_feature(kind);
-                    }
+                if let Some(kind) = d.feature() {
+                    self.add_or_replace(d.editing, kind);
                 }
             }
             Dialog::Revolve(d) => self.apply_revolve(d),

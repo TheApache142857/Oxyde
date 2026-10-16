@@ -67,5 +67,6 @@ pub use feature::{
 pub use material::{Material, MaterialLibrary, MaterialSource};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
-    FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult, TimelineEntry,
+    FeaturePreview, FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult,
+    TimelineEntry,
 };

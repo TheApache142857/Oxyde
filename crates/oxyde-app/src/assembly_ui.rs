@@ -9,8 +9,9 @@
 //! [`ComponentId::ASSEMBLY`]), listed at the top of the tree and drawn in the viewport, so
 //! that a component can be mated exactly where it should be. The Mate command collects
 //! any number of mates before the parts move (as Creo's component placement does): each
-//! pair is added to a list, and OK places the parts with all of them at once; a preview
-//! can be switched on to see them move as mates are added.
+//! pair is added to a list, and OK places the parts with all of them at once. By default
+//! the parts are previewed where the mates put them as soon as both sides of a pair are
+//! picked (Preferences › Graphics › Previews); off, they stay put until OK.
 
 use std::path::Path;
 
@@ -633,7 +634,7 @@ impl OxydeApp {
             aligned: true,
             aligned_set: false,
             pending: Vec::new(),
-            preview: false,
+            preview: self.prefs.previews.mates,
         };
         for r in refs.into_iter().take(2) {
             self.mate_pick(&mut dialog, r);
@@ -643,9 +644,14 @@ impl OxydeApp {
         if let Some(doc) = self.asm.as_mut() {
             doc.selection.clear();
         }
-        self.status = "Pick a face, edge or plane on each of two components; add as many \
-                       mates as needed, then OK places the parts"
-            .to_owned();
+        self.status = if self.prefs.previews.mates {
+            "Pick a face, edge or plane on each of two components: the parts are shown where \
+             the mate puts them; add as many mates as needed, then OK"
+        } else {
+            "Pick a face, edge or plane on each of two components; add as many mates as \
+             needed, then OK places the parts"
+        }
+        .to_owned();
     }
 
     fn edit_mate(&mut self, id: MateId) {
@@ -1510,6 +1516,7 @@ impl OxydeApp {
         let mut answer = None;
         let mut add = false;
         let mut remove = None;
+        let mut preview_changed = false;
         egui::Frame::none()
             .fill(ui.visuals().faint_bg_color)
             .stroke(Stroke::new(
@@ -1637,11 +1644,12 @@ impl OxydeApp {
                         });
                     }
                     if pending.is_empty() {
-                        ui.label(
-                            RichText::new("None yet: the parts stay put until OK.")
-                                .italics()
-                                .weak(),
-                        );
+                        let text = if d.preview {
+                            "None yet."
+                        } else {
+                            "None yet: the parts stay put until OK."
+                        };
+                        ui.label(RichText::new(text).italics().weak());
                     }
                     ui.add_space(2.0);
                     if ui
@@ -1656,11 +1664,20 @@ impl OxydeApp {
                     }
                 }
                 ui.add_space(4.0);
-                ui.checkbox(&mut d.preview, "Preview: move the parts as mates are added")
+                if ui
+                    .checkbox(
+                        &mut d.preview,
+                        "Preview: move the parts as mates are picked",
+                    )
                     .on_hover_text(
-                        "Off, the parts stay where they are until OK, so every mate can be \
-                         picked where the parts sit now",
-                    );
+                        "The parts go where the mates put them as soon as both sides are \
+                         picked. Off, they stay where they are until OK, so every mate can \
+                         be picked where the parts sit now",
+                    )
+                    .changed()
+                {
+                    preview_changed = true;
+                }
                 if let Some(e) = &preview_error {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -1688,6 +1705,10 @@ impl OxydeApp {
             if i < d.pending.len() {
                 d.pending.remove(i);
             }
+        }
+        if preview_changed {
+            self.prefs.previews.mates = d.preview;
+            self.save_preferences();
         }
         if d.a.is_some() && d.b.is_some() {
             self.mate_defaults(&mut d);

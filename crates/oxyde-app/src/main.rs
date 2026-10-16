@@ -48,6 +48,7 @@ mod materials_ui;
 mod model_refs;
 mod prefs;
 mod prefs_ui;
+mod preview;
 mod property_manager;
 mod section_view;
 mod sketch_mode;
