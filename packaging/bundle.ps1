@@ -103,13 +103,15 @@ if (Test-Path $Zip) { Remove-Item $Zip }
 Compress-Archive -Path $Bundle -DestinationPath $Zip
 Write-Host "Wrote $Zip"
 
-$iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+# The tools are kept as paths: Get-Command gives a command whose .Source is its path,
+# Get-Item a file, which has none.
+$iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) {
     $default = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-    if (Test-Path $default) { $iscc = Get-Item $default }
+    if (Test-Path $default) { $iscc = $default }
 }
 if ($iscc) {
-    & $iscc.Source "/DAppVersion=$Version" packaging\installer.iss
+    & $iscc "/DAppVersion=$Version" packaging\installer.iss
     if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
 } else {
     Write-Warning "Inno Setup (iscc) not found: no .exe installer"
@@ -119,17 +121,24 @@ if ($iscc) {
 # WiX is a .NET tool: `dotnet tool install --global wix --version 5.0.2` (needs the .NET
 # SDK 8 or later). WiX 6 works too but asks you to accept its maintenance-fee licence
 # first (`wix eula accept wix6`).
-$wix = Get-Command wix.exe -ErrorAction SilentlyContinue
+# A terminal opened before WiX was installed does not have .dotnet\tools on its PATH yet.
+$wix = (Get-Command wix.exe -ErrorAction SilentlyContinue).Source
 if (-not $wix) {
     $tool = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
-    if (Test-Path $tool) { $wix = Get-Item $tool }
+    if (Test-Path $tool) { $wix = $tool }
 }
 if ($wix) {
     $Msi = Join-Path $Dist "Oxyde-$Version-windows-x64.msi"
     if (Test-Path $Msi) { Remove-Item $Msi }
-    & $wix.Source build packaging\installer.wxs -arch x64 -d "Version=$Version" `
-        -d "BundleDir=$Bundle" -o $Msi
+    # WiX's working files go next to the bundle: in its default random folder under %TEMP%
+    # the cabinet it was writing vanished mid-build ("failed to compress cabinet").
+    $WixObj = Join-Path $Dist "wix-obj"
+    & $wix build packaging\installer.wxs -arch x64 -d "Version=$Version" `
+        -d "BundleDir=$Bundle" -intermediatefolder $WixObj -o $Msi
     if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+    Remove-Item -Recurse -Force $WixObj -ErrorAction SilentlyContinue
+    # The debug file WiX writes next to the .msi is not for users.
+    Remove-Item ([IO.Path]::ChangeExtension($Msi, ".wixpdb")) -ErrorAction SilentlyContinue
     Write-Host "Wrote $Msi"
 } else {
     Write-Warning "WiX (wix) not found: no .msi. Install it with: dotnet tool install --global wix --version 5.0.2"
