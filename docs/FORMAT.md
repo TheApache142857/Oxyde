@@ -125,6 +125,7 @@ Rules:
 | `sketch` | `plane` (PlaneRef); `entities` and `relations`, see below |
 | `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut` \| `intersect` \| `new_body`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse`, `bodies` (optional, see Bodies below) |
 | `revolve` | `sketch`, `operation`, `axis` (`{"sketch_line": entity id}` \| `{"axis": AxisRef}`), `angle` (radians, up to 2π), `mid_plane`, `reverse`, `bodies` (optional) |
+| `sweep` | `profile` (feature id of the sketch swept), `path` (feature id of the sketch followed: one chain of curves, open or closed), `operation`, `bodies` (optional) |
 | `fillet` | `edges` (list of EdgeRef), `radius` |
 | `chamfer` | `edges` (list of EdgeRef), `distance` |
 | `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
@@ -136,7 +137,7 @@ Rules:
 | `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). `apply_colors` (optional, default false): the colours the STEP file gives its solids and faces are still to become appearances (see *Appearances*); Oxyde writes it only for a part it has not rebuilt yet, such as the parts of an imported assembly. |
 | `combine` | `target` (body), `tools` (bodies), `operation` (`join` \| `cut` \| `intersect`), `keep_tools` (optional, default false) |
 
-Counts include the seed. Seeds of patterns and mirrors are extrusions and revolves (their tool bodies are copied).
+Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves and sweeps (their tool bodies are copied).
 
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
 **AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
@@ -145,7 +146,7 @@ Counts include the seed. Seeds of patterns and mirrors are extrusions and revolv
 
 A part may hold several separate solid bodies (as in Fusion 360 or Creo). A body is named by the feature that made it and which of that feature's bodies it is: `{"feature": 7, "index": 0}` (`index` optional, default 0; a pattern of a `new_body` feature makes one body per copy, numbered in order).
 
-- `operation` of an extrusion or a revolve: `boss` joins the swept solid to a body (the first `boss` of a part makes its first body), `cut` removes it from bodies, `intersect` keeps only what it shares with a body, `new_body` keeps it as a body of its own.
+- `operation` of an extrusion, a revolve or a sweep: `boss` joins the swept solid to a body (the first `boss` of a part makes its first body), `cut` removes it from bodies, `intersect` keeps only what it shares with a body, `new_body` keeps it as a body of its own.
 - `bodies` lists the bodies a `boss`, `cut` or `intersect` works on. Absent or empty means automatic: a `boss` or an `intersect` goes into the body the sketch's face is on (else the newest body), a `cut` goes through every body. Several bodies in a `boss` are joined into the first.
 - Fillets, chamfers and shells work on the bodies their edges or faces are on. Pattern and mirror copies do what their seed did, to the same bodies.
 - A `combine` changes its `target` body by its `tools`, which disappear unless `keep_tools`.
@@ -200,8 +201,8 @@ Sketch coordinates are in the sketch plane's frame. For standard planes: Front =
 References to geometry are never indices; they are the persistent names described in `ARCHITECTURE.md` §6, written as JSON:
 
 - **FaceRef** `{ "key": FaceKey, "part": n }`, where FaceKey is one of:
-  - `{"type": "profile", "feature": id, "segment": sketch_entity_id}`: side face swept by an extrusion or a revolve
-  - `{"type": "start_cap", "feature": id}`, `{"type": "end_cap", "feature": id}`: ends of an extrusion or of a revolve of less than a full turn
+  - `{"type": "profile", "feature": id, "segment": sketch_entity_id}`: side face swept by an extrusion, a revolve or a sweep
+  - `{"type": "start_cap", "feature": id}`, `{"type": "end_cap", "feature": id}`: ends of an extrusion, of a revolve of less than a full turn or of a sweep along an open path
   - `{"type": "from_edge", "feature": id, "edge": EdgeRef}`: fillet/chamfer face
   - `{"type": "from_vertex", "feature": id, "vertex": VertexRef}`: corner blend
   - `{"type": "offset", "feature": id, "face": FaceRef}`: inner wall of a shell, offset from that face
@@ -222,6 +223,24 @@ Optional, default empty, SolidWorks style:
 - `next_global_id`: id the next new global variable will get (default 1; readers raise it above every id).
 
 Expressions are text: numbers, names between double quotes (`"Width"` for a global variable, `"D1@Sketch1"` for a dimension), `+ - * / ^`, parentheses, `pi`, and the functions `sin cos tan asin acos atan` (in degrees), `sqrt abs exp log` (natural) `log10 int round sgn` (one argument) and `min max` (two). Values are in mm, angles in **degrees** (unlike the rest of the file, as in SolidWorks), instance counts are rounded. Names are written as they are at save time. A name that matches nothing on load is kept and reported as an error when the equations are evaluated (a broken equation, not a broken file); a syntax error refuses the file.
+
+### Configurations
+
+`configurations` (optional; absent when the part has none) holds the part's named variants, as SolidWorks' configurations: which one is active, and for each one the values of the *configured* dimensions and whether the *configured* features are suppressed. Everything else in the timeline is shared. The features themselves are saved as the active configuration left them, so a reader that ignores this key opens the part as the active configuration.
+
+```json
+"configurations": {
+  "active": "Thick",
+  "list": [
+    { "name": "Default", "dimensions": { "D1@Boss-Extrude1": 10 }, "suppressed": { "5": false } },
+    { "name": "Thick", "dimensions": { "D1@Boss-Extrude1": 25 }, "suppressed": { "5": true } }
+  ]
+}
+```
+
+- `dimensions` maps full dimension names (as equations write them) to values in internal units: millimetres, radians, or a count. A name that matches no dimension is dropped on reading.
+- `suppressed` maps feature ids (as strings, JSON keys being strings) to `true` (suppressed in that configuration) or `false`. An unknown id is dropped.
+- Names are unique, not empty, at most 64 characters; `active` names one of them (else the first is active).
 
 ### Appearances
 

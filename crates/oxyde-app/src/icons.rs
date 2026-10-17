@@ -15,6 +15,7 @@ pub enum Icon {
     Sketch,
     Extrude,
     Revolve,
+    Sweep,
     Fillet,
     Chamfer,
     Shell,
@@ -65,6 +66,10 @@ pub enum Icon {
     Measure,
     /// Section View: a block cut open, the cut face coloured.
     SectionView,
+    /// Interference Detection: two blocks overlapping, the overlap in red.
+    Interference,
+    /// The ConfigurationManager: a table with a marked row.
+    Configurations,
     Equations,
     Rebuild,
     // View and edit
@@ -395,6 +400,27 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.line(&around, 2.0, ACCENT);
             let (x, y) = around[0];
             pen.head((x + 1.2, y - 1.6), 1.0, -1.2, 4.0, ACCENT);
+        }
+        Sweep => {
+            // A round profile at the bottom left, carried along a bent path to the top
+            // right: a pipe elbow, drawn as its two straight runs and the bend.
+            let path = {
+                let mut p = vec![(5.0, 21.0), (5.0, 13.0)];
+                p.extend(Pen::arc_points(11.0, 13.0, 6.0, 6.0, PI, 1.5 * PI));
+                p.push((19.0, 7.0));
+                p
+            };
+            // The pipe: the path drawn thick, outlined.
+            pen.line(&path, 7.4, INK);
+            pen.line(&path, 5.6, BODY);
+            // The profile at the start, and the path as a sketch line down the middle.
+            pen.painter.add(Shape::convex_polygon(
+                pen.pts(&Pen::arc_points(5.0, 21.0, 3.0, 1.4, 0.0, TAU)),
+                pen.c(BODY_TOP),
+                pen.stroke(1.0, INK),
+            ));
+            pen.dashed(&path, 1.2, SKETCH, 2.5, 1.5);
+            pen.head((21.5, 7.0), 1.0, 0.0, 4.0, ACCENT);
         }
         Fillet => {
             // Front face with its top right corner rounded.
@@ -841,6 +867,53 @@ fn draw(pen: &Pen, icon: Icon) {
             );
             pen.line(&[(19.5, 2.0), (19.5, 22.0)], 1.2, INK);
         }
+        Interference => {
+            // Two blocks run into each other; what they share is red.
+            pen.poly(
+                &[(2.0, 20.0), (2.0, 9.0), (13.0, 9.0), (13.0, 20.0)],
+                BODY,
+                INK,
+            );
+            pen.poly(
+                &[(2.0, 9.0), (6.0, 5.0), (17.0, 5.0), (13.0, 9.0)],
+                BODY_TOP,
+                INK,
+            );
+            pen.poly(
+                &[(10.0, 22.0), (10.0, 13.0), (22.0, 13.0), (22.0, 22.0)],
+                BODY_SIDE,
+                INK,
+            );
+            pen.poly(
+                &[(10.0, 13.0), (13.0, 10.0), (22.0, 10.0), (22.0, 13.0)],
+                BODY_TOP,
+                INK,
+            );
+            pen.poly(
+                &[(10.0, 20.0), (10.0, 13.0), (13.0, 13.0), (13.0, 20.0)],
+                REMOVE,
+                INK,
+            );
+        }
+        Configurations => {
+            // A small table: three rows, the middle one marked as the active configuration.
+            pen.poly(
+                &[(3.0, 4.0), (21.0, 4.0), (21.0, 20.0), (3.0, 20.0)],
+                WHITE,
+                INK,
+            );
+            pen.line(&[(3.0, 9.5), (21.0, 9.5)], 1.0, INK);
+            pen.line(&[(3.0, 15.0), (21.0, 15.0)], 1.0, INK);
+            pen.line(&[(9.0, 4.0), (9.0, 20.0)], 1.0, INK);
+            pen.fill(
+                &[(3.5, 10.0), (20.5, 10.0), (20.5, 14.5), (3.5, 14.5)],
+                ACCENT_LIGHT,
+            );
+            pen.circle(6.0, 12.25, 1.6, ACCENT, None);
+            pen.line(&[(11.0, 12.25), (19.0, 12.25)], 1.6, INK);
+            pen.line(&[(11.0, 6.75), (19.0, 6.75)], 1.2, BODY_SIDE);
+            pen.line(&[(11.0, 17.5), (19.0, 17.5)], 1.2, BODY_SIDE);
+        }
         Equations => {
             pen.line(
                 &[
@@ -1025,7 +1098,7 @@ pub fn dropdown_marker(ui: &Ui, button: &Response) {
     ));
 }
 
-/// The "remove material" badge over a feature icon (cut extrusions and revolves).
+/// The "remove material" badge over a feature icon (cut extrusions, revolves and sweeps).
 pub fn cut_badge(painter: &egui::Painter, icon_rect: Rect) {
     let r = icon_rect.width() * 0.24;
     let c = icon_rect.right_bottom() - Vec2::splat(r * 0.9);
@@ -1056,12 +1129,13 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 62] = {
+pub const ALL: [Icon; 65] = {
     use Icon::*;
     [
         Sketch,
         Extrude,
         Revolve,
+        Sweep,
         Fillet,
         Chamfer,
         Shell,
@@ -1103,6 +1177,8 @@ pub const ALL: [Icon; 62] = {
         MassProperties,
         Measure,
         SectionView,
+        Interference,
+        Configurations,
         Equations,
         Rebuild,
         ViewFront,

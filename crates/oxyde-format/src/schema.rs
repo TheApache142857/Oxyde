@@ -7,12 +7,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend,
-    EdgeName, EquationText, Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
-    FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Import,
-    LinearPattern, Material, MaterialSource, Mirror, PartDefinition, PatternDirection, PlaneRef,
-    RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
-    StandardPlane, Texture, VertexName,
+    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp,
+    ConfigurationText, ConfigurationsText, EdgeBlend, EdgeName, EquationText, Equations,
+    EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
+    FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Material,
+    MaterialSource, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve,
+    RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep, Texture,
+    VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -81,6 +82,28 @@ pub(crate) struct PartModel {
     /// What the part is made of, copied from a material library.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub material: Option<MaterialDto>,
+    /// Named variants of the part; absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configurations: Option<ConfigurationsDto>,
+}
+
+/// The configurations of a part (see `docs/FORMAT.md` §3, *Configurations*).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ConfigurationsDto {
+    /// Name of the active configuration.
+    pub active: String,
+    pub list: Vec<ConfigurationDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ConfigurationDto {
+    pub name: String,
+    /// Full dimension names ("D1@Sketch1") to values (mm, radians, counts).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dimensions: BTreeMap<String, f64>,
+    /// Feature ids (as strings, for JSON keys) to whether the configuration suppresses them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub suppressed: BTreeMap<String, bool>,
 }
 
 // ---- Materials -----------------------------------------------------------------------------
@@ -406,6 +429,13 @@ pub(crate) enum KindDto {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         bodies: Vec<BodyIdDto>,
     },
+    Sweep {
+        profile: u32,
+        path: u32,
+        operation: OperationDto,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
+    },
     Fillet {
         edges: Vec<EdgeRefDto>,
         radius: f64,
@@ -693,7 +723,24 @@ pub(crate) struct VertexRefDto {
 impl PartModel {
     pub fn from_definition(definition: &PartDefinition, textures: &TextureTable) -> Self {
         let text = definition.equations_text();
+        let configurations = definition.configurations_text();
         Self {
+            configurations: (!configurations.list.is_empty()).then(|| ConfigurationsDto {
+                active: configurations.active,
+                list: configurations
+                    .list
+                    .into_iter()
+                    .map(|c| ConfigurationDto {
+                        name: c.name,
+                        dimensions: c.dimensions.into_iter().collect(),
+                        suppressed: c
+                            .suppressed
+                            .into_iter()
+                            .map(|(id, s)| (id.to_string(), s))
+                            .collect(),
+                    })
+                    .collect(),
+            }),
             appearances: appearances_dto(&definition.appearances, textures),
             material: definition
                 .material
@@ -778,6 +825,12 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             mid_plane: revolve.mid_plane,
             reverse: revolve.reverse,
             bodies: revolve.bodies.iter().map(body_dto).collect(),
+        },
+        FeatureKind::Sweep(sweep) => KindDto::Sweep {
+            profile: sweep.profile.raw(),
+            path: sweep.path.raw(),
+            operation: operation_dto(sweep.op),
+            bodies: sweep.bodies.iter().map(body_dto).collect(),
         },
         FeatureKind::Fillet(blend) => KindDto::Fillet {
             edges: blend.edges.iter().map(edge_dto).collect(),
@@ -1072,7 +1125,35 @@ impl PartModel {
                 .map(|m| material_from(m, files))
                 .transpose()
                 .map_err(|e| format!("material: {e}"))?,
+            configurations: Default::default(),
         };
+        if let Some(configurations) = self.configurations {
+            let text = ConfigurationsText {
+                active: configurations.active,
+                list: configurations
+                    .list
+                    .into_iter()
+                    .map(|c| {
+                        Ok(ConfigurationText {
+                            name: c.name,
+                            dimensions: c.dimensions.into_iter().collect(),
+                            suppressed: c
+                                .suppressed
+                                .into_iter()
+                                .map(|(id, s)| {
+                                    id.parse::<u32>()
+                                        .map(|id| (id, s))
+                                        .map_err(|_| format!("configurations: feature id \"{id}\""))
+                                })
+                                .collect::<Result<_, String>>()?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?,
+            };
+            definition
+                .set_configurations_text(text)
+                .map_err(|e| format!("configurations: {e}"))?;
+        }
         definition
             .set_equations_text(EquationsText {
                 globals: self
@@ -1238,6 +1319,17 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             angle,
             mid_plane,
             reverse,
+            bodies: bodies.into_iter().map(body_from).collect(),
+        }),
+        KindDto::Sweep {
+            profile,
+            path,
+            operation,
+            bodies,
+        } => FeatureKind::Sweep(Sweep {
+            profile: FeatureId::from_raw(profile),
+            path: FeatureId::from_raw(path),
+            op: operation_from(operation),
             bodies: bodies.into_iter().map(body_from).collect(),
         }),
         KindDto::Shell {

@@ -1,5 +1,5 @@
-//! Commands of the features added in M3–M5: revolve, shell, reference plane and axis,
-//! linear and circular patterns, mirror. Each opens in the PropertyManager for a new feature
+//! Commands of the features added in M3–M5: revolve, sweep, shell, reference plane and
+//! axis, linear and circular patterns, mirror. Each opens in the PropertyManager for a new feature
 //! (from the command bar) or for an existing one (double-click in the timeline).
 //!
 //! Planes, axes and directions start from what is selected and are listed with the
@@ -9,7 +9,7 @@
 use oxyde_model::{
     AxisRef, BodyId, CircularPattern, Combine, CombineOp, ExtrudeOp, FaceName, Feature, FeatureId,
     FeatureKind, FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane,
+    RefPlane, Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane, Sweep,
 };
 use oxyde_sketch::Geometry;
 
@@ -36,6 +36,40 @@ pub struct RevolveDialog {
     pub reverse: bool,
     /// Bodies it joins, cuts or intersects; empty = automatic.
     pub bodies: Vec<BodyId>,
+}
+
+/// Sweep: a profile sketch carried along a path sketch.
+pub struct SweepDialog {
+    pub editing: Option<FeatureId>,
+    /// The sketch swept; picked in the timeline.
+    pub profile: Option<FeatureId>,
+    /// The sketch followed; picked in the timeline.
+    pub path: Option<FeatureId>,
+    pub op: ExtrudeOp,
+    /// Clicks fill the path box rather than the profile.
+    pub path_next: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic.
+    pub bodies: Vec<BodyId>,
+}
+
+impl SweepDialog {
+    pub fn feature(&self) -> Result<FeatureKind, &'static str> {
+        let profile = self
+            .profile
+            .ok_or("Choose the sketch to sweep (the profile)")?;
+        let path = self
+            .path
+            .ok_or("Choose the sketch to sweep along (the path)")?;
+        if profile == path {
+            return Err("The profile and the path must be two different sketches");
+        }
+        Ok(FeatureKind::Sweep(Sweep {
+            profile,
+            path,
+            op: self.op,
+            bodies: self.bodies.clone(),
+        }))
+    }
 }
 
 /// Combine: a target body and the tool bodies joined to, cut from or intersected with it.
@@ -457,6 +491,32 @@ impl OxydeApp {
         self.open_revolve(None, sketch, ExtrudeOp::Boss, None);
     }
 
+    pub(crate) fn open_sweep(&mut self, editing: Option<FeatureId>, existing: Option<&Sweep>) {
+        self.open_dialog(Dialog::Sweep(SweepDialog {
+            editing,
+            profile: existing.map(|s| s.profile),
+            path: existing.map(|s| s.path),
+            op: existing.map_or(ExtrudeOp::Boss, |s| s.op),
+            path_next: existing.is_some(),
+            bodies: existing.map(|s| s.bodies.clone()).unwrap_or_default(),
+        }));
+    }
+
+    /// Sweep: the selected sketch (or the latest unused one) is the profile; the path is
+    /// picked next.
+    pub(crate) fn begin_sweep(&mut self) {
+        let profile = self.sketch_to_use();
+        self.open_sweep(None, None);
+        if let Some(Dialog::Sweep(d)) = self.dialog.as_mut() {
+            d.profile = profile;
+            d.path_next = profile.is_some();
+        }
+        if self.sketches().len() < 2 {
+            self.status = "A sweep needs two sketches: a closed profile and an open or closed path"
+                .to_owned();
+        }
+    }
+
     pub(crate) fn open_shell(&mut self, editing: Option<FeatureId>, existing: Option<&Shell>) {
         let faces = match existing {
             Some(shell) => shell.faces.clone(),
@@ -594,7 +654,8 @@ impl OxydeApp {
     pub(crate) fn begin_pattern(&mut self, kind: PatternKind) {
         if self.seed_choices(None).is_empty() {
             self.status =
-                "Patterns and mirrors copy extrusions and revolves: add one first".to_owned();
+                "Patterns and mirrors copy extrusions, revolves and sweeps: add one first"
+                    .to_owned();
             return;
         }
         self.open_pattern(None, kind, None);
@@ -686,6 +747,12 @@ impl OxydeApp {
 
     pub(crate) fn apply_revolve(&mut self, d: RevolveDialog) {
         if d.sketch.is_some() {
+            self.apply_feature(d.editing, d.feature());
+        }
+    }
+
+    pub(crate) fn apply_sweep(&mut self, d: SweepDialog) {
+        if d.profile.is_some() && d.path.is_some() {
             self.apply_feature(d.editing, d.feature());
         }
     }

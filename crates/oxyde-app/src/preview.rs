@@ -163,22 +163,19 @@ pub(crate) fn tint(doc: &Document, preview: Option<&Preview>) -> Option<(Rgb, Ve
 fn removes(doc: &Document, kind: &FeatureKind) -> bool {
     let removing = |op: ExtrudeOp| matches!(op, ExtrudeOp::Cut | ExtrudeOp::Intersect);
     let seeds = match kind {
-        FeatureKind::Extrude(e) => return removing(e.op),
-        FeatureKind::Revolve(r) => return removing(r.op),
         FeatureKind::Combine(c) => return matches!(c.op, CombineOp::Cut | CombineOp::Intersect),
         FeatureKind::LinearPattern(p) => &p.seeds,
         FeatureKind::CircularPattern(p) => &p.seeds,
         FeatureKind::Mirror(m) => &m.seeds,
-        _ => return false,
+        other => return other.sweep_op().is_some_and(removing),
     };
     !seeds.is_empty()
-        && seeds
-            .iter()
-            .all(|id| match doc.part.feature(*id).map(|f| f.kind()) {
-                Some(FeatureKind::Extrude(e)) => removing(e.op),
-                Some(FeatureKind::Revolve(r)) => removing(r.op),
-                _ => false,
-            })
+        && seeds.iter().all(|id| {
+            doc.part
+                .feature(*id)
+                .and_then(|f| f.kind().sweep_op())
+                .is_some_and(removing)
+        })
 }
 
 impl OxydeApp {
@@ -188,6 +185,7 @@ impl OxydeApp {
         let kind = match dialog {
             Dialog::Extrude(d) => d.feature(),
             Dialog::Revolve(d) => d.feature().ok(),
+            Dialog::Sweep(d) => d.feature().ok(),
             Dialog::Blend(d) => d.feature(),
             Dialog::Shell(d) => Some(d.feature()),
             Dialog::Pattern(d) => d.feature(&self.doc.part).ok(),
@@ -208,7 +206,7 @@ impl OxydeApp {
         let on = self.prefs.previews.features
             && self.sketch.is_none()
             && self.section.is_none()
-            && self.stl.is_none()
+            && self.mesh_export.is_none()
             && !self.busy();
         let Some(spec) = on.then(|| self.dialog_feature()).flatten() else {
             self.clear_preview();
@@ -381,7 +379,8 @@ mod tests {
             size: 2.0,
         }));
         let s2 = doc.part.add_feature(rectangle(10.0, 10.0));
-        doc.rebuild(kernel).expect("the preview test model rebuilds");
+        doc.rebuild(kernel)
+            .expect("the preview test model rebuilds");
         (doc, base, round, s2)
     }
 

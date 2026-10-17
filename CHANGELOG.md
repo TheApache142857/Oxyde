@@ -5,6 +5,60 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Sweep, configurations, interference detection, an Export menu (unreleased, October 2026)
+
+Features and tools SolidWorks users reach for next, after a look at what solidcraft offers:
+
+- **Sweep.** Features › Sweep carries the closed contours of one sketch (the profile) along
+  the curves of another (the path): a round profile along a bent path gives a pipe, a
+  square along a closed path a frame. The path is one chain of lines and arcs, open or
+  closed (a full circle gives a ring); a path in two pieces, a branching one or the
+  profile sketch itself are refused with a message. The profile keeps its angle to the
+  path through bends. Sweeps join, cut, intersect or make a new body like extrusions, are
+  named `Sweep1` and `Cut-Sweep1`, show both sketches under them in the tree, preview
+  live, and can be the seed of a pattern or a mirror. Side faces are named after the
+  profile's segments as an extrusion's are, so fillets and later features on a sweep keep
+  their references. The PropertyManager takes the profile first and the path next
+  (buttons switch which box the next click fills); the Insert menu, the Features tab and
+  a keyboard shortcut (Preferences › Shortcuts › Sweep) start it. In files: a new feature
+  `type` `sweep` (FORMAT.md §3).
+- **Configurations.** The left panel has two tabs now, as SolidWorks' FeatureManager and
+  ConfigurationManager: *Features* (the tree) and *Configurations*. A configuration is a
+  named variant of the part in the same file: its own values for chosen dimensions and
+  its own suppressed features, everything else shared. Add the first one and the part as
+  it is becomes *Default*; add dimensions and features to the table with the two menus;
+  click a name to activate a configuration (the part rebuilds with its values), edit the
+  active row to edit the part, edit another row to set what that configuration will apply.
+  What is changed while a configuration is active stays with it. Right-click a name to
+  rename or remove it, a column heading to stop configuring it. Every change is one undo
+  step. Saved in `model.json` under `configurations` (FORMAT.md §3); files without any open
+  as before.
+- **Interference Detection** (assemblies, Evaluate tab). Every pair of visible parts whose
+  boxes overlap is checked exactly, on every core; the pairs that share a volume are
+  listed with it (largest first), the shared volumes are drawn in red over the model,
+  and clicking a pair selects its two components. Parts that only touch along a face are
+  not interferences. The window says when the assembly changed since the last
+  calculation.
+- **File › Export** is a menu now, in parts and assemblies: **STEP** (as before; an
+  assembly's visible parts placed, with their colours and materials, in one file),
+  **IGES** 5.3 (new), **STL**, **OBJ** (new: one named object per part or body, with
+  normals, for Blender and renderers) and **3MF** (new: named, coloured objects and the
+  unit, for modern slicers) through the mesh export window, which previews the mesh as it
+  will be written and reports its triangles and whether it is watertight, and **Image
+  (PNG)** (new): the view at any size, from a standard view or as on screen, drawn by the
+  software renderer with the viewport's colours. The command line's `export` writes the
+  new formats too, by extension (`.igs`, `.obj`, `.3mf`).
+- **Edit in place at any depth.** A part inside a sub-assembly (inside another, at any
+  depth) can be edited in place straight from the top assembly: right-click it in the tree
+  or on a face in the graphics area, or double-click its row. The rest of the whole
+  assembly is ghosted around it, in the part's own coordinates, and File › Finish editing
+  comes back with the files read again. Opening a sub-assembly in place and a part from
+  there still works.
+- **A plan for a Render tab** is in `docs/RENDERING.md`: a renderer inside Oxyde (a CPU
+  path tracer as the reference, a wgpu preview), a link to Blender (glTF export and an
+  add-on with reload), and the order to build them in, with the questions the owner
+  decides. Nothing of it is built yet.
+
 ### Booleans on every core (unreleased, October 2026)
 
 - **Booleans use every core.** A fuse, cut or intersection (an extrusion joining or

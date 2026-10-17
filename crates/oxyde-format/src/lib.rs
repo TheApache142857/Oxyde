@@ -34,9 +34,11 @@
 
 mod assembly_schema;
 pub mod material_library;
+pub mod obj;
 mod schema;
 pub mod step_import;
 pub mod stl;
+pub mod threemf;
 
 use std::fmt;
 use std::fs::File;
@@ -288,7 +290,10 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
         (MANIFEST, to_json(MANIFEST, &manifest)?),
         (
             MODEL,
-            to_json(MODEL, &PartModel::from_definition(&part.definition, &textures))?,
+            to_json(
+                MODEL,
+                &PartModel::from_definition(&part.definition, &textures),
+            )?,
         ),
         (PROPERTIES, to_json(PROPERTIES, &part.properties)?),
     ] {
@@ -525,6 +530,7 @@ mod tests {
     use oxyde_geom::Point2;
     use std::f64::consts::{PI, TAU};
 
+    use oxyde_model::Sweep;
     use oxyde_model::{
         AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, Extrude,
         ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, FeatureKind, LinearPattern, Mirror,
@@ -643,6 +649,25 @@ mod tests {
             tools: vec![BodyId::new(ring, 0)],
             op: CombineOp::Join,
             keep_tools: true,
+        }));
+        // A sweep: a round profile along a path of another sketch.
+        let mut round = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        round.circle(Point2::new(40.0, 0.0), 1.0);
+        let s4 = part.add_feature(FeatureKind::Sketch(round));
+        let mut bend = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+        bend.geometry
+            .line(Point2::new(40.0, 0.0), Point2::new(40.0, -5.0));
+        bend.geometry.arc(
+            Point2::new(45.0, -5.0),
+            Point2::new(40.0, -5.0),
+            Point2::new(45.0, -10.0),
+        );
+        let s5 = part.add_feature(FeatureKind::Sketch(bend));
+        part.add_feature(FeatureKind::Sweep(Sweep {
+            profile: s4,
+            path: s5,
+            op: ExtrudeOp::NewBody,
+            bodies: vec![BodyId::new(boss, 0)],
         }));
         let shell = part.add_feature(FeatureKind::Shell(Shell {
             faces: vec![FaceName::new(FaceKey::Instance {
@@ -1036,10 +1061,16 @@ mod tests {
             },
             750.0,
         ));
-        let bytes = write_part(Cursor::new(Vec::new()), &file).unwrap().into_inner();
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         let mut model = String::new();
-        archive.by_name(MODEL).unwrap().read_to_string(&mut model).unwrap();
+        archive
+            .by_name(MODEL)
+            .unwrap()
+            .read_to_string(&mut model)
+            .unwrap();
         assert!(model.contains("\"material\": {"), "{model}");
         assert!(model.contains("\"density\": 750"), "{model}");
         assert!(model.contains("\"file\": \"textures/1.png\""), "{model}");
@@ -1049,10 +1080,16 @@ mod tests {
 
         // A part without a material writes none.
         let plain = sample();
-        let bytes = write_part(Cursor::new(Vec::new()), &plain).unwrap().into_inner();
+        let bytes = write_part(Cursor::new(Vec::new()), &plain)
+            .unwrap()
+            .into_inner();
         let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
         let mut model = String::new();
-        archive.by_name(MODEL).unwrap().read_to_string(&mut model).unwrap();
+        archive
+            .by_name(MODEL)
+            .unwrap()
+            .read_to_string(&mut model)
+            .unwrap();
         assert!(!model.contains("material"));
     }
 

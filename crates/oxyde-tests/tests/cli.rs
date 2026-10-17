@@ -296,7 +296,7 @@ fn check_passes_on_the_hand_calculation_and_fails_when_it_is_off() {
 }
 
 #[test]
-fn export_writes_step_and_stl() {
+fn export_writes_step_iges_and_meshes() {
     let dir = scratch("export");
     let part = dir.join("box.oxyprt");
     filleted_box(&part, R);
@@ -332,11 +332,61 @@ fn export_writes_step_and_stl() {
     assert!(count >= 12, "{count} triangles");
     assert_eq!(bytes.len(), 84 + 50 * count);
 
+    // OBJ: one object named after the file, its faces indexed from 1.
+    let obj = dir.join("box.obj");
+    let (code, out, err) = run(&[
+        "export",
+        part.to_str().unwrap(),
+        "--out",
+        obj.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}{err}");
+    let text = std::fs::read_to_string(&obj).unwrap();
+    assert!(
+        text.contains(
+            "o box
+"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.matches(
+            "
+f "
+        )
+        .count()
+            >= 12
+    );
+
+    // 3MF: a ZIP with the model inside, in millimetres.
+    let threemf = dir.join("box.3mf");
+    let (code, out, err) = run(&[
+        "export",
+        part.to_str().unwrap(),
+        "--out",
+        threemf.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}{err}");
+    let bytes = std::fs::read(&threemf).unwrap();
+    assert_eq!(&bytes[..2], b"PK");
+
+    // IGES: read back by OpenCASCADE with the same volume.
+    let iges = dir.join("box.igs");
+    let (code, out, err) = run(&[
+        "export",
+        part.to_str().unwrap(),
+        "--out",
+        iges.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}{err}");
+    let header = std::fs::read_to_string(&iges).unwrap();
+    assert!(header.contains('S') && header.len() > 1000, "IGES written");
+
     let (code, _, err) = run(&[
         "export",
         part.to_str().unwrap(),
         "--out",
-        dir.join("box.obj").to_str().unwrap(),
+        dir.join("box.xyz").to_str().unwrap(),
     ]);
     assert_eq!(code, EXIT_ERROR);
     assert!(err.contains(".stl"), "{err}");

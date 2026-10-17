@@ -49,6 +49,16 @@ impl Kernel for PanickingKernel {
         panic!("revolve has a bug")
     }
 
+    fn sweep(
+        &mut self,
+        _: &Plane,
+        _: &Profile,
+        _: &Plane,
+        _: &oxyde_geom::Path,
+    ) -> Result<OpResult, NeverError> {
+        panic!("sweep has a bug")
+    }
+
     fn shell(&mut self, _: ShapeHandle, _: &[u32], _: f64) -> Result<OpResult, NeverError> {
         panic!("shell has a bug")
     }
@@ -106,6 +116,10 @@ impl Kernel for PanickingKernel {
         _: &Path,
     ) -> Result<(), NeverError> {
         panic!("export_step has a bug")
+    }
+
+    fn export_iges(&self, _: &[ShapeHandle], _: &Path) -> Result<(), NeverError> {
+        panic!("export_iges has a bug")
     }
 
     fn import_step(&mut self, _: &[u8]) -> Result<StepImport, NeverError> {

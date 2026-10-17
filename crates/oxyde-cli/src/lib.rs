@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use oxyde_format::stl::{self, StlQuality, StlUnit};
 use oxyde_format::{FormatError, Properties, load_part};
+use oxyde_format::{obj, threemf};
 use oxyde_kernel::{Kernel, Mesh, StepMaterial};
 use oxyde_model::{FeatureStatus, ModelError, Part};
 use oxyde_occt::{OcctError, OcctKernel};
@@ -616,13 +617,20 @@ pub fn write_check(out: &mut dyn Write, report: &CheckReport) -> io::Result<()> 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
+    /// STEP AP214 with colours and material.
     Step,
+    /// IGES 5.3, the solids as B-rep.
+    Iges,
     /// Binary STL in millimetres, at the application's Normal quality.
     Stl,
+    /// Wavefront OBJ in millimetres, one object per body, with normals.
+    Obj,
+    /// 3MF in millimetres, one named, coloured object per body.
+    ThreeMf,
 }
 
 impl ExportFormat {
-    /// From the file's extension: `.step` and `.stp`, or `.stl`.
+    /// From the file's extension: `.step`/`.stp`, `.igs`/`.iges`, `.stl`, `.obj` or `.3mf`.
     pub fn of(path: &Path) -> Result<Self> {
         match path
             .extension()
@@ -631,23 +639,32 @@ impl ExportFormat {
             .as_deref()
         {
             Some("step" | "stp") => Ok(ExportFormat::Step),
+            Some("igs" | "iges") => Ok(ExportFormat::Iges),
             Some("stl") => Ok(ExportFormat::Stl),
+            Some("obj") => Ok(ExportFormat::Obj),
+            Some("3mf") => Ok(ExportFormat::ThreeMf),
             _ => Err(Error(format!(
-                "{}: the output must be a .step, .stp or .stl file",
+                "{}: the output must be a .step, .stp, .igs, .iges, .stl, .obj or .3mf file",
                 path.display()
             ))),
         }
     }
 }
 
-/// Writes the rebuilt body of `rebuilt` to `out`, STEP or STL by its extension. A part
-/// without a solid is an error.
+/// Writes the rebuilt body of `rebuilt` to `out`, in the format its extension names. A
+/// part without a solid is an error.
 pub fn export_rebuilt(rebuilt: &Rebuilt, out: &Path) -> Result<ExportFormat> {
     let format = ExportFormat::of(out)?;
     let Some(body) = rebuilt.part.body() else {
         return Err(Error("nothing to export: the part has no solid".to_owned()));
     };
     let kernel = &rebuilt.kernel;
+    let name = rebuilt
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "part".to_owned());
+    let io_error = |e: std::io::Error| Error(format!("{}: {e}", out.display()));
     match format {
         ExportFormat::Step => {
             let shapes = body.shapes();
@@ -661,31 +678,66 @@ pub fn export_rebuilt(rebuilt: &Rebuilt, out: &Path) -> Result<ExportFormat> {
             let materials = vec![material; shapes.len()];
             kernel.export_step(&shapes, &colors, &materials, out)?;
         }
-        ExportFormat::Stl => {
+        ExportFormat::Iges => {
+            kernel.export_iges(&body.shapes(), out)?;
+        }
+        ExportFormat::Stl | ExportFormat::Obj | ExportFormat::ThreeMf => {
             let (deflection, angle) = StlQuality::Normal
                 .settings(rebuilt.diagonal())
                 .unwrap_or((0.05, 20.0));
-            let mut mesh = Mesh::default();
-            for solid in &body.solids {
-                let m =
+            // One mesh per body, named after the file (and the body when there are
+            // several), with the body's colour.
+            let colors = rebuilt.part.step_colors(body);
+            let mut bodies: Vec<(String, Mesh, Option<[u8; 3]>)> = Vec::new();
+            for (i, solid) in body.solids.iter().enumerate() {
+                let mesh =
                     kernel.tessellate_for_export(solid.shape, deflection, angle.to_radians())?;
-                mesh.faces.extend(m.faces);
-                mesh.edges.extend(m.edges);
+                let color = colors
+                    .get(i)
+                    .and_then(|c| c.solids.first().copied().flatten())
+                    .map(|c| c.rgb);
+                let object = if body.solids.len() > 1 {
+                    format!("{name} Body {}", i + 1)
+                } else {
+                    name.clone()
+                };
+                bodies.push((object, mesh, color));
             }
-            let triangles = stl::triangles(&mesh, StlUnit::Millimetre.per_mm());
-            let name = rebuilt
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "part".to_owned());
-            stl::save(out, &name, &triangles, true)
-                .map_err(|e| Error(format!("{}: {e}", out.display())))?;
+            match format {
+                ExportFormat::Stl => {
+                    let mut mesh = Mesh::default();
+                    for (_, m, _) in &bodies {
+                        mesh.faces.extend(m.faces.iter().cloned());
+                        mesh.edges.extend(m.edges.iter().cloned());
+                    }
+                    let triangles = stl::triangles(&mesh, StlUnit::Millimetre.per_mm());
+                    stl::save(out, &name, &triangles, true).map_err(io_error)?;
+                }
+                ExportFormat::Obj => {
+                    let meshes: Vec<obj::NamedMesh<'_>> = bodies
+                        .iter()
+                        .map(|(n, m, _)| obj::NamedMesh { name: n, mesh: m })
+                        .collect();
+                    obj::save(out, &meshes, 1.0).map_err(io_error)?;
+                }
+                _ => {
+                    let meshes: Vec<threemf::NamedMesh<'_>> = bodies
+                        .iter()
+                        .map(|(n, m, c)| threemf::NamedMesh {
+                            name: n,
+                            mesh: m,
+                            color: *c,
+                        })
+                        .collect();
+                    threemf::save(out, &meshes, StlUnit::Millimetre).map_err(io_error)?;
+                }
+            }
         }
     }
     Ok(format)
 }
 
-/// Rebuilds `path` and writes its body to `out` (STEP or STL by extension). Returns the
+/// Rebuilds `path` and writes its body to `out` (the format by extension). Returns the
 /// features' statuses as well, since a body built from failed features is worth a look.
 pub fn export(path: &Path, out: &Path) -> Result<(ExportFormat, Vec<FeatureReport>)> {
     let rebuilt = rebuild(path)?;
@@ -767,8 +819,9 @@ enum Command {
         #[arg(long, default_value_t = 1e-3)]
         tol: f64,
     },
-    /// Rebuild a part and write its body as STEP (.step, .stp) or binary STL (.stl).
-    /// Exit 1 if a feature failed (the file is still written).
+    /// Rebuild a part and write its body as STEP (.step, .stp), IGES (.igs, .iges), binary
+    /// STL (.stl), OBJ (.obj) or 3MF (.3mf). Exit 1 if a feature failed (the file is still
+    /// written).
     Export {
         /// The .oxyprt file.
         part: PathBuf,

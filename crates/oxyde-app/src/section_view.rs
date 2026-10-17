@@ -737,8 +737,8 @@ impl OxydeApp {
         if self.section.is_none() {
             return;
         }
-        // The STL preview owns the viewport while its window is open.
-        if self.stl.is_some() {
+        // The mesh export preview owns the viewport while its window is open.
+        if self.mesh_export.is_some() {
             self.close_section_view();
             return;
         }

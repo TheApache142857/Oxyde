@@ -9,22 +9,23 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use oxyde_geom::{Axis, Plane, Profile, ProfileError, Transform};
+use oxyde_geom::{Axis, Path as SweepPath, PathError, Plane, Profile, ProfileError, Transform};
 use oxyde_kernel::{BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind};
 use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
 use crate::appearance::{Appearance, Appearances};
-use crate::material::Material;
-use oxyde_kernel::{StepColor, StepColors};
 use crate::bodies::{Body, Solid, Working};
+use crate::configurations::Configurations;
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
     AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
     ExtrudeOp, Feature, FeatureId, FeatureKind, Import, LinearPattern, Mirror, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane,
+    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, Sweep,
 };
+use crate::material::Material;
 use crate::naming::{FaceKey, FaceName, Resolution};
+use oxyde_kernel::{StepColor, StepColors};
 
 /// State of a feature as shown in the timeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +64,9 @@ pub struct SketchResult {
     /// Closed regions, or why the sketch cannot be extruded (an open sketch is not an error
     /// in itself, only for features that need a closed contour).
     pub profile: Result<Profile, ProfileError>,
+    /// The sketch's curves as one chain, or why they are not one (only an error for a
+    /// sweep following the sketch).
+    pub path: Result<SweepPath, PathError>,
 }
 
 /// Geometry of a reference feature.
@@ -100,7 +104,7 @@ impl ToolOp {
     }
 }
 
-/// The solid an extrusion or a revolve swept, kept so that patterns and mirrors can copy
+/// The solid an extrusion, a revolve or a sweep swept, kept so that patterns and mirrors can copy
 /// it and do the same with the copies.
 #[derive(Debug)]
 struct ToolBody {
@@ -221,6 +225,9 @@ pub struct PartDefinition {
     /// What the part is made of: its look where no appearance overrides it, and its
     /// density.
     pub material: Option<Material>,
+    /// Named variants of the part: values of configured dimensions and suppression of
+    /// configured features, one of them active.
+    pub configurations: Configurations,
 }
 
 /// A part document: its timeline and the cached results of the last rebuild.
@@ -237,6 +244,7 @@ pub struct Part {
     pub(crate) equation_results: EquationResults,
     appearances: Appearances,
     material: Option<Material>,
+    pub(crate) configurations: Configurations,
     results: Vec<FeatureResult>,
     /// Results from this index on are stale.
     dirty_from: usize,
@@ -258,6 +266,7 @@ impl Part {
             equation_results: EquationResults::default(),
             appearances: Appearances::default(),
             material: None,
+            configurations: Configurations::default(),
             results: Vec::new(),
             dirty_from: 0,
         }
@@ -316,6 +325,7 @@ impl Part {
             }
         }
         definition.equations.validate()?;
+        definition.configurations.validate()?;
         let highest = definition
             .features
             .iter()
@@ -330,6 +340,7 @@ impl Part {
             equation_results: EquationResults::default(),
             appearances: definition.appearances,
             material: definition.material.map(Material::clamped),
+            configurations: definition.configurations,
             results: Vec::new(),
             dirty_from: 0,
         })
@@ -344,6 +355,7 @@ impl Part {
             equations: self.equations.clone(),
             appearances: self.appearances.clone(),
             material: self.material.clone(),
+            configurations: self.configurations.clone(),
         }
     }
 
@@ -872,7 +884,7 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The solved sketch an extrusion or a revolve uses, with a closed profile.
+    /// The solved sketch an extrusion, a revolve or a sweep uses, with a closed profile.
     fn profile_sketch(&self, sketch: FeatureId) -> Result<(&'a SketchResult, &'a Profile), String> {
         let (feature, result) = self.earlier(sketch)?;
         let name = &feature.name;
@@ -891,6 +903,21 @@ impl<'a> Context<'a> {
             return Err(format!("{name} has no closed contour"));
         }
         Ok((solved, profile))
+    }
+
+    /// The solved sketch a sweep follows, with its curves chained into one path.
+    fn path_sketch(&self, sketch: FeatureId) -> Result<(&'a SketchResult, &'a SweepPath), String> {
+        let (feature, result) = self.earlier(sketch)?;
+        let name = &feature.name;
+        if matches!(result.status, FeatureStatus::Error(_)) {
+            return Err(format!("{name} has errors"));
+        }
+        let solved = result
+            .sketch
+            .as_ref()
+            .ok_or_else(|| format!("{name} is suppressed or has errors"))?;
+        let path = solved.path.as_ref().map_err(|e| format!("{name}: {e}"))?;
+        Ok((solved, path))
     }
 }
 
@@ -929,6 +956,11 @@ fn build_feature<K: Kernel>(
             }
             FeatureKind::Revolve(revolve) => {
                 let (body, tool) = build_revolve(&ctx, revolve, kernel, &mut warnings)?;
+                result.produced = Some(body);
+                result.tool = Some(tool);
+            }
+            FeatureKind::Sweep(sweep) => {
+                let (body, tool) = build_sweep(&ctx, sweep, kernel, &mut warnings)?;
                 result.produced = Some(body);
                 result.tool = Some(tool);
             }
@@ -1071,6 +1103,7 @@ fn build_sketch(
             partial: Some(SketchResult {
                 plane,
                 profile: Profile::from_curves(&solved.profile_segments()),
+                path: SweepPath::from_curves(&solved.profile_segments()),
                 degrees_of_freedom: 0,
                 solved,
             }),
@@ -1083,6 +1116,7 @@ fn build_sketch(
     Ok(SketchResult {
         plane,
         profile: Profile::from_curves(&solved.profile_segments()),
+        path: SweepPath::from_curves(&solved.profile_segments()),
         degrees_of_freedom: report.degrees_of_freedom,
         solved,
     })
@@ -1628,6 +1662,44 @@ fn build_revolve<K: Kernel>(
     )
 }
 
+fn build_sweep<K: Kernel>(
+    ctx: &Context<'_>,
+    sweep: &Sweep,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<(Body, ToolBody), String> {
+    if sweep.profile == sweep.path {
+        return Err("the profile and the path must be two different sketches".to_owned());
+    }
+    let (profile_sketch, profile) = ctx.profile_sketch(sweep.profile)?;
+    let (path_sketch, path) = ctx.path_sketch(sweep.path)?;
+    // SolidWorks carries the profile from the path's start: a path that does not start on
+    // the profile's plane still sweeps (the profile is moved along with it), but is
+    // usually a mistake, so it is said.
+    if let Some(start) = path.start() {
+        let start = path_sketch.plane.to_world(start);
+        let plane = &profile_sketch.plane;
+        let off_plane = (start - plane.origin).dot(plane.normal).abs();
+        if off_plane > 1e-6 {
+            warnings.push(format!(
+                "the path starts {off_plane:.3} mm off the profile's plane; the profile is swept from where it is"
+            ));
+        }
+    }
+    let tool = kernel
+        .sweep(&profile_sketch.plane, profile, &path_sketch.plane, path)
+        .map_err(|e| e.to_string())?;
+    apply_tool(
+        ctx,
+        sweep.op,
+        &sweep.bodies,
+        sweep.profile,
+        tool,
+        kernel,
+        warnings,
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Blend {
     Fillet,
@@ -1966,7 +2038,7 @@ fn build_instances<K: Kernel>(
         let (feature, result) = ctx.earlier(*seed)?;
         if !feature.kind.is_patternable() {
             return Err(format!(
-                "{} cannot be copied: only extrusions and revolves can, for now",
+                "{} cannot be copied: only extrusions, revolves and sweeps can, for now",
                 feature.name
             ));
         }

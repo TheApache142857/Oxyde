@@ -33,13 +33,14 @@ pub enum Selected {
 }
 
 /// An action that would discard unsaved changes, waiting for confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingAction {
     New,
     NewAssembly,
     Open,
-    /// Edit a component's part or sub-assembly in place (see `edit_in_place`).
-    OpenComponent(oxyde_assembly::ComponentId),
+    /// Edit a part or sub-assembly of the assembly in place, at any depth (see
+    /// `edit_in_place`).
+    OpenComponent(crate::assembly::Occurrence),
     /// Back to the assembly a component was opened from.
     FinishEdit,
     /// A new part from a STEP file.
@@ -54,7 +55,7 @@ pub enum PendingAction {
 impl PendingAction {
     /// Whether the action closes every open document, including the assemblies set
     /// aside while a component is edited in place: those are finished first.
-    pub fn leaves_everything(self) -> bool {
+    pub fn leaves_everything(&self) -> bool {
         !matches!(
             self,
             PendingAction::OpenComponent(_) | PendingAction::FinishEdit
@@ -69,6 +70,7 @@ pub enum Command {
     /// Adds or removes material; chosen in the PropertyManager.
     Extrude,
     Revolve,
+    Sweep,
     /// Fillet (true) or chamfer (false).
     Blend(bool),
     Shell,
@@ -182,6 +184,9 @@ pub struct OxydeApp {
     pub(crate) selected_body: Option<oxyde_model::BodyId>,
     /// The Solid Bodies folder is open in the timeline.
     pub(crate) bodies_expanded: bool,
+    /// Which tab of the left panel is shown: the feature tree or the configurations.
+    pub(crate) left_tab: crate::configurations_ui::LeftTab,
+    pub(crate) configurations_panel: crate::configurations_ui::ConfigurationsPanel,
     pub(crate) selection: Vec<Selected>,
     pub(crate) dialog: Option<Dialog>,
     /// The sketch being edited, when in sketch mode.
@@ -194,6 +199,8 @@ pub struct OxydeApp {
     pub(crate) pending_tool: Option<Tool>,
     pub(crate) show_mass_properties: bool,
     pub(crate) show_measure: bool,
+    /// Evaluate › Interference Detection, while its window is open (assemblies).
+    pub(crate) interference: Option<crate::interference::InterferenceWindow>,
     /// Evaluate › Section View, while its window is open.
     pub(crate) section: Option<crate::section_view::SectionView>,
     /// Which planes, axes, sketches and origins are drawn.
@@ -233,7 +240,7 @@ pub struct OxydeApp {
     /// The move handle's arrows as drawn last frame, to know what the pointer is on.
     pub(crate) handle_shapes: Vec<crate::assembly_ui::HandleArrow>,
     /// A component whose part should open once unsaved changes are dealt with.
-    pub(crate) pending_open_component: Option<oxyde_assembly::ComponentId>,
+    pub(crate) pending_open_component: Option<crate::assembly::Occurrence>,
     /// The assemblies set aside while a component is edited in place, outermost first.
     pub(crate) edit_stack: Vec<crate::edit_in_place::Suspended>,
     /// An action to take once editing in place is finished, level by level.
@@ -241,7 +248,9 @@ pub struct OxydeApp {
     /// The edit locks this window holds (one per open document).
     pub(crate) locks: crate::lockfile::Locks,
     /// File › Export STL, while its window is open.
-    pub(crate) stl: Option<crate::stl_export::StlDialog>,
+    pub(crate) mesh_export: Option<crate::mesh_export::MeshExportDialog>,
+    /// File › Export › Image: the picture settings window.
+    pub(crate) image_export: Option<crate::export::ImageExportDialog>,
     pub(crate) prefs: crate::prefs::Preferences,
     pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
     pub(crate) debug_stats: crate::prefs_ui::DebugStats,
@@ -276,6 +285,8 @@ impl OxydeApp {
             selected_plane: None,
             selected_body: None,
             bodies_expanded: true,
+            left_tab: crate::configurations_ui::LeftTab::Features,
+            configurations_panel: Default::default(),
             selection: Vec::new(),
             dialog: None,
             sketch: None,
@@ -285,6 +296,7 @@ impl OxydeApp {
             pending_tool: None,
             show_mass_properties: false,
             show_measure: false,
+            interference: None,
             section: None,
             visibility: Default::default(),
             expanded: Default::default(),
@@ -311,7 +323,8 @@ impl OxydeApp {
             edit_stack: Vec::new(),
             after_unwind: None,
             locks: Default::default(),
-            stl: None,
+            mesh_export: None,
+            image_export: None,
             prefs: crate::prefs::Preferences::load(),
             prefs_window: Default::default(),
             debug_stats: Default::default(),
@@ -597,8 +610,9 @@ impl OxydeApp {
             .collect()
     }
 
-    /// The sketch an extrude or revolve starts with: the one selected in the timeline, else
-    /// the latest sketch nothing uses yet. `None` leaves the PropertyManager waiting for one.
+    /// The sketch an extrude, a revolve or a sweep starts with: the one selected in the
+    /// timeline, else the latest sketch nothing uses yet. `None` leaves the PropertyManager
+    /// waiting for one.
     pub(crate) fn sketch_to_use(&self) -> Option<FeatureId> {
         let sketches = self.sketches();
         if let Some(id) = self.selected_feature {
@@ -607,11 +621,11 @@ impl OxydeApp {
             }
         }
         let used = |id: FeatureId| {
-            self.doc.part.features().iter().any(|f| match f.kind() {
-                FeatureKind::Extrude(e) => e.sketch == id,
-                FeatureKind::Revolve(r) => r.sketch == id,
-                _ => false,
-            })
+            self.doc
+                .part
+                .features()
+                .iter()
+                .any(|f| f.kind().swept_sketches().contains(&id))
         };
         sketches
             .iter()
@@ -731,7 +745,7 @@ impl OxydeApp {
     }
 
     /// Leaves sketch mode, keeping or discarding the changes. The sketch stays selected, so
-    /// that Extrude or Revolve picks it up.
+    /// that Extrude, Revolve or Sweep picks it up.
     pub(crate) fn finish_sketch(&mut self, keep: bool) {
         let Some(session) = self.sketch.take() else {
             return;
@@ -762,7 +776,7 @@ impl OxydeApp {
             format!("Left {} with nothing drawn: it is removed", session.name)
         } else if keep {
             format!(
-                "Closed {}. With it selected, click Extrude or Revolve to make a solid",
+                "Closed {}. With it selected, click Extrude, Revolve or Sweep to make a solid",
                 session.name
             )
         } else {
@@ -836,6 +850,7 @@ impl OxydeApp {
             Command::Sketch => self.begin_sketch(None),
             Command::Extrude => self.begin_extrude(),
             Command::Revolve => self.begin_revolve(),
+            Command::Sweep => self.begin_sweep(),
             Command::Blend(fillet) => self.begin_blend(fillet),
             Command::Shell => self.begin_shell(),
             Command::Pattern(kind) => self.begin_pattern(kind),
@@ -903,7 +918,7 @@ impl OxydeApp {
                     self.open_path(&path);
                 }
             }
-            PendingAction::OpenComponent(id) => self.open_component(id),
+            PendingAction::OpenComponent(o) => self.open_component(o),
             PendingAction::FinishEdit => self.finish_edit(ctx),
             PendingAction::OpenStep => {
                 if let Some(path) = pick_step() {
@@ -950,7 +965,7 @@ impl OxydeApp {
         self.doc.release(&mut self.kernel);
         self.doc = doc;
         self.sketch = None;
-        self.stl = None;
+        self.mesh_export = None;
         self.selection.clear();
         self.selected_feature = None;
         self.selected_features.clear();
@@ -1205,41 +1220,6 @@ impl OxydeApp {
                 false
             }
         }
-    }
-
-    /// File › Export STEP: the body's solids with their colours (appearances and material)
-    /// as STEP colours, which other CAD systems read back.
-    pub(crate) fn export_step(&mut self) {
-        let Some((shapes, colors)) = self
-            .doc
-            .part
-            .body()
-            .map(|b| (b.shapes(), self.doc.part.step_colors(b)))
-        else {
-            self.status = "Nothing to export".to_owned();
-            return;
-        };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("STEP", &["step", "stp"])
-            .set_file_name(format!("{}.step", self.doc.display_name()))
-            .save_file()
-        else {
-            return;
-        };
-        // The part's material goes with every solid, as its name and density.
-        let material = self.doc.part.material().map(|m| oxyde_kernel::StepMaterial {
-            name: m.name.clone(),
-            description: m.category.clone(),
-            density: m.density,
-        });
-        let materials = vec![material; shapes.len()];
-        self.status = match self
-            .kernel
-            .export_step(&shapes, &colors, &materials, &path)
-        {
-            Ok(()) => format!("Exported {}", path.display()),
-            Err(e) => format!("Export failed: {e}"),
-        };
     }
 
     // ---- Layout ------------------------------------------------------------------------------
@@ -2015,7 +1995,9 @@ impl OxydeApp {
                 .show(ctx, |ui| self.assembly_viewport(ui));
             self.bom_window(ctx);
             self.evaluate_windows(ctx);
-            self.stl_window(ctx);
+            self.interference_window(ctx);
+            self.mesh_export_window(ctx);
+            self.image_export_window(ctx);
             self.materials_window(ctx);
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
@@ -2040,7 +2022,11 @@ impl OxydeApp {
             .min_width(220.0)
             .show(ctx, |ui| {
                 self.property_manager(ui);
-                self.timeline_ui(ui);
+                self.left_panel_tabs(ui);
+                match self.left_tab {
+                    crate::configurations_ui::LeftTab::Features => self.timeline_ui(ui),
+                    crate::configurations_ui::LeftTab::Configurations => self.configurations_ui(ui),
+                }
             });
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -2048,7 +2034,8 @@ impl OxydeApp {
 
         self.equations_window(ctx);
         self.evaluate_windows(ctx);
-        self.stl_window(ctx);
+        self.mesh_export_window(ctx);
+        self.image_export_window(ctx);
         self.materials_window(ctx);
         self.preferences_window(ctx);
         self.debug_overlay(ctx, self.viewport_rect);

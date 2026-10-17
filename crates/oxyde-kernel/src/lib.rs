@@ -31,7 +31,7 @@
 
 use std::path::Path;
 
-use oxyde_geom::{Axis, Plane, Point3, Profile, Transform, Vec3};
+use oxyde_geom::{Axis, Path as SweepPath, Plane, Point3, Profile, Transform, Vec3};
 
 /// Runs `f`, turning a panic inside it into an error carrying the panic's message.
 ///
@@ -336,6 +336,23 @@ pub trait Kernel {
         angle: f64,
     ) -> Result<OpResult, Self::Error>;
 
+    /// Sweeps the regions of `profile`, drawn on `plane`, along `path`, drawn on
+    /// `path_plane`: the profile is carried from the path's start to its end, kept at the
+    /// same angle to the path (a corrected Frenet frame), so a round profile swept along a
+    /// bend gives a pipe. A closed path (a full circle, a rounded rectangle) gives a ring
+    /// with no caps.
+    ///
+    /// History sources: [`FaceSource::ProfileSegment`] (one face per profile segment and
+    /// path segment), and for an open path [`FaceSource::StartCap`] and
+    /// [`FaceSource::EndCap`].
+    fn sweep(
+        &mut self,
+        plane: &Plane,
+        profile: &Profile,
+        path_plane: &Plane,
+        path: &SweepPath,
+    ) -> Result<OpResult, Self::Error>;
+
     /// Hollows a solid: removes the given faces (indices into the shape's
     /// [`Topology::faces`]) and turns the remaining faces into walls of thickness
     /// `|offset|`, inside the solid for a negative offset, outside for a positive one.
@@ -439,6 +456,10 @@ pub trait Kernel {
         materials: &[Option<StepMaterial>],
         path: &Path,
     ) -> Result<(), Self::Error>;
+
+    /// Writes `shapes` to an IGES 5.3 file at `path`, in millimetres, as B-rep solids
+    /// (IGES carries no colours or materials worth writing).
+    fn export_iges(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), Self::Error>;
 
     /// Reads the solids of a STEP file (its contents, not its path), in millimetres, with
     /// the colours the file gives them. Several solids come back as one compound shape;

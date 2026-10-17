@@ -294,6 +294,15 @@ pub(crate) mod bridge {
             angle: f64,
         ) -> Result<OpResultData>;
 
+        /// Sweeps the profile along `path`: connected segments on `path_plane`, in order.
+        fn sweep(
+            self: Pin<&mut Session>,
+            plane: &PlaneData,
+            regions: &[RegionData],
+            path_plane: &PlaneData,
+            path: &[SegmentData],
+        ) -> Result<OpResultData>;
+
         /// Thick solid: removes `faces`, offsets the rest by `offset` (negative = inward).
         fn shell(
             self: Pin<&mut Session>,
@@ -359,6 +368,9 @@ pub(crate) mod bridge {
             materials: &[StepMaterialData],
             path: &str,
         ) -> Result<()>;
+
+        /// Writes the shapes to an IGES file, in millimetres.
+        fn export_iges(self: &Session, shapes: &[u64], path: &str) -> Result<()>;
 
         /// Reads the solids of a STEP file held in memory, in millimetres, with their
         /// colours.

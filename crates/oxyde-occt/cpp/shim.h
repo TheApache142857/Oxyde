@@ -25,6 +25,7 @@ struct OpResultData;
 struct PlaneData;
 struct PointData;
 struct RegionData;
+struct SegmentData;
 struct StepAssemblyData;
 struct StepImportData;
 struct StepMaterialData;
@@ -39,6 +40,8 @@ public:
                          double dx, double dy, double dz);
     OpResultData revolve(const PlaneData& plane, rust::Slice<const RegionData> regions,
                          const AxisData& axis, double angle);
+    OpResultData sweep(const PlaneData& plane, rust::Slice<const RegionData> regions,
+                       const PlaneData& path_plane, rust::Slice<const SegmentData> path);
     OpResultData shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
                        double offset);
     OpResultData transform(std::uint64_t shape, rust::Slice<const double> rows);
@@ -61,6 +64,7 @@ public:
     void export_step(rust::Slice<const std::uint64_t> shapes,
                      rust::Slice<const StepShapeColors> colors,
                      rust::Slice<const StepMaterialData> materials, rust::Str path) const;
+    void export_iges(rust::Slice<const std::uint64_t> shapes, rust::Str path) const;
     StepImportData import_step(rust::Slice<const std::uint8_t> data);
     StepAssemblyData read_step_assembly(rust::Slice<const std::uint8_t> data);
 

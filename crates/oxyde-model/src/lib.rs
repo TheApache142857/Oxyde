@@ -39,6 +39,7 @@
 
 mod appearance;
 mod bodies;
+mod configurations;
 mod dimensions;
 mod equations;
 mod error;
@@ -50,6 +51,9 @@ mod part;
 
 pub use appearance::{Appearance, Appearances, Texture};
 pub use bodies::{Body, Solid};
+pub use configurations::{
+    Configuration, ConfigurationText, Configurations, ConfigurationsText, DEFAULT_CONFIGURATION,
+};
 pub use dimensions::{
     Dimension, DimensionKey, DimensionRef, DimensionUnit, full_name, split_full_name,
 };
@@ -62,7 +66,7 @@ pub use feature::{
     AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
     ExtrudeOp, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, Import, LinearPattern,
     Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
-    SketchPlane, StandardAxis, StandardPlane,
+    SketchPlane, StandardAxis, StandardPlane, Sweep,
 };
 pub use material::{Material, MaterialLibrary, MaterialSource};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};

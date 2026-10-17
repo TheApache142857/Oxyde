@@ -50,12 +50,7 @@ impl OxydeApp {
     pub(crate) fn absorbed_sketches(&self) -> HashMap<FeatureId, FeatureId> {
         let mut out = HashMap::new();
         for feature in self.doc.part.features() {
-            let sketch = match feature.kind() {
-                FeatureKind::Extrude(e) => Some(e.sketch),
-                FeatureKind::Revolve(r) => Some(r.sketch),
-                _ => None,
-            };
-            if let Some(sketch) = sketch {
+            for sketch in feature.kind().swept_sketches() {
                 out.entry(sketch).or_insert(feature.id());
             }
         }
@@ -97,7 +92,6 @@ impl Visibility {
 }
 
 impl OxydeApp {
-
     /// Whether an item is drawn: shown, and its kind not filtered out.
     pub(crate) fn item_visible(&self, item: Item) -> bool {
         let kind_on = match item {

@@ -488,6 +488,26 @@ impl AssemblyDoc {
         self.walk(top, path).map(|w| w.2).unwrap_or_default()
     }
 
+    /// The name of an occurrence as the tree reads it: "Base", or "Wheel assembly / Axle"
+    /// for a part inside a sub-assembly.
+    pub fn occurrence_name(&self, o: &Occurrence) -> String {
+        let mut names: Vec<String> = self
+            .component(o.top)
+            .map(|c| c.name.clone())
+            .into_iter()
+            .collect();
+        names.extend(self.inner_names(o.top, &o.path));
+        names.join(" / ")
+    }
+
+    /// Where an occurrence sits in the assembly: its top-level component's placement
+    /// composed with the placements inside the sub-assemblies on the way to it.
+    pub fn occurrence_placement(&self, o: &Occurrence) -> Option<Placement> {
+        let top = self.assembly.placement_of(o.top)?;
+        let (_, inner, _) = self.walk(o.top, &o.path)?;
+        Some(top.compose(&inner))
+    }
+
     /// Every part shown for `assembly`'s visible components, at its place in the assembly.
     pub fn leaves<'a>(
         &'a self,
@@ -874,6 +894,14 @@ impl AssemblyDoc {
         };
         (path.to_string_lossy().into_owned(), sub)
     }
+}
+
+/// The box around a part's box moved to `placement`.
+pub(crate) fn placed_bounds(
+    placement: &Placement,
+    bounds: (Point3, Point3),
+) -> Option<(Point3, Point3)> {
+    bounds_of(std::iter::once((*placement, bounds)))
 }
 
 fn bounds_of(

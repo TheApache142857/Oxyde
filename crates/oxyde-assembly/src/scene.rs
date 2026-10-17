@@ -16,6 +16,33 @@ pub struct MeshRange<K> {
     pub edges: Range<u32>,
 }
 
+/// A copy of `mesh` moved to `placement`, faces and edges in the same order.
+pub fn placed(mesh: &Mesh, placement: &Placement) -> Mesh {
+    let place = |p: &[f32; 3]| {
+        let q = placement.apply_point(oxyde_geom::Point3::new(
+            f64::from(p[0]),
+            f64::from(p[1]),
+            f64::from(p[2]),
+        ));
+        [q.x as f32, q.y as f32, q.z as f32]
+    };
+    Mesh {
+        faces: mesh
+            .faces
+            .iter()
+            .map(|f| FaceMesh {
+                positions: f.positions.iter().map(place).collect(),
+                triangles: f.triangles.clone(),
+            })
+            .collect(),
+        edges: mesh
+            .edges
+            .iter()
+            .map(|e| e.iter().map(place).collect())
+            .collect(),
+    }
+}
+
 /// The meshes of `parts`, each moved to its placement, as one mesh: faces and edges keep
 /// their order, component after component.
 pub fn combine<'a, K>(
@@ -27,22 +54,11 @@ pub fn combine<'a, K>(
     };
     let mut ranges = Vec::new();
     for (owner, placement, mesh) in parts {
-        let place = |p: &[f32; 3]| {
-            let q = placement.apply_point(oxyde_geom::Point3::new(
-                f64::from(p[0]),
-                f64::from(p[1]),
-                f64::from(p[2]),
-            ));
-            [q.x as f32, q.y as f32, q.z as f32]
-        };
         let faces = out.faces.len() as u32;
         let edges = out.edges.len() as u32;
-        out.faces.extend(mesh.faces.iter().map(|f| FaceMesh {
-            positions: f.positions.iter().map(place).collect(),
-            triangles: f.triangles.clone(),
-        }));
-        out.edges
-            .extend(mesh.edges.iter().map(|e| e.iter().map(place).collect()));
+        let moved = placed(mesh, placement);
+        out.faces.extend(moved.faces);
+        out.edges.extend(moved.edges);
         ranges.push(MeshRange {
             owner,
             faces: faces..out.faces.len() as u32,

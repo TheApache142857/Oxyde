@@ -68,6 +68,7 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
         FeatureKind::Sketch(_) => Icon::Sketch,
         FeatureKind::Extrude(_) => Icon::Extrude,
         FeatureKind::Revolve(_) => Icon::Revolve,
+        FeatureKind::Sweep(_) => Icon::Sweep,
         FeatureKind::Fillet(_) => Icon::Fillet,
         FeatureKind::Chamfer(_) => Icon::Chamfer,
         FeatureKind::Shell(_) => Icon::Shell,
@@ -84,7 +85,7 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
 /// One row of the tree.
 pub(crate) struct Row {
     pub(crate) icon: Icon,
-    /// A cut extrusion or revolve: red badge on the icon.
+    /// A cut extrusion, revolve or sweep: red badge on the icon.
     pub(crate) cut: bool,
     pub(crate) text: RichText,
     pub(crate) highlighted: bool,
@@ -360,10 +361,14 @@ impl OxydeApp {
                         if bar.is_none() && index >= active {
                             bar = Some(rollback_bar(ui));
                         }
-                        let child = absorbed
+                        // The sketches the feature absorbs (a sweep has two: its
+                        // profile and its path), in timeline order.
+                        let mut children: Vec<usize> = absorbed
                             .iter()
-                            .find(|(_, parent)| **parent == entry.id)
-                            .map(|(sketch, _)| *sketch);
+                            .filter(|(_, parent)| **parent == entry.id)
+                            .filter_map(|(sketch, _)| index_of(*sketch))
+                            .collect();
+                        children.sort_unstable();
                         let expanded = self.expanded.contains(&entry.id);
                         let rect = self.timeline_row(
                             ui,
@@ -371,17 +376,20 @@ impl OxydeApp {
                             highlighted(entry.id),
                             under_pointer == Some(entry.id),
                             0.0,
-                            child.map(|_| expanded),
+                            (!children.is_empty()).then_some(expanded),
                             &mut action,
                         );
                         rows.push((rect, index));
-                        if let (Some(sketch), true) = (child, expanded) {
-                            if let Some(child_index) = index_of(sketch) {
+                        if expanded {
+                            for child_index in children {
+                                let Some(child) = entries.get(child_index) else {
+                                    continue;
+                                };
                                 let rect = self.timeline_row(
                                     ui,
-                                    &entries[child_index],
-                                    highlighted(sketch),
-                                    under_pointer == Some(sketch),
+                                    child,
+                                    highlighted(child.id),
+                                    under_pointer == Some(child.id),
                                     16.0,
                                     None,
                                     &mut action,
@@ -564,10 +572,8 @@ impl OxydeApp {
         let suppressed = feature.is_some_and(|f| f.is_suppressed());
         let icon = feature.map_or(Icon::Part, |f| feature_icon(f.kind()));
         let cut = feature.is_some_and(|f| match f.kind() {
-            FeatureKind::Extrude(e) => e.op == ExtrudeOp::Cut,
-            FeatureKind::Revolve(r) => r.op == ExtrudeOp::Cut,
             FeatureKind::Combine(c) => c.op == oxyde_model::CombineOp::Cut,
-            _ => false,
+            kind => kind.sweep_op() == Some(ExtrudeOp::Cut),
         });
         let label = if entry.under_defined {
             format!("(-) {}", entry.name)
@@ -629,7 +635,8 @@ impl OxydeApp {
         } else if response.double_clicked() {
             *action = Some(Action::Edit(entry.id));
         } else if response.clicked() {
-            let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+            let (ctrl, shift) =
+                ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
             let mode = if shift {
                 SelectMode::Range
             } else if ctrl {
@@ -752,7 +759,11 @@ impl OxydeApp {
                 if ids.len() > 1 {
                     self.status = format!(
                         "{changed} features {}",
-                        if suppressed { "suppressed" } else { "unsuppressed" }
+                        if suppressed {
+                            "suppressed"
+                        } else {
+                            "unsuppressed"
+                        }
                     );
                 }
             }
@@ -854,6 +865,7 @@ impl OxydeApp {
                 }));
             }
             FeatureKind::Revolve(r) => self.open_revolve(Some(id), Some(r.sketch), r.op, Some(&r)),
+            FeatureKind::Sweep(s) => self.open_sweep(Some(id), Some(&s)),
             FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
             FeatureKind::Combine(c) => self.open_combine(Some(id), Some(&c)),
             FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),

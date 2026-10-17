@@ -39,9 +39,10 @@ const CORE_TOOLKITS: &[&str] = &[
     "TKXCAF",
 ];
 
-/// OCCT 7.8 merged the STEP toolkits into TKDESTEP; older versions ship them separately.
-const STEP_TOOLKITS_7_8: &[&str] = &["TKDESTEP"];
-const STEP_TOOLKITS_LEGACY: &[&str] = &["TKSTEP", "TKSTEPBase", "TKXDESTEP"];
+/// OCCT 7.8 merged the STEP toolkits into TKDESTEP and the IGES ones into TKDEIGES; older
+/// versions ship them separately.
+const STEP_TOOLKITS_7_8: &[&str] = &["TKDESTEP", "TKDEIGES"];
+const STEP_TOOLKITS_LEGACY: &[&str] = &["TKSTEP", "TKSTEPBase", "TKXDESTEP", "TKIGES"];
 
 fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");

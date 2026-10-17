@@ -17,7 +17,7 @@ use crate::app::OxydeApp;
 use crate::dialogs::{Answer, BlendDialog, Dialog, ExtrudeDialog, plane_name, positive_length};
 use crate::features_ui::{
     AxisDialog, Choices, CombineDialog, PatternDialog, PatternKind, PlaneDialog, RevolveDialog,
-    ShellDialog,
+    ShellDialog, SweepDialog,
 };
 use crate::icons::{self, Icon};
 
@@ -205,7 +205,7 @@ fn dimension_note(ui: &mut egui::Ui, name: Option<&String>) {
     }
 }
 
-/// What an extrusion or a revolve does: join, cut, intersect or a new body (Fusion's
+/// What an extrusion, a revolve or a sweep does: join, cut, intersect or a new body (Fusion's
 /// operations), with icons.
 fn operation(ui: &mut egui::Ui, op: &mut ExtrudeOp, has_body: bool) {
     let options = [
@@ -551,6 +551,30 @@ impl OxydeApp {
                     None => false,
                 },
             },
+            Dialog::Sweep(d) => match &pick {
+                PanelPick::Feature(id) if self.is_sketch(*id) && self.usable(*id, d.editing) => {
+                    // A sketch goes into the empty box, else into the active one; the
+                    // first pick is the profile, the next the path, as in SolidWorks.
+                    if d.profile.is_none() && !d.path_next {
+                        d.profile = Some(*id);
+                        d.path_next = true;
+                    } else if d.path.is_none() || d.path_next {
+                        d.path = Some(*id);
+                        d.path_next = false;
+                    } else {
+                        d.profile = Some(*id);
+                        d.path_next = true;
+                    }
+                    true
+                }
+                other => match self.body_of_pick(other) {
+                    Some(body) if d.op != ExtrudeOp::NewBody => {
+                        toggle(&mut d.bodies, body);
+                        true
+                    }
+                    _ => false,
+                },
+            },
             Dialog::Blend(d) => match pick {
                 PanelPick::Edge(e) => {
                     match d.edges.iter().position(|x| *x == e) {
@@ -732,6 +756,7 @@ impl OxydeApp {
         match &self.dialog {
             Some(Dialog::Extrude(d)) => d.sketch.into_iter().collect(),
             Some(Dialog::Revolve(d)) => d.sketch.into_iter().collect(),
+            Some(Dialog::Sweep(d)) => d.profile.into_iter().chain(d.path).collect(),
             Some(Dialog::Pattern(d)) => d.seeds.clone(),
             _ => Vec::new(),
         }
@@ -837,6 +862,11 @@ impl OxydeApp {
                 editing(d.editing, "Revolve", "Edit Revolve"),
                 d.sketch.is_some() && !d.axes.is_empty(),
             ),
+            Dialog::Sweep(d) => (
+                Icon::Sweep,
+                editing(d.editing, "Sweep", "Edit Sweep"),
+                d.feature().is_ok(),
+            ),
             Dialog::Blend(d) if d.fillet => (
                 Icon::Fillet,
                 editing(d.editing, "Fillet", "Edit Fillet"),
@@ -878,6 +908,7 @@ impl OxydeApp {
             Dialog::ChoosePlane => return self.choose_plane_body(ui),
             Dialog::Extrude(d) => self.extrude_body(ui, d),
             Dialog::Revolve(d) => self.revolve_body(ui, d),
+            Dialog::Sweep(d) => self.sweep_body(ui, d),
             Dialog::Blend(d) => self.blend_body(ui, d),
             Dialog::Shell(d) => self.shell_body(ui, d),
             Dialog::Pattern(d) => self.pattern_body(ui, d),
@@ -998,6 +1029,79 @@ impl OxydeApp {
         }
     }
 
+    fn sweep_body(&self, ui: &mut egui::Ui, d: &mut SweepDialog) {
+        let active = |ui: &mut egui::Ui, on: bool, items: &[(String, String)], hint: &str| {
+            let frame = egui::Frame::none()
+                .stroke(Stroke::new(
+                    if on { 2.0_f32 } else { 0.0_f32 },
+                    box_active(),
+                ))
+                .rounding(4.0);
+            frame.show(ui, |ui| selection_box(ui, items, hint)).inner
+        };
+        section(ui, "Profile");
+        let profile: Vec<(String, String)> = d
+            .profile
+            .map(|id| (self.feature_name(id), String::new()))
+            .into_iter()
+            .collect();
+        if active(
+            ui,
+            !d.path_next,
+            &profile,
+            "Select the sketch to sweep in the tree",
+        )
+        .is_some()
+        {
+            d.profile = None;
+            d.path_next = false;
+        }
+        section(ui, "Path");
+        let path: Vec<(String, String)> = d
+            .path
+            .map(|id| (self.feature_name(id), String::new()))
+            .into_iter()
+            .collect();
+        if active(
+            ui,
+            d.path_next,
+            &path,
+            "Select the sketch to sweep along in the tree",
+        )
+        .is_some()
+        {
+            d.path = None;
+            d.path_next = true;
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Pick the profile")
+                .on_hover_text("The next sketch clicked is the profile")
+                .clicked()
+            {
+                d.path_next = false;
+            }
+            if ui
+                .small_button("Pick the path")
+                .on_hover_text("The next sketch clicked is the path")
+                .clicked()
+            {
+                d.path_next = true;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "The profile's closed contours follow the path's curves, kept at the same \
+                 angle to it. The path starts on the profile's plane, as a rule.",
+            )
+            .small()
+            .weak(),
+        );
+        section(ui, "Operation");
+        operation(ui, &mut d.op, self.doc.part.body().is_some());
+        self.bodies_box(ui, d.op, &mut d.bodies);
+    }
+
     /// The bodies a join, cut or intersection works on, when the part has several.
     fn bodies_box(&self, ui: &mut egui::Ui, op: ExtrudeOp, bodies: &mut Vec<oxyde_model::BodyId>) {
         if op == ExtrudeOp::NewBody || self.body_count() < 2 {
@@ -1026,7 +1130,10 @@ impl OxydeApp {
             .collect();
         let active = |ui: &mut egui::Ui, on: bool, items: &[(String, String)], hint: &str| {
             let frame = egui::Frame::none()
-                .stroke(Stroke::new(if on { 2.0_f32 } else { 0.0_f32 }, box_active()))
+                .stroke(Stroke::new(
+                    if on { 2.0_f32 } else { 0.0_f32 },
+                    box_active(),
+                ))
                 .rounding(4.0);
             frame.show(ui, |ui| selection_box(ui, items, hint)).inner
         };

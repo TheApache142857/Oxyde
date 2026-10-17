@@ -93,18 +93,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.import_step();
                 }
-                if ui.button("Export STEP…").clicked() {
-                    ui.close_menu();
-                    self.export_step();
-                }
-                if ui
-                    .button("Export STL…")
-                    .on_hover_text("A mesh of the part for 3D printing, with a preview")
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.begin_stl_export();
-                }
+                self.export_menu(ui);
                 ui.separator();
                 if ui.button("Part properties…").clicked() {
                     ui.close_menu();
@@ -155,10 +144,12 @@ impl OxydeApp {
                 let (sketch, body, seeds) =
                     (self.has_sketch(), self.has_body(), self.has_patternable());
                 let bodies = self.body_count() >= 2;
-                let commands: [(Icon, &str, bool, Command); 12] = [
+                let two_sketches = self.sketches().len() >= 2;
+                let commands: [(Icon, &str, bool, Command); 13] = [
                     (Icon::Sketch, "Sketch", true, Command::Sketch),
                     (Icon::Extrude, "Extrude", sketch, Command::Extrude),
                     (Icon::Revolve, "Revolve", sketch, Command::Revolve),
+                    (Icon::Sweep, "Sweep", two_sketches, Command::Sweep),
                     (Icon::Fillet, "Fillet", body, Command::Blend(true)),
                     (Icon::Chamfer, "Chamfer", body, Command::Blend(false)),
                     (Icon::Shell, "Shell", body, Command::Shell),
@@ -185,7 +176,7 @@ impl OxydeApp {
                     (Icon::RefAxis, "Reference Axis", true, Command::RefAxis),
                 ];
                 for (i, (icon, label, enabled, command)) in commands.into_iter().enumerate() {
-                    if i == 1 || i == 3 || i == 6 || i == 9 {
+                    if i == 1 || i == 4 || i == 7 || i == 10 {
                         ui.separator();
                     }
                     let clicked = ui
@@ -358,6 +349,7 @@ impl OxydeApp {
         match (&self.dialog, command) {
             (Some(Dialog::Extrude(d)), Command::Extrude) => d.editing.is_none(),
             (Some(Dialog::Revolve(d)), Command::Revolve) => d.editing.is_none(),
+            (Some(Dialog::Sweep(d)), Command::Sweep) => d.editing.is_none(),
             (Some(Dialog::Blend(d)), Command::Blend(fillet)) => {
                 d.editing.is_none() && d.fillet == fillet
             }
@@ -388,6 +380,14 @@ impl OxydeApp {
             sketch,
             "Revolve a sketch about an axis, adding or removing material.",
             Command::Revolve,
+        );
+        self.command(
+            ui,
+            Icon::Sweep,
+            "Sweep",
+            self.sketches().len() >= 2,
+            "Sweep a closed sketch along the curves of another sketch (a pipe along a bend), adding or removing material.\nSelect the profile first; the path is picked next.",
+            Command::Sweep,
         );
         group_separator(ui);
         self.command(

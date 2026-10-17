@@ -23,6 +23,7 @@
 #include <BRepGProp.hxx>
 #include <BRepMesh_IncrementalMesh.hxx>
 #include <BRepOffsetAPI_MakeOffsetShape.hxx>
+#include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
 #include <BRepOffset_Mode.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -37,9 +38,13 @@
 #include <GeomAbs_CurveType.hxx>
 #include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <GeomFill_Trihedron.hxx>
 #include <Geom_Curve.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <IFSelect_ReturnStatus.hxx>
+#include <IGESControl_Controller.hxx>
+#include <IGESControl_Writer.hxx>
+#include <Interface_Static.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
 #include <STEPControl_Reader.hxx>
@@ -1198,6 +1203,66 @@ OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionDa
     });
 }
 
+OpResultData Session::sweep(const PlaneData& plane, rust::Slice<const RegionData> regions,
+                            const PlaneData& path_plane, rust::Slice<const SegmentData> path) {
+    return guarded("sweep", [&] {
+        if (path.empty()) {
+            throw std::invalid_argument("the path has no curve");
+        }
+        const Frame frame(plane);
+        std::vector<SegmentMark> marks;
+        const TopoDS_Shape base = make_profile_base(regions, frame, marks);
+
+        // The spine: the path's curves as one wire, in the order given.
+        const Frame path_frame(path_plane);
+        BRepBuilderAPI_MakeWire spine;
+        for (const SegmentData& seg : path) {
+            spine.Add(make_edge(seg, path_frame));
+            if (!spine.IsDone()) {
+                throw std::runtime_error("path segment " + std::to_string(seg.id) +
+                                         " does not connect to the previous one");
+            }
+        }
+        const TopoDS_Wire wire = spine.Wire();
+        const bool closed = BRep_Tool::IsClosed(wire);
+
+        // Corrected Frenet: the profile keeps its angle to the path through bends, and does
+        // not spin about a straight run, as a SolidWorks sweep with "follow path".
+        BRepOffsetAPI_MakePipe pipe(wire, base, GeomFill_IsCorrectedFrenet, Standard_False);
+        pipe.Build();
+        if (!pipe.IsDone()) {
+            throw std::runtime_error(
+                "the sweep did not complete (does the profile turn through itself along the path?)");
+        }
+        TopoDS_Shape result = pipe.Shape();
+        check_valid(result, "the sweep made an invalid solid (a bend tighter than the profile?)");
+        // Depending on the path direction the solid may come out inside out.
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        if (!closed) {
+            // Caps first, as in revolve: the start cap holds every profile edge.
+            for (TopExp_Explorer it(pipe.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
+                add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
+            }
+            for (TopExp_Explorer it(pipe.LastShape(), TopAbs_FACE); it.More(); it.Next()) {
+                add_source(out, result_faces, it.Current(), SourceKind::EndCap, 0, 0);
+            }
+        }
+        record_profile_faces(pipe, base, marks, result_faces, out);
+        record_unnamed_profile_faces(base, marks, result_faces, out);
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
 OpResultData Session::shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
                             double offset) {
     return guarded("shell", [&] {
@@ -1782,6 +1847,30 @@ void Session::export_step(rust::Slice<const std::uint64_t> shapes,
                 throw std::runtime_error("could not write " + file);
             }
         });
+    });
+}
+
+void Session::export_iges(rust::Slice<const std::uint64_t> shapes, rust::Str path) const {
+    guarded("export_iges", [&] {
+        // The IGES translator shares its global settings with the STEP one: same lock.
+        const std::lock_guard<std::mutex> lock(step_mutex());
+        if (shapes.empty()) {
+            throw std::invalid_argument("no shapes to export");
+        }
+        IGESControl_Controller::Init();
+        // Millimetres, and solids as B-rep (manifold solid B-rep entities, type 186) rather
+        // than loose trimmed surfaces, which every reader that knows IGES 5.3 takes.
+        IGESControl_Writer writer("MM", 1);
+        for (const std::uint64_t id : shapes) {
+            if (!writer.AddShape(get(id))) {
+                throw std::runtime_error("a shape could not be translated to IGES");
+            }
+        }
+        writer.ComputeModel();
+        const std::string file(path);
+        if (!writer.Write(file.c_str())) {
+            throw std::runtime_error("could not write " + file);
+        }
     });
 }
 

@@ -255,6 +255,16 @@ impl Viewport {
         &self.renderer
     }
 
+    /// The camera as it looks now, for drawing the scene elsewhere (an exported picture).
+    pub fn camera(&self) -> Camera {
+        self.camera
+    }
+
+    /// The scene on show.
+    pub fn scene(&self) -> &Scene {
+        &self.scene
+    }
+
     pub fn set_scene(&mut self, scene: Scene, fit: bool) {
         let mesh = scene.gpu_mesh();
         self.scene_counts = (mesh.indices.len() / 3, mesh.segments.len());

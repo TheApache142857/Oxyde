@@ -10,7 +10,7 @@ use oxyde_model::{
     AxisRef, CircularPattern, EdgeBlend, EdgeName, Extrude, ExtrudeOp, FaceKey, FaceName,
     FeatureId, FeatureKind, FeatureStatus, LinearPattern, Mirror, Part, PatternDirection, PlaneRef,
     RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
-    StandardPlane,
+    StandardPlane, Sweep,
 };
 use oxyde_occt::OcctKernel;
 
@@ -742,5 +742,152 @@ fn patterns_only_copy_extrusions_and_revolves() {
         part.status(pattern),
         Some(FeatureStatus::Error(_))
     ));
+    part.release(&mut kernel);
+}
+
+// ---- Sweep -----------------------------------------------------------------------------------
+
+/// A round profile of radius `r` at (`x`, 0) on the Front plane.
+fn round_profile(x: f64, r: f64) -> (Sketch, u32) {
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let circle = sketch.circle(Point2::new(x, 0.0), r);
+    (sketch, circle)
+}
+
+fn sweep(profile: FeatureId, path: FeatureId, op: ExtrudeOp) -> FeatureKind {
+    FeatureKind::Sweep(Sweep {
+        profile,
+        path,
+        op,
+        bodies: Vec::new(),
+    })
+}
+
+#[test]
+fn a_sweep_along_a_straight_path_is_an_extrusion() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (profile, circle) = round_profile(0.0, 5.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    // The Top plane's sketch Y points towards -Z: this line runs 30 mm along +Z.
+    let mut path = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    path.geometry
+        .line(Point2::new(0.0, 0.0), Point2::new(0.0, -30.0));
+    let s2 = part.add_feature(FeatureKind::Sketch(path));
+    let pipe = part.add_feature(sweep(s1, s2, ExtrudeOp::Boss));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), PI * 25.0 * 30.0);
+    // Its faces are named as an extrusion's: the side after the circle, two caps.
+    let body = part.body().unwrap();
+    assert!(
+        body.naming
+            .find_face(&FaceName::profile(pipe, circle))
+            .is_some()
+    );
+    assert!(body.naming.find_face(&FaceName::start_cap(pipe)).is_some());
+    assert!(body.naming.find_face(&FaceName::end_cap(pipe)).is_some());
+    assert_eq!(part.feature(pipe).unwrap().name(), "Sweep1");
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_sweep_along_an_arc_has_the_volume_pappus_gives() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (profile, _) = round_profile(0.0, 5.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    // A quarter turn of radius 20 from the origin, starting along +Z (sketch -Y on Top).
+    let mut path = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    path.geometry.arc(
+        Point2::new(20.0, 0.0),
+        Point2::new(0.0, 0.0),
+        Point2::new(20.0, -20.0),
+    );
+    let s2 = part.add_feature(FeatureKind::Sketch(path));
+    part.add_feature(sweep(s1, s2, ExtrudeOp::Boss));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    // Pappus: the profile's area times the distance its centre travels.
+    assert_close(volume(&part, &kernel), PI * 25.0 * (20.0 * PI / 2.0));
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_sweep_along_a_closed_path_is_a_ring() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (profile, _) = round_profile(20.0, 5.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    let mut path = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    path.circle(Point2::ORIGIN, 20.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(path));
+    part.add_feature(sweep(s1, s2, ExtrudeOp::Boss));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    // A torus: 2 π² R r².
+    assert_close(volume(&part, &kernel), 2.0 * PI * PI * 20.0 * 25.0);
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_cut_sweep_removes_material_and_a_sweep_can_be_patterned() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 40.0, 40.0, 10.0);
+    let mut profile = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    profile.circle(Point2::new(10.0, 20.0), 2.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    let mut path = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    path.geometry
+        .line(Point2::new(10.0, 0.0), Point2::new(10.0, -10.0));
+    let s2 = part.add_feature(FeatureKind::Sketch(path));
+    let groove = part.add_feature(sweep(s1, s2, ExtrudeOp::Cut));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let hole = PI * 4.0 * 10.0;
+    assert_close(volume(&part, &kernel), 16000.0 - hole);
+    assert_eq!(part.feature(groove).unwrap().name(), "Cut-Sweep1");
+
+    // Two more holes along X: the sweep's tool body is copied like an extrusion's.
+    part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![groove],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 10.0,
+            count: 3,
+            reverse: false,
+        },
+        second: None,
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 16000.0 - 3.0 * hole);
+    let _ = base;
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_sweep_refuses_a_path_in_pieces_or_the_profile_as_path() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (profile, _) = round_profile(0.0, 5.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(profile));
+    let mut path = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    path.geometry
+        .line(Point2::new(0.0, 0.0), Point2::new(0.0, -30.0));
+    path.geometry
+        .line(Point2::new(5.0, 0.0), Point2::new(5.0, -30.0));
+    let s2 = part.add_feature(FeatureKind::Sketch(path));
+    let broken = part.add_feature(sweep(s1, s2, ExtrudeOp::Boss));
+    let same = part.add_feature(sweep(s1, s1, ExtrudeOp::Boss));
+    part.rebuild(&mut kernel);
+    match part.status(broken) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("one chain"), "{message}");
+        }
+        other => panic!("a path in two pieces should fail, got {other:?}"),
+    }
+    assert!(matches!(part.status(same), Some(FeatureStatus::Error(_))));
     part.release(&mut kernel);
 }

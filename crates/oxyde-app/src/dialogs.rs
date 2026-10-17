@@ -10,7 +10,9 @@ use oxyde_model::{
 use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
-use crate::features_ui::{AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog};
+use crate::features_ui::{
+    AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog, SweepDialog,
+};
 use crate::sketch_mode;
 
 pub struct ExtrudeDialog {
@@ -87,6 +89,7 @@ pub enum DimensionTarget {
 pub enum Dialog {
     Extrude(ExtrudeDialog),
     Revolve(RevolveDialog),
+    Sweep(SweepDialog),
     Blend(BlendDialog),
     Shell(ShellDialog),
     /// Linear pattern, circular pattern or mirror.
@@ -132,6 +135,7 @@ impl Dialog {
             self,
             Dialog::Extrude(_)
                 | Dialog::Revolve(_)
+                | Dialog::Sweep(_)
                 | Dialog::Blend(_)
                 | Dialog::Shell(_)
                 | Dialog::Pattern(_)
@@ -149,6 +153,7 @@ impl Dialog {
             self,
             Dialog::Extrude(_)
                 | Dialog::Revolve(_)
+                | Dialog::Sweep(_)
                 | Dialog::Blend(_)
                 | Dialog::Shell(_)
                 | Dialog::Pattern(_)
@@ -163,6 +168,7 @@ impl Dialog {
         match self {
             Dialog::Extrude(d) => d.editing,
             Dialog::Revolve(d) => d.editing,
+            Dialog::Sweep(d) => d.editing,
             Dialog::Blend(d) => d.editing,
             Dialog::Shell(d) => d.editing,
             Dialog::Pattern(d) => d.editing,
@@ -353,6 +359,7 @@ impl OxydeApp {
         let answer = match &mut dialog {
             Dialog::Extrude(_)
             | Dialog::Revolve(_)
+            | Dialog::Sweep(_)
             | Dialog::Blend(_)
             | Dialog::Shell(_)
             | Dialog::Pattern(_)
@@ -538,6 +545,7 @@ impl OxydeApp {
                 }
             }
             Dialog::Revolve(d) => self.apply_revolve(d),
+            Dialog::Sweep(d) => self.apply_sweep(d),
             Dialog::Shell(d) => self.apply_shell(d),
             Dialog::Pattern(d) => self.apply_pattern(d),
             Dialog::Combine(d) => self.apply_combine(d),

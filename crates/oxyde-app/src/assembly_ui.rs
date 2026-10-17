@@ -181,7 +181,8 @@ enum TreeAction {
     /// Shows hidden components and hides shown ones.
     Hide(Vec<ComponentId>),
     Fix(Vec<ComponentId>, bool),
-    OpenPart(ComponentId),
+    /// Edit a part or sub-assembly in place, at any depth.
+    OpenPart(Occurrence),
     Appearance(ComponentId),
     /// Opens the Materials window on the material of this component's part.
     EditMaterial(ComponentId),
@@ -415,7 +416,7 @@ impl OxydeApp {
     pub(crate) fn enter_assembly_loaded(&mut self, doc: AssemblyDoc, notes: Vec<String>) {
         self.leave_assembly();
         self.close_dialog();
-        self.stl = None;
+        self.mesh_export = None;
         let errors = doc.solution.as_ref().map_or(0, Solution::errors);
         self.status = match (notes.first(), errors) {
             (Some(note), _) => note.clone(),
@@ -442,6 +443,7 @@ impl OxydeApp {
         self.show_bom = false;
         self.show_mass_properties = false;
         self.show_measure = false;
+        self.interference = None;
         self.asm_plane = None;
         self.asm_scroll_to = None;
         self.asm_tab = AsmTab::Assembly;
@@ -541,8 +543,8 @@ impl OxydeApp {
     }
 
     /// Opens a component's part or sub-assembly for editing in place.
-    pub(crate) fn open_component(&mut self, id: ComponentId) {
-        self.open_component_with(id, crate::edit_in_place::LockMode::Lock);
+    pub(crate) fn open_component(&mut self, o: Occurrence) {
+        self.open_component_with(o, crate::edit_in_place::LockMode::Lock);
     }
 
     // ---- Commands --------------------------------------------------------------------------
@@ -1145,14 +1147,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.save_assembly(true);
                 }
-                if ui
-                    .button("Export STL…")
-                    .on_hover_text("Every part as one mesh, for 3D printing")
-                    .clicked()
-                {
-                    ui.close_menu();
-                    self.begin_stl_export();
-                }
+                self.export_menu(ui);
                 ui.separator();
                 if ui.button("Insert component…").clicked() {
                     ui.close_menu();
@@ -1433,6 +1428,11 @@ impl OxydeApp {
             self.show_measure = !self.show_measure;
         }
         self.section_view_button(ui, has_parts);
+        let two_parts = self
+            .asm
+            .as_ref()
+            .is_some_and(|d| d.leaves(&d.assembly).len() >= 2);
+        self.interference_button(ui, two_parts);
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -1899,7 +1899,7 @@ impl OxydeApp {
                     } else if row.eye_clicked {
                         action = Some(TreeAction::Hide(vec![id]));
                     } else if row.response.double_clicked() {
-                        action = Some(TreeAction::OpenPart(id));
+                        action = Some(TreeAction::OpenPart(Occurrence::top(id)));
                     } else if row.response.clicked() && !mating {
                         action = Some(TreeAction::Select(AsmSelected::Component(id)));
                     }
@@ -1936,7 +1936,7 @@ impl OxydeApp {
                             )
                             .clicked()
                         {
-                            action = Some(TreeAction::OpenPart(id));
+                            action = Some(TreeAction::OpenPart(Occurrence::top(id)));
                             ui.close_menu();
                         }
                         if ui
@@ -2027,10 +2027,7 @@ impl OxydeApp {
                                     }
                                 });
                                 if let Some(m) = material {
-                                    if ui
-                                        .button("Edit in the Materials window…")
-                                        .clicked()
-                                    {
+                                    if ui.button("Edit in the Materials window…").clicked() {
                                         action = Some(TreeAction::EditMaterial(id));
                                         ui.close_menu();
                                     }
@@ -2164,7 +2161,7 @@ impl OxydeApp {
                 }
             }
             TreeAction::Fix(ids, fixed) => self.set_fixed(&ids, fixed),
-            TreeAction::OpenPart(id) => self.pending_open_component = Some(id),
+            TreeAction::OpenPart(o) => self.pending_open_component = Some(o),
             TreeAction::Appearance(id) => self.begin_component_appearance(id),
             TreeAction::EditMaterial(id) => {
                 let material = self
@@ -2337,16 +2334,36 @@ impl OxydeApp {
                 self.status = format!("{} component(s) selected", doc.selection.len());
             }
         }
-        // Right-click on the part: what can be done with its component.
+        // Right-click on the part: what can be done with its component. The part under
+        // the pointer may lie deep in a sub-assembly: that part is the one edited.
         let hovered = self
             .asm
             .as_ref()
             .and_then(|d| d.selection.iter().find_map(AsmSelected::component));
+        let hovered_part = self.asm.as_ref().and_then(|d| {
+            d.selection.iter().find_map(|s| match s {
+                AsmSelected::Face(o, _) | AsmSelected::Edge(o, _) => Some(o.clone()),
+                AsmSelected::Component(c) => Some(Occurrence::top(*c)),
+                AsmSelected::Mate(_) => None,
+            })
+        });
         output.response.context_menu(|ui| match hovered {
             Some(id) => {
-                if ui.button("Edit part in place").clicked() {
-                    self.pending_open_component = Some(id);
-                    ui.close_menu();
+                if let Some(o) = hovered_part.clone() {
+                    let label = if o.path.is_empty() {
+                        "Edit part in place".to_owned()
+                    } else {
+                        format!(
+                            "Edit {} in place",
+                            self.asm
+                                .as_ref()
+                                .map_or_else(String::new, |d| d.occurrence_name(&o))
+                        )
+                    };
+                    if ui.button(label).clicked() {
+                        self.pending_open_component = Some(o);
+                        ui.close_menu();
+                    }
                 }
                 let fixed = self
                     .asm
@@ -2444,8 +2461,8 @@ impl OxydeApp {
             }
         });
         let ctx = ui.ctx().clone();
-        if let Some(id) = self.pending_open_component.take() {
-            self.guard(PendingAction::OpenComponent(id), &ctx);
+        if let Some(o) = self.pending_open_component.take() {
+            self.guard(PendingAction::OpenComponent(o), &ctx);
         }
         self.heads_up_toolbar(&ctx, output.rect);
     }
@@ -2693,7 +2710,14 @@ impl OxydeApp {
         let mut mesh = doc.scene_mesh(&assembly);
         let (mut materials, textures) = self.assembly_materials(&assembly);
         self.add_context(&mut mesh, &mut materials);
-        self.viewport.pickable = self.own_mesh_counts(&mesh);
+        let own = self.own_mesh_counts(&mesh);
+        let before = (mesh.faces.len() as u32, mesh.edges.len() as u32);
+        // The red volumes of Interference Detection come last and cannot be picked.
+        self.viewport.pickable = if self.add_interferences(&mut mesh, &mut materials) {
+            Some(own.unwrap_or(before))
+        } else {
+            own
+        };
         let mut scene = Scene::from_mesh(&mesh);
         scene.set_materials(materials, textures);
         self.viewport.set_scene(scene, first);
@@ -2987,6 +3011,9 @@ impl SubTree<'_> {
                 self.hovered
                     .push(Hovered::Picks(doc.picks_under(self.top, path)));
             }
+            if row.response.double_clicked() {
+                *self.action = Some(TreeAction::OpenPart(occurrence.clone()));
+            }
             let (material, is_part) = match inner {
                 Some(crate::assembly::Loaded::Part(p)) => (p.part.material(), true),
                 _ => (None, false),
@@ -3002,6 +3029,21 @@ impl SubTree<'_> {
                 file.map(|p| doc.part_paths_at(p)).unwrap_or_default();
             response.context_menu(|ui| {
                 ui.label(RichText::new(format!("{} in {sub_name}", c.name)).small().weak());
+                if ui
+                    .button(if nested.is_some() {
+                        "Edit sub-assembly in place"
+                    } else {
+                        "Edit part in place"
+                    })
+                    .on_hover_text(
+                        "Opens the file for editing, with the rest of the whole assembly \
+                         shown around it; File › Finish editing comes back here",
+                    )
+                    .clicked()
+                {
+                    *self.action = Some(TreeAction::OpenPart(occurrence.clone()));
+                    ui.close_menu();
+                }
                 if ui
                     .button("Appearance…")
                     .on_hover_text("Colour, transparency or texture of this component, written into the sub-assembly's file")
@@ -3029,9 +3071,12 @@ impl SubTree<'_> {
                 }
                 ui.separator();
                 ui.label(
-                    RichText::new("Mates, placement and the rest: Edit sub-assembly in place.")
-                        .small()
-                        .weak(),
+                    RichText::new(
+                        "Mates and placement inside the sub-assembly: edit the sub-assembly \
+                         in place.",
+                    )
+                    .small()
+                    .weak(),
                 );
             });
             if is_part {

@@ -30,7 +30,9 @@ mod ffi;
 use std::fmt;
 use std::path::Path;
 
-use oxyde_geom::{Axis, Curve2, Loop, Plane, Point3, Profile, ProfileSegment, Transform, Vec3};
+use oxyde_geom::{
+    Axis, Curve2, Loop, Path as SweepPath, Plane, Point3, Profile, ProfileSegment, Transform, Vec3,
+};
 use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
     OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
@@ -162,6 +164,26 @@ impl Kernel for OcctKernel {
                 &regions,
                 &axis_data(axis),
                 angle,
+            )?;
+            Ok(op_result(data))
+        })
+    }
+
+    fn sweep(
+        &mut self,
+        plane: &Plane,
+        profile: &Profile,
+        path_plane: &Plane,
+        path: &SweepPath,
+    ) -> Result<OpResult, OcctError> {
+        guarded(|| {
+            let regions = regions_data(profile);
+            let segments: Vec<ffi::SegmentData> = path.segments.iter().map(segment_data).collect();
+            let data = self.session.pin_mut().sweep(
+                &plane_data(plane),
+                &regions,
+                &plane_data(path_plane),
+                &segments,
             )?;
             Ok(op_result(data))
         })
@@ -329,6 +351,17 @@ impl Kernel for OcctKernel {
                 .map(|m| material_data(m.as_ref()))
                 .collect();
             self.session.export_step(&ids, &colors, &materials, path)?;
+            Ok(())
+        })
+    }
+
+    fn export_iges(&self, shapes: &[ShapeHandle], path: &Path) -> Result<(), OcctError> {
+        guarded(|| {
+            let path = path.to_str().ok_or_else(|| {
+                OcctError::Occt(format!("path is not valid UTF-8: {}", path.display()))
+            })?;
+            let ids: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
+            self.session.export_iges(&ids, path)?;
             Ok(())
         })
     }

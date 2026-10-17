@@ -2,7 +2,9 @@
 //! it, with the rest of that assembly shown ghosted around it, in the component's own
 //! coordinates. The assembly is set aside meanwhile (loaded, with its undo history and
 //! selection) and File › Finish editing comes back to it, reading the edited files again.
-//! Editing can nest: a part inside a sub-assembly inside the main assembly.
+//! A part at any depth can be opened straight from the top assembly (a part inside a
+//! sub-assembly inside another), as SolidWorks does; editing can nest too, a sub-assembly
+//! opened in place and one of its parts opened from there.
 //!
 //! Every document open for editing, set aside or not, holds an edit lock (see
 //! [`crate::lockfile`]); a document another window is editing opens read-only, or is
@@ -11,21 +13,20 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use oxyde_assembly::ComponentId;
 use oxyde_kernel::Mesh;
 use oxyde_render::Material;
 
 use crate::app::{OxydeApp, PendingAction};
-use crate::assembly::AssemblyDoc;
+use crate::assembly::{AssemblyDoc, Occurrence};
 use crate::dialogs::Dialog;
 use crate::lockfile::LockInfo;
 
 /// An assembly set aside while one of its components is edited.
 pub(crate) struct Suspended {
     pub asm: AssemblyDoc,
-    /// The component being edited.
-    pub component: ComponentId,
-    /// Its instance name, for the banner and the menus.
+    /// The component being edited: a top-level one, or one inside sub-assemblies.
+    pub component: Occurrence,
+    /// Its name as the tree reads it ("Wheel assembly / Axle"), for the banner and menus.
     pub component_name: String,
     /// The other components, in the edited component's coordinates, drawn ghosted.
     pub context: Mesh,
@@ -46,7 +47,7 @@ pub(crate) enum LockMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
     Path(PathBuf),
-    Component(ComponentId),
+    Component(Occurrence),
 }
 
 /// The ghosted rest of the assembly.
@@ -86,7 +87,7 @@ impl OxydeApp {
     pub(crate) fn open_locked(&mut self, request: OpenRequest, mode: LockMode) {
         match request {
             OpenRequest::Path(path) => self.open_path_with(&path, mode),
-            OpenRequest::Component(id) => self.open_component_with(id, mode),
+            OpenRequest::Component(o) => self.open_component_with(o, mode),
         }
     }
 
@@ -113,39 +114,37 @@ impl OxydeApp {
         self.locks.retain(&keep);
     }
 
-    /// Opens a component's file for editing in place: the assembly is set aside and the
-    /// component's part or sub-assembly becomes the document, with the other components
-    /// ghosted around it.
-    pub(crate) fn open_component_with(&mut self, id: ComponentId, mode: LockMode) {
+    /// Opens a component's file for editing in place, at any depth: the assembly is set
+    /// aside and the part or sub-assembly becomes the document, with everything else
+    /// ghosted around it in that component's own coordinates.
+    pub(crate) fn open_component_with(&mut self, o: Occurrence, mode: LockMode) {
         let Some(doc) = self.asm.as_ref() else {
             return;
         };
-        let Some(path) = doc.sources.get(&id).cloned() else {
+        let Some(path) = doc.path_at(&o) else {
+            self.status = "The component's file is not loaded".to_owned();
             return;
         };
-        if doc.load_error(id).is_some() {
+        if matches!(doc.docs.get(&path), Some(Err(_)) | None) {
             self.status = format!("{} cannot be opened", path.display());
             return;
         }
         let read_only = match self.claim(&path, mode) {
             Ok(read_only) => read_only,
             Err(holder) => {
-                self.ask_about_lock(&path, holder, OpenRequest::Component(id));
+                self.ask_about_lock(&path, holder, OpenRequest::Component(o));
                 return;
             }
         };
         let Some(parent) = self.asm.take() else {
             return;
         };
-        let component_name = parent
-            .component(id)
-            .map(|c| c.name.clone())
-            .unwrap_or_default();
-        let context = parent.context_mesh(id);
+        let component_name = parent.occurrence_name(&o);
+        let context = parent.context_mesh(&o);
         let parent_name = parent.display_name();
         self.edit_stack.push(Suspended {
             asm: parent,
-            component: id,
+            component: o,
             component_name: component_name.clone(),
             context,
         });
@@ -196,7 +195,7 @@ impl OxydeApp {
             self.doc.release(&mut self.kernel);
             self.doc = crate::document::Document::new();
             self.sketch = None;
-            self.stl = None;
+            self.mesh_export = None;
             self.selection.clear();
             self.selected_feature = None;
             self.selected_features.clear();
@@ -210,7 +209,7 @@ impl OxydeApp {
         // file is gone from `sources`, which `loaded` tolerates.
         self.asm = Some(parent);
         self.asm_scene = None;
-        self.asm_scroll_to = Some(suspended.component);
+        self.asm_scroll_to = Some(suspended.component.top);
         self.viewport.request_fit();
         self.status = match notes.first() {
             Some(note) => note.clone(),
@@ -382,17 +381,19 @@ impl OxydeApp {
 }
 
 impl AssemblyDoc {
-    /// The parts of every component but `except`, in `except`'s own coordinates: the
-    /// context shown ghosted around a component edited in place.
-    pub fn context_mesh(&self, except: ComponentId) -> Mesh {
-        let Some(placement) = self.assembly.placement_of(except) else {
+    /// The parts of everything but `except` (a component at any depth, and what is under
+    /// it), in `except`'s own coordinates: the context shown ghosted around a component
+    /// edited in place.
+    pub fn context_mesh(&self, except: &Occurrence) -> Mesh {
+        let Some(placement) = self.occurrence_placement(except) else {
             return Mesh::default();
         };
         let inverse = placement.inverse();
         let leaves = self.leaves(&self.assembly);
+        let under_except = |o: &Occurrence| o.top == except.top && o.path.starts_with(&except.path);
         let placed: Vec<(usize, oxyde_assembly::Placement, &Mesh)> = leaves
             .iter()
-            .filter(|(o, _, _)| o.top != except)
+            .filter(|(o, _, _)| !under_except(o))
             .filter_map(|(_, p, part)| Some((0, inverse.compose(p), part.mesh.as_ref()?)))
             .collect();
         let (mut mesh, _) =

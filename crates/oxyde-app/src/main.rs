@@ -22,7 +22,6 @@
         clippy::indexing_slicing
     )
 )]
-
 // No console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -31,6 +30,7 @@ mod appearance_ui;
 mod assembly;
 mod assembly_ui;
 mod command_bar;
+mod configurations_ui;
 mod demo;
 mod dialogs;
 mod display;
@@ -38,13 +38,16 @@ mod document;
 mod edit_in_place;
 mod equations_ui;
 mod evaluate;
+mod export;
 mod features_ui;
 mod gpu;
 mod icons;
+mod interference;
 mod jobs;
 mod lockfile;
 mod materials;
 mod materials_ui;
+mod mesh_export;
 mod model_refs;
 mod prefs;
 mod prefs_ui;
@@ -53,7 +56,6 @@ mod property_manager;
 mod section_view;
 mod sketch_mode;
 mod splash;
-mod stl_export;
 mod theme;
 mod timeline;
 mod viewport;

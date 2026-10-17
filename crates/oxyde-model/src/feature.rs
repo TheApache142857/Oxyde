@@ -273,6 +273,7 @@ pub enum FeatureKind {
     Sketch(Sketch),
     Extrude(Extrude),
     Revolve(Revolve),
+    Sweep(Sweep),
     Fillet(EdgeBlend),
     Chamfer(EdgeBlend),
     Shell(Shell),
@@ -302,6 +303,11 @@ impl FeatureKind {
                 ExtrudeOp::Cut => "Cut-Revolve",
                 ExtrudeOp::Intersect => "Intersect-Revolve",
             },
+            FeatureKind::Sweep(s) => match s.op {
+                ExtrudeOp::Boss | ExtrudeOp::NewBody => "Sweep",
+                ExtrudeOp::Cut => "Cut-Sweep",
+                ExtrudeOp::Intersect => "Intersect-Sweep",
+            },
             FeatureKind::Fillet(_) => "Fillet",
             FeatureKind::Chamfer(_) => "Chamfer",
             FeatureKind::Shell(_) => "Shell",
@@ -321,6 +327,7 @@ impl FeatureKind {
         use FeatureParameter as P;
         match self {
             FeatureKind::Sketch(_)
+            | FeatureKind::Sweep(_)
             | FeatureKind::Axis(_)
             | FeatureKind::Mirror(_)
             | FeatureKind::Import(_)
@@ -430,6 +437,11 @@ impl FeatureKind {
                     axis.collect_features(&mut out);
                 }
             }
+            FeatureKind::Sweep(s) => {
+                out.push(s.profile);
+                out.push(s.path);
+                out.extend(s.bodies.iter().map(|b| b.feature));
+            }
             FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
                 for edge in &b.edges {
                     faces(&edge.faces, &mut out);
@@ -471,7 +483,31 @@ impl FeatureKind {
     /// Whether the feature can be the seed of a pattern or a mirror: it adds or removes
     /// material with a tool body.
     pub fn is_patternable(&self) -> bool {
-        matches!(self, FeatureKind::Extrude(_) | FeatureKind::Revolve(_))
+        matches!(
+            self,
+            FeatureKind::Extrude(_) | FeatureKind::Revolve(_) | FeatureKind::Sweep(_)
+        )
+    }
+
+    /// The sketches the feature sweeps, if it is an extrusion, a revolve or a sweep: its
+    /// profile first. The timeline shows them under the feature.
+    pub fn swept_sketches(&self) -> Vec<FeatureId> {
+        match self {
+            FeatureKind::Extrude(e) => vec![e.sketch],
+            FeatureKind::Revolve(r) => vec![r.sketch],
+            FeatureKind::Sweep(s) => vec![s.profile, s.path],
+            _ => Vec::new(),
+        }
+    }
+
+    /// What the feature does with the solid it sweeps, if it sweeps one.
+    pub fn sweep_op(&self) -> Option<ExtrudeOp> {
+        match self {
+            FeatureKind::Extrude(e) => Some(e.op),
+            FeatureKind::Revolve(r) => Some(r.op),
+            FeatureKind::Sweep(s) => Some(s.op),
+            _ => None,
+        }
     }
 }
 
@@ -600,7 +636,7 @@ impl Sketch {
     }
 }
 
-/// What an extrusion or a revolve does with the solid it sweeps.
+/// What an extrusion, a revolve or a sweep does with the solid it sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtrudeOp {
     /// Adds material: joined to a body (the first boss of a part makes the first body).
@@ -690,6 +726,19 @@ pub struct Revolve {
     pub mid_plane: bool,
     /// Turn the other way.
     pub reverse: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic, as for [`Extrude`].
+    pub bodies: Vec<BodyId>,
+}
+
+/// Swept boss or cut: the closed regions of one sketch carried along the open or closed
+/// chain of curves of another (SolidWorks' Sweep with "follow path").
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sweep {
+    /// The sketch whose closed regions are swept.
+    pub profile: FeatureId,
+    /// The sketch whose curves make the path: one chain, open or closed.
+    pub path: FeatureId,
+    pub op: ExtrudeOp,
     /// Bodies it joins, cuts or intersects; empty = automatic, as for [`Extrude`].
     pub bodies: Vec<BodyId>,
 }

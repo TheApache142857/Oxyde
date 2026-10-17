@@ -1,32 +1,87 @@
-//! File › Export STL: the part (or every visible part of the assembly, placed) meshed for
-//! 3D printing, with a window to choose how fine, which unit and which flavour of STL,
-//! and the mesh shown in the viewport as it will be written, triangles and all, before
-//! anything is saved. The window reports how many triangles there are, how big the file
-//! will be and whether the mesh is watertight, which slicers need.
+//! File › Export › STL, OBJ or 3MF: the part (or every visible part of the assembly, placed)
+//! meshed for 3D printing or rendering, with a window to choose the format, how fine, which
+//! unit and (for STL) which flavour, and the mesh shown in the viewport as it will be
+//! written, triangles and all, before anything is saved. The window reports how many
+//! triangles there are, how big an STL file will be and whether the mesh is watertight,
+//! which slicers need.
 //!
 //! The mesh is made with [`Kernel::tessellate_for_export`]: a maximum distance from the
 //! true surface and a maximum angle between neighbouring triangles, so small holes and
-//! fillets keep their shape at any part size.
+//! fillets keep their shape at any part size. OBJ and 3MF keep each part (and each body of
+//! a part) as an object of its own, named, 3MF with its colour.
 
 use eframe::egui;
 use oxyde_format::stl::{self, MeshReport, StlQuality, StlTriangle, StlUnit};
+use oxyde_format::{obj, threemf};
 use oxyde_kernel::{Kernel, Mesh};
 use oxyde_render::Scene;
 
 use crate::app::OxydeApp;
 
-pub struct StlDialog {
+/// The mesh file formats the window writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshFormat {
+    /// Binary or ASCII STL: what every slicer reads, one mesh, no names or colours.
+    Stl,
+    /// Wavefront OBJ: one named object per part or body, with normals; Blender and renderers.
+    Obj,
+    /// 3MF: one named, coloured object per part or body, with the unit; modern slicers.
+    ThreeMf,
+}
+
+impl MeshFormat {
+    pub const ALL: [MeshFormat; 3] = [MeshFormat::Stl, MeshFormat::Obj, MeshFormat::ThreeMf];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MeshFormat::Stl => "STL (3D printing, one mesh)",
+            MeshFormat::Obj => "OBJ (Blender, renderers; named objects)",
+            MeshFormat::ThreeMf => "3MF (slicers; named, coloured objects, with the unit)",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MeshFormat::Stl => "STL",
+            MeshFormat::Obj => "OBJ",
+            MeshFormat::ThreeMf => "3MF",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            MeshFormat::Stl => "stl",
+            MeshFormat::Obj => "obj",
+            MeshFormat::ThreeMf => "3mf",
+        }
+    }
+}
+
+/// One object of the file: a part of the assembly, or a body of the part.
+pub struct ExportObject {
+    pub name: String,
+    /// In mm, in the document's coordinates.
+    pub mesh: Mesh,
+    /// Its appearance colour, for formats that carry one.
+    pub color: Option<[u8; 3]>,
+}
+
+pub struct MeshExportDialog {
+    pub format: MeshFormat,
     pub quality: StlQuality,
     /// Maximum distance between the mesh and the true surface, mm.
     pub deflection: f64,
     /// Maximum angle between the normals across a triangle edge, degrees.
     pub angle: f64,
     pub unit: StlUnit,
+    /// STL only: binary or ASCII.
     pub binary: bool,
     /// Draw the triangles' edges over the mesh in the viewport.
     pub wireframe: bool,
-    /// The mesh as it will be written, in mm, in the document's coordinates.
+    /// The whole mesh as it will be written, in mm, in the document's coordinates.
     pub mesh: Option<Mesh>,
+    /// The same mesh, object by object.
+    pub objects: Vec<ExportObject>,
     pub report: Option<MeshReport>,
     pub error: Option<String>,
     /// Document revision the mesh was made for.
@@ -72,9 +127,10 @@ fn triangle_edges(mesh: &Mesh) -> Vec<Vec<[f32; 3]>> {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
                 let key = (a.min(b), a.max(b));
                 if a != b && seen.insert(key) {
-                    if let (Some(p), Some(q)) =
-                        (face.positions.get(a as usize), face.positions.get(b as usize))
-                    {
+                    if let (Some(p), Some(q)) = (
+                        face.positions.get(a as usize),
+                        face.positions.get(b as usize),
+                    ) {
                         out.push(vec![*p, *q]);
                     }
                 }
@@ -84,9 +140,49 @@ fn triangle_edges(mesh: &Mesh) -> Vec<Vec<[f32; 3]>> {
     out
 }
 
+/// Meshes every solid of a body, each as an object named after `name` (and its body
+/// number when there are several), with the body's or part's colour.
+fn body_objects<K: Kernel>(
+    kernel: &K,
+    part: &oxyde_model::Part,
+    name: &str,
+    deflection: f64,
+    angle: f64,
+    placement: Option<&oxyde_assembly::Placement>,
+) -> Result<Vec<ExportObject>, String> {
+    let Some(body) = part.body() else {
+        return Ok(Vec::new());
+    };
+    let colors = part.step_colors(body);
+    let mut out = Vec::with_capacity(body.solids.len());
+    for (i, solid) in body.solids.iter().enumerate() {
+        let mut mesh = kernel
+            .tessellate_for_export(solid.shape, deflection, angle)
+            .map_err(|e| e.to_string())?;
+        if let Some(p) = placement {
+            mesh = oxyde_assembly::scene::placed(&mesh, p);
+        }
+        let color = colors
+            .get(i)
+            .and_then(|c| c.solids.first().copied().flatten())
+            .map(|c| c.rgb);
+        let object_name = if body.solids.len() > 1 {
+            format!("{name} Body {}", i + 1)
+        } else {
+            name.to_owned()
+        };
+        out.push(ExportObject {
+            name: object_name,
+            mesh,
+            color,
+        });
+    }
+    Ok(out)
+}
+
 impl OxydeApp {
-    /// File › Export STL: opens the window and meshes the document.
-    pub(crate) fn begin_stl_export(&mut self) {
+    /// File › Export › STL, OBJ or 3MF: opens the window and meshes the document.
+    pub(crate) fn begin_mesh_export(&mut self, format: MeshFormat) {
         let empty = match &self.asm {
             Some(asm) => asm.leaves(&asm.assembly).is_empty(),
             None => self.doc.part.body().is_none(),
@@ -96,9 +192,16 @@ impl OxydeApp {
             return;
         }
         self.finish_sketch(true);
+        if let Some(d) = self.mesh_export.as_mut() {
+            d.format = format;
+            return;
+        }
         let diagonal = self.model_diagonal();
-        let (deflection, angle) = StlQuality::Normal.settings(diagonal).unwrap_or((0.05, 20.0));
-        self.stl = Some(StlDialog {
+        let (deflection, angle) = StlQuality::Normal
+            .settings(diagonal)
+            .unwrap_or((0.05, 20.0));
+        self.mesh_export = Some(MeshExportDialog {
+            format,
             quality: StlQuality::Normal,
             deflection,
             angle,
@@ -106,6 +209,7 @@ impl OxydeApp {
             binary: true,
             wireframe: true,
             mesh: None,
+            objects: Vec::new(),
             report: None,
             error: None,
             revision: None,
@@ -116,13 +220,19 @@ impl OxydeApp {
     }
 
     /// The document's size, mm: the diagonal of its bounding box.
-    fn model_diagonal(&self) -> f64 {
+    pub(crate) fn model_diagonal(&self) -> f64 {
         let bounds = match &self.asm {
             Some(asm) => asm.bounds(&asm.assembly),
             None => {
                 let mut lo = [f64::INFINITY; 3];
                 let mut hi = [f64::NEG_INFINITY; 3];
-                for solid in self.doc.part.body().map(|b| b.solids.as_slice()).unwrap_or(&[]) {
+                for solid in self
+                    .doc
+                    .part
+                    .body()
+                    .map(|b| b.solids.as_slice())
+                    .unwrap_or(&[])
+                {
                     if let Ok((a, b)) = self.kernel.bounds(solid.shape) {
                         for (k, (a, b)) in
                             [(a.x, b.x), (a.y, b.y), (a.z, b.z)].into_iter().enumerate()
@@ -146,7 +256,7 @@ impl OxydeApp {
             .unwrap_or(100.0)
     }
 
-    fn document_revision(&self) -> u64 {
+    pub(crate) fn document_revision(&self) -> u64 {
         match &self.asm {
             Some(asm) => asm.revision,
             None => self.doc.revision,
@@ -154,90 +264,98 @@ impl OxydeApp {
     }
 
     /// Meshes the document with the window's settings and shows the result.
-    fn remesh_stl(&mut self) {
-        let Some(d) = self.stl.as_ref() else {
+    fn remesh_export(&mut self) {
+        let Some(d) = self.mesh_export.as_ref() else {
             return;
         };
-        let (deflection, angle) = (d.deflection.max(0.0005), d.angle.clamp(1.0, 60.0).to_radians());
+        let (deflection, angle) = (
+            d.deflection.max(0.0005),
+            d.angle.clamp(1.0, 60.0).to_radians(),
+        );
         let start = std::time::Instant::now();
-        let result = match self.asm.as_mut() {
+        let result: Result<Vec<ExportObject>, String> = match self.asm.as_ref() {
             Some(asm) => {
-                // Every visible part, placed; the ranges let the materials follow.
-                let leaves = asm.leaves(&asm.assembly);
-                let mut meshes = Vec::new();
-                let mut error = None;
-                for (o, placement, part) in leaves {
-                    let Some(body) = part.part.body() else {
-                        continue;
-                    };
-                    let mut mesh = Mesh::default();
-                    for solid in &body.solids {
-                        match self.kernel.tessellate_for_export(solid.shape, deflection, angle) {
-                            Ok(m) => {
-                                mesh.faces.extend(m.faces);
-                                mesh.edges.extend(m.edges);
+                // Every visible part, placed, one object each, named by its place in the
+                // tree ("Base", "Wheel assembly / Axle").
+                let mut objects = Vec::new();
+                for (o, placement, part) in asm.leaves(&asm.assembly) {
+                    let name = asm.occurrence_name(&o);
+                    match body_objects(
+                        &self.kernel,
+                        &part.part,
+                        &name,
+                        deflection,
+                        angle,
+                        Some(&placement),
+                    ) {
+                        Ok(mut found) => {
+                            // A component's own appearance paints the whole part.
+                            if let Some(a) = asm.occurrence_appearance(&asm.assembly, &o) {
+                                for object in &mut found {
+                                    object.color = Some(a.color);
+                                }
                             }
-                            Err(e) => error = Some(e.to_string()),
+                            objects.extend(found);
+                        }
+                        Err(e) => {
+                            self.mesh_export_failed(e, start);
+                            return;
                         }
                     }
-                    meshes.push((o.clone(), placement, mesh));
                 }
-                match error {
-                    Some(e) => Err(e),
-                    None => {
-                        let (mesh, ranges) = oxyde_assembly::scene::combine(
-                            meshes.iter().map(|(o, p, m)| (o.clone(), p, m)),
-                        );
-                        asm.ranges = ranges;
-                        Ok(mesh)
-                    }
-                }
+                Ok(objects)
             }
-            None => match self.doc.part.body() {
-                Some(body) => {
-                    let mut mesh = Mesh::default();
-                    let mut error = None;
-                    for solid in &body.solids {
-                        match self.kernel.tessellate_for_export(solid.shape, deflection, angle) {
-                            Ok(m) => {
-                                mesh.faces.extend(m.faces);
-                                mesh.edges.extend(m.edges);
-                            }
-                            Err(e) => error = Some(e.to_string()),
-                        }
-                    }
-                    error.map_or(Ok(mesh), Err)
-                }
-                None => Err("there is no solid".to_owned()),
-            },
+            None => body_objects(
+                &self.kernel,
+                &self.doc.part,
+                &self.doc.display_name(),
+                deflection,
+                angle,
+                None,
+            ),
         };
+        match result {
+            Ok(objects) => {
+                let mut mesh = Mesh::default();
+                for object in &objects {
+                    mesh.faces.extend(object.mesh.faces.iter().cloned());
+                    mesh.edges.extend(object.mesh.edges.iter().cloned());
+                }
+                let took = start.elapsed().as_secs_f64();
+                let revision = self.document_revision();
+                if let Some(d) = self.mesh_export.as_mut() {
+                    d.dirty = false;
+                    d.revision = Some(revision);
+                    d.took = Some(took);
+                    let tris = stl::triangles(&mesh, d.unit.per_mm());
+                    d.report = Some(stl::report(&tris));
+                    d.mesh = Some(mesh);
+                    d.objects = objects;
+                    d.error = None;
+                }
+                self.show_mesh_preview();
+            }
+            Err(e) => self.mesh_export_failed(e, start),
+        }
+    }
+
+    fn mesh_export_failed(&mut self, error: String, start: std::time::Instant) {
         let took = start.elapsed().as_secs_f64();
         let revision = self.document_revision();
-        let Some(d) = self.stl.as_mut() else {
-            return;
-        };
-        d.dirty = false;
-        d.revision = Some(revision);
-        d.took = Some(took);
-        match result {
-            Ok(mesh) => {
-                let tris = stl::triangles(&mesh, d.unit.per_mm());
-                d.report = Some(stl::report(&tris));
-                d.mesh = Some(mesh);
-                d.error = None;
-            }
-            Err(e) => {
-                d.mesh = None;
-                d.report = None;
-                d.error = Some(e);
-            }
+        if let Some(d) = self.mesh_export.as_mut() {
+            d.dirty = false;
+            d.revision = Some(revision);
+            d.took = Some(took);
+            d.mesh = None;
+            d.objects.clear();
+            d.report = None;
+            d.error = Some(error);
         }
-        self.show_stl_preview();
     }
 
     /// Shows the export mesh in the viewport instead of the display mesh.
-    fn show_stl_preview(&mut self) {
-        let Some(d) = self.stl.as_ref() else {
+    fn show_mesh_preview(&mut self) {
+        let Some(d) = self.mesh_export.as_ref() else {
             return;
         };
         let Some(mesh) = d.mesh.as_ref() else {
@@ -251,13 +369,18 @@ impl OxydeApp {
                 mesh.edges.clone()
             },
         };
-        let (mut materials, textures) = match self.asm.as_ref().map(|a| a.assembly.clone()) {
-            Some(assembly) => self.assembly_materials(&assembly),
-            None => self.part_materials(),
-        };
+        // The objects' own colours, face by face, so the preview looks like the model.
+        let mut materials: Vec<oxyde_render::Material> = Vec::with_capacity(shown.faces.len());
+        for object in &d.objects {
+            let material = oxyde_render::Material {
+                color: object.color,
+                ..oxyde_render::Material::default()
+            };
+            materials.extend(std::iter::repeat_n(material, object.mesh.faces.len()));
+        }
         self.add_context(&mut shown, &mut materials);
         let mut scene = Scene::from_mesh(&shown);
-        scene.set_materials(materials, textures);
+        scene.set_materials(materials, Vec::new());
         // Looked at, not picked: faces and edges are the mesh's, not the model's.
         self.viewport.pickable = Some((0, 0));
         self.viewport.set_scene(scene, false);
@@ -271,62 +394,102 @@ impl OxydeApp {
     }
 
     /// Closes the window and shows the model again.
-    fn close_stl_export(&mut self) {
-        self.stl = None;
+    fn close_mesh_export(&mut self) {
+        self.mesh_export = None;
         self.viewport.pickable = None;
         self.scene_revision = None;
         self.asm_scene = None;
     }
 
-    /// The triangles as they will be written.
-    fn stl_triangles(&self) -> Option<(Vec<StlTriangle>, String)> {
-        let d = self.stl.as_ref()?;
-        let mesh = d.mesh.as_ref()?;
-        let name = match &self.asm {
+    /// The document's name, for the file and the STL solid.
+    fn export_name(&self) -> String {
+        match &self.asm {
             Some(asm) => asm.display_name(),
             None => self.doc.display_name(),
-        };
-        Some((stl::triangles(mesh, d.unit.per_mm()), name))
+        }
     }
 
-    fn export_stl_file(&mut self) {
-        let Some((tris, name)) = self.stl_triangles() else {
+    /// The triangles as STL will write them.
+    fn stl_triangles(&self) -> Option<Vec<StlTriangle>> {
+        let d = self.mesh_export.as_ref()?;
+        let mesh = d.mesh.as_ref()?;
+        Some(stl::triangles(mesh, d.unit.per_mm()))
+    }
+
+    fn export_mesh_file(&mut self) {
+        let Some(d) = self.mesh_export.as_ref() else {
             return;
         };
-        let binary = self.stl.as_ref().is_some_and(|d| d.binary);
+        let format = d.format;
+        let name = self.export_name();
+        let extension = format.extension();
         let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("STL", &["stl"])
-            .set_file_name(format!("{name}.stl"))
+            .add_filter(format.name(), &[extension])
+            .set_file_name(format!("{name}.{extension}"))
             .save_file()
         else {
             return;
         };
-        if !crate::assembly_ui::has_extension(&path, "stl") {
-            path.set_extension("stl");
+        if !crate::assembly_ui::has_extension(&path, extension) {
+            path.set_extension(extension);
         }
-        self.status = match stl::save(&path, &name, &tris, binary) {
-            Ok(()) => format!(
-                "Exported {} ({} triangles)",
-                path.display(),
-                thousands(tris.len() as u64)
-            ),
+        let result = match format {
+            MeshFormat::Stl => {
+                let Some(tris) = self.stl_triangles() else {
+                    return;
+                };
+                stl::save(&path, &name, &tris, d.binary).map(|()| tris.len())
+            }
+            MeshFormat::Obj => {
+                let meshes: Vec<obj::NamedMesh<'_>> = d
+                    .objects
+                    .iter()
+                    .map(|o| obj::NamedMesh {
+                        name: &o.name,
+                        mesh: &o.mesh,
+                    })
+                    .collect();
+                obj::save(&path, &meshes, d.unit.per_mm()).map(|()| d.objects.len())
+            }
+            MeshFormat::ThreeMf => {
+                let meshes: Vec<threemf::NamedMesh<'_>> = d
+                    .objects
+                    .iter()
+                    .map(|o| threemf::NamedMesh {
+                        name: &o.name,
+                        mesh: &o.mesh,
+                        color: o.color,
+                    })
+                    .collect();
+                threemf::save(&path, &meshes, d.unit).map(|()| d.objects.len())
+            }
+        };
+        self.status = match result {
+            Ok(count) => match format {
+                MeshFormat::Stl => format!(
+                    "Exported {} ({} triangles)",
+                    path.display(),
+                    thousands(count as u64)
+                ),
+                _ => format!("Exported {} ({count} object(s))", path.display()),
+            },
             Err(e) => format!("Export failed: {e}"),
         };
     }
 
-    /// The Export STL window, in part and assembly mode.
-    pub(crate) fn stl_window(&mut self, ctx: &egui::Context) {
-        if self.stl.is_none() {
+    /// The mesh export window, in part and assembly mode.
+    pub(crate) fn mesh_export_window(&mut self, ctx: &egui::Context) {
+        if self.mesh_export.is_none() {
             return;
         }
         // The model changed under the window: mesh it again.
         let revision = self.document_revision();
         if self
-            .stl
+            .mesh_export
             .as_ref()
             .is_some_and(|d| d.revision.is_some_and(|r| r != revision))
         {
-            if let Some(d) = self.stl.as_mut() {
+            if let Some(d) = self.mesh_export.as_mut() {
                 d.dirty = true;
             }
         }
@@ -335,22 +498,42 @@ impl OxydeApp {
         let mut close = false;
         let mut preview_changed = false;
         let assembly = self.asm.is_some();
-        egui::Window::new("Export STL")
+        let title = self
+            .mesh_export
+            .as_ref()
+            .map_or("Export mesh", |d| match d.format {
+                MeshFormat::Stl => "Export STL",
+                MeshFormat::Obj => "Export OBJ",
+                MeshFormat::ThreeMf => "Export 3MF",
+            });
+        egui::Window::new(title)
+            .id(egui::Id::new("mesh_export"))
             .open(&mut open)
             .resizable(false)
             .default_pos(ctx.screen_rect().right_top() + egui::vec2(-360.0, 70.0))
             .show(ctx, |ui| {
-                let Some(d) = self.stl.as_mut() else {
+                let Some(d) = self.mesh_export.as_mut() else {
                     return;
                 };
                 ui.set_width(320.0);
-                egui::Grid::new("stl_settings")
+                egui::Grid::new("mesh_export_settings")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
                     .show(ui, |ui| {
+                        ui.label("Format");
+                        egui::ComboBox::from_id_salt("mesh_format")
+                            .width(220.0)
+                            .selected_text(d.format.label())
+                            .show_ui(ui, |ui| {
+                                for format in MeshFormat::ALL {
+                                    ui.selectable_value(&mut d.format, format, format.label());
+                                }
+                            });
+                        ui.end_row();
+
                         ui.label("Quality");
                         let before = d.quality;
-                        egui::ComboBox::from_id_salt("stl_quality")
+                        egui::ComboBox::from_id_salt("mesh_quality")
                             .width(220.0)
                             .selected_text(
                                 StlQuality::ALL
@@ -407,8 +590,11 @@ impl OxydeApp {
                         });
                         ui.end_row();
 
-                        ui.label("Units");
-                        egui::ComboBox::from_id_salt("stl_unit")
+                        ui.label("Units").on_hover_text(match d.format {
+                            MeshFormat::ThreeMf => "Written into the file, which readers honour",
+                            _ => "The format has no unit: the coordinates are scaled to it",
+                        });
+                        egui::ComboBox::from_id_salt("mesh_unit")
                             .width(220.0)
                             .selected_text(d.unit.label())
                             .show_ui(ui, |ui| {
@@ -423,14 +609,16 @@ impl OxydeApp {
                             });
                         ui.end_row();
 
-                        ui.label("Format");
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut d.binary, true, "Binary")
-                                .on_hover_text("Compact; every slicer reads it");
-                            ui.radio_value(&mut d.binary, false, "ASCII")
-                                .on_hover_text("Text, about five times larger");
-                        });
-                        ui.end_row();
+                        if d.format == MeshFormat::Stl {
+                            ui.label("Flavour");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut d.binary, true, "Binary")
+                                    .on_hover_text("Compact; every slicer reads it");
+                                ui.radio_value(&mut d.binary, false, "ASCII")
+                                    .on_hover_text("Text, about five times larger");
+                            });
+                            ui.end_row();
+                        }
                     });
                 if ui
                     .checkbox(&mut d.wireframe, "Show the triangles in the viewport")
@@ -445,10 +633,15 @@ impl OxydeApp {
                 }
                 if let Some(r) = &d.report {
                     let unit = d.unit.symbol();
-                    egui::Grid::new("stl_report")
+                    egui::Grid::new("mesh_report")
                         .num_columns(2)
                         .spacing([12.0, 3.0])
                         .show(ui, |ui| {
+                            if d.format != MeshFormat::Stl {
+                                ui.label("Objects");
+                                ui.label(d.objects.len().to_string());
+                                ui.end_row();
+                            }
                             ui.label("Triangles");
                             ui.label(thousands(r.triangles as u64));
                             ui.end_row();
@@ -465,13 +658,15 @@ impl OxydeApp {
                                 ));
                                 ui.end_row();
                             }
-                            ui.label("File size");
-                            ui.label(if d.binary {
-                                size_text(r.binary_size)
-                            } else {
-                                format!("about {}", size_text(r.ascii_size))
-                            });
-                            ui.end_row();
+                            if d.format == MeshFormat::Stl {
+                                ui.label("File size");
+                                ui.label(if d.binary {
+                                    size_text(r.binary_size)
+                                } else {
+                                    format!("about {}", size_text(r.ascii_size))
+                                });
+                                ui.end_row();
+                            }
                             ui.label("Watertight");
                             if r.watertight() {
                                 ui.label("Yes: a closed surface, ready to slice");
@@ -505,11 +700,22 @@ impl OxydeApp {
                         });
                 }
                 ui.label(
-                    egui::RichText::new(if assembly {
-                        "Every visible part, where it sits in the assembly, as one mesh. \
-                         Hidden components are left out."
-                    } else {
-                        "The viewport shows the mesh as it will be written."
+                    egui::RichText::new(match (assembly, d.format) {
+                        (true, MeshFormat::Stl) => {
+                            "Every visible part, where it sits in the assembly, as one mesh. \
+                             Hidden components are left out."
+                        }
+                        (true, _) => {
+                            "Every visible part, where it sits in the assembly, as an object \
+                             of its own named after the tree. Hidden components are left out."
+                        }
+                        (false, MeshFormat::Stl) => {
+                            "The viewport shows the mesh as it will be written."
+                        }
+                        (false, _) => {
+                            "Each body is an object of its own, named after the part. The \
+                             viewport shows the mesh as it will be written."
+                        }
                     })
                     .small()
                     .weak(),
@@ -527,16 +733,16 @@ impl OxydeApp {
                     }
                 });
             });
-        if self.stl.as_ref().is_some_and(|d| d.dirty) {
-            self.remesh_stl();
+        if self.mesh_export.as_ref().is_some_and(|d| d.dirty) {
+            self.remesh_export();
         } else if preview_changed {
-            self.show_stl_preview();
+            self.show_mesh_preview();
         }
         if export {
-            self.export_stl_file();
+            self.export_mesh_file();
         }
         if close || !open {
-            self.close_stl_export();
+            self.close_mesh_export();
         }
     }
 }

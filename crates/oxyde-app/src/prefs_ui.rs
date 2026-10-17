@@ -714,6 +714,7 @@ impl OxydeApp {
             Action::Sketch => self.run(Command::Sketch),
             Action::Extrude => self.run(Command::Extrude),
             Action::Revolve => self.run(Command::Revolve),
+            Action::Sweep => self.run(Command::Sweep),
             Action::Fillet => self.run(Command::Blend(true)),
             Action::Chamfer => self.run(Command::Blend(false)),
             Action::Shell => self.run(Command::Shell),

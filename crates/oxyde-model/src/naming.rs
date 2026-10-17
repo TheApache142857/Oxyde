@@ -25,11 +25,11 @@ use crate::feature::FeatureId;
 /// Where a face comes from, independent of kernel numbering.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FaceKey {
-    /// Side face swept by an extrusion or a revolve from a sketch segment.
+    /// Side face swept by an extrusion, a revolve or a sweep from a sketch segment.
     Profile { feature: FeatureId, segment: u32 },
-    /// Face of an extrusion or a revolve lying on its sketch plane.
+    /// Face of an extrusion, a revolve or a sweep lying on its sketch plane.
     StartCap { feature: FeatureId },
-    /// Face at the far end of an extrusion or a revolve.
+    /// Face at the far end of an extrusion, a revolve or a sweep.
     EndCap { feature: FeatureId },
     /// Face generated from an edge (fillet or chamfer face).
     FromEdge { feature: FeatureId, edge: EdgeName },

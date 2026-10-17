@@ -528,6 +528,7 @@ pub enum Action {
     Sketch,
     Extrude,
     Revolve,
+    Sweep,
     Fillet,
     Chamfer,
     Shell,
@@ -546,7 +547,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 34] = [
         Action::NewPart,
         Action::Open,
         Action::Save,
@@ -565,6 +566,7 @@ impl Action {
         Action::Sketch,
         Action::Extrude,
         Action::Revolve,
+        Action::Sweep,
         Action::Fillet,
         Action::Chamfer,
         Action::Shell,
@@ -603,6 +605,7 @@ impl Action {
             Action::Sketch => "features.sketch",
             Action::Extrude => "features.extrude",
             Action::Revolve => "features.revolve",
+            Action::Sweep => "features.sweep",
             Action::Fillet => "features.fillet",
             Action::Chamfer => "features.chamfer",
             Action::Shell => "features.shell",
@@ -641,6 +644,7 @@ impl Action {
             Action::Sketch => "Sketch",
             Action::Extrude => "Extrude",
             Action::Revolve => "Revolve",
+            Action::Sweep => "Sweep",
             Action::Fillet => "Fillet",
             Action::Chamfer => "Chamfer",
             Action::Shell => "Shell",
