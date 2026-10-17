@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX Toolset (version 5 or later): the Windows Installer package (.msi), from dist\Oxyde
+  (made by bundle.ps1), which builds it with
+
+    wix build packaging\installer.wxs -arch x64 -d Version=0.0.6 -d BundleDir=dist\Oxyde
+        -o dist\Oxyde-0.0.6-windows-x64.msi
+
+  An alternative to the Inno Setup installer (installer.iss), for IT departments and
+  deployment tools that want an .msi: it installs for every user of the machine, into
+  Program Files\Oxyde (Windows asks for administrator rights), with a Start menu entry,
+  and opens .oxyprt and .oxyasm files (and the older .oxy) with Oxyde. A newer .msi
+  replaces an older one in place; it is uninstalled from Settings > Apps.
+
+  Never change the UpgradeCode: Windows recognises an upgrade by it. MSI versions are
+  numbers only (major.minor.build, each part 0-255 for the first two), which Oxyde's
+  0.0.x versions are.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Oxyde"
+           Manufacturer="TheApache142857"
+           Version="$(Version)"
+           UpgradeCode="{4D341F44-3F5D-418C-8F75-AFC11026531D}"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+    <SummaryInformation Description="Oxyde, a parametric 3D CAD modeller" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Oxyde is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="OxydeIcon" SourceFile="packaging\oxyde.ico" />
+    <Property Id="ARPPRODUCTICON" Value="OxydeIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/TheApache142857/oxyde" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/TheApache142857/oxyde" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Oxyde" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Oxyde" Level="1">
+      <!-- Everything bundle.ps1 put in dist\Oxyde: Oxyde.exe, the OpenCASCADE DLLs, the
+           licences and the README. -->
+      <Files Directory="INSTALLFOLDER" Include="$(BundleDir)\**" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="FileTypes" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut">
+        <Shortcut Id="OxydeShortcut"
+                  Name="Oxyde"
+                  Description="Parametric 3D CAD"
+                  Target="[INSTALLFOLDER]Oxyde.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="OxydeIcon" />
+        <RegistryValue Root="HKCU" Key="Software\TheApache142857\Oxyde"
+                       Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <!-- File types for every user (HKLM), removed on uninstall. -->
+    <Component Id="FileTypes" Directory="INSTALLFOLDER">
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Part" Type="string"
+                     Value="Oxyde part" KeyPath="yes" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Part\DefaultIcon" Type="string"
+                     Value="[INSTALLFOLDER]Oxyde.exe,0" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Part\shell\open\command"
+                     Type="string" Value="&quot;[INSTALLFOLDER]Oxyde.exe&quot; &quot;%1&quot;" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Assembly" Type="string"
+                     Value="Oxyde assembly" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Assembly\DefaultIcon"
+                     Type="string" Value="[INSTALLFOLDER]Oxyde.exe,0" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\Oxyde.Assembly\shell\open\command"
+                     Type="string" Value="&quot;[INSTALLFOLDER]Oxyde.exe&quot; &quot;%1&quot;" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.oxyprt" Type="string" Value="Oxyde.Part" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.oxyprt\OpenWithProgids" Name="Oxyde.Part"
+                     Type="string" Value="" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.oxy\OpenWithProgids" Name="Oxyde.Part"
+                     Type="string" Value="" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.oxyasm" Type="string" Value="Oxyde.Assembly" />
+      <RegistryValue Root="HKLM" Key="Software\Classes\.oxyasm\OpenWithProgids"
+                     Name="Oxyde.Assembly" Type="string" Value="" />
+    </Component>
+  </Package>
+</Wix>

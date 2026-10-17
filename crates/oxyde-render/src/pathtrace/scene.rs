@@ -235,6 +235,18 @@ impl TraceScene {
         })
     }
 
+    pub(crate) fn tris(&self) -> &[Tri] {
+        &self.tris
+    }
+
+    pub(crate) fn looks(&self) -> &[Look] {
+        &self.looks
+    }
+
+    pub(crate) fn bvh(&self) -> &Bvh {
+        &self.bvh
+    }
+
     pub(crate) fn aabb(&self) -> Aabb {
         self.bvh.bounds()
     }

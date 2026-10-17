@@ -181,6 +181,14 @@ impl Bvh {
         (Bvh { nodes }, order)
     }
 
+    /// Every node in order, as (box, first triangle or left child, triangle count (0 for
+    /// an inner node), right child).
+    pub fn flat(&self) -> impl Iterator<Item = (Aabb, u32, u32, u32)> + '_ {
+        self.nodes
+            .iter()
+            .map(|n| (n.bounds, n.first, n.count, n.right))
+    }
+
     /// The box around everything.
     pub fn bounds(&self) -> Aabb {
         self.nodes.first().map_or(Aabb::EMPTY, |n| n.bounds)

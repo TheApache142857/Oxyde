@@ -115,17 +115,20 @@ builds the release and writes:
 
 - `dist\Oxyde\`: `Oxyde.exe` with exactly the OpenCASCADE DLLs it needs (followed with `dumpbin`; without it, every DLL of OpenCASCADE's `bin` folder), the licences and the README;
 - `dist\Oxyde-<version>-windows-x64.zip`: the same, to unzip and run anywhere;
-- `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed: a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde.
+- `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed: a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde;
+- `dist\Oxyde-<version>-windows-x64.msi`, when the [WiX Toolset](https://wixtoolset.org) 5 or later is installed (`dotnet tool install --global wix --version 5.0.2`, which needs the .NET SDK 8 or later; WiX 6 asks you to accept its maintenance-fee licence first, `wix eula accept wix6`): a Windows Installer package for every user of the machine, into `Program Files\Oxyde` (Windows asks for administrator rights), with a Start menu entry and the same file types, for IT departments and deployment tools (`msiexec /i Oxyde-<version>-windows-x64.msi /qn` installs it silently). A newer `.msi` replaces an older one; the two installers are alternatives, not meant to be installed side by side. Its definition is `packaging/installer.wxs`, whose `UpgradeCode` must never change.
 
 The script checks the bundle by running `Oxyde.exe --version`, which loads OpenCASCADE: a missing DLL fails the bundle rather than the user. The version comes from the workspace `Cargo.toml`. The icon is drawn by `packaging/make_icon.py` (Pillow); its outputs are committed.
 
 ## 4. Bundling for macOS
 
+Double-click `packaging/Build Oxyde.dmg.command` in the Finder, or in Terminal:
+
 ```sh
 bash packaging/bundle-macos.sh
 ```
 
-builds the release and writes:
+The `.command` file checks what the build needs first (an Apple Silicon Mac, Xcode's command line tools, Homebrew, Rust 1.88 or later, OpenCASCADE, 8 GB free), offers to install Xcode's tools and OpenCASCADE when they are missing and says how to get the rest, then runs `bundle-macos.sh`, keeps a log in `dist/build-macos.log` and opens `dist` in the Finder. Either way the build writes:
 
 - `dist/Oxyde.app`: the executable with the OpenCASCADE dylibs it needs (followed with `otool -L`, copied into `Contents/Frameworks` and re-pointed through `@rpath`, so the app runs on a Mac without Homebrew), the icon (an `.icns` made from `packaging/oxyde.png` with `sips` and `iconutil`), the licences, and `.oxyprt` / `.oxyasm` declared as its document types (`packaging/Info.plist`);
 - `dist/Oxyde-<version>-macos-arm64.dmg`: the app with an *Applications* shortcut, to drag across;
@@ -135,7 +138,7 @@ The app is signed **ad hoc** (Apple Silicon runs no unsigned code) unless `OXYDE
 
 ## 5. Releasing
 
-Executables are built by hand, on a machine of each kind (no hosted build service is used): `packagingundle.ps1` on a Windows PC gives the zip and the installer, `packaging/bundle-macos.sh` on an Apple Silicon Mac gives the `.dmg` and the zip. Both read the version from the workspace `Cargo.toml` and check the bundle by running it with `--version`. To release: bump the version, run both scripts, tag the commit (`git tag v0.0.5`) and attach the four files to a GitHub release of that tag.
+Executables are built by hand, on a machine of each kind (no hosted build service is used): `packaging\bundle.ps1` on a Windows PC gives the zip, the `.exe` installer and the `.msi`, `packaging/bundle-macos.sh` on an Apple Silicon Mac gives the `.dmg` and the zip. Both read the version from the workspace `Cargo.toml` and check the bundle by running it with `--version`. A Mac is needed for the `.dmg`: OpenCASCADE's dylibs, `codesign` and `hdiutil` exist only there. To release: bump the version, run both scripts, tag the commit (`git tag v0.0.6`) and attach the files to a GitHub release of that tag.
 
 ## 6. Troubleshooting
 

@@ -14,12 +14,18 @@
 //!
 //! Like the rest of this crate it sees meshes only: no kernel, no model. The application
 //! turns appearances and finishes into looks.
+//!
+//! The application also runs the same algorithm on the GPU (`oxyde-app`'s
+//! `gpu_trace.rs` and `pathtrace.wgsl`): [`TraceScene::gpu_scene`] and [`GpuFrame`] lay the
+//! scene and the settings out for its shader, and [`develop_sums`] turns what it read
+//! back into the same picture, so both paths share everything but the tracing itself.
 
 mod bsdf;
 mod bvh;
 mod camera;
 mod denoise;
 mod environment;
+mod gpu;
 mod render;
 mod sampling;
 mod scene;
@@ -27,8 +33,12 @@ mod vector;
 
 pub use camera::{Projection, RenderCamera};
 pub use environment::{Environment, EnvironmentKind};
+pub use gpu::{
+    GpuFrame, GpuScene, LEAF_BIT, LOOK_BYTES, MAX_GPU_LIGHTS, NODE_BYTES, PARAMS_BYTES, TRI_BYTES,
+    decode_normal, encode_normal,
+};
 pub use render::{
-    Background, Floor, MAX_PIXELS, RenderImage, RenderSettings, Renderer, fit_pixel_budget,
-    inverse_tonemap, render_image, tonemap,
+    Background, Floor, MAX_PIXELS, RenderImage, RenderSettings, Renderer, develop_sums,
+    fit_pixel_budget, inverse_tonemap, render_image, tonemap,
 };
 pub use scene::{Look, SceneBuilder, TraceScene};

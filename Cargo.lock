@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-app"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "eframe",
  "image",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-assembly"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-geom",
  "oxyde-kernel",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-cli"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "clap",
  "oxyde-format",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-format"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-assembly",
  "oxyde-geom",
@@ -2575,18 +2575,18 @@ dependencies = [
 
 [[package]]
 name = "oxyde-geom"
-version = "0.0.5"
+version = "0.0.6"
 
 [[package]]
 name = "oxyde-kernel"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-geom",
 ]
 
 [[package]]
 name = "oxyde-model"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-geom",
  "oxyde-kernel",
@@ -2595,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-occt"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -2605,21 +2605,21 @@ dependencies = [
 
 [[package]]
 name = "oxyde-render"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-kernel",
 ]
 
 [[package]]
 name = "oxyde-sketch"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-geom",
 ]
 
 [[package]]
 name = "oxyde-tests"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "oxyde-assembly",
  "oxyde-cli",

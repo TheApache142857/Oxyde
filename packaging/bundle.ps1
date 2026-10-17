@@ -1,6 +1,8 @@
 # Builds the Oxyde bundle for Windows: dist\Oxyde\ (Oxyde.exe, the OpenCASCADE DLLs it
-# needs, licences), dist\Oxyde-<version>-windows-x64.zip and, when Inno Setup's iscc is on
-# the PATH, the installer dist\Oxyde-Setup-<version>.exe.
+# needs, licences), dist\Oxyde-<version>-windows-x64.zip and, when the tools are there,
+# the installers: dist\Oxyde-Setup-<version>.exe (Inno Setup's iscc, per user) and
+# dist\Oxyde-<version>-windows-x64.msi (the WiX Toolset's wix, version 5 or later, for
+# every user of the machine).
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\bundle.ps1
 #
@@ -110,5 +112,25 @@ if ($iscc) {
     & $iscc.Source "/DAppVersion=$Version" packaging\installer.iss
     if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
 } else {
-    Write-Warning "Inno Setup (iscc) not found: no installer, only the zip"
+    Write-Warning "Inno Setup (iscc) not found: no .exe installer"
+}
+
+# ---- Windows Installer package (.msi) -------------------------------------------------------
+# WiX is a .NET tool: `dotnet tool install --global wix --version 5.0.2` (needs the .NET
+# SDK 8 or later). WiX 6 works too but asks you to accept its maintenance-fee licence
+# first (`wix eula accept wix6`).
+$wix = Get-Command wix.exe -ErrorAction SilentlyContinue
+if (-not $wix) {
+    $tool = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
+    if (Test-Path $tool) { $wix = Get-Item $tool }
+}
+if ($wix) {
+    $Msi = Join-Path $Dist "Oxyde-$Version-windows-x64.msi"
+    if (Test-Path $Msi) { Remove-Item $Msi }
+    & $wix.Source build packaging\installer.wxs -arch x64 -d "Version=$Version" `
+        -d "BundleDir=$Bundle" -o $Msi
+    if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
+    Write-Host "Wrote $Msi"
+} else {
+    Write-Warning "WiX (wix) not found: no .msi. Install it with: dotnet tool install --global wix --version 5.0.2"
 }

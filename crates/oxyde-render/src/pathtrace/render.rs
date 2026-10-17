@@ -108,10 +108,64 @@ struct PathResult {
 
 /// The floor, placed under the scene.
 #[derive(Debug, Clone)]
-struct FloorPlane {
-    y: f32,
-    catcher: bool,
-    look: Look,
+pub(crate) struct FloorPlane {
+    pub y: f32,
+    pub catcher: bool,
+    pub look: Look,
+}
+
+/// What a render of a scene from a camera is set up with, CPU or GPU: the settings held
+/// to the pixel budget, the lights placed, the floor put under the scene, and the
+/// distances rays keep from surfaces and start from.
+#[derive(Debug, Clone)]
+pub(crate) struct Stage {
+    pub settings: RenderSettings,
+    pub lighting: Lighting,
+    pub floor: Option<FloorPlane>,
+    /// Offset of new rays from the surface they leave, mm.
+    pub eps: f32,
+    /// How far behind the centre of the view orthographic rays start, mm.
+    pub back: f32,
+}
+
+impl Stage {
+    pub fn new(scene: &TraceScene, camera: &RenderCamera, settings: &RenderSettings) -> Stage {
+        let mut settings = *settings;
+        (settings.width, settings.height) = fit_pixel_budget(settings.width, settings.height);
+        let bounds = scene.aabb();
+        let (centre, diagonal) = if bounds.is_empty() {
+            (camera.eye, 100.0)
+        } else {
+            (bounds.centre(), (bounds.hi - bounds.lo).length().max(1e-3))
+        };
+        let eps = (diagonal * 2e-5).max(1e-5);
+        let back = (centre - camera.eye).length() + diagonal * 2.0;
+        let lighting = Lighting::new(&settings.environment, camera.right, -camera.forward);
+        let floor = match settings.floor {
+            Floor::None => None,
+            _ if bounds.is_empty() => None,
+            Floor::ShadowCatcher => Some(FloorPlane {
+                y: bounds.lo.y - diagonal * 1e-4,
+                catcher: true,
+                look: Look::default(),
+            }),
+            Floor::Visible { color, gloss } => {
+                let gloss = gloss.clamp(0.0, 1.0);
+                Some(FloorPlane {
+                    y: bounds.lo.y - diagonal * 1e-4,
+                    catcher: false,
+                    look: Look::from_srgb(color, 0.0, 0.9 - 0.88 * gloss, 0.0),
+                })
+            }
+        };
+        Stage {
+            settings,
+            lighting,
+            floor,
+            eps,
+            back,
+        }
+    }
 }
 
 /// A render in progress.
@@ -152,34 +206,13 @@ pub fn fit_pixel_budget(width: usize, height: usize) -> (usize, usize) {
 
 impl Renderer {
     pub fn new(scene: Arc<TraceScene>, camera: RenderCamera, settings: RenderSettings) -> Self {
-        let mut settings = settings;
-        (settings.width, settings.height) = fit_pixel_budget(settings.width, settings.height);
-        let bounds = scene.aabb();
-        let (centre, diagonal) = if bounds.is_empty() {
-            (camera.eye, 100.0)
-        } else {
-            (bounds.centre(), (bounds.hi - bounds.lo).length().max(1e-3))
-        };
-        let eps = (diagonal * 2e-5).max(1e-5);
-        let back = (centre - camera.eye).length() + diagonal * 2.0;
-        let lighting = Lighting::new(&settings.environment, camera.right, -camera.forward);
-        let floor = match settings.floor {
-            Floor::None => None,
-            _ if bounds.is_empty() => None,
-            Floor::ShadowCatcher => Some(FloorPlane {
-                y: bounds.lo.y - diagonal * 1e-4,
-                catcher: true,
-                look: Look::default(),
-            }),
-            Floor::Visible { color, gloss } => {
-                let gloss = gloss.clamp(0.0, 1.0);
-                Some(FloorPlane {
-                    y: bounds.lo.y - diagonal * 1e-4,
-                    catcher: false,
-                    look: Look::from_srgb(color, 0.0, 0.9 - 0.88 * gloss, 0.0),
-                })
-            }
-        };
+        let Stage {
+            settings,
+            lighting,
+            floor,
+            eps,
+            back,
+        } = Stage::new(&scene, &camera, &settings);
         Renderer {
             pixels: vec![Pixel::default(); settings.width * settings.height],
             scene,
@@ -566,44 +599,110 @@ impl Renderer {
     /// The picture so far, tonemapped for the screen; `denoise` smooths the noise first,
     /// guided by the surfaces' colours, normals and depths so edges and textures stay.
     pub fn image(&self, denoise: bool) -> RenderImage {
-        let (w, h) = (self.settings.width, self.settings.height);
-        let k = 1.0 / self.samples.max(1) as f32;
-        let mut color: Vec<V> = self
-            .pixels
-            .iter()
-            .map(|p| {
-                let alpha = p.alpha * k;
-                if alpha > 1e-6 {
-                    p.color * (k / alpha)
-                } else {
-                    V::ZERO
-                }
-            })
-            .collect();
-        if denoise && self.samples > 0 {
-            let pixels = &self.pixels;
-            let feature = |i: usize| {
-                pixels.get(i).map_or((V::ZERO, V::ZERO, 0.0), |p| {
-                    (p.albedo * k, p.normal * k, p.depth * k)
+        let pixels = &self.pixels;
+        develop(
+            self.settings.width,
+            self.settings.height,
+            self.samples,
+            self.settings.exposure,
+            denoise,
+            self.settings.threads,
+            |i| {
+                pixels.get(i).map_or(Sums::default(), |p| Sums {
+                    color: p.color,
+                    alpha: p.alpha,
+                    albedo: p.albedo,
+                    normal: p.normal,
+                    depth: p.depth,
                 })
-            };
-            color = super::denoise::denoise(&color, &feature, w, h, self.settings.threads);
-        }
-        let exposure = self.exposure();
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for (c, p) in color.iter().zip(&self.pixels) {
-            let mapped = (*c * exposure).map(tonemap);
-            for v in mapped.to_array() {
-                rgba.push((linear_to_srgb(v) * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
-            }
-            rgba.push(((p.alpha * k).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-        }
-        RenderImage {
-            width: w,
-            height: h,
-            rgba,
-        }
+            },
+        )
     }
+}
+
+/// What a pixel has gathered over its samples.
+#[derive(Debug, Clone, Copy, Default)]
+struct Sums {
+    color: V,
+    alpha: f32,
+    albedo: V,
+    normal: V,
+    depth: f32,
+}
+
+/// The picture from every pixel's sums over `samples` samples: averaged, denoised if
+/// asked, exposed by `exposure` stops, tonemapped and sRGB-encoded.
+fn develop(
+    w: usize,
+    h: usize,
+    samples: u32,
+    exposure: f32,
+    denoise: bool,
+    threads: usize,
+    sums: impl Fn(usize) -> Sums + Sync,
+) -> RenderImage {
+    let k = 1.0 / samples.max(1) as f32;
+    let mut color: Vec<V> = (0..w * h)
+        .map(|i| {
+            let p = sums(i);
+            let alpha = p.alpha * k;
+            if alpha > 1e-6 {
+                p.color * (k / alpha)
+            } else {
+                V::ZERO
+            }
+        })
+        .collect();
+    if denoise && samples > 0 {
+        let feature = |i: usize| {
+            let p = sums(i);
+            (p.albedo * k, p.normal * k, p.depth * k)
+        };
+        color = super::denoise::denoise(&color, &feature, w, h, threads);
+    }
+    let exposure = 2f32.powf(exposure.clamp(-20.0, 20.0));
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for (i, c) in color.iter().enumerate() {
+        let mapped = (*c * exposure).map(tonemap);
+        for v in mapped.to_array() {
+            rgba.push((linear_to_srgb(v) * 255.0 + 0.5).clamp(0.0, 255.0) as u8);
+        }
+        rgba.push(((sums(i).alpha * k).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+    }
+    RenderImage {
+        width: w,
+        height: h,
+        rgba,
+    }
+}
+
+/// The picture from sums read back from the GPU shader, developed exactly as the CPU
+/// renderer develops its own: per pixel, `color` holds the colour (premultiplied by
+/// coverage) and the alpha summed, `albedo_depth` the first surface's colour and depth,
+/// `normals` its normal, each summed over `samples` samples.
+#[allow(clippy::too_many_arguments)]
+pub fn develop_sums(
+    width: usize,
+    height: usize,
+    samples: u32,
+    exposure: f32,
+    denoise: bool,
+    color: &[[f32; 4]],
+    albedo_depth: &[[f32; 4]],
+    normals: &[[f32; 4]],
+) -> RenderImage {
+    develop(width, height, samples, exposure, denoise, 0, |i| {
+        let c = color.get(i).copied().unwrap_or_default();
+        let a = albedo_depth.get(i).copied().unwrap_or_default();
+        let n = normals.get(i).copied().unwrap_or_default();
+        Sums {
+            color: V::new(c[0], c[1], c[2]),
+            alpha: c[3],
+            albedo: V::new(a[0], a[1], a[2]),
+            normal: V::new(n[0], n[1], n[2]),
+            depth: a[3],
+        }
+    })
 }
 
 /// The filmic tone curve (Narkowicz's fit of ACES): bright light rolls off instead of
@@ -883,6 +982,49 @@ mod tests {
         }
         for y in [0.0, 0.1, 0.5, 0.9] {
             assert!((tonemap(inverse_tonemap(y)) - y).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn sums_develop_as_the_renderer_does() {
+        let scene = scene_with(Look::default());
+        let settings = RenderSettings {
+            width: 12,
+            height: 10,
+            samples: 3,
+            threads: 1,
+            ..RenderSettings::default()
+        };
+        let mut r = Renderer::new(scene, front_camera(Some(50.0)), settings);
+        r.render_all(&AtomicBool::new(false));
+        let color: Vec<[f32; 4]> = r
+            .pixels
+            .iter()
+            .map(|p| [p.color.x, p.color.y, p.color.z, p.alpha])
+            .collect();
+        let albedo: Vec<[f32; 4]> = r
+            .pixels
+            .iter()
+            .map(|p| [p.albedo.x, p.albedo.y, p.albedo.z, p.depth])
+            .collect();
+        let normals: Vec<[f32; 4]> = r
+            .pixels
+            .iter()
+            .map(|p| [p.normal.x, p.normal.y, p.normal.z, 0.0])
+            .collect();
+        for denoise in [false, true] {
+            let a = r.image(denoise);
+            let b = develop_sums(
+                12,
+                10,
+                3,
+                settings.exposure,
+                denoise,
+                &color,
+                &albedo,
+                &normals,
+            );
+            assert_eq!(a, b);
         }
     }
 

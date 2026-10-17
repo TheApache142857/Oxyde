@@ -149,6 +149,11 @@ impl Lighting {
         }
     }
 
+    /// What every light and the background are multiplied by.
+    pub fn strength(&self) -> f32 {
+        self.strength
+    }
+
     /// Radiance arriving from direction `dir` (unit), leaving the lights out.
     pub fn background(&self, dir: V) -> V {
         let (_, up, _) = self.frame;

@@ -1,9 +1,9 @@
 # Rendering: a plan for a Render tab
 
 Status: **first steps built** (October 2026): the CPU path tracer and the Render tab of
-§3 step 3, and the glTF exporter of step 1, without any change to the file formats (see
-§6). The Blender add-on, the wgpu preview and the looks in the files wait for the
-owner's answers in §5.
+§3 step 3, the same path tracer on the GPU (the end of step 4), and the glTF exporter of
+step 1, without any change to the file formats (see §6). The Blender add-on, a
+rasterised PBR preview and the looks in the files wait for the owner's answers in §5.
 
 This document lays out how Oxyde could get a Render
 tab, the way SolidWorks has Visualize and Fusion 360 has its Render workspace: a picture of
@@ -190,6 +190,30 @@ is still open:
   materials from the finishes. No textures yet (no texture coordinates; they would
   need to be generated from the triplanar mapping).
 
-Still to do, in the order of §3: the Blender add-on (step 2), HDRI environments, the
-wgpu preview (step 4), and moving looks and render setups into the files once the owner
-decides how.
+- **GPU path tracer** (`oxyde-app/src/gpu_trace.rs`, `pathtrace.wgsl`; 0.0.6): the CPU
+  tracer ported line for line to a WGSL compute shader on the device egui draws with (no
+  ray-tracing extension, no new dependency). `oxyde_render::pathtrace::gpu` lays the
+  scene and the settings out as flat words (`TraceScene::gpu_scene`, `GpuFrame`): BVH
+  nodes 32 bytes, triangles 64 (normals octahedral in snorm16 pairs), looks 32, one
+  uniform block per dispatch at 512-byte strides (the window's device asks for the
+  card's largest storage buffers, `device_descriptor` in `main.rs`, instead of wgpu's
+  128 MB default, which held the triangles to about two million). The GPU keeps three sums per pixel
+  (colour and alpha, albedo and depth, normal: 48 bytes) and adds one sample per pixel a
+  band of rows at a time; the bands a frame submits are sized from how long the last
+  submission took (`on_submitted_work_done`), aiming at 30 ms, so the UI stays live and
+  no dispatch nears the Windows driver timeout. A second entry point develops the sums
+  into an sRGB texture egui draws. The final picture is the sums read back (one buffer
+  at a time) and developed on the CPU by `develop_sums`, the same code as the CPU
+  renderer's, denoiser included. Tests without a GPU: the shader parses and validates
+  with naga, its struct sizes equal the CPU-side layouts, the hierarchy as written is
+  walkable, normals survive the encoding, the parameters land where the shader reads
+  them, and `develop_sums` equals the CPU renderer's own picture. The ignored
+  `gpu_tracing_matches_the_cpu` test compares the GPU with the CPU on a furnace sphere
+  and a metal sphere in the studio, on a machine with a GPU. The random numbers differ
+  from the CPU's (PCG hash per pixel and sample), so pictures agree in the mean, not
+  pixel for pixel. Colour textures are not on the GPU yet: a textured face renders in
+  its appearance colour there.
+
+Still to do, in the order of §3: the Blender add-on (step 2), HDRI environments, textures
+in the GPU tracer and in glTF, a rasterised PBR preview, and moving looks and render
+setups into the files once the owner decides how.

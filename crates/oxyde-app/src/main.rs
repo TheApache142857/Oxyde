@@ -41,6 +41,7 @@ mod evaluate;
 mod export;
 mod features_ui;
 mod gpu;
+mod gpu_trace;
 mod icons;
 mod interference;
 mod jobs;
@@ -78,7 +79,39 @@ fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
                 height: 64,
             }),
         renderer,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            device_descriptor: std::sync::Arc::new(device_descriptor),
+            ..Default::default()
+        },
         ..Default::default()
+    }
+}
+
+/// The GPU device the window draws with: egui's own settings, but asking for the largest
+/// storage buffers the card allows instead of wgpu's default 128 MB. The Render tab's GPU
+/// path tracer keeps the scene's triangles in one buffer (64 bytes each), so the default
+/// stopped it at about two million triangles; Direct3D 12 and Vulkan allow up to 2 GB.
+fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
+    use eframe::wgpu;
+    let supported = adapter.limits();
+    let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+        wgpu::Limits::downlevel_webgl2_defaults()
+    } else {
+        wgpu::Limits::default()
+    };
+    wgpu::DeviceDescriptor {
+        label: Some("oxyde wgpu device"),
+        required_features: wgpu::Features::default(),
+        required_limits: wgpu::Limits {
+            // As egui asks: a depth buffer the size of a 4K+ screen.
+            max_texture_dimension_2d: 8192,
+            max_storage_buffer_binding_size: supported
+                .max_storage_buffer_binding_size
+                .max(base.max_storage_buffer_binding_size),
+            max_buffer_size: supported.max_buffer_size.max(base.max_buffer_size),
+            ..base
+        },
+        memory_hints: wgpu::MemoryHints::default(),
     }
 }
 

@@ -5,6 +5,42 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### The Render tab on the GPU (0.0.6, October 2026)
+
+- **Renders run on the GPU.** The Render tab's path tracer now runs on the graphics card
+  the window draws with (Direct3D 12, Vulkan or Metal), typically ten to fifty times
+  faster than on the CPU, so the picture refines almost as fast as the view settles.
+  It is the same algorithm, ported to a compute shader: same materials, lights, floor,
+  glass and background, same picture. The GPU adds samples a band of rows at a time,
+  sized each frame to what the card manages in about 30 ms, so the window stays
+  responsive and no single piece of work runs long enough for Windows to reset the
+  driver. When the render is done, the final picture (denoised if asked) is made from
+  the GPU's sums exactly as on the CPU; *Save Image* works mid-render too.
+- **Output › Device**: *GPU when available* (the default) or *CPU*. The panel says which
+  GPU renders, or why the CPU does: a window drawn without a GPU, a model with more
+  triangles than the card's largest buffer holds, or any error from the GPU, after which
+  the tab carries on with the CPU renderer.
+- **Big models on the GPU.** Oxyde now asks the graphics card for its largest buffers
+  (up to 2 GB with Direct3D 12 and Vulkan) instead of wgpu's default 128 MB, which
+  stopped the GPU renderer at about two million triangles.
+- **Render While Moving** (a button in the Render tab, and a box in the panel's Camera
+  section): the render stays on screen while orbiting, panning and zooming, restarting
+  at once, instead of the viewport showing until the view is still. Smooth on the GPU;
+  on the CPU the picture follows a little behind. Off by default.
+- On the GPU a new view replaces the picture once one whole sample of it is in, instead
+  of appearing band by band.
+- The Render panel scrolls, so a long list of surfaces no longer pushes the rest of the
+  setup and the tree out of reach.
+- **The macOS installer by double-click**: `packaging/Build Oxyde.dmg.command`, opened
+  from the Finder on a Mac, checks what the build needs (Xcode's tools, Homebrew, Rust,
+  OpenCASCADE, disk space), offers to install what is missing, builds the `.dmg` and
+  shows it in the Finder. No Terminal commands to type.
+- **An .msi installer for Windows** (`packaging\bundle.ps1`, when the WiX Toolset is
+  installed): Oxyde for every user of the machine, into Program Files, with a Start menu
+  entry and the file types, for IT departments and deployment tools. The per-user
+  `.exe` installer stays; macOS keeps its `.dmg`.
+- Version 0.0.6.
+
 ### A Render tab, glTF export, File › Open recent (unreleased, October 2026)
 
 - **Render tab** (parts and assemblies), the first step of `docs/RENDERING.md`: the model

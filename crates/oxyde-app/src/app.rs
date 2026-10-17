@@ -257,6 +257,9 @@ pub struct OxydeApp {
     pub(crate) image_export: Option<crate::export::ImageExportDialog>,
     /// The Render tab: its render and the meshes it is made from.
     pub(crate) render: crate::render_ui::RenderView,
+    /// The GPU device egui draws with, when the window has one: the Render tab traces on
+    /// it.
+    pub(crate) wgpu_state: Option<eframe::egui_wgpu::RenderState>,
     pub(crate) prefs: crate::prefs::Preferences,
     pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
     pub(crate) debug_stats: crate::prefs_ui::DebugStats,
@@ -332,6 +335,7 @@ impl OxydeApp {
             mesh_export: None,
             image_export: None,
             render: Default::default(),
+            wgpu_state: None,
             prefs: crate::prefs::Preferences::load(),
             prefs_window: Default::default(),
             debug_stats: Default::default(),
@@ -352,6 +356,7 @@ impl OxydeApp {
             app.status = problem;
         }
         app.apply_preferences(&cc.egui_ctx);
+        app.wgpu_state = cc.wgpu_render_state.clone();
         if let Some(state) = &cc.wgpu_render_state {
             let info = state.adapter.get_info();
             app.viewport.enable_gpu(

@@ -9,8 +9,10 @@
 //! glass…), the samples and the picture size; *Save image…* writes the picture as a PNG.
 //!
 //! The model is meshed again for the render, finer than the display mesh, on the UI
-//! thread when the model or its looks change (not when only the camera moves); the render
-//! runs on a thread of its own, which posts a picture about every 150 ms.
+//! thread when the model or its looks change (not when only the camera moves). The render
+//! runs on the GPU when there is one (`gpu_trace.rs`: the same algorithm in a compute
+//! shader, a band of rows at a time, refined every frame), else, or when the GPU path
+//! fails, on a thread of its own on the CPU, which posts a picture about every 150 ms.
 //!
 //! Nothing here is saved in the document: the setup and the finishes are preferences
 //! (`render` in `preferences.json`), the finishes keyed by material name, or by the part's
@@ -80,6 +82,16 @@ pub enum FloorChoice {
     Visible,
 }
 
+/// What renders: the GPU when there is one, or always the CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceChoice {
+    /// The GPU when the window draws with one, else the CPU.
+    Automatic,
+    /// Every core of the CPU: slower, and the reference.
+    Cpu,
+}
+
 /// How finely the model is meshed for the render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +156,12 @@ pub struct RenderPrefs {
     pub width: u32,
     pub height: u32,
     pub detail: Detail,
+    /// GPU or CPU.
+    pub device: DeviceChoice,
+    /// Keep rendering while the view moves (the render restarts at once and the last
+    /// picture stays until the new one is in), instead of showing the viewport until the
+    /// view is still.
+    pub live: bool,
     /// Finish ids chosen by the user, by finish group (a material name, or `part:` and
     /// a document id).
     pub finishes: BTreeMap<String, String>,
@@ -172,6 +190,8 @@ impl Default for RenderPrefs {
             width: 1920,
             height: 1080,
             detail: Detail::Fine,
+            device: DeviceChoice::Automatic,
+            live: false,
             finishes: BTreeMap::new(),
         }
     }
@@ -408,6 +428,58 @@ impl RenderJob {
     }
 }
 
+impl RenderJob {
+    /// Develops sums read back from the GPU into the final picture on a thread, posted
+    /// like a CPU render's last picture.
+    fn develop(
+        sums: crate::gpu_trace::Sums,
+        exposure: f32,
+        denoise: bool,
+        seconds: f64,
+    ) -> RenderJob {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let s = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("oxyde render develop".into())
+            .spawn(move || {
+                let result = oxyde_kernel::catch_panic(|| {
+                    oxyde_render::pathtrace::develop_sums(
+                        sums.width as usize,
+                        sums.height as usize,
+                        sums.samples,
+                        exposure,
+                        denoise,
+                        &sums.color,
+                        &sums.albedo,
+                        &sums.normals,
+                    )
+                });
+                if let Ok(mut shared) = s.lock() {
+                    match result {
+                        Ok(image) => {
+                            shared.latest = Some(Published {
+                                image,
+                                samples: sums.samples,
+                                target: sums.samples,
+                                preview: false,
+                                done: true,
+                                seconds,
+                            });
+                        }
+                        Err(message) => shared.failed = Some(message),
+                    }
+                }
+            });
+        if let Err(e) = spawned
+            && let Ok(mut s) = shared.lock()
+        {
+            s.failed = Some(format!("the develop thread could not start: {e}"));
+        }
+        RenderJob { cancel, shared }
+    }
+}
+
 impl Drop for RenderJob {
     /// The thread notices at its next row and ends; nothing waits for it.
     fn drop(&mut self) {
@@ -495,6 +567,16 @@ struct RunKey {
     settings: RenderSettings,
     focal: Option<f64>,
     denoise: bool,
+    /// Traced on the GPU.
+    gpu: bool,
+}
+
+/// The GPU tracer, once asked for.
+enum GpuSlot {
+    Untried,
+    Ready(Box<crate::gpu_trace::GpuTracer>),
+    /// Why the GPU cannot render: renders go to the CPU.
+    Failed(String),
 }
 
 /// The Render tab's state.
@@ -518,6 +600,11 @@ pub struct RenderView {
     error: Option<String>,
     /// The setup changed: save the preferences once the pointer is up.
     prefs_dirty: bool,
+    gpu: GpuSlot,
+    /// The render running is traced on the GPU; when it started.
+    gpu_run: Option<Instant>,
+    /// Its final picture has been asked for.
+    gpu_developed: bool,
 }
 
 impl Default for RenderView {
@@ -537,6 +624,9 @@ impl Default for RenderView {
             groups: Vec::new(),
             error: None,
             prefs_dirty: false,
+            gpu: GpuSlot::Untried,
+            gpu_run: None,
+            gpu_developed: false,
         }
     }
 }
@@ -551,6 +641,12 @@ impl RenderView {
         self.latest = None;
         self.samples = 0;
         self.done = false;
+        self.gpu_run = None;
+        self.gpu_developed = false;
+        // The GPU's picture buffers go too; the scene stays uploaded for coming back.
+        if let GpuSlot::Ready(t) = &mut self.gpu {
+            t.idle();
+        }
     }
 
     /// Forgets everything, the meshes too: another document.
@@ -562,7 +658,20 @@ impl RenderView {
     }
 
     pub fn has_image(&self) -> bool {
-        self.latest.is_some()
+        self.latest.is_some() || (self.gpu_run.is_some() && self.samples > 0)
+    }
+
+    /// The GPU's name, or why it is not used, for the panel.
+    fn device_text(&self, wanted: bool, has_gpu: bool) -> String {
+        if !wanted {
+            return "Rendering on the CPU".to_owned();
+        }
+        match &self.gpu {
+            GpuSlot::Ready(t) => format!("GPU: {}", t.name),
+            GpuSlot::Failed(why) => format!("CPU, the GPU failed: {why}"),
+            GpuSlot::Untried if has_gpu => "GPU".to_owned(),
+            GpuSlot::Untried => "CPU: the window draws without a GPU".to_owned(),
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -725,7 +834,7 @@ impl OxydeApp {
             .is_none_or(|s| s.geometry != geometry)
         {
             let meshes = self.render_meshes(geometry.detail)?;
-            let version = self.render.scene.as_ref().map_or(1, |s| s.version + 1);
+            let version = crate::document::next_revision();
             self.render.scene = Some(CachedScene {
                 geometry,
                 meshes,
@@ -755,7 +864,7 @@ impl OxydeApp {
                 s.meshes = meshes;
                 s.looks = Some(looks);
                 s.scene = Some(Arc::new(scene));
-                s.version += 1;
+                s.version = crate::document::next_revision();
             }
         }
         match self.render.scene.as_ref() {
@@ -883,24 +992,44 @@ impl OxydeApp {
             settings: self.prefs.render.settings(size.0, size.1),
             focal: self.prefs.render.focal(),
             denoise: self.prefs.render.denoise,
+            gpu: self.render_wants_gpu(),
         };
+        let live = self.prefs.render.live;
         if self.render.running.as_ref() != Some(&key) {
             // The view, the model or the setup moved on: the picture shown is wrong now.
+            // Rendering while moving, it stays until the new one is in: the CPU's until
+            // its next picture is posted, the GPU's own texture until a whole sample of
+            // the new view is.
             self.render.job = None;
-            self.render.texture = None;
+            if !live || key.gpu {
+                self.render.texture = None;
+            }
             self.render.latest = None;
             self.render.running = None;
             self.render.samples = 0;
             self.render.done = false;
-            if !interacting && self.render.pending.as_ref() == Some(&key) {
+            self.render.gpu_run = None;
+            self.render.gpu_developed = false;
+            if live || (!interacting && self.render.pending.as_ref() == Some(&key)) {
                 self.start_render(key);
             } else {
                 self.render.pending = Some(key);
                 ctx.request_repaint();
             }
         }
+        if self.render.gpu_run.is_some() {
+            self.step_gpu(&ctx);
+        }
         self.render.poll(&ctx);
         self.paint_render(ui, output.rect);
+    }
+
+    /// Whether renders go to the GPU: wanted, the window draws with one, and it has not
+    /// failed.
+    fn render_wants_gpu(&self) -> bool {
+        self.prefs.render.device == DeviceChoice::Automatic
+            && self.wgpu_state.is_some()
+            && !matches!(self.render.gpu, GpuSlot::Failed(_))
     }
 
     fn start_render(&mut self, key: RunKey) {
@@ -908,22 +1037,135 @@ impl OxydeApp {
             return;
         };
         let camera = RenderCamera::from_view(&key.camera, key.focal);
-        self.render.job = Some(RenderJob::spawn(scene, camera, key.settings, key.denoise));
         self.render.target = key.settings.samples;
         self.render.seconds = 0.0;
         self.render.pending = None;
+        if key.gpu {
+            match self.start_gpu(key.scene_version, &scene, &camera, &key.settings) {
+                Ok(()) => {
+                    self.render.gpu_run = Some(Instant::now());
+                    self.render.running = Some(key);
+                }
+                Err(why) => {
+                    // The next frame starts it again on the CPU.
+                    self.render.gpu = GpuSlot::Failed(why);
+                }
+            }
+            return;
+        }
+        self.render.job = Some(RenderJob::spawn(scene, camera, key.settings, key.denoise));
         self.render.running = Some(key);
+    }
+
+    /// Makes the GPU tracer if needed, uploads the scene if it changed, starts the render.
+    fn start_gpu(
+        &mut self,
+        version: u64,
+        scene: &TraceScene,
+        camera: &RenderCamera,
+        settings: &RenderSettings,
+    ) -> Result<(), String> {
+        if matches!(self.render.gpu, GpuSlot::Untried) {
+            let Some(state) = self.wgpu_state.as_ref() else {
+                return Err("the window draws without a GPU".to_owned());
+            };
+            let made = oxyde_kernel::catch_panic(|| crate::gpu_trace::GpuTracer::new(state))
+                .map_err(|m| format!("internal error: {m}"))
+                .and_then(|r| r);
+            self.render.gpu = match made {
+                Ok(t) => GpuSlot::Ready(Box::new(t)),
+                Err(why) => GpuSlot::Failed(why),
+            };
+        }
+        let tracer = match &mut self.render.gpu {
+            GpuSlot::Ready(t) => t,
+            GpuSlot::Failed(why) => return Err(why.clone()),
+            GpuSlot::Untried => return Err("the GPU was not set up".to_owned()),
+        };
+        let frame = oxyde_render::pathtrace::GpuFrame::new(scene, camera, settings);
+        let started = oxyde_kernel::catch_panic(|| -> Result<(), String> {
+            if !tracer.has_scene(version) {
+                let data = scene.gpu_scene();
+                if let Some(why) = tracer.refuses(&data, frame.width, frame.height) {
+                    return Err(why);
+                }
+                tracer.set_scene(version, &data)?;
+            }
+            tracer.start(frame)
+        });
+        match started {
+            Ok(result) => result,
+            Err(m) => Err(format!("internal error: {m}")),
+        }
+    }
+
+    /// One frame of the GPU render: more samples, the picture developed; at the end, the
+    /// final picture made from the sums read back, denoised if asked.
+    fn step_gpu(&mut self, ctx: &egui::Context) {
+        let Some(started) = self.render.gpu_run else {
+            return;
+        };
+        let GpuSlot::Ready(tracer) = &mut self.render.gpu else {
+            self.render.gpu_run = None;
+            return;
+        };
+        if let Err(m) = oxyde_kernel::catch_panic(|| tracer.step()) {
+            // A GPU error: render on the CPU from now on.
+            self.render.gpu = GpuSlot::Failed(format!("internal error: {m}"));
+            self.render.stop();
+            return;
+        }
+        self.render.samples = tracer.samples();
+        self.render.seconds = started.elapsed().as_secs_f64();
+        if !tracer.is_done() {
+            ctx.request_repaint();
+            return;
+        }
+        if self.render.gpu_developed {
+            return;
+        }
+        self.render.gpu_developed = true;
+        let denoise = self.prefs.render.denoise;
+        match oxyde_kernel::catch_panic(|| tracer.read_sums(denoise)) {
+            Ok(Some(sums)) => {
+                self.render.job = Some(RenderJob::develop(
+                    sums,
+                    self.prefs.render.exposure,
+                    denoise,
+                    self.render.seconds,
+                ));
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                self.render.error =
+                    Some("Render: the GPU picture could not be read back".to_owned())
+            }
+            Err(m) => {
+                self.render.gpu = GpuSlot::Failed(format!("internal error: {m}"));
+                self.render.stop();
+            }
+        }
     }
 
     /// The render over the viewport: fitted to it (letterboxed when its shape differs),
     /// on a checkerboard where it is transparent, with the progress below.
     fn paint_render(&self, ui: &mut egui::Ui, rect: egui::Rect) {
-        let Some(texture) = self.render.texture.as_ref() else {
+        let gpu_texture = match (&self.render.gpu, self.render.gpu_run) {
+            (GpuSlot::Ready(t), Some(_)) => t
+                .texture()
+                .zip(t.size())
+                .map(|(id, (w, h))| (id, egui::vec2(w as f32, h as f32))),
+            _ => None,
+        };
+        let shown = match self.render.texture.as_ref() {
+            Some(t) => Some((t.id(), t.size_vec2())),
+            None => gpu_texture,
+        };
+        let Some((texture_id, size)) = shown else {
             self.paint_render_hud(ui, rect);
             return;
         };
         let painter = ui.painter_at(rect);
-        let size = texture.size_vec2();
         let (custom, transparent) = (
             self.prefs.render.custom_size,
             self.prefs.render.background == BackgroundChoice::Transparent,
@@ -956,7 +1198,7 @@ impl OxydeApp {
             }
         }
         painter.image(
-            texture.id(),
+            texture_id,
             image_rect,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
@@ -967,17 +1209,21 @@ impl OxydeApp {
     /// The progress (or the reason there is no render) in the corner of the viewport.
     fn paint_render_hud(&self, ui: &mut egui::Ui, rect: egui::Rect) {
         let r = &self.render;
+        let on = if r.gpu_run.is_some() { "GPU" } else { "CPU" };
         let text = if let Some(e) = &r.error {
             e.clone()
         } else if r.running.is_none() {
             "Render starts when the view is still".to_owned()
         } else if r.done {
-            format!("Done: {} samples in {:.1} s", r.samples, r.seconds)
+            format!(
+                "Done on the {on}: {} samples in {:.1} s",
+                r.samples, r.seconds
+            )
         } else if r.samples == 0 {
-            "Rendering…".to_owned()
+            format!("Rendering on the {on}…")
         } else {
             format!(
-                "Rendering: {} / {} samples, {:.1} s",
+                "Rendering on the {on}: {} / {} samples, {:.1} s",
                 r.samples, r.target, r.seconds
             )
         };
@@ -1000,7 +1246,17 @@ impl OxydeApp {
     /// Render › Save image: the picture as it is now, as a PNG (with transparency when
     /// the background is transparent).
     pub(crate) fn save_render_image(&mut self) {
-        let Some(image) = self.render.latest.clone() else {
+        let from_gpu = match (&self.render.gpu, self.render.gpu_run) {
+            (GpuSlot::Ready(t), Some(_)) if self.render.latest.is_none() => {
+                let (exposure, denoise) = (self.prefs.render.exposure, self.prefs.render.denoise);
+                oxyde_kernel::catch_panic(|| t.image(exposure, denoise))
+                    .ok()
+                    .flatten()
+                    .map(Arc::new)
+            }
+            _ => None,
+        };
+        let Some(image) = self.render.latest.clone().or(from_gpu) else {
             self.status = "Nothing to save yet: the render has not drawn a full pass".to_owned();
             return;
         };
@@ -1051,6 +1307,22 @@ impl OxydeApp {
         {
             self.save_render_image();
         }
+        if command_button(
+            ui,
+            Icon::Move,
+            "Render While Moving",
+            has_model,
+            self.prefs.render.live,
+        )
+        .on_hover_text(
+            "Keep the render on screen while orbiting, panning and zooming, restarting it at \
+             once (smooth on the GPU); off, the viewport shows until the view is still",
+        )
+        .clicked()
+        {
+            self.prefs.render.live = !self.prefs.render.live;
+            self.render.prefs_dirty = true;
+        }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -1069,6 +1341,13 @@ impl OxydeApp {
     pub(crate) fn render_panel(&mut self, ui: &mut egui::Ui) {
         let before = self.prefs.render.clone();
         let mut save_image = false;
+        let device_text = self.render.device_text(
+            self.prefs.render.device == DeviceChoice::Automatic,
+            self.wgpu_state.is_some(),
+        );
+        // The setup scrolls within most of the panel's height, leaving the tree room
+        // below: a long list of surfaces must not push the rest out of reach.
+        let max_height = (ui.available_height() * 0.7).max(160.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1098,84 +1377,98 @@ impl OxydeApp {
                 );
             }
             let p = &mut self.prefs.render;
-            egui::CollapsingHeader::new("Scene")
-                .default_open(true)
+            egui::ScrollArea::vertical()
+                .id_salt("render_panel")
+                .max_height(max_height)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    egui::Grid::new("render_scene")
-                        .num_columns(2)
-                        .spacing([10.0, 4.0])
+                    egui::CollapsingHeader::new("Scene")
+                        .default_open(true)
                         .show(ui, |ui| {
-                            ui.label("Environment");
-                            egui::ComboBox::from_id_salt("render_env")
-                                .selected_text(p.environment.kind().label())
-                                .show_ui(ui, |ui| {
-                                    for e in EnvironmentChoice::ALL {
-                                        ui.selectable_value(
-                                            &mut p.environment,
-                                            e,
-                                            e.kind().label(),
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-                            ui.label("Brightness");
-                            ui.add(egui::Slider::new(&mut p.strength, 0.1..=4.0).logarithmic(true));
-                            ui.end_row();
-                            ui.label("Rotation");
-                            ui.add(egui::Slider::new(&mut p.rotation, -180.0..=180.0).suffix("°"));
-                            ui.end_row();
-                            ui.label("");
-                            ui.checkbox(&mut p.lights_follow_view, "Lights follow the view")
-                                .on_hover_text(
-                                    "Keep the lights where they are relative to the camera, \
+                            egui::Grid::new("render_scene")
+                                .num_columns(2)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Environment");
+                                    egui::ComboBox::from_id_salt("render_env")
+                                        .selected_text(p.environment.kind().label())
+                                        .show_ui(ui, |ui| {
+                                            for e in EnvironmentChoice::ALL {
+                                                ui.selectable_value(
+                                                    &mut p.environment,
+                                                    e,
+                                                    e.kind().label(),
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                    ui.label("Brightness");
+                                    ui.add(
+                                        egui::Slider::new(&mut p.strength, 0.1..=4.0)
+                                            .logarithmic(true),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Rotation");
+                                    ui.add(
+                                        egui::Slider::new(&mut p.rotation, -180.0..=180.0)
+                                            .suffix("°"),
+                                    );
+                                    ui.end_row();
+                                    ui.label("");
+                                    ui.checkbox(
+                                        &mut p.lights_follow_view,
+                                        "Lights follow the view",
+                                    )
+                                    .on_hover_text(
+                                        "Keep the lights where they are relative to the camera, \
                                      so the model is lit from the front however it is turned",
-                                );
-                            ui.end_row();
-                            ui.label("Background");
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("render_bg")
-                                    .selected_text(match p.background {
-                                        BackgroundChoice::Environment => "Environment",
-                                        BackgroundChoice::Color => "Colour",
-                                        BackgroundChoice::Transparent => "Transparent",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut p.background,
-                                            BackgroundChoice::Environment,
-                                            "Environment",
-                                        );
-                                        ui.selectable_value(
-                                            &mut p.background,
-                                            BackgroundChoice::Color,
-                                            "Colour",
-                                        );
-                                        ui.selectable_value(
-                                            &mut p.background,
-                                            BackgroundChoice::Transparent,
-                                            "Transparent",
-                                        );
+                                    );
+                                    ui.end_row();
+                                    ui.label("Background");
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("render_bg")
+                                            .selected_text(match p.background {
+                                                BackgroundChoice::Environment => "Environment",
+                                                BackgroundChoice::Color => "Colour",
+                                                BackgroundChoice::Transparent => "Transparent",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut p.background,
+                                                    BackgroundChoice::Environment,
+                                                    "Environment",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut p.background,
+                                                    BackgroundChoice::Color,
+                                                    "Colour",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut p.background,
+                                                    BackgroundChoice::Transparent,
+                                                    "Transparent",
+                                                );
+                                            });
+                                        if p.background == BackgroundChoice::Color {
+                                            ui.color_edit_button_srgb(&mut p.background_color);
+                                        }
                                     });
-                                if p.background == BackgroundChoice::Color {
-                                    ui.color_edit_button_srgb(&mut p.background_color);
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Floor");
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt("render_floor")
-                                    .selected_text(match p.floor {
-                                        FloorChoice::None => "None",
-                                        FloorChoice::Shadow => "Shadows only",
-                                        FloorChoice::Visible => "Visible",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut p.floor,
-                                            FloorChoice::None,
-                                            "None",
-                                        );
-                                        ui.selectable_value(
+                                    ui.end_row();
+                                    ui.label("Floor");
+                                    ui.horizontal(|ui| {
+                                        egui::ComboBox::from_id_salt("render_floor")
+                                            .selected_text(match p.floor {
+                                                FloorChoice::None => "None",
+                                                FloorChoice::Shadow => "Shadows only",
+                                                FloorChoice::Visible => "Visible",
+                                            })
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut p.floor,
+                                                    FloorChoice::None,
+                                                    "None",
+                                                );
+                                                ui.selectable_value(
                                             &mut p.floor,
                                             FloorChoice::Shadow,
                                             "Shadows only",
@@ -1184,30 +1477,33 @@ impl OxydeApp {
                                             "An invisible floor that shows the model's shadow \
                                              over the background",
                                         );
-                                        ui.selectable_value(
-                                            &mut p.floor,
-                                            FloorChoice::Visible,
-                                            "Visible",
-                                        );
+                                                ui.selectable_value(
+                                                    &mut p.floor,
+                                                    FloorChoice::Visible,
+                                                    "Visible",
+                                                );
+                                            });
+                                        if p.floor == FloorChoice::Visible {
+                                            ui.color_edit_button_srgb(&mut p.floor_color);
+                                        }
                                     });
-                                if p.floor == FloorChoice::Visible {
-                                    ui.color_edit_button_srgb(&mut p.floor_color);
-                                }
-                            });
-                            ui.end_row();
-                            if p.floor == FloorChoice::Visible {
-                                ui.label("Floor gloss");
-                                ui.add(egui::Slider::new(&mut p.floor_gloss, 0.0..=1.0));
-                                ui.end_row();
-                            }
+                                    ui.end_row();
+                                    if p.floor == FloorChoice::Visible {
+                                        ui.label("Floor gloss");
+                                        ui.add(egui::Slider::new(&mut p.floor_gloss, 0.0..=1.0));
+                                        ui.end_row();
+                                    }
+                                });
                         });
-                });
-            egui::CollapsingHeader::new("Camera")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut p.perspective, "Perspective");
-                        ui.add_enabled(
+                    egui::CollapsingHeader::new("Camera")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.checkbox(&mut p.live, "Render while moving").on_hover_text(
+                        "Keep the render on screen while the view moves, restarting it at once",
+                    );
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut p.perspective, "Perspective");
+                                ui.add_enabled(
                             p.perspective,
                             egui::DragValue::new(&mut p.focal_length)
                                 .range(8.0..=1200.0)
@@ -1219,57 +1515,63 @@ impl OxydeApp {
                              view, long for a flat one. The orbit, pan and zoom are the \
                              viewport's.",
                         );
-                    });
-                });
-            let groups = self.render.groups.clone();
-            egui::CollapsingHeader::new("Surfaces")
-                .default_open(true)
-                .show(ui, |ui| {
-                    if groups.is_empty() {
-                        ui.label(egui::RichText::new("Nothing to render yet").weak());
-                    }
-                    egui::Grid::new("render_surfaces")
-                        .num_columns(2)
-                        .spacing([10.0, 4.0])
+                            });
+                        });
+                    let groups = self.render.groups.clone();
+                    egui::CollapsingHeader::new("Surfaces")
+                        .default_open(true)
                         .show(ui, |ui| {
-                            for g in &groups {
-                                ui.label(&g.label)
+                            if groups.is_empty() {
+                                ui.label(egui::RichText::new("Nothing to render yet").weak());
+                            }
+                            egui::Grid::new("render_surfaces")
+                                .num_columns(2)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    for g in &groups {
+                                        ui.label(&g.label)
                                     .on_hover_text(if g.key.starts_with("part:") {
                                         "A part without a material: its finish is kept for it alone"
                                     } else {
                                         "Every part of this material"
                                     });
-                                let chosen = p.chosen(&g.key);
-                                let shown = match chosen {
-                                    Some(f) => f.label().to_owned(),
-                                    None => format!("Automatic ({})", g.automatic.label()),
-                                };
-                                egui::ComboBox::from_id_salt(("render_finish", &g.key))
-                                    .selected_text(shown)
-                                    .width(170.0)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                chosen.is_none(),
-                                                format!("Automatic ({})", g.automatic.label()),
-                                            )
-                                            .clicked()
-                                        {
-                                            p.finishes.remove(&g.key);
-                                        }
-                                        for (f, label) in Finish::ALL {
-                                            if ui
-                                                .selectable_label(chosen == Some(f), label)
-                                                .clicked()
-                                            {
-                                                p.finishes.insert(g.key.clone(), f.id().to_owned());
-                                            }
-                                        }
-                                    });
-                                ui.end_row();
-                            }
-                        });
-                    ui.label(
+                                        let chosen = p.chosen(&g.key);
+                                        let shown = match chosen {
+                                            Some(f) => f.label().to_owned(),
+                                            None => format!("Automatic ({})", g.automatic.label()),
+                                        };
+                                        egui::ComboBox::from_id_salt(("render_finish", &g.key))
+                                            .selected_text(shown)
+                                            .width(170.0)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(
+                                                        chosen.is_none(),
+                                                        format!(
+                                                            "Automatic ({})",
+                                                            g.automatic.label()
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    p.finishes.remove(&g.key);
+                                                }
+                                                for (f, label) in Finish::ALL {
+                                                    if ui
+                                                        .selectable_label(chosen == Some(f), label)
+                                                        .clicked()
+                                                    {
+                                                        p.finishes.insert(
+                                                            g.key.clone(),
+                                                            f.id().to_owned(),
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.label(
                         egui::RichText::new(
                             "Automatic follows the material: metals brushed, plastics satin, \
                              see-through appearances glass.",
@@ -1277,85 +1579,112 @@ impl OxydeApp {
                         .small()
                         .weak(),
                     );
-                });
-            egui::CollapsingHeader::new("Output")
-                .default_open(false)
-                .show(ui, |ui| {
-                    egui::Grid::new("render_output")
-                        .num_columns(2)
-                        .spacing([10.0, 4.0])
+                        });
+                    egui::CollapsingHeader::new("Output")
+                        .default_open(false)
                         .show(ui, |ui| {
-                            ui.label("Samples");
-                            ui.add(
-                                egui::DragValue::new(&mut p.samples)
-                                    .range(1..=100_000)
-                                    .speed(4.0),
-                            )
-                            .on_hover_text("Per pixel: more is smoother and slower");
-                            ui.end_row();
-                            ui.label("Bounces");
-                            ui.add(egui::DragValue::new(&mut p.bounces).range(1..=64));
-                            ui.end_row();
-                            ui.label("Exposure");
-                            ui.add(egui::Slider::new(&mut p.exposure, -4.0..=4.0).suffix(" EV"));
-                            ui.end_row();
-                            ui.label("");
-                            ui.checkbox(&mut p.denoise, "Denoise")
-                                .on_hover_text("Smooth the noise of the first passes");
-                            ui.end_row();
-                            ui.label("Size");
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut p.custom_size, false, "Viewport");
-                                ui.radio_value(&mut p.custom_size, true, "Fixed");
-                            });
-                            ui.end_row();
-                            if p.custom_size {
-                                ui.label("");
-                                ui.horizontal(|ui| {
+                            egui::Grid::new("render_output")
+                                .num_columns(2)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label("Samples");
                                     ui.add(
-                                        egui::DragValue::new(&mut p.width)
-                                            .range(16..=8192)
-                                            .suffix(" px"),
-                                    );
-                                    ui.label("×");
+                                        egui::DragValue::new(&mut p.samples)
+                                            .range(1..=100_000)
+                                            .speed(4.0),
+                                    )
+                                    .on_hover_text("Per pixel: more is smoother and slower");
+                                    ui.end_row();
+                                    ui.label("Bounces");
+                                    ui.add(egui::DragValue::new(&mut p.bounces).range(1..=64));
+                                    ui.end_row();
+                                    ui.label("Exposure");
                                     ui.add(
-                                        egui::DragValue::new(&mut p.height)
-                                            .range(16..=8192)
-                                            .suffix(" px"),
-                                    );
-                                });
-                                ui.end_row();
-                                if (p.width as usize) * (p.height as usize)
-                                    > oxyde_render::pathtrace::MAX_PIXELS
-                                {
-                                    ui.label("");
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Above 8 megapixels: rendered smaller, to keep \
-                                             memory under 1 GB",
-                                        )
-                                        .small()
-                                        .weak(),
+                                        egui::Slider::new(&mut p.exposure, -4.0..=4.0)
+                                            .suffix(" EV"),
                                     );
                                     ui.end_row();
-                                }
-                            } else {
-                                ui.label("Resolution");
-                                egui::ComboBox::from_id_salt("render_res")
-                                    .selected_text(format!("{:.0} %", p.resolution * 100.0))
-                                    .show_ui(ui, |ui| {
-                                        for r in [0.25f32, 0.5, 1.0, 2.0] {
-                                            ui.selectable_value(
-                                                &mut p.resolution,
-                                                r,
-                                                format!("{:.0} %", r * 100.0),
-                                            );
-                                        }
+                                    ui.label("");
+                                    ui.checkbox(&mut p.denoise, "Denoise")
+                                        .on_hover_text("Smooth the noise of the first passes");
+                                    ui.end_row();
+                                    ui.label("Size");
+                                    ui.horizontal(|ui| {
+                                        ui.radio_value(&mut p.custom_size, false, "Viewport");
+                                        ui.radio_value(&mut p.custom_size, true, "Fixed");
                                     });
-                                ui.end_row();
-                            }
-                            ui.label("Mesh detail");
-                            egui::ComboBox::from_id_salt("render_detail")
+                                    ui.end_row();
+                                    if p.custom_size {
+                                        ui.label("");
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::DragValue::new(&mut p.width)
+                                                    .range(16..=8192)
+                                                    .suffix(" px"),
+                                            );
+                                            ui.label("×");
+                                            ui.add(
+                                                egui::DragValue::new(&mut p.height)
+                                                    .range(16..=8192)
+                                                    .suffix(" px"),
+                                            );
+                                        });
+                                        ui.end_row();
+                                        if (p.width as usize) * (p.height as usize)
+                                            > oxyde_render::pathtrace::MAX_PIXELS
+                                        {
+                                            ui.label("");
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Above 8 megapixels: rendered smaller, to keep \
+                                             memory under 1 GB",
+                                                )
+                                                .small()
+                                                .weak(),
+                                            );
+                                            ui.end_row();
+                                        }
+                                    } else {
+                                        ui.label("Resolution");
+                                        egui::ComboBox::from_id_salt("render_res")
+                                            .selected_text(format!("{:.0} %", p.resolution * 100.0))
+                                            .show_ui(ui, |ui| {
+                                                for r in [0.25f32, 0.5, 1.0, 2.0] {
+                                                    ui.selectable_value(
+                                                        &mut p.resolution,
+                                                        r,
+                                                        format!("{:.0} %", r * 100.0),
+                                                    );
+                                                }
+                                            });
+                                        ui.end_row();
+                                    }
+                                    ui.label("Device");
+                                    egui::ComboBox::from_id_salt("render_device")
+                                        .selected_text(match p.device {
+                                            DeviceChoice::Automatic => "GPU when available",
+                                            DeviceChoice::Cpu => "CPU",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut p.device,
+                                                DeviceChoice::Automatic,
+                                                "GPU when available",
+                                            );
+                                            ui.selectable_value(
+                                                &mut p.device,
+                                                DeviceChoice::Cpu,
+                                                "CPU",
+                                            );
+                                        });
+                                    ui.end_row();
+                                    ui.label("");
+                                    ui.label(
+                                        egui::RichText::new(device_text.clone()).small().weak(),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Mesh detail");
+                                    egui::ComboBox::from_id_salt("render_detail")
                                 .selected_text(p.detail.label())
                                 .show_ui(ui, |ui| {
                                     for (d, label) in Detail::ALL {
@@ -1367,7 +1696,8 @@ impl OxydeApp {
                                     "How closely the triangles follow curved faces: finer is \
                                      smoother in close-ups and slower to prepare",
                                 );
-                            ui.end_row();
+                                    ui.end_row();
+                                });
                         });
                 });
         });
