@@ -1,6 +1,11 @@
 # Rendering: a plan for a Render tab
 
-Status: **plan, nothing built yet**. This document lays out how Oxyde could get a Render
+Status: **first steps built** (October 2026): the CPU path tracer and the Render tab of
+§3 step 3, and the glTF exporter of step 1, without any change to the file formats (see
+§6). The Blender add-on, the wgpu preview and the looks in the files wait for the
+owner's answers in §5.
+
+This document lays out how Oxyde could get a Render
 tab, the way SolidWorks has Visualize and Fusion 360 has its Render workspace: a picture of
 the part or assembly with real materials, lights and shadows, rather than the viewport's
 engineering shading. It weighs two routes, a renderer inside Oxyde and a link to Blender,
@@ -153,3 +158,38 @@ Steps 1–2 and 3 are independent: a session each, after the owner picks the loo
 4. HDRI files: a couple bundled (small, 1k, licence-free) or user-supplied only?
 5. Dependencies: an `.hdr`/`.exr` reader crate (or write a Radiance HDR reader, ~100
    lines, and skip EXR), and whether a BVH crate is preferred to an in-house one.
+
+## 6. What is built
+
+Built without touching the file formats or adding a dependency, so every answer of §5
+is still open:
+
+- **Path tracer** (`oxyde_render::pathtrace`): a binned-SAH BVH written in house, the
+  metallic-roughness BSDF (Lambert under GGX with Schlick's Fresnel) and smooth glass,
+  next-event estimation towards the environment's lights with multiple importance
+  sampling, Russian roulette, a shadow-catcher or visible floor, perspective or
+  orthographic camera, ACES tone curve, an edge-avoiding à-trous denoiser guided by
+  albedo, normal and depth. Deterministic: each pixel sample seeds its own generator,
+  so the picture does not depend on the threads (tested). The tests are the furnace
+  test, a mirror sphere showing a uniform environment, the shadow on the catcher,
+  energy conservation of the BSDF, exact plain backgrounds and reproducibility.
+- **Environments** are procedural (studio, sky and sun, uniform), no image files: the
+  HDRI question (§5.4) and the reader dependency (§5.5) stay open.
+- **Looks**: instead of new keys on appearances (§5.1), a *finish* (`oxyde_model::Finish`:
+  matte, satin, glossy, brushed metal, polished metal, glass, rubber) is guessed from the
+  part's material and the appearance's transparency, and the user can choose another
+  per material (or per part without one) in the Render tab. The choices are
+  preferences (`render.finishes` in `preferences.json`), as is the whole render setup
+  (`render`), not document data (§5.3).
+- **Render tab** (`oxyde-app/src/render_ui.rs`): the scene is meshed with
+  `tessellate_for_export` on the UI thread when the model or its looks change, the
+  render runs on a thread of its own and posts a picture about every 150 ms; camera
+  moves restart it once the view is still. Pictures are capped at 8 megapixels
+  (`MAX_PIXELS`) and passes accumulate in place, which keeps a render under about 1 GB.
+- **glTF** (`oxyde_format::gltf`, File › Export, `oxyde-cli export x.glb`): §2 B.1,
+  materials from the finishes. No textures yet (no texture coordinates; they would
+  need to be generated from the triplanar mapping).
+
+Still to do, in the order of §3: the Blender add-on (step 2), HDRI environments, the
+wgpu preview (step 4), and moving looks and render setups into the files once the owner
+decides how.

@@ -45,6 +45,7 @@ mod equations;
 mod error;
 mod expression;
 mod feature;
+mod finish;
 mod material;
 mod naming;
 mod part;
@@ -68,6 +69,7 @@ pub use feature::{
     Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
     SketchPlane, StandardAxis, StandardPlane, Sweep,
 };
+pub use finish::{Finish, FinishParams};
 pub use material::{Material, MaterialLibrary, MaterialSource};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{

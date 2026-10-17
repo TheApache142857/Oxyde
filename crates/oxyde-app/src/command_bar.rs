@@ -1,4 +1,4 @@
-//! The menus, the tabbed command bar (Features, Sketch, Evaluate — SolidWorks'
+//! The menus, the tabbed command bar (Features, Sketch, Evaluate, Render — SolidWorks'
 //! CommandManager) and the heads-up view toolbar over the viewport.
 
 use eframe::egui;
@@ -59,6 +59,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
                 }
+                self.open_recent_menu(ui, &ctx);
                 self.finish_editing_item(ui);
                 if ui.button("New part from STEP…").clicked() {
                     ui.close_menu();
@@ -267,6 +268,48 @@ impl OxydeApp {
         });
     }
 
+    /// File › Open recent: the documents opened or saved lately, newest first, as
+    /// SolidWorks' File › Open Recent. Files that are gone are greyed out; *Clear list*
+    /// forgets them all. Shared by the part and the assembly menus.
+    pub(crate) fn open_recent_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let recent = self.prefs.recent.clone();
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("Open recent", |ui| {
+                let mut chosen = None;
+                for path in &recent {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    let exists = path.exists();
+                    let hint = if exists {
+                        path.display().to_string()
+                    } else {
+                        format!("{} (not found)", path.display())
+                    };
+                    if ui
+                        .add_enabled(exists, egui::Button::new(name))
+                        .on_hover_text(&hint)
+                        .on_disabled_hover_text(&hint)
+                        .clicked()
+                    {
+                        chosen = Some(path.clone());
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear list").clicked() {
+                    ui.close_menu();
+                    self.prefs.recent.clear();
+                    let _ = self.prefs.save();
+                }
+                if let Some(path) = chosen {
+                    ui.close_menu();
+                    self.guard(PendingAction::OpenRecent(path), ctx);
+                }
+            });
+        });
+    }
+
     pub(crate) fn command_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -274,6 +317,7 @@ impl OxydeApp {
                 (CommandTab::Features, "Features"),
                 (CommandTab::Sketch, "Sketch"),
                 (CommandTab::Evaluate, "Evaluate"),
+                (CommandTab::Render, "Render"),
             ] {
                 let text = egui::RichText::new(label).size(13.0);
                 let text = if self.tab == tab { text.strong() } else { text };
@@ -315,6 +359,7 @@ impl OxydeApp {
                     CommandTab::Features => self.features_tab(ui),
                     CommandTab::Sketch => self.sketch_tab(ui),
                     CommandTab::Evaluate => self.evaluate_tab(ui),
+                    CommandTab::Render => self.render_tab(ui),
                 });
             });
     }

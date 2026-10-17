@@ -370,6 +370,22 @@ f "
     let bytes = std::fs::read(&threemf).unwrap();
     assert_eq!(&bytes[..2], b"PK");
 
+    // glTF: a binary glTF 2.0 file with a mesh and a material.
+    let glb = dir.join("box.glb");
+    let (code, out, err) = run(&[
+        "export",
+        part.to_str().unwrap(),
+        "--out",
+        glb.to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}{err}");
+    let bytes = std::fs::read(&glb).unwrap();
+    assert_eq!(&bytes[..4], b"glTF");
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let json: serde_json::Value = serde_json::from_slice(&bytes[20..20 + json_len]).unwrap();
+    assert_eq!(json["meshes"].as_array().unwrap().len(), 1);
+    assert!(!json["materials"].as_array().unwrap().is_empty());
+
     // IGES: read back by OpenCASCADE with the same volume.
     let iges = dir.join("box.igs");
     let (code, out, err) = run(&[

@@ -53,6 +53,7 @@ mod prefs;
 mod prefs_ui;
 mod preview;
 mod property_manager;
+mod render_ui;
 mod section_view;
 mod sketch_mode;
 mod splash;

@@ -5,7 +5,8 @@
 //!   out as its visible parts, each moved to its place, in one file (flat: the product
 //!   structure is not written yet).
 //! - **IGES** 5.3: the exact B-rep as solids, for the systems that still want it.
-//! - **STL**, **OBJ**, **3MF**: meshes, through the mesh export window (`mesh_export`).
+//! - **STL**, **OBJ**, **3MF**, **glTF**: meshes, through the mesh export window
+//!   (`mesh_export`).
 //! - **Image**: the view as a PNG, drawn by the software renderer at any size.
 
 use std::path::{Path, PathBuf};
@@ -79,6 +80,11 @@ impl OxydeApp {
                 (
                     MeshFormat::ThreeMf,
                     "A mesh with named, coloured objects and the unit, for modern slicers",
+                ),
+                (
+                    MeshFormat::Gltf,
+                    "Named objects with physically based materials (the Render tab's \
+                     finishes), for Blender, three.js and Windows' 3D Viewer",
                 ),
             ] {
                 if ui
@@ -161,7 +167,7 @@ impl OxydeApp {
     }
 
     /// Asks where to save, with the document's name and `extension`.
-    fn ask_export_path(&self, filter: &str, extensions: &[&str]) -> Option<PathBuf> {
+    pub(crate) fn ask_export_path(&self, filter: &str, extensions: &[&str]) -> Option<PathBuf> {
         let name = match &self.asm {
             Some(asm) => asm.display_name(),
             None => self.doc.display_name(),

@@ -15,6 +15,9 @@
 //!
 //! Without the application, [`mesh_deflection`] gives the display precision it would use
 //! and [`snapshot`] draws a mesh from a standard view, fitted to the image.
+//!
+//! [`pathtrace`] is the other renderer: a path tracer for the Render tab, with
+//! perspective, physically based surfaces, environment light and shadows.
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -41,6 +44,7 @@
 mod camera;
 mod headless;
 mod material;
+pub mod pathtrace;
 mod raster;
 mod style;
 mod vec3;

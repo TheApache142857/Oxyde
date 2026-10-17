@@ -72,6 +72,13 @@ pub enum Icon {
     Configurations,
     Equations,
     Rebuild,
+    // Render
+    /// Render: a shiny ball on a floor, its shadow under it.
+    Render,
+    /// Save Image: a picture with a mountain and the sun.
+    SaveImage,
+    /// glTF export: a block with an arrow leaving it.
+    ExportMesh,
     // View and edit
     ViewFront,
     ViewTop,
@@ -895,6 +902,30 @@ fn draw(pen: &Pen, icon: Icon) {
                 INK,
             );
         }
+        Render => {
+            // The shadow on the floor, the ball, its highlight.
+            pen.fill(
+                &Pen::arc_points(12.0, 20.0, 8.0, 2.2, 0.0, TAU),
+                Color32::from_rgb(120, 130, 140),
+            );
+            pen.circle(12.0, 11.0, 7.5, BODY_SIDE, Some((1.0, INK)));
+            pen.circle(12.0, 11.0, 5.0, BODY, None);
+            pen.circle(9.6, 8.4, 2.2, WHITE, None);
+        }
+        SaveImage => {
+            pen.poly(
+                &[(2.0, 4.0), (22.0, 4.0), (22.0, 20.0), (2.0, 20.0)],
+                Color32::from_rgb(214, 232, 248),
+                INK,
+            );
+            pen.fill(&[(4.0, 18.0), (10.0, 9.0), (15.0, 18.0)], BODY_SIDE);
+            pen.fill(&[(11.0, 18.0), (16.0, 12.0), (20.0, 18.0)], BODY);
+            pen.circle(17.0, 8.0, 2.0, ACCENT, None);
+        }
+        ExportMesh => {
+            pen.solid(3.0, 11.0, 10.0, 9.0, 4.0);
+            pen.arrow((12.0, 9.0), (21.0, 3.0), 2.0, ACCENT);
+        }
         Configurations => {
             // A small table: three rows, the middle one marked as the active configuration.
             pen.poly(
@@ -1129,7 +1160,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 65] = {
+pub const ALL: [Icon; 68] = {
     use Icon::*;
     [
         Sketch,
@@ -1181,6 +1212,9 @@ pub const ALL: [Icon; 65] = {
         Configurations,
         Equations,
         Rebuild,
+        Render,
+        SaveImage,
+        ExportMesh,
         ViewFront,
         ViewTop,
         ViewRight,

@@ -1,4 +1,4 @@
-//! File › Export › STL, OBJ or 3MF: the part (or every visible part of the assembly, placed)
+//! File › Export › STL, OBJ, 3MF or glTF: the part (or every visible part of the assembly, placed)
 //! meshed for 3D printing or rendering, with a window to choose the format, how fine, which
 //! unit and (for STL) which flavour, and the mesh shown in the viewport as it will be
 //! written, triangles and all, before anything is saved. The window reports how many
@@ -7,12 +7,13 @@
 //!
 //! The mesh is made with [`Kernel::tessellate_for_export`]: a maximum distance from the
 //! true surface and a maximum angle between neighbouring triangles, so small holes and
-//! fillets keep their shape at any part size. OBJ and 3MF keep each part (and each body of
-//! a part) as an object of its own, named, 3MF with its colour.
+//! fillets keep their shape at any part size. OBJ, 3MF and glTF keep each part (and each
+//! body of a part) as an object of its own, named, 3MF with its colour, glTF with a
+//! physically based material per appearance and finish (the Render tab's).
 
 use eframe::egui;
 use oxyde_format::stl::{self, MeshReport, StlQuality, StlTriangle, StlUnit};
-use oxyde_format::{obj, threemf};
+use oxyde_format::{gltf, obj, threemf};
 use oxyde_kernel::{Kernel, Mesh};
 use oxyde_render::Scene;
 
@@ -27,16 +28,25 @@ pub enum MeshFormat {
     Obj,
     /// 3MF: one named, coloured object per part or body, with the unit; modern slicers.
     ThreeMf,
+    /// glTF binary: named objects with physically based materials, in metres; Blender,
+    /// three.js, Windows' 3D Viewer.
+    Gltf,
 }
 
 impl MeshFormat {
-    pub const ALL: [MeshFormat; 3] = [MeshFormat::Stl, MeshFormat::Obj, MeshFormat::ThreeMf];
+    pub const ALL: [MeshFormat; 4] = [
+        MeshFormat::Stl,
+        MeshFormat::Obj,
+        MeshFormat::ThreeMf,
+        MeshFormat::Gltf,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             MeshFormat::Stl => "STL (3D printing, one mesh)",
             MeshFormat::Obj => "OBJ (Blender, renderers; named objects)",
             MeshFormat::ThreeMf => "3MF (slicers; named, coloured objects, with the unit)",
+            MeshFormat::Gltf => "glTF (Blender, three.js; named objects with materials)",
         }
     }
 
@@ -45,6 +55,7 @@ impl MeshFormat {
             MeshFormat::Stl => "STL",
             MeshFormat::Obj => "OBJ",
             MeshFormat::ThreeMf => "3MF",
+            MeshFormat::Gltf => "glTF",
         }
     }
 
@@ -53,6 +64,7 @@ impl MeshFormat {
             MeshFormat::Stl => "stl",
             MeshFormat::Obj => "obj",
             MeshFormat::ThreeMf => "3mf",
+            MeshFormat::Gltf => "glb",
         }
     }
 }
@@ -64,6 +76,8 @@ pub struct ExportObject {
     pub mesh: Mesh,
     /// Its appearance colour, for formats that carry one.
     pub color: Option<[u8; 3]>,
+    /// How each face looks (colour and finish), for glTF's materials.
+    pub face_looks: Vec<crate::render_ui::FaceLook>,
 }
 
 pub struct MeshExportDialog {
@@ -140,6 +154,15 @@ fn triangle_edges(mesh: &Mesh) -> Vec<Vec<[f32; 3]>> {
     out
 }
 
+/// How a part's faces are to look in the file: the finishes chosen in the Render tab, the
+/// viewport's colour where there is no appearance, and a component's own appearance.
+struct LookSource<'a> {
+    prefs: &'a crate::render_ui::RenderPrefs,
+    document_id: &'a str,
+    default_color: [u8; 3],
+    own: Option<&'a oxyde_model::Appearance>,
+}
+
 /// Meshes every solid of a body, each as an object named after `name` (and its body
 /// number when there are several), with the body's or part's colour.
 fn body_objects<K: Kernel>(
@@ -149,10 +172,12 @@ fn body_objects<K: Kernel>(
     deflection: f64,
     angle: f64,
     placement: Option<&oxyde_assembly::Placement>,
+    looks: &LookSource<'_>,
 ) -> Result<Vec<ExportObject>, String> {
     let Some(body) = part.body() else {
         return Ok(Vec::new());
     };
+    let key = crate::render_ui::finish_key(part, looks.document_id);
     let colors = part.step_colors(body);
     let mut out = Vec::with_capacity(body.solids.len());
     for (i, solid) in body.solids.iter().enumerate() {
@@ -171,10 +196,25 @@ fn body_objects<K: Kernel>(
         } else {
             name.to_owned()
         };
+        let face_looks = solid
+            .faces
+            .clone()
+            .map(|k| {
+                let appearance = looks.own.or_else(|| part.face_appearance(body, k));
+                crate::render_ui::FaceLook::new(
+                    looks.prefs,
+                    &key,
+                    part.material(),
+                    appearance,
+                    looks.default_color,
+                )
+            })
+            .collect();
         out.push(ExportObject {
             name: object_name,
             mesh,
             color,
+            face_looks,
         });
     }
     Ok(out)
@@ -280,6 +320,13 @@ impl OxydeApp {
                 let mut objects = Vec::new();
                 for (o, placement, part) in asm.leaves(&asm.assembly) {
                     let name = asm.occurrence_name(&o);
+                    let own = asm.occurrence_appearance(&asm.assembly, &o);
+                    let looks = LookSource {
+                        prefs: &self.prefs.render,
+                        document_id: &part.document_id,
+                        default_color: self.prefs.graphics.face,
+                        own,
+                    };
                     match body_objects(
                         &self.kernel,
                         &part.part,
@@ -287,10 +334,11 @@ impl OxydeApp {
                         deflection,
                         angle,
                         Some(&placement),
+                        &looks,
                     ) {
                         Ok(mut found) => {
                             // A component's own appearance paints the whole part.
-                            if let Some(a) = asm.occurrence_appearance(&asm.assembly, &o) {
+                            if let Some(a) = own {
                                 for object in &mut found {
                                     object.color = Some(a.color);
                                 }
@@ -312,6 +360,12 @@ impl OxydeApp {
                 deflection,
                 angle,
                 None,
+                &LookSource {
+                    prefs: &self.prefs.render,
+                    document_id: &self.doc.document_id,
+                    default_color: self.prefs.graphics.face,
+                    own: None,
+                },
             ),
         };
         match result {
@@ -463,6 +517,40 @@ impl OxydeApp {
                     .collect();
                 threemf::save(&path, &meshes, d.unit).map(|()| d.objects.len())
             }
+            MeshFormat::Gltf => {
+                // Each distinct look once, as a material.
+                let mut looks: Vec<crate::render_ui::FaceLook> = Vec::new();
+                let indices: Vec<Vec<usize>> = d
+                    .objects
+                    .iter()
+                    .map(|o| {
+                        o.face_looks
+                            .iter()
+                            .map(|l| match looks.iter().position(|x| x == l) {
+                                Some(i) => i,
+                                None => {
+                                    looks.push(*l);
+                                    looks.len() - 1
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let materials: Vec<gltf::GltfMaterial> =
+                    looks.iter().map(crate::render_ui::FaceLook::gltf).collect();
+                let objects: Vec<gltf::GltfObject<'_>> = d
+                    .objects
+                    .iter()
+                    .zip(&indices)
+                    .map(|(o, faces)| gltf::GltfObject {
+                        name: &o.name,
+                        mesh: &o.mesh,
+                        face_materials: faces,
+                    })
+                    .collect();
+                let generator = format!("Oxyde {}", env!("CARGO_PKG_VERSION"));
+                gltf::save(&path, &objects, &materials, &generator).map(|()| d.objects.len())
+            }
         };
         self.status = match result {
             Ok(count) => match format {
@@ -505,6 +593,7 @@ impl OxydeApp {
                 MeshFormat::Stl => "Export STL",
                 MeshFormat::Obj => "Export OBJ",
                 MeshFormat::ThreeMf => "Export 3MF",
+                MeshFormat::Gltf => "Export glTF",
             });
         egui::Window::new(title)
             .id(egui::Id::new("mesh_export"))
@@ -592,6 +681,10 @@ impl OxydeApp {
 
                         ui.label("Units").on_hover_text(match d.format {
                             MeshFormat::ThreeMf => "Written into the file, which readers honour",
+                            MeshFormat::Gltf => {
+                                "glTF is always in metres: this setting only changes the \
+                                 sizes shown below"
+                            }
                             _ => "The format has no unit: the coordinates are scaled to it",
                         });
                         egui::ComboBox::from_id_salt("mesh_unit")

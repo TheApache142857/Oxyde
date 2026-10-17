@@ -38,6 +38,8 @@ pub enum AsmTab {
     #[default]
     Assembly,
     Evaluate,
+    /// The assembly drawn by the path tracer (`render_ui`).
+    Render,
 }
 
 /// The mate types offered, in the order shown.
@@ -1129,6 +1131,7 @@ impl OxydeApp {
                     ui.close_menu();
                     self.guard(PendingAction::Open, &ctx);
                 }
+                self.open_recent_menu(ui, &ctx);
                 if ui
                     .button("Import STEP assembly…")
                     .on_hover_text("One part file per part and one assembly file per assembly")
@@ -1264,6 +1267,7 @@ impl OxydeApp {
             for (tab, label) in [
                 (AsmTab::Assembly, "Assembly"),
                 (AsmTab::Evaluate, "Evaluate"),
+                (AsmTab::Render, "Render"),
             ] {
                 let text = RichText::new(label).size(13.0);
                 let text = if self.asm_tab == tab {
@@ -1297,6 +1301,10 @@ impl OxydeApp {
         ui.add_space(2.0);
         if self.asm_tab == AsmTab::Evaluate {
             ui.horizontal(|ui| self.assembly_evaluate_tab(ui));
+            return;
+        }
+        if self.asm_tab == AsmTab::Render {
+            ui.horizontal(|ui| self.render_tab(ui));
             return;
         }
         // Fix/Float: every selected component, named after the first.
@@ -1468,6 +1476,9 @@ impl OxydeApp {
 
     /// The PropertyManager (when Mate is open) and the assembly tree.
     pub(crate) fn assembly_panel(&mut self, ui: &mut egui::Ui) {
+        if self.asm_tab == AsmTab::Render {
+            self.render_panel(ui);
+        }
         self.mate_manager(ui);
         self.refresh_mate_preview();
         self.property_manager(ui);
@@ -2269,6 +2280,7 @@ impl OxydeApp {
         self.viewport_rect = output.rect;
         let overlays = self.draw_assembly_references(ui, &output);
         self.move_handle_ui(ui, &output);
+        self.render_over_viewport(ui, &output);
 
         if let Some(grab) = output.grab {
             self.grab_component(&grab);

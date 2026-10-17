@@ -38,6 +38,8 @@ pub enum PendingAction {
     New,
     NewAssembly,
     Open,
+    /// File › Open recent: a document opened or saved lately, by its path.
+    OpenRecent(std::path::PathBuf),
     /// Edit a part or sub-assembly of the assembly in place, at any depth (see
     /// `edit_in_place`).
     OpenComponent(crate::assembly::Occurrence),
@@ -86,6 +88,8 @@ pub enum CommandTab {
     Features,
     Sketch,
     Evaluate,
+    /// The model drawn by the path tracer (`render_ui`).
+    Render,
 }
 
 /// A plane or axis drawn over the viewport, which can be clicked.
@@ -251,6 +255,8 @@ pub struct OxydeApp {
     pub(crate) mesh_export: Option<crate::mesh_export::MeshExportDialog>,
     /// File › Export › Image: the picture settings window.
     pub(crate) image_export: Option<crate::export::ImageExportDialog>,
+    /// The Render tab: its render and the meshes it is made from.
+    pub(crate) render: crate::render_ui::RenderView,
     pub(crate) prefs: crate::prefs::Preferences,
     pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
     pub(crate) debug_stats: crate::prefs_ui::DebugStats,
@@ -325,6 +331,7 @@ impl OxydeApp {
             locks: Default::default(),
             mesh_export: None,
             image_export: None,
+            render: Default::default(),
             prefs: crate::prefs::Preferences::load(),
             prefs_window: Default::default(),
             debug_stats: Default::default(),
@@ -918,6 +925,16 @@ impl OxydeApp {
                     self.open_path(&path);
                 }
             }
+            PendingAction::OpenRecent(path) => {
+                if path.exists() {
+                    self.open_path(&path);
+                } else {
+                    // Moved or deleted since: say so and forget it.
+                    self.status = format!("{} is no longer there", path.display());
+                    self.prefs.recent.retain(|p| *p != path);
+                    let _ = self.prefs.save();
+                }
+            }
             PendingAction::OpenComponent(o) => self.open_component(o),
             PendingAction::FinishEdit => self.finish_edit(ctx),
             PendingAction::OpenStep => {
@@ -966,6 +983,7 @@ impl OxydeApp {
         self.doc = doc;
         self.sketch = None;
         self.mesh_export = None;
+        self.render.clear();
         self.selection.clear();
         self.selected_feature = None;
         self.selected_features.clear();
@@ -1301,6 +1319,7 @@ impl OxydeApp {
         let output = self.viewport.ui(ui, picks, hint, false);
         self.viewport_rect = output.rect;
         let overlays = self.draw_references(ui, &output);
+        self.render_over_viewport(ui, &output);
         if let Some(pick) = output.clicked {
             let position = output.response.interact_pointer_pos();
             let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some()));
@@ -1976,6 +1995,7 @@ impl OxydeApp {
         self.handle_close_request(ctx);
         self.splash_step(ctx);
         self.sync_locks();
+        self.render_housekeeping(ctx);
         let busy = self.busy();
         if self.asm.is_some() {
             self.clear_preview();
@@ -2021,6 +2041,9 @@ impl OxydeApp {
             .default_width(290.0)
             .min_width(220.0)
             .show(ctx, |ui| {
+                if self.tab == CommandTab::Render && self.sketch.is_none() {
+                    self.render_panel(ui);
+                }
                 self.property_manager(ui);
                 self.left_panel_tabs(ui);
                 match self.left_tab {

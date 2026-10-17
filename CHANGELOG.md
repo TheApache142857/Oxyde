@@ -5,6 +5,43 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### A Render tab, glTF export, File › Open recent (unreleased, October 2026)
+
+- **Render tab** (parts and assemblies), the first step of `docs/RENDERING.md`: the model
+  drawn by a path tracer with real materials, light and soft shadows instead of the
+  viewport's shading, as SolidWorks Visualize does. The picture refines pass after pass
+  on every core; orbiting, panning or zooming shows the usual viewport and the render
+  starts again once the view is still. The panel at the top of the left side holds the
+  setup:
+  - *Scene*: a built-in environment (a studio with a key, a fill and a rim light, a sky
+    with the sun, or a uniform light), its brightness and rotation, lights that follow
+    the view or stay with the model; the background (the environment, a plain colour,
+    or transparent for the PNG); the floor (shadows only, visible with a colour and a
+    gloss, or none).
+  - *Camera*: perspective with a focal length (full-frame equivalent), or the
+    viewport's orthographic view.
+  - *Surfaces*: a finish per material (matte, satin or glossy plastic, brushed or
+    polished metal, glass, rubber). *Automatic* guesses it from the material's category
+    and name (steel and aluminium are brushed metal, plastics satin, wood matte; a
+    see-through appearance is glass, which refracts). Parts without a material get a
+    choice of their own.
+  - *Output*: samples, bounces, exposure, denoising of the first passes, the size (the
+    viewport's at 25–200 %, or a fixed size; at most 8 megapixels, so a render stays
+    under about 1 GB of memory) and how finely the model is meshed for it.
+  - **Save Image** writes the picture as it is as a PNG (with transparency when the
+    background is transparent).
+  The setup and the finishes are kept in the preferences, not in the document: where
+  they belong in the files is still open (`docs/RENDERING.md` §5). Nothing in the
+  document changes.
+- **glTF export** (File › Export › glTF, the Render tab's *glTF for Blender* button, and
+  the command line's `export` with a `.glb` file): a binary glTF 2.0 file with one named
+  object per part or body and a physically based material per appearance and finish
+  (glass with transmission and an index of refraction), in metres, which Blender,
+  three.js and Windows' 3D Viewer open. Textures are not written yet.
+- **File › Open recent** (parts and assemblies): the last ten documents opened or saved,
+  newest first, as on the start screen; files that are gone are greyed out, and *Clear
+  list* empties it.
+
 ### Sweep, configurations, interference detection, an Export menu (unreleased, October 2026)
 
 Features and tools SolidWorks users reach for next, after a look at what solidcraft offers:

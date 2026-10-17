@@ -6,7 +6,7 @@
 //!   bounds and topology counts, as text or JSON;
 //! - `check`: the same measures compared with an `expected.json` within a relative
 //!   tolerance, the seed of a reference oracle;
-//! - `export`: the rebuilt body as STEP or binary STL;
+//! - `export`: the rebuilt body as STEP, IGES, binary STL, OBJ, 3MF or glTF (`.glb`);
 //! - `snapshot`: a PNG from a standard view, drawn by the software renderer.
 //!
 //! The binary is a thin wrapper around [`run`]; tests call [`run`], or [`evaluate`],
@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use oxyde_format::stl::{self, StlQuality, StlUnit};
 use oxyde_format::{FormatError, Properties, load_part};
-use oxyde_format::{obj, threemf};
+use oxyde_format::{gltf, obj, threemf};
 use oxyde_kernel::{Kernel, Mesh, StepMaterial};
-use oxyde_model::{FeatureStatus, ModelError, Part};
+use oxyde_model::{FeatureStatus, Finish, ModelError, Part};
 use oxyde_occt::{OcctError, OcctKernel};
 use oxyde_render::{NORMAL_MESH_FRACTION, StandardView, Style};
 use serde::{Deserialize, Serialize};
@@ -627,10 +627,15 @@ pub enum ExportFormat {
     Obj,
     /// 3MF in millimetres, one named, coloured object per body.
     ThreeMf,
+    /// glTF binary in metres, one named object per body, with a physically based
+    /// material per appearance (the finish guessed from the material, as the Render tab
+    /// does by default).
+    Gltf,
 }
 
 impl ExportFormat {
-    /// From the file's extension: `.step`/`.stp`, `.igs`/`.iges`, `.stl`, `.obj` or `.3mf`.
+    /// From the file's extension: `.step`/`.stp`, `.igs`/`.iges`, `.stl`, `.obj`, `.3mf`
+    /// or `.glb`.
     pub fn of(path: &Path) -> Result<Self> {
         match path
             .extension()
@@ -643,8 +648,9 @@ impl ExportFormat {
             Some("stl") => Ok(ExportFormat::Stl),
             Some("obj") => Ok(ExportFormat::Obj),
             Some("3mf") => Ok(ExportFormat::ThreeMf),
+            Some("glb") => Ok(ExportFormat::Gltf),
             _ => Err(Error(format!(
-                "{}: the output must be a .step, .stp, .igs, .iges, .stl, .obj or .3mf file",
+                "{}: the output must be a .step, .stp, .igs, .iges, .stl, .obj, .3mf or .glb file",
                 path.display()
             ))),
         }
@@ -681,7 +687,7 @@ pub fn export_rebuilt(rebuilt: &Rebuilt, out: &Path) -> Result<ExportFormat> {
         ExportFormat::Iges => {
             kernel.export_iges(&body.shapes(), out)?;
         }
-        ExportFormat::Stl | ExportFormat::Obj | ExportFormat::ThreeMf => {
+        ExportFormat::Stl | ExportFormat::Obj | ExportFormat::ThreeMf | ExportFormat::Gltf => {
             let (deflection, angle) = StlQuality::Normal
                 .settings(rebuilt.diagonal())
                 .unwrap_or((0.05, 20.0));
@@ -712,6 +718,46 @@ pub fn export_rebuilt(rebuilt: &Rebuilt, out: &Path) -> Result<ExportFormat> {
                     }
                     let triangles = stl::triangles(&mesh, StlUnit::Millimetre.per_mm());
                     stl::save(out, &name, &triangles, true).map_err(io_error)?;
+                }
+                ExportFormat::Gltf => {
+                    // One material per distinct appearance and finish, face by face.
+                    let mut materials: Vec<gltf::GltfMaterial> = Vec::new();
+                    let mut faces: Vec<Vec<usize>> = Vec::new();
+                    for solid in &body.solids {
+                        let indices = solid
+                            .faces
+                            .clone()
+                            .map(|k| {
+                                let part = &rebuilt.part;
+                                let appearance = part.face_appearance(body, k);
+                                let finish = Finish::guess(part.material(), appearance);
+                                let m = gltf::GltfMaterial::from_finish(
+                                    appearance.map_or(Style::default().face, |a| a.color),
+                                    appearance.map_or(0.0, |a| a.transparency),
+                                    finish,
+                                );
+                                match materials.iter().position(|x| *x == m) {
+                                    Some(i) => i,
+                                    None => {
+                                        materials.push(m);
+                                        materials.len() - 1
+                                    }
+                                }
+                            })
+                            .collect();
+                        faces.push(indices);
+                    }
+                    let objects: Vec<gltf::GltfObject<'_>> = bodies
+                        .iter()
+                        .zip(&faces)
+                        .map(|((n, m, _), f)| gltf::GltfObject {
+                            name: n,
+                            mesh: m,
+                            face_materials: f,
+                        })
+                        .collect();
+                    let generator = format!("Oxyde {}", env!("CARGO_PKG_VERSION"));
+                    gltf::save(out, &objects, &materials, &generator).map_err(io_error)?;
                 }
                 ExportFormat::Obj => {
                     let meshes: Vec<obj::NamedMesh<'_>> = bodies
@@ -820,8 +866,8 @@ enum Command {
         tol: f64,
     },
     /// Rebuild a part and write its body as STEP (.step, .stp), IGES (.igs, .iges), binary
-    /// STL (.stl), OBJ (.obj) or 3MF (.3mf). Exit 1 if a feature failed (the file is still
-    /// written).
+    /// STL (.stl), OBJ (.obj), 3MF (.3mf) or glTF (.glb). Exit 1 if a feature failed (the
+    /// file is still written).
     Export {
         /// The .oxyprt file.
         part: PathBuf,

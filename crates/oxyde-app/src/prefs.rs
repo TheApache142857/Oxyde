@@ -24,6 +24,8 @@ pub struct Preferences {
     pub shortcuts: BTreeMap<String, String>,
     /// Documents opened or saved lately, newest first.
     pub recent: Vec<PathBuf>,
+    /// The Render tab's setup and the finishes chosen per material.
+    pub render: crate::render_ui::RenderPrefs,
 }
 
 impl Default for Preferences {
@@ -35,6 +37,7 @@ impl Default for Preferences {
             debug: Debug::default(),
             shortcuts: BTreeMap::new(),
             recent: Vec::new(),
+            render: Default::default(),
         }
     }
 }

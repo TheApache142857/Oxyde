@@ -33,6 +33,7 @@
 )]
 
 mod assembly_schema;
+pub mod gltf;
 pub mod material_library;
 pub mod obj;
 mod schema;
