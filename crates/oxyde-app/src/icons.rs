@@ -100,6 +100,24 @@ pub enum Icon {
     Displacement,
     /// Factor of safety: a shield with a check.
     Safety,
+    /// New Study: a study sheet with a green plus.
+    NewStudy,
+    /// Temperature: a thermometer, red.
+    Temperature,
+    /// Heat Power: orange arrows into a block, a flame.
+    HeatPower,
+    /// Heat Flux: orange arrows into a block's top.
+    HeatFlux,
+    /// Convection: blue waves leaving a block.
+    Convection,
+    /// Radiation: orange zigzags leaving a block.
+    Radiation,
+    /// Internal Heat: a block with a glowing core.
+    InternalHeat,
+    /// The temperature plot: a block in plot colours, cold to hot, with a thermometer.
+    TemperaturePlot,
+    /// The heat flux plot: a block with arrows through it in plot colours.
+    HeatFluxPlot,
     // View and edit
     ViewFront,
     ViewTop,
@@ -135,6 +153,11 @@ const AXIS_X: Color32 = Color32::from_rgb(210, 50, 50);
 const AXIS_Y: Color32 = Color32::from_rgb(40, 150, 60);
 /// Loads in the Simulation tab, purple as in SolidWorks.
 const LOAD: Color32 = Color32::from_rgb(150, 60, 190);
+/// Heat in the Simulation tab's thermal loads.
+const HEAT: Color32 = Color32::from_rgb(235, 120, 25);
+const HOT: Color32 = Color32::from_rgb(220, 45, 35);
+/// A fluid carrying heat away.
+const COOL: Color32 = Color32::from_rgb(40, 125, 215);
 const WHITE: Color32 = Color32::WHITE;
 
 /// Draws on the 24-unit grid of one icon.
@@ -1059,6 +1082,133 @@ fn draw(pen: &Pen, icon: Icon) {
             );
             pen.check(12.0, 12.0, 4.0, ADD);
         }
+        NewStudy => {
+            pen.poly(
+                &[(4.0, 2.0), (16.0, 2.0), (16.0, 22.0), (4.0, 22.0)],
+                WHITE,
+                INK,
+            );
+            for y in [7.0, 11.0, 15.0] {
+                pen.line(&[(7.0, y), (13.0, y)], 1.2, INK);
+            }
+            pen.circle(17.0, 17.0, 6.0, ADD, Some((1.0, WHITE)));
+            pen.line(&[(14.0, 17.0), (20.0, 17.0)], 2.2, WHITE);
+            pen.line(&[(17.0, 14.0), (17.0, 20.0)], 2.2, WHITE);
+        }
+        Temperature => {
+            // A thermometer: the tube, the bulb, the red column.
+            pen.poly(
+                &[(10.0, 3.0), (14.0, 3.0), (14.0, 15.0), (10.0, 15.0)],
+                WHITE,
+                INK,
+            );
+            pen.circle(12.0, 18.0, 4.5, HOT, Some((1.2, INK)));
+            pen.fill(&[(11.0, 8.0), (13.0, 8.0), (13.0, 16.0), (11.0, 16.0)], HOT);
+            for y in [6.0, 9.0, 12.0] {
+                pen.line(&[(14.0, y), (16.5, y)], 1.0, INK);
+            }
+        }
+        HeatPower => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            pen.arrow((4.0, 3.0), (8.0, 11.0), 1.6, HEAT);
+            pen.arrow((15.0, 3.0), (12.0, 11.0), 1.6, HEAT);
+            // A flame.
+            pen.poly(
+                &[
+                    (19.0, 2.0),
+                    (22.0, 7.0),
+                    (20.5, 10.0),
+                    (17.5, 10.0),
+                    (16.5, 6.5),
+                ],
+                HEAT,
+                HOT,
+            );
+        }
+        HeatFlux => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            for x in [6.0, 11.0, 16.0] {
+                pen.line(&[(x - 1.0, 2.0), (x + 1.0, 4.5), (x - 1.0, 7.0)], 1.4, HEAT);
+                pen.arrow((x - 1.0, 7.0), (x, 10.5), 1.4, HEAT);
+            }
+        }
+        Convection => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            for (k, y) in [3.0f32, 6.5, 10.0].into_iter().enumerate() {
+                let x = 6.0 + k as f32;
+                pen.line(
+                    &Pen::arc_points(x + 3.0, y, 3.0, 1.4, PI, 2.0 * PI)
+                        .into_iter()
+                        .chain(Pen::arc_points(x + 9.0, y, 3.0, 1.4, PI, 0.0))
+                        .collect::<Vec<_>>(),
+                    1.5,
+                    COOL,
+                );
+            }
+            pen.head((20.0, 3.0), 1.0, 0.0, 3.0, COOL);
+        }
+        Radiation => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            for (x, y) in [(5.0, 10.0), (10.0, 10.0), (15.0, 10.0)] {
+                pen.line(
+                    &[
+                        (x, y),
+                        (x + 1.5, y - 2.0),
+                        (x, y - 4.0),
+                        (x + 1.5, y - 6.0),
+                        (x, y - 8.0),
+                    ],
+                    1.4,
+                    HEAT,
+                );
+            }
+            pen.circle(20.0, 4.0, 2.4, HOT, None);
+        }
+        InternalHeat => {
+            pen.solid(3.0, 9.0, 13.0, 12.0, 5.0);
+            pen.circle(9.5, 15.0, 3.6, HEAT, Some((1.0, HOT)));
+            pen.circle(9.5, 15.0, 1.6, Color32::from_rgb(255, 225, 120), None);
+        }
+        TemperaturePlot => {
+            let bands = [
+                Color32::from_rgb(0, 60, 255),
+                Color32::from_rgb(0, 200, 255),
+                Color32::from_rgb(40, 220, 60),
+                Color32::from_rgb(250, 220, 0),
+                Color32::from_rgb(240, 40, 20),
+            ];
+            for (k, color) in bands.iter().enumerate() {
+                let y = 20.0 - 2.4 * (k + 1) as f32;
+                pen.fill(
+                    &[(2.0, y), (13.0, y), (13.0, y + 2.4), (2.0, y + 2.4)],
+                    *color,
+                );
+            }
+            pen.closed(
+                &[(2.0, 8.0), (13.0, 8.0), (13.0, 20.0), (2.0, 20.0)],
+                1.0,
+                INK,
+            );
+            pen.poly(
+                &[(16.5, 3.0), (19.5, 3.0), (19.5, 14.0), (16.5, 14.0)],
+                WHITE,
+                INK,
+            );
+            pen.circle(18.0, 17.0, 3.6, HOT, Some((1.0, INK)));
+            pen.fill(&[(17.3, 7.0), (18.7, 7.0), (18.7, 15.0), (17.3, 15.0)], HOT);
+        }
+        HeatFluxPlot => {
+            pen.solid(3.0, 9.0, 15.0, 12.0, 4.0);
+            let colors = [
+                Color32::from_rgb(0, 60, 255),
+                Color32::from_rgb(40, 220, 60),
+                Color32::from_rgb(240, 40, 20),
+            ];
+            for (k, color) in colors.iter().enumerate() {
+                let y = 12.0 + 3.0 * k as f32;
+                pen.arrow((1.0, y), (21.0, y), 1.5, *color);
+            }
+        }
         Configurations => {
             // A small table: three rows, the middle one marked as the active configuration.
             pen.poly(
@@ -1293,7 +1443,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 78] = {
+pub const ALL: [Icon; 87] = {
     use Icon::*;
     [
         Sketch,
@@ -1358,6 +1508,15 @@ pub const ALL: [Icon; 78] = {
         Stress,
         Displacement,
         Safety,
+        NewStudy,
+        Temperature,
+        HeatPower,
+        HeatFlux,
+        Convection,
+        Radiation,
+        InternalHeat,
+        TemperaturePlot,
+        HeatFluxPlot,
         ViewFront,
         ViewTop,
         ViewRight,

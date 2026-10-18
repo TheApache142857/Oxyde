@@ -1,8 +1,12 @@
-//! The Simulation tab: a linear static study of the part or assembly, as SolidWorks
-//! Simulation runs one (`docs/SIMULATION.md`).
+//! The Simulation tab: studies of the part or assembly, as SolidWorks Simulation and
+//! Fusion 360 run them (`docs/SIMULATION.md`). The tab starts on *New Study*, which makes
+//! a static, thermal, transient thermal or thermal stress study; a model has any number
+//! of them, one shown at a time (`simulation_studies.rs`).
 //!
-//! Select faces, then *Fixed Geometry*, *Roller/Slider*, *Force* or *Pressure* makes a
-//! fixture or a load on them; *Gravity* adds the model's weight. The panel at the top of
+//! In a static study, select faces, then *Fixed Geometry*, *Roller/Slider*, *Force* or
+//! *Pressure* makes a fixture or a load on them; *Gravity* adds the model's weight. A
+//! thermal study takes *Temperature*, *Heat Power*, *Heat Flux*, *Convection*,
+//! *Radiation* and *Internal Heat* instead; a thermal stress study takes both. The panel at the top of
 //! the left side lists them with their values, the material's mechanical properties (its
 //! own, else typical values for its name; a study can override them), the mesh settings
 //! and the results. *Run* meshes the model
@@ -35,17 +39,19 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use oxyde_assembly::Placement;
 use oxyde_format::results::{Fingerprint, SolverInfo};
+use oxyde_format::simulation::{StudyType, TransientSettings};
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
     FaceMesh, FaceSource, Kernel, Mesh, ShapeHandle, VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
-use oxyde_model::{FaceName, Material, Mechanical};
+use oxyde_model::{FaceName, Material, Mechanical, Thermal};
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
     ContactCandidate, ContactKind, Elastic, FixtureKind, LoadKind, MeshOptions, MeshReport,
-    NO_LABEL, Quantity, Results, SolveOptions, Summary, SurfaceMesh, TetMesh,
+    NO_LABEL, Quantity, Results, SolveOptions, Summary, SurfaceMesh, TetMesh, ThermalLoadKind,
+    ThermalMaterial, ThermalProps, ThermalResults, ThermalStudy, ThermalSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,10 +82,16 @@ pub enum PlotChoice {
     FactorOfSafety,
     /// The pressure between bodies in contact.
     ContactPressure,
+    /// °C, of a thermal study.
+    Temperature,
+    /// W/m², the length of the heat flux.
+    HeatFlux,
 }
 
 impl PlotChoice {
-    const ALL: [PlotChoice; 5] = [
+    pub(crate) const ALL: [PlotChoice; 7] = [
+        PlotChoice::Temperature,
+        PlotChoice::HeatFlux,
         PlotChoice::VonMises,
         PlotChoice::FirstPrincipal,
         PlotChoice::Displacement,
@@ -87,25 +99,41 @@ impl PlotChoice {
         PlotChoice::ContactPressure,
     ];
 
+    /// Whether it plots a thermal study's results.
+    pub(crate) fn is_thermal(self) -> bool {
+        matches!(self, PlotChoice::Temperature | PlotChoice::HeatFlux)
+    }
+
     fn quantity(self) -> Option<Quantity> {
         match self {
             PlotChoice::VonMises => Some(Quantity::VonMises),
             PlotChoice::FirstPrincipal => Some(Quantity::FirstPrincipal),
             PlotChoice::Displacement => Some(Quantity::Displacement),
             PlotChoice::FactorOfSafety => Some(Quantity::FactorOfSafety),
-            PlotChoice::ContactPressure => None,
+            PlotChoice::ContactPressure | PlotChoice::Temperature | PlotChoice::HeatFlux => None,
         }
     }
 
-    fn label(self) -> &'static str {
-        self.quantity().map_or("Contact pressure", Quantity::label)
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            PlotChoice::ContactPressure => "Contact pressure",
+            PlotChoice::Temperature => "Temperature",
+            PlotChoice::HeatFlux => "Heat flux",
+            other => other.quantity().map_or("", Quantity::label),
+        }
     }
 
     fn unit(self) -> &'static str {
-        self.quantity().map_or("MPa", Quantity::unit)
+        match self {
+            PlotChoice::ContactPressure => "MPa",
+            PlotChoice::Temperature => "°C",
+            PlotChoice::HeatFlux => "W/m²",
+            other => other.quantity().map_or("", Quantity::unit),
+        }
     }
 
-    /// Its value at each node (contact pressure: 0 off the contacts' faces).
+    /// Its value at each node (contact pressure: 0 off the contacts' faces), of a static
+    /// solve's results.
     fn values(self, results: &Results) -> Vec<f64> {
         match self.quantity() {
             Some(q) => q.values(results),
@@ -239,19 +267,88 @@ pub enum ItemKind {
     Pressure {
         mpa: f64,
     },
+    /// The faces held at a temperature, °C.
+    Temperature {
+        celsius: f64,
+    },
+    /// A total heat flow into the faces, W, spread by area.
+    HeatPower {
+        watts: f64,
+    },
+    /// A heat flux into the faces, W/m².
+    HeatFlux {
+        flux: f64,
+    },
+    /// Convection to a fluid: film coefficient W/(m²·K), fluid temperature °C.
+    Convection {
+        coefficient: f64,
+        ambient: f64,
+    },
+    /// Radiation to the surroundings: emissivity 0 to 1, their temperature °C.
+    Radiation {
+        emissivity: f64,
+        ambient: f64,
+    },
+    /// Heat made inside the bodies of the faces, W in all.
+    InternalHeat {
+        watts: f64,
+    },
 }
+
+/// The names items are numbered after, as SolidWorks names them.
+pub(crate) const ITEM_BASES: [&str; 11] = [
+    "Fixed",
+    "Roller/Slider",
+    "Force",
+    "Pressure",
+    "Temperature",
+    "Heat Power",
+    "Heat Flux",
+    "Convection",
+    "Radiation",
+    "Internal Heat",
+    "Contact",
+];
 
 impl ItemKind {
     fn is_fixture(&self) -> bool {
         matches!(self, ItemKind::Fixed | ItemKind::Roller)
     }
 
-    fn base_name(&self) -> &'static str {
+    /// Whether it is a thermal load, which only thermal studies take.
+    pub(crate) fn is_thermal(&self) -> bool {
+        matches!(
+            self,
+            ItemKind::Temperature { .. }
+                | ItemKind::HeatPower { .. }
+                | ItemKind::HeatFlux { .. }
+                | ItemKind::Convection { .. }
+                | ItemKind::Radiation { .. }
+                | ItemKind::InternalHeat { .. }
+        )
+    }
+
+    pub(crate) fn base_name(&self) -> &'static str {
         match self {
             ItemKind::Fixed => "Fixed",
             ItemKind::Roller => "Roller/Slider",
             ItemKind::Force { .. } => "Force",
             ItemKind::Pressure { .. } => "Pressure",
+            ItemKind::Temperature { .. } => "Temperature",
+            ItemKind::HeatPower { .. } => "Heat Power",
+            ItemKind::HeatFlux { .. } => "Heat Flux",
+            ItemKind::Convection { .. } => "Convection",
+            ItemKind::Radiation { .. } => "Radiation",
+            ItemKind::InternalHeat { .. } => "Internal Heat",
+        }
+    }
+
+    /// Whether a study of `t` takes it.
+    pub(crate) fn fits(&self, t: StudyType) -> bool {
+        if self.is_thermal() {
+            t.is_thermal()
+        } else {
+            t.is_structural()
         }
     }
 }
@@ -347,12 +444,19 @@ impl StudyContact {
 pub struct Study {
     /// `Static 1`, as SolidWorks names a study.
     pub name: String,
+    pub study_type: StudyType,
     pub items: Vec<StudyItem>,
     /// The model's weight, along −Y (the world's down).
     pub gravity: bool,
     /// Mechanical properties this study uses instead of the material's, by material
     /// group (a material name, or `part:` and a document id for a part without one).
     pub overrides: BTreeMap<String, Mechanical>,
+    /// Thermal properties this study uses instead of the material's, by material group.
+    pub thermal_overrides: BTreeMap<String, Thermal>,
+    /// A transient thermal study's duration, steps and start.
+    pub transient: TransientSettings,
+    /// The temperature a thermal stress study's model is free of stress at, °C.
+    pub reference_temperature: f64,
     pub contacts: Vec<StudyContact>,
     /// mm: how close faces of different bodies must be to be found in contact.
     pub contact_tolerance: f64,
@@ -365,11 +469,22 @@ pub struct Study {
 
 impl Default for Study {
     fn default() -> Self {
+        Self::of_type(StudyType::Static, "Static 1")
+    }
+}
+
+impl Study {
+    /// An empty study of `study_type` called `name`.
+    pub(crate) fn of_type(study_type: StudyType, name: &str) -> Self {
         Self {
-            name: "Static 1".to_owned(),
+            name: name.to_owned(),
+            study_type,
             items: Vec::new(),
             gravity: false,
             overrides: BTreeMap::new(),
+            thermal_overrides: BTreeMap::new(),
+            transient: TransientSettings::default(),
+            reference_temperature: 20.0,
             contacts: Vec::new(),
             contact_tolerance: 0.1,
             contacts_found: false,
@@ -384,7 +499,7 @@ impl Study {
     /// a new one does not repeat a name.
     pub(crate) fn recount(&mut self) {
         let mut made: BTreeMap<&'static str, u32> = BTreeMap::new();
-        let bases = ["Fixed", "Roller/Slider", "Force", "Pressure", "Contact"];
+        let bases = ITEM_BASES;
         let names = self
             .items
             .iter()
@@ -455,7 +570,7 @@ impl Study {
         self.contacts_found = true;
     }
 
-    fn add(&mut self, kind: ItemKind, faces: Vec<SimFace>) -> usize {
+    pub(crate) fn add(&mut self, kind: ItemKind, faces: Vec<SimFace>) -> usize {
         let name = self.next_name(kind.base_name());
         self.items.push(StudyItem { name, kind, faces });
         self.items.len() - 1
@@ -522,6 +637,8 @@ struct MaterialGroup {
     label: String,
     /// The properties the study uses and where they come from.
     effective: Option<(Mechanical, PropsSource)>,
+    /// The thermal properties the study uses and where they come from.
+    thermal: Option<(ThermalProps, PropsSource)>,
     density: f64,
     /// The part's own material can take the values (the open part has it).
     can_apply: bool,
@@ -561,6 +678,7 @@ struct Outcome {
     mesh: TetMesh,
     report: MeshReport,
     results: Option<Results>,
+    thermal: Option<ThermalResults>,
     mesh_seconds: f64,
     solve_seconds: f64,
     /// Faces found facing each other, when contacts were looked for.
@@ -578,7 +696,7 @@ struct Shared {
     outcome: Option<Result<Outcome, String>>,
 }
 
-struct SimJob {
+pub(crate) struct SimJob {
     cancel: Arc<AtomicBool>,
     shared: Arc<Mutex<Shared>>,
     revision: u64,
@@ -592,6 +710,7 @@ struct SimJob {
     bodies: Vec<(String, String)>,
     /// The model and study as they were run, for the results file.
     fingerprint: Option<Fingerprint>,
+    study_type: StudyType,
 }
 
 impl Drop for SimJob {
@@ -609,8 +728,14 @@ pub(crate) struct Done {
     assembly: bool,
     pub(crate) mesh: TetMesh,
     report: MeshReport,
+    /// What was solved: the study's type then.
+    pub(crate) study_type: StudyType,
+    /// Displacements and stresses (a static or thermal stress study).
     pub(crate) results: Option<Results>,
     summary: Option<Summary>,
+    /// Temperatures and heat flux (a thermal, transient or thermal stress study).
+    pub(crate) thermal: Option<ThermalResults>,
+    thermal_summary: Option<ThermalSummary>,
     pub(crate) mesh_seconds: f64,
     pub(crate) solve_seconds: f64,
     diagonal: f64,
@@ -624,6 +749,43 @@ pub(crate) struct Done {
     pub(crate) fingerprint: Option<Fingerprint>,
 }
 
+impl Done {
+    /// Whether it holds results (not just a mesh).
+    pub(crate) fn solved(&self) -> bool {
+        self.results.is_some() || self.thermal.is_some()
+    }
+
+    /// Whether it can draw `plot`.
+    pub(crate) fn has(&self, plot: PlotChoice) -> bool {
+        if plot.is_thermal() {
+            self.thermal.is_some()
+        } else {
+            self.results.is_some()
+        }
+    }
+
+    /// `wanted` if it can draw it, else the first plot it can (temperature for thermal
+    /// results, von Mises for static ones).
+    pub(crate) fn plot_for(&self, wanted: PlotChoice) -> Option<PlotChoice> {
+        if self.has(wanted) {
+            return Some(wanted);
+        }
+        PlotChoice::ALL.into_iter().find(|p| self.has(*p))
+    }
+
+    /// The values of `plot` at each node: temperatures at `frame` of a transient study.
+    fn values(&self, plot: PlotChoice, frame: Option<usize>) -> Vec<f64> {
+        match (plot, &self.thermal, &self.results) {
+            (PlotChoice::Temperature, Some(t), _) => frame
+                .and_then(|f| t.frames.get(f))
+                .map_or_else(|| t.temperature.clone(), |f| f.temperature.clone()),
+            (PlotChoice::HeatFlux, Some(t), _) => t.heat_flux_magnitude(),
+            (p, _, Some(r)) if !p.is_thermal() => p.values(r),
+            _ => vec![0.0; self.mesh.nodes.len()],
+        }
+    }
+}
+
 /// What the viewport shows: anything else, and the plot is made again.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PlotKey {
@@ -632,6 +794,8 @@ struct PlotKey {
     scale: f64,
     bands: u32,
     show_mesh: bool,
+    /// The transient study's time shown.
+    frame: Option<usize>,
 }
 
 /// The legend of the plot shown.
@@ -659,18 +823,30 @@ pub struct SimulationView {
     /// Why the surfaces could not be made for this revision (assembly or not): not tried
     /// again every frame.
     surfaces_failed: Option<(u64, bool, String)>,
-    job: Option<SimJob>,
+    pub(crate) job: Option<SimJob>,
     pub(crate) done: Option<Done>,
     /// The plot (or the mesh) is shown over the model; off while setting up.
-    show_plot: bool,
+    pub(crate) show_plot: bool,
     shown: Option<PlotKey>,
     legend: Option<Legend>,
     error: Option<String>,
     prefs_dirty: bool,
     /// The item picked in the panel, whose faces are selected.
-    selected: Option<usize>,
+    pub(crate) selected: Option<usize>,
     /// The contact picked in the panel.
-    selected_contact: Option<usize>,
+    pub(crate) selected_contact: Option<usize>,
+    /// Whether a study is open: the tab starts on *New Study* until there is one.
+    pub(crate) started: bool,
+    /// The model's other studies, in order, without the open one (which sits at `active`
+    /// among them).
+    pub(crate) others: Vec<crate::simulation_studies::Parked>,
+    pub(crate) active: usize,
+    /// The time of a transient study's results shown, an index into its frames.
+    pub(crate) frame: usize,
+    /// While the frames play: when the last one was shown.
+    pub(crate) playing: Option<Instant>,
+    /// The open study's new name, while it is being renamed.
+    pub(crate) renaming: Option<String>,
 }
 
 impl SimulationView {
@@ -709,6 +885,7 @@ fn material_groups_of(bodies: &[BodyInfo], study: &Study, assembly: bool) -> Vec
             key: b.key.clone(),
             label,
             effective: mechanical_of(study, &b.key, b.material.as_ref()),
+            thermal: thermal_of(study, &b.key, b.material.as_ref()),
             density,
             can_apply: !assembly && b.material.is_some(),
             has_material: b.material.is_some(),
@@ -740,15 +917,45 @@ fn mechanical_of(
     ))
 }
 
+/// The thermal properties a study uses for a material group: its own override, else the
+/// material's, else typical values for the material's name.
+fn thermal_of(
+    study: &Study,
+    key: &str,
+    material: Option<&Material>,
+) -> Option<(ThermalProps, PropsSource)> {
+    let props = |t: &Thermal| ThermalProps::new(t.conductivity, t.specific_heat, t.expansion);
+    if let Some(t) = study.thermal_overrides.get(key) {
+        return Some((props(t), PropsSource::Study));
+    }
+    let m = material?;
+    if let Some(t) = &m.thermal {
+        return Some((props(t), PropsSource::Material));
+    }
+    ThermalProps::guess(&m.name, &m.category).map(|t| (t, PropsSource::Typical))
+}
+
 /// The solver's material for `body`: [`mechanical_of`] with the material's density, the
-/// factor of safety measured against the yield strength, else the tensile strength.
+/// factor of safety measured against the yield strength, else the tensile strength, and
+/// the expansion of [`thermal_of`] (0 when unknown).
 fn elastic_of(study: &Study, body: &BodyInfo) -> Option<Elastic> {
     let density = body.material.as_ref().map_or(0.0, |m| m.density);
     let (p, _) = mechanical_of(study, &body.key, body.material.as_ref())?;
-    Some(Elastic::new(
-        p.elastic_modulus,
-        p.poisson_ratio,
-        p.strength(),
+    let expansion =
+        thermal_of(study, &body.key, body.material.as_ref()).map_or(0.0, |(t, _)| t.expansion);
+    Some(
+        Elastic::new(p.elastic_modulus, p.poisson_ratio, p.strength(), density)
+            .with_expansion(expansion),
+    )
+}
+
+/// The thermal solver's material for `body`: [`thermal_of`] with the material's density.
+fn thermal_material_of(study: &Study, body: &BodyInfo) -> Option<ThermalMaterial> {
+    let density = body.material.as_ref().map_or(0.0, |m| m.density);
+    let (t, _) = thermal_of(study, &body.key, body.material.as_ref())?;
+    Some(ThermalMaterial::new(
+        t.conductivity,
+        t.specific_heat,
         density,
     ))
 }
@@ -856,8 +1063,11 @@ impl OxydeApp {
             self.restore_simulation_scene();
             self.simulation.reset();
             self.simulation.document = Some(key);
+            // The model's studies, when they were saved next to it.
+            self.open_saved_studies();
         }
         self.poll_simulation(ctx);
+        self.advance_playback(ctx);
         if self.simulation.shown.is_some() && !self.plot_wanted() {
             self.restore_simulation_scene();
             ctx.request_repaint();
@@ -866,6 +1076,30 @@ impl OxydeApp {
             self.simulation.prefs_dirty = false;
             self.save_preferences();
         }
+    }
+
+    /// While a transient study plays: the next time every so often, back to the start
+    /// after the end.
+    fn advance_playback(&mut self, ctx: &egui::Context) {
+        let Some(last) = self.simulation.playing else {
+            return;
+        };
+        let frames = self
+            .simulation
+            .done
+            .as_ref()
+            .and_then(|d| d.thermal.as_ref())
+            .map_or(0, |t| t.frames.len());
+        if frames < 2 || !self.simulation_active() {
+            self.simulation.playing = None;
+            return;
+        }
+        let step = Duration::from_millis(120);
+        if last.elapsed() >= step {
+            self.simulation.frame = (self.simulation.frame + 1) % frames;
+            self.simulation.playing = Some(Instant::now());
+        }
+        ctx.request_repaint_after(step);
     }
 
     /// Whether a plot or mesh should be on show now: the tab is open, it is asked for,
@@ -878,7 +1112,7 @@ impl OxydeApp {
             })
     }
 
-    fn restore_simulation_scene(&mut self) {
+    pub(crate) fn restore_simulation_scene(&mut self) {
         if self.simulation.shown.take().is_some() {
             // The usual scene comes back on the next frame.
             self.viewport.pickable = None;
@@ -906,14 +1140,26 @@ impl OxydeApp {
         match outcome {
             Ok(o) => {
                 let summary = o.results.as_ref().map(Results::summary);
-                self.status = match (&o.results, &summary) {
-                    (Some(_), Some(s)) => format!(
-                        "Study solved in {:.1} s: von Mises up to {}, displacement up to {}",
-                        o.mesh_seconds + o.solve_seconds,
+                let thermal_summary = o.thermal.as_ref().map(ThermalResults::summary);
+                let seconds = o.mesh_seconds + o.solve_seconds;
+                self.status = match (&summary, &thermal_summary) {
+                    (Some(s), Some(t)) => format!(
+                        "Study solved in {seconds:.1} s: {} to {}, von Mises up to {}",
+                        format_value(t.min_temperature.0, "°C"),
+                        format_value(t.max_temperature.0, "°C"),
+                        format_value(s.max_von_mises.0, "MPa"),
+                    ),
+                    (Some(s), None) => format!(
+                        "Study solved in {seconds:.1} s: von Mises up to {}, displacement up to {}",
                         format_value(s.max_von_mises.0, "MPa"),
                         format_value(s.max_displacement.0, "mm"),
                     ),
-                    _ => format!(
+                    (None, Some(t)) => format!(
+                        "Study solved in {seconds:.1} s: temperatures from {} to {}",
+                        format_value(t.min_temperature.0, "°C"),
+                        format_value(t.max_temperature.0, "°C"),
+                    ),
+                    (None, None) => format!(
                         "Meshed in {:.1} s: {} nodes, {} elements",
                         o.mesh_seconds, o.report.nodes, o.report.elements
                     ),
@@ -934,7 +1180,7 @@ impl OxydeApp {
                         self.status = format!("{count} contact(s) found between the bodies");
                     }
                 }
-                let solved = o.results.is_some();
+                let solved = o.results.is_some() || o.thermal.is_some();
                 // Contacts Run found and bonded itself are now in the study it solved: the
                 // fingerprint says so, unless the model changed meanwhile (then the
                 // results are stale and are not saved).
@@ -951,8 +1197,11 @@ impl OxydeApp {
                     assembly: job.assembly,
                     mesh: o.mesh,
                     report: o.report,
+                    study_type: job.study_type,
                     results: o.results,
                     summary,
+                    thermal_summary,
+                    thermal: o.thermal,
                     mesh_seconds: o.mesh_seconds,
                     solve_seconds: o.solve_seconds,
                     diagonal: job.diagonal,
@@ -969,6 +1218,14 @@ impl OxydeApp {
                 });
                 self.simulation.error = None;
                 self.simulation.show_plot = true;
+                // A transient study opens on its last time, stopped.
+                self.simulation.frame = self
+                    .simulation
+                    .done
+                    .as_ref()
+                    .and_then(|d| d.thermal.as_ref())
+                    .map_or(0, |t| t.frames.len().saturating_sub(1));
+                self.simulation.playing = None;
                 // A saved study keeps its results beside it, as SolidWorks does, and is
                 // saved with them, so the two agree (contacts found by Run included).
                 if solved && self.simulation.file.is_some() {
@@ -1220,6 +1477,9 @@ impl OxydeApp {
 
     /// A fixture or load on the selected faces (the command bar's buttons).
     fn add_study_item(&mut self, kind: ItemKind) {
+        if !self.simulation.started || !kind.fits(self.simulation.study.study_type) {
+            return;
+        }
         let faces = self.selected_sim_faces();
         if faces.is_empty() {
             self.status = if self.simulation.shown.is_some() {
@@ -1247,13 +1507,10 @@ impl OxydeApp {
         }
     }
 
-    /// The study as the solver takes it, with the materials, or what is missing.
-    fn solver_study(
-        &self,
-        surfaces: &Surfaces,
-        mesh_only: bool,
-    ) -> Result<(oxyde_sim::Study, Vec<Elastic>), String> {
+    /// The study as the solvers take it, with the materials, or what is missing.
+    fn solver_study(&self, surfaces: &Surfaces, mesh_only: bool) -> Result<SolveInput, String> {
         let study = &self.simulation.study;
+        let study_type = study.study_type;
         let mut contacts = Vec::new();
         if surfaces.bodies.len() > 1 {
             for c in &study.contacts {
@@ -1274,7 +1531,9 @@ impl OxydeApp {
         }
         let mut fixtures = Vec::new();
         let mut loads = Vec::new();
-        for item in &study.items {
+        let mut thermal_loads = Vec::new();
+        let mut internal = Vec::new();
+        for item in study.items.iter().filter(|i| i.kind.fits(study_type)) {
             let labels = surfaces.labels(&item.faces);
             if labels.is_empty() && !mesh_only {
                 return Err(format!(
@@ -1282,6 +1541,10 @@ impl OxydeApp {
                     item.name
                 ));
             }
+            let thermal = |kind| oxyde_sim::ThermalLoad {
+                kind,
+                labels: labels.clone(),
+            };
             match item.kind {
                 ItemKind::Fixed => fixtures.push(oxyde_sim::Fixture {
                     kind: FixtureKind::Fixed,
@@ -1302,59 +1565,155 @@ impl OxydeApp {
                     kind: LoadKind::Pressure { value: mpa },
                     labels,
                 }),
+                ItemKind::Temperature { celsius } => {
+                    thermal_loads.push(thermal(ThermalLoadKind::Temperature { celsius }));
+                }
+                ItemKind::HeatPower { watts } => {
+                    thermal_loads.push(thermal(ThermalLoadKind::HeatPower { watts }));
+                }
+                ItemKind::HeatFlux { flux } => {
+                    thermal_loads.push(thermal(ThermalLoadKind::HeatFlux { flux }));
+                }
+                ItemKind::Convection {
+                    coefficient,
+                    ambient,
+                } => thermal_loads.push(thermal(ThermalLoadKind::Convection {
+                    coefficient,
+                    ambient,
+                })),
+                ItemKind::Radiation {
+                    emissivity,
+                    ambient,
+                } => thermal_loads.push(thermal(ThermalLoadKind::Radiation {
+                    emissivity,
+                    ambient,
+                })),
+                ItemKind::InternalHeat { watts } => {
+                    // The bodies the faces belong to.
+                    let mut bodies: Vec<u32> = labels
+                        .iter()
+                        .filter_map(|&l| surfaces.face_body.get(l as usize).copied())
+                        .collect();
+                    bodies.sort_unstable();
+                    bodies.dedup();
+                    internal.push(oxyde_sim::InternalHeat { bodies, watts });
+                }
             }
         }
         if !mesh_only {
-            if fixtures.is_empty() {
+            if study_type.is_structural() && fixtures.is_empty() {
                 return Err(
                     "The model is not held: select faces and add Fixed Geometry or a Roller/Slider"
                         .to_owned(),
                 );
             }
-            if loads.is_empty() && !study.gravity {
+            if study_type == StudyType::Static && loads.is_empty() && !study.gravity {
                 return Err(
                     "Nothing loads the model: select faces and add a Force or a Pressure, or turn on Gravity"
                         .to_owned(),
                 );
             }
+            if study_type.is_thermal() && thermal_loads.is_empty() && internal.is_empty() {
+                return Err(
+                    "Nothing heats or cools the model: select faces and add a Temperature, a Heat Power or Flux, a Convection or a Radiation"
+                        .to_owned(),
+                );
+            }
         }
-        let mut materials = Vec::with_capacity(surfaces.bodies.len());
-        for body in &surfaces.bodies {
-            match elastic_of(study, body) {
-                Some(e) if e.is_valid() => materials.push(e),
-                _ if mesh_only => materials.push(Elastic::new(1.0, 0.3, 0.0, 0.0)),
-                Some(_) => {
-                    return Err(format!(
-                        "The properties of {} are not usable: check them in Material",
-                        body.name
-                    ));
+        let structural = oxyde_sim::Study {
+            fixtures,
+            loads,
+            gravity: study.gravity.then_some([0.0, -9.81, 0.0]),
+            contacts: contacts.clone(),
+        };
+        let transient = (study_type == StudyType::TransientThermal).then(|| oxyde_sim::Transient {
+            duration: study.transient.duration,
+            steps: study.transient.steps.max(1) as usize,
+            initial: study.transient.initial_temperature,
+            frames: TRANSIENT_FRAMES,
+        });
+        let thermal = ThermalStudy {
+            loads: thermal_loads,
+            internal,
+            contacts,
+            transient,
+        };
+        let elastic = || -> Result<Vec<Elastic>, String> {
+            let mut out = Vec::with_capacity(surfaces.bodies.len());
+            for body in &surfaces.bodies {
+                match elastic_of(study, body) {
+                    Some(e) if e.is_valid() => out.push(e),
+                    _ if mesh_only => out.push(Elastic::new(1.0, 0.3, 0.0, 0.0)),
+                    Some(_) => {
+                        return Err(format!(
+                            "The properties of {} are not usable: check them in Material",
+                            body.name
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{} has no known material: apply one (right-click › Material) or type its properties in Material",
+                            body.name
+                        ));
+                    }
                 }
-                None => {
+                if study.gravity
+                    && !mesh_only
+                    && body.material.as_ref().is_none_or(|m| m.density <= 0.0)
+                {
                     return Err(format!(
-                        "{} has no known material: apply one (right-click › Material) or type its properties in Material",
+                        "Gravity needs a density: {} has none (apply a material)",
                         body.name
                     ));
                 }
             }
-            if study.gravity
-                && !mesh_only
-                && body.material.as_ref().is_none_or(|m| m.density <= 0.0)
-            {
-                return Err(format!(
-                    "Gravity needs a density: {} has none (apply a material)",
-                    body.name
-                ));
+            Ok(out)
+        };
+        let conducting = || -> Result<Vec<ThermalMaterial>, String> {
+            let mut out = Vec::with_capacity(surfaces.bodies.len());
+            for body in &surfaces.bodies {
+                match thermal_material_of(study, body) {
+                    _ if mesh_only => out.push(ThermalMaterial::new(1.0, 1.0, 1.0)),
+                    Some(t) if !t.is_valid() => {
+                        return Err(format!(
+                            "The thermal properties of {} are not usable: check them in Material",
+                            body.name
+                        ));
+                    }
+                    Some(t) if study_type == StudyType::TransientThermal && !t.stores_heat() => {
+                        return Err(format!(
+                            "{} needs a specific heat and a density for a transient study: type them in Material, or apply a material",
+                            body.name
+                        ));
+                    }
+                    Some(t) => out.push(t),
+                    None => {
+                        return Err(format!(
+                            "{} has no known thermal conductivity: apply a material or type it in Material",
+                            body.name
+                        ));
+                    }
+                }
             }
-        }
-        Ok((
-            oxyde_sim::Study {
-                fixtures,
-                loads,
-                gravity: study.gravity.then_some([0.0, -9.81, 0.0]),
-                contacts,
+            Ok(out)
+        };
+        Ok(match study_type {
+            StudyType::Static => SolveInput::Static {
+                study: structural,
+                materials: elastic()?,
             },
-            materials,
-        ))
+            StudyType::Thermal | StudyType::TransientThermal => SolveInput::Thermal {
+                study: thermal,
+                materials: conducting()?,
+            },
+            StudyType::ThermalStress => SolveInput::ThermalStress {
+                thermal,
+                thermal_materials: conducting()?,
+                study: structural,
+                materials: elastic()?,
+                reference: study.reference_temperature,
+            },
+        })
     }
 
     /// Run, Mesh or Find Contacts: meshes the model and, for Run, solves the study, on a
@@ -1377,7 +1736,7 @@ impl OxydeApp {
             self.status = "Contacts are between bodies: this model has one".to_owned();
             return;
         }
-        let (study, materials) = match self.solver_study(surfaces, mesh_only) {
+        let solve = match self.solver_study(surfaces, mesh_only) {
             Ok(s) => s,
             Err(e) => {
                 self.simulation.error = Some(e.clone());
@@ -1405,13 +1764,13 @@ impl OxydeApp {
                 max_nodes: max_nodes(self.prefs.simulation.memory_budget_gb, quadratic),
                 separate_bodies: true,
             },
-            study,
-            materials,
+            solve,
             names: surfaces.bodies.iter().map(|b| b.name.clone()).collect(),
             mode,
             detect,
             budget_gb: self.prefs.simulation.memory_budget_gb,
         };
+        let study_type = sim_study.study_type;
         let faces = surfaces.faces.clone();
         let bodies: Vec<(String, String)> = surfaces
             .bodies
@@ -1462,6 +1821,7 @@ impl OxydeApp {
             faces,
             bodies,
             fingerprint,
+            study_type,
         });
         self.status = match mode {
             RunMode::Mesh => "Meshing…",
@@ -1517,22 +1877,14 @@ impl OxydeApp {
         out
     }
 
-    /// Replaces the study (one read from a file): its results and the plot go.
-    pub(crate) fn set_study(&mut self, study: Study) {
-        self.simulation.job = None;
-        self.restore_simulation_scene();
-        self.simulation.done = None;
-        self.simulation.selected = None;
-        self.simulation.selected_contact = None;
-        self.simulation.study = study;
-        self.simulation.show_plot = false;
-    }
-
     /// Results read from a file, shown as if just solved.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn show_loaded_results(
         &mut self,
         mesh: TetMesh,
-        results: Results,
+        study_type: StudyType,
+        results: Option<Results>,
+        thermal: Option<ThermalResults>,
         faces: BTreeMap<u32, SimFace>,
         bodies: Vec<(String, String)>,
         fingerprint: Fingerprint,
@@ -1560,16 +1912,24 @@ impl OxydeApp {
                 .sqrt();
             if d.is_finite() { d } else { 1.0 }
         };
-        let summary = Some(results.summary());
+        let summary = results.as_ref().map(Results::summary);
+        let thermal_summary = thermal.as_ref().map(ThermalResults::summary);
         self.restore_simulation_scene();
+        self.simulation.frame = thermal
+            .as_ref()
+            .map_or(0, |t| t.frames.len().saturating_sub(1));
+        self.simulation.playing = None;
         self.simulation.done = Some(Done {
             id: crate::document::next_revision(),
             revision: self.document_revision(),
             assembly: self.asm.is_some(),
             mesh,
             report,
-            results: Some(results),
+            study_type,
+            results,
             summary,
+            thermal,
+            thermal_summary,
             mesh_seconds: 0.0,
             solve_seconds: solver.seconds,
             diagonal,
@@ -1652,12 +2012,27 @@ impl OxydeApp {
             },
             _ => 0.0,
         };
+        let plot = done.plot_for(prefs.plot);
+        // The plot shown is the one chosen from now on, so the command bar lights it.
+        if let Some(p) = plot
+            && p != prefs.plot
+        {
+            self.prefs.simulation.plot = p;
+            self.simulation.prefs_dirty = true;
+        }
+        // A transient study's temperatures at the time picked.
+        let frame = done
+            .thermal
+            .as_ref()
+            .filter(|t| !t.frames.is_empty() && plot == Some(PlotChoice::Temperature))
+            .map(|t| self.simulation.frame.min(t.frames.len() - 1));
         let key = PlotKey {
             id: done.id,
-            plot: done.results.as_ref().map(|_| prefs.plot),
+            plot,
             scale,
             bands: prefs.bands.clamp(2, 64),
-            show_mesh: prefs.show_mesh || done.results.is_none(),
+            show_mesh: prefs.show_mesh || !done.solved(),
+            frame,
         };
         if self.simulation.shown == Some(key) {
             return;
@@ -1678,13 +2053,24 @@ impl OxydeApp {
                 .collect(),
             _ => mesh.nodes.clone(),
         };
-        let (groups, colors, legend) = match (&done.results, key.plot) {
-            (Some(results), Some(plot)) => {
-                let values = plot.values(results);
+        let (groups, colors, legend) = match key.plot {
+            Some(plot) => {
+                let values = done.values(plot, key.frame);
                 let finite = || values.iter().copied().filter(|v| v.is_finite());
                 let lo = finite().fold(f64::INFINITY, f64::min);
                 let hi = finite().fold(f64::NEG_INFINITY, f64::max);
                 let (lo, hi) = if lo.is_finite() { (lo, hi) } else { (0.0, 1.0) };
+                // While a transient study plays, the colours keep their meaning: the
+                // range is the whole history's.
+                let (lo, hi) = match (key.frame, &done.thermal) {
+                    (Some(_), Some(t)) => t
+                        .frames
+                        .iter()
+                        .flat_map(|f| f.temperature.iter().copied())
+                        .filter(|v| v.is_finite())
+                        .fold((lo, hi), |(lo, hi), v| (lo.min(v), hi.max(v))),
+                    _ => (lo, hi),
+                };
                 let reversed = plot == PlotChoice::FactorOfSafety;
                 // Factors of safety far above the lowest say nothing more: SolidWorks too
                 // shows them up to a cap.
@@ -1708,7 +2094,13 @@ impl OxydeApp {
                         s.min_factor_of_safety.map(|(_, n)| (n, "Min"))
                     }
                     (PlotChoice::VonMises, Some(s)) => Some((s.max_von_mises.1, "Max")),
-                    (PlotChoice::FirstPrincipal | PlotChoice::ContactPressure, _) => values
+                    (
+                        PlotChoice::FirstPrincipal
+                        | PlotChoice::ContactPressure
+                        | PlotChoice::Temperature
+                        | PlotChoice::HeatFlux,
+                        _,
+                    ) => values
                         .iter()
                         .enumerate()
                         .filter(|(_, v)| v.is_finite())
@@ -1721,8 +2113,16 @@ impl OxydeApp {
                     let v = *values.get(n as usize)?;
                     Some((p, format!("{word}: {}", format_value(v, plot.unit()))))
                 });
+                let title = match (key.frame, &done.thermal) {
+                    (Some(f), Some(t)) => format!(
+                        "{} at {}",
+                        plot.label(),
+                        format_value(t.frames.get(f).map_or(0.0, |f| f.time), "s")
+                    ),
+                    _ => plot.label().to_owned(),
+                };
                 let legend = Legend {
-                    title: plot.label().to_owned(),
+                    title,
                     unit: plot.unit(),
                     range: (lo, hi),
                     bands: key.bands,
@@ -1841,6 +2241,12 @@ impl OxydeApp {
         };
         let fixture_color = egui::Color32::from_rgb(40, 170, 70);
         let load_color = egui::Color32::from_rgb(160, 60, 200);
+        let heat_color = egui::Color32::from_rgb(235, 120, 25);
+        let hot_color = egui::Color32::from_rgb(215, 45, 35);
+        let cool_color = egui::Color32::from_rgb(40, 125, 215);
+        if !self.simulation.started {
+            return;
+        }
         for (index, item) in self.simulation.study.items.iter().enumerate() {
             let selected = self.simulation.selected == Some(index);
             let width = if selected { 2.6_f32 } else { 1.8_f32 };
@@ -1906,6 +2312,56 @@ impl OxydeApp {
                                 painter.circle_filled(tip, 4.0, load_color);
                             }
                         }
+                    }
+                    ItemKind::Temperature { .. } => {
+                        // A thermometer's bulb on the face.
+                        painter.circle_filled(tip, 5.0, hot_color);
+                        painter.circle_stroke(tip, 7.5, egui::Stroke::new(width, hot_color));
+                    }
+                    ItemKind::HeatPower { watts: q } | ItemKind::HeatFlux { flux: q } => {
+                        // Arrows into the face (out of it when heat is taken away).
+                        let stroke = egui::Stroke::new(width, heat_color);
+                        let into = normal.map(|n| {
+                            let s = q.signum();
+                            Vec3::new(-n.x * s, -n.y * s, -n.z * s)
+                        });
+                        match into.and_then(|d| screen_dir(c, d, 26.0)) {
+                            Some(v) => {
+                                let side = egui::vec2(-v.y, v.x) * 0.5;
+                                for offset in [-1.0f32, 1.0] {
+                                    let t = tip + side * offset;
+                                    paint_arrow(painter, t - v, t, stroke);
+                                }
+                            }
+                            None => {
+                                painter.circle_filled(tip, 4.0, heat_color);
+                            }
+                        }
+                    }
+                    ItemKind::Convection { .. } | ItemKind::Radiation { .. } => {
+                        // Arrows leaving the face, blue for a fluid, orange for radiation.
+                        let color = if matches!(item.kind, ItemKind::Convection { .. }) {
+                            cool_color
+                        } else {
+                            heat_color
+                        };
+                        let stroke = egui::Stroke::new(width, color);
+                        match normal.and_then(|n| screen_dir(c, n, 26.0)) {
+                            Some(v) => {
+                                let side = egui::vec2(-v.y, v.x) * 0.5;
+                                for offset in [-1.0f32, 0.0, 1.0] {
+                                    let t = tip + side * offset;
+                                    paint_arrow(painter, t, t + v, stroke);
+                                }
+                            }
+                            None => {
+                                painter.circle_stroke(tip, 6.0, stroke);
+                            }
+                        }
+                    }
+                    ItemKind::InternalHeat { .. } => {
+                        painter.circle_filled(tip, 6.0, heat_color);
+                        painter.circle_filled(tip, 2.5, egui::Color32::from_rgb(255, 225, 120));
                     }
                 }
             }
@@ -2037,8 +2493,14 @@ impl OxydeApp {
             "The model changed: run the study again".to_owned()
         } else if s.shown.is_none() && s.done.is_some() {
             "Plot hidden: Show Results in the panel, or a plot button".to_owned()
+        } else if !s.started {
+            "New Study: pick what to study in the panel".to_owned()
         } else if s.done.is_none() {
-            "Select faces, add fixtures and loads, then Run".to_owned()
+            if s.study.study_type.is_structural() {
+                "Select faces, add fixtures and loads, then Run".to_owned()
+            } else {
+                "Select faces, add temperatures, heat and cooling, then Run".to_owned()
+            }
         } else {
             return;
         };
@@ -2067,29 +2529,84 @@ impl OxydeApp {
         self.simulation.show_plot = true;
     }
 
-    /// The Simulation tab's buttons.
+    /// The Simulation tab's buttons: New Study, then those of the open study's type.
     pub(crate) fn simulation_tab(&mut self, ui: &mut egui::Ui) {
         use crate::icons::{Icon, command_button};
         let has_model = match &self.asm {
             Some(asm) => !asm.leaves(&asm.assembly).is_empty(),
             None => self.doc.part.body().is_some(),
         };
-        let has_faces = !self.selected_sim_faces().is_empty();
         let running = self.simulation.job.is_some();
-        let items: [(Icon, &str, ItemKind, &str); 4] = [
-            (
+        // New Study, a menu of the study types, as Fusion 360's first button.
+        let response = command_button(ui, Icon::NewStudy, "New Study", !running, false)
+            .on_hover_text("A new study of the model: static stress, thermal, transient thermal or thermal stress");
+        crate::icons::dropdown_marker(ui, &response);
+        let popup = ui.make_persistent_id("simulation_new_study");
+        if response.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup));
+        }
+        let picked = egui::popup::popup_below_widget(
+            ui,
+            popup,
+            &response,
+            egui::PopupCloseBehavior::CloseOnClick,
+            |ui| {
+                ui.set_min_width(170.0);
+                crate::simulation_studies::new_study_menu(ui)
+            },
+        )
+        .flatten();
+        if let Some(t) = picked {
+            self.new_study(t);
+        }
+        if !self.simulation.started {
+            return;
+        }
+        let study_type = self.simulation.study.study_type;
+        let has_faces = !self.selected_sim_faces().is_empty();
+        let enabled = has_model && !running;
+        let item_button = |app: &mut OxydeApp,
+                           ui: &mut egui::Ui,
+                           icon: Icon,
+                           label: &str,
+                           kind: ItemKind,
+                           hint: &str| {
+            let response = command_button(ui, icon, label, enabled, false);
+            let response = if has_faces {
+                response.on_hover_text(hint)
+            } else {
+                response.on_hover_text(format!("{hint}\n(select faces first)"))
+            };
+            if response.clicked() {
+                app.add_study_item(kind);
+            }
+        };
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(2.0);
+        if study_type.is_structural() {
+            item_button(
+                self,
+                ui,
                 Icon::Fixture,
                 "Fixed Geometry",
                 ItemKind::Fixed,
                 "Hold the selected faces where they are: no motion at all",
-            ),
-            (
+            );
+            item_button(
+                self,
+                ui,
                 Icon::Roller,
                 "Roller/Slider",
                 ItemKind::Roller,
                 "Let the selected faces slide along themselves, but not move off them",
-            ),
-            (
+            );
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            item_button(
+                self,
+                ui,
                 Icon::Force,
                 "Force",
                 ItemKind::Force {
@@ -2097,79 +2614,107 @@ impl OxydeApp {
                     direction: LoadDirection::Normal,
                 },
                 "A force on the selected faces, spread by area (set its value in the panel)",
-            ),
-            (
+            );
+            item_button(
+                self,
+                ui,
                 Icon::Pressure,
                 "Pressure",
                 ItemKind::Pressure { mpa: 1.0 },
                 "A pressure on the selected faces, pressing into them",
-            ),
-        ];
-        for (k, (icon, label, kind, hint)) in items.into_iter().enumerate() {
-            if k == 2 {
+            );
+            if command_button(
+                ui,
+                Icon::Gravity,
+                "Gravity",
+                enabled,
+                self.simulation.study.gravity,
+            )
+            .on_hover_text("The model's own weight, from its materials' densities, downwards (−Y)")
+            .clicked()
+            {
+                self.simulation.study.gravity = !self.simulation.study.gravity;
+                self.simulation.show_plot = false;
+            }
+        }
+        if study_type.is_thermal() {
+            if study_type.is_structural() {
                 ui.add_space(2.0);
                 ui.separator();
                 ui.add_space(2.0);
             }
-            let response = command_button(ui, icon, label, has_model && !running, false);
-            let response = if has_faces {
-                response.on_hover_text(hint)
-            } else {
-                response.on_hover_text(format!("{hint}\n(select faces first)"))
-            };
-            if response.clicked() {
-                self.add_study_item(kind);
+            let thermal: [(Icon, &str, ItemKind, &str); 6] = [
+                (
+                    Icon::Temperature,
+                    "Temperature",
+                    ItemKind::Temperature { celsius: 100.0 },
+                    "Hold the selected faces at a temperature",
+                ),
+                (
+                    Icon::HeatPower,
+                    "Heat Power",
+                    ItemKind::HeatPower { watts: 10.0 },
+                    "Heat flowing in through the selected faces, a total in watts spread by area",
+                ),
+                (
+                    Icon::HeatFlux,
+                    "Heat Flux",
+                    ItemKind::HeatFlux { flux: 1000.0 },
+                    "Heat flowing in through the selected faces, in watts per square metre",
+                ),
+                (
+                    Icon::Convection,
+                    "Convection",
+                    ItemKind::Convection {
+                        coefficient: 25.0,
+                        ambient: 20.0,
+                    },
+                    "The selected faces lose heat to air or a fluid (25 W/m²·K is still air, 100 to 1000 forced)",
+                ),
+                (
+                    Icon::Radiation,
+                    "Radiation",
+                    ItemKind::Radiation {
+                        emissivity: 0.9,
+                        ambient: 20.0,
+                    },
+                    "The selected faces radiate heat to their surroundings",
+                ),
+                (
+                    Icon::InternalHeat,
+                    "Internal Heat",
+                    ItemKind::InternalHeat { watts: 5.0 },
+                    "Heat made inside the bodies of the selected faces (a motor's losses, a resistor)",
+                ),
+            ];
+            for (icon, label, kind, hint) in thermal {
+                item_button(self, ui, icon, label, kind, hint);
             }
-        }
-        if command_button(
-            ui,
-            Icon::Gravity,
-            "Gravity",
-            has_model && !running,
-            self.simulation.study.gravity,
-        )
-        .on_hover_text("The model's own weight, from its materials' densities, downwards (−Y)")
-        .clicked()
-        {
-            self.simulation.study.gravity = !self.simulation.study.gravity;
-            self.simulation.show_plot = false;
         }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        if command_button(
-            ui,
-            Icon::Mate,
-            "Find Contacts",
-            has_model && !running,
-            false,
-        )
-        .on_hover_text(
-            "Find the faces of different bodies that touch and list them as contacts \
-                 (bonded until changed in the panel), as Fusion 360 does",
-        )
-        .clicked()
+        if command_button(ui, Icon::Mate, "Find Contacts", enabled, false)
+            .on_hover_text(
+                "Find the faces of different bodies that touch and list them as contacts \
+                     (bonded until changed in the panel), as Fusion 360 does",
+            )
+            .clicked()
         {
             self.run_simulation(RunMode::FindContacts);
         }
-        if command_button(
-            ui,
-            Icon::Interference,
-            "Manual Contact",
-            has_model && !running,
-            false,
-        )
-        .on_hover_text(
-            "A contact between the selected faces: those of one body against those of another",
-        )
-        .clicked()
+        if command_button(ui, Icon::Interference, "Manual Contact", enabled, false)
+            .on_hover_text(
+                "A contact between the selected faces: those of one body against those of another",
+            )
+            .clicked()
         {
             self.add_manual_contact();
         }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        if command_button(ui, Icon::Mesh, "Mesh", has_model && !running, false)
+        if command_button(ui, Icon::Mesh, "Mesh", enabled, false)
             .on_hover_text("Fill the model with tetrahedra and show the mesh")
             .clicked()
         {
@@ -2191,12 +2736,24 @@ impl OxydeApp {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        let solved = self
+        let done = self
             .simulation
             .done
             .as_ref()
-            .is_some_and(|d| d.results.is_some() && d.revision == self.document_revision());
+            .filter(|d| d.solved() && d.revision == self.document_revision());
         let plots = [
+            (
+                Icon::TemperaturePlot,
+                "Temperature",
+                PlotChoice::Temperature,
+                "The temperature, °C",
+            ),
+            (
+                Icon::HeatFluxPlot,
+                "Heat Flux",
+                PlotChoice::HeatFlux,
+                "How much heat flows through each point, W/m²",
+            ),
             (
                 Icon::Stress,
                 "Stress",
@@ -2216,18 +2773,31 @@ impl OxydeApp {
                 "The yield strength over the von Mises stress: below 1, the part yields",
             ),
         ];
+        let mut show = None;
         for (icon, label, plot, hint) in plots {
-            let active = solved
+            let fits = if plot.is_thermal() {
+                study_type.is_thermal()
+            } else {
+                study_type.is_structural()
+            };
+            if !fits {
+                continue;
+            }
+            let available = done.is_some_and(|d| d.has(plot));
+            let active = available
                 && self.simulation.show_plot
                 && (self.prefs.simulation.plot == plot
                     || (plot == PlotChoice::VonMises
                         && self.prefs.simulation.plot == PlotChoice::FirstPrincipal));
-            if command_button(ui, icon, label, solved, active)
+            if command_button(ui, icon, label, available, active)
                 .on_hover_text(hint)
                 .clicked()
             {
-                self.show_plot(Some(plot));
+                show = Some(plot);
             }
+        }
+        if let Some(plot) = show {
+            self.show_plot(Some(plot));
         }
     }
 
@@ -2250,10 +2820,19 @@ impl OxydeApp {
         let element_size = self.simulation_element_size();
         let mut action: Option<PanelAction> = None;
         let max_height = (ui.available_height() * 0.7).max(160.0);
+        if !self.simulation.started {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.new_study_chooser(ui);
+            });
+            ui.add_space(4.0);
+            return;
+        }
+        let study_type = self.simulation.study.study_type;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
+            self.study_bar(ui);
             ui.horizontal(|ui| {
-                ui.strong("Static study");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.simulation.job.is_some() {
                         if ui.button("Cancel").clicked() {
@@ -2295,7 +2874,7 @@ impl OxydeApp {
                 {
                     action = Some(PanelAction::OpenResults);
                 }
-                let solved = self.simulation.done.as_ref().is_some_and(|d| d.results.is_some());
+                let solved = self.simulation.done.as_ref().is_some_and(Done::solved);
                 if ui
                     .add_enabled(solved, egui::Button::new("Save results…").small())
                     .clicked()
@@ -2335,13 +2914,69 @@ impl OxydeApp {
                                 ui.label(egui::RichText::new("Nothing to study yet").weak());
                             }
                             for (i, g) in groups.iter().enumerate() {
-                                if let Some(a) =
-                                    material_rows(ui, &mut study.overrides, g, i, &material_names)
-                                {
+                                if let Some(a) = material_rows(
+                                    ui,
+                                    study_type,
+                                    &mut study.overrides,
+                                    &mut study.thermal_overrides,
+                                    g,
+                                    i,
+                                    &material_names,
+                                ) {
                                     action = Some(a);
                                 }
                             }
                         });
+                    if study_type.is_thermal() {
+                        egui::CollapsingHeader::new("Thermal loads")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let mut any = false;
+                                for (i, item) in study.items.iter_mut().enumerate() {
+                                    if !item.kind.is_thermal() {
+                                        continue;
+                                    }
+                                    any = true;
+                                    item_row(ui, i, item, selected, &mut action);
+                                }
+                                if !any {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Select faces, then Temperature, Heat Power, Heat Flux, Convection, Radiation or Internal Heat. Faces with none are insulated.",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                                if study_type == StudyType::TransientThermal {
+                                    ui.separator();
+                                    if transient_rows(ui, &mut study.transient) {
+                                        action.get_or_insert(PanelAction::Edited);
+                                    }
+                                }
+                                if study_type == StudyType::ThermalStress {
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Stress-free at");
+                                        if ui
+                                            .add(
+                                                egui::DragValue::new(&mut study.reference_temperature)
+                                                    .range(-273.15..=5000.0)
+                                                    .speed(0.5)
+                                                    .suffix(" °C"),
+                                            )
+                                            .on_hover_text(
+                                                "The temperature at which the model has no stress: it expands from there",
+                                            )
+                                            .changed()
+                                        {
+                                            action.get_or_insert(PanelAction::Edited);
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                    if study_type.is_structural() {
                     egui::CollapsingHeader::new("Fixtures")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -2382,13 +3017,15 @@ impl OxydeApp {
                                 action.get_or_insert(PanelAction::Edited);
                             }
                             if !any && !study.gravity {
-                                ui.label(
-                                    egui::RichText::new("Select faces, then Force or Pressure")
-                                        .small()
-                                        .weak(),
-                                );
+                                let hint = if study_type == StudyType::ThermalStress {
+                                    "Optional: the expansion loads the model. Select faces, then Force or Pressure"
+                                } else {
+                                    "Select faces, then Force or Pressure"
+                                };
+                                ui.label(egui::RichText::new(hint).small().weak());
                             }
                         });
+                    }
                     let selected_contact = &mut self.simulation.selected_contact;
                     egui::CollapsingHeader::new("Contacts")
                         .default_open(true)
@@ -2401,6 +3038,15 @@ impl OxydeApp {
                                     egui::RichText::new(
                                         "Bodies touching are found on Run (or Find Contacts) and bonded; \
                                          change a contact's type here",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                            if study_type.is_thermal() && !study.contacts.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Heat crosses every contact as if bonded, whatever its type",
                                     )
                                     .small()
                                     .weak(),
@@ -2582,6 +3228,49 @@ impl OxydeApp {
                         .default_open(true)
                         .show(ui, |ui| {
                             let done = self.simulation.done.as_ref();
+                            if let Some(t) = done.and_then(|d| d.thermal_summary) {
+                                ui.label(format!(
+                                    "Temperature from {} to {}",
+                                    format_value(t.min_temperature.0, "°C"),
+                                    format_value(t.max_temperature.0, "°C")
+                                ));
+                                ui.label(format!(
+                                    "Heat flux up to {}",
+                                    format_value(t.max_heat_flux.0, "W/m²")
+                                ));
+                            }
+                            // A transient study's time, and its playback.
+                            if let Some(frames) = done
+                                .and_then(|d| d.thermal.as_ref())
+                                .map(|t| &t.frames)
+                                .filter(|f| f.len() > 1)
+                            {
+                                let last = frames.len() - 1;
+                                let frame = &mut self.simulation.frame;
+                                *frame = (*frame).min(last);
+                                ui.horizontal(|ui| {
+                                    let playing = self.simulation.playing.is_some();
+                                    if ui
+                                        .small_button(if playing { "⏸" } else { "▶" })
+                                        .on_hover_text(if playing { "Pause" } else { "Play the temperatures over time" })
+                                        .clicked()
+                                    {
+                                        action = Some(PanelAction::Play(!playing));
+                                    }
+                                    let mut at = *frame;
+                                    if ui
+                                        .add(egui::Slider::new(&mut at, 0..=last).show_value(false))
+                                        .on_hover_text("The time shown")
+                                        .changed()
+                                    {
+                                        *frame = at;
+                                        action = Some(PanelAction::Play(false));
+                                    }
+                                    if let Some(f) = frames.get(*frame) {
+                                        ui.label(format_value(f.time, "s"));
+                                    }
+                                });
+                            }
                             match done.and_then(|d| d.summary.map(|s| (d, s))) {
                                 Some((d, s)) => {
                                     ui.label(format!(
@@ -2618,32 +3307,37 @@ impl OxydeApp {
                                             );
                                         }
                                     }
-                                    if let Some(r) = &d.results {
+                                    if let Some(r) = &d.results
+                                        && !r.contacts.is_empty()
+                                        && !r.contact_solve.converged
+                                    {
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "Solved in {:.1} s, {} iterations, {} mesh",
-                                                d.solve_seconds,
-                                                r.iterations,
-                                                if d.mesher == "netgen" { "Netgen" } else { "lattice" }
+                                                "The contacts did not settle (a gap of {} mm is left): treat the results with care",
+                                                format_number(r.contact_solve.violation)
                                             ))
                                             .small()
-                                            .weak(),
+                                            .color(egui::Color32::from_rgb(210, 140, 30)),
                                         );
-                                        if !r.contacts.is_empty() && !r.contact_solve.converged {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "The contacts did not settle (a gap of {} mm is left): treat the results with care",
-                                                    format_number(r.contact_solve.violation)
-                                                ))
-                                                .small()
-                                                .color(egui::Color32::from_rgb(210, 140, 30)),
-                                            );
-                                        }
                                     }
                                 }
+                                None if done.is_some_and(Done::solved) => {}
                                 None => {
                                     ui.label(egui::RichText::new("Not run yet").weak());
                                 }
+                            }
+                            if let Some(d) = done.filter(|d| d.solved()) {
+                                let iterations = d.results.as_ref().map_or(0, |r| r.iterations)
+                                    + d.thermal.as_ref().map_or(0, |t| t.iterations);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Solved in {:.1} s, {iterations} iterations, {} mesh",
+                                        d.solve_seconds,
+                                        if d.mesher == "netgen" { "Netgen" } else { "lattice" }
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
                             }
                             let mut shown = self.simulation.show_plot;
                             if ui
@@ -2657,10 +3351,21 @@ impl OxydeApp {
                                 .spacing([10.0, 4.0])
                                 .show(ui, |ui| {
                                     ui.label("Plot");
+                                    // The plots of the study's type.
+                                    let fits = |c: PlotChoice| {
+                                        if c.is_thermal() {
+                                            study_type.is_thermal()
+                                        } else {
+                                            study_type.is_structural()
+                                        }
+                                    };
+                                    let shown = done
+                                        .and_then(|d| d.plot_for(p.plot))
+                                        .unwrap_or(p.plot);
                                     egui::ComboBox::from_id_salt("simulation_plot_choice")
-                                        .selected_text(p.plot.label())
+                                        .selected_text(shown.label())
                                         .show_ui(ui, |ui| {
-                                            for c in PlotChoice::ALL {
+                                            for c in PlotChoice::ALL.into_iter().filter(|c| fits(*c)) {
                                                 ui.selectable_value(
                                                     &mut p.plot,
                                                     c,
@@ -2786,16 +3491,32 @@ impl OxydeApp {
                 self.simulation.show_plot = false;
             }
             Some(PanelAction::ShowPlot(on)) => self.simulation.show_plot = on,
+            Some(PanelAction::Play(on)) => {
+                self.simulation.playing = on.then(Instant::now);
+                if on {
+                    // Playing shows the temperatures.
+                    self.show_plot(Some(PlotChoice::Temperature));
+                }
+            }
             Some(PanelAction::ApplyMaterial(i)) => {
                 let Some(g) = groups.get(i) else {
                     return;
                 };
                 let values = self.simulation.study.overrides.get(&g.key).copied();
-                if let (Some(values), Some(mut m)) = (values, self.doc.part.material().cloned()) {
-                    m.mechanical = Some(values);
+                let thermal = self.simulation.study.thermal_overrides.get(&g.key).copied();
+                if let Some(mut m) = self.doc.part.material().cloned()
+                    && (values.is_some() || thermal.is_some())
+                {
+                    if values.is_some() {
+                        m.mechanical = values;
+                    }
+                    if thermal.is_some() {
+                        m.thermal = thermal;
+                    }
                     // One undo step; the results go stale with the document's revision.
                     self.set_part_material(Some(m), false);
                     self.simulation.study.overrides.remove(&g.key);
+                    self.simulation.study.thermal_overrides.remove(&g.key);
                 }
             }
             Some(PanelAction::SetMaterial(i, choice)) => {
@@ -2835,6 +3556,8 @@ enum PanelAction {
     UseSelection(usize),
     Delete(usize),
     ShowPlot(bool),
+    /// Play (or pause) a transient study's temperatures.
+    Play(bool),
     /// A value of the study changed: the plot hides, it is out of date.
     Edited,
     /// The study's properties for a material group written to the part's material.
@@ -2970,25 +3693,186 @@ fn item_row(
                     .changed();
             });
         }
+        ItemKind::Temperature { celsius } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(celsius)
+                            .range(-273.15..=5000.0)
+                            .speed(0.5)
+                            .suffix(" °C"),
+                    )
+                    .on_hover_text("The faces are held at this temperature")
+                    .changed();
+            });
+        }
+        ItemKind::HeatPower { watts } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(egui::DragValue::new(watts).speed(0.1).suffix(" W"))
+                    .on_hover_text(
+                        "The heat flowing in, in all, spread over the faces by area; negative takes heat out",
+                    )
+                    .changed();
+            });
+        }
+        ItemKind::HeatFlux { flux } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(egui::DragValue::new(flux).speed(10.0).suffix(" W/m²"))
+                    .on_hover_text("The heat flowing in per area; negative takes heat out")
+                    .changed();
+            });
+        }
+        ItemKind::Convection {
+            coefficient,
+            ambient,
+        } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(coefficient)
+                            .range(0.0..=1e6)
+                            .speed(0.5)
+                            .suffix(" W/m²·K"),
+                    )
+                    .on_hover_text(
+                        "The film coefficient: about 5 to 25 in still air, 25 to 250 in moving air, 100 to 20 000 in water",
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(ambient)
+                            .range(-273.15..=5000.0)
+                            .speed(0.5)
+                            .prefix("to ")
+                            .suffix(" °C"),
+                    )
+                    .on_hover_text("The fluid's temperature")
+                    .changed();
+            });
+        }
+        ItemKind::Radiation {
+            emissivity,
+            ambient,
+        } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(emissivity)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .prefix("ε "),
+                    )
+                    .on_hover_text(
+                        "The emissivity: about 0.05 for polished metal, 0.3 for oxidized aluminium, 0.9 for paint",
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(ambient)
+                            .range(-273.15..=5000.0)
+                            .speed(0.5)
+                            .prefix("to ")
+                            .suffix(" °C"),
+                    )
+                    .on_hover_text("The surroundings' temperature")
+                    .changed();
+            });
+        }
+        ItemKind::InternalHeat { watts } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(egui::DragValue::new(watts).speed(0.1).suffix(" W"))
+                    .on_hover_text(
+                        "The heat made inside the bodies of the faces, in all, spread through their volume",
+                    )
+                    .changed();
+            });
+        }
     }
     if changed {
         action.get_or_insert(PanelAction::Edited);
     }
 }
 
-/// A material group's mechanical properties: what the study uses and where it comes
-/// from. Typing a value makes it the study's own. *Change* gives the group's parts
-/// another material of the library (`names`), *Apply to the material* keeps the typed
-/// values in the part's material; either is returned for the group `index`.
+/// A transient study's time settings; whether one changed.
+fn transient_rows(ui: &mut egui::Ui, t: &mut TransientSettings) -> bool {
+    let mut changed = false;
+    egui::Grid::new("simulation_transient")
+        .num_columns(2)
+        .spacing([10.0, 2.0])
+        .show(ui, |ui| {
+            ui.label("Duration");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut t.duration)
+                        .range(1e-3..=1e9)
+                        .speed(1.0)
+                        .suffix(" s"),
+                )
+                .on_hover_text("How long the study follows the temperatures")
+                .changed();
+            ui.end_row();
+            ui.label("Time steps");
+            changed |= ui
+                .add(egui::DragValue::new(&mut t.steps).range(1..=100_000).speed(1.0))
+                .on_hover_text(
+                    "More steps follow fast changes better; each is a solve (the results keep about a hundred of them)",
+                )
+                .changed();
+            ui.end_row();
+            ui.label("Starting at");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut t.initial_temperature)
+                        .range(-273.15..=5000.0)
+                        .speed(0.5)
+                        .suffix(" °C"),
+                )
+                .on_hover_text("The whole model's temperature at the start")
+                .changed();
+            ui.end_row();
+        });
+    changed
+}
+
+/// Where properties come from, for the panel.
+fn source_note(source: Option<PropsSource>) -> &'static str {
+    match source {
+        Some(PropsSource::Study) => "this study's",
+        Some(PropsSource::Material) => "the material's",
+        Some(PropsSource::Typical) => "typical values",
+        None => "unknown",
+    }
+}
+
+/// A material group's properties as a study of `study_type` uses them, mechanical and
+/// thermal, and where they come from. Typing a value makes it the study's own. *Change*
+/// gives the group's parts another material of the library (`names`), *Apply to the
+/// material* keeps the typed values in the part's material; either is returned for the
+/// group `index`.
+#[allow(clippy::too_many_arguments)]
 fn material_rows(
     ui: &mut egui::Ui,
+    study_type: StudyType,
     overrides: &mut BTreeMap<String, Mechanical>,
+    thermal_overrides: &mut BTreeMap<String, Thermal>,
     g: &MaterialGroup,
     index: usize,
     names: &[String],
 ) -> Option<PanelAction> {
     let mut action = None;
     let source = g.effective.map(|(_, s)| s);
+    let thermal_source = g.thermal.map(|(_, s)| s);
+    let typed = (study_type.is_structural() && source == Some(PropsSource::Study))
+        || (study_type.is_thermal() && thermal_source == Some(PropsSource::Study));
     ui.horizontal(|ui| {
         let parts = if g.bodies.len() > 1 {
             format!("{} bodies: {}", g.bodies.len(), g.bodies.join(", "))
@@ -3019,20 +3903,20 @@ fn material_rows(
         } else {
             "Give these parts a material of the library (their files are saved)"
         });
-        let note = match source {
-            Some(PropsSource::Study) => "this study's",
-            Some(PropsSource::Material) => "the material's",
-            Some(PropsSource::Typical) => "typical values",
-            None => "unknown",
+        let note = if study_type.is_structural() {
+            source_note(source)
+        } else {
+            source_note(thermal_source)
         };
         ui.label(egui::RichText::new(note).small().weak());
-        if source == Some(PropsSource::Study) {
+        if typed {
             if ui
                 .small_button("Reset")
                 .on_hover_text("Back to the material's own properties")
                 .clicked()
             {
                 overrides.remove(&g.key);
+                thermal_overrides.remove(&g.key);
             }
             if g.can_apply
                 && ui
@@ -3044,6 +3928,12 @@ fn material_rows(
             }
         }
     });
+    if study_type.is_thermal() {
+        thermal_material_rows(ui, study_type, thermal_overrides, g);
+    }
+    if !study_type.is_structural() {
+        return action;
+    }
     let mut values = g
         .effective
         .map_or(Mechanical::new(0.0, 0.3, 0.0, 0.0), |(p, _)| p);
@@ -3111,6 +4001,76 @@ fn material_rows(
         overrides.insert(g.key.clone(), values);
     }
     action
+}
+
+/// A material group's thermal properties: the conductivity, and what the study's type
+/// also needs (the specific heat for a transient study, the expansion for thermal stress).
+fn thermal_material_rows(
+    ui: &mut egui::Ui,
+    study_type: StudyType,
+    overrides: &mut BTreeMap<String, Thermal>,
+    g: &MaterialGroup,
+) {
+    let mut values = g.thermal.map_or(Thermal::new(0.0, 0.0, 0.0), |(t, _)| {
+        Thermal::new(t.conductivity, t.specific_heat, t.expansion)
+    });
+    let mut changed = false;
+    // Micrometres per metre and kelvin, as libraries list it.
+    let mut expansion = values.expansion * 1e6;
+    egui::Grid::new(("simulation_thermal_material", &g.key))
+        .num_columns(2)
+        .spacing([10.0, 2.0])
+        .show(ui, |ui| {
+            ui.label("Conductivity");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut values.conductivity)
+                        .range(0.0..=5000.0)
+                        .speed(0.1)
+                        .suffix(" W/m·K"),
+                )
+                .changed();
+            ui.end_row();
+            if study_type == StudyType::TransientThermal {
+                ui.label("Specific heat");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut values.specific_heat)
+                            .range(0.0..=1e5)
+                            .speed(1.0)
+                            .suffix(" J/kg·K"),
+                    )
+                    .on_hover_text("With the density, how much heat it stores")
+                    .changed();
+                ui.end_row();
+            }
+            if study_type == StudyType::ThermalStress {
+                ui.label("Expansion");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut expansion)
+                            .range(-100.0..=1000.0)
+                            .speed(0.1)
+                            .suffix(" µm/m·K"),
+                    )
+                    .on_hover_text(
+                        "How much it grows per kelvin: 12 µm/m·K for steel, 23 for aluminium",
+                    )
+                    .changed();
+                ui.end_row();
+            }
+        });
+    if g.thermal.is_none() && !changed {
+        ui.label(
+            egui::RichText::new("Unknown conductivity: apply a material, or type it")
+                .small()
+                .color(egui::Color32::from_rgb(210, 140, 30)),
+        );
+    }
+    if changed {
+        values.expansion = expansion * 1e-6;
+        overrides.insert(g.key.clone(), values);
+    }
 }
 
 fn paint_arrow(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, stroke: egui::Stroke) {
@@ -3181,14 +4141,53 @@ struct ThreadInput {
     /// Netgen's solids; empty to use the lattice mesher.
     netgen: Vec<NetgenInput>,
     options: MeshOptions,
-    study: oxyde_sim::Study,
-    materials: Vec<Elastic>,
+    solve: SolveInput,
     names: Vec<String>,
     mode: RunMode,
     /// Look for contacts within this tolerance, mm.
     detect: Option<f64>,
     /// Preferences › Simulation's memory budget, GB, for the messages.
     budget_gb: f64,
+}
+
+/// Temperatures kept of a transient study, the start and the end included: enough to
+/// play it smoothly, few enough to save.
+const TRANSIENT_FRAMES: usize = 101;
+
+/// What the study's thread solves once the model is meshed, with the materials of each
+/// body, by the study's type.
+enum SolveInput {
+    Static {
+        study: oxyde_sim::Study,
+        materials: Vec<Elastic>,
+    },
+    Thermal {
+        study: ThermalStudy,
+        materials: Vec<ThermalMaterial>,
+    },
+    /// The steady temperatures, then the static solve of the expansion they cause.
+    ThermalStress {
+        thermal: ThermalStudy,
+        thermal_materials: Vec<ThermalMaterial>,
+        study: oxyde_sim::Study,
+        materials: Vec<Elastic>,
+        /// °C.
+        reference: f64,
+    },
+}
+
+impl SolveInput {
+    /// The contacts Run found and bonded itself, in every solve it makes.
+    fn set_contacts(&mut self, contacts: Vec<oxyde_sim::Contact>) {
+        match self {
+            SolveInput::Static { study, .. } => study.contacts = contacts,
+            SolveInput::Thermal { study, .. } => study.contacts = contacts,
+            SolveInput::ThermalStress { thermal, study, .. } => {
+                thermal.contacts = contacts.clone();
+                study.contacts = contacts;
+            }
+        }
+    }
 }
 
 /// The solids meshed by Netgen on a worker kernel, each on its own, into one mesh whose
@@ -3264,8 +4263,7 @@ fn study_thread(
         solids,
         netgen,
         options,
-        mut study,
-        materials,
+        mut solve,
         names,
         mode,
         detect,
@@ -3340,16 +4338,19 @@ fn study_thread(
         && let Some(found) = &candidates
     {
         // Run's own search: what it finds is bonded, as listed afterwards.
-        study.contacts = found
-            .iter()
-            .map(|c| c.contact(ContactKind::Bonded))
-            .collect();
+        solve.set_contacts(
+            found
+                .iter()
+                .map(|c| c.contact(ContactKind::Bonded))
+                .collect(),
+        );
     }
     if mesh_only {
         return Ok(Outcome {
             mesh,
             report,
             results: None,
+            thermal: None,
             mesh_seconds,
             solve_seconds: 0.0,
             candidates,
@@ -3365,15 +4366,11 @@ fn study_thread(
             .cloned()
             .unwrap_or_else(|| format!("Body {b}"))
     };
-    let results = oxyde_sim::solve(
-        &mesh,
-        &materials,
-        &study,
-        &SolveOptions::default(),
-        cancel,
-        &|f| report_progress("Solving", span + (1.0 - span) * f),
-    )
-    .map_err(|e| match e {
+    let solving = |from: f64, to: f64| {
+        move |f: f64| report_progress("Solving", span + (1.0 - span) * (from + (to - from) * f))
+    };
+    let static_error = |e: oxyde_sim::SolveError| {
+        match e {
         oxyde_sim::SolveError::NotHeld { body } => format!(
             "{} is not held: it could move freely. Add a fixture to it, or a contact with a held part.",
             name(body)
@@ -3386,17 +4383,102 @@ fn study_thread(
                 .to_owned()
         }
         other => format!("The study failed: {other}"),
-    })?;
+    }
+    };
+    let thermal_error = |e: oxyde_sim::ThermalError| match e {
+        oxyde_sim::ThermalError::NotAnchored { body } => format!(
+            "Nothing sets the temperature of {}: add a Temperature, a Convection or a Radiation on it, or a contact with a part that has one",
+            name(body)
+        ),
+        oxyde_sim::ThermalError::BadMaterial { body } => {
+            format!("{} has no usable thermal conductivity", name(body))
+        }
+        oxyde_sim::ThermalError::NoHeatCapacity { body } => format!(
+            "{} needs a specific heat and a density for a transient study",
+            name(body)
+        ),
+        oxyde_sim::ThermalError::BadStudy(why) => capitalized(&why),
+        other => format!("The study failed: {other}"),
+    };
+    let options = SolveOptions::default();
+    let (results, thermal) = match &solve {
+        SolveInput::Static { study, materials } => {
+            let r = oxyde_sim::solve(
+                &mesh,
+                materials,
+                study,
+                &options,
+                cancel,
+                &solving(0.0, 1.0),
+            )
+            .map_err(static_error)?;
+            (Some(r), None)
+        }
+        SolveInput::Thermal { study, materials } => {
+            let t = oxyde_sim::solve_thermal(
+                &mesh,
+                materials,
+                study,
+                &options,
+                cancel,
+                &solving(0.0, 1.0),
+            )
+            .map_err(thermal_error)?;
+            (None, Some(t))
+        }
+        SolveInput::ThermalStress {
+            thermal,
+            thermal_materials,
+            study,
+            materials,
+            reference,
+        } => {
+            let t = oxyde_sim::solve_thermal(
+                &mesh,
+                thermal_materials,
+                thermal,
+                &options,
+                cancel,
+                &solving(0.0, 0.4),
+            )
+            .map_err(thermal_error)?;
+            let strain = oxyde_sim::ThermalStrain {
+                temperature: t.temperature.clone(),
+                reference: *reference,
+            };
+            let r = oxyde_sim::solve_thermal_stress(
+                &mesh,
+                materials,
+                study,
+                &strain,
+                &options,
+                cancel,
+                &solving(0.4, 1.0),
+            )
+            .map_err(static_error)?;
+            (Some(r), Some(t))
+        }
+    };
     Ok(Outcome {
         mesh,
         report,
-        results: Some(results),
+        results,
+        thermal,
         mesh_seconds,
         solve_seconds: start.elapsed().as_secs_f64(),
         candidates,
         mesher,
         note,
     })
+}
+
+/// `text` with its first letter in capitals, for a message of its own.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]

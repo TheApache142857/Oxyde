@@ -1,6 +1,8 @@
 //! A smoothed-aggregation algebraic multigrid preconditioner for the stiffness matrix
 //! (Vaněk, Mandel and Brezina, 1996): what makes conjugate gradients in [`crate::solve`]
-//! converge in tens of iterations instead of thousands.
+//! converge in tens of iterations instead of thousands. The same hierarchy serves the
+//! conduction matrix of [`crate::thermal`], with one mode (a uniform temperature) instead
+//! of the six rigid motions.
 //!
 //! - **Aggregates**: each node is grouped with its strongly coupled neighbours (a block
 //!   counts when its norm is a fair fraction of the two diagonal blocks'), greedily and in
@@ -42,8 +44,8 @@ const POWER_STEPS: usize = 15;
 const SPECTRUM_MARGIN: f64 = 1.1;
 /// Matrices with fewer values are multiplied on one thread.
 const PARALLEL_VALUES: usize = 1 << 18;
-/// Rigid motions: three translations, three turns.
-const MODES: usize = 6;
+/// Rigid motions: three translations, three turns; the near-null space of elasticity.
+pub(crate) const RIGID_MODES: usize = 6;
 const NONE: u32 = u32::MAX;
 
 /// A sparse matrix of dense `r × c` blocks, row-major, row by row (block CSR).
@@ -231,6 +233,9 @@ fn multiply(a: BsrRef, ranges: &[(usize, usize)], x: &[f64], y: &mut [f64]) {
         }),
         (6, 6) => for_rows(ranges, 6, y, |r0, r1, o| {
             rows_times::<6, 6>(a, x, r0, r1, o)
+        }),
+        (1, 1) => for_rows(ranges, 1, y, |r0, r1, o| {
+            rows_times::<1, 1>(a, x, r0, r1, o)
         }),
         _ => for_rows(ranges, a.r, y, |r0, r1, o| rows_times_any(a, x, r0, r1, o)),
     }
@@ -590,10 +595,16 @@ fn aggregate(a: BsrRef) -> (Vec<u32>, usize) {
     (agg, count as usize)
 }
 
-/// The tentative prolongator, a `b × 6` block per node (zero for nodes in no aggregate),
-/// and the coarse level's rigid motions, `6 × 6` per aggregate: the local QR of each
-/// aggregate's rows of `modes`.
-fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, Vec<f64>) {
+/// The tentative prolongator, a `b × mc` block per node (zero for nodes in no
+/// aggregate), and the coarse level's modes, `mc × mc` per aggregate: the local QR of each
+/// aggregate's rows of `modes` (`mc` columns).
+fn tentative(
+    agg: &[u32],
+    count: usize,
+    b: usize,
+    mc: usize,
+    modes: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
     let mut start = vec![0usize; count + 1];
     for &a in agg {
         if a != NONE {
@@ -611,25 +622,25 @@ fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, V
             fill[a as usize] += 1;
         }
     }
-    let width = b * MODES;
+    let width = b * mc;
     let mut t = vec![0.0; agg.len() * width];
-    let mut coarse = vec![0.0; count * MODES * MODES];
+    let mut coarse = vec![0.0; count * mc * mc];
     // Column by column: column `j` is `q[j * rows..(j + 1) * rows]`.
     let mut q: Vec<f64> = Vec::new();
     for a in 0..count {
         let nodes = &members[start[a]..start[a + 1]];
         let rows = nodes.len() * b;
         q.clear();
-        q.resize(rows * MODES, 0.0);
+        q.resize(rows * mc, 0.0);
         for (m, &node) in nodes.iter().enumerate() {
             for d in 0..b {
-                for j in 0..MODES {
-                    q[j * rows + m * b + d] = modes[(node * b + d) * MODES + j];
+                for j in 0..mc {
+                    q[j * rows + m * b + d] = modes[(node * b + d) * mc + j];
                 }
             }
         }
-        let r = &mut coarse[a * MODES * MODES..(a + 1) * MODES * MODES];
-        for j in 0..MODES {
+        let r = &mut coarse[a * mc * mc..(a + 1) * mc * mc];
+        for j in 0..mc {
             let (done, rest) = q.split_at_mut(j * rows);
             let v = &mut rest[..rows];
             let before = dot(v, v).sqrt();
@@ -638,7 +649,7 @@ fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, V
                 for i in 0..j {
                     let qi = &done[i * rows..(i + 1) * rows];
                     let d = dot(qi, v);
-                    r[i * MODES + j] += d;
+                    r[i * mc + j] += d;
                     for (v, q) in v.iter_mut().zip(qi) {
                         *v -= d * q;
                     }
@@ -646,7 +657,7 @@ fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, V
             }
             let after = dot(v, v).sqrt();
             if after > 1e-10 * before && after > 0.0 {
-                r[j * MODES + j] = after;
+                r[j * mc + j] = after;
                 for x in v.iter_mut() {
                     *x /= after;
                 }
@@ -657,8 +668,8 @@ fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, V
         }
         for (m, &node) in nodes.iter().enumerate() {
             for d in 0..b {
-                for j in 0..MODES {
-                    t[(node * b + d) * MODES + j] = q[j * rows + m * b + d];
+                for j in 0..mc {
+                    t[(node * b + d) * mc + j] = q[j * rows + m * b + d];
                 }
             }
         }
@@ -666,7 +677,7 @@ fn tentative(agg: &[u32], count: usize, b: usize, modes: &[f64]) -> (Vec<f64>, V
     (t, coarse)
 }
 
-/// The smoothed prolongator `P = (I − ω D⁻¹ A) T`.
+/// The smoothed prolongator `P = (I − ω D⁻¹ A) T`, `T` holding `b × mc` per node.
 fn prolongator(
     a: BsrRef,
     ranges: &[(usize, usize)],
@@ -677,7 +688,8 @@ fn prolongator(
     count: usize,
 ) -> Result<Bsr, String> {
     let b = a.r;
-    let width = b * MODES;
+    let mc = t.len() / (agg.len() * b).max(1);
+    let width = b * mc;
     let parts = map_rows(ranges, |r0, r1| {
         let mut rows = RowBuilder::new(count, width);
         let mut tmp = [0.0; 36];
@@ -688,13 +700,13 @@ fn prolongator(
                     continue;
                 }
                 let tj = &t[j * width..(j + 1) * width];
-                mul_add(rows.slot(agg[j]), a.block(k), tj, b, b, MODES);
+                mul_add(rows.slot(agg[j]), a.block(k), tj, b, b, mc);
             }
             let di = &dinv[i * b * b..(i + 1) * b * b];
             let ti = &t[i * width..(i + 1) * width];
             for (col, block) in rows.row_mut() {
                 tmp[..width].fill(0.0);
-                mul_add(&mut tmp[..width], di, block, b, b, MODES);
+                mul_add(&mut tmp[..width], di, block, b, b, mc);
                 for (o, v) in block.iter_mut().zip(&tmp[..width]) {
                     *o = -omega * v;
                 }
@@ -708,7 +720,7 @@ fn prolongator(
         }
         rows
     })?;
-    Ok(concat(parts, b, MODES))
+    Ok(concat(parts, b, mc))
 }
 
 /// `A P`.
@@ -718,22 +730,23 @@ fn times_prolongator(
     p: BsrRef,
     count: usize,
 ) -> Result<Bsr, String> {
+    let mc = p.c;
     let b = a.r;
     let parts = map_rows(ranges, |r0, r1| {
-        let mut rows = RowBuilder::new(count, b * MODES);
+        let mut rows = RowBuilder::new(count, b * mc);
         for i in r0..r1 {
             for k in a.row(i) {
                 let j = a.columns[k] as usize;
                 let block = a.block(k);
                 for kp in p.row(j) {
-                    mul_add(rows.slot(p.columns[kp]), block, p.block(kp), b, b, MODES);
+                    mul_add(rows.slot(p.columns[kp]), block, p.block(kp), b, b, mc);
                 }
             }
             rows.finish_row();
         }
         rows
     })?;
-    Ok(concat(parts, b, MODES))
+    Ok(concat(parts, b, mc))
 }
 
 /// The coarse matrix `Pᵀ (A P)`, row by row of the coarse level.
@@ -744,21 +757,22 @@ fn galerkin(
     ap: BsrRef,
     count: usize,
 ) -> Result<Bsr, String> {
+    let mc = p.c;
     let b = p.r;
     let parts = map_rows(ranges, |c0, c1| {
-        let mut rows = RowBuilder::new(count, MODES * MODES);
+        let mut rows = RowBuilder::new(count, mc * mc);
         for c in c0..c1 {
             for &(i, kp) in &columns.entries[columns.start[c]..columns.start[c + 1]] {
                 let pb = p.block(kp);
                 for k in ap.row(i as usize) {
-                    mul_t_add(rows.slot(ap.columns[k]), pb, ap.block(k), MODES, b, MODES);
+                    mul_t_add(rows.slot(ap.columns[k]), pb, ap.block(k), mc, b, mc);
                 }
             }
             rows.finish_row();
         }
         rows
     })?;
-    let mut ac = concat(parts, MODES, MODES);
+    let mut ac = concat(parts, mc, mc);
     // A rigid motion an aggregate could not carry left a zero row and column: a diagonal
     // keeps the coarse matrix invertible without coupling the unknown to anything. It is
     // the mean of the block's other diagonal terms, so that it weighs no more than they
@@ -767,9 +781,9 @@ fn galerkin(
         let Some(k) = ac.view().diagonal(i) else {
             return Err(format!("coarse row {i} has no diagonal"));
         };
-        let block = &mut ac.values[k * MODES * MODES..(k + 1) * MODES * MODES];
-        let live: Vec<f64> = (0..MODES)
-            .map(|d| block[d * MODES + d])
+        let block = &mut ac.values[k * mc * mc..(k + 1) * mc * mc];
+        let live: Vec<f64> = (0..mc)
+            .map(|d| block[d * mc + d])
             .filter(|&v| v != 0.0)
             .collect();
         let fill = if live.is_empty() {
@@ -777,9 +791,9 @@ fn galerkin(
         } else {
             live.iter().sum::<f64>() / live.len() as f64
         };
-        for d in 0..MODES {
-            if block[d * MODES + d] == 0.0 {
-                block[d * MODES + d] = fill;
+        for d in 0..mc {
+            if block[d * mc + d] == 0.0 {
+                block[d * mc + d] = fill;
             }
         }
     }
@@ -880,14 +894,22 @@ pub(crate) struct Multigrid<'a> {
 
 impl<'a> Multigrid<'a> {
     /// The hierarchy for the symmetric positive definite `fine`, whose near-null space
-    /// is `modes`: six columns per unknown (`fine.r × 6` per row of blocks, row-major).
-    /// `Err` says why it could not be built; the caller then falls back to block-Jacobi.
+    /// is `modes`: `mode_count` columns per unknown (`fine.r × mode_count` per row of
+    /// blocks, row-major), the six rigid motions for elasticity, a uniform value for
+    /// conduction. `Err` says why it could not be built; the caller then falls back to
+    /// (block-)Jacobi.
     pub(crate) fn new(
         fine: BsrRef<'a>,
         modes: &[f64],
+        mode_count: usize,
         threads: usize,
     ) -> Result<Multigrid<'a>, String> {
-        if fine.r != fine.c || fine.r > 6 || modes.len() != fine.rows() * fine.r * MODES {
+        let mc = mode_count;
+        if fine.r != fine.c
+            || fine.r > 6
+            || !(1..=6).contains(&mc)
+            || modes.len() != fine.rows() * fine.r * mc
+        {
             return Err("the matrix and its rigid motions do not match".to_owned());
         }
         let mut levels: Vec<Level> = Vec::new();
@@ -907,7 +929,7 @@ impl<'a> Multigrid<'a> {
                 // Coarsening has stalled.
                 break;
             }
-            let (t, coarse_modes) = tentative(&agg, count, a.r, &modes);
+            let (t, coarse_modes) = tentative(&agg, count, a.r, mc, &modes);
             let p = prolongator(a, &ranges, &dinv, 4.0 / (3.0 * lambda), &agg, &t, count)?;
             let pt = columns_of(p.view(), count);
             let ap = times_prolongator(a, &ranges, p.view(), count)?;
@@ -941,7 +963,7 @@ impl<'a> Multigrid<'a> {
         for (l, level) in levels.iter().enumerate() {
             let n = level.a.as_ref().map_or(fine, Bsr::view).rows() * level.p.r;
             let coarse = match levels.get(l + 1) {
-                Some(next) => next.a.as_ref().map_or(0, |a| a.view().rows() * MODES),
+                Some(next) => next.a.as_ref().map_or(0, |a| a.view().rows() * mc),
                 None => coarsest.n,
             };
             work.push(Work {
@@ -1065,6 +1087,8 @@ fn smooth(
 mod tests {
     use super::*;
 
+    const MODES: usize = RIGID_MODES;
+
     /// The 1D Laplacian in 3 × 3 blocks (each unknown its own chain), `n` nodes, ends held.
     fn chain(n: usize) -> Bsr {
         let mut row_start = vec![0];
@@ -1103,7 +1127,7 @@ mod tests {
                 modes[(i * 3 + d) * MODES + d] = 1.0;
             }
         }
-        Multigrid::new(a.view(), &modes, 4).unwrap()
+        Multigrid::new(a.view(), &modes, MODES, 4).unwrap()
     }
 
     #[test]

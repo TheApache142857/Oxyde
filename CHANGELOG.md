@@ -5,6 +5,41 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Several studies per model, and thermal studies (unreleased, October 2026)
+
+- **New Study.** The Simulation tab now opens on *New Study*, as Fusion 360's does: pick
+  *Static Stress*, *Thermal*, *Transient Thermal* or *Thermal Stress*. A model can have as
+  many studies as wanted, each with its own loads, contacts, mesh settings, material
+  values and results; the list at the top of the panel switches between them (*New*,
+  *Rename*, *Delete* beside it), and switching keeps each study's results. *Save* writes
+  them all to the model's `.oxysim`, which now opens with the model when it sits next to
+  it, and each study's results go to `<study file>-<study>.oxyres`.
+- **Thermal studies.** Select faces, then *Temperature* (held at a temperature), *Heat
+  Power* (watts in, spread by area), *Heat Flux* (W/m²), *Convection* (a film coefficient
+  and the fluid's temperature), *Radiation* (an emissivity and the surroundings'
+  temperature) or *Internal Heat* (watts made inside the faces' bodies, a motor's losses
+  or a resistor). Faces with none are insulated, and heat crosses every contact as if
+  bonded. *Run* gives the temperatures and the heat flux, plotted in colour bands with
+  the hottest point marked (*Temperature* and *Heat Flux* in the command bar).
+- **Transient thermal studies** follow the temperatures over time from a uniform start:
+  set the duration, the time steps and the starting temperature in the panel; the
+  results keep about a hundred times, shown with a slider and played with ▶, the colours
+  keeping one range over the whole history.
+- **Thermal stress studies** solve the steady temperatures, then the stresses of the
+  expansion they cause with the fixtures (and any forces, pressures or gravity): a part
+  free to grow is unstressed, a held one is stressed. Set the temperature at which the
+  model is free of stress in the panel. Stress, displacement, factor of safety and
+  temperature can all be plotted.
+- **Materials know how they take heat**: conductivity, specific heat and thermal
+  expansion, edited on the Material page (*Add properties* starts from typical values for
+  the material's name) and saved with the material, in the part and in `materials.json`
+  (a new optional `thermal` block, `docs/FORMAT.md` §3). Every material of the starter
+  library has them; older files and STEP materials get typical values by name. The
+  Simulation panel shows the values a study uses and lets a study type its own.
+- Study and results files holding a thermal study are `format_version` 2; files with
+  static studies only stay version 1, so earlier Oxyde builds still open them
+  (`docs/FORMAT.md` §8–§9).
+
 ### Materials a click away, a maximum element size (unreleased, October 2026)
 
 - **A memory budget for simulations** (Tools › Preferences › *Simulation*, 8 GB by

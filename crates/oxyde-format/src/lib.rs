@@ -60,8 +60,14 @@ use assembly_schema::AssemblyModel;
 pub use schema::Properties;
 use schema::{Manifest, PartModel, TextureTable, Units, import_entry};
 
-/// The `format_version` written by this crate, and the newest it can read.
+/// The `format_version` written by this crate, and the newest it can read, for parts,
+/// assemblies and drawings.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// The newest `format_version` of simulation studies and results this crate reads: 2 adds
+/// thermal studies. A document is written with 1 when it holds only what version 1 knows,
+/// so older readers still open static studies.
+pub const SIMULATION_FORMAT_VERSION: u32 = 2;
 
 const FORMAT_NAME: &str = "oxyde";
 const MANIFEST: &str = "manifest.json";
@@ -98,6 +104,14 @@ impl DocumentKind {
             DocumentKind::Drawing => "drawing",
             DocumentKind::Simulation => "simulation",
             DocumentKind::SimulationResults => "simulation_results",
+        }
+    }
+
+    /// The newest `format_version` of this kind of document, by its manifest `kind`.
+    fn newest_version(kind: &str) -> u32 {
+        match kind {
+            "simulation" | "simulation_results" => SIMULATION_FORMAT_VERSION,
+            _ => FORMAT_VERSION,
         }
     }
 }
@@ -233,9 +247,14 @@ fn from_json<T: serde::de::DeserializeOwned>(
 }
 
 fn manifest(kind: DocumentKind, document_id: &str) -> Manifest {
+    manifest_version(kind, document_id, FORMAT_VERSION)
+}
+
+/// A manifest written with `format_version` `version`.
+fn manifest_version(kind: DocumentKind, document_id: &str, version: u32) -> Manifest {
     Manifest {
         format: FORMAT_NAME.to_owned(),
-        format_version: FORMAT_VERSION,
+        format_version: version,
         kind: kind.name().to_owned(),
         document_id: document_id.to_owned(),
         units: Units {
@@ -257,10 +276,11 @@ fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Manifest
     if manifest.format != FORMAT_NAME {
         return Err(FormatError::NotOxyde);
     }
-    if manifest.format_version > FORMAT_VERSION {
+    let newest = DocumentKind::newest_version(&manifest.kind);
+    if manifest.format_version > newest {
         return Err(FormatError::UnsupportedVersion {
             found: manifest.format_version,
-            supported: FORMAT_VERSION,
+            supported: newest,
         });
     }
     Ok(manifest)

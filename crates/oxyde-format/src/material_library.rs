@@ -177,6 +177,43 @@ mod tests {
     }
 
     #[test]
+    fn thermal_properties_are_optional_and_checked() {
+        let dir = std::env::temp_dir().join(format!("oxyde-materials-heat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("materials.json");
+        std::fs::write(
+            &path,
+            br#"{ "format": "oxyde-materials", "format_version": 1, "materials": [
+                { "name": "Old", "density": 1000, "appearance": { "color": [1, 2, 3] } },
+                { "name": "Copper", "density": 8940, "appearance": { "color": [1, 2, 3] },
+                  "thermal": { "conductivity": 391, "specific_heat": 385, "expansion": 1.7e-5 } },
+                { "name": "Some", "density": 1, "appearance": { "color": [1, 2, 3] },
+                  "thermal": { "conductivity": 2.5 } },
+                { "name": "Odd", "density": 1, "appearance": { "color": [1, 2, 3] },
+                  "thermal": { "conductivity": -1 } }
+            ] }"#,
+        )
+        .unwrap();
+        let library = load_material_library(&path).unwrap();
+        assert!(library.get("Old").unwrap().thermal.is_none());
+        let copper = library.get("Copper").unwrap().thermal.unwrap();
+        assert_eq!(
+            (copper.conductivity, copper.specific_heat, copper.expansion),
+            (391.0, 385.0, 1.7e-5)
+        );
+        // Only the conductivity is required; the rest is unknown.
+        let some = library.get("Some").unwrap().thermal.unwrap();
+        assert_eq!((some.specific_heat, some.expansion), (0.0, 0.0));
+        // A conductivity no material has: as if the file said nothing.
+        assert!(library.get("Odd").unwrap().thermal.is_none());
+        // And back: written as read.
+        let out = dir.join("again.json");
+        save_material_library(&out, &library).unwrap();
+        assert_eq!(load_material_library(&out).unwrap(), library);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn other_files_are_refused() {
         let dir = std::env::temp_dir().join(format!("oxyde-materials-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

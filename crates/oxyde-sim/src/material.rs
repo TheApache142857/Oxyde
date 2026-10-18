@@ -1,9 +1,11 @@
-//! Elastic properties of a material, and a guess of them from the material's name.
+//! Elastic and thermal properties of a material, and guesses of them from the material's
+//! name.
 //!
-//! Oxyde's materials hold a density but no mechanical data yet (whether they should is
-//! the owner's call, `docs/SIMULATION.md` §5.2), so the Simulation tab starts from
-//! [`Elastic::guess`]: the starter library's materials by name, then families by
-//! keyword, with typical handbook values. The user can type others in.
+//! Oxyde's materials may carry their mechanical and thermal properties; for those that do
+//! not (older files, materials named by STEP files), the Simulation tab starts from
+//! [`Elastic::guess`] and [`ThermalProps::guess`]: the starter library's materials by
+//! name, then families by keyword, with typical handbook values. The user can type others
+//! in.
 
 /// An isotropic linear elastic material.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -17,6 +19,9 @@ pub struct Elastic {
     pub yield_strength: f64,
     /// kg/m³, for the weight; 0 when unknown.
     pub density: f64,
+    /// Coefficient of linear thermal expansion, 1/K, for a thermal stress study; 0 when
+    /// unknown (no expansion).
+    pub expansion: f64,
 }
 
 impl Elastic {
@@ -26,7 +31,14 @@ impl Elastic {
             poisson,
             yield_strength,
             density,
+            expansion: 0.0,
         }
+    }
+
+    /// The same material expanding by `expansion` per kelvin.
+    pub const fn with_expansion(mut self, expansion: f64) -> Self {
+        self.expansion = expansion;
+        self
     }
 
     /// Whether the solver can use it: a positive modulus and a Poisson's ratio that keeps
@@ -41,6 +53,7 @@ impl Elastic {
             && self.yield_strength >= 0.0
             && self.density.is_finite()
             && self.density >= 0.0
+            && self.expansion.is_finite()
     }
 
     /// Lamé's λ and μ (the shear modulus), MPa.
@@ -56,31 +69,66 @@ impl Elastic {
     /// German, as `oxyde_model::Finish` guesses looks). `None`
     /// when nothing matches. The density is left at 0: the material's own is used.
     pub fn guess(name: &str, category: &str) -> Option<Elastic> {
-        if let Some((_, e)) = NAMED
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
-        {
-            return Some(*e);
-        }
-        let text = format!("{category} {name}").to_lowercase();
-        let tokens: Vec<&str> = text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| !t.is_empty())
-            .collect();
-        // Short keywords (`pla`, `pet`, `abs`) are whole words, so that "plastic" is
-        // not PLA; longer ones, and ones with a sign (`fr-4`), match anywhere.
-        let matches = |w: &&str| {
-            if w.chars().count() <= 4 && w.chars().all(char::is_alphanumeric) {
-                tokens.contains(w)
-            } else {
-                text.contains(*w)
-            }
-        };
-        FAMILIES
-            .iter()
-            .find(|(words, _)| words.iter().any(matches))
-            .map(|(_, e)| *e)
+        guess_from(name, category, NAMED, FAMILIES)
     }
+}
+
+/// How a material conducts, stores and expands with heat: conductivity in W/(m·K),
+/// specific heat in J/(kg·K), linear expansion in 1/K.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThermalProps {
+    pub conductivity: f64,
+    pub specific_heat: f64,
+    pub expansion: f64,
+}
+
+impl ThermalProps {
+    pub const fn new(conductivity: f64, specific_heat: f64, expansion: f64) -> Self {
+        Self {
+            conductivity,
+            specific_heat,
+            expansion,
+        }
+    }
+
+    /// Typical properties for a material called `name` in `category`, found as
+    /// [`Elastic::guess`] finds them. `None` when nothing matches.
+    pub fn guess(name: &str, category: &str) -> Option<ThermalProps> {
+        guess_from(name, category, NAMED_THERMAL, THERMAL_FAMILIES)
+    }
+}
+
+/// `named` by exact name (ignoring case), else the first of `families` with a keyword in
+/// the category or the name. Short keywords (`pla`, `pet`, `abs`) are whole words, so that
+/// "plastic" is not PLA; longer ones, and ones with a sign (`fr-4`), match anywhere.
+fn guess_from<T: Copy>(
+    name: &str,
+    category: &str,
+    named: &[(&str, T)],
+    families: &[(&[&str], T)],
+) -> Option<T> {
+    if let Some((_, e)) = named
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
+    {
+        return Some(*e);
+    }
+    let text = format!("{category} {name}").to_lowercase();
+    let tokens: Vec<&str> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let matches = |w: &&str| {
+        if w.chars().count() <= 4 && w.chars().all(char::is_alphanumeric) {
+            tokens.contains(w)
+        } else {
+            text.contains(*w)
+        }
+    };
+    families
+        .iter()
+        .find(|(words, _)| words.iter().any(matches))
+        .map(|(_, e)| *e)
 }
 
 /// The starter library (`oxyde_model::MaterialLibrary::standard`): E (MPa), ν, yield or
@@ -233,9 +281,181 @@ const FAMILIES: &[(&[&str], Elastic)] = &[
     ),
 ];
 
+/// The starter library's thermal properties (`oxyde_model::MaterialLibrary::standard`).
+const NAMED_THERMAL: &[(&str, ThermalProps)] = &[
+    (
+        "Plain carbon steel (AISI 1020)",
+        ThermalProps::new(51.9, 486.0, 11.7e-6),
+    ),
+    (
+        "Alloy steel (AISI 4140)",
+        ThermalProps::new(42.6, 473.0, 12.3e-6),
+    ),
+    (
+        "Stainless steel (AISI 304)",
+        ThermalProps::new(16.2, 500.0, 17.3e-6),
+    ),
+    ("Cast iron (grey)", ThermalProps::new(46.0, 490.0, 10.8e-6)),
+    (
+        "Aluminium 6061-T6",
+        ThermalProps::new(167.0, 896.0, 23.6e-6),
+    ),
+    (
+        "Aluminium 7075-T6",
+        ThermalProps::new(130.0, 960.0, 23.4e-6),
+    ),
+    (
+        "Aluminium (cast, A356)",
+        ThermalProps::new(151.0, 963.0, 21.4e-6),
+    ),
+    ("Brass (C260)", ThermalProps::new(120.0, 375.0, 19.9e-6)),
+    ("Bronze (C905)", ThermalProps::new(75.0, 376.0, 18.0e-6)),
+    ("Copper (C110)", ThermalProps::new(391.0, 385.0, 17.0e-6)),
+    (
+        "Titanium (Ti-6Al-4V)",
+        ThermalProps::new(6.7, 526.0, 8.6e-6),
+    ),
+    ("ABS", ThermalProps::new(0.17, 1400.0, 90.0e-6)),
+    ("PLA", ThermalProps::new(0.13, 1800.0, 68.0e-6)),
+    ("Nylon 6/6", ThermalProps::new(0.25, 1670.0, 80.0e-6)),
+    ("Polycarbonate", ThermalProps::new(0.20, 1200.0, 65.0e-6)),
+    ("Acrylic (PMMA)", ThermalProps::new(0.19, 1470.0, 70.0e-6)),
+    (
+        "Black plastic (PA, filled)",
+        ThermalProps::new(0.35, 1500.0, 30.0e-6),
+    ),
+    (
+        "Rubber (natural)",
+        ThermalProps::new(0.13, 1900.0, 220.0e-6),
+    ),
+    ("Silicone rubber", ThermalProps::new(0.22, 1250.0, 250.0e-6)),
+    ("Glass (soda-lime)", ThermalProps::new(1.0, 840.0, 9.0e-6)),
+    ("Oak", ThermalProps::new(0.17, 2380.0, 5.0e-6)),
+    ("Pine", ThermalProps::new(0.12, 2300.0, 5.0e-6)),
+    ("Plywood (birch)", ThermalProps::new(0.13, 1800.0, 6.0e-6)),
+    ("PCB (FR-4)", ThermalProps::new(0.29, 1100.0, 14.0e-6)),
+    (
+        "Carbon fibre (epoxy)",
+        ThermalProps::new(5.0, 1000.0, 2.0e-6),
+    ),
+];
+
+/// Thermal families by keyword, most specific first, as [`FAMILIES`].
+const THERMAL_FAMILIES: &[(&[&str], ThermalProps)] = &[
+    (
+        &["stainless", "inox", "inoxydable", "edelstahl", "rostfrei"],
+        ThermalProps::new(16.2, 500.0, 17.3e-6),
+    ),
+    (
+        &["cast iron", "fonte", "gusseisen", "grey iron", "gray iron"],
+        ThermalProps::new(46.0, 490.0, 10.8e-6),
+    ),
+    (
+        &["steel", "acier", "stahl"],
+        ThermalProps::new(51.9, 486.0, 11.7e-6),
+    ),
+    (&["iron", "eisen"], ThermalProps::new(46.0, 490.0, 10.8e-6)),
+    (&["titan"], ThermalProps::new(6.7, 526.0, 8.6e-6)),
+    (&["7075"], ThermalProps::new(130.0, 960.0, 23.4e-6)),
+    (&["alumin", "alu"], ThermalProps::new(167.0, 896.0, 23.6e-6)),
+    (&["magnesium"], ThermalProps::new(96.0, 1020.0, 26.0e-6)),
+    (
+        &["brass", "laiton", "messing"],
+        ThermalProps::new(120.0, 375.0, 19.9e-6),
+    ),
+    (&["bronze"], ThermalProps::new(75.0, 376.0, 18.0e-6)),
+    (
+        &["copper", "cuivre", "kupfer"],
+        ThermalProps::new(391.0, 385.0, 17.0e-6),
+    ),
+    (&["zinc", "zamak"], ThermalProps::new(113.0, 419.0, 27.4e-6)),
+    (&["silicone"], ThermalProps::new(0.22, 1250.0, 250.0e-6)),
+    (
+        &["rubber", "caoutchouc", "gummi", "elastomer"],
+        ThermalProps::new(0.13, 1900.0, 220.0e-6),
+    ),
+    (
+        &["glass", "verre", "glas"],
+        ThermalProps::new(1.0, 840.0, 9.0e-6),
+    ),
+    (
+        &["carbon", "cfrp", "carbone"],
+        ThermalProps::new(5.0, 1000.0, 2.0e-6),
+    ),
+    (
+        &["fr-4", "fr4", "pcb", "epoxy"],
+        ThermalProps::new(0.29, 1100.0, 14.0e-6),
+    ),
+    (&["polycarbonate"], ThermalProps::new(0.20, 1200.0, 65.0e-6)),
+    (
+        &["acrylic", "pmma", "plexi"],
+        ThermalProps::new(0.19, 1470.0, 70.0e-6),
+    ),
+    (
+        &["nylon", "polyamide", "pa6", "pa12"],
+        ThermalProps::new(0.25, 1670.0, 80.0e-6),
+    ),
+    (&["pla"], ThermalProps::new(0.13, 1800.0, 68.0e-6)),
+    (&["petg", "pet"], ThermalProps::new(0.2, 1200.0, 60.0e-6)),
+    (
+        &["polypropylene", "pp"],
+        ThermalProps::new(0.22, 1900.0, 100.0e-6),
+    ),
+    (
+        &["polyethylene", "hdpe", "pe"],
+        ThermalProps::new(0.45, 1900.0, 120.0e-6),
+    ),
+    (
+        &["pom", "acetal", "delrin"],
+        ThermalProps::new(0.31, 1460.0, 110.0e-6),
+    ),
+    (
+        &["abs", "plastic", "plastique", "kunststoff", "polymer"],
+        ThermalProps::new(0.17, 1400.0, 90.0e-6),
+    ),
+    (
+        &["oak", "chêne", "chene", "eiche"],
+        ThermalProps::new(0.17, 2380.0, 5.0e-6),
+    ),
+    (
+        &["plywood", "contreplaqué", "sperrholz"],
+        ThermalProps::new(0.13, 1800.0, 6.0e-6),
+    ),
+    (
+        &["wood", "bois", "holz", "pine", "pin"],
+        ThermalProps::new(0.12, 2300.0, 5.0e-6),
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thermal_guesses_by_name_then_family() {
+        let copper = ThermalProps::guess("Copper (C110)", "Copper alloy").unwrap();
+        assert_eq!(copper.conductivity, 391.0);
+        let inox = ThermalProps::guess("Acier inoxydable", "Imported from STEP").unwrap();
+        assert_eq!(inox.conductivity, 16.2);
+        let al = ThermalProps::guess("AlMg3", "Aluminium").unwrap();
+        assert_eq!(al.expansion, 23.6e-6);
+        assert!(ThermalProps::guess("Unobtainium", "Imported from STEP").is_none());
+        // Every material the elastic tables know, the thermal ones know too.
+        for (name, _) in NAMED {
+            assert!(NAMED_THERMAL.iter().any(|(n, _)| n == name), "{name}");
+        }
+        assert_eq!(FAMILIES.len(), THERMAL_FAMILIES.len());
+        for ((a, _), (b, _)) in FAMILIES.iter().zip(THERMAL_FAMILIES) {
+            assert_eq!(a, b);
+        }
+        for t in NAMED_THERMAL
+            .iter()
+            .map(|(_, t)| t)
+            .chain(THERMAL_FAMILIES.iter().map(|(_, t)| t))
+        {
+            assert!(t.conductivity > 0.0 && t.specific_heat > 0.0 && t.expansion > 0.0);
+        }
+    }
 
     #[test]
     fn guesses_by_name_then_family() {

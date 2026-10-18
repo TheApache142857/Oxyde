@@ -1,5 +1,6 @@
 //! The Simulation tab's path through the real kernel: a part's export meshes, labelled by
-//! face, filled with tetrahedra by `oxyde_sim`'s mesher and solved, against beam theory.
+//! face, filled with tetrahedra by `oxyde_sim`'s mesher and solved, against beam theory
+//! and, for the thermal studies, against conduction along a bar.
 
 use oxyde_geom::Point2;
 use oxyde_kernel::{Kernel, Mesh, VolumeMeshError, VolumeMeshOptions};
@@ -9,7 +10,7 @@ use oxyde_model::{
 use oxyde_occt::OcctKernel;
 use oxyde_sim::{
     Contact, ContactKind, Elastic, Fixture, FixtureKind, Load, LoadKind, MeshOptions, SolveOptions,
-    Study, SurfaceMesh, TetMesh,
+    Study, SurfaceMesh, TetMesh, ThermalLoad, ThermalLoadKind, ThermalMaterial, ThermalStudy,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -256,4 +257,115 @@ fn a_cantilever_meshed_by_netgen_deflects_as_beam_theory_says() {
         delta > 0.97 && delta < 1.06,
         "tip {delta} mm, beam theory 1 mm"
     );
+}
+
+/// The temperature at the node nearest `(x, 10, 10)` of a 200 mm aluminium bar held at
+/// 100 °C at x = 0 and convected to 20 °C at x = 200 (h = 50 W/m²·K), its sides insulated.
+fn bar_temperature(part: &Part, kernel: &OcctKernel, separate: bool, x: f64) -> (f64, f64) {
+    let (solids, ends) = surfaces(part, kernel);
+    let at = |x0: f64| -> Vec<u32> {
+        ends.iter()
+            .filter(|(_, x)| (x - x0).abs() < 1e-3)
+            .map(|e| e.0)
+            .collect()
+    };
+    let options = MeshOptions {
+        element_size: 4.0,
+        separate_bodies: separate,
+        ..MeshOptions::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let (mesh, _) = oxyde_sim::mesh_solids(&solids, &options, &cancel, &|_| {}).unwrap();
+    let contacts: Vec<Contact> = oxyde_sim::detect_contacts(&mesh, 0.01)
+        .iter()
+        .map(|c| c.contact(ContactKind::Bonded))
+        .collect();
+    if separate && solids.len() > 1 {
+        assert!(!contacts.is_empty(), "no contact found between the bodies");
+    }
+    let study = ThermalStudy {
+        loads: vec![
+            ThermalLoad {
+                kind: ThermalLoadKind::Temperature { celsius: 100.0 },
+                labels: at(0.0),
+            },
+            ThermalLoad {
+                kind: ThermalLoadKind::Convection {
+                    coefficient: 50.0,
+                    ambient: 20.0,
+                },
+                labels: at(200.0),
+            },
+        ],
+        contacts,
+        ..ThermalStudy::default()
+    };
+    let aluminium = ThermalMaterial::new(167.0, 896.0, 2700.0);
+    let r = oxyde_sim::solve_thermal(
+        &mesh,
+        &vec![aluminium; solids.len()],
+        &study,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    let near = |x: f64| {
+        let i = (0..mesh.nodes.len())
+            .min_by(|&a, &b| {
+                let d = |i: usize| {
+                    let p = mesh.nodes[i];
+                    (p[0] - x).powi(2) + (p[1] - 10.0).powi(2) + (p[2] - 10.0).powi(2)
+                };
+                d(a).total_cmp(&d(b))
+            })
+            .unwrap();
+        (mesh.nodes[i][0], r.temperature[i])
+    };
+    near(x)
+}
+
+/// The steady temperature along the bar of [`bar_temperature`]: the bar (L / kA) and the
+/// film (1 / hA) in series.
+fn bar_theory(x: f64) -> f64 {
+    let (k, h, length) = (167.0, 50.0, 0.2);
+    let area = 0.02 * 0.02;
+    let power = 80.0 / (length / (k * area) + 1.0 / (h * area));
+    100.0 - power * (x * 1e-3) / (k * area)
+}
+
+#[test]
+fn a_bar_part_conducts_heat_as_theory_says() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    block(&mut part, 0.0, 200.0, ExtrudeOp::Boss);
+    part.rebuild(&mut kernel);
+    for x in [50.0, 150.0, 200.0] {
+        let (at, t) = bar_temperature(&part, &kernel, false, x);
+        let expected = bar_theory(at);
+        assert!(
+            (t - expected).abs() < 0.01 * (100.0 - 20.0),
+            "{t} °C at x = {at}, theory {expected} °C"
+        );
+    }
+}
+
+#[test]
+fn heat_crosses_a_detected_contact_between_bodies() {
+    // The same bar as two bodies meshed apart: the contact found between them conducts.
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    block(&mut part, 0.0, 100.0, ExtrudeOp::Boss);
+    block(&mut part, 100.0, 100.0, ExtrudeOp::NewBody);
+    part.rebuild(&mut kernel);
+    assert_eq!(part.body().map(|b| b.solids.len()), Some(2));
+    for x in [50.0, 150.0] {
+        let (at, t) = bar_temperature(&part, &kernel, true, x);
+        let expected = bar_theory(at);
+        // The lattice mesher's bevelled edges where the bodies meet cost a little.
+        assert!(
+            (t - expected).abs() < 0.03 * (100.0 - 20.0),
+            "{t} °C at x = {at}, theory {expected} °C"
+        );
+    }
 }

@@ -727,6 +727,7 @@ impl OxydeApp {
                     );
                     ui.end_row();
                     mechanical_rows(ui, m);
+                    thermal_rows(ui, m);
                 });
             appearance_controls(ui, &mut m.appearance, &mut self.status);
             ui.add_space(8.0);
@@ -1069,6 +1070,72 @@ impl OxydeApp {
         self.add_context_materials(own, &mut materials);
         self.viewport.set_materials(materials, textures);
     }
+}
+
+/// A material's thermal properties in the Material page's grid, for the Simulation tab's
+/// thermal studies: edited when known, else offered from the typical values of its family.
+fn thermal_rows(ui: &mut egui::Ui, m: &mut Material) {
+    let Some(t) = m.thermal.as_mut() else {
+        ui.label("Thermal");
+        if ui
+            .button("Add properties")
+            .on_hover_text(
+                "Conductivity, specific heat and expansion, for the Simulation tab's thermal \
+                 studies: typical values for this kind of material to start from",
+            )
+            .clicked()
+        {
+            m.thermal = Some(match oxyde_sim::ThermalProps::guess(&m.name, &m.category) {
+                Some(t) => oxyde_model::Thermal::new(t.conductivity, t.specific_heat, t.expansion),
+                // Nothing known of it: a plastic's, to be typed over.
+                None => oxyde_model::Thermal::new(0.2, 1500.0, 80e-6),
+            });
+        }
+        ui.end_row();
+        return;
+    };
+    ui.label("Conductivity");
+    ui.add(
+        egui::DragValue::new(&mut t.conductivity)
+            .range(0.001..=5000.0)
+            .speed(0.1)
+            .suffix(" W/m·K"),
+    );
+    ui.end_row();
+    ui.label("Specific heat");
+    ui.add(
+        egui::DragValue::new(&mut t.specific_heat)
+            .range(0.0..=1e5)
+            .speed(1.0)
+            .suffix(" J/kg·K"),
+    )
+    .on_hover_text("With the density, how much heat it stores (transient studies)");
+    ui.end_row();
+    // Micrometres per metre and kelvin, as libraries list it.
+    let mut expansion = t.expansion * 1e6;
+    ui.label("Expansion");
+    if ui
+        .add(
+            egui::DragValue::new(&mut expansion)
+                .range(-100.0..=1000.0)
+                .speed(0.1)
+                .suffix(" µm/m·K"),
+        )
+        .on_hover_text("How much it grows per kelvin (thermal stress studies)")
+        .changed()
+    {
+        t.expansion = expansion * 1e-6;
+    }
+    ui.end_row();
+    ui.label("");
+    if ui
+        .small_button("Remove thermal properties")
+        .on_hover_text("The Simulation tab then uses typical values for its name")
+        .clicked()
+    {
+        m.thermal = None;
+    }
+    ui.end_row();
 }
 
 /// A material's mechanical properties in the Material page's grid, for the Simulation

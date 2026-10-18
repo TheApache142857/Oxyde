@@ -13,7 +13,7 @@ use oxyde_model::{
     FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Material,
     MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis,
     RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep,
-    Texture, VertexName,
+    Texture, Thermal, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -124,6 +124,9 @@ pub(crate) struct MaterialDto {
     /// How it behaves under load, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mechanical: Option<MechanicalDto>,
+    /// How it conducts, stores and expands with heat, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<ThermalDto>,
 }
 
 /// A material's mechanical properties, MPa (N/mm²) for the modulus and the strengths.
@@ -136,6 +139,17 @@ pub(crate) struct MechanicalDto {
     pub yield_strength: f64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub tensile_strength: f64,
+}
+
+/// A material's thermal properties: W/(m·K), J/(kg·K) and 1/K.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ThermalDto {
+    pub conductivity: f64,
+    /// 0 or absent when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub specific_heat: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expansion: f64,
 }
 
 pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto {
@@ -153,6 +167,11 @@ pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto
             poisson_ratio: p.poisson_ratio,
             yield_strength: p.yield_strength,
             tensile_strength: p.tensile_strength,
+        }),
+        thermal: m.thermal.map(|t| ThermalDto {
+            conductivity: t.conductivity,
+            specific_heat: t.specific_heat,
+            expansion: t.expansion,
         }),
     }
 }
@@ -184,6 +203,9 @@ pub(crate) fn material_from(
                 p.tensile_strength,
             )
         }),
+        thermal: dto
+            .thermal
+            .map(|t| Thermal::new(t.conductivity, t.specific_heat, t.expansion)),
     }
     .clamped())
 }

@@ -235,12 +235,12 @@ pub(crate) fn von_mises(s: &[f64; 6]) -> f64 {
 // ---- Elements ---------------------------------------------------------------------------
 
 /// The barycentric gradients and the volume of a straight-sided element.
-struct Geometry {
-    grad: [V3; 4],
-    volume: f64,
+pub(crate) struct Geometry {
+    pub grad: [V3; 4],
+    pub volume: f64,
 }
 
-fn geometry(mesh: &TetMesh, e: usize) -> Option<Geometry> {
+pub(crate) fn geometry(mesh: &TetMesh, e: usize) -> Option<Geometry> {
     let t = mesh.tets[e];
     let x = t.map(|i| mesh.nodes[i as usize]);
     let (a, b, c) = (sub(x[1], x[0]), sub(x[2], x[0]), sub(x[3], x[0]));
@@ -259,7 +259,12 @@ fn geometry(mesh: &TetMesh, e: usize) -> Option<Geometry> {
 }
 
 /// The gradients of the element's shape functions at barycentric coordinates `l`.
-fn shape_gradients(g: &Geometry, l: [f64; 4], quadratic: bool, out: &mut [V3; 10]) -> usize {
+pub(crate) fn shape_gradients(
+    g: &Geometry,
+    l: [f64; 4],
+    quadratic: bool,
+    out: &mut [V3; 10],
+) -> usize {
     if !quadratic {
         out[..4].copy_from_slice(&g.grad);
         return 4;
@@ -274,7 +279,7 @@ fn shape_gradients(g: &Geometry, l: [f64; 4], quadratic: bool, out: &mut [V3; 10
 }
 
 /// Integration points (barycentric) and their weight as a fraction of the volume.
-fn integration_points(quadratic: bool) -> Vec<([f64; 4], f64)> {
+pub(crate) fn integration_points(quadratic: bool) -> Vec<([f64; 4], f64)> {
     if !quadratic {
         return vec![([0.25; 4], 1.0)];
     }
@@ -288,7 +293,7 @@ fn integration_points(quadratic: bool) -> Vec<([f64; 4], f64)> {
 }
 
 /// The element's barycentric coordinates at each of its nodes.
-fn node_points(quadratic: bool) -> Vec<[f64; 4]> {
+pub(crate) fn node_points(quadratic: bool) -> Vec<[f64; 4]> {
     let mut out: Vec<[f64; 4]> = (0..4)
         .map(|i| {
             let mut l = [0.0; 4];
@@ -464,7 +469,7 @@ impl BlockMatrix {
     }
 }
 
-fn thread_count(wanted: usize) -> usize {
+pub(crate) fn thread_count(wanted: usize) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     if wanted == 0 {
         cores
@@ -632,7 +637,7 @@ impl Constraints {
 }
 
 /// Every node of a facet: its corners, and its edge nodes for ten-node elements.
-fn facet_nodes(mesh: &TetMesh, f: &crate::Facet) -> Vec<u32> {
+pub(crate) fn facet_nodes(mesh: &TetMesh, f: &crate::Facet) -> Vec<u32> {
     let mut out = mesh.facet_corners(f).to_vec();
     if let Some(mids) = mesh.facet_edge_nodes(f) {
         out.extend(mids);
@@ -641,7 +646,7 @@ fn facet_nodes(mesh: &TetMesh, f: &crate::Facet) -> Vec<u32> {
 }
 
 /// Connected pieces of the mesh: each node's piece.
-fn pieces(mesh: &TetMesh) -> Vec<u32> {
+pub(crate) fn pieces(mesh: &TetMesh) -> Vec<u32> {
     let n = mesh.nodes.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(parent: &mut [u32], mut i: u32) -> u32 {
@@ -870,6 +875,38 @@ pub fn solve(
         materials,
         study,
         options,
+        strain: None,
+    };
+    solve_with(&problem, Preconditioner::Multigrid, cancel, progress)
+}
+
+/// Temperatures that expand the model: each node's, and the temperature at which the
+/// model is free of stress, °C.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThermalStrain {
+    pub temperature: Vec<f64>,
+    pub reference: f64,
+}
+
+/// [`solve`] with the model expanded by `strain` (a thermal stress study): each element
+/// grows by `α (T − T_ref)` in every direction, `α` its material's
+/// [`Elastic::expansion`]. A part free to grow does so without stress; held, it is
+/// stressed by `E α ΔT / (1 − 2ν)` when held all round.
+pub fn solve_thermal_stress(
+    mesh: &TetMesh,
+    materials: &[Elastic],
+    study: &Study,
+    strain: &ThermalStrain,
+    options: &SolveOptions,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f64),
+) -> Result<Results, SolveError> {
+    let problem = Problem {
+        mesh,
+        materials,
+        study,
+        options,
+        strain: Some(strain),
     };
     solve_with(&problem, Preconditioner::Multigrid, cancel, progress)
 }
@@ -891,6 +928,8 @@ struct Problem<'a> {
     materials: &'a [Elastic],
     study: &'a Study,
     options: &'a SolveOptions,
+    /// Temperatures expanding the model, for a thermal stress study.
+    strain: Option<&'a ThermalStrain>,
 }
 
 fn solve_with(
@@ -904,8 +943,18 @@ fn solve_with(
         materials,
         study,
         options,
+        strain,
     } = *problem;
     mesh.validate().map_err(SolveError::Invalid)?;
+    if let Some(strain) = strain
+        && (strain.temperature.len() != mesh.nodes.len()
+            || !strain.reference.is_finite()
+            || strain.temperature.iter().any(|t| !t.is_finite()))
+    {
+        return Err(SolveError::Invalid(
+            "its temperatures do not match its nodes".to_owned(),
+        ));
+    }
     if mesh.tets.is_empty() {
         return Err(SolveError::Invalid("it has no elements".to_owned()));
     }
@@ -922,7 +971,10 @@ fn solve_with(
     if let Some(body) = free_piece(mesh, &constraints, ties) {
         return Err(SolveError::NotHeld { body });
     }
-    let force = load_vector(mesh, materials, study);
+    let mut force = load_vector(mesh, materials, study);
+    if let Some(strain) = strain {
+        add_thermal_load(mesh, materials, strain, &mut force);
+    }
     let load_size = force.iter().map(|f| dot(*f, *f)).sum::<f64>().sqrt();
     if !(load_size > 0.0 && load_size.is_finite()) {
         return Err(SolveError::NoLoads);
@@ -1131,17 +1183,21 @@ fn solve_with(
                     }
                 }
             }
-            let strain = |i: usize, j: usize| 0.5 * (h[i][j] + h[j][i]);
+            let e = |i: usize, j: usize| 0.5 * (h[i][j] + h[j][i]);
             let trace = h[0][0] + h[1][1] + h[2][2];
-            let s = [
-                lambda * trace + 2.0 * mu * strain(0, 0),
-                lambda * trace + 2.0 * mu * strain(1, 1),
-                lambda * trace + 2.0 * mu * strain(2, 2),
-                2.0 * mu * strain(0, 1),
-                2.0 * mu * strain(1, 2),
-                2.0 * mu * strain(2, 0),
-            ];
             let node = nodes[local] as usize;
+            // The expansion's share of the strain carries no stress.
+            let thermal = strain.map_or(0.0, |t| {
+                (3.0 * lambda + 2.0 * mu) * material.expansion * (t.temperature[node] - t.reference)
+            });
+            let s = [
+                lambda * trace + 2.0 * mu * e(0, 0) - thermal,
+                lambda * trace + 2.0 * mu * e(1, 1) - thermal,
+                lambda * trace + 2.0 * mu * e(2, 2) - thermal,
+                2.0 * mu * e(0, 1),
+                2.0 * mu * e(1, 2),
+                2.0 * mu * e(2, 0),
+            ];
             for k in 0..6 {
                 sum[node][k] += s[k];
             }
@@ -1249,7 +1305,9 @@ impl<'a> Linear<'a> {
         threads: usize,
     ) -> Linear<'a> {
         let multigrid = match modes {
-            Some(modes) if use_multigrid => Multigrid::new(matrix.view(), modes, threads).ok(),
+            Some(modes) if use_multigrid => {
+                Multigrid::new(matrix.view(), modes, crate::amg::RIGID_MODES, threads).ok()
+            }
             _ => None,
         };
         Linear {
@@ -1482,6 +1540,45 @@ fn rigid_motions(mesh: &TetMesh, constraints: &Constraints) -> Vec<f64> {
     out
 }
 
+/// Adds to `force` the nodal forces that expand each element by `α ΔT`: `∫ ∇Nₐ σₜ dV`,
+/// `σₜ = (3λ + 2μ) α ΔT` the hydrostatic stress that would hold the expansion back, with
+/// the temperature interpolated by the element's shape functions.
+fn add_thermal_load(
+    mesh: &TetMesh,
+    materials: &[Elastic],
+    strain: &ThermalStrain,
+    force: &mut [V3],
+) {
+    let quadratic = mesh.is_quadratic();
+    let mut grads = [[0.0; 3]; 10];
+    let mut shapes = [0.0; 10];
+    let points = integration_points(quadratic);
+    for e in 0..mesh.tets.len() {
+        let material = &materials[mesh.bodies[e] as usize];
+        if material.expansion == 0.0 {
+            continue;
+        }
+        let Some(g) = geometry(mesh, e) else {
+            continue;
+        };
+        let (lambda, mu) = material.lame();
+        let (nodes, count) = mesh.element_nodes(e);
+        for &(l, w) in &points {
+            shape_gradients(&g, l, quadratic, &mut grads);
+            crate::thermal::shape_values(l, quadratic, &mut shapes);
+            let t: f64 = (0..count)
+                .map(|a| shapes[a] * strain.temperature[nodes[a] as usize])
+                .sum();
+            let sigma = (3.0 * lambda + 2.0 * mu) * material.expansion * (t - strain.reference);
+            let weight = w * g.volume * sigma;
+            for a in 0..count {
+                let i = nodes[a] as usize;
+                force[i] = add(force[i], scale(grads[a], weight));
+            }
+        }
+    }
+}
+
 /// The nodal forces of the loads and the weight, N, in global directions.
 fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> {
     let n = mesh.nodes.len();
@@ -1571,6 +1668,7 @@ mod tests {
             materials: &[STEEL],
             study,
             options: &SolveOptions::default(),
+            strain: None,
         };
         solve_with(&problem, preconditioner, &cancel, &|_| {}).unwrap()
     }
@@ -1925,6 +2023,77 @@ mod tests {
         assert_eq!(
             solve(&mesh, &[bad], &unloaded, &options, &cancel, &|_| {}),
             Err(SolveError::BadMaterial { body: 0 })
+        );
+    }
+
+    #[test]
+    fn a_heated_bar_grows_freely_and_pushes_when_held() {
+        // A steel bar 100 K above its stress-free temperature.
+        let steel = STEEL.with_expansion(12e-6);
+        let mut mesh = TetMesh::structured_box([0.0; 3], [100.0, 10.0, 10.0], [10, 2, 2]);
+        mesh.make_quadratic();
+        let strain = ThermalStrain {
+            temperature: vec![120.0; mesh.nodes.len()],
+            reference: 20.0,
+        };
+        let cancel = AtomicBool::new(false);
+        let solve_held = |fixtures: Vec<Fixture>| {
+            let study = Study {
+                fixtures,
+                loads: Vec::new(),
+                gravity: None,
+                contacts: Vec::new(),
+            };
+            solve_thermal_stress(
+                &mesh,
+                &[steel],
+                &study,
+                &strain,
+                &SolveOptions::default(),
+                &cancel,
+                &|_| {},
+            )
+            .unwrap()
+        };
+        // Held on one end only by rollers on three faces (free to grow, not to move):
+        // it grows α ΔT L = 0.12 mm and carries no stress.
+        let roller = |label| Fixture {
+            kind: FixtureKind::Roller,
+            labels: vec![label],
+        };
+        let free = solve_held(vec![roller(0), roller(2), roller(4)]);
+        let tip = node_at(&mesh, [100.0, 10.0, 10.0]);
+        assert!((free.displacement[tip][0] - 0.12).abs() < 1e-6);
+        assert!((free.displacement[tip][1] - 12e-6 * 100.0 * 10.0).abs() < 1e-6);
+        let largest = free.von_mises.iter().fold(0.0f64, |m, &s| m.max(s));
+        assert!(largest < 1e-3, "a free bar is unstressed: {largest} MPa");
+        // Both ends on rollers along X: it cannot grow along X, σxx = −E α ΔT = −240 MPa.
+        let held = solve_held(vec![roller(0), roller(1), roller(2), roller(4)]);
+        let mid = node_at(&mesh, [50.0, 5.0, 5.0]);
+        assert!(
+            (held.stress[mid][0] + 240.0).abs() < 1e-3 * 240.0,
+            "{:?}",
+            held.stress[mid]
+        );
+        assert!(held.stress[mid][1].abs() < 1e-3 && held.stress[mid][2].abs() < 1e-3);
+        // Without expansion, nothing loads it.
+        let study = Study {
+            fixtures: vec![roller(0), roller(1), roller(2), roller(4)],
+            loads: Vec::new(),
+            gravity: None,
+            contacts: Vec::new(),
+        };
+        assert_eq!(
+            solve_thermal_stress(
+                &mesh,
+                &[STEEL],
+                &study,
+                &strain,
+                &SolveOptions::default(),
+                &cancel,
+                &|_| {},
+            ),
+            Err(SolveError::NoLoads)
         );
     }
 

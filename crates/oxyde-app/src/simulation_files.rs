@@ -1,5 +1,7 @@
-//! The Simulation tab's files: the study saved as a `.oxysim` document and its results as
-//! a `.oxyres` (`oxyde_format::simulation`, `oxyde_format::results`, FORMAT.md §8–§9).
+//! The Simulation tab's files: the model's studies saved together as a `.oxysim` document
+//! and each study's results as a `.oxyres` beside it, `<study file>-<study>.oxyres`
+//! (`oxyde_format::simulation`, `oxyde_format::results`, FORMAT.md §8–§9). The studies
+//! saved next to a model as `<model>.oxysim` open with it.
 //!
 //! A study document names its part or assembly by relative path and document id, and holds
 //! the fixtures, loads, contacts, mesh settings and material overrides by persistent face
@@ -13,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use oxyde_format::results::{
     DocumentHash, Elements, Extreme, Fingerprint, NodalFields, ResultBody, ResultFacet, ResultMesh,
-    ResultsFile, SolverInfo,
+    ResultsFile, SolverInfo, TemperatureFrame, ThermalFields,
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
@@ -22,7 +24,7 @@ use oxyde_format::simulation::{
     StudyFace,
 };
 use oxyde_format::{AssemblyFile, PartFile};
-use oxyde_sim::{ContactKind, Facet, Results, TetMesh};
+use oxyde_sim::{ContactKind, Facet, Frame, Results, TetMesh, ThermalResults};
 
 use crate::app::OxydeApp;
 use crate::assembly::{Loaded, Occurrence};
@@ -77,11 +79,17 @@ fn contact_kind(k: FileContactKind) -> ContactKind {
     }
 }
 
-/// The study as a `.oxysim` holds it.
+/// The study as a `.oxysim` holds it: the items its type takes.
 pub(crate) fn file_study(study: &Study) -> FileStudy {
-    let mut out = FileStudy::new(&study.name);
+    let mut out = FileStudy::of_type(&study.name, study.study_type);
     let faces = |faces: &[SimFace]| faces.iter().map(study_face).collect::<Vec<_>>();
-    for item in &study.items {
+    let load = |name: &str, kind: FileLoadKind| Load {
+        name: name.to_owned(),
+        kind,
+        suppressed: false,
+    };
+    for item in study.items.iter().filter(|i| i.kind.fits(study.study_type)) {
+        let on = faces(&item.faces);
         match &item.kind {
             ItemKind::Fixed | ItemKind::Roller => out.fixtures.push(Fixture {
                 name: item.name.clone(),
@@ -113,9 +121,59 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
                 },
                 suppressed: false,
             }),
+            ItemKind::Temperature { celsius } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::Temperature {
+                    faces: on,
+                    celsius: *celsius,
+                },
+            )),
+            ItemKind::HeatPower { watts } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::HeatPower {
+                    faces: on,
+                    watts: *watts,
+                },
+            )),
+            ItemKind::HeatFlux { flux } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::HeatFlux {
+                    faces: on,
+                    flux: *flux,
+                },
+            )),
+            ItemKind::Convection {
+                coefficient,
+                ambient,
+            } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::Convection {
+                    faces: on,
+                    coefficient: *coefficient,
+                    ambient: *ambient,
+                },
+            )),
+            ItemKind::Radiation {
+                emissivity,
+                ambient,
+            } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::Radiation {
+                    faces: on,
+                    emissivity: *emissivity,
+                    ambient: *ambient,
+                },
+            )),
+            ItemKind::InternalHeat { watts } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::InternalHeat {
+                    faces: on,
+                    watts: *watts,
+                },
+            )),
         }
     }
-    if study.gravity {
+    if study.gravity && study.study_type.is_structural() {
         out.loads.push(Load {
             name: "Gravity-1".to_owned(),
             kind: FileLoadKind::Gravity {
@@ -159,16 +217,16 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
         },
     };
     out.materials = study.overrides.clone();
+    out.thermal_materials = study.thermal_overrides.clone();
+    out.transient = study.transient;
+    out.reference_temperature = study.reference_temperature;
     out
 }
 
 /// The study a `.oxysim` holds, as the panel edits it. Suppressed items are left out (the
 /// panel has no switch for them yet); a gravity load other than −Y becomes −Y.
 pub(crate) fn study_of(file: &FileStudy) -> Study {
-    let mut study = Study {
-        name: file.name.clone(),
-        ..Study::default()
-    };
+    let mut study = Study::of_type(file.study_type, &file.name);
     let faces = |faces: &[StudyFace]| faces.iter().map(sim_face).collect::<Vec<_>>();
     for f in file.fixtures.iter().filter(|f| !f.suppressed) {
         study.items.push(StudyItem {
@@ -203,6 +261,50 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
                 faces: faces(f),
             }),
             FileLoadKind::Gravity { .. } => study.gravity = true,
+            FileLoadKind::Temperature { faces: f, celsius } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::Temperature { celsius: *celsius },
+                faces: faces(f),
+            }),
+            FileLoadKind::HeatPower { faces: f, watts } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::HeatPower { watts: *watts },
+                faces: faces(f),
+            }),
+            FileLoadKind::HeatFlux { faces: f, flux } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::HeatFlux { flux: *flux },
+                faces: faces(f),
+            }),
+            FileLoadKind::Convection {
+                faces: f,
+                coefficient,
+                ambient,
+            } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::Convection {
+                    coefficient: *coefficient,
+                    ambient: *ambient,
+                },
+                faces: faces(f),
+            }),
+            FileLoadKind::Radiation {
+                faces: f,
+                emissivity,
+                ambient,
+            } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::Radiation {
+                    emissivity: *emissivity,
+                    ambient: *ambient,
+                },
+                faces: faces(f),
+            }),
+            FileLoadKind::InternalHeat { faces: f, watts } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::InternalHeat { watts: *watts },
+                faces: faces(f),
+            }),
         }
     }
     for c in file.contacts.iter().filter(|c| !c.suppressed) {
@@ -240,6 +342,9 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
         },
     };
     study.overrides = file.materials.clone();
+    study.thermal_overrides = file.thermal_materials.clone();
+    study.transient = file.transient;
+    study.reference_temperature = file.reference_temperature;
     study.recount();
     study
 }
@@ -274,7 +379,6 @@ pub(crate) fn relative_path(from: &Path, to: &Path) -> String {
 /// The results of `done` as a `.oxyres` holds them.
 pub(crate) fn results_file(
     done: &Done,
-    results: &Results,
     simulation_id: &str,
     study: &str,
     fingerprint: Fingerprint,
@@ -290,24 +394,37 @@ pub(crate) fn results_file(
         ),
         None => Elements::Linear(mesh.tets.clone()),
     };
-    let summary = results.summary();
+    let summary = done.results.as_ref().map(Results::summary);
+    let thermal_summary = done.thermal.as_ref().map(ThermalResults::summary);
     let extreme = |(value, node): (f64, u32)| Extreme { value, node };
+    let iterations = done.results.as_ref().map_or(0, |r| r.iterations)
+        + done.thermal.as_ref().map_or(0, |t| t.iterations);
+    let residual = done
+        .results
+        .as_ref()
+        .map(|r| r.residual)
+        .or_else(|| done.thermal.as_ref().map(|t| t.residual))
+        .unwrap_or(0.0);
     ResultsFile {
         document_id: oxyde_format::new_document_id(),
         simulation_id: simulation_id.to_owned(),
         study: study.to_owned(),
+        study_type: done.study_type,
         fingerprint,
         summary: oxyde_format::results::Summary {
-            max_von_mises: extreme(summary.max_von_mises),
-            max_displacement: extreme(summary.max_displacement),
-            min_factor_of_safety: summary.min_factor_of_safety.map(extreme),
+            max_von_mises: summary.map(|s| extreme(s.max_von_mises)),
+            max_displacement: summary.map(|s| extreme(s.max_displacement)),
+            min_factor_of_safety: summary.and_then(|s| s.min_factor_of_safety.map(extreme)),
+            max_temperature: thermal_summary.map(|t| extreme(t.max_temperature)),
+            min_temperature: thermal_summary.map(|t| extreme(t.min_temperature)),
+            max_heat_flux: thermal_summary.map(|t| extreme(t.max_heat_flux)),
         },
         solver: SolverInfo {
             program: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
             mesher: done.mesher.to_owned(),
             method: "pcg+amg".to_owned(),
-            iterations: results.iterations as u64,
-            residual: results.residual,
+            iterations: iterations as u64,
+            residual,
             seconds: done.mesh_seconds + done.solve_seconds,
         },
         bodies: done
@@ -337,19 +454,41 @@ pub(crate) fn results_file(
                 })
                 .collect(),
         },
-        fields: NodalFields {
-            displacement: results.displacement.clone(),
-            stress: results.stress.clone(),
-            von_mises: results.von_mises.clone(),
-            yield_strength: results.yield_strength.clone(),
-            contact_pressure: (!results.contact_pressure.is_empty())
-                .then(|| results.contact_pressure.clone()),
+        fields: match &done.results {
+            Some(results) => NodalFields {
+                displacement: results.displacement.clone(),
+                stress: results.stress.clone(),
+                von_mises: results.von_mises.clone(),
+                yield_strength: results.yield_strength.clone(),
+                contact_pressure: (!results.contact_pressure.is_empty())
+                    .then(|| results.contact_pressure.clone()),
+            },
+            None => NodalFields::default(),
         },
+        thermal: done.thermal.as_ref().map(|t| ThermalFields {
+            temperature: t.temperature.clone(),
+            heat_flux: t.heat_flux.clone(),
+            history: t
+                .frames
+                .iter()
+                .map(|f| TemperatureFrame {
+                    time: f.time,
+                    temperature: f.temperature.clone(),
+                })
+                .collect(),
+        }),
     }
 }
 
+/// What a `.oxyres` holds, as the tab shows it.
+pub(crate) struct LoadedResults {
+    pub mesh: TetMesh,
+    pub results: Option<Results>,
+    pub thermal: Option<ThermalResults>,
+}
+
 /// The mesh and results a `.oxyres` holds, or why they cannot be used.
-pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<(TetMesh, Results), String> {
+pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, String> {
     let m = &file.mesh;
     let (tets, edge_nodes) = match &m.elements {
         Elements::Linear(e) => (e.clone(), None),
@@ -380,29 +519,80 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<(TetMesh, Results),
     mesh.validate()?;
     let f = &file.fields;
     let n = mesh.nodes.len();
-    if [
-        f.displacement.len(),
-        f.stress.len(),
-        f.von_mises.len(),
-        f.yield_strength.len(),
-    ]
-    .iter()
-    .any(|&len| len != n)
-    {
-        return Err("its fields do not match its mesh".to_owned());
-    }
-    let results = Results {
-        displacement: f.displacement.clone(),
-        stress: f.stress.clone(),
-        von_mises: f.von_mises.clone(),
-        yield_strength: f.yield_strength.clone(),
-        iterations: file.solver.iterations as usize,
-        residual: file.solver.residual,
-        contact_pressure: f.contact_pressure.clone().unwrap_or_default(),
-        contacts: Vec::new(),
-        contact_solve: Default::default(),
+    let results = if file.study_type.is_structural() {
+        if [
+            f.displacement.len(),
+            f.stress.len(),
+            f.von_mises.len(),
+            f.yield_strength.len(),
+        ]
+        .iter()
+        .any(|&len| len != n)
+        {
+            return Err("its fields do not match its mesh".to_owned());
+        }
+        Some(Results {
+            displacement: f.displacement.clone(),
+            stress: f.stress.clone(),
+            von_mises: f.von_mises.clone(),
+            yield_strength: f.yield_strength.clone(),
+            iterations: file.solver.iterations as usize,
+            residual: file.solver.residual,
+            contact_pressure: f.contact_pressure.clone().unwrap_or_default(),
+            contacts: Vec::new(),
+            contact_solve: Default::default(),
+        })
+    } else {
+        None
     };
-    Ok((mesh, results))
+    let thermal = match &file.thermal {
+        Some(t) if t.temperature.len() != n || t.heat_flux.len() != n => {
+            return Err("its temperatures do not match its mesh".to_owned());
+        }
+        Some(t) => Some(ThermalResults {
+            temperature: t.temperature.clone(),
+            heat_flux: t.heat_flux.clone(),
+            frames: t
+                .history
+                .iter()
+                .map(|f| Frame {
+                    time: f.time,
+                    temperature: f.temperature.clone(),
+                })
+                .collect(),
+            iterations: file.solver.iterations as usize,
+            residual: file.solver.residual,
+            nonlinear_iterations: 0,
+        }),
+        None => None,
+    };
+    Ok(LoadedResults {
+        mesh,
+        results,
+        thermal,
+    })
+}
+
+/// Where a study's results are saved: beside the study file, `<study file>-<study>.oxyres`,
+/// the study's name made safe for a file name.
+pub(crate) fn results_path(study_file: &Path, study: &str) -> PathBuf {
+    let stem = study_file
+        .file_stem()
+        .map_or_else(|| "Study".to_owned(), |s| s.to_string_lossy().into_owned());
+    let safe: String = study
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    study_file.with_file_name(format!(
+        "{stem}-{safe}.{}",
+        oxyde_format::results::RESULTS_EXTENSION
+    ))
 }
 
 // ---- The application side ------------------------------------------------------------------
@@ -501,7 +691,16 @@ impl OxydeApp {
         if let Some(f) = existing.filter(|f| f.path == path) {
             file.document_id = f.document_id;
         }
-        file.studies = vec![file_study(&self.simulation.study)];
+        file.studies = self
+            .simulation
+            .all_studies()
+            .iter()
+            .map(file_study)
+            .collect();
+        if file.studies.is_empty() {
+            self.status = "No study to save: make one with New Study".to_owned();
+            return false;
+        }
         match oxyde_format::simulation::save_simulation(&path, &file) {
             Ok(()) => {
                 self.status = format!("Saved the study to {}", path.display());
@@ -548,20 +747,41 @@ impl OxydeApp {
             );
             return;
         }
-        let Some(first) = file.studies.first() else {
+        if file.studies.is_empty() {
             self.status = format!("{} holds no study", path.display());
             return;
-        };
-        let more = file.studies.len() - 1;
-        self.set_study(study_of(first));
-        self.status = if more > 0 {
-            format!(
-                "Opened {} (its first study; {more} more not shown)",
-                first.name
-            )
+        }
+        let count = file.studies.len();
+        self.set_studies(file.studies.iter().map(study_of).collect());
+        self.status = if count > 1 {
+            format!("Opened {count} studies from {}", path.display())
         } else {
-            format!("Opened the study {}", first.name)
+            format!("Opened the study {}", self.simulation.study.name)
         };
+        self.simulation.file = Some(StudyFile {
+            path,
+            document_id: file.document_id,
+        });
+    }
+
+    /// When the model changes: the studies saved next to it as `<model>.oxysim` (made
+    /// for it, by document id), if there are any, as SolidWorks keeps a model's studies
+    /// with it. Their results are not read; *Open results…* or *Run* shows them.
+    pub(crate) fn open_saved_studies(&mut self) {
+        let Some((model_path, model_id, _)) = self.studied_model() else {
+            return;
+        };
+        let path = model_path.with_extension(oxyde_format::simulation::SIMULATION_EXTENSION);
+        if !path.is_file() {
+            return;
+        }
+        let Ok(file) = oxyde_format::simulation::load_simulation(&path) else {
+            return;
+        };
+        if file.model.document_id != model_id || file.studies.is_empty() {
+            return;
+        }
+        self.set_studies(file.studies.iter().map(study_of).collect());
         self.simulation.file = Some(StudyFile {
             path,
             document_id: file.document_id,
@@ -582,13 +802,11 @@ impl OxydeApp {
             self.status = "Nothing to save: run the study first".to_owned();
             return false;
         };
-        let (Some(results), Some(fingerprint)) = (&done.results, &done.fingerprint) else {
+        let (true, Some(fingerprint)) = (done.solved(), &done.fingerprint) else {
             self.status = "Nothing to save: run the study first".to_owned();
             return false;
         };
-        let mut path = study_file
-            .path
-            .with_extension(oxyde_format::results::RESULTS_EXTENSION);
+        let mut path = results_path(&study_file.path, &self.simulation.study.name);
         if ask {
             let Some(chosen) = rfd::FileDialog::new()
                 .add_filter("Oxyde results", &[oxyde_format::results::RESULTS_EXTENSION])
@@ -604,7 +822,6 @@ impl OxydeApp {
         }
         let file = results_file(
             done,
-            results,
             &study_file.document_id,
             &self.simulation.study.name,
             fingerprint.clone(),
@@ -643,6 +860,25 @@ impl OxydeApp {
             self.status = format!("{} are the results of another study file", path.display());
             return;
         }
+        // The results of another of the model's studies: that one opens.
+        if self.simulation.study.name != file.study {
+            match self
+                .simulation
+                .study_list()
+                .iter()
+                .position(|(name, _)| *name == file.study)
+            {
+                Some(i) => self.switch_study(i),
+                None => {
+                    self.status = format!(
+                        "{} are the results of {}, which is not one of this model's studies",
+                        path.display(),
+                        file.study
+                    );
+                    return;
+                }
+            }
+        }
         let now = match self.simulation_fingerprint() {
             Ok(f) => f,
             Err(e) => {
@@ -663,7 +899,7 @@ impl OxydeApp {
             );
             return;
         }
-        let (mesh, results) = match mesh_and_results(&file) {
+        let loaded = match mesh_and_results(&file) {
             Ok(r) => r,
             Err(e) => {
                 self.status = format!("Could not use {}: {e}", path.display());
@@ -677,7 +913,116 @@ impl OxydeApp {
             .iter()
             .map(|b| (b.name.clone(), b.material.clone()))
             .collect();
-        self.show_loaded_results(mesh, results, faces, bodies, file.fingerprint, &file.solver);
+        self.show_loaded_results(
+            loaded.mesh,
+            file.study_type,
+            loaded.results,
+            loaded.thermal,
+            faces,
+            bodies,
+            file.fingerprint,
+            &file.solver,
+        );
         self.status = format!("Opened the results {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxyde_format::simulation::{StudyType, TransientSettings};
+    use oxyde_model::{FaceName, FeatureId, Thermal};
+
+    fn face(feature: u32) -> SimFace {
+        SimFace {
+            occurrence: None,
+            face: FaceName::end_cap(FeatureId::from_raw(feature)),
+        }
+    }
+
+    #[test]
+    fn a_thermal_study_survives_its_file() {
+        let mut study = Study::of_type(StudyType::TransientThermal, "Transient 1");
+        for (k, kind) in [
+            ItemKind::Temperature { celsius: 80.0 },
+            ItemKind::HeatPower { watts: 12.5 },
+            ItemKind::HeatFlux { flux: -1500.0 },
+            ItemKind::Convection {
+                coefficient: 25.0,
+                ambient: 20.0,
+            },
+            ItemKind::Radiation {
+                emissivity: 0.9,
+                ambient: 15.0,
+            },
+            ItemKind::InternalHeat { watts: 5.0 },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            study.items.push(StudyItem {
+                name: format!("{}-1", kind.base_name()),
+                kind,
+                faces: vec![face(k as u32 + 2)],
+            });
+        }
+        study.transient = TransientSettings {
+            duration: 300.0,
+            steps: 30,
+            initial_temperature: 25.0,
+        };
+        study.thermal_overrides.insert(
+            "Copper (C110)".to_owned(),
+            Thermal::new(391.0, 385.0, 17e-6),
+        );
+        let mut back = study_of(&file_study(&study));
+        assert_eq!(back.study_type, StudyType::TransientThermal);
+        // The counters are rebuilt from the names read.
+        back.made.clear();
+        study.made.clear();
+        assert_eq!(back, study);
+        // A new item is numbered after the ones read.
+        let mut read = study_of(&file_study(&study));
+        read.add(ItemKind::Temperature { celsius: 0.0 }, vec![face(9)]);
+        assert_eq!(
+            read.items.last().map(|i| i.name.as_str()),
+            Some("Temperature-2")
+        );
+    }
+
+    #[test]
+    fn a_study_keeps_only_the_items_its_type_takes() {
+        // A static study's file never holds a thermal load, which readers would refuse.
+        let mut study = Study::of_type(StudyType::Static, "Static 1");
+        study.items.push(StudyItem {
+            name: "Fixed-1".to_owned(),
+            kind: ItemKind::Fixed,
+            faces: vec![face(2)],
+        });
+        study.items.push(StudyItem {
+            name: "Temperature-1".to_owned(),
+            kind: ItemKind::Temperature { celsius: 50.0 },
+            faces: vec![face(3)],
+        });
+        let file = file_study(&study);
+        assert_eq!(file.fixtures.len(), 1);
+        assert!(file.loads.is_empty());
+        // A thermal stress study keeps both.
+        study.study_type = StudyType::ThermalStress;
+        let file = file_study(&study);
+        assert_eq!((file.fixtures.len(), file.loads.len()), (1, 1));
+    }
+
+    #[test]
+    fn each_study_has_its_results_file() {
+        let study = Path::new("/models/bracket.oxysim");
+        assert_eq!(
+            results_path(study, "Thermal 1"),
+            Path::new("/models/bracket-Thermal 1.oxyres")
+        );
+        assert_eq!(
+            results_path(study, "A/B: hot?"),
+            Path::new("/models/bracket-A_B_ hot_.oxyres")
+        );
     }
 }

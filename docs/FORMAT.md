@@ -44,7 +44,8 @@ Rules:
 }
 ```
 
-- `kind`: `"part"`, `"assembly"` or `"drawing"`.
+- `kind`: `"part"`, `"assembly"` or `"drawing"`; `"simulation"` and `"simulation_results"` for §8 and §9.
+- `format_version`: 1 for parts, assemblies and drawings. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
 - `units` are display units. Values in `model.json` are always millimetres.
 
@@ -279,12 +280,18 @@ What the part is made of, optional (absent = no material):
     "poisson_ratio": 0.33,
     "yield_strength": 275,
     "tensile_strength": 310
+  },
+  "thermal": {
+    "conductivity": 167,
+    "specific_heat": 896,
+    "expansion": 2.36e-5
   }
 }
 ```
 
 - A part has at most one material. It is a **copy** of a library entry, so the file never depends on a library: `name` (unique in a library; `properties.json` gets it as `material`, for the bill of materials), `category` (for grouping; optional), `density` in kg/m³ (0 when unknown; mass = volume × density) and an `appearance` (same shape as in *Appearances*; its texture image goes under `textures/` like the others).
 - `mechanical` (optional): how the material behaves under load, for the Simulation tab (isotropic, linear elastic). `elastic_modulus` (Young's modulus) and `poisson_ratio` are required in it; `yield_strength` and `tensile_strength` (ultimate) are optional, 0 or absent when unknown. Moduli and strengths are in **MPa** (N/mm²). A factor of safety is measured against the yield strength, or the tensile strength when there is no yield strength (brittle materials: grey cast iron, glass, acrylic). Readers treat a block a solver could not use (a modulus that is not positive, a Poisson's ratio outside −1 to 0.5, a negative strength) as absent; Oxyde then uses typical values for the material's name, as it does for materials without the block (files written before it, and materials named by STEP files).
+- `thermal` (optional): how the material conducts, stores and expands with heat, for the Simulation tab's thermal studies (isotropic, constant with temperature). `conductivity` in **W/(m·K)** is required in it; `specific_heat` in **J/(kg·K)** (with the density, the heat a transient study stores) and `expansion`, the coefficient of linear thermal expansion in **1/K** (what a thermal stress study expands by; it may be negative), are optional, 0 or absent when unknown. Readers treat a block a solver could not use (a conductivity that is not positive, a negative specific heat, an expansion of a hundredth per kelvin or more) as absent; Oxyde then uses typical values for the material's name.
 - `source` (optional): where the material comes from. Absent or `"library"`: Oxyde's material library (the starter set, or one the user made). `"step"`: named by the STEP file the part was imported from, with the density that file gave, so that a library's own materials and the ones a STEP file brought are always told apart (the material keeps `"source": "step"` when it is added to the library; readers refuse other values). Imported STEP materials are filed under the category `Imported from STEP` until renamed.
 - The material's appearance is what the part is drawn with where nothing more specific applies: face over body over part appearance over material. Oxyde clears a part's own appearances when it applies a material to it (after asking), so a part normally has either; both can still be stored.
 
@@ -301,7 +308,7 @@ What the part is made of, optional (absent = no material):
 }
 ```
 
-Entries have the same shape as a part's `material` (with `mechanical` when known), `texture.file` relative to the library file's folder. Readers refuse another `format` or a higher `format_version`; a material whose image is missing is kept without it. Oxyde writes the file the first time a material is saved to the library; until then it uses its built-in starter set (steels, aluminium alloys, brass, copper, titanium, ABS, PLA, nylon, polycarbonate, acrylic, rubber, glass, woods, FR-4, carbon fibre), every one with its mechanical properties.
+Entries have the same shape as a part's `material` (with `mechanical` and `thermal` when known), `texture.file` relative to the library file's folder. Readers refuse another `format` or a higher `format_version`; a material whose image is missing is kept without it. Oxyde writes the file the first time a material is saved to the library; until then it uses its built-in starter set (steels, aluminium alloys, brass, copper, titanium, ABS, PLA, nylon, polycarbonate, acrylic, rubber, glass, woods, FR-4, carbon fibre), every one with its mechanical and thermal properties.
 
 ### Names
 
@@ -391,7 +398,7 @@ bracket.oxysim
 └── simulation.json      required  — the model studied and its studies
 ```
 
-A study document holds what the Simulation tab needs to solve a model again: no geometry, no mesh and no results (those go in a `.oxyres`, §9). It refers to one part or assembly file and to its faces by persistent name, so it survives edits of the model as mates do.
+A study document holds what the Simulation tab needs to solve a model again: no geometry, no mesh and no results (those go in a `.oxyres`, §9). It refers to one part or assembly file and to its faces by persistent name, so it survives edits of the model as mates do. It holds every study of the model, of four types: static stress, thermal (steady state), transient thermal and thermal stress. Oxyde saves it next to the model as `<model>.oxysim` by default and opens it with the model.
 
 ```json
 {
@@ -425,45 +432,79 @@ A study document holds what the Simulation tab needs to solve a model again: no 
                                "yield_strength": 275, "tensile_strength": 310 },
         "part:11111111-1111-1111-1111-111111111111": { "elastic_modulus": 2000, "poisson_ratio": 0.35 }
       }
+    },
+    {
+      "name": "Transient 1",
+      "type": "transient_thermal",
+      "loads": [
+        { "name": "Temperature-1", "type": "temperature", "temperature": 80, "faces": [ … ] },
+        { "name": "Heat Power-1", "type": "heat_power", "power": 12.5, "faces": [ … ] },
+        { "name": "Heat Flux-1", "type": "heat_flux", "flux": -1500, "faces": [ … ] },
+        { "name": "Convection-1", "type": "convection", "coefficient": 25, "ambient": 20, "faces": [ … ] },
+        { "name": "Radiation-1", "type": "radiation", "emissivity": 0.9, "ambient": 15, "faces": [ … ] },
+        { "name": "Internal Heat-1", "type": "internal_heat", "power": 5, "faces": [ … ] }
+      ],
+      "transient": { "duration": 120, "steps": 40, "initial_temperature": 25 },
+      "thermal_materials": {
+        "Copper (C110)": { "conductivity": 391, "specific_heat": 385, "expansion": 1.7e-5 }
+      }
+    },
+    {
+      "name": "Thermal Stress 1",
+      "type": "thermal_stress",
+      "fixtures": [ … ],
+      "loads": [ { "name": "Temperature-1", "type": "temperature", "temperature": 150, "faces": [ … ] } ],
+      "reference_temperature": 22
     }
   ]
 }
 ```
 
 - **`model`**: `kind` is `part` or `assembly`; `path` is relative to the study document's folder, with `/` separators. `document_id` is the model's, so a moved or renamed model can be found again by it, as an assembly finds its parts (§6).
-- **Studies**: `name` is unique in the document. `type` is `static` (linear static stress) in version 1; another type is an error. `fixtures`, `loads` and `contacts` may be absent (empty). Their `name`s are unique within the study, together (`Fixed-1`, `Force-2`, `Contact-1`, as SolidWorks numbers them). `suppressed` items are kept but not applied.
+- **Studies**: `name` is unique in the document. `type` is `static` (linear static stress: displacements, stresses, factor of safety), `thermal` (the temperatures once heat flow has settled), `transient_thermal` (the temperatures over time) or `thermal_stress` (the steady temperatures, then the stresses of the expansion they cause); another type is an error. `fixtures`, `loads` and `contacts` may be absent (empty). Their `name`s are unique within the study, together (`Fixed-1`, `Force-2`, `Temperature-1`, `Contact-1`, as SolidWorks numbers them). `suppressed` items are kept but not applied.
+- **What each type takes**: a `static` study takes fixtures and the `force`, `pressure` and `gravity` loads; `thermal` and `transient_thermal` take the thermal loads only (no fixtures); `thermal_stress` takes all of them. Readers refuse a study holding what its type does not take. `transient` is only in a `transient_thermal` study and `reference_temperature` only in a `thermal_stress` one; readers refuse them elsewhere.
 - **Faces** are written as a mate's references are (§6): `face` is a FaceRef (§3 *References*), resolved in the rebuilt part. In an assembly study, `component` names the component holding it (from 1) and `path`, when the component is a sub-assembly, the component ids inside it down to the part; in a part study both are absent. Readers refuse a face of the other kind.
 - **Fixtures**: `fixed` (no displacement at all) or `roller` (roller/slider: free in the face's plane, not along its normal).
 - **Loads**: `force` is a total in N shared over its faces by area, along `direction`: `"normal"` (normal to each face, into it) or a vector in world coordinates (Y up; only its direction counts, not zero). A negative force pushes the other way. `pressure` is in MPa (N/mm²), into each face along its normal. `gravity` has no faces: an `acceleration` vector in m/s², in world coordinates, applied to the whole model with its materials' densities.
+- **Thermal loads**, temperatures in °C (not under −273.15): `temperature` holds the faces at `temperature`. `heat_power` is a total heat flow into the faces in W, shared by area (`power`; negative takes heat out). `heat_flux` is in W/m² into the faces (`flux`). `convection` cools (or warms) the faces towards a fluid at `ambient` with a film `coefficient` in W/(m²·K), not negative. `radiation` exchanges heat with surroundings at `ambient` by `emissivity` (0 to 1) × σ (T⁴ − T∞⁴), in kelvin. `internal_heat` is a `power` in W made inside the bodies the faces belong to, spread through their volume. Faces with no thermal load are insulated.
+- **`transient`** (a `transient_thermal` study; these defaults when absent): the `duration` in seconds (positive), the number of time `steps` (1 to 100 000; 60) and the uniform `initial_temperature` the model starts at (°C; 20). The boundary conditions apply from the first instant.
+- **`reference_temperature`** (a `thermal_stress` study; 20 when absent): the temperature, °C, at which the model is free of stress; it expands by its materials' `expansion` (§3) times the difference.
 - **Contacts** between two sets of faces `a` and `b`, as Fusion 360 names them: `bonded` (glued), `separation` (may part, not pass through, no friction), `sliding` (stays in touch, slides without friction), `rough` (may part, not slide) and `offset_bonded` (glued across a gap of `offset` mm; `offset` is 0 or absent for the others). `automatic: true` marks a contact Oxyde found itself, faces of different bodies closer than `tolerance` mm (required then, positive); a manual contact (`automatic` absent) has no `tolerance`.
 - **`mesh`** (optional; these defaults when absent): `mesher` `netgen` (default) or `lattice` (Oxyde's own); `quality` `high` (ten-node tetrahedra, default) or `draft` (four-node); and either `density`, from coarse (0) to fine (1) relative to the model's size (0.5 when neither is given), or `element_size` in mm (positive), not both.
 - **`materials`** (optional): mechanical properties this study uses instead of the materials' own, by material group: a material's `name`, or `part:` and a part's `document_id` for a part with no material. The values have the same four keys and units as a material's `mechanical` block (§3) and are read the same way: an entry a solver could not use is ignored, and the material's own values (or the typical ones for its name) apply.
+- **`thermal_materials`** (optional): thermal properties this study uses instead of the materials' own, by material group as `materials`, with the keys and units of a material's `thermal` block (§3), read the same way.
+- **Contacts in thermal studies** conduct heat as if bonded, whatever their `type`.
+- **Version.** A document holding only `static` studies is written with `format_version` 1, which readers of version 1 open; one holding any other type is written with 2 (version 1 readers would refuse its types anyway).
 
 ## 9. Simulation results (`.oxyres`)
 
 ```
 bracket-Static 1.oxyres
-├── manifest.json                 required  — "kind": "simulation_results"
-├── results.json                  required  — what the results are of, summary, entry table
-├── mesh/nodes.bin                required  — f64 × 3 per node
-├── mesh/elements.bin             required  — u32 × 4 or × 10 per element
-├── mesh/element_bodies.bin       required  — u32 per element
-├── mesh/facet_elements.bin       required  — u32 per boundary facet
-├── mesh/facet_faces.bin          required  — u8 per boundary facet
-├── mesh/facet_labels.bin         required  — u32 per boundary facet
-├── fields/displacement.bin       required  — f64 × 3 per node
-├── fields/stress.bin             required  — f64 × 6 per node
-├── fields/von_mises.bin          required  — f64 per node
-├── fields/yield_strength.bin     required  — f64 per node
-└── fields/contact_pressure.bin   optional  — f64 per node
+├── manifest.json                    required  — "kind": "simulation_results"
+├── results.json                     required  — what the results are of, summary, entry table
+├── mesh/nodes.bin                   required  — f64 × 3 per node
+├── mesh/elements.bin                required  — u32 × 4 or × 10 per element
+├── mesh/element_bodies.bin          required  — u32 per element
+├── mesh/facet_elements.bin          required  — u32 per boundary facet
+├── mesh/facet_faces.bin             required  — u8 per boundary facet
+├── mesh/facet_labels.bin            required  — u32 per boundary facet
+├── fields/displacement.bin          static, thermal stress   — f64 × 3 per node
+├── fields/stress.bin                static, thermal stress   — f64 × 6 per node
+├── fields/von_mises.bin             static, thermal stress   — f64 per node
+├── fields/yield_strength.bin        static, thermal stress   — f64 per node
+├── fields/contact_pressure.bin      optional                 — f64 per node
+├── fields/temperature.bin           thermal types            — f64 per node
+├── fields/heat_flux.bin             thermal types            — f64 × 3 per node
+└── fields/temperature_history.bin   transient thermal        — f64 × nodes per time
 ```
 
-Results are kept apart from the study so the study stays small and diffs cleanly, and results can be deleted and computed again. They are a cache of a solve, never a source of truth.
+Results are kept apart from the study so the study stays small and diffs cleanly, and results can be deleted and computed again. They are a cache of a solve, never a source of truth. Oxyde saves each study's results beside its study document as `<study document>-<study name>.oxyres`.
 
 ```json
 {
   "simulation": "9b2d…",
   "study": "Static 1",
+  "type": "static",
   "fingerprint": {
     "study": "fnv1a128:8c0e…",
     "documents": [
@@ -471,7 +512,7 @@ Results are kept apart from the study so the study stays small and diffs cleanly
       { "document_id": "6f1c1f6e-…", "hash": "fnv1a128:a07b…" }
     ]
   },
-  "units": { "length": "mm", "force": "N", "stress": "MPa" },
+  "units": { "length": "mm", "force": "N", "stress": "MPa", "temperature": "degC", "heat_flux": "W/m2" },
   "summary": {
     "max_von_mises": { "value": 212.5, "node": 1033 },
     "max_displacement": { "value": 0.125, "node": 87 },
@@ -490,10 +531,11 @@ Results are kept apart from the study so the study stays small and diffs cleanly
 }
 ```
 
-- **`simulation`** and **`study`**: the document id of the `.oxysim` (§8) and the name of the study in it.
+- **`simulation`** and **`study`**: the document id of the `.oxysim` (§8) and the name of the study in it. **`type`**: the study's type, as in §8 (absent: `static`); it says which fields there are.
 - **`fingerprint`**: what the results were computed from, so a reader can tell stale results. `study` is the hash of the study as `simulation.json` holds it (its name, items, mesh settings and material overrides); `documents` lists every part and assembly file the model is made of, sorted by `document_id`, with the hash of its `model.json` (a part) or `assembly.json` (an assembly: components, placements and mates) as Oxyde writes it. A hash is `fnv1a128:` and 32 lower-case hex digits: FNV-1a, 128 bits, of the entry's bytes. The results hold while every hash matches the model and study as they are now; otherwise they are out of date and should be shown as such until the study is solved again.
-- **`units`**: always `mm`, `N` and `MPa` in version 1; readers refuse others. Displacements are in mm, stresses and strengths in MPa.
-- **`summary`**: the largest von Mises stress, the largest displacement (its length) and the smallest factor of safety (strength / von Mises stress; absent when no material has a known strength), each with the node (an index into `mesh/nodes.bin`) where it is reached.
+- **`units`**: always `mm`, `N`, `MPa`, `degC` and `W/m2` (the last two absent in version 1, which had no temperatures); readers refuse others. Displacements are in mm, stresses and strengths in MPa, temperatures in °C, heat fluxes in W/m².
+- **`summary`**, what the study computed, each with the node (an index into `mesh/nodes.bin`) where it is reached: for static and thermal stress studies the largest von Mises stress, the largest displacement (its length) and the smallest factor of safety (strength / von Mises stress; absent when no material has a known strength); for thermal studies `max_temperature`, `min_temperature` and `max_heat_flux` (its length), at the end of a transient study.
+- **`times`** (transient thermal): the time, in seconds from the start, of each record of `fields/temperature_history.bin`, the start (0) first, going forward.
 - **`solver`**: for the record, free text and numbers: the program, the mesher, the solution method, iterations, the relative residual reached and the wall time in seconds.
 - **`bodies`**: the solids of the mesh, by `mesh/element_bodies.bin` index: a display `name` and the material group used (as in §8 `materials`).
 - **`labels`**: the model face each facet label stands for, written as §8 faces are (`component` and `path` in an assembly). Labels are unique; `4294967295` (`u32` max) is reserved for facets on no model face and is not listed.
@@ -505,6 +547,9 @@ The arrays:
 - `mesh/elements.bin`: tetrahedra by node index, 4 per element (linear) or 10 (quadratic): the four corners, positively oriented (the fourth on the side the first three wind counter-clockwise around), then for ten-node elements the middles of the edges 0-1, 1-2, 0-2, 0-3, 1-3 and 2-3.
 - `mesh/element_bodies.bin`: the body of each element, an index into `bodies`.
 - `mesh/facet_elements.bin`, `mesh/facet_faces.bin`, `mesh/facet_labels.bin`: the boundary facets, one record per facet across the three arrays (same count): the element, the corner the facet is opposite (0 to 3; the facet is the element's other three corners, wound counter-clockwise seen from outside: 1 2 3, 0 3 2, 0 1 3, 0 2 1) and its label.
-- `fields/displacement.bin`: mm, x y z. `fields/stress.bin`: the Cauchy stress, MPa, xx yy zz xy yz zx. `fields/von_mises.bin`: MPa. `fields/yield_strength.bin`: MPa, the strength the factor of safety is measured against at the node (the yield strength, else the tensile strength; 0 when unknown). `fields/contact_pressure.bin`: MPa, the normal pressure between bodies in contact, present when the study has contacts. All have one record per node.
+- `fields/displacement.bin`: mm, x y z. `fields/stress.bin`: the Cauchy stress, MPa, xx yy zz xy yz zx (in a thermal stress study, the stress the expansion leaves once the fixtures hold it). `fields/von_mises.bin`: MPa. `fields/yield_strength.bin`: MPa, the strength the factor of safety is measured against at the node (the yield strength, else the tensile strength; 0 when unknown). `fields/contact_pressure.bin`: MPa, the normal pressure between bodies in contact, present when the study has contacts. All have one record per node; static and thermal stress results have them, thermal results do not.
+- `fields/temperature.bin`: °C, one per node: the steady state, or the end of a transient study. `fields/heat_flux.bin`: the heat flux −k ∇T, W/m², x y z, one record per node, at the same time. Thermal, transient thermal and thermal stress results have them.
+- `fields/temperature_history.bin` (transient thermal only, and required there): one record per time of `times`, each with `components` equal to the node count: the temperature of every node at that time, °C.
+- **Version.** Static results are written with `format_version` 1; the others with 2.
 
-Readers refuse a described entry that is missing or whose length does not match, a required entry not described, a `dtype` or `components` other than the above for a known entry, field arrays whose count is not the node count, and node, element, body or label indices out of range. They ignore entries, described or not, and keys they do not know, so later versions can add fields (strains, temperatures) without a version bump.
+Readers refuse a described entry that is missing or whose length does not match, a required entry not described, a `dtype` or `components` other than the above for a known entry, field arrays whose count is not the node count, and node, element, body or label indices out of range. They ignore entries, described or not, and keys they do not know, so later versions can add fields (strains, for instance) without a version bump.

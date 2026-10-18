@@ -1,6 +1,7 @@
 //! Simulation results (`.oxyres`): the mesh a study was solved on and the fields computed
-//! at its nodes, kept apart from the study (`.oxysim`) so studies stay small and diff
-//! cleanly while results can be thrown away and computed again.
+//! at its nodes (displacements and stresses, temperatures and heat flux), kept apart from
+//! the study (`.oxysim`) so studies stay small and diff cleanly while results can be
+//! thrown away and computed again.
 //!
 //! `results.json` says which study the results belong to, a fingerprint of the model they
 //! were computed from (so stale results are detected when reopened), a summary, and
@@ -17,10 +18,13 @@ use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::simulation::{Study, StudyFace, StudyFaceDto, study_face_dto, study_face_from};
+use crate::simulation::{
+    Study, StudyFace, StudyFaceDto, StudyType, StudyTypeDto, study_face_dto, study_face_from,
+};
 use crate::{
-    AssemblyFile, DocumentKind, FormatError, MANIFEST, PartFile, assembly_json, expect_kind,
-    from_json, manifest, model_json, read_entry, read_manifest, to_json, write_file,
+    AssemblyFile, DocumentKind, FORMAT_VERSION, FormatError, MANIFEST, PartFile,
+    SIMULATION_FORMAT_VERSION, assembly_json, expect_kind, from_json, manifest_version, model_json,
+    read_entry, read_manifest, to_json, write_file,
 };
 
 /// File extension of simulation results.
@@ -42,6 +46,9 @@ const STRESS: &str = "fields/stress.bin";
 const VON_MISES: &str = "fields/von_mises.bin";
 const YIELD_STRENGTH: &str = "fields/yield_strength.bin";
 const CONTACT_PRESSURE: &str = "fields/contact_pressure.bin";
+const TEMPERATURE: &str = "fields/temperature.bin";
+const HEAT_FLUX: &str = "fields/heat_flux.bin";
+const TEMPERATURE_HISTORY: &str = "fields/temperature_history.bin";
 
 /// A results document as stored on disk.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +59,8 @@ pub struct ResultsFile {
     pub simulation_id: String,
     /// The study's name in it.
     pub study: String,
+    /// What the study computed: which fields there are.
+    pub study_type: StudyType,
     pub fingerprint: Fingerprint,
     pub summary: Summary,
     pub solver: SolverInfo,
@@ -60,7 +69,11 @@ pub struct ResultsFile {
     /// The model face each facet label stands for.
     pub labels: BTreeMap<u32, StudyFace>,
     pub mesh: ResultMesh,
+    /// Displacements and stresses: a static or thermal stress study's; empty for a
+    /// thermal one.
     pub fields: NodalFields,
+    /// Temperatures and heat flux: a thermal, transient thermal or thermal stress study's.
+    pub thermal: Option<ThermalFields>,
 }
 
 /// What the results were computed from, to tell whether they still hold.
@@ -152,16 +165,27 @@ pub fn study_hash(study: &Study) -> Result<String, FormatError> {
     Ok(content_hash(&crate::simulation::study_json(study)?))
 }
 
-/// The headline numbers, each with the node where it is reached.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The headline numbers, each with the node where it is reached; those of what the study
+/// computed.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Summary {
     /// MPa.
-    pub max_von_mises: Extreme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_von_mises: Option<Extreme>,
     /// mm, the length of the displacement.
-    pub max_displacement: Extreme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_displacement: Option<Extreme>,
     /// Absent when no material of the model has a known strength.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_factor_of_safety: Option<Extreme>,
+    /// °C, at the end of a transient study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_temperature: Option<Extreme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_temperature: Option<Extreme>,
+    /// W/m², the length of the heat flux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_heat_flux: Option<Extreme>,
 }
 
 /// A value and the node (an index into the mesh's nodes) where it is reached.
@@ -282,6 +306,32 @@ pub struct NodalFields {
     pub contact_pressure: Option<Vec<f64>>,
 }
 
+/// The temperatures and heat flux at the mesh's nodes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ThermalFields {
+    /// °C: the steady state, or the end of a transient study.
+    pub temperature: Vec<f64>,
+    /// W/m², at the same time.
+    pub heat_flux: Vec<[f64; 3]>,
+    /// A transient study's temperatures at the times kept, from the start; empty for the
+    /// others.
+    pub history: Vec<TemperatureFrame>,
+}
+
+/// The temperature of every node at one time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemperatureFrame {
+    /// s from the start.
+    pub time: f64,
+    /// °C per node.
+    pub temperature: Vec<f64>,
+}
+
+/// Whether a study of `t` computes displacements and stresses.
+fn structural(t: StudyType) -> bool {
+    t.is_structural()
+}
+
 /// Writes a results document as a ZIP archive (`.oxyres`), after checking it the way a
 /// reader would.
 pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W, FormatError> {
@@ -332,35 +382,66 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             mesh.facets.len(),
             u32s(mesh.facets.iter().map(|f| &f.label)),
         ),
-        entry(
-            DISPLACEMENT,
+    ];
+    if structural(file.study_type) {
+        entries.extend([
+            entry(
+                DISPLACEMENT,
+                Dtype::F64,
+                3,
+                fields.displacement.len(),
+                f64s(fields.displacement.iter().flatten()),
+            ),
+            entry(
+                STRESS,
+                Dtype::F64,
+                6,
+                fields.stress.len(),
+                f64s(fields.stress.iter().flatten()),
+            ),
+            entry(
+                VON_MISES,
+                Dtype::F64,
+                1,
+                fields.von_mises.len(),
+                f64s(fields.von_mises.iter()),
+            ),
+            entry(
+                YIELD_STRENGTH,
+                Dtype::F64,
+                1,
+                fields.yield_strength.len(),
+                f64s(fields.yield_strength.iter()),
+            ),
+        ]);
+    }
+    let mut times = Vec::new();
+    if let Some(t) = &file.thermal {
+        entries.push(entry(
+            TEMPERATURE,
+            Dtype::F64,
+            1,
+            t.temperature.len(),
+            f64s(t.temperature.iter()),
+        ));
+        entries.push(entry(
+            HEAT_FLUX,
             Dtype::F64,
             3,
-            fields.displacement.len(),
-            f64s(fields.displacement.iter().flatten()),
-        ),
-        entry(
-            STRESS,
-            Dtype::F64,
-            6,
-            fields.stress.len(),
-            f64s(fields.stress.iter().flatten()),
-        ),
-        entry(
-            VON_MISES,
-            Dtype::F64,
-            1,
-            fields.von_mises.len(),
-            f64s(fields.von_mises.iter()),
-        ),
-        entry(
-            YIELD_STRENGTH,
-            Dtype::F64,
-            1,
-            fields.yield_strength.len(),
-            f64s(fields.yield_strength.iter()),
-        ),
-    ];
+            t.heat_flux.len(),
+            f64s(t.heat_flux.iter().flatten()),
+        ));
+        if !t.history.is_empty() {
+            times = t.history.iter().map(|f| f.time).collect();
+            entries.push(entry(
+                TEMPERATURE_HISTORY,
+                Dtype::F64,
+                mesh.nodes.len() as u32,
+                t.history.len(),
+                f64s(t.history.iter().flat_map(|f| f.temperature.iter())),
+            ));
+        }
+    }
     if let Some(p) = &fields.contact_pressure {
         entries.push(entry(
             CONTACT_PRESSURE,
@@ -374,6 +455,7 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
     let model = ResultsDto {
         simulation: file.simulation_id.clone(),
         study: file.study.clone(),
+        study_type: StudyTypeDto::of(file.study_type),
         fingerprint: file.fingerprint.clone(),
         units: ResultUnits::default(),
         summary: file.summary.clone(),
@@ -388,9 +470,16 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             })
             .collect(),
         entries: entries.iter().map(|(e, _)| e.clone()).collect(),
+        times,
     };
 
-    let manifest = manifest(DocumentKind::SimulationResults, &file.document_id);
+    // Version 1 readers know static results only.
+    let version = if file.study_type == StudyType::Static {
+        FORMAT_VERSION
+    } else {
+        SIMULATION_FORMAT_VERSION
+    };
+    let manifest = manifest_version(DocumentKind::SimulationResults, &file.document_id, version);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
     for (name, bytes) in [
@@ -417,10 +506,15 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
     let invalid = FormatError::InvalidResults;
     if dto.units != ResultUnits::default() {
         return Err(invalid(format!(
-            "units {} {} {} (version 1 has mm, N and MPa only)",
-            dto.units.length, dto.units.force, dto.units.stress
+            "units {} {} {} {} {} (mm, N, MPa, degC and W/m2 only)",
+            dto.units.length,
+            dto.units.force,
+            dto.units.stress,
+            dto.units.temperature,
+            dto.units.heat_flux
         )));
     }
+    let study_type = dto.study_type.study_type();
 
     let mut described = BTreeMap::new();
     for e in &dto.entries {
@@ -474,19 +568,35 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
         }
         Ok(Some((bytes, e.components)))
     };
-    let mut required = |name: &'static str, dtype: Dtype, components: &[u32]| {
-        array(name, dtype, components)?.ok_or_else(|| invalid(format!("{name} is missing")))
-    };
+    let missing = |name: &str| invalid(format!("{name} is missing"));
 
-    let nodes = triples(&required(NODES, Dtype::F64, &[3])?.0);
-    let elements = match required(ELEMENTS, Dtype::U32, &[4, 10])? {
+    let nodes = triples(
+        &array(NODES, Dtype::F64, &[3])?
+            .ok_or_else(|| missing(NODES))?
+            .0,
+    );
+    let elements = match array(ELEMENTS, Dtype::U32, &[4, 10])?.ok_or_else(|| missing(ELEMENTS))? {
         (bytes, 4) => Elements::Linear(fixed(&read_u32s(&bytes))),
         (bytes, _) => Elements::Quadratic(fixed(&read_u32s(&bytes))),
     };
-    let element_bodies = read_u32s(&required(ELEMENT_BODIES, Dtype::U32, &[1])?.0);
-    let facet_elements = read_u32s(&required(FACET_ELEMENTS, Dtype::U32, &[1])?.0);
-    let facet_faces = required(FACET_FACES, Dtype::U8, &[1])?.0;
-    let facet_labels = read_u32s(&required(FACET_LABELS, Dtype::U32, &[1])?.0);
+    let element_bodies = read_u32s(
+        &array(ELEMENT_BODIES, Dtype::U32, &[1])?
+            .ok_or_else(|| missing(ELEMENT_BODIES))?
+            .0,
+    );
+    let facet_elements = read_u32s(
+        &array(FACET_ELEMENTS, Dtype::U32, &[1])?
+            .ok_or_else(|| missing(FACET_ELEMENTS))?
+            .0,
+    );
+    let facet_faces = array(FACET_FACES, Dtype::U8, &[1])?
+        .ok_or_else(|| missing(FACET_FACES))?
+        .0;
+    let facet_labels = read_u32s(
+        &array(FACET_LABELS, Dtype::U32, &[1])?
+            .ok_or_else(|| missing(FACET_LABELS))?
+            .0,
+    );
     if facet_faces.len() != facet_elements.len() || facet_labels.len() != facet_elements.len() {
         return Err(invalid(
             "the facet arrays have different lengths".to_owned(),
@@ -502,11 +612,79 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             label,
         })
         .collect();
-    let displacement = triples(&required(DISPLACEMENT, Dtype::F64, &[3])?.0);
-    let stress = fixed(&read_f64s(&required(STRESS, Dtype::F64, &[6])?.0));
-    let von_mises = read_f64s(&required(VON_MISES, Dtype::F64, &[1])?.0);
-    let yield_strength = read_f64s(&required(YIELD_STRENGTH, Dtype::F64, &[1])?.0);
-    let contact_pressure = array(CONTACT_PRESSURE, Dtype::F64, &[1])?.map(|(b, _)| read_f64s(&b));
+    let (displacement, stress, von_mises, yield_strength) = if structural(study_type) {
+        (
+            triples(
+                &array(DISPLACEMENT, Dtype::F64, &[3])?
+                    .ok_or_else(|| missing(DISPLACEMENT))?
+                    .0,
+            ),
+            fixed(&read_f64s(
+                &array(STRESS, Dtype::F64, &[6])?
+                    .ok_or_else(|| missing(STRESS))?
+                    .0,
+            )),
+            read_f64s(
+                &array(VON_MISES, Dtype::F64, &[1])?
+                    .ok_or_else(|| missing(VON_MISES))?
+                    .0,
+            ),
+            read_f64s(
+                &array(YIELD_STRENGTH, Dtype::F64, &[1])?
+                    .ok_or_else(|| missing(YIELD_STRENGTH))?
+                    .0,
+            ),
+        )
+    } else {
+        Default::default()
+    };
+    let contact_pressure = if structural(study_type) {
+        array(CONTACT_PRESSURE, Dtype::F64, &[1])?.map(|(b, _)| read_f64s(&b))
+    } else {
+        None
+    };
+    let thermal = if study_type.is_thermal() {
+        let temperature = read_f64s(
+            &array(TEMPERATURE, Dtype::F64, &[1])?
+                .ok_or_else(|| missing(TEMPERATURE))?
+                .0,
+        );
+        let heat_flux = triples(
+            &array(HEAT_FLUX, Dtype::F64, &[3])?
+                .ok_or_else(|| missing(HEAT_FLUX))?
+                .0,
+        );
+        let node_count = nodes.len() as u32;
+        let history = match array(TEMPERATURE_HISTORY, Dtype::F64, &[node_count])? {
+            Some((bytes, _)) => {
+                let values = read_f64s(&bytes);
+                let frames: Vec<&[f64]> = values.chunks(nodes.len().max(1)).collect();
+                if frames.len() != dto.times.len() {
+                    return Err(invalid(format!(
+                        "{} temperature frames for {} times",
+                        frames.len(),
+                        dto.times.len()
+                    )));
+                }
+                frames
+                    .into_iter()
+                    .zip(&dto.times)
+                    .map(|(t, &time)| TemperatureFrame {
+                        time,
+                        temperature: t.to_vec(),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        Some(ThermalFields {
+            temperature,
+            heat_flux,
+            history,
+        })
+    } else {
+        None
+    };
 
     let mut labels = BTreeMap::new();
     for l in dto.labels {
@@ -524,6 +702,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
         document_id: manifest.document_id,
         simulation_id: dto.simulation,
         study: dto.study,
+        study_type,
         fingerprint: dto.fingerprint,
         summary: dto.summary,
         solver: dto.solver,
@@ -542,6 +721,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             yield_strength,
             contact_pressure,
         },
+        thermal,
     };
     validate(&file).map_err(invalid)?;
     Ok(file)
@@ -571,6 +751,12 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
             mesh.element_bodies.len()
         ));
     }
+    // Each field there is has a value per node; the study's type says which there are.
+    let expected = if structural(file.study_type) {
+        nodes
+    } else {
+        0
+    };
     for (name, count) in [
         ("displacement", fields.displacement.len()),
         ("stress", fields.stress.len()),
@@ -578,12 +764,47 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
         ("yield_strength", fields.yield_strength.len()),
         (
             "contact_pressure",
-            fields.contact_pressure.as_ref().map_or(nodes, Vec::len),
+            fields.contact_pressure.as_ref().map_or(expected, Vec::len),
         ),
     ] {
-        if count != nodes {
-            return Err(format!("{count} {name} values for {nodes} nodes"));
+        if count != expected {
+            return Err(format!("{count} {name} values for {expected} nodes"));
         }
+    }
+    match (&file.thermal, file.study_type.is_thermal()) {
+        (Some(t), true) => {
+            if t.temperature.len() != nodes || t.heat_flux.len() != nodes {
+                return Err(format!(
+                    "{} temperatures and {} heat fluxes for {nodes} nodes",
+                    t.temperature.len(),
+                    t.heat_flux.len()
+                ));
+            }
+            let transient = file.study_type == StudyType::TransientThermal;
+            if transient == t.history.is_empty() {
+                return Err(if transient {
+                    "a transient study's results have no temperature history".to_owned()
+                } else {
+                    "a steady study's results have a temperature history".to_owned()
+                });
+            }
+            let mut last = f64::NEG_INFINITY;
+            for frame in &t.history {
+                if frame.temperature.len() != nodes {
+                    return Err(format!(
+                        "a temperature frame has {} values for {nodes} nodes",
+                        frame.temperature.len()
+                    ));
+                }
+                if !frame.time.is_finite() || frame.time < last {
+                    return Err("the frames' times do not go forward".to_owned());
+                }
+                last = frame.time;
+            }
+        }
+        (None, false) => {}
+        (Some(_), false) => return Err("static results have temperatures".to_owned()),
+        (None, true) => return Err("thermal results have no temperatures".to_owned()),
     }
     if mesh.elements.nodes().any(|n| n as usize >= nodes) {
         return Err(format!(
@@ -612,13 +833,21 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
         }
     }
     let summary = &file.summary;
+    if structural(file.study_type)
+        && (summary.max_von_mises.is_none() || summary.max_displacement.is_none())
+    {
+        return Err("the summary has no largest stress or displacement".to_owned());
+    }
     for (name, extreme) in [
-        ("max_von_mises", Some(&summary.max_von_mises)),
-        ("max_displacement", Some(&summary.max_displacement)),
+        ("max_von_mises", summary.max_von_mises.as_ref()),
+        ("max_displacement", summary.max_displacement.as_ref()),
         (
             "min_factor_of_safety",
             summary.min_factor_of_safety.as_ref(),
         ),
+        ("max_temperature", summary.max_temperature.as_ref()),
+        ("min_temperature", summary.min_temperature.as_ref()),
+        ("max_heat_flux", summary.max_heat_flux.as_ref()),
     ] {
         let Some(extreme) = extreme else { continue };
         if !extreme.value.is_finite() {
@@ -643,6 +872,13 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
 struct ResultsDto {
     simulation: String,
     study: String,
+    /// Absent in version 1: static.
+    #[serde(
+        rename = "type",
+        default,
+        skip_serializing_if = "StudyTypeDto::is_static"
+    )]
+    study_type: StudyTypeDto,
     fingerprint: Fingerprint,
     units: ResultUnits,
     summary: Summary,
@@ -652,6 +888,9 @@ struct ResultsDto {
     #[serde(default)]
     labels: Vec<LabelDto>,
     entries: Vec<EntryDto>,
+    /// s: the times of a transient study's temperature frames.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    times: Vec<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -659,6 +898,18 @@ struct ResultUnits {
     length: String,
     force: String,
     stress: String,
+    #[serde(default = "degrees_celsius")]
+    temperature: String,
+    #[serde(default = "watts_per_square_metre")]
+    heat_flux: String,
+}
+
+fn degrees_celsius() -> String {
+    "degC".to_owned()
+}
+
+fn watts_per_square_metre() -> String {
+    "W/m2".to_owned()
 }
 
 impl Default for ResultUnits {
@@ -667,6 +918,8 @@ impl Default for ResultUnits {
             length: "mm".to_owned(),
             force: "N".to_owned(),
             stress: "MPa".to_owned(),
+            temperature: degrees_celsius(),
+            heat_flux: watts_per_square_metre(),
         }
     }
 }
@@ -761,7 +1014,6 @@ fn fixed<T: Copy, const N: usize>(values: &[T]) -> Vec<[T; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FORMAT_VERSION;
     use oxyde_assembly::ComponentId;
     use oxyde_model::{FaceName, FeatureId};
 
@@ -796,6 +1048,7 @@ mod tests {
             document_id: crate::new_document_id(),
             simulation_id: "55555555-5555-5555-5555-555555555555".to_owned(),
             study: "Static 1".to_owned(),
+            study_type: StudyType::Static,
             fingerprint: Fingerprint::new(
                 "fnv1a128:00".to_owned(),
                 vec![
@@ -810,18 +1063,19 @@ mod tests {
                 ],
             ),
             summary: Summary {
-                max_von_mises: Extreme {
+                max_von_mises: Some(Extreme {
                     value: 212.5,
                     node: 4,
-                },
-                max_displacement: Extreme {
+                }),
+                max_displacement: Some(Extreme {
                     value: 0.125,
                     node: 3,
-                },
+                }),
                 min_factor_of_safety: Some(Extreme {
                     value: 1.25,
                     node: 4,
                 }),
+                ..Summary::default()
             },
             solver: SolverInfo {
                 program: "oxyde 0.0.6".to_owned(),
@@ -873,7 +1127,119 @@ mod tests {
                 yield_strength: vec![275.0; n],
                 contact_pressure: Some(vec![0.0, 0.5, 0.5, 0.5, 0.0]),
             },
+            thermal: None,
         }
+    }
+
+    /// The sample as a transient thermal study's results: temperatures only.
+    fn transient_sample() -> ResultsFile {
+        let mut file = sample();
+        let n = file.mesh.nodes.len();
+        file.study = "Transient 1".to_owned();
+        file.study_type = StudyType::TransientThermal;
+        file.fields = NodalFields::default();
+        let at = |time: f64| TemperatureFrame {
+            time,
+            temperature: (0..n).map(|i| 20.0 + time * i as f64).collect(),
+        };
+        file.thermal = Some(ThermalFields {
+            temperature: at(30.0).temperature,
+            heat_flux: (0..n).map(|i| [i as f64 * 100.0, 0.0, -5.0]).collect(),
+            history: vec![at(0.0), at(15.0), at(30.0)],
+        });
+        file.summary = Summary {
+            max_temperature: Some(Extreme {
+                value: 140.0,
+                node: 4,
+            }),
+            min_temperature: Some(Extreme {
+                value: 20.0,
+                node: 0,
+            }),
+            max_heat_flux: Some(Extreme {
+                value: 400.0,
+                node: 4,
+            }),
+            ..Summary::default()
+        };
+        file
+    }
+
+    #[test]
+    fn thermal_results_round_trip() {
+        let file = transient_sample();
+        let written = bytes(&file);
+        assert_eq!(read_results(Cursor::new(&written)).unwrap(), file);
+        let mut archive = ZipArchive::new(Cursor::new(&written)).unwrap();
+        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        assert!(names.iter().all(|n| n != STRESS && n != DISPLACEMENT));
+        assert!(names.iter().any(|n| n == TEMPERATURE_HISTORY));
+        let json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert_eq!(json["type"], "transient_thermal");
+        assert_eq!(json["times"], serde_json::json!([0.0, 15.0, 30.0]));
+        assert_eq!(json["units"]["temperature"], "degC");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 2);
+        let history = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == TEMPERATURE_HISTORY)
+            .unwrap();
+        assert_eq!(
+            (&history["count"], &history["components"]),
+            (&3.into(), &5.into())
+        );
+
+        // A steady study's: no history.
+        let mut steady = transient_sample();
+        steady.study_type = StudyType::Thermal;
+        if let Some(t) = steady.thermal.as_mut() {
+            t.history.clear();
+        }
+        assert_eq!(read_results(Cursor::new(bytes(&steady))).unwrap(), steady);
+        // A thermal stress study's: both.
+        let mut both = sample();
+        both.study_type = StudyType::ThermalStress;
+        both.thermal = steady.thermal.clone();
+        assert_eq!(read_results(Cursor::new(bytes(&both))).unwrap(), both);
+        // Static results are version 1, as before.
+        let mut archive = ZipArchive::new(Cursor::new(bytes(&sample()))).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 1);
+    }
+
+    #[test]
+    fn inconsistent_thermal_results_are_not_written() {
+        let refused =
+            |file: ResultsFile, why: &str| match write_results(Cursor::new(Vec::new()), &file) {
+                Err(FormatError::InvalidResults(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected invalid results ({why}), got {other:?}"),
+            };
+        let mut no_history = transient_sample();
+        if let Some(t) = no_history.thermal.as_mut() {
+            t.history.clear();
+        }
+        refused(no_history, "no temperature history");
+        let mut backwards = transient_sample();
+        if let Some(t) = backwards.thermal.as_mut() {
+            t.history.swap(0, 2);
+        }
+        refused(backwards, "do not go forward");
+        let mut short = transient_sample();
+        if let Some(t) = short.thermal.as_mut() {
+            t.temperature.pop();
+        }
+        refused(short, "4 temperatures");
+        let mut stressed = transient_sample();
+        stressed.fields = sample().fields;
+        refused(stressed, "values for 0 nodes");
+        let mut cold = sample();
+        cold.thermal = transient_sample().thermal;
+        refused(cold, "static results have temperatures");
     }
 
     fn bytes(file: &ResultsFile) -> Vec<u8> {
@@ -1061,8 +1427,8 @@ mod tests {
             MANIFEST,
             text_edit(|m| {
                 m.replace(
-                    &format!("\"format_version\": {FORMAT_VERSION}"),
-                    &format!("\"format_version\": {}", FORMAT_VERSION + 1),
+                    "\"format_version\": 1",
+                    &format!("\"format_version\": {}", SIMULATION_FORMAT_VERSION + 1),
                 )
             }),
         );
@@ -1093,7 +1459,9 @@ mod tests {
     #[test]
     fn what_a_reader_would_refuse_is_not_written() {
         let mut file = sample();
-        file.summary.max_von_mises.value = f64::INFINITY;
+        if let Some(e) = file.summary.max_von_mises.as_mut() {
+            e.value = f64::INFINITY;
+        }
         assert!(matches!(
             write_results(Cursor::new(Vec::new()), &file),
             Err(FormatError::InvalidResults(_))

@@ -1,6 +1,7 @@
-//! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it, how its
-//! bodies touch, how it is meshed and which mechanical properties the study uses instead of
-//! the materials' own.
+//! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it (forces
+//! and pressures, or heat), how its bodies touch, how it is meshed and which mechanical and
+//! thermal properties the study uses instead of the materials' own. A document holds any
+//! number of studies of four types: static, thermal, transient thermal and thermal stress.
 //!
 //! A study document refers to the model it studies (a part or an assembly file, by relative
 //! path and document id) and to its faces by persistent name, never by index, so a study
@@ -15,15 +16,15 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::Path;
 
 use oxyde_assembly::ComponentId;
-use oxyde_model::{FaceName, Mechanical};
+use oxyde_model::{FaceName, Mechanical, Thermal};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::schema::{FaceRefDto, MechanicalDto, face_dto, face_from};
+use crate::schema::{FaceRefDto, MechanicalDto, ThermalDto, face_dto, face_from};
 use crate::{
-    DocumentKind, FormatError, MANIFEST, expect_kind, from_json, manifest, new_document_id,
-    read_entry, read_manifest, to_json, write_file,
+    DocumentKind, FORMAT_VERSION, FormatError, MANIFEST, SIMULATION_FORMAT_VERSION, expect_kind,
+    from_json, manifest_version, new_document_id, read_entry, read_manifest, to_json, write_file,
 };
 
 /// File extension of simulation studies.
@@ -105,6 +106,46 @@ pub enum StudyType {
     /// Linear static stress: displacements, stresses and the factor of safety.
     #[default]
     Static,
+    /// The temperatures once heat flow has settled (steady state).
+    Thermal,
+    /// The temperatures over time, from a uniform start ([`Study::transient`]).
+    TransientThermal,
+    /// The steady temperatures, then the stresses of the expansion they cause with the
+    /// fixtures and loads of a static study ([`Study::reference_temperature`]).
+    ThermalStress,
+}
+
+impl StudyType {
+    /// Whether it takes fixtures, forces, pressures and gravity.
+    pub fn is_structural(self) -> bool {
+        matches!(self, StudyType::Static | StudyType::ThermalStress)
+    }
+
+    /// Whether it takes thermal loads.
+    pub fn is_thermal(self) -> bool {
+        !matches!(self, StudyType::Static)
+    }
+}
+
+/// How a transient thermal study marches in time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TransientSettings {
+    /// s.
+    pub duration: f64,
+    /// Time steps over the duration.
+    pub steps: u32,
+    /// The uniform temperature the model starts at, °C.
+    pub initial_temperature: f64,
+}
+
+impl Default for TransientSettings {
+    fn default() -> Self {
+        Self {
+            duration: 60.0,
+            steps: 60,
+            initial_temperature: 20.0,
+        }
+    }
 }
 
 /// One study: fixtures, loads, contacts, mesh settings and material overrides.
@@ -120,19 +161,34 @@ pub struct Study {
     /// Mechanical properties this study uses instead of the material's, by material
     /// group: a material name, or `part:` and a document id for a part without one.
     pub materials: BTreeMap<String, Mechanical>,
+    /// Thermal properties this study uses instead of the material's, by material group.
+    pub thermal_materials: BTreeMap<String, Thermal>,
+    /// A transient thermal study's time steps; ignored by the other types.
+    pub transient: TransientSettings,
+    /// The temperature at which a thermal stress study's model is free of stress, °C;
+    /// ignored by the other types.
+    pub reference_temperature: f64,
 }
 
 impl Study {
     /// An empty static study.
     pub fn new(name: &str) -> Self {
+        Self::of_type(name, StudyType::Static)
+    }
+
+    /// An empty study of `study_type`.
+    pub fn of_type(name: &str, study_type: StudyType) -> Self {
         Self {
             name: name.to_owned(),
-            study_type: StudyType::Static,
+            study_type,
             fixtures: Vec::new(),
             loads: Vec::new(),
             contacts: Vec::new(),
             mesh: MeshSettings::default(),
             materials: BTreeMap::new(),
+            thermal_materials: BTreeMap::new(),
+            transient: TransientSettings::default(),
+            reference_temperature: 20.0,
         }
     }
 }
@@ -177,6 +233,38 @@ pub enum LoadKind {
     Pressure { faces: Vec<StudyFace>, mpa: f64 },
     /// The model's weight: an acceleration in m/s² in world coordinates (Y up).
     Gravity { acceleration: [f64; 3] },
+    /// The faces held at a temperature, °C.
+    Temperature { faces: Vec<StudyFace>, celsius: f64 },
+    /// A total heat flow into the faces, W, shared by area; negative takes heat out.
+    HeatPower { faces: Vec<StudyFace>, watts: f64 },
+    /// A heat flux into the faces, W/m²; negative takes heat out.
+    HeatFlux { faces: Vec<StudyFace>, flux: f64 },
+    /// Convection from the faces to a fluid at `ambient` °C, the film coefficient in
+    /// W/(m²·K).
+    Convection {
+        faces: Vec<StudyFace>,
+        coefficient: f64,
+        ambient: f64,
+    },
+    /// Radiation from the faces to surroundings at `ambient` °C, an emissivity from 0 to 1.
+    Radiation {
+        faces: Vec<StudyFace>,
+        emissivity: f64,
+        ambient: f64,
+    },
+    /// Heat made inside the bodies the faces belong to, W in all, spread through their
+    /// volume.
+    InternalHeat { faces: Vec<StudyFace>, watts: f64 },
+}
+
+impl LoadKind {
+    /// Whether it is a thermal load (a static study takes none of them).
+    pub fn is_thermal(&self) -> bool {
+        !matches!(
+            self,
+            LoadKind::Force { .. } | LoadKind::Pressure { .. } | LoadKind::Gravity { .. }
+        )
+    }
 }
 
 /// Along what a force pushes.
@@ -267,12 +355,30 @@ pub enum MeshSize {
     ElementSize(f64),
 }
 
+/// The `format_version` `file` is written with: 2 when a study is not static (version 1
+/// readers would refuse it anyway), else 1, which readers of version 1 still open.
+pub fn simulation_version(file: &SimulationFile) -> u32 {
+    if file
+        .studies
+        .iter()
+        .any(|s| s.study_type != StudyType::Static)
+    {
+        SIMULATION_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
+}
+
 /// Writes a simulation document as a ZIP archive (`.oxysim`).
 pub fn write_simulation<W: Write + Seek>(
     writer: W,
     file: &SimulationFile,
 ) -> Result<W, FormatError> {
-    let manifest = manifest(DocumentKind::Simulation, &file.document_id);
+    let manifest = manifest_version(
+        DocumentKind::Simulation,
+        &file.document_id,
+        simulation_version(file),
+    );
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
     for (entry, bytes) in [
@@ -367,12 +473,62 @@ struct StudyDto {
     mesh: MeshDto,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     materials: BTreeMap<String, MechanicalDto>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    thermal_materials: BTreeMap<String, ThermalDto>,
+    /// Only in a transient thermal study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transient: Option<TransientDto>,
+    /// °C; only in a thermal stress study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_temperature: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StudyTypeDto {
+    #[default]
+    Static,
+    Thermal,
+    TransientThermal,
+    ThermalStress,
+}
+
+impl StudyTypeDto {
+    pub(crate) fn of(t: StudyType) -> Self {
+        match t {
+            StudyType::Static => StudyTypeDto::Static,
+            StudyType::Thermal => StudyTypeDto::Thermal,
+            StudyType::TransientThermal => StudyTypeDto::TransientThermal,
+            StudyType::ThermalStress => StudyTypeDto::ThermalStress,
+        }
+    }
+
+    pub(crate) fn study_type(self) -> StudyType {
+        match self {
+            StudyTypeDto::Static => StudyType::Static,
+            StudyTypeDto::Thermal => StudyType::Thermal,
+            StudyTypeDto::TransientThermal => StudyType::TransientThermal,
+            StudyTypeDto::ThermalStress => StudyType::ThermalStress,
+        }
+    }
+
+    pub(crate) fn is_static(&self) -> bool {
+        *self == StudyTypeDto::Static
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum StudyTypeDto {
-    Static,
+struct TransientDto {
+    /// s.
+    duration: f64,
+    steps: u32,
+    /// °C.
+    #[serde(default = "default_initial")]
+    initial_temperature: f64,
+}
+
+fn default_initial() -> f64 {
+    20.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +576,44 @@ enum LoadKindDto {
     },
     /// m/s².
     Gravity { acceleration: [f64; 3] },
+    /// °C.
+    Temperature {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        temperature: f64,
+    },
+    /// W.
+    HeatPower {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        power: f64,
+    },
+    /// W/m².
+    HeatFlux {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        flux: f64,
+    },
+    /// W/(m²·K) and °C.
+    Convection {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        coefficient: f64,
+        ambient: f64,
+    },
+    /// 0 to 1, and °C.
+    Radiation {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        emissivity: f64,
+        ambient: f64,
+    },
+    /// W, in the bodies of the faces.
+    InternalHeat {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        power: f64,
+    },
 }
 
 /// `"normal"` or a vector.
@@ -536,9 +730,7 @@ fn faces_dto(faces: &[StudyFace]) -> Vec<StudyFaceDto> {
 fn study_dto(study: &Study) -> StudyDto {
     StudyDto {
         name: study.name.clone(),
-        study_type: match study.study_type {
-            StudyType::Static => StudyTypeDto::Static,
-        },
+        study_type: StudyTypeDto::of(study.study_type),
         fixtures: study
             .fixtures
             .iter()
@@ -576,6 +768,40 @@ fn study_dto(study: &Study) -> StudyDto {
                     },
                     LoadKind::Gravity { acceleration } => LoadKindDto::Gravity {
                         acceleration: *acceleration,
+                    },
+                    LoadKind::Temperature { faces, celsius } => LoadKindDto::Temperature {
+                        faces: faces_dto(faces),
+                        temperature: *celsius,
+                    },
+                    LoadKind::HeatPower { faces, watts } => LoadKindDto::HeatPower {
+                        faces: faces_dto(faces),
+                        power: *watts,
+                    },
+                    LoadKind::HeatFlux { faces, flux } => LoadKindDto::HeatFlux {
+                        faces: faces_dto(faces),
+                        flux: *flux,
+                    },
+                    LoadKind::Convection {
+                        faces,
+                        coefficient,
+                        ambient,
+                    } => LoadKindDto::Convection {
+                        faces: faces_dto(faces),
+                        coefficient: *coefficient,
+                        ambient: *ambient,
+                    },
+                    LoadKind::Radiation {
+                        faces,
+                        emissivity,
+                        ambient,
+                    } => LoadKindDto::Radiation {
+                        faces: faces_dto(faces),
+                        emissivity: *emissivity,
+                        ambient: *ambient,
+                    },
+                    LoadKind::InternalHeat { faces, watts } => LoadKindDto::InternalHeat {
+                        faces: faces_dto(faces),
+                        power: *watts,
                     },
                 },
                 suppressed: l.suppressed,
@@ -637,6 +863,27 @@ fn study_dto(study: &Study) -> StudyDto {
                 )
             })
             .collect(),
+        thermal_materials: study
+            .thermal_materials
+            .iter()
+            .map(|(group, t)| {
+                (
+                    group.clone(),
+                    ThermalDto {
+                        conductivity: t.conductivity,
+                        specific_heat: t.specific_heat,
+                        expansion: t.expansion,
+                    },
+                )
+            })
+            .collect(),
+        transient: (study.study_type == StudyType::TransientThermal).then_some(TransientDto {
+            duration: study.transient.duration,
+            steps: study.transient.steps,
+            initial_temperature: study.transient.initial_temperature,
+        }),
+        reference_temperature: (study.study_type == StudyType::ThermalStress)
+            .then_some(study.reference_temperature),
     }
 }
 
@@ -722,7 +969,17 @@ fn finite_vector(v: [f64; 3], what: &str) -> Result<[f64; 3], String> {
     }
 }
 
+/// A temperature in °C, not under absolute zero.
+fn celsius(value: f64, what: &str) -> Result<f64, String> {
+    let value = finite(value, what)?;
+    if value < -273.15 {
+        return Err(format!("{what} is below absolute zero"));
+    }
+    Ok(value)
+}
+
 fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
+    let study_type = dto.study_type.study_type();
     // Fixtures, loads and contacts share one set of names, as in SolidWorks' study tree.
     let mut names = BTreeSet::new();
     let mut named = |name: &str| -> Result<(), String> {
@@ -735,6 +992,9 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         }
     };
 
+    if !study_type.is_structural() && !dto.fixtures.is_empty() {
+        return Err("a thermal study has fixtures".to_owned());
+    }
     let mut fixtures = Vec::with_capacity(dto.fixtures.len());
     for f in dto.fixtures {
         named(&f.name)?;
@@ -779,7 +1039,61 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             LoadKindDto::Gravity { acceleration } => LoadKind::Gravity {
                 acceleration: finite_vector(acceleration, "the acceleration").map_err(item)?,
             },
+            LoadKindDto::Temperature { faces, temperature } => LoadKind::Temperature {
+                faces: faces_from(faces, kind).map_err(item)?,
+                celsius: celsius(temperature, "the temperature").map_err(item)?,
+            },
+            LoadKindDto::HeatPower { faces, power } => LoadKind::HeatPower {
+                faces: faces_from(faces, kind).map_err(item)?,
+                watts: finite(power, "the power").map_err(item)?,
+            },
+            LoadKindDto::HeatFlux { faces, flux } => LoadKind::HeatFlux {
+                faces: faces_from(faces, kind).map_err(item)?,
+                flux: finite(flux, "the flux").map_err(item)?,
+            },
+            LoadKindDto::Convection {
+                faces,
+                coefficient,
+                ambient,
+            } => {
+                let coefficient = finite(coefficient, "the film coefficient").map_err(item)?;
+                if coefficient < 0.0 {
+                    return Err(item("the film coefficient is negative".to_owned()));
+                }
+                LoadKind::Convection {
+                    faces: faces_from(faces, kind).map_err(item)?,
+                    coefficient,
+                    ambient: celsius(ambient, "the fluid's temperature").map_err(item)?,
+                }
+            }
+            LoadKindDto::Radiation {
+                faces,
+                emissivity,
+                ambient,
+            } => {
+                let emissivity = finite(emissivity, "the emissivity").map_err(item)?;
+                if !(0.0..=1.0).contains(&emissivity) {
+                    return Err(item("the emissivity is not between 0 and 1".to_owned()));
+                }
+                LoadKind::Radiation {
+                    faces: faces_from(faces, kind).map_err(item)?,
+                    emissivity,
+                    ambient: celsius(ambient, "the surroundings' temperature").map_err(item)?,
+                }
+            }
+            LoadKindDto::InternalHeat { faces, power } => LoadKind::InternalHeat {
+                faces: faces_from(faces, kind).map_err(item)?,
+                watts: finite(power, "the power").map_err(item)?,
+            },
         };
+        if load_kind.is_thermal() && !study_type.is_thermal() {
+            return Err(item("a static study has a thermal load".to_owned()));
+        }
+        if !load_kind.is_thermal() && !study_type.is_structural() {
+            return Err(item(
+                "a thermal study has a force, a pressure or gravity".to_owned(),
+            ));
+        }
         loads.push(Load {
             name: l.name,
             kind: load_kind,
@@ -864,11 +1178,47 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         }
     }
 
+    let mut thermal_materials = BTreeMap::new();
+    for (group, t) in dto.thermal_materials {
+        if group.is_empty() {
+            return Err("a material override names no material".to_owned());
+        }
+        let thermal = Thermal::new(t.conductivity, t.specific_heat, t.expansion);
+        // As for mechanical overrides: unusable values are dropped.
+        if thermal.is_valid() {
+            thermal_materials.insert(group, thermal);
+        }
+    }
+    let transient = match (study_type, dto.transient) {
+        (StudyType::TransientThermal, Some(t)) => {
+            let duration = finite(t.duration, "the duration")?;
+            if duration <= 0.0 {
+                return Err("the duration is not positive".to_owned());
+            }
+            if !(1..=100_000).contains(&t.steps) {
+                return Err("the time steps are not from 1 to 100 000".to_owned());
+            }
+            TransientSettings {
+                duration,
+                steps: t.steps,
+                initial_temperature: celsius(t.initial_temperature, "the initial temperature")?,
+            }
+        }
+        (StudyType::TransientThermal, None) => TransientSettings::default(),
+        (_, Some(_)) => return Err("only a transient thermal study has time steps".to_owned()),
+        (_, None) => TransientSettings::default(),
+    };
+    let reference_temperature = match (study_type, dto.reference_temperature) {
+        (StudyType::ThermalStress, Some(t)) => celsius(t, "the reference temperature")?,
+        (_, Some(_)) => {
+            return Err("only a thermal stress study has a reference temperature".to_owned());
+        }
+        (_, None) => 20.0,
+    };
+
     Ok(Study {
         name: dto.name,
-        study_type: match dto.study_type {
-            StudyTypeDto::Static => StudyType::Static,
-        },
+        study_type,
         fixtures,
         loads,
         contacts,
@@ -884,13 +1234,15 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             size,
         },
         materials,
+        thermal_materials,
+        transient,
+        reference_temperature,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FORMAT_VERSION;
     use oxyde_model::FeatureId;
 
     fn face(feature: u32) -> FaceName {
@@ -993,6 +1345,84 @@ mod tests {
             "part:11111111-1111-1111-1111-111111111111".to_owned(),
             Mechanical::new(2000.0, 0.35, 0.0, 0.0),
         );
+        let mut thermal = Study::of_type("Transient 1", StudyType::TransientThermal);
+        thermal.transient = TransientSettings {
+            duration: 120.0,
+            steps: 40,
+            initial_temperature: 25.0,
+        };
+        thermal.loads = vec![
+            Load {
+                name: "Temperature-1".to_owned(),
+                kind: LoadKind::Temperature {
+                    faces: vec![base(2)],
+                    celsius: 80.0,
+                },
+                suppressed: false,
+            },
+            Load {
+                name: "Heat Power-1".to_owned(),
+                kind: LoadKind::HeatPower {
+                    faces: vec![base(3)],
+                    watts: 12.5,
+                },
+                suppressed: false,
+            },
+            Load {
+                name: "Heat Flux-1".to_owned(),
+                kind: LoadKind::HeatFlux {
+                    faces: vec![base(4)],
+                    flux: -1500.0,
+                },
+                suppressed: false,
+            },
+            Load {
+                name: "Convection-1".to_owned(),
+                kind: LoadKind::Convection {
+                    faces: vec![base(5)],
+                    coefficient: 25.0,
+                    ambient: 20.0,
+                },
+                suppressed: false,
+            },
+            Load {
+                name: "Radiation-1".to_owned(),
+                kind: LoadKind::Radiation {
+                    faces: vec![base(6)],
+                    emissivity: 0.9,
+                    ambient: 15.0,
+                },
+                suppressed: true,
+            },
+            Load {
+                name: "Internal Heat-1".to_owned(),
+                kind: LoadKind::InternalHeat {
+                    faces: vec![base(7)],
+                    watts: 5.0,
+                },
+                suppressed: false,
+            },
+        ];
+        thermal.thermal_materials.insert(
+            "Copper (C110)".to_owned(),
+            Thermal::new(391.0, 385.0, 17e-6),
+        );
+        let mut stress = Study::of_type("Thermal Stress 1", StudyType::ThermalStress);
+        stress.reference_temperature = 22.0;
+        stress.fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: vec![base(2)],
+            suppressed: false,
+        });
+        stress.loads.push(Load {
+            name: "Temperature-1".to_owned(),
+            kind: LoadKind::Temperature {
+                faces: vec![base(3)],
+                celsius: 150.0,
+            },
+            suppressed: false,
+        });
         let mut second = Study::new("Static 2");
         second.contacts.push(Contact {
             name: "Contact-1".to_owned(),
@@ -1003,7 +1433,7 @@ mod tests {
             detection: ContactDetection::Manual,
             suppressed: false,
         });
-        file.studies = vec![study, second];
+        file.studies = vec![study, second, thermal, stress];
         file
     }
 
@@ -1099,6 +1529,47 @@ mod tests {
         // Unknown strengths are left out, as in a material's own block.
         let part_group = &study["materials"]["part:11111111-1111-1111-1111-111111111111"];
         assert!(part_group.get("yield_strength").is_none());
+        assert!(study.get("transient").is_none() && study.get("reference_temperature").is_none());
+
+        let thermal = &v["studies"][2];
+        assert_eq!(thermal["type"], "transient_thermal");
+        assert_eq!(thermal["transient"]["duration"], 120.0);
+        assert_eq!(thermal["transient"]["steps"], 40);
+        assert_eq!(thermal["transient"]["initial_temperature"], 25.0);
+        let loads = &thermal["loads"];
+        assert_eq!(loads[0]["type"], "temperature");
+        assert_eq!(loads[0]["temperature"], 80.0);
+        assert_eq!(loads[1]["type"], "heat_power");
+        assert_eq!(loads[1]["power"], 12.5);
+        assert_eq!(loads[2]["type"], "heat_flux");
+        assert_eq!(loads[2]["flux"], -1500.0);
+        assert_eq!(loads[3]["type"], "convection");
+        assert_eq!(
+            (&loads[3]["coefficient"], &loads[3]["ambient"]),
+            (&serde_json::json!(25.0), &serde_json::json!(20.0))
+        );
+        assert_eq!(loads[4]["type"], "radiation");
+        assert_eq!(loads[4]["emissivity"], 0.9);
+        assert_eq!(loads[5]["type"], "internal_heat");
+        assert_eq!(
+            thermal["thermal_materials"]["Copper (C110)"]["conductivity"],
+            391.0
+        );
+        let stress = &v["studies"][3];
+        assert_eq!(stress["type"], "thermal_stress");
+        assert_eq!(stress["reference_temperature"], 22.0);
+    }
+
+    #[test]
+    fn static_studies_are_written_as_version_1() {
+        let mut file = sample();
+        assert_eq!(simulation_version(&file), 2);
+        file.studies.truncate(2);
+        assert_eq!(simulation_version(&file), 1);
+        let mut archive = ZipArchive::new(Cursor::new(bytes(&file))).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 1);
     }
 
     #[test]
@@ -1135,8 +1606,8 @@ mod tests {
         let good = bytes(&sample());
         let newer = edited(&good, MANIFEST, |m| {
             m.replace(
-                &format!("\"format_version\": {FORMAT_VERSION}"),
-                &format!("\"format_version\": {}", FORMAT_VERSION + 1),
+                &format!("\"format_version\": {SIMULATION_FORMAT_VERSION}"),
+                &format!("\"format_version\": {}", SIMULATION_FORMAT_VERSION + 1),
             )
         });
         assert!(matches!(
@@ -1171,7 +1642,10 @@ mod tests {
             &|s| s.replace("\"assembly\"", "\"part\""),
             "names a component",
         );
-        refused(&|s| s.replace("2.5", "-1"), "element size");
+        refused(
+            &|s| s.replace("\"element_size\": 2.5", "\"element_size\": -1"),
+            "element size",
+        );
         refused(&|s| s.replace("0.05", "0"), "tolerance");
         refused(
             &|s| s.replace("\"offset\": 0.4", "\"offset\": -0.4"),
@@ -1181,7 +1655,27 @@ mod tests {
             &|s| s.replace("\"direction\": \"normal\"", "\"direction\": [0, 0, 0]"),
             "zero vector",
         );
-        // An unknown study or contact type is an error in version 1, as unknown features are.
+        refused(
+            &|s| s.replace("\"emissivity\": 0.9", "\"emissivity\": 1.5"),
+            "emissivity",
+        );
+        refused(
+            &|s| s.replace("\"temperature\": 80.0", "\"temperature\": -300.0"),
+            "absolute zero",
+        );
+        refused(
+            &|s| s.replace("\"steps\": 40", "\"steps\": 0"),
+            "time steps",
+        );
+        refused(
+            &|s| s.replace("\"type\": \"transient_thermal\"", "\"type\": \"static\""),
+            "thermal load",
+        );
+        refused(
+            &|s| s.replace("\"type\": \"thermal_stress\"", "\"type\": \"thermal\""),
+            "fixtures",
+        );
+        // An unknown study or contact type is an error, as unknown features are.
         assert!(matches!(
             read_simulation(Cursor::new(
                 edited(&good, SIMULATION, |s| s.replace("\"static\"", "\"modal\""))

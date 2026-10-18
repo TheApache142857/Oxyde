@@ -358,4 +358,51 @@ is still open:
   for curved parts. A Netgen cantilever is tested against beam theory
   (`oxyde-tests/tests/simulation.rs`).
 
-Still to do, in the order of §3: the owner's decisions of §5, then probing, a report, mesh controls and the other study types.
+Still to do, in the order of §3: probing, a report, mesh controls, frequency and buckling studies.
+
+## 7. Studies and thermal studies
+
+**Decided (October 2026):** the tab opens on *New Study*, as Fusion 360's does, and a model
+has any number of studies, saved together in its `.oxysim`; thermal studies are steady,
+transient and thermal stress, with every boundary condition of SolidWorks and Fusion
+(fixed temperature, heat power and flux, convection, radiation, internal heat);
+materials carry their thermal properties (`thermal` in FORMAT.md §3) and studies and
+results files with a thermal study are `format_version` 2.
+
+- **Several studies.** The open study stays where the tab's code expects it
+  (`SimulationView::study`, `done`); the others wait in `others`, in order, each with its
+  results, so switching keeps every study's results. New studies are numbered per type
+  (`Static 1`, `Thermal 2`). Each study's results go to `<study file>-<study>.oxyres`.
+- **The thermal solver** (`oxyde_sim::thermal`): `ρc ∂T/∂t = ∇·(k ∇T) + Q` on the static
+  solve's four- and ten-node tetrahedra. Conduction is integrated as the stiffness is;
+  the heat capacity `∫ ρc Nₐ N_b` exactly, from the integrals of barycentric monomials;
+  boundary terms on the facets' triangles with a seven-point rule exact to degree 5.
+  Fixed temperatures are eliminated (their columns move to the right-hand side).
+  Convection adds `∫ h Nₐ N_b` and `∫ h T∞ Nₐ`. Radiation, `εσ (T⁴ − T∞⁴)`, is solved by
+  Newton's method from 20 °C or more (convex in T, so the iterates come down steadily);
+  its Jacobian `∫ 4εσ T³ Nₐ N_b` is symmetric and positive, so each Newton step is a
+  conduction problem. Contacts reuse the static pairing with a conductance of `30 k / h`
+  per area and the same augmented Lagrangian (a scalar multiplier per slave node), so
+  heat crosses every contact as a perfect bond. Transient studies march by backward
+  Euler, stable at any step, from a uniform temperature, keeping about a hundred evenly
+  spaced sets of temperatures. The heat flux `−k ∇T` is averaged at the nodes as the
+  stresses are. A steady study whose piece of the mesh has no fixed temperature,
+  convection or radiation is refused (its temperature level is undefined).
+- **Multigrid for temperatures.** `amg::Multigrid` takes the number of near-null modes:
+  six rigid motions for elasticity, one (a uniform temperature, zero at fixed nodes) for
+  conduction. The hierarchy is built once per matrix: once for a whole steady or
+  transient study without radiation, once per Newton step with it.
+- **Thermal stress.** The steady temperatures, then `solve_thermal_stress`: the load
+  `∫ ∇Nₐ (3λ + 2μ) α ΔT dV` with ΔT interpolated at the integration points, and the
+  same hydrostatic stress taken out of the recovered stresses, so a part free to grow is
+  unstressed and a held one carries `−E α ΔT` along the held direction.
+- **Tests**, against closed forms: a bar between two temperatures (linear profile, the
+  flux `k ΔT / L` to 0.1 %), heat in at one end (`P L / kA`), internal heat (the parabola
+  `Q x (L − x) / 2k`, exact on ten-node elements), convection in series with conduction,
+  radiation balancing a heat input (`T⁴ = P / σA` to a millikelvin), a cooling bar's first
+  two modes in a transient study (within 1 % with 200 steps), refusals (no anchoring, no
+  heat capacity), heat across a contact between blocks meshed apart, 60 000 nodes in
+  under 60 iterations; a heated bar free to grow (unstressed, grows `α ΔT L`) and held
+  (`−E α ΔT`). Through OpenCASCADE: a bar part held at one end and convected at the other,
+  in one body and in two bodies tied by a detected contact, against the series
+  resistances.

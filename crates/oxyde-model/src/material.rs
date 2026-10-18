@@ -6,7 +6,8 @@
 //! gives the part's mass, and its name goes to the bill of materials. Materials come from a
 //! library (the user's, saved next to the preferences) and are copied into the part when
 //! applied, so a part file stays self-contained. A material may also say how it behaves
-//! under load ([`Mechanical`]), for the Simulation tab.
+//! under load ([`Mechanical`]) and how it conducts, stores and expands with heat
+//! ([`Thermal`]), for the Simulation tab.
 
 use crate::appearance::Appearance;
 
@@ -64,6 +65,41 @@ impl Mechanical {
     }
 }
 
+/// How a material conducts, stores and expands with heat, as SolidWorks' and Fusion's
+/// libraries list it: isotropic, constant with temperature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thermal {
+    /// Thermal conductivity, W/(m·K).
+    pub conductivity: f64,
+    /// Specific heat capacity, J/(kg·K); 0 when unknown (a transient study needs it).
+    pub specific_heat: f64,
+    /// Coefficient of linear thermal expansion, 1/K; 0 when unknown (a thermal stress
+    /// study then sees no expansion).
+    pub expansion: f64,
+}
+
+impl Thermal {
+    pub const fn new(conductivity: f64, specific_heat: f64, expansion: f64) -> Self {
+        Self {
+            conductivity,
+            specific_heat,
+            expansion,
+        }
+    }
+
+    /// Whether a solver can use it: a positive conductivity, a specific heat that is not
+    /// negative, an expansion coefficient no material reaches beyond (a hundredth per
+    /// kelvin; some materials shrink when heated, so it may be negative).
+    pub fn is_valid(&self) -> bool {
+        self.conductivity.is_finite()
+            && self.conductivity > 0.0
+            && self.specific_heat.is_finite()
+            && self.specific_heat >= 0.0
+            && self.expansion.is_finite()
+            && self.expansion.abs() < 1e-2
+    }
+}
+
 /// Where a material comes from, so that the ones Oxyde's library defines are told apart
 /// from the ones an imported STEP file merely names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,6 +127,8 @@ pub struct Material {
     pub source: MaterialSource,
     /// How it behaves under load, when known.
     pub mechanical: Option<Mechanical>,
+    /// How it conducts, stores and expands with heat, when known.
+    pub thermal: Option<Thermal>,
 }
 
 impl Material {
@@ -105,6 +143,7 @@ impl Material {
             density,
             source: MaterialSource::Library,
             mechanical: None,
+            thermal: None,
         }
         .clamped()
     }
@@ -112,6 +151,12 @@ impl Material {
     /// The same material with these mechanical properties (dropped if not usable).
     pub fn with_mechanical(mut self, mechanical: Mechanical) -> Self {
         self.mechanical = mechanical.is_valid().then_some(mechanical);
+        self
+    }
+
+    /// The same material with these thermal properties (dropped if not usable).
+    pub fn with_thermal(mut self, thermal: Thermal) -> Self {
+        self.thermal = thermal.is_valid().then_some(thermal);
         self
     }
 
@@ -131,6 +176,7 @@ impl Material {
                 density,
                 source: MaterialSource::Step,
                 mechanical: None,
+                thermal: None,
             }
             .clamped(),
         )
@@ -146,14 +192,15 @@ impl Material {
         self.density > 0.0
     }
 
-    /// The density kept positive and finite, the appearance in range, mechanical
-    /// properties a solver could not use dropped.
+    /// The density kept positive and finite, the appearance in range, mechanical and
+    /// thermal properties a solver could not use dropped.
     pub fn clamped(mut self) -> Self {
         if !self.density.is_finite() || self.density < 0.0 {
             self.density = 0.0;
         }
         self.appearance = self.appearance.clamped();
         self.mechanical = self.mechanical.filter(Mechanical::is_valid);
+        self.thermal = self.thermal.filter(Thermal::is_valid);
         self
     }
 
@@ -177,10 +224,12 @@ pub struct MaterialLibrary {
 
 impl MaterialLibrary {
     /// The starter library: common engineering materials with their densities, a
-    /// plausible look and their mechanical properties. Densities are typical handbook
-    /// values in kg/m³; elastic moduli and strengths in MPa, for the annealed or common
-    /// temper SolidWorks' library lists (brittle materials, grey iron and glass, have a
-    /// tensile strength only).
+    /// plausible look, and their mechanical and thermal properties. Densities are typical
+    /// handbook values in kg/m³; elastic moduli and strengths in MPa, for the annealed or
+    /// common temper SolidWorks' library lists (brittle materials, grey iron and glass,
+    /// have a tensile strength only); conductivities in W/(m·K), specific heats in
+    /// J/(kg·K) and expansion coefficients in 1/K at room temperature (woods and
+    /// composites along their fibres or plies, as one isotropic value).
     pub fn standard() -> Self {
         let plain = |rgb: [u8; 3]| Appearance::colored(rgb);
         let glassy = |rgb: [u8; 3], transparency: f64| Appearance {
@@ -189,6 +238,7 @@ impl MaterialLibrary {
             texture: None,
         };
         let m = Mechanical::new;
+        let t = Thermal::new;
         let list = [
             (
                 "Plain carbon steel (AISI 1020)",
@@ -196,6 +246,7 @@ impl MaterialLibrary {
                 plain([150, 152, 158]),
                 7870.0,
                 m(200_000.0, 0.29, 351.6, 420.5),
+                t(51.9, 486.0, 11.7e-6),
             ),
             (
                 "Alloy steel (AISI 4140)",
@@ -203,6 +254,7 @@ impl MaterialLibrary {
                 plain([128, 130, 136]),
                 7850.0,
                 m(205_000.0, 0.29, 415.0, 655.0),
+                t(42.6, 473.0, 12.3e-6),
             ),
             (
                 "Stainless steel (AISI 304)",
@@ -210,6 +262,7 @@ impl MaterialLibrary {
                 plain([188, 190, 195]),
                 8000.0,
                 m(193_000.0, 0.29, 215.0, 505.0),
+                t(16.2, 500.0, 17.3e-6),
             ),
             (
                 "Cast iron (grey)",
@@ -217,6 +270,7 @@ impl MaterialLibrary {
                 plain([95, 97, 100]),
                 7200.0,
                 m(100_000.0, 0.26, 0.0, 150.0),
+                t(46.0, 490.0, 10.8e-6),
             ),
             (
                 "Aluminium 6061-T6",
@@ -224,6 +278,7 @@ impl MaterialLibrary {
                 plain([200, 203, 208]),
                 2700.0,
                 m(68_900.0, 0.33, 275.0, 310.0),
+                t(167.0, 896.0, 23.6e-6),
             ),
             (
                 "Aluminium 7075-T6",
@@ -231,6 +286,7 @@ impl MaterialLibrary {
                 plain([206, 208, 213]),
                 2810.0,
                 m(71_700.0, 0.33, 503.0, 572.0),
+                t(130.0, 960.0, 23.4e-6),
             ),
             (
                 "Aluminium (cast, A356)",
@@ -238,6 +294,7 @@ impl MaterialLibrary {
                 plain([180, 183, 188]),
                 2670.0,
                 m(72_400.0, 0.33, 165.0, 234.0),
+                t(151.0, 963.0, 21.4e-6),
             ),
             (
                 "Brass (C260)",
@@ -245,6 +302,7 @@ impl MaterialLibrary {
                 plain([205, 170, 80]),
                 8530.0,
                 m(110_000.0, 0.34, 200.0, 370.0),
+                t(120.0, 375.0, 19.9e-6),
             ),
             (
                 "Bronze (C905)",
@@ -252,6 +310,7 @@ impl MaterialLibrary {
                 plain([170, 115, 70]),
                 8800.0,
                 m(103_000.0, 0.34, 152.0, 310.0),
+                t(75.0, 376.0, 18.0e-6),
             ),
             (
                 "Copper (C110)",
@@ -259,6 +318,7 @@ impl MaterialLibrary {
                 plain([190, 110, 80]),
                 8940.0,
                 m(115_000.0, 0.31, 70.0, 220.0),
+                t(391.0, 385.0, 17.0e-6),
             ),
             (
                 "Titanium (Ti-6Al-4V)",
@@ -266,6 +326,7 @@ impl MaterialLibrary {
                 plain([160, 160, 166]),
                 4430.0,
                 m(113_800.0, 0.342, 880.0, 950.0),
+                t(6.7, 526.0, 8.6e-6),
             ),
             (
                 "ABS",
@@ -273,6 +334,7 @@ impl MaterialLibrary {
                 plain([235, 235, 230]),
                 1040.0,
                 m(2_200.0, 0.35, 40.0, 44.0),
+                t(0.17, 1400.0, 90.0e-6),
             ),
             (
                 "PLA",
@@ -280,6 +342,7 @@ impl MaterialLibrary {
                 plain([225, 228, 222]),
                 1240.0,
                 m(3_500.0, 0.36, 50.0, 60.0),
+                t(0.13, 1800.0, 68.0e-6),
             ),
             (
                 "Nylon 6/6",
@@ -287,6 +350,7 @@ impl MaterialLibrary {
                 plain([228, 226, 212]),
                 1140.0,
                 m(2_500.0, 0.39, 60.0, 75.0),
+                t(0.25, 1670.0, 80.0e-6),
             ),
             (
                 "Polycarbonate",
@@ -294,6 +358,7 @@ impl MaterialLibrary {
                 glassy([205, 225, 235], 0.35),
                 1200.0,
                 m(2_380.0, 0.37, 62.0, 65.0),
+                t(0.20, 1200.0, 65.0e-6),
             ),
             (
                 "Acrylic (PMMA)",
@@ -301,6 +366,7 @@ impl MaterialLibrary {
                 glassy([215, 230, 240], 0.5),
                 1180.0,
                 m(3_000.0, 0.37, 0.0, 72.0),
+                t(0.19, 1470.0, 70.0e-6),
             ),
             (
                 "Black plastic (PA, filled)",
@@ -308,6 +374,7 @@ impl MaterialLibrary {
                 plain([40, 40, 42]),
                 1150.0,
                 m(6_000.0, 0.35, 100.0, 120.0),
+                t(0.35, 1500.0, 30.0e-6),
             ),
             (
                 "Rubber (natural)",
@@ -315,6 +382,7 @@ impl MaterialLibrary {
                 plain([50, 50, 50]),
                 930.0,
                 m(2.0, 0.49, 0.0, 20.0),
+                t(0.13, 1900.0, 220.0e-6),
             ),
             (
                 "Silicone rubber",
@@ -322,6 +390,7 @@ impl MaterialLibrary {
                 plain([225, 215, 205]),
                 1150.0,
                 m(3.0, 0.49, 0.0, 7.0),
+                t(0.22, 1250.0, 250.0e-6),
             ),
             (
                 "Glass (soda-lime)",
@@ -329,6 +398,7 @@ impl MaterialLibrary {
                 glassy([180, 220, 235], 0.7),
                 2500.0,
                 m(72_000.0, 0.22, 0.0, 40.0),
+                t(1.0, 840.0, 9.0e-6),
             ),
             (
                 "Oak",
@@ -336,6 +406,7 @@ impl MaterialLibrary {
                 plain([170, 120, 70]),
                 750.0,
                 m(11_000.0, 0.35, 40.0, 90.0),
+                t(0.17, 2380.0, 5.0e-6),
             ),
             (
                 "Pine",
@@ -343,6 +414,7 @@ impl MaterialLibrary {
                 plain([210, 175, 110]),
                 500.0,
                 m(9_000.0, 0.35, 35.0, 80.0),
+                t(0.12, 2300.0, 5.0e-6),
             ),
             (
                 "Plywood (birch)",
@@ -350,6 +422,7 @@ impl MaterialLibrary {
                 plain([200, 165, 105]),
                 680.0,
                 m(8_000.0, 0.3, 30.0, 40.0),
+                t(0.13, 1800.0, 6.0e-6),
             ),
             (
                 "PCB (FR-4)",
@@ -357,6 +430,7 @@ impl MaterialLibrary {
                 plain([30, 110, 60]),
                 1850.0,
                 m(22_000.0, 0.15, 250.0, 310.0),
+                t(0.29, 1100.0, 14.0e-6),
             ),
             (
                 "Carbon fibre (epoxy)",
@@ -364,12 +438,15 @@ impl MaterialLibrary {
                 plain([45, 45, 50]),
                 1600.0,
                 m(60_000.0, 0.3, 500.0, 600.0),
+                t(5.0, 1000.0, 2.0e-6),
             ),
         ];
         let mut library = Self::default();
-        for (name, category, appearance, density, mechanical) in list {
+        for (name, category, appearance, density, mechanical, thermal) in list {
             library.insert(
-                Material::new(name, category, appearance, density).with_mechanical(mechanical),
+                Material::new(name, category, appearance, density)
+                    .with_mechanical(mechanical)
+                    .with_thermal(thermal),
             );
         }
         library
@@ -482,6 +559,34 @@ mod tests {
         let mut odd = Material::new("y", "", Appearance::default(), 1.0);
         odd.mechanical = Some(Mechanical::new(1.0, 0.7, 0.0, 0.0));
         assert!(odd.clamped().mechanical.is_none());
+    }
+
+    #[test]
+    fn the_starter_library_knows_how_its_materials_take_heat() {
+        for m in MaterialLibrary::standard().materials() {
+            let t = m
+                .thermal
+                .unwrap_or_else(|| panic!("{} has no thermal properties", m.name));
+            assert!(t.is_valid(), "{}", m.name);
+            assert!(t.specific_heat > 0.0 && t.expansion > 0.0, "{}", m.name);
+        }
+        let library = MaterialLibrary::standard();
+        let copper = library.get("Copper (C110)").unwrap().thermal.unwrap();
+        let steel = library
+            .get("Stainless steel (AISI 304)")
+            .unwrap()
+            .thermal
+            .unwrap();
+        assert!(copper.conductivity > 20.0 * steel.conductivity);
+        // Properties a solver could not use are not kept.
+        let bad = Material::new("x", "", Appearance::default(), 1.0)
+            .with_thermal(Thermal::new(0.0, 500.0, 1e-5));
+        assert!(bad.thermal.is_none());
+        let mut odd = Material::new("y", "", Appearance::default(), 1.0);
+        odd.thermal = Some(Thermal::new(1.0, -1.0, 0.0));
+        assert!(odd.clamped().thermal.is_none());
+        // Invar-like and shrinking materials are fine.
+        assert!(Thermal::new(10.0, 500.0, -1e-6).is_valid());
     }
 
     #[test]

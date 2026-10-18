@@ -11,6 +11,10 @@
 //! - [`solve`] assembles the stiffness matrix, applies fixtures and loads, solves by
 //!   conjugate gradients on every core, preconditioned by algebraic multigrid (`amg`),
 //!   and recovers the stresses.
+//! - [`thermal`] conducts heat: steady and transient thermal studies (fixed temperatures,
+//!   heat flows and fluxes, convection, radiation, heat made inside bodies), on the same
+//!   meshes and contacts, solved with the same multigrid; their temperatures expand the
+//!   model in a thermal stress study ([`solve::ThermalStrain`]).
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
 //! - [`material`] holds the elastic properties, and a guess of them from a material's
@@ -52,17 +56,23 @@ pub mod mesh;
 pub mod mesher;
 pub mod plot;
 pub mod solve;
+pub mod thermal;
 
 pub use contact::{
     Contact, ContactCandidate, ContactKind, ContactResult, ContactSolve, detect_contacts,
 };
-pub use material::Elastic;
+pub use material::{Elastic, ThermalProps};
 pub use math::V3;
 pub use mesh::{Facet, TetMesh};
 pub use mesher::{MeshError, MeshOptions, MeshReport, SurfaceMesh, mesh_solids};
 pub use plot::{Band, Quantity, bands, mesh_edges, rainbow};
 pub use solve::{
-    Fixture, FixtureKind, Load, LoadKind, Results, SolveError, SolveOptions, Study, Summary, solve,
+    Fixture, FixtureKind, Load, LoadKind, Results, SolveError, SolveOptions, Study, Summary,
+    ThermalStrain, solve, solve_thermal_stress,
+};
+pub use thermal::{
+    Frame, InternalHeat, KELVIN, ThermalError, ThermalLoad, ThermalLoadKind, ThermalMaterial,
+    ThermalResults, ThermalStudy, ThermalSummary, Transient, solve_thermal,
 };
 
 /// A label on no face: a boundary facet the mesher could not tie to a model face.
