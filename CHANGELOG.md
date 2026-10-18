@@ -5,6 +5,22 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Materials a click away, a typed mesh density (unreleased, October 2026)
+
+- **A Material row in every tree.** The part's tree has a *Material* row above the
+  features (SolidWorks' `Material <not specified>`), and in an assembly every part
+  shows its Material row under it, without expanding it. Clicking the row lists the
+  library's materials and *None*; double-clicking opens the Material page (the Materials
+  window in an assembly); right-click has the same choices and *Select parts with this
+  material*. The trees are there in every tab, Simulation and Render included.
+- **The Simulation panel gives materials.** Each line of its Material list has *Choose*
+  (a part without a material) or *Change*: the library's materials, for the part, or for
+  every part of the assembly in that line. The results go stale and the panel asks for
+  another run, as for any change to the model.
+- **The mesh density can be typed.** Beside the Coarse–Fine slider of the Simulation
+  panel's Mesh section, a box shows the density from 0 % (coarsest) to 100 % (finest);
+  drag it or type a value, and the slider follows.
+
 ### A Simulation tab (unreleased, October 2026)
 
 - **Simulation tab** (parts and assemblies), the first steps of `docs/SIMULATION.md`: a

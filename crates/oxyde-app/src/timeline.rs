@@ -6,6 +6,9 @@
 //! to extrude, a feature to pattern, a plane…) to that command. Selecting a face or an edge
 //! in the viewport highlights the feature that created it. The rollback bar is a line with
 //! a handle that can be dragged between features.
+//!
+//! Above the features, the Material row says what the part is made of; a click on it
+//! lists the library's materials (SolidWorks' `Material <not specified>` row).
 
 use eframe::egui::{self, Color32, CursorIcon, RichText, Sense, Stroke};
 use oxyde_model::{
@@ -61,6 +64,12 @@ enum Action {
     ToggleBodies,
     SelectBody(oxyde_model::BodyId),
     BodyAppearance(oxyde_model::BodyId),
+    /// Give the part this library material, or none.
+    Material(Option<String>),
+    /// The Material page of the Appearance panel.
+    MaterialPage,
+    /// The part's material in the Materials window.
+    EditMaterial,
 }
 
 pub fn feature_icon(kind: &FeatureKind) -> Icon {
@@ -221,6 +230,12 @@ impl OxydeApp {
         // The face or edge under the pointer in the viewport lights up its feature here.
         let under_pointer = self.viewport.hovered().and_then(|p| self.pick_creator(p));
         let referenced = self.panel_features();
+        let material_names: Vec<String> = self
+            .materials
+            .materials()
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
         let enabled = self.sketch.is_none();
         ui.add_enabled_ui(enabled, |ui| {
             egui::ScrollArea::vertical()
@@ -333,6 +348,40 @@ impl OxydeApp {
                             }
                         }
                     }
+                    // What the part is made of, a click away from changing.
+                    let material = self.doc.part.material();
+                    let row = crate::assembly_ui::material_row(ui, material, 0.0);
+                    if let Some(choice) =
+                        crate::assembly_ui::material_popup(ui, &row.response, &material_names)
+                    {
+                        action = Some(Action::Material(choice));
+                    }
+                    if row.response.double_clicked() {
+                        action = Some(Action::MaterialPage);
+                    }
+                    row.response.context_menu(|ui| {
+                        ui.menu_button("Change material", |ui| {
+                            if let Some(choice) =
+                                crate::assembly_ui::material_menu(ui, &material_names)
+                            {
+                                action = Some(Action::Material(choice));
+                            }
+                        });
+                        if ui
+                            .button("Material…")
+                            .on_hover_text("The Material page: the part's look and its density")
+                            .clicked()
+                        {
+                            action = Some(Action::MaterialPage);
+                            ui.close_menu();
+                        }
+                        if material.is_some()
+                            && ui.button("Edit in the Materials window…").clicked()
+                        {
+                            action = Some(Action::EditMaterial);
+                            ui.close_menu();
+                        }
+                    });
                     ui.add_space(3.0);
                     ui.separator();
 
@@ -737,6 +786,17 @@ impl OxydeApp {
                 self.selection.clear();
             }
             Action::BodyAppearance(id) => self.begin_body_appearance(id),
+            Action::Material(Some(name)) => self.apply_material_to_part(&name),
+            Action::Material(None) => {
+                if self.doc.part.material().is_some() {
+                    self.set_part_material(None, false);
+                }
+            }
+            Action::MaterialPage => self.begin_material(),
+            Action::EditMaterial => match self.doc.part.material().cloned() {
+                Some(m) => self.edit_material(m),
+                None => self.open_materials_window(),
+            },
             Action::Edit(id) => self.edit_feature(id),
             Action::Rename(feature) => {
                 let name = self

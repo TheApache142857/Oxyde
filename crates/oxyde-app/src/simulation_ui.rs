@@ -467,6 +467,8 @@ struct BodyInfo {
     /// Its material group: the material's name, or `part:` and the part's document id.
     key: String,
     material: Option<Material>,
+    /// The part file it comes from (an assembly's part), to give it another material.
+    path: Option<std::path::PathBuf>,
 }
 
 /// Where a solid of the model is, for a volume mesher that works on the shape itself.
@@ -519,6 +521,12 @@ struct MaterialGroup {
     density: f64,
     /// The part's own material can take the values (the open part has it).
     can_apply: bool,
+    /// The group is a material (not a part that has none).
+    has_material: bool,
+    /// The bodies in the group, for the hover.
+    bodies: Vec<String>,
+    /// The part files the group's bodies come from (an assembly); empty for the open part.
+    paths: Vec<std::path::PathBuf>,
 }
 
 /// Where a study's mechanical properties come from.
@@ -670,6 +678,41 @@ impl SimulationView {
             ..SimulationView::default()
         };
     }
+}
+
+/// The material groups of `bodies`, in order: one per material (or per part without
+/// one), with the bodies and part files it covers, so that a material given to the group
+/// goes to all of them.
+fn material_groups_of(bodies: &[BodyInfo], study: &Study, assembly: bool) -> Vec<MaterialGroup> {
+    let mut out: Vec<MaterialGroup> = Vec::new();
+    for b in bodies {
+        if let Some(g) = out.iter_mut().find(|g| g.key == b.key) {
+            if !g.bodies.contains(&b.name) {
+                g.bodies.push(b.name.clone());
+            }
+            if let Some(p) = &b.path
+                && !g.paths.contains(p)
+            {
+                g.paths.push(p.clone());
+            }
+            continue;
+        }
+        let (label, density) = match &b.material {
+            Some(m) => (m.name.clone(), m.density),
+            None => (format!("{} (no material)", b.name), 0.0),
+        };
+        out.push(MaterialGroup {
+            key: b.key.clone(),
+            label,
+            effective: mechanical_of(study, &b.key, b.material.as_ref()),
+            density,
+            can_apply: !assembly && b.material.is_some(),
+            has_material: b.material.is_some(),
+            bodies: vec![b.name.clone()],
+            paths: b.path.iter().cloned().collect(),
+        });
+    }
+    out
 }
 
 /// The mechanical properties a study uses for a material group: its own override, else
@@ -1018,6 +1061,7 @@ impl OxydeApp {
                             name,
                             key: key.clone(),
                             material: part.material().cloned(),
+                            path: None,
                         },
                         solid.shape,
                         None,
@@ -1048,6 +1092,7 @@ impl OxydeApp {
                                 name: asm.occurrence_name(&o),
                                 key: key.clone(),
                                 material: loaded.part.material().cloned(),
+                                path: asm.path_at(&o),
                             },
                             solid.shape,
                             Some(placement),
@@ -1088,24 +1133,7 @@ impl OxydeApp {
         let Some(s) = self.simulation.surfaces.as_ref() else {
             return Vec::new();
         };
-        let mut out: Vec<MaterialGroup> = Vec::new();
-        for b in &s.bodies {
-            if out.iter().any(|g| g.key == b.key) {
-                continue;
-            }
-            let (label, density) = match &b.material {
-                Some(m) => (m.name.clone(), m.density),
-                None => (format!("{} (no material)", b.name), 0.0),
-            };
-            out.push(MaterialGroup {
-                key: b.key.clone(),
-                label,
-                effective: mechanical_of(&self.simulation.study, &b.key, b.material.as_ref()),
-                density,
-                can_apply: self.asm.is_none() && b.material.is_some(),
-            });
-        }
-        out
+        material_groups_of(&s.bodies, &self.simulation.study, self.asm.is_some())
     }
 
     /// The faces selected now, as study faces.
@@ -2177,6 +2205,12 @@ impl OxydeApp {
         };
         let before = self.prefs.simulation.clone();
         let groups = self.material_groups();
+        let material_names: Vec<String> = self
+            .materials
+            .materials()
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
         let element_size = self.simulation_element_size();
         let mut action: Option<PanelAction> = None;
         let max_height = (ui.available_height() * 0.7).max(160.0);
@@ -2265,8 +2299,10 @@ impl OxydeApp {
                                 ui.label(egui::RichText::new("Nothing to study yet").weak());
                             }
                             for (i, g) in groups.iter().enumerate() {
-                                if material_rows(ui, &mut study.overrides, g) {
-                                    action = Some(PanelAction::ApplyMaterial(i));
+                                if let Some(a) =
+                                    material_rows(ui, &mut study.overrides, g, i, &material_names)
+                                {
+                                    action = Some(a);
                                 }
                             }
                         });
@@ -2429,12 +2465,37 @@ impl OxydeApp {
                                     } else {
                                         ui.label("Density");
                                         ui.horizontal(|ui| {
+                                            // Room left for the box beside the slider,
+                                            // as the panel is narrow.
+                                            ui.spacing_mut().slider_width =
+                                                (ui.available_width() - 140.0).clamp(50.0, 160.0);
                                             ui.label(egui::RichText::new("Coarse").small());
                                             ui.add(
                                                 egui::Slider::new(&mut m.density, 0.0..=1.0)
                                                     .show_value(false),
                                             );
                                             ui.label(egui::RichText::new("Fine").small());
+                                            // The same density as a number to type: 0 %
+                                            // the coarsest mesh, 100 % the finest.
+                                            ui.add(
+                                                egui::DragValue::new(&mut m.density)
+                                                    .range(0.0..=1.0)
+                                                    .speed(0.005)
+                                                    .custom_formatter(|v, _| {
+                                                        format!("{:.0} %", v * 100.0)
+                                                    })
+                                                    .custom_parser(|s| {
+                                                        s.trim()
+                                                            .trim_end_matches('%')
+                                                            .trim()
+                                                            .parse::<f64>()
+                                                            .ok()
+                                                            .map(|v| v / 100.0)
+                                                    }),
+                                            )
+                                            .on_hover_text(
+                                                "0 % is the coarsest mesh, 100 % the finest",
+                                            );
                                         });
                                         ui.end_row();
                                         if let Some(h) = element_size {
@@ -2705,6 +2766,25 @@ impl OxydeApp {
                     self.simulation.study.overrides.remove(&g.key);
                 }
             }
+            Some(PanelAction::SetMaterial(i, choice)) => {
+                let Some(g) = groups.get(i) else {
+                    return;
+                };
+                let name = choice.and_then(|k| material_names.get(k).cloned());
+                if name.is_none() && !g.has_material {
+                    return;
+                }
+                // The model changes, so the plot goes stale and the panel asks for a run.
+                self.simulation.show_plot = false;
+                if self.asm.is_some() {
+                    self.apply_material_to_paths(&g.paths, name);
+                } else {
+                    match name {
+                        Some(name) => self.apply_material_to_part(&name),
+                        None => self.set_part_material(None, false),
+                    }
+                }
+            }
             Some(PanelAction::Edited) => self.simulation.show_plot = false,
             None => {}
         }
@@ -2727,6 +2807,9 @@ enum PanelAction {
     Edited,
     /// The study's properties for a material group written to the part's material.
     ApplyMaterial(usize),
+    /// A material group's parts given a material of the library (its index in the
+    /// library's list), or none.
+    SetMaterial(usize, Option<usize>),
     FindContacts,
     OpenStudy,
     SaveStudy,
@@ -2862,17 +2945,48 @@ fn item_row(
 }
 
 /// A material group's mechanical properties: what the study uses and where it comes
-/// from. Typing a value makes it the study's own; whether *Apply to the material* was
-/// clicked.
+/// from. Typing a value makes it the study's own. *Change* gives the group's parts
+/// another material of the library (`names`), *Apply to the material* keeps the typed
+/// values in the part's material; either is returned for the group `index`.
 fn material_rows(
     ui: &mut egui::Ui,
     overrides: &mut BTreeMap<String, Mechanical>,
     g: &MaterialGroup,
-) -> bool {
-    let mut apply = false;
+    index: usize,
+    names: &[String],
+) -> Option<PanelAction> {
+    let mut action = None;
     let source = g.effective.map(|(_, s)| s);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(&g.label).strong());
+        let parts = if g.bodies.len() > 1 {
+            format!("{} bodies: {}", g.bodies.len(), g.bodies.join(", "))
+        } else {
+            g.bodies.join(", ")
+        };
+        ui.label(egui::RichText::new(&g.label).strong())
+            .on_hover_text(parts);
+        ui.menu_button(if g.has_material { "Change" } else { "Choose" }, |ui| {
+            if g.bodies.len() > 1 {
+                ui.label(
+                    egui::RichText::new(format!("For its {} bodies", g.bodies.len()))
+                        .small()
+                        .weak(),
+                );
+            }
+            if let Some(choice) = crate::assembly_ui::material_menu(ui, names) {
+                let index_of = |n: &String| names.iter().position(|m| m == n);
+                action = Some(PanelAction::SetMaterial(
+                    index,
+                    choice.as_ref().and_then(index_of),
+                ));
+            }
+        })
+        .response
+        .on_hover_text(if g.paths.is_empty() {
+            "Give the part a material of the library (one undo step)"
+        } else {
+            "Give these parts a material of the library (their files are saved)"
+        });
         let note = match source {
             Some(PropsSource::Study) => "this study's",
             Some(PropsSource::Material) => "the material's",
@@ -2894,7 +3008,7 @@ fn material_rows(
                     .on_hover_text("Keep these values in the part's material (one undo step)")
                     .clicked()
             {
-                apply = true;
+                action = Some(PanelAction::ApplyMaterial(index));
             }
         }
     });
@@ -2964,7 +3078,7 @@ fn material_rows(
     if changed {
         overrides.insert(g.key.clone(), values);
     }
-    apply
+    action
 }
 
 fn paint_arrow(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, stroke: egui::Stroke) {
@@ -3338,6 +3452,7 @@ mod tests {
             name: "Bracket".into(),
             key: steel.name.clone(),
             material: Some(steel.clone()),
+            path: None,
         };
         let mut study = Study::default();
         let e = elastic_of(&study, &body).unwrap();
@@ -3366,6 +3481,43 @@ mod tests {
             ..body
         };
         assert!(elastic_of(&Study::default(), &none).is_none());
+    }
+
+    #[test]
+    fn a_material_group_knows_its_parts() {
+        let library = oxyde_model::MaterialLibrary::standard();
+        let steel = library
+            .get("Plain carbon steel (AISI 1020)")
+            .unwrap()
+            .clone();
+        let body = |name: &str, path: &str, material: Option<&Material>| BodyInfo {
+            name: name.into(),
+            key: material.map_or_else(|| format!("part:{name}"), |m| m.name.clone()),
+            material: material.cloned(),
+            path: Some(path.into()),
+        };
+        let bodies = [
+            body("Plate<1>", "plate.oxyprt", Some(&steel)),
+            body("Bolt<1>", "bolt.oxyprt", None),
+            body("Plate<2>", "plate.oxyprt", Some(&steel)),
+            body("Bracket<1>", "bracket.oxyprt", Some(&steel)),
+        ];
+        let groups = material_groups_of(&bodies, &Study::default(), true);
+        assert_eq!(groups.len(), 2);
+        // Changing the steel line changes every steel part, each file once.
+        assert_eq!(groups[0].bodies, ["Plate<1>", "Plate<2>", "Bracket<1>"]);
+        let paths: Vec<std::path::PathBuf> = vec!["plate.oxyprt".into(), "bracket.oxyprt".into()];
+        assert_eq!(groups[0].paths, paths);
+        assert!(groups[0].has_material && !groups[0].can_apply);
+        assert_eq!(groups[1].label, "Bolt<1> (no material)");
+        assert!(!groups[1].has_material);
+        // The open part: no file to rewrite, the part takes the material itself.
+        let open = [BodyInfo {
+            path: None,
+            ..body("Plate", "", Some(&steel))
+        }];
+        let groups = material_groups_of(&open, &Study::default(), false);
+        assert!(groups[0].paths.is_empty() && groups[0].can_apply);
     }
 
     #[test]

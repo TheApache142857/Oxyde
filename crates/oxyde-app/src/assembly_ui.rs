@@ -208,8 +208,9 @@ enum TreeAction {
 }
 
 /// The row under a part saying what it is made of: `Material: Acier (STEP)`, or none.
-/// The hover gives the density and where the material comes from.
-fn material_row(
+/// The hover gives the density and where the material comes from. A click opens the
+/// library's materials ([`material_popup`]).
+pub(crate) fn material_row(
     ui: &mut egui::Ui,
     material: Option<&oxyde_model::Material>,
     indent: f32,
@@ -229,12 +230,15 @@ fn material_row(
             };
             (
                 RichText::new(format!("Material: {}{tag}", m.name)),
-                format!("{}\n{density} · {from}\nSaved in the part file", m.name),
+                format!(
+                    "{}\n{density} · {from}\nSaved in the part file · click to change it",
+                    m.name
+                ),
             )
         }
         None => (
             RichText::new("Material: none").weak().italics(),
-            "No material: right-click to give the part one. The mass needs it.".to_owned(),
+            "No material: click to give the part one. The mass and simulations need it.".to_owned(),
         ),
     };
     let row = tree_row(
@@ -257,9 +261,38 @@ fn material_row(
     }
 }
 
+/// The library's materials in a list below a material row, opened by clicking the row,
+/// so a part gets its material in two clicks. Returns the choice as [`material_menu`]
+/// does.
+pub(crate) fn material_popup(
+    ui: &mut egui::Ui,
+    row: &egui::Response,
+    names: &[String],
+) -> Option<Option<String>> {
+    let popup = row.id.with("material_popup");
+    if row.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup));
+    }
+    let choice = egui::popup::popup_below_widget(
+        ui,
+        popup,
+        row,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_min_width(200.0);
+            material_menu(ui, names)
+        },
+    )
+    .flatten();
+    if choice.is_some() {
+        ui.memory_mut(|m| m.close_popup());
+    }
+    choice
+}
+
 /// The entries of a Material menu: the library's materials and "None". Returns the choice
 /// (`Some(None)` for no material) once one is clicked.
-fn material_menu(ui: &mut egui::Ui, names: &[String]) -> Option<Option<String>> {
+pub(crate) fn material_menu(ui: &mut egui::Ui, names: &[String]) -> Option<Option<String>> {
     let mut choice = None;
     egui::ScrollArea::vertical()
         .max_height(300.0)
@@ -2009,6 +2042,36 @@ impl OxydeApp {
                             ui.close_menu();
                         }
                     });
+                    // What the part is made of, as saved in its file: always shown under
+                    // it, as SolidWorks shows Material in a part's tree, and a click away
+                    // from changing.
+                    if sub.is_none() && error.is_none() {
+                        let material = doc.component_material_details(id);
+                        let row = material_row(ui, material, 16.0);
+                        if let Some(choice) = material_popup(ui, &row.response, &material_names) {
+                            action = Some(TreeAction::Material(vec![id], choice));
+                        }
+                        if row.response.double_clicked() {
+                            action = Some(TreeAction::EditMaterial(id));
+                        }
+                        row.response.context_menu(|ui| {
+                            ui.menu_button("Change material", |ui| {
+                                if let Some(choice) = material_menu(ui, &material_names) {
+                                    action = Some(TreeAction::Material(vec![id], choice));
+                                }
+                            });
+                            if let Some(m) = material {
+                                if ui.button("Edit in the Materials window…").clicked() {
+                                    action = Some(TreeAction::EditMaterial(id));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Select parts with this material").clicked() {
+                                    action = Some(TreeAction::SelectMaterial(m.name.clone()));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    }
                     if expanded {
                         for (target, label, icon) in standard_targets() {
                             let row = tree_row(
@@ -2033,31 +2096,6 @@ impl OxydeApp {
                             if response.clicked() && mating {
                                 action = Some(TreeAction::Target(MateRef::new(id, target)));
                             }
-                        }
-                        // What the part is made of, as saved in its file.
-                        if sub.is_none() {
-                            let material = doc.component_material_details(id);
-                            let row = material_row(ui, material, 16.0);
-                            if row.response.double_clicked() {
-                                action = Some(TreeAction::EditMaterial(id));
-                            }
-                            row.response.context_menu(|ui| {
-                                ui.menu_button("Change material", |ui| {
-                                    if let Some(choice) = material_menu(ui, &material_names) {
-                                        action = Some(TreeAction::Material(vec![id], choice));
-                                    }
-                                });
-                                if let Some(m) = material {
-                                    if ui.button("Edit in the Materials window…").clicked() {
-                                        action = Some(TreeAction::EditMaterial(id));
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Select parts with this material").clicked() {
-                                        action = Some(TreeAction::SelectMaterial(m.name.clone()));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
                         }
                         // What the sub-assembly holds, as it was saved: its parts take a
                         // material or an appearance from here, the rest by opening it.
@@ -3106,6 +3144,11 @@ impl SubTree<'_> {
             if is_part {
                 // What the part is made of, as saved in its file.
                 let row = material_row(ui, material_details, indent + 16.0);
+                if !paths.is_empty()
+                    && let Some(choice) = material_popup(ui, &row.response, self.materials)
+                {
+                    *self.action = Some(TreeAction::MaterialPaths(paths.clone(), choice));
+                }
                 row.response.context_menu(|ui| {
                     ui.add_enabled_ui(!paths.is_empty(), |ui| {
                         ui.menu_button("Change material", |ui| {
