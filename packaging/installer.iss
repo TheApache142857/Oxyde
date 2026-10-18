@@ -42,6 +42,8 @@ Name: "associate"; Description: "Open .oxyprt and .oxyasm files with Oxyde"; Gro
 Type: files; Name: "{app}\*.dll"
 
 [Files]
+; Oxyde.exe, the OpenCASCADE DLLs and, when the build has the volume mesher, Netgen's
+; (nglib.dll, ngcore.dll), the licences (THIRD-PARTY.txt) and the README
 Source: "..\dist\Oxyde\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

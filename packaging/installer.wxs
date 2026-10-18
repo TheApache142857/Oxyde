@@ -39,7 +39,8 @@
     </StandardDirectory>
 
     <Feature Id="Main" Title="Oxyde" Level="1">
-      <!-- Everything bundle.ps1 put in dist\Oxyde: Oxyde.exe, the OpenCASCADE DLLs, the
+      <!-- Everything bundle.ps1 put in dist\Oxyde: Oxyde.exe, the OpenCASCADE DLLs,
+           Netgen's (nglib.dll, ngcore.dll) when the build has the volume mesher, the
            licences and the README. -->
       <Files Directory="INSTALLFOLDER" Include="$(BundleDir)\**" />
       <ComponentRef Id="StartMenuShortcut" />

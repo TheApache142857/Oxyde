@@ -106,6 +106,10 @@
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
+#ifdef OXYDE_NETGEN
+#include "oxyde-occt/cpp/netgen_mesh.h"
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -1785,6 +1789,70 @@ TopologyCounts Session::topology_counts(std::uint64_t shape) const {
     });
 }
 
+VolumeMeshData Session::volume_mesh(std::uint64_t shape,
+                                    const VolumeMeshOptionsData& options) const {
+    return guarded("volume_mesh", [&]() -> VolumeMeshData {
+#ifndef OXYDE_NETGEN
+        (void)shape;
+        (void)options;
+        throw std::runtime_error("this build of Oxyde has no Netgen");
+#else
+        const TopoDS_Shape s = get(shape);
+        TopTools_IndexedMapOfShape solids;
+        TopExp::MapShapes(s, TopAbs_SOLID, solids);
+        if (solids.Extent() != 1) {
+            throw std::runtime_error("a volume mesh is made of one solid, this shape has " +
+                                     std::to_string(solids.Extent()));
+        }
+
+        netgen_bridge::Options o;
+        o.max_size = options.max_size;
+        o.min_size = options.min_size;
+        o.grading = options.grading;
+        o.curvature_safety = options.curvature_safety;
+        o.segments_per_edge = options.segments_per_edge;
+        o.second_order = options.second_order;
+        o.optimize_steps = static_cast<int>(options.optimize_steps);
+        netgen_bridge::Result mesh = netgen_bridge::mesh_solid(solids(1), o);
+
+        // Netgen numbers the faces its own way: name each by its index in the shape's
+        // topology, which is what persistent face names resolve to.
+        TopTools_IndexedMapOfShape faces;
+        TopExp::MapShapes(s, TopAbs_FACE, faces);
+        std::vector<std::uint32_t> face_index;
+        face_index.reserve(mesh.faces.size());
+        for (const TopoDS_Shape& face : mesh.faces) {
+            const int k = faces.FindIndex(face);
+            if (k < 1) {
+                throw std::runtime_error("Netgen meshed a face that is not the shape's");
+            }
+            face_index.push_back(static_cast<std::uint32_t>(k - 1));
+        }
+
+        VolumeMeshData out;
+        out.nodes.reserve(mesh.nodes.size());
+        for (const double v : mesh.nodes) {
+            out.nodes.push_back(v);
+        }
+        out.nodes_per_tet = mesh.nodes_per_tet;
+        out.tets.reserve(mesh.tets.size());
+        for (const std::uint32_t n : mesh.tets) {
+            out.tets.push_back(n);
+        }
+        out.nodes_per_triangle = mesh.nodes_per_triangle;
+        out.triangles.reserve(mesh.triangles.size());
+        for (const std::uint32_t n : mesh.triangles) {
+            out.triangles.push_back(n);
+        }
+        out.triangle_faces.reserve(mesh.triangle_faces.size());
+        for (const std::uint32_t f : mesh.triangle_faces) {
+            out.triangle_faces.push_back(face_index.at(f));
+        }
+        return out;
+#endif
+    });
+}
+
 void Session::export_step(rust::Slice<const std::uint64_t> shapes,
                           rust::Slice<const StepShapeColors> colors,
                           rust::Slice<const StepMaterialData> materials, rust::Str path) const {
@@ -1971,6 +2039,22 @@ std::unique_ptr<Session> new_session() {
 
 rust::String occt_version() {
     return rust::String(OCC_VERSION_COMPLETE);
+}
+
+bool has_netgen() {
+#ifdef OXYDE_NETGEN
+    return true;
+#else
+    return false;
+#endif
+}
+
+rust::String netgen_version() {
+#ifdef OXYDE_NETGEN
+    return rust::String(netgen_bridge::version());
+#else
+    return rust::String();
+#endif
 }
 
 } // namespace oxyde::occt

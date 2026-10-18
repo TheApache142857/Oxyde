@@ -70,7 +70,7 @@ pub use feature::{
     SketchPlane, StandardAxis, StandardPlane, Sweep,
 };
 pub use finish::{Finish, FinishParams};
-pub use material::{Material, MaterialLibrary, MaterialSource};
+pub use material::{Material, MaterialLibrary, MaterialSource, Mechanical};
 pub use naming::{BodyNaming, EdgeName, FaceKey, FaceName, Resolution, VertexName};
 pub use part::{
     FeaturePreview, FeatureStatus, Part, PartDefinition, ReferenceGeometry, SketchResult,

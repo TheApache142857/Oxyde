@@ -145,8 +145,34 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"format\": \"oxyde-materials\""));
         assert!(text.contains("\"density\": 2700"));
+        assert!(text.contains("\"elastic_modulus\": 68900"));
         let back = load_material_library(&path).unwrap();
         assert_eq!(back, library);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mechanical_properties_are_optional_and_checked() {
+        let dir = std::env::temp_dir().join(format!("oxyde-materials-mech-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("materials.json");
+        std::fs::write(
+            &path,
+            br#"{ "format": "oxyde-materials", "format_version": 1, "materials": [
+                { "name": "Old", "density": 1000, "appearance": { "color": [1, 2, 3] } },
+                { "name": "Glass", "density": 2500, "appearance": { "color": [1, 2, 3] },
+                  "mechanical": { "elastic_modulus": 72000, "poisson_ratio": 0.22, "tensile_strength": 40 } },
+                { "name": "Odd", "density": 1, "appearance": { "color": [1, 2, 3] },
+                  "mechanical": { "elastic_modulus": 1, "poisson_ratio": 0.7 } }
+            ] }"#,
+        )
+        .unwrap();
+        let library = load_material_library(&path).unwrap();
+        assert!(library.get("Old").unwrap().mechanical.is_none());
+        let glass = library.get("Glass").unwrap().mechanical.unwrap();
+        assert_eq!((glass.yield_strength, glass.tensile_strength), (0.0, 40.0));
+        // A Poisson's ratio no solid has: as if the file said nothing.
+        assert!(library.get("Odd").unwrap().mechanical.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -156,8 +182,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("materials.json");
         std::fs::write(&path, b"{\"format\": \"something\", \"format_version\": 1}").unwrap();
-        assert!(matches!(load_material_library(&path), Err(FormatError::NotOxyde)));
-        std::fs::write(&path, b"{\"format\": \"oxyde-materials\", \"format_version\": 99}").unwrap();
+        assert!(matches!(
+            load_material_library(&path),
+            Err(FormatError::NotOxyde)
+        ));
+        std::fs::write(
+            &path,
+            b"{\"format\": \"oxyde-materials\", \"format_version\": 99}",
+        )
+        .unwrap();
         assert!(matches!(
             load_material_library(&path),
             Err(FormatError::UnsupportedVersion { found: 99, .. })

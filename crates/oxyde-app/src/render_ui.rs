@@ -353,7 +353,8 @@ struct GeometryKey {
 /// What the looks were made from.
 #[derive(Debug, Clone, PartialEq)]
 enum LooksSource {
-    Part(Appearances, Option<Material>),
+    /// The material boxed: it is far bigger than the other variant.
+    Part(Appearances, Option<Box<Material>>),
     Assembly(Vec<Option<Appearance>>),
 }
 
@@ -802,7 +803,7 @@ impl OxydeApp {
         let source = match self.asm.as_ref() {
             None => LooksSource::Part(
                 self.doc.part.appearances().clone(),
-                self.doc.part.material().cloned(),
+                self.doc.part.material().cloned().map(Box::new),
             ),
             Some(asm) => LooksSource::Assembly(
                 asm.assembly

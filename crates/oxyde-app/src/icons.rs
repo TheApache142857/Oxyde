@@ -79,6 +79,27 @@ pub enum Icon {
     SaveImage,
     /// glTF export: a block with an arrow leaving it.
     ExportMesh,
+    // Simulation
+    /// Fixed Geometry: a block held against hatched ground, in green.
+    Fixture,
+    /// Roller/Slider: a block on green rollers.
+    Roller,
+    /// Force: a purple arrow pushing on a block.
+    Force,
+    /// Pressure: purple arrows pressing on a block's top.
+    Pressure,
+    /// Gravity: a block with a heavy arrow down.
+    Gravity,
+    /// Mesh: a block split into triangles.
+    Mesh,
+    /// Run: a green play mark.
+    RunStudy,
+    /// Stress: a block in plot colours, blue to red.
+    Stress,
+    /// Displacement: a block and, dashed, where it moves.
+    Displacement,
+    /// Factor of safety: a shield with a check.
+    Safety,
     // View and edit
     ViewFront,
     ViewTop,
@@ -112,6 +133,8 @@ const PLANE: Color32 = Color32::from_rgb(236, 222, 176);
 const PLANE_EDGE: Color32 = Color32::from_rgb(184, 150, 62);
 const AXIS_X: Color32 = Color32::from_rgb(210, 50, 50);
 const AXIS_Y: Color32 = Color32::from_rgb(40, 150, 60);
+/// Loads in the Simulation tab, purple as in SolidWorks.
+const LOAD: Color32 = Color32::from_rgb(150, 60, 190);
 const WHITE: Color32 = Color32::WHITE;
 
 /// Draws on the 24-unit grid of one icon.
@@ -926,6 +949,116 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.solid(3.0, 11.0, 10.0, 9.0, 4.0);
             pen.arrow((12.0, 9.0), (21.0, 3.0), 2.0, ACCENT);
         }
+        Fixture => {
+            pen.solid(8.0, 9.0, 12.0, 10.0, 4.0);
+            pen.line(&[(5.5, 4.0), (5.5, 21.0)], 1.6, ADD);
+            for k in 0..5 {
+                let y = 6.0 + 3.5 * k as f32;
+                pen.line(&[(5.5, y), (2.5, y + 2.5)], 1.2, ADD);
+            }
+            pen.head((8.0, 14.0), 1.0, 0.0, 3.6, ADD);
+        }
+        Roller => {
+            pen.solid(4.0, 6.0, 14.0, 9.0, 4.0);
+            for x in [7.0, 12.0, 17.0] {
+                pen.circle(x, 17.5, 2.2, ADD, Some((1.0, INK)));
+            }
+            pen.line(&[(2.0, 21.0), (22.0, 21.0)], 1.4, ADD);
+        }
+        Force => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            pen.arrow((14.0, 1.5), (10.0, 11.5), 2.2, LOAD);
+        }
+        Pressure => {
+            pen.solid(3.0, 13.0, 13.0, 8.0, 4.0);
+            for x in [6.0, 11.0, 16.0] {
+                pen.arrow((x, 2.0), (x, 10.5), 1.6, LOAD);
+            }
+        }
+        Gravity => {
+            pen.solid(4.0, 5.0, 11.0, 8.0, 4.0);
+            pen.arrow((11.5, 11.0), (11.5, 22.0), 2.6, INK);
+        }
+        Mesh => {
+            pen.solid(3.0, 9.0, 13.0, 12.0, 5.0);
+            pen.line(
+                &[(3.0, 21.0), (9.5, 9.0), (9.5, 21.0), (16.0, 9.0)],
+                1.0,
+                INK,
+            );
+            pen.line(&[(3.0, 15.0), (16.0, 15.0)], 1.0, INK);
+            pen.line(&[(3.0, 9.0), (8.0, 4.0)], 1.0, INK);
+            pen.line(&[(9.5, 9.0), (14.5, 4.0), (16.0, 9.0)], 1.0, INK);
+            pen.line(&[(16.0, 15.0), (21.0, 4.0)], 1.0, INK);
+        }
+        RunStudy => {
+            pen.poly(&[(6.0, 3.0), (20.0, 12.0), (6.0, 21.0)], ADD, INK);
+        }
+        Stress => {
+            // Front face in bands, top and side in the end colours.
+            let bands = [
+                Color32::from_rgb(0, 60, 255),
+                Color32::from_rgb(0, 200, 255),
+                Color32::from_rgb(40, 220, 60),
+                Color32::from_rgb(250, 220, 0),
+                Color32::from_rgb(240, 40, 20),
+            ];
+            pen.poly(
+                &[(3.0, 9.0), (7.0, 5.0), (21.0, 5.0), (17.0, 9.0)],
+                Color32::from_rgb(0, 60, 255),
+                INK,
+            );
+            for (k, color) in bands.iter().enumerate() {
+                let x = 3.0 + 2.8 * k as f32;
+                pen.fill(
+                    &[(x, 9.0), (x + 2.8, 9.0), (x + 2.8, 20.0), (x, 20.0)],
+                    *color,
+                );
+            }
+            pen.poly(
+                &[(17.0, 9.0), (21.0, 5.0), (21.0, 16.0), (17.0, 20.0)],
+                Color32::from_rgb(240, 40, 20),
+                INK,
+            );
+            pen.closed(
+                &[(3.0, 9.0), (17.0, 9.0), (17.0, 20.0), (3.0, 20.0)],
+                1.0,
+                INK,
+            );
+        }
+        Displacement => {
+            pen.solid(3.0, 10.0, 11.0, 10.0, 4.0);
+            pen.dashed(
+                &[
+                    (8.0, 6.0),
+                    (19.0, 3.0),
+                    (22.0, 6.0),
+                    (22.0, 14.0),
+                    (11.0, 17.0),
+                    (8.0, 14.0),
+                    (8.0, 6.0),
+                ],
+                1.2,
+                LOAD,
+                2.0,
+                1.6,
+            );
+        }
+        Safety => {
+            pen.poly(
+                &[
+                    (12.0, 2.0),
+                    (20.0, 5.0),
+                    (19.0, 14.0),
+                    (12.0, 22.0),
+                    (5.0, 14.0),
+                    (4.0, 5.0),
+                ],
+                BODY,
+                INK,
+            );
+            pen.check(12.0, 12.0, 4.0, ADD);
+        }
         Configurations => {
             // A small table: three rows, the middle one marked as the active configuration.
             pen.poly(
@@ -1160,7 +1293,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 68] = {
+pub const ALL: [Icon; 78] = {
     use Icon::*;
     [
         Sketch,
@@ -1215,6 +1348,16 @@ pub const ALL: [Icon; 68] = {
         Render,
         SaveImage,
         ExportMesh,
+        Fixture,
+        Roller,
+        Force,
+        Pressure,
+        Gravity,
+        Mesh,
+        RunStudy,
+        Stress,
+        Displacement,
+        Safety,
         ViewFront,
         ViewTop,
         ViewRight,

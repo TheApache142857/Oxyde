@@ -1,5 +1,6 @@
-//! Reading and writing Oxyde documents: parts (`.oxyprt`, formerly `.oxy`) and assemblies
-//! (`.oxyasm`); drawings (`.oxydrw`) come later.
+//! Reading and writing Oxyde documents: parts (`.oxyprt`, formerly `.oxy`), assemblies
+//! (`.oxyasm`), simulation studies (`.oxysim`, [`simulation`]) and their results (`.oxyres`,
+//! [`results`]); drawings (`.oxydrw`) come later.
 //!
 //! Every document is a ZIP archive starting with `manifest.json`, which says what kind of
 //! document it is. A part holds `model.json` (the feature timeline, the source of truth),
@@ -36,7 +37,9 @@ mod assembly_schema;
 pub mod gltf;
 pub mod material_library;
 pub mod obj;
+pub mod results;
 mod schema;
+pub mod simulation;
 pub mod step_import;
 pub mod stl;
 pub mod threemf;
@@ -81,6 +84,10 @@ pub enum DocumentKind {
     Part,
     Assembly,
     Drawing,
+    /// Simulation studies on a part or an assembly (`.oxysim`).
+    Simulation,
+    /// The results of a simulation study (`.oxyres`).
+    SimulationResults,
 }
 
 impl DocumentKind {
@@ -89,6 +96,8 @@ impl DocumentKind {
             DocumentKind::Part => "part",
             DocumentKind::Assembly => "assembly",
             DocumentKind::Drawing => "drawing",
+            DocumentKind::Simulation => "simulation",
+            DocumentKind::SimulationResults => "simulation_results",
         }
     }
 }
@@ -152,6 +161,11 @@ pub enum FormatError {
     InvalidAssembly(String),
     /// A material library file is inconsistent.
     InvalidLibrary(String),
+    /// A simulation study file is inconsistent.
+    InvalidSimulation(String),
+    /// A simulation results file is inconsistent: a binary entry of the wrong length, an
+    /// index out of range.
+    InvalidResults(String),
     /// What would be saved does not read back (nothing was written).
     Unreadable(Box<FormatError>),
 }
@@ -173,6 +187,8 @@ impl fmt::Display for FormatError {
             FormatError::InvalidModel(e) => write!(f, "{e}"),
             FormatError::InvalidAssembly(e) => write!(f, "invalid assembly: {e}"),
             FormatError::InvalidLibrary(e) => write!(f, "invalid material library: {e}"),
+            FormatError::InvalidSimulation(e) => write!(f, "invalid simulation study: {e}"),
+            FormatError::InvalidResults(e) => write!(f, "invalid simulation results: {e}"),
             FormatError::Unreadable(e) => {
                 write!(f, "the file would not open again, so it was not saved: {e}")
             }
@@ -269,9 +285,11 @@ pub fn document_kind(path: &Path) -> Result<(DocumentKind, String), FormatError>
         "part" => DocumentKind::Part,
         "assembly" => DocumentKind::Assembly,
         "drawing" => DocumentKind::Drawing,
+        "simulation" => DocumentKind::Simulation,
+        "simulation_results" => DocumentKind::SimulationResults,
         other => {
             return Err(FormatError::WrongKind {
-                expected: "part, assembly or drawing",
+                expected: "part, assembly, drawing, simulation or simulation results",
                 found: other.to_owned(),
             });
         }
@@ -289,13 +307,7 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
     // The manifest goes first so readers can identify the file cheaply.
     for (entry, bytes) in [
         (MANIFEST, to_json(MANIFEST, &manifest)?),
-        (
-            MODEL,
-            to_json(
-                MODEL,
-                &PartModel::from_definition(&part.definition, &textures),
-            )?,
-        ),
+        (MODEL, part_model_json(part, &textures)?),
         (PROPERTIES, to_json(PROPERTIES, &part.properties)?),
     ] {
         zip.start_file(entry, options)?;
@@ -310,6 +322,19 @@ pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, Form
     }
     write_textures(&mut zip, &textures, options)?;
     Ok(zip.finish()?)
+}
+
+/// `model.json` of a part, as saved.
+fn part_model_json(part: &PartFile, textures: &TextureTable) -> Result<Vec<u8>, FormatError> {
+    to_json(
+        MODEL,
+        &PartModel::from_definition(&part.definition, textures),
+    )
+}
+
+/// `model.json` of a part, exactly as [`write_part`] saves it, for its fingerprint.
+pub(crate) fn model_json(part: &PartFile) -> Result<Vec<u8>, FormatError> {
+    part_model_json(part, &TextureTable::new(part_textures(&part.definition)))
 }
 
 /// Texture images are already compressed: stored as they are.
@@ -470,22 +495,10 @@ pub fn write_assembly<W: Write + Seek>(
     let manifest = manifest(DocumentKind::Assembly, &assembly.document_id);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
-    let textures = TextureTable::new(
-        assembly
-            .assembly
-            .components
-            .iter()
-            .filter_map(|c| c.appearance.as_ref()?.texture.as_ref()),
-    );
+    let textures = assembly_textures(assembly);
     for (entry, bytes) in [
         (MANIFEST, to_json(MANIFEST, &manifest)?),
-        (
-            ASSEMBLY,
-            to_json(
-                ASSEMBLY,
-                &AssemblyModel::from_assembly(&assembly.assembly, &textures),
-            )?,
-        ),
+        (ASSEMBLY, assembly_model_json(assembly, &textures)?),
         (PROPERTIES, to_json(PROPERTIES, &assembly.properties)?),
     ] {
         zip.start_file(entry, options)?;
@@ -493,6 +506,32 @@ pub fn write_assembly<W: Write + Seek>(
     }
     write_textures(&mut zip, &textures, options)?;
     Ok(zip.finish()?)
+}
+
+fn assembly_textures(assembly: &AssemblyFile) -> TextureTable {
+    TextureTable::new(
+        assembly
+            .assembly
+            .components
+            .iter()
+            .filter_map(|c| c.appearance.as_ref()?.texture.as_ref()),
+    )
+}
+
+fn assembly_model_json(
+    assembly: &AssemblyFile,
+    textures: &TextureTable,
+) -> Result<Vec<u8>, FormatError> {
+    to_json(
+        ASSEMBLY,
+        &AssemblyModel::from_assembly(&assembly.assembly, textures),
+    )
+}
+
+/// `assembly.json` of an assembly, exactly as [`write_assembly`] saves it, for its
+/// fingerprint.
+pub(crate) fn assembly_json(assembly: &AssemblyFile) -> Result<Vec<u8>, FormatError> {
+    assembly_model_json(assembly, &assembly_textures(assembly))
 }
 
 /// Reads an assembly document and checks it: unique ids, mates between its components.

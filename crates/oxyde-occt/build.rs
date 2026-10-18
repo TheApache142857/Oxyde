@@ -10,6 +10,11 @@
 //!
 //! `OXYDE_OCCT_CHECK_ONLY=1` skips all of this, for `cargo check` on other systems.
 //!
+//! Netgen, the volume mesher (`Kernel::volume_mesh`), is optional. It is looked for in
+//! `OXYDE_NETGEN_DIR` (an install root), else next to OpenCASCADE (vcpkg installs both in
+//! the same folder). Without it the shim builds without a volume mesher;
+//! `OXYDE_NETGEN=0` leaves it out even when found, `OXYDE_NETGEN=1` makes it required.
+//!
 //! See `docs/BUILDING.md`.
 
 use std::env;
@@ -48,12 +53,16 @@ fn main() {
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=cpp/shim.h");
     println!("cargo:rerun-if-changed=cpp/shim.cpp");
+    println!("cargo:rerun-if-changed=cpp/netgen_mesh.h");
+    println!("cargo:rerun-if-changed=cpp/netgen_mesh.cpp");
     for var in [
         "OXYDE_OCCT_DIR",
         "OXYDE_OCCT_INCLUDE_DIR",
         "OXYDE_OCCT_LIB_DIR",
         "VCPKG_ROOT",
         "OXYDE_OCCT_CHECK_ONLY",
+        "OXYDE_NETGEN",
+        "OXYDE_NETGEN_DIR",
     ] {
         println!("cargo:rerun-if-env-changed={var}");
     }
@@ -78,9 +87,13 @@ fn main() {
     }
 
     let occt = Occt::locate();
+    let netgen = Netgen::locate(&occt);
 
-    cxx_build::bridge("src/ffi.rs")
-        .file("cpp/shim.cpp")
+    let mut shim = cxx_build::bridge("src/ffi.rs");
+    if netgen.is_some() {
+        shim.define("OXYDE_NETGEN", None);
+    }
+    shim.file("cpp/shim.cpp")
         .include(&occt.include_dir)
         .std("c++17")
         // MSVC runs no destructors while a C++ exception unwinds unless told the exception
@@ -93,6 +106,11 @@ fn main() {
         // OCCT headers are noisy at high warning levels.
         .warnings(false)
         .compile("oxyde_occt_shim");
+
+    // After the shim, which calls into it: GNU ld resolves static libraries in order.
+    if let Some(netgen) = &netgen {
+        netgen.compile_bridge(&occt);
+    }
 
     println!("cargo:rustc-link-search=native={}", occt.lib_dir.display());
     let step = if occt.has_lib("TKDESTEP") {
@@ -115,6 +133,123 @@ fn main() {
 struct Occt {
     include_dir: PathBuf,
     lib_dir: PathBuf,
+}
+
+/// The Netgen libraries the volume mesher links: the mesher and its core.
+const NETGEN_LIBRARIES: &[&str] = &["nglib", "ngcore"];
+
+/// A Netgen install built with OpenCASCADE support (`USE_OCC=ON`).
+struct Netgen {
+    /// Folders to add to the include path: Netgen's headers include one another both as
+    /// `<meshing.hpp>` and as `<core/ngcore.hpp>`.
+    include_dirs: Vec<PathBuf>,
+    lib_dir: PathBuf,
+}
+
+impl Netgen {
+    /// Finds Netgen, or `None` to build without it (see the module documentation).
+    fn locate(occt: &Occt) -> Option<Self> {
+        let wanted = env::var("OXYDE_NETGEN").ok();
+        if wanted.as_deref() == Some("0") {
+            return None;
+        }
+        let explicit = env::var_os("OXYDE_NETGEN_DIR").map(PathBuf::from);
+        let required = wanted.as_deref() == Some("1") || explicit.is_some();
+
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = &explicit {
+            roots.push(dir.clone());
+        } else {
+            // vcpkg and Homebrew-style prefixes keep Netgen beside OpenCASCADE: the two
+            // folders above its headers and above its libraries.
+            for dir in [&occt.include_dir, &occt.lib_dir] {
+                for root in dir.ancestors().skip(1).take(2) {
+                    if !roots.iter().any(|r| r == root) {
+                        roots.push(root.to_path_buf());
+                    }
+                }
+            }
+        }
+        for root in &roots {
+            if let Some(found) = Self::at(root) {
+                return Some(found);
+            }
+        }
+        // One line: Cargo shows only the first line of a build script's warning.
+        let searched: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        let message = format!(
+            "Netgen (occ/occgeom.hpp and the {} libraries) not found in {}",
+            NETGEN_LIBRARIES.join(" and "),
+            searched.join(", ")
+        );
+        if required {
+            fail(&message);
+        }
+        println!(
+            "cargo:warning=building without the Netgen volume mesher (docs/BUILDING.md): {message}"
+        );
+        None
+    }
+
+    /// Netgen installed under `root`: headers in `include` (vcpkg, Windows) or
+    /// `include/netgen` (CMake's default elsewhere), libraries in `lib`.
+    fn at(root: &Path) -> Option<Self> {
+        let lib_dir = root.join("lib");
+        if !NETGEN_LIBRARIES
+            .iter()
+            .all(|lib| lib_dir.join(lib_file(lib)).is_file())
+        {
+            return None;
+        }
+        ["include", "include/netgen"]
+            .iter()
+            .map(|rel| root.join(rel))
+            .find(|dir| dir.join("occ/occgeom.hpp").is_file())
+            .map(|include| Self {
+                include_dirs: vec![include.join("include"), include],
+                lib_dir,
+            })
+    }
+
+    /// Compiles `cpp/netgen_mesh.cpp`, the only file that sees Netgen's headers, and links
+    /// Netgen.
+    fn compile_bridge(&self, occt: &Occt) {
+        let mut build = cxx_build::bridges(std::iter::empty::<&str>());
+        build
+            .cpp(true)
+            .file("cpp/netgen_mesh.cpp")
+            .include(&occt.include_dir)
+            .includes(&self.include_dirs)
+            .std("c++17")
+            // As for the shim: destructors must run while an exception unwinds.
+            .flag_if_supported("/EHsc")
+            // Netgen's headers are templates enough to overflow MSVC's object sections.
+            .flag_if_supported("/bigobj")
+            .define("OCCGEOMETRY", None)
+            .warnings(false);
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            // What Netgen's own CMake targets ask of their users on Windows (ngcore's
+            // public compile definitions); WIN32 selects its dllimport declarations.
+            for define in [
+                "WIN32",
+                "WNT",
+                "WNT_WINDOW",
+                "NOMINMAX",
+                "MSVC_EXPRESS",
+                "_CRT_SECURE_NO_WARNINGS",
+                "HAVE_STRUCT_TIMESPEC",
+            ] {
+                build.define(define, None);
+            }
+            build.define("_WIN32_WINNT", Some("0x0A00"));
+        }
+        build.compile("oxyde_occt_netgen");
+
+        println!("cargo:rustc-link-search=native={}", self.lib_dir.display());
+        for lib in NETGEN_LIBRARIES {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+    }
 }
 
 impl Occt {

@@ -726,6 +726,7 @@ impl OxydeApp {
                             .suffix(" kg/m³"),
                     );
                     ui.end_row();
+                    mechanical_rows(ui, m);
                 });
             appearance_controls(ui, &mut m.appearance, &mut self.status);
             ui.add_space(8.0);
@@ -1068,4 +1069,71 @@ impl OxydeApp {
         self.add_context_materials(own, &mut materials);
         self.viewport.set_materials(materials, textures);
     }
+}
+
+/// A material's mechanical properties in the Material page's grid, for the Simulation
+/// tab: edited when known, else offered from the typical values of its family.
+fn mechanical_rows(ui: &mut egui::Ui, m: &mut Material) {
+    let Some(p) = m.mechanical.as_mut() else {
+        ui.label("Mechanical");
+        if ui
+            .button("Add properties")
+            .on_hover_text(
+                "Elastic modulus, Poisson's ratio and strengths, for the Simulation tab:                  typical values for this kind of material to start from",
+            )
+            .clicked()
+        {
+            m.mechanical = Some(match oxyde_sim::Elastic::guess(&m.name, &m.category) {
+                Some(e) => {
+                    oxyde_model::Mechanical::new(e.youngs_modulus, e.poisson, e.yield_strength, 0.0)
+                }
+                // Nothing known of it: a soft plastic's, to be typed over.
+                None => oxyde_model::Mechanical::new(2_000.0, 0.35, 0.0, 0.0),
+            });
+        }
+        ui.end_row();
+        return;
+    };
+    ui.label("Elastic modulus");
+    ui.add(
+        egui::DragValue::new(&mut p.elastic_modulus)
+            .range(0.001..=1e7)
+            .speed(100.0)
+            .suffix(" MPa"),
+    );
+    ui.end_row();
+    ui.label("Poisson's ratio");
+    ui.add(
+        egui::DragValue::new(&mut p.poisson_ratio)
+            .range(-0.99..=0.4999)
+            .speed(0.005)
+            .max_decimals(3),
+    );
+    ui.end_row();
+    ui.label("Yield strength");
+    ui.add(
+        egui::DragValue::new(&mut p.yield_strength)
+            .range(0.0..=1e5)
+            .speed(1.0)
+            .suffix(" MPa"),
+    )
+    .on_hover_text("0 when it has none (brittle materials): the tensile strength is used");
+    ui.end_row();
+    ui.label("Tensile strength");
+    ui.add(
+        egui::DragValue::new(&mut p.tensile_strength)
+            .range(0.0..=1e5)
+            .speed(1.0)
+            .suffix(" MPa"),
+    );
+    ui.end_row();
+    ui.label("");
+    if ui
+        .small_button("Remove properties")
+        .on_hover_text("The Simulation tab then uses typical values for its name")
+        .clicked()
+    {
+        m.mechanical = None;
+    }
+    ui.end_row();
 }

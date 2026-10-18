@@ -32,6 +32,8 @@ struct StepMaterialData;
 struct StepShapeColors;
 struct TopologyCounts;
 struct TopologyData;
+struct VolumeMeshData;
+struct VolumeMeshOptionsData;
 
 class Session {
 public:
@@ -60,6 +62,7 @@ public:
     PointData centre_of_mass(std::uint64_t shape) const;
     BoundsData bounds(std::uint64_t shape) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;
+    VolumeMeshData volume_mesh(std::uint64_t shape, const VolumeMeshOptionsData& options) const;
 
     void export_step(rust::Slice<const std::uint64_t> shapes,
                      rust::Slice<const StepShapeColors> colors,
@@ -79,5 +82,9 @@ private:
 std::unique_ptr<Session> new_session();
 
 rust::String occt_version();
+
+bool has_netgen();
+
+rust::String netgen_version();
 
 } // namespace oxyde::occt

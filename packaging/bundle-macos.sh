@@ -6,6 +6,7 @@
 #   bash packaging/bundle-macos.sh
 #
 # OpenCASCADE is found as for building (see docs/BUILDING.md): Homebrew's, or OXYDE_OCCT_DIR.
+# Netgen, the volume mesher, when the build has it: from OXYDE_NETGEN_DIR.
 # The dylibs are copied into Contents/Frameworks and the executable and every dylib are
 # pointed at them through @rpath, so the .app runs on a Mac without Homebrew.
 #
@@ -29,11 +30,14 @@ echo "Oxyde $VERSION ($ARCH)"
 # ---- Build ----------------------------------------------------------------------------------
 cargo build --release -p oxyde-app
 
-# ---- Where the OpenCASCADE dylibs are -------------------------------------------------------
+# ---- Where the OpenCASCADE and Netgen dylibs are --------------------------------------------
 # Libraries referred to through @rpath or @loader_path are looked for here.
 SEARCH_DIRS=()
 if [ -n "${OXYDE_OCCT_DIR:-}" ]; then
     SEARCH_DIRS+=("$OXYDE_OCCT_DIR/lib")
+fi
+if [ -n "${OXYDE_NETGEN_DIR:-}" ]; then
+    SEARCH_DIRS+=("$OXYDE_NETGEN_DIR/lib")
 fi
 if command -v brew >/dev/null 2>&1; then
     SEARCH_DIRS+=("$(brew --prefix opencascade 2>/dev/null || true)/lib" "$(brew --prefix)/lib")
@@ -117,6 +121,12 @@ for lib in "$FRAMEWORKS"/*.dylib; do
     install_name_tool -add_rpath "@loader_path" "$lib" 2>/dev/null || true
 done
 echo "$(ls "$FRAMEWORKS" | wc -l | tr -d ' ') dylibs in Frameworks"
+# Netgen is optional at build time (docs/BUILDING.md): say which kind of bundle this is.
+if [ -f "$FRAMEWORKS/libnglib.dylib" ]; then
+    echo "Netgen volume mesher included (libnglib.dylib, libngcore.dylib)"
+else
+    echo "Warning: no Netgen in this build: the Simulation tab meshes with its own mesher" >&2
+fi
 
 # ---- Sign: Apple Silicon runs no unsigned code, and install_name_tool broke the signatures --
 IDENTITY="${OXYDE_SIGN_IDENTITY:--}"

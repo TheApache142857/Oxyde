@@ -56,6 +56,8 @@ mod preview;
 mod property_manager;
 mod render_ui;
 mod section_view;
+mod simulation_files;
+mod simulation_ui;
 mod sketch_mode;
 mod splash;
 mod theme;

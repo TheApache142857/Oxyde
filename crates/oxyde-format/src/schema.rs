@@ -11,9 +11,9 @@ use oxyde_model::{
     ConfigurationText, ConfigurationsText, EdgeBlend, EdgeName, EquationText, Equations,
     EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
     FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Material,
-    MaterialSource, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve,
-    RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep, Texture,
-    VertexName,
+    MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis,
+    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep,
+    Texture, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -121,6 +121,21 @@ pub(crate) struct MaterialDto {
     /// `"step"` for a material named by an imported STEP file; absent for the library's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// How it behaves under load, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical: Option<MechanicalDto>,
+}
+
+/// A material's mechanical properties, MPa (N/mm²) for the modulus and the strengths.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MechanicalDto {
+    pub elastic_modulus: f64,
+    pub poisson_ratio: f64,
+    /// 0 or absent when unknown.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub yield_strength: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tensile_strength: f64,
 }
 
 pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto {
@@ -133,6 +148,12 @@ pub(crate) fn material_dto(m: &Material, textures: &TextureTable) -> MaterialDto
             MaterialSource::Library => None,
             MaterialSource::Step => Some("step".to_owned()),
         },
+        mechanical: m.mechanical.map(|p| MechanicalDto {
+            elastic_modulus: p.elastic_modulus,
+            poisson_ratio: p.poisson_ratio,
+            yield_strength: p.yield_strength,
+            tensile_strength: p.tensile_strength,
+        }),
     }
 }
 
@@ -154,6 +175,15 @@ pub(crate) fn material_from(
         density: dto.density,
         appearance: appearance_from(dto.appearance, files)?,
         source,
+        // Values a solver could not use are dropped by `clamped`, as if absent.
+        mechanical: dto.mechanical.map(|p| {
+            Mechanical::new(
+                p.elastic_modulus,
+                p.poisson_ratio,
+                p.yield_strength,
+                p.tensile_strength,
+            )
+        }),
     }
     .clamped())
 }

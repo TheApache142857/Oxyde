@@ -58,6 +58,41 @@ Open a new terminal afterwards.
 
 Cargo must be run from the repository folder (`cd C:\path\to\Oxyde`); a new terminal usually starts in your home folder, where Cargo reports *could not find `Cargo.toml`*.
 
+### Netgen, the volume mesher (optional)
+
+The Simulation tab fills parts with tetrahedra using [Netgen](https://ngsolve.org) (LGPL-2.1, linked as a shared library) through OpenCASCADE (`Kernel::volume_mesh`). Oxyde builds without it: the build script prints *building without the Netgen volume mesher* and the Simulation tab uses its own, coarser mesher instead. With vcpkg:
+
+```powershell
+$env:VCPKG_MAX_CONCURRENCY = "4"     # at most 4 compilers at once
+C:\dev\vcpkg\vcpkg install netgen[occ]:x64-windows
+```
+
+This builds Netgen 6.2.2401 (vcpkg's port, patched for OpenCASCADE 8) against the OpenCASCADE already installed, without rebuilding it (a few minutes), and puts it in the same folder: the build script finds it there, and `nglib.dll` and `ngcore.dll` land in the `bin` folder already on `PATH`. Run `cargo clean -p oxyde-occt` afterwards (or touch `crates/oxyde-occt/build.rs`) so the shim is rebuilt with it; `cargo test -p oxyde-tests --test netgen` then meshes real parts instead of skipping.
+
+| Variable | Effect |
+|---|---|
+| `OXYDE_NETGEN_DIR` | a Netgen install root of its own (with `include/occ/occgeom.hpp` or `include/netgen/occ/occgeom.hpp`, and `lib/nglib` and `lib/ngcore`); the build fails if it is not there |
+| `OXYDE_NETGEN=0` | build without Netgen even when it is found |
+| `OXYDE_NETGEN=1` | fail the build when Netgen is not found |
+
+**By hand** (another OpenCASCADE, or macOS, where Homebrew has no Netgen): build the same version with CMake against the OpenCASCADE Oxyde uses. Upstream 6.2.2401 predates OpenCASCADE 7.8's toolkit renames and 8.0's header removals, so apply the vcpkg port's `occt-compat.patch` first (`ports/netgen` in vcpkg; the other patches there are for vcpkg's packaging). The layout options make the install look like vcpkg's on every system, and on macOS the absolute install names let the executable find the dylibs as it finds Homebrew's:
+
+```sh
+git clone --branch v6.2.2401 --depth 1 https://github.com/NGSolve/netgen
+git -C netgen apply /path/to/vcpkg/ports/netgen/occt-compat.patch
+cmake -S netgen -B netgen-build -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_SUPERBUILD=OFF -DUSE_OCC=ON -DUSE_GUI=OFF -DUSE_PYTHON=OFF -DUSE_MPI=OFF \
+  -DUSE_SPDLOG=OFF -DUSE_NATIVE_ARCH=OFF -DENABLE_UNIT_TESTS=OFF \
+  -DOpenCASCADE_DIR="$(brew --prefix opencascade)/lib/cmake/opencascade" \
+  -DCMAKE_INSTALL_PREFIX="$HOME/netgen" -DCMAKE_INSTALL_NAME_DIR="$HOME/netgen/lib" \
+  -DNG_INSTALL_DIR_BIN=bin -DNG_INSTALL_DIR_LIB=lib -DNG_INSTALL_DIR_INCLUDE=include \
+  -DNG_INSTALL_DIR_CMAKE=lib/cmake/netgen -DNG_INSTALL_DIR_RES=share
+cmake --build netgen-build -j 4 && cmake --install netgen-build
+export OXYDE_NETGEN_DIR="$HOME/netgen"
+```
+
+On Windows the same works from a *Developer PowerShell for VS 2022* with `-G Ninja` (or the Visual Studio generator and `--config Release`), `-DOpenCASCADE_DIR=C:\dev\vcpkg\installed\x64-windows\share\opencascade`, and Netgen's `bin` folder added to `PATH`. Only the vcpkg build has been tested; the macOS one has not been tried yet. Whichever way it is built, `packaging/THIRD-PARTY.txt` must name the exact source and options of the Netgen that is shipped (the LGPL asks for it): update it when the version or the build changes.
+
 ## 2. Build and test
 
 ```powershell
@@ -66,6 +101,7 @@ cargo run --release -p oxyde-app -- part.oxyprt   # ... opening a file
 cargo test --workspace                         # everything
 cargo test -p oxyde-geom -p oxyde-sketch -p oxyde-kernel -p oxyde-model -p oxyde-assembly -p oxyde-format -p oxyde-render   # pure Rust, no OCCT needed
 cargo test -p oxyde-tests                      # engine + OpenCASCADE end-to-end tests
+cargo test -p oxyde-tests --test netgen        # the volume mesher (skips without Netgen)
 cargo run  -p oxyde-occt --example make_box    # writes box.step in the current folder
 ```
 
@@ -113,7 +149,7 @@ powershell -ExecutionPolicy Bypass -File packaging\bundle.ps1
 
 builds the release and writes:
 
-- `dist\Oxyde\`: `Oxyde.exe` with exactly the OpenCASCADE DLLs it needs (followed with `dumpbin`; without it, every DLL of OpenCASCADE's `bin` folder), the licences and the README;
+- `dist\Oxyde\`: `Oxyde.exe` with exactly the OpenCASCADE DLLs it needs (and Netgen's, `nglib.dll` and `ngcore.dll`, when the build has it: the script says which) (followed with `dumpbin`; without it, every DLL of OpenCASCADE's `bin` folder), the licences and the README;
 - `dist\Oxyde-<version>-windows-x64.zip`: the same, to unzip and run anywhere;
 - `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed: a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde;
 - `dist\Oxyde-<version>-windows-x64.msi`, when the [WiX Toolset](https://wixtoolset.org) 5 or later is installed (`dotnet tool install --global wix --version 5.0.2`, which needs the .NET SDK 8 or later; WiX 6 asks you to accept its maintenance-fee licence first, `wix eula accept wix6`): a Windows Installer package for every user of the machine, into `Program Files\Oxyde` (Windows asks for administrator rights), with a Start menu entry and the same file types, for IT departments and deployment tools (`msiexec /i Oxyde-<version>-windows-x64.msi /qn` installs it silently). A newer `.msi` replaces an older one; the two installers are alternatives, not meant to be installed side by side. Its definition is `packaging/installer.wxs`, whose `UpgradeCode` must never change.
@@ -149,5 +185,6 @@ Executables are built by hand, on a machine of each kind (no hosted build servic
 | `fatal error C1083: Cannot open include file: 'Standard.hxx'` | Include directory wrong — use Option C to set it explicitly. |
 | `LNK2019: unresolved external symbol` | Library directory from a different OCCT version than the headers, or a missing toolkit. Report the symbol name. |
 | `C1083` for a `*Iterator*.hxx` header, or `'DynamicType': is not a member of 'Standard_Failure'` | OCCT 8 removed legacy typedef headers and changed its exception class. The shim handles both 7.x and 8.x; if a new error of this kind appears, report it with the OCCT version. |
-| Tests exit with `0xc0000135` (`STATUS_DLL_NOT_FOUND`) | OCCT DLLs (or their third-party DLLs) are not on `PATH`. |
+| Tests exit with `0xc0000135` (`STATUS_DLL_NOT_FOUND`) | OCCT DLLs (or their third-party DLLs, or Netgen's `nglib.dll` and `ngcore.dll`) are not on `PATH`. |
+| Warning *building without the Netgen volume mesher* | Netgen is not installed where the build looks (see [Netgen](#netgen-the-volume-mesher-optional)); the message lists the folders searched. Harmless: simulations use the built-in mesher. After installing it, `cargo clean -p oxyde-occt`. |
 | Build script says oxyde-occt supports Windows (MSVC), Linux and macOS | On Windows, you are using the `x86_64-pc-windows-gnu` toolchain: run `rustup default stable-x86_64-pc-windows-msvc`. |

@@ -318,6 +318,7 @@ impl OxydeApp {
                 (CommandTab::Sketch, "Sketch"),
                 (CommandTab::Evaluate, "Evaluate"),
                 (CommandTab::Render, "Render"),
+                (CommandTab::Simulation, "Simulation"),
             ] {
                 let text = egui::RichText::new(label).size(13.0);
                 let text = if self.tab == tab { text.strong() } else { text };
@@ -360,6 +361,7 @@ impl OxydeApp {
                     CommandTab::Sketch => self.sketch_tab(ui),
                     CommandTab::Evaluate => self.evaluate_tab(ui),
                     CommandTab::Render => self.render_tab(ui),
+                    CommandTab::Simulation => self.simulation_tab(ui),
                 });
             });
     }

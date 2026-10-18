@@ -1,0 +1,10 @@
+[package]
+name = "oxyde-sim"
+description = "Finite element simulation for Oxyde: a tetrahedral mesher, a linear static solver, result plots."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

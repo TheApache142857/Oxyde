@@ -7,7 +7,9 @@
 #   powershell -ExecutionPolicy Bypass -File packaging\bundle.ps1
 #
 # OpenCASCADE is found as for building (see docs\BUILDING.md): OXYDE_OCCT_DIR, VCPKG_ROOT,
-# or OXYDE_OCCT_LIB_DIR. Its DLLs are taken from the matching bin folder.
+# or OXYDE_OCCT_LIB_DIR. Its DLLs are taken from the matching bin folder. Netgen's (the
+# volume mesher, when the build has it) come from OXYDE_NETGEN_DIR\bin, or from that same
+# folder, where vcpkg puts them.
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -39,6 +41,13 @@ function Find-OcctBin {
 $OcctBin = Find-OcctBin
 Write-Host "OpenCASCADE DLLs from $OcctBin"
 
+# The folders DLLs are copied from: OpenCASCADE's, and Netgen's when it has its own.
+$DllDirs = @($OcctBin)
+if ($env:OXYDE_NETGEN_DIR) {
+    $NetgenBin = Join-Path $env:OXYDE_NETGEN_DIR "bin"
+    if (Test-Path (Join-Path $NetgenBin "nglib.dll")) { $DllDirs += (Resolve-Path $NetgenBin).Path }
+}
+
 # ---- dumpbin, to follow DLL dependencies ----------------------------------------------------
 function Find-Dumpbin {
     $cmd = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
@@ -63,8 +72,8 @@ New-Item -ItemType Directory -Force -Path $Bundle | Out-Null
 Copy-Item target\release\oxyde.exe (Join-Path $Bundle "Oxyde.exe")
 
 if ($Dumpbin) {
-    # Every DLL the exe needs, then theirs, that OpenCASCADE's bin folder has (system DLLs
-    # stay out).
+    # Every DLL the exe needs, then theirs, that OpenCASCADE's or Netgen's bin folder has
+    # (system DLLs stay out).
     $queue = New-Object System.Collections.Queue
     $queue.Enqueue((Join-Path $Bundle "Oxyde.exe"))
     $copied = @{}
@@ -73,8 +82,10 @@ if ($Dumpbin) {
         $deps = & $Dumpbin /nologo /dependents $file |
             Where-Object { $_ -match '^\s+(\S+\.dll)\s*$' } | ForEach-Object { $Matches[1] }
         foreach ($dll in $deps) {
-            $source = Join-Path $OcctBin $dll
-            if (-not $copied.ContainsKey($dll.ToLower()) -and (Test-Path $source)) {
+            if ($copied.ContainsKey($dll.ToLower())) { continue }
+            $source = $DllDirs | ForEach-Object { Join-Path $_ $dll } |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($source) {
                 Copy-Item $source $Bundle
                 $copied[$dll.ToLower()] = $true
                 $queue.Enqueue((Join-Path $Bundle $dll))
@@ -83,8 +94,14 @@ if ($Dumpbin) {
     }
     Write-Host "$($copied.Count) DLLs copied"
 } else {
-    Write-Warning "dumpbin not found: copying every DLL of $OcctBin"
-    Copy-Item (Join-Path $OcctBin "*.dll") $Bundle
+    Write-Warning "dumpbin not found: copying every DLL of $($DllDirs -join ', ')"
+    foreach ($dir in $DllDirs) { Copy-Item (Join-Path $dir "*.dll") $Bundle }
+}
+# Netgen is optional at build time (docs\BUILDING.md): say which kind of bundle this is.
+if (Test-Path (Join-Path $Bundle "nglib.dll")) {
+    Write-Host "Netgen volume mesher included (nglib.dll, ngcore.dll)"
+} else {
+    Write-Warning "no Netgen in this build: the Simulation tab meshes with its own mesher"
 }
 
 Copy-Item LICENSE (Join-Path $Bundle "LICENSE.txt")

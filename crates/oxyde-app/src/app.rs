@@ -90,6 +90,8 @@ pub enum CommandTab {
     Evaluate,
     /// The model drawn by the path tracer (`render_ui`).
     Render,
+    /// A linear static study (`simulation_ui`).
+    Simulation,
 }
 
 /// A plane or axis drawn over the viewport, which can be clicked.
@@ -257,6 +259,8 @@ pub struct OxydeApp {
     pub(crate) image_export: Option<crate::export::ImageExportDialog>,
     /// The Render tab: its render and the meshes it is made from.
     pub(crate) render: crate::render_ui::RenderView,
+    /// The Simulation tab: the study, its mesh and results.
+    pub(crate) simulation: crate::simulation_ui::SimulationView,
     /// The GPU device egui draws with, when the window has one: the Render tab traces on
     /// it.
     pub(crate) wgpu_state: Option<eframe::egui_wgpu::RenderState>,
@@ -335,6 +339,7 @@ impl OxydeApp {
             mesh_export: None,
             image_export: None,
             render: Default::default(),
+            simulation: Default::default(),
             wgpu_state: None,
             prefs: crate::prefs::Preferences::load(),
             prefs_window: Default::default(),
@@ -1281,6 +1286,7 @@ impl OxydeApp {
     fn viewport_ui(&mut self, ui: &mut egui::Ui) {
         self.sync_preview(ui.ctx());
         self.refresh_scene();
+        self.simulation_scene();
         if self.sketch.is_some() {
             // A dimension's value is previewed only while its window is open.
             if !matches!(self.dialog, Some(Dialog::Dimension { .. }))
@@ -1325,6 +1331,7 @@ impl OxydeApp {
         self.viewport_rect = output.rect;
         let overlays = self.draw_references(ui, &output);
         self.render_over_viewport(ui, &output);
+        self.simulation_over_viewport(ui, &output);
         if let Some(pick) = output.clicked {
             let position = output.response.interact_pointer_pos();
             let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some()));
@@ -2001,6 +2008,7 @@ impl OxydeApp {
         self.splash_step(ctx);
         self.sync_locks();
         self.render_housekeeping(ctx);
+        self.simulation_housekeeping(ctx);
         let busy = self.busy();
         if self.asm.is_some() {
             self.clear_preview();
@@ -2048,6 +2056,9 @@ impl OxydeApp {
             .show(ctx, |ui| {
                 if self.tab == CommandTab::Render && self.sketch.is_none() {
                     self.render_panel(ui);
+                }
+                if self.tab == CommandTab::Simulation && self.sketch.is_none() {
+                    self.simulation_panel(ui);
                 }
                 self.property_manager(ui);
                 self.left_panel_tabs(ui);

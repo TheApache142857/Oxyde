@@ -27,6 +27,7 @@
 
 mod ffi;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -37,6 +38,7 @@ use oxyde_kernel::{
     BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
     OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
     StepMaterial, StepNode, StepNodeContent, SurfaceKind, Topology, TopologyCounts, VertexInfo,
+    VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -101,6 +103,12 @@ impl OcctKernel {
     /// Version of OpenCASCADE this crate was compiled against, e.g. `"7.8.1"`.
     pub fn occt_version() -> String {
         ffi::occt_version()
+    }
+
+    /// Version of the Netgen volume mesher built in, e.g. `"6.2.2401"`; `None` when this
+    /// build has none.
+    pub fn netgen_version() -> Option<String> {
+        ffi::has_netgen().then(ffi::netgen_version)
     }
 }
 
@@ -382,6 +390,36 @@ impl Kernel for OcctKernel {
             let tree = self.session.pin_mut().read_step_assembly(data)?;
             step_assembly(tree)
         })
+    }
+
+    fn has_volume_mesher(&self) -> bool {
+        ffi::has_netgen()
+    }
+
+    fn volume_mesh(
+        &self,
+        shape: ShapeHandle,
+        options: &VolumeMeshOptions,
+    ) -> Result<VolumeMesh, VolumeMeshError> {
+        if !ffi::has_netgen() {
+            return Err(VolumeMeshError::Unsupported);
+        }
+        guarded(|| {
+            let data = self.session.volume_mesh(
+                shape.raw(),
+                &ffi::VolumeMeshOptionsData {
+                    max_size: options.max_size,
+                    min_size: options.min_size,
+                    grading: options.grading,
+                    curvature_safety: options.curvature_safety,
+                    segments_per_edge: options.segments_per_edge,
+                    second_order: options.second_order,
+                    optimize_steps: options.optimize_steps,
+                },
+            )?;
+            volume_mesh_from(&data).map_err(OcctError::Occt)
+        })
+        .map_err(|e| VolumeMeshError::Failed(e.message().to_owned()))
     }
 
     fn release(&mut self, shape: ShapeHandle) {
@@ -724,6 +762,153 @@ fn mesh_from(data: ffi::MeshData) -> Mesh {
     }
 }
 
+// ---- Volume mesh ---------------------------------------------------------------------------
+
+/// Netgen's TET10 edge nodes (after the corners) are on the edges 01 02 03 12 13 23; this
+/// is where each of `oxyde_kernel::TET_EDGES` (01 12 02 03 13 23) finds its node.
+const NETGEN_TET_EDGE: [usize; 6] = [4, 7, 5, 6, 8, 9];
+
+/// Netgen's TRIG6 edge nodes are on the edges 12 02 01, each opposite the corner of its
+/// number; this is where each of `oxyde_kernel::TRIANGLE_EDGES` (01 12 20) finds its node.
+const NETGEN_TRIANGLE_EDGE: [usize; 3] = [5, 3, 4];
+
+/// The mesh in the kernel's terms: Netgen's node order converted, every tetrahedron
+/// positively oriented, every boundary triangle wound counter-clockwise seen from outside.
+/// Netgen's own orientation conventions are not relied on: each element is checked.
+fn volume_mesh_from(data: &ffi::VolumeMeshData) -> Result<VolumeMesh, String> {
+    let nodes: Vec<[f64; 3]> = data.nodes.as_chunks::<3>().0.to_vec();
+    let count = nodes.len();
+    let node = |i: u32| -> Result<[f64; 3], String> {
+        nodes
+            .get(i as usize)
+            .copied()
+            .ok_or_else(|| format!("node {i} of {count} does not exist"))
+    };
+
+    let second_order = match (data.nodes_per_tet, data.nodes_per_triangle) {
+        (4, 3) => false,
+        (10, 6) => true,
+        (t, f) => {
+            return Err(format!(
+                "{t}-node elements with {f}-node boundary triangles"
+            ));
+        }
+    };
+
+    let per_tet = data.nodes_per_tet as usize;
+    let mut tets = Vec::with_capacity(data.tets.len() / per_tet);
+    let mut tet_edges = Vec::new();
+    for el in data.tets.chunks_exact(per_tet) {
+        let mut corners = [at(el, 0)?, at(el, 1)?, at(el, 2)?, at(el, 3)?];
+        let mut edges = [0u32; 6];
+        if second_order {
+            for (e, &netgen) in edges.iter_mut().zip(&NETGEN_TET_EDGE) {
+                *e = at(el, netgen)?;
+                node(*e)?;
+            }
+        }
+        let p = [
+            node(corners[0])?,
+            node(corners[1])?,
+            node(corners[2])?,
+            node(corners[3])?,
+        ];
+        if triple(sub(p[1], p[0]), sub(p[2], p[0]), sub(p[3], p[0])) < 0.0 {
+            // Swapping corners 1 and 2 swaps the edges 01 and 02, and 13 and 23.
+            corners.swap(1, 2);
+            edges.swap(0, 2);
+            edges.swap(4, 5);
+        }
+        tets.push(corners);
+        if second_order {
+            tet_edges.push(edges);
+        }
+    }
+
+    // The fourth corner of the element under a boundary triangle tells its inside.
+    let mut opposite: HashMap<[u32; 3], u32> = HashMap::with_capacity(tets.len() * 2);
+    for t in &tets {
+        for (skip, &apex) in t.iter().enumerate() {
+            let mut face = [0u32; 3];
+            for (slot, &c) in face.iter_mut().zip(
+                t.iter()
+                    .enumerate()
+                    .filter(|&(k, _)| k != skip)
+                    .map(|(_, c)| c),
+            ) {
+                *slot = c;
+            }
+            face.sort_unstable();
+            opposite.insert(face, apex);
+        }
+    }
+
+    let per_triangle = data.nodes_per_triangle as usize;
+    let mut triangles = Vec::with_capacity(data.triangles.len() / per_triangle);
+    let mut triangle_edges = Vec::new();
+    for el in data.triangles.chunks_exact(per_triangle) {
+        let mut corners = [at(el, 0)?, at(el, 1)?, at(el, 2)?];
+        let mut edges = [0u32; 3];
+        if second_order {
+            for (e, &netgen) in edges.iter_mut().zip(&NETGEN_TRIANGLE_EDGE) {
+                *e = at(el, netgen)?;
+                node(*e)?;
+            }
+        }
+        let mut key = corners;
+        key.sort_unstable();
+        let inside = *opposite
+            .get(&key)
+            .ok_or("a boundary triangle that is no element's face")?;
+        let p = [node(corners[0])?, node(corners[1])?, node(corners[2])?];
+        let q = node(inside)?;
+        if triple(sub(p[1], p[0]), sub(p[2], p[0]), sub(q, p[0])) > 0.0 {
+            // The inside is in front: turn the triangle round. Swapping corners 1 and 2
+            // swaps the edges 01 and 20.
+            corners.swap(1, 2);
+            edges.swap(0, 2);
+        }
+        triangles.push(corners);
+        if second_order {
+            triangle_edges.push(edges);
+        }
+    }
+    if data.triangle_faces.len() != triangles.len() {
+        return Err(format!(
+            "{} face indices for {} boundary triangles",
+            data.triangle_faces.len(),
+            triangles.len()
+        ));
+    }
+
+    Ok(VolumeMesh {
+        nodes,
+        tets,
+        tet_edge_nodes: second_order.then_some(tet_edges),
+        triangles,
+        triangle_edge_nodes: second_order.then_some(triangle_edges),
+        triangle_faces: data.triangle_faces.clone(),
+    })
+}
+
+/// Node `k` of an element as the shim lists it.
+fn at(element: &[u32], k: usize) -> Result<u32, String> {
+    element
+        .get(k)
+        .copied()
+        .ok_or_else(|| format!("an element with {} nodes", element.len()))
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// `a . (b x c)`: six times the signed volume of the tetrahedron on the edges `a`, `b`, `c`.
+fn triple(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+        + a[2] * (b[0] * c[1] - b[1] * c[0])
+}
+
 fn surface_kind(kind: ffi::SurfaceKind) -> SurfaceKind {
     match kind {
         ffi::SurfaceKind::Plane => SurfaceKind::Plane,
@@ -749,7 +934,93 @@ fn curve_kind(kind: ffi::CurveKind) -> CurveKind {
 
 #[cfg(test)]
 mod tests {
-    use super::density_kg_per_m3;
+    use super::{density_kg_per_m3, ffi, sub, triple, volume_mesh_from};
+    use oxyde_kernel::{TET_EDGES, TRIANGLE_EDGES};
+
+    /// One ten-node tetrahedron as Netgen could hand it over: inverted, with its four
+    /// boundary triangles wound either way, edge nodes in Netgen's orders.
+    #[test]
+    fn netgen_meshes_come_out_oriented_and_in_kernel_order() {
+        let corners = [
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pairs = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
+        let mut nodes: Vec<[f64; 3]> = corners.to_vec();
+        for (a, b) in pairs {
+            let (p, q): ([f64; 3], [f64; 3]) = (corners[a], corners[b]);
+            nodes.push([
+                (p[0] + q[0]) / 2.0,
+                (p[1] + q[1]) / 2.0,
+                (p[2] + q[2]) / 2.0,
+            ]);
+        }
+        let mid = |a: u32, b: u32| {
+            let key = (a.min(b) as usize, a.max(b) as usize);
+            4 + pairs.iter().position(|&p| p == key).unwrap() as u32
+        };
+        // TRIG6: corners, then the edges 12, 02, 01.
+        let trig6 = |a: u32, b: u32, c: u32| [a, b, c, mid(b, c), mid(a, c), mid(a, b)];
+        let triangles: Vec<u32> = [
+            trig6(1, 2, 3),
+            trig6(0, 2, 3),
+            trig6(1, 0, 3),
+            trig6(0, 1, 2),
+        ]
+        .concat();
+        let data = ffi::VolumeMeshData {
+            nodes: nodes.iter().flatten().copied().collect(),
+            nodes_per_tet: 10,
+            tets: (0..10).collect(),
+            nodes_per_triangle: 6,
+            triangles,
+            triangle_faces: vec![0, 1, 2, 3],
+        };
+        let mesh = volume_mesh_from(&data).unwrap();
+        let at = |n: u32| mesh.nodes[n as usize];
+        let middle = |a: u32, b: u32| {
+            let (p, q) = (at(a), at(b));
+            [
+                (p[0] + q[0]) / 2.0,
+                (p[1] + q[1]) / 2.0,
+                (p[2] + q[2]) / 2.0,
+            ]
+        };
+
+        let t = mesh.tets[0];
+        let p = t.map(at);
+        assert!(triple(sub(p[1], p[0]), sub(p[2], p[0]), sub(p[3], p[0])) > 0.0);
+        let edges = mesh.tet_edge_nodes.as_ref().unwrap()[0];
+        for (k, &(a, b)) in TET_EDGES.iter().enumerate() {
+            assert_eq!(at(edges[k]), middle(t[a], t[b]), "tet edge {k}");
+        }
+
+        let triangle_edges = mesh.triangle_edge_nodes.as_ref().unwrap();
+        for (k, tri) in mesh.triangles.iter().enumerate() {
+            let apex = *t.iter().find(|n| !tri.contains(n)).unwrap();
+            let q = tri.map(at);
+            assert!(triple(sub(q[1], q[0]), sub(q[2], q[0]), sub(at(apex), q[0])) < 0.0);
+            for (e, &(a, b)) in TRIANGLE_EDGES.iter().enumerate() {
+                assert_eq!(at(triangle_edges[k][e]), middle(tri[a], tri[b]));
+            }
+        }
+        assert_eq!(mesh.triangle_faces, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_mesh_with_mismatched_orders_is_refused() {
+        let data = ffi::VolumeMeshData {
+            nodes: vec![0.0; 12],
+            nodes_per_tet: 10,
+            tets: Vec::new(),
+            nodes_per_triangle: 3,
+            triangles: Vec::new(),
+            triangle_faces: Vec::new(),
+        };
+        assert!(volume_mesh_from(&data).is_err());
+    }
 
     #[test]
     fn densities_come_back_in_kilograms_per_cubic_metre() {

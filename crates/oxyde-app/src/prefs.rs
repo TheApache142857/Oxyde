@@ -26,6 +26,8 @@ pub struct Preferences {
     pub recent: Vec<PathBuf>,
     /// The Render tab's setup and the finishes chosen per material.
     pub render: crate::render_ui::RenderPrefs,
+    /// The Simulation tab's mesh and plot settings and the elastic properties typed in.
+    pub simulation: crate::simulation_ui::SimulationPrefs,
 }
 
 impl Default for Preferences {
@@ -38,6 +40,7 @@ impl Default for Preferences {
             shortcuts: BTreeMap::new(),
             recent: Vec::new(),
             render: Default::default(),
+            simulation: Default::default(),
         }
     }
 }

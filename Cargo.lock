@@ -2525,6 +2525,7 @@ dependencies = [
  "oxyde-model",
  "oxyde-occt",
  "oxyde-render",
+ "oxyde-sim",
  "oxyde-sketch",
  "pollster 0.3.0",
  "rfd",
@@ -2611,6 +2612,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxyde-sim"
+version = "0.0.6"
+
+[[package]]
 name = "oxyde-sketch"
 version = "0.0.6"
 dependencies = [
@@ -2628,6 +2633,7 @@ dependencies = [
  "oxyde-kernel",
  "oxyde-model",
  "oxyde-occt",
+ "oxyde-sim",
  "oxyde-sketch",
  "serde_json",
 ]

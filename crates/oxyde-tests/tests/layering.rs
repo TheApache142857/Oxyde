@@ -24,6 +24,7 @@ const FORBIDDEN: &[(&str, &[&str])] = &[
     ("oxyde-assembly", &["oxyde-occt", "oxyde-app"]),
     ("oxyde-format", &["oxyde-occt", "oxyde-app"]),
     ("oxyde-render", &["oxyde-occt", "oxyde-model", "oxyde-app"]),
+    ("oxyde-sim", &["*"]),
     ("oxyde-app", &[]),
     ("oxyde-cli", &["oxyde-app"]),
     ("oxyde-tests", &[]),

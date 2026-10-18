@@ -40,6 +40,8 @@ pub enum AsmTab {
     Evaluate,
     /// The assembly drawn by the path tracer (`render_ui`).
     Render,
+    /// A linear static study of the assembly, its parts bonded (`simulation_ui`).
+    Simulation,
 }
 
 /// The mate types offered, in the order shown.
@@ -1268,6 +1270,7 @@ impl OxydeApp {
                 (AsmTab::Assembly, "Assembly"),
                 (AsmTab::Evaluate, "Evaluate"),
                 (AsmTab::Render, "Render"),
+                (AsmTab::Simulation, "Simulation"),
             ] {
                 let text = RichText::new(label).size(13.0);
                 let text = if self.asm_tab == tab {
@@ -1305,6 +1308,10 @@ impl OxydeApp {
         }
         if self.asm_tab == AsmTab::Render {
             ui.horizontal(|ui| self.render_tab(ui));
+            return;
+        }
+        if self.asm_tab == AsmTab::Simulation {
+            ui.horizontal(|ui| self.simulation_tab(ui));
             return;
         }
         // Fix/Float: every selected component, named after the first.
@@ -1478,6 +1485,9 @@ impl OxydeApp {
     pub(crate) fn assembly_panel(&mut self, ui: &mut egui::Ui) {
         if self.asm_tab == AsmTab::Render {
             self.render_panel(ui);
+        }
+        if self.asm_tab == AsmTab::Simulation {
+            self.simulation_panel(ui);
         }
         self.mate_manager(ui);
         self.refresh_mate_preview();
@@ -2251,6 +2261,7 @@ impl OxydeApp {
 
     pub(crate) fn assembly_viewport(&mut self, ui: &mut egui::Ui) {
         self.refresh_assembly_scene();
+        self.simulation_scene();
         let Some(doc) = self.asm.as_ref() else {
             return;
         };
@@ -2281,6 +2292,7 @@ impl OxydeApp {
         let overlays = self.draw_assembly_references(ui, &output);
         self.move_handle_ui(ui, &output);
         self.render_over_viewport(ui, &output);
+        self.simulation_over_viewport(ui, &output);
 
         if let Some(grab) = output.grab {
             self.grab_component(&grab);

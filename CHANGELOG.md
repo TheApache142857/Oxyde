@@ -5,6 +5,72 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### A Simulation tab (unreleased, October 2026)
+
+- **Simulation tab** (parts and assemblies), the first steps of `docs/SIMULATION.md`: a
+  linear static study as SolidWorks Simulation runs one. Select faces, then:
+  - *Fixed Geometry* holds them where they are; *Roller/Slider* lets them slide along
+    themselves but not move off them.
+  - *Force* pushes on them with a total in newtons, spread by area, normal to the faces or
+    along X, Y or Z; *Pressure* presses into them (MPa); *Gravity* adds the model's weight
+    from its materials' densities, downwards.
+  - *Run* fills the model with tetrahedra and solves it on a thread of its own, with a
+    progress bar and *Cancel*; *Mesh* shows the mesh alone.
+  - Then *Stress* (von Mises, or the first principal stress from the panel),
+    *Displacement* and *Factor of Safety* draw the result on the deformed model in
+    SolidWorks' colours, with a legend, the largest value (the smallest factor of safety)
+    marked, and the deformation exaggerated automatically or at a scale of your choice.
+  The panel at the top of the left side lists the fixtures and loads (click one to select
+  its faces, *Use selection* to move it, values edited in place), the material's elastic
+  modulus, Poisson's ratio and yield strength (typical values for the library's materials
+  and for steels, aluminium, plastics and other families by name; type others in), the mesh
+  (high quality ten-node or draft four-node elements, a coarse-to-fine density or a typed
+  element size, and how much of the model the mesh fills) and the results (largest stress
+  and displacement, smallest factor of safety, a warning when the part yields). Parts that
+  are not held are named before anything is solved, as SolidWorks warns of a model that
+  could move freely.
+- **Materials know how they behave under load**: elastic modulus, Poisson's ratio, yield
+  and tensile strength, edited on the Material page (*Add properties* starts from typical
+  values for the material's name) and saved with the material, in the part and in
+  `materials.json` (a new optional `mechanical` block, `docs/FORMAT.md`). Every material of
+  the starter library has them. The Simulation panel shows where the values come from (the
+  material's own, or typical values when it has none); typing others there changes them
+  for the study only, and *Apply to the material* keeps them in the part's material. A
+  material with no yield strength (cast iron, glass, acrylic) gets its factor of safety
+  from its tensile strength. Older files and materials named by STEP files simply have no
+  block and keep working.
+- **Contacts, as in Fusion 360.** Each body (each part of an assembly, each body of a
+  multi-body part) is meshed on its own and contacts say how bodies interact: *bonded*
+  (glued), *separation* (may part, never pass through each other), *sliding* (slide without
+  friction, stay in touch), *rough* (may part, never slide) and *offset bonded* (glued across
+  a gap). *Run* finds the faces of different bodies that touch (within a tolerance, 0.1 mm
+  by default) and bonds them; *Find Contacts* lists them first so their type can be changed
+  in the panel's Contacts list; *Manual Contact* makes one between the selected faces of two
+  bodies. A *Contact pressure* plot shows what the faces carry, and the panel warns when a
+  separation or rough contact did not settle.
+- **Netgen meshes the model** (when Oxyde is built with it, `docs/BUILDING.md`): elements
+  graded to the model's features and true to its faces and edges, instead of the lattice
+  mesher's bevelled edges. The Mesh section chooses the mesher; without Netgen, or if it
+  fails on a solid, the lattice mesher is used and the status bar says why.
+- **Studies and results are saved**: *Save* in the panel writes the study (fixtures, loads,
+  contacts, mesh settings, material overrides) as a `.oxysim` next to the model, and every
+  *Run* of a saved study saves it again with its results beside it as a `.oxyres` (the mesh
+  and every nodal field). *Open…* reads a study back for the model it was made for; *Open results…*
+  shows saved results without solving again, provided neither the model nor the study
+  changed since (each file records what it was computed from). Both are documented in
+  `docs/FORMAT.md` §8–§9.
+- Results go stale when the model changes: the model comes back and the panel asks for
+  another run.
+- Known limits of the lattice mesher (the fallback): elements are all about the same size,
+  sharp edges are bevelled at that size, and walls thinner than an element are lost (the
+  panel says how much of the model the mesh fills). Ten-node elements are straight-sided,
+  also on Netgen's meshes: curved faces follow their facets.
+- Solves take seconds: the solver's iterations are guided by multigrid, so a
+  70 000-node mesh solves in about 2 s (it took about 15 s with the simpler method, which
+  remains the fallback).
+- Plot settings are preferences (`simulation` in `preferences.json`); everything else
+  belongs to the study and its file.
+
 ### The Render tab on the GPU (0.0.6, October 2026)
 
 - **Renders run on the GPU.** The Render tab's path tracer now runs on the graphics card

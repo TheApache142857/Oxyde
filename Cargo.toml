@@ -19,6 +19,7 @@ oxyde-assembly = { path = "crates/oxyde-assembly" }
 oxyde-format = { path = "crates/oxyde-format" }
 oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
+oxyde-sim = { path = "crates/oxyde-sim" }
 
 clap = { version = "4.6", features = ["derive"] }
 cxx = "1.0"
@@ -33,4 +34,8 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # The software renderer is far too slow unoptimized; keep it fast in debug builds.
 [profile.dev.package.oxyde-render]
+opt-level = 3
+
+# The finite element solver too: a study would take minutes unoptimized.
+[profile.dev.package.oxyde-sim]
 opt-level = 3

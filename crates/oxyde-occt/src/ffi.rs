@@ -194,6 +194,36 @@ pub(crate) mod bridge {
         zmax: f64,
     }
 
+    // ---- Volume mesh (Netgen) ---------------------------------------------------------------
+
+    /// Netgen's meshing parameters, as `oxyde_kernel::VolumeMeshOptions` carries them.
+    struct VolumeMeshOptionsData {
+        max_size: f64,
+        min_size: f64,
+        grading: f64,
+        curvature_safety: f64,
+        segments_per_edge: f64,
+        second_order: bool,
+        optimize_steps: u32,
+    }
+
+    /// A volume mesh as Netgen makes it, untouched: node numbering from 0, and Netgen's own
+    /// node order and orientation within each element (src/lib.rs converts them).
+    struct VolumeMeshData {
+        /// x, y, z per node.
+        nodes: Vec<f64>,
+        /// 4 (first order) or 10 (second order).
+        nodes_per_tet: u32,
+        /// `nodes_per_tet` node indices per tetrahedron.
+        tets: Vec<u32>,
+        /// 3 or 6.
+        nodes_per_triangle: u32,
+        /// `nodes_per_triangle` node indices per boundary triangle.
+        triangles: Vec<u32>,
+        /// Per boundary triangle, the face it lies on, in topology order.
+        triangle_faces: Vec<u32>,
+    }
+
     // ---- STEP colours -----------------------------------------------------------------------
 
     /// A colour of a solid or a face in a STEP file; `present` false where there is none.
@@ -358,6 +388,19 @@ pub(crate) mod bridge {
         fn bounds(self: &Session, shape: u64) -> Result<BoundsData>;
 
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
+
+        /// Whether the shim was built with Netgen.
+        fn has_netgen() -> bool;
+
+        /// Version of the Netgen the shim was built with, or "" without one.
+        fn netgen_version() -> String;
+
+        /// Fills the one solid of `shape` with tetrahedra (Netgen, one call at a time).
+        fn volume_mesh(
+            self: &Session,
+            shape: u64,
+            options: &VolumeMeshOptionsData,
+        ) -> Result<VolumeMeshData>;
 
         /// Writes the shapes with their colours (`colors` indexed like `shapes`, or empty)
         /// and materials (`materials` indexed like `shapes`, or empty).

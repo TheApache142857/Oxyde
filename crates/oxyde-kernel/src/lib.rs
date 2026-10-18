@@ -294,6 +294,114 @@ pub struct StepInstance {
     pub transform: Transform,
 }
 
+/// How finely [`Kernel::volume_mesh`] fills a solid with tetrahedra.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeMeshOptions {
+    /// Largest element edge, mm.
+    pub max_size: f64,
+    /// Smallest element edge the mesher refines down to near small features, mm (0 for
+    /// no limit).
+    pub min_size: f64,
+    /// How fast element size may grow away from a small feature: 0 keeps it uniform, 1
+    /// lets it double from one element to the next (Netgen's grading; 0.3 is moderate).
+    pub grading: f64,
+    /// Elements per radius of curvature on curved faces and edges (Netgen's curvature
+    /// safety; 2 is moderate, higher is finer around fillets and holes).
+    pub curvature_safety: f64,
+    /// Elements per edge at least, however short the edge (Netgen's segments per edge).
+    pub segments_per_edge: f64,
+    /// Ten-node elements with their edge nodes on the true surface, instead of four-node.
+    pub second_order: bool,
+    /// Passes of mesh optimisation after meshing (Netgen's `optsteps3d`).
+    pub optimize_steps: u32,
+}
+
+impl VolumeMeshOptions {
+    /// Moderate settings around a largest element edge of `max_size` mm.
+    pub fn with_size(max_size: f64) -> Self {
+        Self {
+            max_size,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for VolumeMeshOptions {
+    /// Netgen's "moderate" preset with a 5 mm largest element.
+    fn default() -> Self {
+        Self {
+            max_size: 5.0,
+            min_size: 0.0,
+            grading: 0.3,
+            curvature_safety: 2.0,
+            segments_per_edge: 1.0,
+            second_order: false,
+            optimize_steps: 3,
+        }
+    }
+}
+
+/// The edges of a tetrahedron, as pairs of corners, in the order of
+/// [`VolumeMesh::tet_edge_nodes`].
+pub const TET_EDGES: [(usize, usize); 6] = [(0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3)];
+
+/// The edges of a boundary triangle, as pairs of corners, in the order of
+/// [`VolumeMesh::triangle_edge_nodes`].
+pub const TRIANGLE_EDGES: [(usize, usize); 3] = [(0, 1), (1, 2), (2, 0)];
+
+/// A solid filled with tetrahedra, made by [`Kernel::volume_mesh`]: plain data, in mm.
+///
+/// Every element is positively oriented: its fourth corner lies on the side its first three
+/// wind counter-clockwise around. Every boundary triangle is wound counter-clockwise seen
+/// from outside the solid, and names the B-rep face it lies on, so a persistent face name
+/// maps onto the mesh's boundary.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VolumeMesh {
+    /// x, y, z of every node.
+    pub nodes: Vec<[f64; 3]>,
+    /// Corner nodes of each tetrahedron (indices into `nodes`).
+    pub tets: Vec<[u32; 4]>,
+    /// For a second-order mesh, the node on each edge of each tetrahedron, in
+    /// [`TET_EDGES`] order. An edge node on the boundary lies on the true surface, so a
+    /// boundary element is curved; inside the solid it is at the middle of its edge.
+    pub tet_edge_nodes: Option<Vec<[u32; 6]>>,
+    /// Corner nodes of each triangle of the solid's boundary.
+    pub triangles: Vec<[u32; 3]>,
+    /// For a second-order mesh, the node on each edge of each boundary triangle, in
+    /// [`TRIANGLE_EDGES`] order: the same nodes as the elements' edge nodes.
+    pub triangle_edge_nodes: Option<Vec<[u32; 3]>>,
+    /// For each boundary triangle, the face it lies on: an index into the solid's
+    /// [`Topology::faces`].
+    pub triangle_faces: Vec<u32>,
+}
+
+impl VolumeMesh {
+    pub fn is_second_order(&self) -> bool {
+        self.tet_edge_nodes.is_some()
+    }
+}
+
+/// Why [`Kernel::volume_mesh`] gave no mesh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeMeshError {
+    /// This kernel has no volume mesher (or was built without one): mesh another way.
+    Unsupported,
+    /// The mesher was there and failed, or the shape is not one solid; the message says
+    /// why.
+    Failed(String),
+}
+
+impl std::fmt::Display for VolumeMeshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VolumeMeshError::Unsupported => write!(f, "no volume mesher in this kernel"),
+            VolumeMeshError::Failed(message) => write!(f, "volume meshing failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for VolumeMeshError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Fuse,
@@ -471,6 +579,25 @@ pub trait Kernel {
     /// of its children. Products without solids are left out. A file without assembly
     /// structure gives a single part.
     fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, Self::Error>;
+
+    /// Whether [`Kernel::volume_mesh`] can mesh at all here: false when the kernel has no
+    /// volume mesher or was built without one.
+    fn has_volume_mesher(&self) -> bool {
+        false
+    }
+
+    /// Fills one solid with tetrahedra for analysis. `shape` must hold exactly one solid;
+    /// several parts are meshed one call each (their contacts are the solver's business,
+    /// not a shared mesh's). [`VolumeMeshError::Unsupported`] when the kernel has no
+    /// volume mesher, which is the default.
+    fn volume_mesh(
+        &self,
+        shape: ShapeHandle,
+        options: &VolumeMeshOptions,
+    ) -> Result<VolumeMesh, VolumeMeshError> {
+        let _ = (shape, options);
+        Err(VolumeMeshError::Unsupported)
+    }
 
     /// Frees a shape. Releasing an unknown or already released handle does nothing.
     fn release(&mut self, shape: ShapeHandle);
