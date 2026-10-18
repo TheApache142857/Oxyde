@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
-use oxyde_render::{Rgb, Style};
+use oxyde_render::{DisplayStyle, Rgb, Style};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,7 +97,11 @@ pub struct Graphics {
     pub edge: Rgb,
     pub edge_selected: Rgb,
     pub edge_hovered: Rgb,
-    pub show_edges: bool,
+    /// Shaded with or without edges, hidden lines removed or visible, or wireframe
+    /// (View › Display Style). Files from before it have `show_edges` instead, turned
+    /// into a style by [`Preferences::from_json`].
+    #[serde(with = "display_style")]
+    pub display_style: DisplayStyle,
     pub edge_width: f32,
     pub highlight_width: f32,
     pub mesh_quality: MeshQuality,
@@ -130,7 +134,7 @@ impl Default for Graphics {
             edge: [0; 3],
             edge_selected: [0; 3],
             edge_hovered: [0; 3],
-            show_edges: true,
+            display_style: DisplayStyle::default(),
             edge_width: 0.0,
             highlight_width: 0.0,
             mesh_quality: MeshQuality::Normal,
@@ -156,7 +160,7 @@ impl Graphics {
             edge: self.edge,
             edge_selected: self.edge_selected,
             edge_hovered: self.edge_hovered,
-            show_edges: self.show_edges,
+            display: self.display_style,
             edge_width: self.edge_width.clamp(0.5, 8.0),
             highlight_width: self.highlight_width.clamp(0.5, 12.0),
             floor_reflection: if self.floor_reflections {
@@ -172,7 +176,8 @@ impl Graphics {
         }
     }
 
-    /// Takes the colours and edges of `style` (a preset).
+    /// Takes the colours and edge widths of `style` (a preset); the display style stays
+    /// as it is, since a preset is about colours.
     pub fn set_style(&mut self, style: &Style) {
         self.background_top = style.background_top;
         self.background_bottom = style.background_bottom;
@@ -182,7 +187,6 @@ impl Graphics {
         self.edge = style.edge;
         self.edge_selected = style.edge_selected;
         self.edge_hovered = style.edge_hovered;
-        self.show_edges = style.show_edges;
         self.edge_width = style.edge_width;
         self.highlight_width = style.highlight_width;
     }
@@ -330,13 +334,57 @@ pub fn path() -> Option<PathBuf> {
     base.map(|d| d.join("preferences.json"))
 }
 
+/// The display style in the preferences, by name (`oxyde-render` has no serde). A name
+/// this version does not know gives the default style rather than losing the whole file.
+mod display_style {
+    use oxyde_render::DisplayStyle;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub const NAMES: [(DisplayStyle, &str); 5] = [
+        (DisplayStyle::ShadedWithEdges, "shaded_with_edges"),
+        (DisplayStyle::Shaded, "shaded"),
+        (DisplayStyle::HiddenLinesRemoved, "hidden_lines_removed"),
+        (DisplayStyle::HiddenLinesVisible, "hidden_lines_visible"),
+        (DisplayStyle::Wireframe, "wireframe"),
+    ];
+
+    pub fn serialize<S: Serializer>(style: &DisplayStyle, s: S) -> Result<S::Ok, S::Error> {
+        let name = NAMES
+            .iter()
+            .find(|(d, _)| d == style)
+            .map_or(NAMES[0].1, |(_, n)| n);
+        s.serialize_str(name)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DisplayStyle, D::Error> {
+        let name = String::deserialize(d)?;
+        Ok(NAMES
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map_or_else(DisplayStyle::default, |(s, _)| *s))
+    }
+}
+
 impl Preferences {
     /// The saved preferences, or the defaults when there are none or they cannot be read.
     pub fn load() -> Self {
         path()
             .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .and_then(|bytes| Self::from_json(&bytes))
             .unwrap_or_default()
+    }
+
+    /// Preferences read from their file, older files brought up to date: one with edges
+    /// turned off (`show_edges`, before the display styles) gets the Shaded style.
+    pub fn from_json(bytes: &[u8]) -> Option<Self> {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if let Some(g) = value.get_mut("graphics").and_then(|g| g.as_object_mut()) {
+            let edges_off = g.get("show_edges") == Some(&serde_json::Value::Bool(false));
+            if edges_off && !g.contains_key("display_style") {
+                g.insert("display_style".to_owned(), "shaded".into());
+            }
+        }
+        serde_json::from_value(value).ok()
     }
 
     pub fn save(&self) -> Result<PathBuf, String> {
@@ -748,5 +796,59 @@ impl Action {
             Action::Mate => Binding::new(Key::M),
             _ => return None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_display_style_is_saved_and_read_back() {
+        for (style, _) in DisplayStyle::ALL {
+            // Every style has a name in the file.
+            assert!(display_style::NAMES.iter().any(|(s, _)| *s == style));
+            let mut prefs = Preferences::default();
+            prefs.graphics.display_style = style;
+            let bytes = serde_json::to_vec_pretty(&prefs).unwrap();
+            let back = Preferences::from_json(&bytes).unwrap();
+            assert_eq!(back.graphics.display_style, style);
+            assert_eq!(back.graphics.style().display, style);
+        }
+    }
+
+    #[test]
+    fn older_files_keep_their_edges_setting() {
+        let read = |json: &str| Preferences::from_json(json.as_bytes()).unwrap();
+        let style = |json: &str| read(json).graphics.display_style;
+        assert_eq!(
+            style(r#"{"graphics": {"show_edges": false}}"#),
+            DisplayStyle::Shaded
+        );
+        assert_eq!(
+            style(r#"{"graphics": {"show_edges": true}}"#),
+            DisplayStyle::ShadedWithEdges
+        );
+        assert_eq!(style("{}"), DisplayStyle::ShadedWithEdges);
+        // A style chosen since wins over the old setting, and one this version does not
+        // know falls back to the default without losing the rest.
+        assert_eq!(
+            style(r#"{"graphics": {"show_edges": false, "display_style": "wireframe"}}"#),
+            DisplayStyle::Wireframe
+        );
+        let newer = read(r#"{"graphics": {"display_style": "x_ray", "show_triad": false}}"#);
+        assert_eq!(newer.graphics.display_style, DisplayStyle::ShadedWithEdges);
+        assert!(!newer.graphics.show_triad);
+    }
+
+    #[test]
+    fn colour_presets_leave_the_display_style_alone() {
+        let mut g = Graphics {
+            display_style: DisplayStyle::HiddenLinesVisible,
+            ..Graphics::default()
+        };
+        g.set_style(&Style::DARK);
+        assert_eq!(g.display_style, DisplayStyle::HiddenLinesVisible);
+        assert_eq!(g.style().face, Style::DARK.face);
     }
 }

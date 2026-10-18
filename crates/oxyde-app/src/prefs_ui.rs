@@ -3,7 +3,7 @@
 //! viewport, and the dispatch of keyboard shortcuts to commands.
 
 use eframe::egui::{self, Color32, RichText};
-use oxyde_render::{Rgb, StandardView, Style};
+use oxyde_render::{DisplayStyle, Rgb, StandardView, Style};
 
 use crate::app::{Command, OxydeApp, PendingAction};
 use crate::features_ui::PatternKind;
@@ -226,17 +226,27 @@ impl OxydeApp {
 
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Display");
-        ui.checkbox(&mut g.show_edges, "Show edges")
-            .on_hover_text("Hidden edges cannot be clicked: pick faces instead");
-        ui.add_enabled_ui(g.show_edges, |ui| {
-            egui::Grid::new("edges").num_columns(2).show(ui, |ui| {
-                ui.label("Edge width");
-                ui.add(egui::Slider::new(&mut g.edge_width, 0.5..=4.0).suffix(" px"));
-                ui.end_row();
-                ui.label("Highlighted edge width");
-                ui.add(egui::Slider::new(&mut g.highlight_width, 1.0..=8.0).suffix(" px"));
-                ui.end_row();
-            });
+        egui::Grid::new("edges").num_columns(2).show(ui, |ui| {
+            ui.label("Display style");
+            egui::ComboBox::from_id_salt("display_style")
+                .selected_text(g.display_style.label())
+                .show_ui(ui, |ui| {
+                    for (style, label) in DisplayStyle::ALL {
+                        ui.selectable_value(&mut g.display_style, style, label);
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "How the part is drawn (also in View and on the view toolbar). Faces and \
+                     edges can be picked in every style.",
+                );
+            ui.end_row();
+            ui.label("Edge width");
+            ui.add(egui::Slider::new(&mut g.edge_width, 0.5..=4.0).suffix(" px"));
+            ui.end_row();
+            ui.label("Highlighted edge width");
+            ui.add(egui::Slider::new(&mut g.highlight_width, 1.0..=8.0).suffix(" px"));
+            ui.end_row();
         });
         ui.checkbox(&mut g.show_triad, "Orientation triad in the corner");
         ui.checkbox(&mut g.floor_reflections, "Floor reflections")
