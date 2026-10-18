@@ -229,7 +229,8 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
 }
 
 /// Uses the system's interface and code fonts, keeping egui's own as fallbacks for the
-/// symbols they lack (▾, ✓…).
+/// symbols they lack (⏷, emoji…). A character none of them has draws as an empty box: the
+/// test below checks every character in the interface's strings.
 pub fn load_fonts(ctx: &egui::Context) {
     let candidates: &[(&str, &[&str])] = &[
         (
@@ -272,4 +273,127 @@ pub fn load_fonts(ctx: &egui::Context) {
             .insert(0, (*name).to_owned());
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The characters outside ASCII in `source`, outside comments, with their line numbers.
+    /// A small scanner rather than a parser: it knows comments, strings, raw strings and
+    /// character literals, which is all it takes to tell interface text from comments.
+    fn literal_chars(source: &str) -> Vec<(usize, char)> {
+        let chars: Vec<char> = source.chars().collect();
+        let (mut out, mut line, mut i) = (Vec::new(), 1, 0);
+        let at = |i: usize, s: &str| {
+            s.chars()
+                .enumerate()
+                .all(|(k, c)| chars.get(i + k) == Some(&c))
+        };
+        while i < chars.len() {
+            if at(i, "//") {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if at(i, "/*") {
+                while i < chars.len() && !at(i, "*/") {
+                    line += usize::from(chars[i] == '\n');
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            if at(i, "r#\"") || at(i, "r\"") {
+                let hashes = usize::from(chars[i + 1] == '#');
+                let end = if hashes == 1 { "\"#" } else { "\"" };
+                i += 2 + hashes;
+                while i < chars.len() && !at(i, end) {
+                    line += usize::from(chars[i] == '\n');
+                    if !chars[i].is_ascii() {
+                        out.push((line, chars[i]));
+                    }
+                    i += 1;
+                }
+                i += end.len();
+                continue;
+            }
+            match chars[i] {
+                '"' => {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '"' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        line += usize::from(chars[i] == '\n');
+                        if !chars[i].is_ascii() {
+                            out.push((line, chars[i]));
+                        }
+                        i += 1;
+                    }
+                }
+                // A character literal ('"', '\'', '°'), not a lifetime.
+                '\'' if chars.get(i + 2) == Some(&'\'') || chars.get(i + 1) == Some(&'\\') => {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '\'' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        if !chars[i].is_ascii() {
+                            out.push((line, chars[i]));
+                        }
+                        i += 1;
+                    }
+                }
+                '\n' => line += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn literal_chars_skip_comments() {
+        let found = literal_chars("// °\nlet a = \"×\"; /* ² */ let b = '\"'; // µ\nlet c = '·';");
+        assert_eq!(found, vec![(2, '×'), (3, '·')]);
+    }
+
+    /// Every character the interface writes has a glyph in the fonts `load_fonts` sets up,
+    /// in both families: a missing one draws as an empty box (the PropertyManager's ▾ did).
+    #[test]
+    fn interface_characters_have_glyphs() {
+        let ctx = egui::Context::default();
+        load_fonts(&ctx);
+        // Fonts set with `set_fonts` take effect at the start of the next frame.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        files.sort();
+        let mut missing = Vec::new();
+        for path in &files {
+            let source = std::fs::read_to_string(path).unwrap();
+            for (line, c) in literal_chars(&source) {
+                for font in [FontId::proportional(13.0), FontId::monospace(12.5)] {
+                    if !ctx.fonts(|f| f.has_glyph(&font, c)) {
+                        let file = path.file_name().unwrap().to_string_lossy();
+                        missing.push(format!(
+                            "{file}:{line}: {c} (U+{:04X}) in {font:?}",
+                            c as u32
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "characters with no glyph:\n{}",
+            missing.join("\n")
+        );
+    }
 }

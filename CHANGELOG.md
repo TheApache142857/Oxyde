@@ -32,6 +32,12 @@ for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
   one study's results over the other's; New Study and Rename now tell them apart.
 - **Right-click selects what it is on.** A right-click on a face or an edge acted on what
   was selected before; it now selects what is under the pointer first, as in SolidWorks.
+- **Direction and axis boxes are one line high again.** In Linear and Circular Pattern,
+  Mirror, Revolve, Extrude's *Up To Surface*, Plane and Axis, the box holding a direction,
+  an axis, a plane or a face stretched down to the bottom of the window, hiding the
+  spacing, the number of instances and every option under it. Its list button showed an
+  empty square instead of an arrow, and so did the button removing an appearance's
+  texture.
 
 New, for daily work:
 

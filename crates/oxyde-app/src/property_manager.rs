@@ -119,42 +119,48 @@ fn reference_box<T>(
             .inner_margin(egui::Margin::symmetric(6.0, 4.0))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("▾", |ui| {
-                        for (i, (label, _)) in choices.iter().enumerate() {
-                            if ui.selectable_label(*selected == Some(i), label).clicked() {
-                                *selected = Some(i);
-                                chosen = true;
-                                ui.close_menu();
+                // `horizontal` first: a bare right-to-left layout takes all the height left
+                // in the panel and centres the label in it, stretching the box to the bottom.
+                let row = egui::Layout::right_to_left(egui::Align::Center);
+                ui.horizontal(|ui| {
+                    ui.with_layout(row, |ui| {
+                        // ⏷, not ▾: the interface fonts have no ▾, which showed as a box.
+                        ui.menu_button("⏷", |ui| {
+                            for (i, (label, _)) in choices.iter().enumerate() {
+                                if ui.selectable_label(*selected == Some(i), label).clicked() {
+                                    *selected = Some(i);
+                                    chosen = true;
+                                    ui.close_menu();
+                                }
                             }
-                        }
+                        })
+                        .response
+                        .on_hover_text("Choose from the list");
+                        // The rest of the box, left of the arrow, activates it.
+                        let layout = egui::Layout::left_to_right(egui::Align::Center);
+                        ui.with_layout(layout, |ui| {
+                            let text = match current {
+                                Some(label) => RichText::new(label),
+                                None => RichText::new(hint).italics().weak(),
+                            };
+                            let label = ui.add(
+                                egui::Label::new(text)
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            let rest = ui.allocate_response(
+                                egui::vec2(ui.available_width(), label.rect.height()),
+                                egui::Sense::click(),
+                            );
+                            let hover = if active {
+                                "Click in the graphics area or the tree to fill this in"
+                            } else {
+                                "Click here, then in the graphics area or the tree"
+                            };
+                            clicked = label.on_hover_text(hover).clicked()
+                                || rest.on_hover_text(hover).clicked();
+                        });
                     })
-                    .response
-                    .on_hover_text("Choose from the list");
-                    // The rest of the box, left of the arrow, activates it.
-                    let layout = egui::Layout::left_to_right(egui::Align::Center);
-                    ui.with_layout(layout, |ui| {
-                        let text = match current {
-                            Some(label) => RichText::new(label),
-                            None => RichText::new(hint).italics().weak(),
-                        };
-                        let label = ui.add(
-                            egui::Label::new(text)
-                                .truncate()
-                                .sense(egui::Sense::click()),
-                        );
-                        let rest = ui.allocate_response(
-                            egui::vec2(ui.available_width(), label.rect.height()),
-                            egui::Sense::click(),
-                        );
-                        let hover = if active {
-                            "Click in the graphics area or the tree to fill this in"
-                        } else {
-                            "Click here, then in the graphics area or the tree"
-                        };
-                        clicked = label.on_hover_text(hover).clicked()
-                            || rest.on_hover_text(hover).clicked();
-                    });
                 });
             });
     });
@@ -1629,5 +1635,54 @@ fn ref_axis_body(ui: &mut egui::Ui, d: &mut AxisDialog) {
             true,
             "Select an edge, a face or an axis",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The height each box takes in a tall panel, as the left panel is.
+    fn heights(add: impl Fn(&mut egui::Ui)) -> f32 {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(300.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut height = 0.0;
+        let _ = ctx.run(input, |ctx| {
+            egui::SidePanel::left("panel").show(ctx, |ui| {
+                let top = ui.cursor().top();
+                add(ui);
+                height = ui.cursor().top() - top;
+            });
+        });
+        height
+    }
+
+    /// The boxes take a line of text, not the rest of the panel: a right-to-left layout
+    /// straight in the box once stretched the Direction 1 box of Linear Pattern to the
+    /// bottom of the window, hiding everything under it.
+    #[test]
+    fn boxes_are_one_line_high() {
+        let axes = vec![("X axis".to_owned(), ()), ("Y axis".to_owned(), ())];
+        for active in [true, false] {
+            let filled = heights(|ui| {
+                reference_box_set(ui, "axis", &axes, &mut 0, active, "Select an axis");
+            });
+            let empty = heights(|ui| {
+                reference_box(ui, "axis", &axes, &mut None, active, "Select an axis");
+            });
+            assert!(filled < 40.0, "a filled reference box is {filled} high");
+            assert!(empty < 40.0, "an empty reference box is {empty} high");
+        }
+        let items = vec![("Cut-Extrude1".to_owned(), String::new())];
+        let selection = heights(|ui| {
+            selection_box(ui, &items, "Click features");
+        });
+        assert!(selection < 60.0, "a selection box is {selection} high");
     }
 }

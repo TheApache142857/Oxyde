@@ -19,6 +19,7 @@ use oxyde_render::{Material as RenderMaterial, TextureRef};
 use crate::app::{OxydeApp, Selected};
 use crate::assembly::Occurrence;
 use crate::dialogs::Dialog;
+use crate::icons::{self, Icon};
 use crate::property_manager::{PanelPick, section};
 
 /// The largest a texture is kept at, per side: bigger images are shrunk.
@@ -292,8 +293,8 @@ pub(crate) fn appearance_controls(ui: &mut egui::Ui, a: &mut Appearance, status:
         match &a.texture {
             Some(t) => {
                 ui.label(&t.file_name);
-                if ui
-                    .small_button("✕")
+                // An icon, not "✕": no interface font has that glyph.
+                if icons::icon_button(ui, Icon::Cancel, 16.0, true)
                     .on_hover_text("Remove the texture")
                     .clicked()
                 {
