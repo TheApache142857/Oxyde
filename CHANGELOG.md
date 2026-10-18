@@ -5,7 +5,7 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### Several studies per model, and thermal studies (unreleased, October 2026)
+### Several studies per model, and thermal studies (0.0.7, October 2026)
 
 - **New Study.** The Simulation tab now opens on *New Study*, as Fusion 360's does: pick
   *Static Stress*, *Thermal*, *Transient Thermal* or *Thermal Stress*. A model can have as
@@ -39,6 +39,7 @@ release yet; the git history has every detail.
 - Study and results files holding a thermal study are `format_version` 2; files with
   static studies only stay version 1, so earlier Oxyde builds still open them
   (`docs/FORMAT.md` §8–§9).
+- Version 0.0.7, with the Simulation tab, the material rows and the memory budget below.
 
 ### Materials a click away, a maximum element size (unreleased, October 2026)
 
