@@ -5,7 +5,7 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### Materials a click away, a typed mesh density (unreleased, October 2026)
+### Materials a click away, a maximum element size (unreleased, October 2026)
 
 - **A Material row in every tree.** The part's tree has a *Material* row above the
   features (SolidWorks' `Material <not specified>`), and in an assembly every part
@@ -17,9 +17,12 @@ release yet; the git history has every detail.
   (a part without a material) or *Change*: the library's materials, for the part, or for
   every part of the assembly in that line. The results go stale and the panel asks for
   another run, as for any change to the model.
-- **The mesh density can be typed.** Beside the Coarse–Fine slider of the Simulation
-  panel's Mesh section, a box shows the density from 0 % (coarsest) to 100 % (finest);
-  drag it or type a value, and the slider follows.
+- **A maximum element size box under the mesh slider.** The Simulation panel's Mesh
+  section shows the *Max element size* in use (mm) under the Coarse–Fine slider, always:
+  type a value to mesh finer (or coarser) than the slider goes, and Netgen makes no
+  element edge longer than it (smaller ones near small features and curved faces).
+  Moving the slider, or *Automatic*, gives the size back to it. This replaces the
+  *Automatic / Typed* choice; studies save it as before.
 
 ### A Simulation tab (unreleased, October 2026)
 

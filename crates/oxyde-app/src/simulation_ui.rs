@@ -2447,70 +2447,66 @@ impl OxydeApp {
                                             );
                                         });
                                     ui.end_row();
-                                    ui.label("Element size");
+                                    ui.label("Density");
                                     ui.horizontal(|ui| {
-                                        ui.radio_value(&mut m.custom_size, false, "Automatic");
-                                        ui.radio_value(&mut m.custom_size, true, "Typed");
-                                    });
-                                    ui.end_row();
-                                    if m.custom_size {
-                                        ui.label("");
-                                        ui.add(
-                                            egui::DragValue::new(&mut m.element_size)
-                                                .range(0.01..=1000.0)
-                                                .speed(0.05)
-                                                .suffix(" mm"),
-                                        );
-                                        ui.end_row();
-                                    } else {
-                                        ui.label("Density");
-                                        ui.horizontal(|ui| {
-                                            // Room left for the box beside the slider,
-                                            // as the panel is narrow.
-                                            ui.spacing_mut().slider_width =
-                                                (ui.available_width() - 140.0).clamp(50.0, 160.0);
-                                            ui.label(egui::RichText::new("Coarse").small());
-                                            ui.add(
+                                        ui.label(egui::RichText::new("Coarse").small());
+                                        // Moving the slider gives the size back to it.
+                                        if ui
+                                            .add(
                                                 egui::Slider::new(&mut m.density, 0.0..=1.0)
                                                     .show_value(false),
-                                            );
-                                            ui.label(egui::RichText::new("Fine").small());
-                                            // The same density as a number to type: 0 %
-                                            // the coarsest mesh, 100 % the finest.
-                                            ui.add(
-                                                egui::DragValue::new(&mut m.density)
-                                                    .range(0.0..=1.0)
-                                                    .speed(0.005)
-                                                    .custom_formatter(|v, _| {
-                                                        format!("{:.0} %", v * 100.0)
-                                                    })
-                                                    .custom_parser(|s| {
-                                                        s.trim()
-                                                            .trim_end_matches('%')
-                                                            .trim()
-                                                            .parse::<f64>()
-                                                            .ok()
-                                                            .map(|v| v / 100.0)
-                                                    }),
+                                            )
+                                            .changed()
+                                        {
+                                            m.custom_size = false;
+                                        }
+                                        ui.label(egui::RichText::new("Fine").small());
+                                    });
+                                    ui.end_row();
+                                    // The size in use, from the slider or typed; typing one
+                                    // goes finer (or coarser) than the slider reaches.
+                                    ui.label("Max element size");
+                                    ui.horizontal(|ui| {
+                                        let mut size = element_size.unwrap_or(m.element_size);
+                                        let speed = size * 0.01;
+                                        let typed = ui
+                                            .add(
+                                                egui::DragValue::new(&mut size)
+                                                    .range(0.01..=1000.0)
+                                                    .speed(speed)
+                                                    .max_decimals(3)
+                                                    .suffix(" mm"),
                                             )
                                             .on_hover_text(
-                                                "0 % is the coarsest mesh, 100 % the finest",
-                                            );
-                                        });
-                                        ui.end_row();
-                                        if let Some(h) = element_size {
-                                            ui.label("");
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "Elements of about {} mm",
-                                                    format_number(h)
-                                                ))
-                                                .small()
-                                                .weak(),
-                                            );
-                                            ui.end_row();
+                                                "The longest edge an element may have. Netgen \
+                                                 makes smaller ones near small features and \
+                                                 curved faces. Type a value to go finer than \
+                                                 the slider.",
+                                            )
+                                            .changed();
+                                        if typed {
+                                            m.custom_size = true;
+                                            m.element_size = size;
                                         }
-                                    }
+                                        if m.custom_size {
+                                            if ui
+                                                .small_button("Automatic")
+                                                .on_hover_text(
+                                                    "Back to the size the density slider gives",
+                                                )
+                                                .clicked()
+                                            {
+                                                m.custom_size = false;
+                                            }
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new("from the slider")
+                                                    .small()
+                                                    .weak(),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
                                 });
                             if ui.button("Mesh only").clicked() {
                                 action = Some(PanelAction::Mesh);
