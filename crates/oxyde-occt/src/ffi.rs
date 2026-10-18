@@ -66,6 +66,12 @@ pub(crate) mod bridge {
         loops: Vec<LoopData>,
     }
 
+    /// One section of a loft: a closed contour on its plane.
+    struct LoftSectionData {
+        plane: PlaneData,
+        region: RegionData,
+    }
+
     // ---- Operation results ---------------------------------------------------------------
 
     enum SourceKind {
@@ -182,6 +188,28 @@ pub(crate) mod bridge {
         x: f64,
         y: f64,
         z: f64,
+    }
+
+    /// The shortest distance between two shapes, and where it is on each.
+    struct DistanceData {
+        distance: f64,
+        ax: f64,
+        ay: f64,
+        az: f64,
+        bx: f64,
+        by: f64,
+        bz: f64,
+    }
+
+    /// A polyline of a drawing view: (x, y) pairs.
+    struct PolylineData {
+        points: Vec<f64>,
+    }
+
+    /// The edges of shapes seen in a view, visible and hidden.
+    struct ProjectionData {
+        visible: Vec<PolylineData>,
+        hidden: Vec<PolylineData>,
     }
 
     /// An axis-aligned box.
@@ -315,6 +343,14 @@ pub(crate) mod bridge {
             dz: f64,
         ) -> Result<OpResultData>;
 
+        /// Lofts a solid through closed contours, smoothly or `ruled` (straight between
+        /// sections).
+        fn loft(
+            self: Pin<&mut Session>,
+            sections: &[LoftSectionData],
+            ruled: bool,
+        ) -> Result<OpResultData>;
+
         /// Revolves by `angle` radians about `axis` (right-hand rule).
         fn revolve(
             self: Pin<&mut Session>,
@@ -366,6 +402,18 @@ pub(crate) mod bridge {
             distance: f64,
         ) -> Result<OpResultData>;
 
+        /// `first` along `faces[i]` from `edges[i]`; `second` a distance (kind 0) or an
+        /// angle in radians (kind 1).
+        fn chamfer_with(
+            self: Pin<&mut Session>,
+            shape: u64,
+            edges: &[u32],
+            faces: &[u32],
+            first: f64,
+            kind: u8,
+            second: f64,
+        ) -> Result<OpResultData>;
+
         fn release(self: Pin<&mut Session>, shape: u64);
 
         fn topology(self: &Session, shape: u64) -> Result<TopologyData>;
@@ -386,6 +434,27 @@ pub(crate) mod bridge {
         fn centre_of_mass(self: &Session, shape: u64) -> Result<PointData>;
 
         fn bounds(self: &Session, shape: u64) -> Result<BoundsData>;
+
+        /// The shortest distance between part of `a` and part of `b`: the whole shape
+        /// (kind 0), or a face (1), an edge (2) or a vertex (3) by index in its topology.
+        fn distance(
+            self: &Session,
+            a: u64,
+            a_kind: u8,
+            a_index: u32,
+            b: u64,
+            b_kind: u8,
+            b_index: u32,
+        ) -> Result<DistanceData>;
+
+        /// The edges of `shapes` seen along -normal of `view` (orthographic, hidden line
+        /// removal), in the view's frame, each polyline within `deflection` mm.
+        fn project_edges(
+            self: &Session,
+            shapes: &[u64],
+            view: &PlaneData,
+            deflection: f64,
+        ) -> Result<ProjectionData>;
 
         fn topology_counts(self: &Session, shape: u64) -> Result<TopologyCounts>;
 

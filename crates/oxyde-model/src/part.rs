@@ -19,9 +19,10 @@ use crate::configurations::Configurations;
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
-    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
-    ExtrudeOp, Feature, FeatureId, FeatureKind, Import, LinearPattern, Mirror, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, Sweep,
+    AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude,
+    ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Hole, HoleKind, Import,
+    LinearPattern, Loft, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
+    SketchPlane, Sweep,
 };
 use crate::material::Material;
 use crate::naming::{FaceKey, FaceName, Resolution};
@@ -540,6 +541,7 @@ impl Part {
         }
         self.features.remove(index);
         self.appearances.remove_feature(id);
+        self.configurations.forget_feature(id);
         if let Some(active) = self.rollback.as_mut() {
             if index < *active {
                 *active -= 1;
@@ -1001,7 +1003,15 @@ fn build_feature<K: Kernel>(
             }
             FeatureKind::Mirror(mirror) => {
                 let instances = mirror_instances(&ctx, mirror, &mut warnings)?;
-                result.produced = Some(build_instances(&ctx, &mirror.seeds, &instances, kernel)?);
+                result.produced = Some(if mirror.bodies.is_empty() {
+                    build_instances(&ctx, &mirror.seeds, &instances, kernel)?
+                } else if mirror.seeds.is_empty() {
+                    mirror_bodies(&ctx, &mirror.bodies, &instances, kernel)?
+                } else {
+                    return Err(
+                        "a mirror copies features or bodies, not both: make two mirrors".to_owned(),
+                    );
+                });
             }
             FeatureKind::Import(import) => {
                 let (body, appearances) = build_import(&ctx, import, kernel)?;
@@ -1010,6 +1020,16 @@ fn build_feature<K: Kernel>(
             }
             FeatureKind::Combine(combine) => {
                 result.produced = Some(build_combine(&ctx, combine, kernel, &mut warnings)?);
+            }
+            FeatureKind::Hole(hole) => {
+                let (body, tool) = build_hole(&ctx, hole, kernel, &mut warnings)?;
+                result.produced = Some(body);
+                result.tool = Some(tool);
+            }
+            FeatureKind::Loft(loft) => {
+                let (body, tool) = build_loft(&ctx, loft, kernel, &mut warnings)?;
+                result.produced = Some(body);
+                result.tool = Some(tool);
             }
         }
         Ok(())
@@ -1336,8 +1356,32 @@ fn apply_tool<K: Kernel>(
     kernel: &mut K,
     warnings: &mut Vec<String>,
 ) -> Result<(Body, ToolBody), String> {
+    let names = sweep_names(ctx.feature().id, &tool.history);
+    let tool = NamedTool {
+        shape: tool.shape,
+        names,
+    };
+    apply_named_tool(ctx, op, chosen, sketch, tool, kernel, warnings)
+}
+
+/// A tool body and the names of its faces.
+struct NamedTool {
+    shape: ShapeHandle,
+    names: Vec<Option<FaceName>>,
+}
+
+/// [`apply_tool`] for a tool whose faces are named already.
+fn apply_named_tool<K: Kernel>(
+    ctx: &Context<'_>,
+    op: ExtrudeOp,
+    chosen: &[BodyId],
+    sketch: FeatureId,
+    tool: NamedTool,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<(Body, ToolBody), String> {
     let id = ctx.feature().id;
-    let tool_names = sweep_names(id, &tool.history);
+    let tool_names = tool.names;
     let requested = ToolOp::of(op);
     let mut op = requested;
     let targets = match tool_targets(ctx, op, chosen, Some(sketch)) {
@@ -1573,8 +1617,11 @@ fn build_extrude<K: Kernel>(
     warnings: &mut Vec<String>,
 ) -> Result<(Body, ToolBody), String> {
     let (sketch, profile) = ctx.profile_sketch(extrude.sketch)?;
-    let depth = extrude.extent.depth();
-    if !(depth > 0.0) {
+    if extrude
+        .extent
+        .depth()
+        .is_some_and(|depth| depth.is_nan() || depth <= 0.0)
+    {
         return Err("depth must be positive".to_owned());
     }
 
@@ -1582,12 +1629,47 @@ fn build_extrude<K: Kernel>(
     if extrude.reverse {
         along = -along;
     }
-    let (plane, vector) = match extrude.extent {
-        ExtrudeExtent::Blind { depth } => (sketch.plane, sketch.plane.normal * (depth * along)),
-        ExtrudeExtent::MidPlane { depth } => (
-            sketch.plane.offset(-depth / 2.0),
-            sketch.plane.normal * depth,
-        ),
+    let normal = sketch.plane.normal;
+    let (plane, vector) = match &extrude.extent {
+        ExtrudeExtent::Blind { depth } => (sketch.plane, normal * (depth * along)),
+        ExtrudeExtent::MidPlane { depth } => (sketch.plane.offset(-depth / 2.0), normal * *depth),
+        ExtrudeExtent::ThroughAll { both } => {
+            let (back, front) = through_all_reach(ctx, &sketch.plane, extrude.op, kernel)?;
+            if *both {
+                (sketch.plane.offset(-back), normal * (back + front))
+            } else {
+                let reach = if along > 0.0 { front } else { back };
+                if reach.is_nan() || reach <= 0.0 {
+                    return Err(
+                        "there is nothing to go through on that side of the sketch: reverse the direction"
+                            .to_owned(),
+                    );
+                }
+                (sketch.plane, normal * (reach * along))
+            }
+        }
+        ExtrudeExtent::UpToSurface { plane: target } => {
+            let target = ctx.plane(target, warnings)?;
+            match up_to_surface(&sketch.plane, profile, &target)? {
+                UpTo::Parallel(distance) => (sketch.plane, normal * distance),
+                UpTo::Slanted {
+                    vector,
+                    keep,
+                    reach,
+                } => {
+                    let tool = trimmed_prism(&sketch.plane, profile, vector, &keep, reach, kernel)?;
+                    return apply_tool(
+                        ctx,
+                        extrude.op,
+                        &extrude.bodies,
+                        extrude.sketch,
+                        tool,
+                        kernel,
+                        warnings,
+                    );
+                }
+            }
+        }
     };
 
     let tool = kernel
@@ -1602,6 +1684,431 @@ fn build_extrude<K: Kernel>(
         kernel,
         warnings,
     )
+}
+
+/// The included angle of a drill's point, at the bottom of a blind hole.
+const DRILL_POINT: f64 = 118.0 * std::f64::consts::PI / 180.0;
+
+/// The lone points of a sketch, where holes go: neither the end nor the centre of any of
+/// its curves, nor its origin, nor construction geometry. With their entity ids, which
+/// name the holes' faces, so a hole keeps its names while others come and go.
+fn hole_points(sketch: &ConstrainedSketch) -> Vec<(u32, oxyde_geom::Point2)> {
+    let mut used = HashSet::new();
+    for entity in sketch.entities() {
+        match entity.geometry {
+            Geometry::Line { start, end } => {
+                used.insert(start);
+                used.insert(end);
+            }
+            Geometry::Circle { center, .. } => {
+                used.insert(center);
+            }
+            Geometry::Arc { center, start, end } => {
+                used.extend([center, start, end]);
+            }
+            Geometry::Point(_) => {}
+        }
+    }
+    let origin = sketch.origin();
+    sketch
+        .entities()
+        .iter()
+        .filter(|e| !e.construction && Some(e.id) != origin && !used.contains(&e.id))
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(at) => Some((e.id.0, at)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The half section of a hole, to turn about its axis: the radius along x, the depth
+/// into the part along y, from a little above the sketch plane (so the cut does not end
+/// on the face it is drilled from) down to `depth` and, for a blind hole, its drill
+/// point. Segment ids name the faces whatever the kind: 1 the top (above the part), 2 the
+/// counterbore's wall or the countersink's cone, 3 the counterbore's floor, 4 the hole's
+/// wall, 5 its bottom (or drill point), 6 the axis.
+fn hole_profile(hole: &Hole, depth: f64) -> Result<Profile, String> {
+    let r = hole.diameter / 2.0;
+    let lift = 0.05 * hole.diameter + 0.5;
+    let tip = if hole.depth.is_some() {
+        r / (DRILL_POINT / 2.0).tan()
+    } else {
+        0.0
+    };
+    let p = oxyde_geom::Point2::new;
+    let mut corners: Vec<(u32, oxyde_geom::Point2)> = vec![(1, p(0.0, -lift))];
+    match hole.kind {
+        HoleKind::Simple => corners.push((4, p(r, -lift))),
+        HoleKind::Counterbore {
+            diameter,
+            depth: counter,
+        } => {
+            if diameter.is_nan() || diameter <= hole.diameter {
+                return Err("the counterbore must be wider than the hole".to_owned());
+            }
+            if counter.is_nan() || counter <= 0.0 {
+                return Err("the counterbore's depth must be positive".to_owned());
+            }
+            if counter >= depth {
+                return Err("the counterbore is as deep as the hole, or deeper".to_owned());
+            }
+            corners.push((2, p(diameter / 2.0, -lift)));
+            corners.push((3, p(diameter / 2.0, counter)));
+            corners.push((4, p(r, counter)));
+        }
+        HoleKind::Countersink { diameter, angle } => {
+            if diameter.is_nan() || diameter <= hole.diameter {
+                return Err("the countersink must be wider than the hole".to_owned());
+            }
+            if angle.is_nan() || angle <= 0.0 || angle >= std::f64::consts::PI {
+                return Err("the countersink's angle must be between 0° and 180°".to_owned());
+            }
+            let slope = (angle / 2.0).tan();
+            let bottom = (diameter / 2.0 - r) / slope;
+            if bottom >= depth {
+                return Err("the countersink is as deep as the hole, or deeper".to_owned());
+            }
+            corners.push((2, p(diameter / 2.0 + lift * slope, -lift)));
+            corners.push((4, p(r, bottom)));
+        }
+    }
+    corners.push((5, p(r, depth)));
+    corners.push((6, p(0.0, depth + tip)));
+    // Each corner starts the segment named by its id, to the next corner.
+    let segments: Vec<oxyde_geom::ProfileSegment> = corners
+        .iter()
+        .zip(corners.iter().cycle().skip(1))
+        .map(|((id, start), (_, end))| oxyde_geom::ProfileSegment {
+            id: *id,
+            curve: oxyde_geom::Curve2::Line {
+                start: *start,
+                end: *end,
+            },
+        })
+        .collect();
+    Profile::from_curves(&segments).map_err(|e| format!("the hole's section: {e}"))
+}
+
+/// Holes at the lone points of a sketch: each the hole's section turned about an axis
+/// through its point along the sketch normal, into the part, all of them cut from the
+/// bodies as one tool (a Cut-Extrude's), which patterns and mirrors copy.
+fn build_hole<K: Kernel>(
+    ctx: &Context<'_>,
+    hole: &Hole,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<(Body, ToolBody), String> {
+    let id = ctx.feature().id;
+    let (feature, result) = ctx.earlier(hole.sketch)?;
+    if matches!(result.status, FeatureStatus::Error(_)) {
+        return Err(format!("{} has errors", feature.name));
+    }
+    let sketch = result
+        .sketch
+        .as_ref()
+        .ok_or_else(|| format!("{} is suppressed or has errors", feature.name))?;
+    if hole.diameter.is_nan() || hole.diameter <= 0.0 {
+        return Err("the hole's diameter must be positive".to_owned());
+    }
+    if hole.depth.is_some_and(|d| d.is_nan() || d <= 0.0) {
+        return Err("the hole's depth must be positive".to_owned());
+    }
+    let points = hole_points(&sketch.solved);
+    if points.is_empty() {
+        return Err(format!(
+            "{} has no lone points: put a point (Sketch › Point) where each hole goes",
+            feature.name
+        ));
+    }
+    check_count(points.len() as u64)?;
+    let plane = sketch.plane;
+    let into = if hole.reverse {
+        plane.normal
+    } else {
+        plane.normal * -1.0
+    };
+    let depth = match hole.depth {
+        Some(depth) => depth,
+        None => {
+            let (back, front) = through_all_reach(ctx, &plane, ExtrudeOp::Cut, kernel)?;
+            let reach = if hole.reverse { front } else { back };
+            if reach.is_nan() || reach <= 0.0 {
+                return Err(
+                    "there is nothing to drill through on that side of the sketch: reverse the direction"
+                        .to_owned(),
+                );
+            }
+            reach
+        }
+    };
+    let section = hole_profile(hole, depth)?;
+    // One turned section per point, its faces named after the point.
+    let mut tools: Vec<NamedTool> = Vec::with_capacity(points.len());
+    let mut failure = None;
+    for (point, at) in &points {
+        let origin = plane.to_world(*at);
+        let section_plane = Plane {
+            origin,
+            x_dir: plane.x_dir,
+            normal: plane.x_dir.cross(into),
+        };
+        let Some(axis) = Axis::new(origin, into) else {
+            failure = Some("the sketch plane has no direction".to_owned());
+            break;
+        };
+        match kernel.revolve(&section_plane, &section, &axis, std::f64::consts::TAU) {
+            Ok(turned) => {
+                let names = sweep_names(id, &turned.history)
+                    .into_iter()
+                    .map(|name| {
+                        name.map(|face| {
+                            FaceName::new(FaceKey::Instance {
+                                feature: id,
+                                instance: [*point, 0],
+                                face: Box::new(face),
+                            })
+                        })
+                    })
+                    .collect();
+                tools.push(NamedTool {
+                    shape: turned.shape,
+                    names,
+                });
+            }
+            Err(e) => {
+                failure = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    if let Some(e) = failure {
+        for tool in tools {
+            kernel.release(tool.shape);
+        }
+        return Err(e);
+    }
+    // All of them as one tool.
+    let mut tools = tools.into_iter();
+    let Some(first) = tools.next() else {
+        return Err("no hole was made".to_owned());
+    };
+    let rest: Vec<NamedTool> = tools.collect();
+    let tool = if rest.is_empty() {
+        first
+    } else {
+        let shapes: Vec<ShapeHandle> = rest.iter().map(|t| t.shape).collect();
+        let fused = kernel.boolean_many(BooleanOp::Fuse, first.shape, &shapes);
+        let rest_names: Vec<&[Option<FaceName>]> =
+            rest.iter().map(|t| t.names.as_slice()).collect();
+        let named = fused.map(|f| NamedTool {
+            names: boolean_names(&f.history, &first.names, &rest_names),
+            shape: f.shape,
+        });
+        kernel.release(first.shape);
+        for t in &rest {
+            kernel.release(t.shape);
+        }
+        named.map_err(|e| e.to_string())?
+    };
+    apply_named_tool(
+        ctx,
+        ExtrudeOp::Cut,
+        &hole.bodies,
+        hole.sketch,
+        tool,
+        kernel,
+        warnings,
+    )
+}
+
+/// How far the part's bodies reach from `plane`, behind it and in front of it along its
+/// normal: where Through All goes (0 on a side with nothing). A cut or an intersection
+/// goes a little further, so that it ends outside every body rather than on a face,
+/// which could leave a skin; a boss ends level with the furthest geometry.
+fn through_all_reach<K: Kernel>(
+    ctx: &Context<'_>,
+    plane: &Plane,
+    op: ExtrudeOp,
+    kernel: &K,
+) -> Result<(f64, f64), String> {
+    let none = || "Through All needs a body to go through: the part has none yet".to_owned();
+    let body = ctx.body.ok_or_else(none)?;
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut size: f64 = 0.0;
+    for solid in &body.solids {
+        let (a, b) = kernel.bounds(solid.shape).map_err(|e| e.to_string())?;
+        size = size.max(a.distance(b));
+        for corner in 0..8 {
+            let pick = |bit: u32, low: f64, high: f64| if corner & bit == 0 { low } else { high };
+            let p =
+                oxyde_geom::Point3::new(pick(1, a.x, b.x), pick(2, a.y, b.y), pick(4, a.z, b.z));
+            let t = (p - plane.origin).dot(plane.normal);
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+    }
+    if !(lo.is_finite() && hi.is_finite()) {
+        return Err(none());
+    }
+    let tolerance = 1e-6 * size.max(1.0);
+    let margin = if op.adds() { 0.0 } else { 0.01 * size + 0.1 };
+    let side = |reach: f64| {
+        if reach > tolerance {
+            reach + margin
+        } else {
+            0.0
+        }
+    };
+    Ok((side(-lo), side(hi)))
+}
+
+/// How an extrusion reaches a plane (Up To Surface).
+#[derive(Debug)]
+enum UpTo {
+    /// The plane is parallel to the sketch: a blind extrusion of this signed distance along
+    /// the sketch normal.
+    Parallel(f64),
+    /// The plane is slanted: a prism along `vector`, long enough to pass the plane all
+    /// over the sketch, to be cut back to the side of `keep` its normal points to. `reach`
+    /// bounds how far the prism goes from `keep`'s origin.
+    Slanted {
+        vector: oxyde_geom::Vec3,
+        keep: Plane,
+        reach: f64,
+    },
+}
+
+/// How far a profile's points lie from its plane's origin, at most.
+fn profile_radius(profile: &Profile) -> f64 {
+    let mut radius: f64 = 0.0;
+    for region in &profile.regions {
+        for segment in &region.outer.segments {
+            let (x0, x1) = segment.curve.range_along(1.0, 0.0);
+            let (y0, y1) = segment.curve.range_along(0.0, 1.0);
+            radius = radius.max(x0.abs().max(x1.abs()).hypot(y0.abs().max(y1.abs())));
+        }
+    }
+    radius
+}
+
+/// The extrusion of `profile`, sketched on `sketch`, up to the plane `target`, towards it
+/// whichever side of the sketch it lies on. Refused when the plane is parallel to the
+/// direction, or passes through the sketch's contours (some of them would go backwards).
+fn up_to_surface(sketch: &Plane, profile: &Profile, target: &Plane) -> Result<UpTo, String> {
+    let n = target.normal;
+    let cos = sketch.normal.dot(n);
+    if cos.abs() < 1e-6 {
+        return Err(
+            "that surface is parallel to the extrusion's direction: it is never reached".to_owned(),
+        );
+    }
+    // The distance along the sketch normal from the sketch point (x, y) to the plane is
+    // `t0 + x * tx + y * ty`.
+    let t0 = (target.origin - sketch.origin).dot(n) / cos;
+    let (tx, ty) = (-sketch.x_dir.dot(n) / cos, -sketch.y_dir().dot(n) / cos);
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for region in &profile.regions {
+        for segment in &region.outer.segments {
+            let (a, b) = segment.curve.range_along(tx, ty);
+            lo = lo.min(t0 + a);
+            hi = hi.max(t0 + b);
+        }
+    }
+    if !(lo.is_finite() && hi.is_finite()) {
+        return Err("the sketch has no closed contour".to_owned());
+    }
+    let radius = profile_radius(profile);
+    let tolerance = 1e-6 * (radius + t0.abs()).max(1.0);
+    // Towards the plane: backwards when it lies behind the sketch.
+    let (sign, lo, hi) = if hi > tolerance {
+        (1.0, lo, hi)
+    } else {
+        (-1.0, -hi, -lo)
+    };
+    if lo <= tolerance {
+        return Err(if hi <= tolerance {
+            "the sketch lies on that surface: there is nothing to extrude up to".to_owned()
+        } else {
+            "that surface passes through the sketch: pick one beyond it, or a blind depth"
+                .to_owned()
+        });
+    }
+    if hi - lo <= tolerance {
+        return Ok(UpTo::Parallel(sign * hi));
+    }
+    // Cut back by the half-space on the sketch's side of the plane.
+    let length = hi + 0.1 * (hi - lo) + 1.0;
+    let towards_sketch = n * -(sign * cos).signum();
+    let keep = Plane::from_point_normal(target.origin, towards_sketch)
+        .ok_or_else(|| "that surface has no direction".to_owned())?;
+    Ok(UpTo::Slanted {
+        vector: sketch.normal * (sign * length),
+        keep,
+        reach: 2.0 * ((sketch.origin - target.origin).length() + radius + length) + 1.0,
+    })
+}
+
+/// A prism of `profile` along `vector`, cut back to the half-space on the side `keep`'s
+/// normal points to (a box `reach` mm across), with an extrusion's history: the face it
+/// was cut along is its end cap, the rest keep their names.
+fn trimmed_prism<K: Kernel>(
+    sketch: &Plane,
+    profile: &Profile,
+    vector: oxyde_geom::Vec3,
+    keep: &Plane,
+    reach: f64,
+    kernel: &mut K,
+) -> Result<OpResult, String> {
+    let error = |e: K::Error| e.to_string();
+    let prism = kernel.extrude(sketch, profile, vector).map_err(error)?;
+    let l = reach.max(1.0);
+    let raw = match kernel.make_box(
+        oxyde_geom::Point3::new(-l, -l, 0.0),
+        oxyde_geom::Vec3::new(2.0 * l, 2.0 * l, l),
+    ) {
+        Ok(raw) => raw,
+        Err(e) => {
+            kernel.release(prism.shape);
+            return Err(e.to_string());
+        }
+    };
+    let placed = kernel.transform(raw, &Transform::from_plane(keep));
+    kernel.release(raw);
+    let half = match placed {
+        Ok(placed) => placed.shape,
+        Err(e) => {
+            kernel.release(prism.shape);
+            return Err(e.to_string());
+        }
+    };
+    let common = kernel.boolean(BooleanOp::Common, prism.shape, half);
+    kernel.release(half);
+    kernel.release(prism.shape);
+    let common = common.map_err(error)?;
+    let faces = common
+        .history
+        .faces
+        .iter()
+        .map(|sources| {
+            let mut out = Vec::new();
+            for source in sources {
+                match *source {
+                    FaceSource::InputFace { input: 0, face } => {
+                        if let Some(from) = prism.history.faces.get(face as usize) {
+                            out.extend(from.iter().copied());
+                        }
+                    }
+                    FaceSource::InputFace { input: 1, .. } => out.push(FaceSource::EndCap),
+                    _ => {}
+                }
+            }
+            out
+        })
+        .collect();
+    Ok(OpResult {
+        shape: common.shape,
+        history: OpHistory { faces },
+    })
 }
 
 fn build_revolve<K: Kernel>(
@@ -1638,6 +2145,12 @@ fn build_revolve<K: Kernel>(
     if axis.direction.dot(plane.normal).abs() > 1e-6 || off_plane > 1e-6 {
         return Err("the axis must lie in the sketch plane".to_owned());
     }
+    if crosses_axis(profile, &plane, &axis) {
+        return Err(
+            "the sketch crosses the axis: keep its contours on one side of it (they may touch it)"
+                .to_owned(),
+        );
+    }
     if revolve.reverse {
         axis = axis.reversed();
     }
@@ -1660,6 +2173,30 @@ fn build_revolve<K: Kernel>(
         kernel,
         warnings,
     )
+}
+
+/// Whether the profile's contours lie on both sides of `axis`, which lies in `plane`: the
+/// solid they would turn into passes through itself, which the kernel builds without a
+/// word and no later feature can use. Touching the axis is fine (a solid of revolution
+/// whose profile has a side on its axis).
+fn crosses_axis(profile: &Profile, plane: &Plane, axis: &Axis) -> bool {
+    // The signed distance from the axis, in the plane, of the sketch point (x, y) is
+    // `s0 + x * gx + y * gy`.
+    let across = |v: oxyde_geom::Vec3| axis.direction.cross(v).dot(plane.normal);
+    let (gx, gy) = (across(plane.x_dir), across(plane.y_dir()));
+    let s0 = across(plane.origin - axis.origin);
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for region in &profile.regions {
+        for contour in std::iter::once(&region.outer).chain(&region.holes) {
+            for segment in &contour.segments {
+                let (a, b) = segment.curve.range_along(gx, gy);
+                lo = lo.min(s0 + a);
+                hi = hi.max(s0 + b);
+            }
+        }
+    }
+    let tolerance = 1e-6 * (hi - lo).abs().max(1.0);
+    lo < -tolerance && hi > tolerance
 }
 
 fn build_sweep<K: Kernel>(
@@ -1700,6 +2237,74 @@ fn build_sweep<K: Kernel>(
     )
 }
 
+/// A loft through the closed contours of its sketches, in order, each turned to run the
+/// same way round along the loft (a contour drawn clockwise and the next counter-clockwise
+/// would twist it inside out).
+fn build_loft<K: Kernel>(
+    ctx: &Context<'_>,
+    loft: &Loft,
+    kernel: &mut K,
+    warnings: &mut Vec<String>,
+) -> Result<(Body, ToolBody), String> {
+    if loft.profiles.len() < 2 {
+        return Err("a loft goes through two sketches at least".to_owned());
+    }
+    let mut seen = HashSet::new();
+    let mut sections: Vec<(Plane, oxyde_geom::Loop)> = Vec::with_capacity(loft.profiles.len());
+    for id in &loft.profiles {
+        if !seen.insert(*id) {
+            return Err("a sketch is in the loft twice".to_owned());
+        }
+        let (feature, _) = ctx.earlier(*id)?;
+        let (sketch, profile) = ctx.profile_sketch(*id)?;
+        let contour = match profile.regions.as_slice() {
+            [region] if region.holes.is_empty() => region.outer.clone(),
+            _ => {
+                return Err(format!(
+                    "{}: a loft's sketch must be one closed contour, without holes",
+                    feature.name
+                ));
+            }
+        };
+        sections.push((sketch.plane, contour));
+    }
+    // Along the loft: from the first contour's middle to the last one's.
+    let middle = |(plane, contour): &(Plane, oxyde_geom::Loop)| {
+        let points = contour.polygon();
+        let n = points.len().max(1) as f64;
+        let (x, y) = points
+            .iter()
+            .fold((0.0, 0.0), |(x, y), p| (x + p.x / n, y + p.y / n));
+        plane.to_world(oxyde_geom::Point2::new(x, y))
+    };
+    let along = match (sections.first(), sections.last()) {
+        (Some(first), Some(last)) => {
+            let d = middle(last) - middle(first);
+            if d.length() > 1e-9 { d } else { first.0.normal }
+        }
+        _ => return Err("a loft goes through two sketches at least".to_owned()),
+    };
+    for (plane, contour) in &mut sections {
+        let turn = contour.signed_area() * plane.normal.dot(along);
+        if turn < 0.0 {
+            contour.segments.reverse();
+            for segment in &mut contour.segments {
+                segment.curve = segment.curve.reversed();
+            }
+        }
+    }
+    let tool = kernel
+        .loft(&sections, loft.ruled)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "this kernel cannot loft".to_owned())?;
+    let first = loft
+        .profiles
+        .first()
+        .copied()
+        .ok_or_else(|| "a loft goes through two sketches at least".to_owned())?;
+    apply_tool(ctx, loft.op, &loft.bodies, first, tool, kernel, warnings)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Blend {
     Fillet,
@@ -1720,6 +2325,21 @@ fn build_blend<K: Kernel>(
     if !(blend.size > 0.0) {
         return Err("size must be positive".to_owned());
     }
+    let second = match (kind, blend.chamfer) {
+        (Blend::Fillet, _) | (Blend::Chamfer, ChamferShape::Equal) => None,
+        (Blend::Chamfer, ChamferShape::TwoDistances { distance, .. }) => {
+            if distance.is_nan() || distance <= 0.0 {
+                return Err("the second distance must be positive".to_owned());
+            }
+            Some(oxyde_kernel::ChamferSecond::Distance(distance))
+        }
+        (Blend::Chamfer, ChamferShape::AngleDistance { angle, .. }) => {
+            if angle.is_nan() || angle <= 0.0 || angle >= std::f64::consts::FRAC_PI_2 {
+                return Err("the angle must be between 0° and 90°".to_owned());
+            }
+            Some(oxyde_kernel::ChamferSecond::Angle(angle))
+        }
+    };
     let mut edges = Vec::with_capacity(blend.edges.len());
     for name in &blend.edges {
         edges.push(resolve(
@@ -1740,9 +2360,19 @@ fn build_blend<K: Kernel>(
             }
             local.sort_unstable();
             local.dedup();
-            let result = match kind {
-                Blend::Fillet => kernel.fillet(solid.shape, &local, blend.size),
-                Blend::Chamfer => kernel.chamfer(solid.shape, &local, blend.size),
+            let result = match (kind, second) {
+                (Blend::Fillet, _) => kernel.fillet(solid.shape, &local, blend.size),
+                (Blend::Chamfer, None) => kernel.chamfer(solid.shape, &local, blend.size),
+                (Blend::Chamfer, Some(second)) => {
+                    let pairs = chamfer_faces(body, solid, &blend.edges, &edges, blend.chamfer)?;
+                    match kernel.chamfer_with(solid.shape, &pairs, blend.size, second) {
+                        Ok(Some(result)) => Ok(result),
+                        Ok(None) => {
+                            return Err("this kernel makes equal chamfers only".to_owned());
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
             }
             .map_err(|e| e.to_string())?;
             let names = derived_names(id, &result.history, body, solid);
@@ -1762,6 +2392,48 @@ fn build_blend<K: Kernel>(
             Err(e)
         }
     }
+}
+
+/// For an unequal chamfer, the edges of `solid` (by their index in it) with the face the
+/// chamfer's first size runs along: the edge's face named first in its persistent name
+/// (names are sorted, so the choice is stable), or the other one when `shape` flips.
+fn chamfer_faces(
+    body: &Body,
+    solid: &Solid,
+    names: &[crate::naming::EdgeName],
+    edges: &[u32],
+    shape: ChamferShape,
+) -> Result<Vec<(u32, u32)>, String> {
+    let side = usize::from(shape.flipped());
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (name, edge) in names.iter().zip(edges) {
+        let Some(local) = solid.local_edge(*edge) else {
+            continue;
+        };
+        if out.iter().any(|(e, _)| *e == local) {
+            continue;
+        }
+        let adjacent = body
+            .topology
+            .edges
+            .get(*edge as usize)
+            .map(|e| e.faces.clone())
+            .unwrap_or_default();
+        let wanted = name.faces.get(side);
+        // The adjacent face of that name, else the edge's faces in the kernel's order.
+        let face = adjacent
+            .iter()
+            .copied()
+            .find(|f| body.naming.face(*f) == wanted)
+            .or_else(|| adjacent.get(side).copied())
+            .or_else(|| adjacent.first().copied())
+            .ok_or_else(|| format!("edge {name} has no face to chamfer along"))?;
+        let face = solid
+            .local_face(face)
+            .ok_or_else(|| format!("edge {name} is not on one body"))?;
+        out.push((local, face));
+    }
+    Ok(out)
 }
 
 fn build_shell<K: Kernel>(
@@ -2017,6 +2689,73 @@ fn mirror_instances(
     Ok(vec![([1, 0], Transform::mirror(&plane))])
 }
 
+/// Mirrors whole bodies: each joined to its copy through the plane (the one instance),
+/// whose faces are named after the body's own and the instance, so that features after
+/// the mirror find the faces of either half.
+fn mirror_bodies<K: Kernel>(
+    ctx: &Context<'_>,
+    bodies: &[BodyId],
+    instances: &[Instance],
+    kernel: &mut K,
+) -> Result<Body, String> {
+    let id = ctx.feature().id;
+    let body = ctx.body()?;
+    let Some((key, transform)) = instances.first() else {
+        return Err("no mirror plane".to_owned());
+    };
+    let mut work = Working::from(ctx.body);
+    let outcome = (|| -> Result<(), String> {
+        for target in bodies {
+            let solid = body.solid(*target).ok_or_else(|| {
+                format!("body {target} no longer exists: choose the bodies again")
+            })?;
+            let copy = kernel
+                .transform(solid.shape, transform)
+                .map_err(|e| e.to_string())?;
+            let names: Vec<Option<FaceName>> = copy
+                .history
+                .faces
+                .iter()
+                .map(|sources| {
+                    sources.iter().find_map(|source| match *source {
+                        FaceSource::InputFace { input: 0, face } => {
+                            body.face_name(solid, face).map(|original| {
+                                FaceName::new(FaceKey::Instance {
+                                    feature: id,
+                                    instance: *key,
+                                    face: Box::new(original),
+                                })
+                            })
+                        }
+                        _ => None,
+                    })
+                })
+                .collect();
+            let joined = match work.find(*target) {
+                Some(index) => combine_into(
+                    &mut work,
+                    index,
+                    BooleanOp::Fuse,
+                    copy.shape,
+                    &names,
+                    kernel,
+                ),
+                None => Err(format!("body {target} no longer exists")),
+            };
+            kernel.release(copy.shape);
+            joined?;
+        }
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => Ok(work.finish(id)),
+        Err(e) => {
+            work.abort(kernel);
+            Err(e)
+        }
+    }
+}
+
 /// Copies the tools of `seeds` to every instance and does with each copy what the seed
 /// did: joined to or cut from the same bodies, or a new body. Faces of a copy are named
 /// after the seed's face and the instance.
@@ -2038,7 +2777,7 @@ fn build_instances<K: Kernel>(
         let (feature, result) = ctx.earlier(*seed)?;
         if !feature.kind.is_patternable() {
             return Err(format!(
-                "{} cannot be copied: only extrusions, revolves and sweeps can, for now",
+                "{} cannot be copied: only extrusions, revolves, sweeps and holes can, for now",
                 feature.name
             ));
         }
@@ -2228,6 +2967,7 @@ mod tests {
                 FaceName::end_cap(boss),
             )],
             size: 1.0,
+            chamfer: Default::default(),
         }));
 
         assert_eq!(
@@ -2286,6 +3026,7 @@ mod tests {
         let fillet = part.add_feature(FeatureKind::Fillet(EdgeBlend {
             edges: vec![edge.clone()],
             size: 1.0,
+            chamfer: Default::default(),
         }));
         let s2 = part.add_feature(rectangle_sketch());
         let cut = part.add_feature(FeatureKind::Extrude(Extrude::blind(
@@ -2302,6 +3043,7 @@ mod tests {
                 FaceName::end_cap(boss),
             )],
             size: 1.0,
+            chamfer: Default::default(),
         });
         let own_face = FeatureKind::Fillet(EdgeBlend {
             edges: vec![EdgeName::between(
@@ -2309,6 +3051,7 @@ mod tests {
                 FaceName::end_cap(boss),
             )],
             size: 1.0,
+            chamfer: Default::default(),
         });
         for (feature, kind, reference) in [
             (boss, later_sketch, s2),
@@ -2328,6 +3071,7 @@ mod tests {
             FeatureKind::Fillet(EdgeBlend {
                 edges: vec![edge],
                 size: 2.0,
+                chamfer: Default::default(),
             }),
         )
         .unwrap();

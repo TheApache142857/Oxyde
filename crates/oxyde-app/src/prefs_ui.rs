@@ -719,7 +719,9 @@ impl OxydeApp {
             Action::Redo | Action::RedoAlternate => {
                 if assembly {
                     self.asm_redo();
-                } else if self.sketch.is_none() {
+                } else if let Some(session) = self.sketch.as_mut() {
+                    session.redo();
+                } else {
                     self.redo();
                 }
             }
@@ -761,6 +763,8 @@ impl OxydeApp {
             Action::Extrude => self.run(Command::Extrude),
             Action::Revolve => self.run(Command::Revolve),
             Action::Sweep => self.run(Command::Sweep),
+            Action::Hole => self.run(Command::Hole),
+            Action::Loft => self.run(Command::Loft),
             Action::Fillet => self.run(Command::Blend(true)),
             Action::Chamfer => self.run(Command::Blend(false)),
             Action::Shell => self.run(Command::Shell),
@@ -773,7 +777,13 @@ impl OxydeApp {
             Action::Rectangle => self.sketch_tool(Tool::Rectangle),
             Action::Circle => self.sketch_tool(Tool::Circle),
             Action::Arc => self.sketch_tool(Tool::Arc),
+            Action::ThreePointArc => self.sketch_tool(Tool::ThreePointArc),
+            Action::TangentArc => self.sketch_tool(Tool::TangentArc),
+            Action::Slot => self.sketch_tool(Tool::Slot),
+            Action::Polygon => self.sketch_tool(Tool::Polygon),
+            Action::Point => self.sketch_tool(Tool::Point),
             Action::Trim => self.sketch_tool(Tool::Trim),
+            Action::Extend => self.sketch_tool(Tool::Extend),
             Action::InsertComponent => self.insert_component(),
             Action::Mate => {
                 if self

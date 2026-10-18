@@ -1,5 +1,6 @@
-//! Editing helpers on solved geometry: where curves cross, the closest point on a curve, and
-//! trimming a curve back to its nearest crossings (SolidWorks' "Trim Entities", power trim).
+//! Editing helpers on solved geometry: where curves cross, the closest point on a curve,
+//! trimming a curve back to its nearest crossings (SolidWorks' "Trim Entities", power trim),
+//! and extending one to the next curve it meets ("Extend Entities").
 
 use std::collections::HashMap;
 use std::f64::consts::TAU;
@@ -391,12 +392,12 @@ impl ConstrainedSketch {
             Piece::Start(cut) => {
                 let q = self.cut_point(cut);
                 self.reattach(curve, |g| set_start(g, q));
-                self.after_shortening(curve, &entity);
+                self.after_ends_moved(curve, &entity);
             }
             Piece::End(cut) => {
                 let q = self.cut_point(cut);
                 self.reattach(curve, |g| set_end(g, q));
-                self.after_shortening(curve, &entity);
+                self.after_ends_moved(curve, &entity);
             }
             Piece::Between(from, to) => match entity.geometry {
                 Geometry::Circle { center, .. } => {
@@ -420,7 +421,7 @@ impl ConstrainedSketch {
                         }
                     };
                     self.set_construction(second, entity.construction);
-                    self.after_shortening(curve, &entity);
+                    self.after_ends_moved(curve, &entity);
                 }
                 Geometry::Point(_) => {}
             },
@@ -445,9 +446,9 @@ impl ConstrainedSketch {
         }
     }
 
-    /// After a curve got shorter: drop its length dimension and midpoint relations (they
-    /// would pull the geometry back), and end points nothing stands on any more.
-    fn after_shortening(&mut self, curve: EntityId, before: &Entity) {
+    /// After a curve got shorter or longer: drop its length dimension and midpoint relations
+    /// (they would pull the geometry back), and end points nothing stands on any more.
+    fn after_ends_moved(&mut self, curve: EntityId, before: &Entity) {
         self.relations.retain(|r| {
             !matches!(r.constraint,
                 Constraint::Length(l, _) | Constraint::Midpoint(_, l) if l == curve)
@@ -495,6 +496,159 @@ impl ConstrainedSketch {
         if let Some((start, _)) = self.endpoints(to) {
             self.constrain(Constraint::PointOnLine(start, from));
         }
+    }
+}
+
+/// What Extend Entities does to a curve: which end moves, and where to.
+#[derive(Debug, Clone, Copy)]
+struct ExtendPlan {
+    shape: Curve,
+    /// The end that moves: the curve's end, or else its start.
+    at_end: bool,
+    /// How far it moves: a length along a line, an angle round an arc.
+    beyond: f64,
+    /// Where it stops, on the curve it meets.
+    cut: Cut,
+}
+
+impl ConstrainedSketch {
+    fn extend_plan(&self, curve: EntityId, at: Point2) -> Option<ExtendPlan> {
+        let shape = self.curve(curve)?;
+        let entity = self.entity(curve)?;
+        let (lo, hi) = shape.range();
+        let clicked = shape.parameter(shape.closest(at));
+        let at_end = clicked >= (lo + hi) / 2.0;
+        let (start, end) = match entity.geometry {
+            Geometry::Line { start, end } | Geometry::Arc { start, end, .. } => (start, end),
+            // A circle has no end to extend.
+            _ => return None,
+        };
+        // An end another curve stands on stays where it is: moving it would tear the two
+        // apart.
+        let moving = if at_end { end } else { start };
+        let shared = self
+            .entities
+            .iter()
+            .any(|e| e.id != curve && curve_points(&e.geometry).contains(&moving));
+        if shared {
+            return None;
+        }
+        let slack = shape.slack() * 10.0;
+        // How far beyond the moving end a point of the curve's carrier is, if it is
+        // beyond it at all.
+        let beyond = |p: Point2| -> Option<f64> {
+            let d = match shape {
+                Curve::Segment(a, b) => {
+                    let t = shape.parameter(p);
+                    let length = a.distance(b);
+                    if at_end {
+                        (t - 1.0) * length
+                    } else {
+                        -t * length
+                    }
+                }
+                Curve::Arc(c, _, a0, sweep) => {
+                    let angle = angle_of(c, p);
+                    let d = if at_end {
+                        (angle - a0 - sweep).rem_euclid(TAU)
+                    } else {
+                        (a0 - angle).rem_euclid(TAU)
+                    };
+                    // Round as far as the other end, and no further.
+                    if d >= TAU - sweep - slack {
+                        return None;
+                    }
+                    d
+                }
+                Curve::Circle(..) => return None,
+            };
+            let gap = match shape {
+                Curve::Segment(..) => TOLERANCE * 10.0,
+                _ => slack,
+            };
+            (d > gap).then_some(d)
+        };
+        let mut best: Option<(f64, Cut)> = None;
+        for (other, other_shape) in self.curves() {
+            if other == curve {
+                continue;
+            }
+            let candidates = match (carrier(&shape), carrier(&other_shape)) {
+                (Carrier::Line(p, d), Carrier::Line(q, e)) => line_line(p, d, q, e),
+                (Carrier::Line(p, d), Carrier::Circle(c, r))
+                | (Carrier::Circle(c, r), Carrier::Line(p, d)) => line_circle(p, d, c, r),
+                (Carrier::Circle(c1, r1), Carrier::Circle(c2, r2)) => circle_circle(c1, r1, c2, r2),
+            };
+            for point in candidates {
+                if !other_shape.contains(point) {
+                    continue;
+                }
+                if let Some(d) = beyond(point)
+                    && best.is_none_or(|(b, _)| d < b)
+                {
+                    best = Some((
+                        d,
+                        Cut {
+                            param: d,
+                            point,
+                            by: other,
+                        },
+                    ));
+                }
+            }
+        }
+        let (beyond, cut) = best?;
+        Some(ExtendPlan {
+            shape,
+            at_end,
+            beyond,
+            cut,
+        })
+    }
+
+    /// The piece Extend Entities would add to `curve` at the end nearer to `at`, as a
+    /// polyline for preview, or `None` if that end meets nothing.
+    pub fn extend_preview(&self, curve: EntityId, at: Point2) -> Option<Vec<Point2>> {
+        let plan = self.extend_plan(curve, at)?;
+        Some(match plan.shape {
+            Curve::Segment(a, b) => {
+                let from = if plan.at_end { b } else { a };
+                vec![from, plan.cut.point]
+            }
+            Curve::Arc(c, r, a0, sweep) => {
+                let (from, turn) = if plan.at_end {
+                    (a0 + sweep, plan.beyond)
+                } else {
+                    (a0, -plan.beyond)
+                };
+                let steps = 32;
+                (0..=steps)
+                    .map(|k| on_circle(c, r, from + turn * k as f64 / steps as f64))
+                    .collect()
+            }
+            Curve::Circle(..) => return None,
+        })
+    }
+
+    /// Extends `curve` at the end nearer to `at` up to the first curve it meets there, as
+    /// SolidWorks' Extend Entities: a line straight on, an arc round its circle. The new end
+    /// stays on the curve it met. An end other curves stand on, a circle, and an end that
+    /// meets nothing are left alone (false).
+    pub fn extend(&mut self, curve: EntityId, at: Point2) -> bool {
+        let Some(plan) = self.extend_plan(curve, at) else {
+            return false;
+        };
+        let Some(entity) = self.entity(curve).copied() else {
+            return false;
+        };
+        let q = self.cut_point(plan.cut);
+        if plan.at_end {
+            self.reattach(curve, |g| set_end(g, q));
+        } else {
+            self.reattach(curve, |g| set_start(g, q));
+        }
+        self.after_ends_moved(curve, &entity);
+        true
     }
 }
 

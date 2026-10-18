@@ -53,6 +53,55 @@ impl Curve2 {
         }
     }
 
+    /// The smallest and the largest value of `p.x * ux + p.y * uy` over the points `p` of
+    /// the curve: how far it reaches along that direction (scaled by its length). Exact
+    /// for arcs and circles, not sampled.
+    pub fn range_along(&self, ux: f64, uy: f64) -> (f64, f64) {
+        let along = |p: Point2| p.x * ux + p.y * uy;
+        match *self {
+            Curve2::Line { start, end } => {
+                let (a, b) = (along(start), along(end));
+                (a.min(b), a.max(b))
+            }
+            Curve2::Circle { center, radius } => {
+                let (c, r) = (along(center), radius.abs() * ux.hypot(uy));
+                (c - r, c + r)
+            }
+            Curve2::Arc { start, mid, end } => {
+                let (a, b) = (along(start), along(end));
+                let (mut lo, mut hi) = (a.min(b), a.max(b));
+                match circle_through(start, mid, end) {
+                    // The arc reaches furthest where its radius points along the
+                    // direction, either way, if the arc goes through there.
+                    Some((center, radius)) if ux.hypot(uy) > 0.0 => {
+                        let a0 = angle(center, start);
+                        let sweep = arc_sweep(a0, angle(center, mid), angle(center, end));
+                        for target in [uy.atan2(ux), (-uy).atan2(-ux)] {
+                            let turned = if sweep >= 0.0 {
+                                (target - a0).rem_euclid(TAU)
+                            } else {
+                                (a0 - target).rem_euclid(TAU)
+                            };
+                            if turned <= sweep.abs() {
+                                let p = Point2::new(
+                                    center.x + radius * target.cos(),
+                                    center.y + radius * target.sin(),
+                                );
+                                lo = lo.min(along(p));
+                                hi = hi.max(along(p));
+                            }
+                        }
+                    }
+                    _ => {
+                        lo = lo.min(along(mid));
+                        hi = hi.max(along(mid));
+                    }
+                }
+                (lo, hi)
+            }
+        }
+    }
+
     /// Appends points along the curve, from its start up to (excluding) its end.
     fn sample_into(&self, out: &mut Vec<Point2>) {
         const ARC_SAMPLES: usize = 16;
@@ -668,6 +717,43 @@ mod tests {
             line(first_id + 2, x + w, y + h, x, y + h),
             line(first_id + 3, x, y + h, x, y),
         ]
+    }
+
+    #[test]
+    fn curves_reach_as_far_as_their_geometry() {
+        let close = |(lo, hi): (f64, f64), want: (f64, f64)| {
+            assert!(
+                (lo - want.0).abs() < 1e-12 && (hi - want.1).abs() < 1e-12,
+                "{lo}..{hi}, wanted {want:?}"
+            );
+        };
+        close(
+            line(1, 1.0, 2.0, 4.0, -1.0).curve.range_along(1.0, 0.0),
+            (1.0, 4.0),
+        );
+        close(
+            circle(1, 2.0, 0.0, 3.0).curve.range_along(1.0, 0.0),
+            (-1.0, 5.0),
+        );
+        // A quarter arc from (1, 0) to (0, 1) about the origin, through 45°.
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        let quarter = Curve2::Arc {
+            start: Point2::new(1.0, 0.0),
+            mid: Point2::new(h, h),
+            end: Point2::new(0.0, 1.0),
+        };
+        close(quarter.range_along(1.0, 0.0), (0.0, 1.0));
+        // Along the diagonal it bulges past both ends, to its radius.
+        close(quarter.range_along(h, h), (h, 1.0));
+        // The other way round (the same arc, clockwise) reaches as far.
+        close(quarter.reversed().range_along(h, h), (h, 1.0));
+        // A half circle below the x axis reaches down to -1, not up.
+        let half = Curve2::Arc {
+            start: Point2::new(1.0, 0.0),
+            mid: Point2::new(0.0, -1.0),
+            end: Point2::new(-1.0, 0.0),
+        };
+        close(half.range_along(0.0, 1.0), (-1.0, 0.0));
     }
 
     #[test]

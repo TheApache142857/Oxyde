@@ -64,10 +64,10 @@ pub use equations::{
 pub use error::ModelError;
 pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};
 pub use feature::{
-    AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude, ExtrudeExtent,
-    ExtrudeOp, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, Import, LinearPattern,
-    Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
-    SketchPlane, StandardAxis, StandardPlane, Sweep,
+    AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude,
+    ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, FeatureParameter, FileData, Hole,
+    HoleKind, Import, LinearPattern, Loft, Mirror, PatternDirection, PlaneRef, RefAxis, RefPlane,
+    Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep,
 };
 pub use finish::{Finish, FinishParams};
 pub use material::{Material, MaterialLibrary, MaterialSource, Mechanical, Thermal};

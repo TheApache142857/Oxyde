@@ -7,13 +7,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
 use oxyde_model::{
-    Appearance, Appearances, AxisRef, BodyId, CircularPattern, Combine, CombineOp,
+    Appearance, Appearances, AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp,
     ConfigurationText, ConfigurationsText, EdgeBlend, EdgeName, EquationText, Equations,
     EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
-    FeatureKind, FeatureParameter, FileData, GlobalText, Import, LinearPattern, Material,
-    MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis, StandardPlane, Sweep,
-    Texture, Thermal, VertexName,
+    FeatureKind, FeatureParameter, FileData, GlobalText, Hole, HoleKind, Import, LinearPattern,
+    Loft, Material, MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef,
+    RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
+    StandardPlane, Sweep, Texture, Thermal, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -495,6 +495,9 @@ pub(crate) enum KindDto {
     Chamfer {
         edges: Vec<EdgeRefDto>,
         distance: f64,
+        /// The other side of an unequal chamfer; absent for an equal one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        second: Option<ChamferSecondDto>,
     },
     Shell {
         #[serde(default)]
@@ -534,6 +537,9 @@ pub(crate) enum KindDto {
     Mirror {
         seeds: Vec<u32>,
         plane: PlaneDto,
+        /// Bodies mirrored whole, each joined to its image.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
     },
     /// Geometry imported from a STEP file, stored in the archive at `file`.
     Import {
@@ -551,6 +557,61 @@ pub(crate) enum KindDto {
         operation: CombineOpDto,
         #[serde(default)]
         keep_tools: bool,
+    },
+    /// A solid lofted through the contours of several sketches, in order.
+    Loft {
+        profiles: Vec<u32>,
+        operation: OperationDto,
+        #[serde(default)]
+        ruled: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
+    },
+    /// Holes at the lone points of a sketch (Hole Wizard).
+    Hole {
+        sketch: u32,
+        kind: HoleKindDto,
+        diameter: f64,
+        /// `None` (null): through everything.
+        #[serde(default)]
+        depth: Option<f64>,
+        #[serde(default)]
+        reverse: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bodies: Vec<BodyIdDto>,
+    },
+}
+
+/// An unequal chamfer's other side.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ChamferSecondDto {
+    Distance {
+        distance: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flip: bool,
+    },
+    Angle {
+        /// Radians.
+        angle: f64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flip: bool,
+    },
+}
+
+/// A hole's mouth.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum HoleKindDto {
+    Simple,
+    Counterbore {
+        diameter: f64,
+        depth: f64,
+    },
+    Countersink {
+        diameter: f64,
+        /// Included angle, radians.
+        angle: f64,
     },
 }
 
@@ -682,6 +743,9 @@ pub(crate) enum RelationDto {
     VerticalDistance { a: u32, b: u32, value: f64 },
     Length { line: u32, value: f64 },
     Radius { curve: u32, value: f64 },
+    Diameter { curve: u32, value: f64 },
+    HorizontalPoints { a: u32, b: u32 },
+    VerticalPoints { a: u32, b: u32 },
     Angle { a: u32, b: u32, value: f64 },
     PointOnLine { point: u32, line: u32 },
     PointOnCircle { point: u32, curve: u32 },
@@ -702,11 +766,23 @@ pub(crate) enum OperationDto {
     NewBody,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ExtentDto {
-    Blind { depth: f64 },
-    MidPlane { depth: f64 },
+    Blind {
+        depth: f64,
+    },
+    MidPlane {
+        depth: f64,
+    },
+    ThroughAll {
+        /// Through everything on both sides of the sketch plane.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        both: bool,
+    },
+    UpToSurface {
+        plane: PlaneDto,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -859,9 +935,13 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
             operation: operation_dto(extrude.op),
-            extent: match extrude.extent {
-                ExtrudeExtent::Blind { depth } => ExtentDto::Blind { depth },
-                ExtrudeExtent::MidPlane { depth } => ExtentDto::MidPlane { depth },
+            extent: match &extrude.extent {
+                ExtrudeExtent::Blind { depth } => ExtentDto::Blind { depth: *depth },
+                ExtrudeExtent::MidPlane { depth } => ExtentDto::MidPlane { depth: *depth },
+                ExtrudeExtent::ThroughAll { both } => ExtentDto::ThroughAll { both: *both },
+                ExtrudeExtent::UpToSurface { plane } => ExtentDto::UpToSurface {
+                    plane: plane_dto(plane),
+                },
             },
             reverse: extrude.reverse,
             bodies: extrude.bodies.iter().map(body_dto).collect(),
@@ -891,6 +971,15 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Chamfer(blend) => KindDto::Chamfer {
             edges: blend.edges.iter().map(edge_dto).collect(),
             distance: blend.size,
+            second: match blend.chamfer {
+                ChamferShape::Equal => None,
+                ChamferShape::TwoDistances { distance, flip } => {
+                    Some(ChamferSecondDto::Distance { distance, flip })
+                }
+                ChamferShape::AngleDistance { angle, flip } => {
+                    Some(ChamferSecondDto::Angle { angle, flip })
+                }
+            },
         },
         FeatureKind::Shell(shell) => KindDto::Shell {
             faces: shell.faces.iter().map(face_dto).collect(),
@@ -924,6 +1013,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
         FeatureKind::Mirror(mirror) => KindDto::Mirror {
             seeds: ids(&mirror.seeds),
             plane: plane_dto(&mirror.plane),
+            bodies: mirror.bodies.iter().map(body_dto).collect(),
         },
         FeatureKind::Import(import) => KindDto::Import {
             file_name: import.file_name.clone(),
@@ -939,6 +1029,28 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                 CombineOp::Intersect => CombineOpDto::Intersect,
             },
             keep_tools: combine.keep_tools,
+        },
+        FeatureKind::Loft(loft) => KindDto::Loft {
+            profiles: ids(&loft.profiles),
+            operation: operation_dto(loft.op),
+            ruled: loft.ruled,
+            bodies: loft.bodies.iter().map(body_dto).collect(),
+        },
+        FeatureKind::Hole(hole) => KindDto::Hole {
+            sketch: hole.sketch.raw(),
+            kind: match hole.kind {
+                HoleKind::Simple => HoleKindDto::Simple,
+                HoleKind::Counterbore { diameter, depth } => {
+                    HoleKindDto::Counterbore { diameter, depth }
+                }
+                HoleKind::Countersink { diameter, angle } => {
+                    HoleKindDto::Countersink { diameter, angle }
+                }
+            },
+            diameter: hole.diameter,
+            depth: hole.depth,
+            reverse: hole.reverse,
+            bodies: hole.bodies.iter().map(body_dto).collect(),
         },
     };
     FeatureDto {
@@ -1049,6 +1161,9 @@ fn relation_dto(c: &Constraint) -> RelationDto {
         },
         C::Length(l, value) => R::Length { line: l.0, value },
         C::Radius(r, value) => R::Radius { curve: r.0, value },
+        C::Diameter(r, value) => R::Diameter { curve: r.0, value },
+        C::HorizontalPoints(a, b) => R::HorizontalPoints { a: a.0, b: b.0 },
+        C::VerticalPoints(a, b) => R::VerticalPoints { a: a.0, b: b.0 },
         C::Angle(a, b, value) => R::Angle {
             a: a.0,
             b: b.0,
@@ -1278,6 +1393,9 @@ fn relation_from(dto: RelationDto) -> Constraint {
         R::VerticalDistance { a, b, value } => C::VerticalDistance(id(a), id(b), value),
         R::Length { line, value } => C::Length(id(line), value),
         R::Radius { curve, value } => C::Radius(id(curve), value),
+        R::Diameter { curve, value } => C::Diameter(id(curve), value),
+        R::HorizontalPoints { a, b } => C::HorizontalPoints(id(a), id(b)),
+        R::VerticalPoints { a, b } => C::VerticalPoints(id(a), id(b)),
         R::Angle { a, b, value } => C::Angle(id(a), id(b), value),
         R::PointOnLine { point, line } => C::PointOnLine(id(point), id(line)),
         R::PointOnCircle { point, curve } => C::PointOnCircle(id(point), id(curve)),
@@ -1341,6 +1459,10 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             extent: match extent {
                 ExtentDto::Blind { depth } => ExtrudeExtent::Blind { depth },
                 ExtentDto::MidPlane { depth } => ExtrudeExtent::MidPlane { depth },
+                ExtentDto::ThroughAll { both } => ExtrudeExtent::ThroughAll { both },
+                ExtentDto::UpToSurface { plane } => ExtrudeExtent::UpToSurface {
+                    plane: plane_from(plane),
+                },
             },
             reverse,
             bodies: bodies.into_iter().map(body_from).collect(),
@@ -1348,10 +1470,24 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
         KindDto::Fillet { edges, radius } => FeatureKind::Fillet(EdgeBlend {
             edges: edges.into_iter().map(edge_from).collect(),
             size: radius,
+            chamfer: Default::default(),
         }),
-        KindDto::Chamfer { edges, distance } => FeatureKind::Chamfer(EdgeBlend {
+        KindDto::Chamfer {
+            edges,
+            distance,
+            second,
+        } => FeatureKind::Chamfer(EdgeBlend {
             edges: edges.into_iter().map(edge_from).collect(),
             size: distance,
+            chamfer: match second {
+                None => ChamferShape::Equal,
+                Some(ChamferSecondDto::Distance { distance, flip }) => {
+                    ChamferShape::TwoDistances { distance, flip }
+                }
+                Some(ChamferSecondDto::Angle { angle, flip }) => {
+                    ChamferShape::AngleDistance { angle, flip }
+                }
+            },
         }),
         KindDto::Revolve {
             sketch,
@@ -1426,9 +1562,14 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             equal_spacing,
             reverse,
         }),
-        KindDto::Mirror { seeds, plane } => FeatureKind::Mirror(Mirror {
+        KindDto::Mirror {
+            seeds,
+            plane,
+            bodies,
+        } => FeatureKind::Mirror(Mirror {
             seeds: ids_from(seeds),
             plane: plane_from(plane),
+            bodies: bodies.into_iter().map(body_from).collect(),
         }),
         KindDto::Import {
             file_name,
@@ -1458,6 +1599,40 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
                 CombineOpDto::Intersect => CombineOp::Intersect,
             },
             keep_tools,
+        }),
+        KindDto::Loft {
+            profiles,
+            operation,
+            ruled,
+            bodies,
+        } => FeatureKind::Loft(Loft {
+            profiles: ids_from(profiles),
+            op: operation_from(operation),
+            ruled,
+            bodies: bodies.into_iter().map(body_from).collect(),
+        }),
+        KindDto::Hole {
+            sketch,
+            kind,
+            diameter,
+            depth,
+            reverse,
+            bodies,
+        } => FeatureKind::Hole(Hole {
+            sketch: FeatureId::from_raw(sketch),
+            kind: match kind {
+                HoleKindDto::Simple => HoleKind::Simple,
+                HoleKindDto::Counterbore { diameter, depth } => {
+                    HoleKind::Counterbore { diameter, depth }
+                }
+                HoleKindDto::Countersink { diameter, angle } => {
+                    HoleKind::Countersink { diameter, angle }
+                }
+            },
+            diameter,
+            depth,
+            reverse,
+            bodies: bodies.into_iter().map(body_from).collect(),
         }),
     };
     let mut parameter_names = BTreeMap::new();

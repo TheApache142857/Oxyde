@@ -433,10 +433,13 @@ fn mate_box(ui: &mut egui::Ui, text: Option<String>, active: bool, hint: &str) -
 impl OxydeApp {
     // ---- Opening, saving, leaving ----------------------------------------------------------
 
+    /// Whether the open document has changes to save: a part's include the sketch being
+    /// edited, whose drawing is written into the part only when it is left (closing the
+    /// window or opening another file meanwhile must still ask).
     pub(crate) fn is_modified(&self) -> bool {
         match &self.asm {
             Some(doc) => doc.modified,
-            None => self.doc.modified,
+            None => self.doc.modified || self.sketch.as_ref().is_some_and(|s| s.changed()),
         }
     }
 
@@ -1099,6 +1102,8 @@ impl OxydeApp {
         };
         let selection = std::mem::take(&mut doc.selection);
         let mut removed = 0;
+        // Mates go with the components they hold: said, as SolidWorks lists them.
+        let mut mates_gone: Vec<String> = Vec::new();
         for item in &selection {
             match item {
                 AsmSelected::Mate(m) => {
@@ -1112,7 +1117,7 @@ impl OxydeApp {
                     if removed == 0 {
                         doc.checkpoint();
                     }
-                    doc.assembly.remove_component(*c);
+                    mates_gone.extend(doc.assembly.remove_component(*c));
                     removed += 1;
                 }
                 _ => {}
@@ -1120,7 +1125,14 @@ impl OxydeApp {
         }
         if removed > 0 {
             doc.solve();
-            self.status = format!("Deleted {removed} item(s)");
+            self.status = if mates_gone.is_empty() {
+                format!("Deleted {removed} item(s)")
+            } else {
+                format!(
+                    "Deleted {removed} item(s), and the mates that held them: {} (Undo brings them back)",
+                    mates_gone.join(", ")
+                )
+            };
         }
     }
 
@@ -1653,7 +1665,8 @@ impl OxydeApp {
                                 egui::DragValue::new(&mut d.distance)
                                     .speed(0.1)
                                     .range(0.0..=crate::dialogs::MAX_LENGTH)
-                                    .suffix(" mm"),
+                                    .suffix(" mm")
+                                    .custom_parser(crate::dialogs::length_parser),
                             );
                         });
                     }
@@ -1664,7 +1677,8 @@ impl OxydeApp {
                                 egui::DragValue::new(&mut d.angle)
                                     .speed(0.5)
                                     .range(0.0..=180.0)
-                                    .suffix("°"),
+                                    .suffix("°")
+                                    .custom_parser(crate::dialogs::angle_parser),
                             );
                         });
                     }

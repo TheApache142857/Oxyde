@@ -32,13 +32,15 @@ use std::fmt;
 use std::path::Path;
 
 use oxyde_geom::{
-    Axis, Curve2, Loop, Path as SweepPath, Plane, Point3, Profile, ProfileSegment, Transform, Vec3,
+    Axis, Curve2, Loop, Path as SweepPath, Plane, Point2, Point3, Profile, ProfileSegment,
+    Transform, Vec3,
 };
 use oxyde_kernel::{
-    BooleanOp, CurveKind, EdgeInfo, FaceInfo, FaceMesh, FaceSource, Kernel, Mesh, OpHistory,
-    OpResult, ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance,
-    StepMaterial, StepNode, StepNodeContent, SurfaceKind, Topology, TopologyCounts, VertexInfo,
-    VolumeMesh, VolumeMeshError, VolumeMeshOptions,
+    BooleanOp, ChamferSecond, CurveKind, Distance, EdgeInfo, FaceInfo, FaceMesh, FaceSource,
+    Kernel, Mesh, OpHistory, OpResult, ProjectedEdges, ShapeHandle, StepAssembly, StepColor,
+    StepColors, StepImport, StepInstance, StepMaterial, StepNode, StepNodeContent, SubShape,
+    SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh, VolumeMeshError,
+    VolumeMeshOptions,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -158,6 +160,26 @@ impl Kernel for OcctKernel {
         })
     }
 
+    fn loft(
+        &mut self,
+        sections: &[(Plane, Loop)],
+        ruled: bool,
+    ) -> Result<Option<OpResult>, OcctError> {
+        guarded(|| {
+            let data: Vec<ffi::LoftSectionData> = sections
+                .iter()
+                .map(|(plane, contour)| ffi::LoftSectionData {
+                    plane: plane_data(plane),
+                    region: ffi::RegionData {
+                        loops: vec![loop_data(contour)],
+                    },
+                })
+                .collect();
+            let result = self.session.pin_mut().loft(&data, ruled)?;
+            Ok(Some(op_result(result)))
+        })
+    }
+
     fn revolve(
         &mut self,
         plane: &Plane,
@@ -272,6 +294,31 @@ impl Kernel for OcctKernel {
         })
     }
 
+    fn chamfer_with(
+        &mut self,
+        shape: ShapeHandle,
+        edges: &[(u32, u32)],
+        first: f64,
+        second: ChamferSecond,
+    ) -> Result<Option<OpResult>, OcctError> {
+        let (kind, value) = match second {
+            ChamferSecond::Distance(d) => (0, d),
+            ChamferSecond::Angle(a) => (1, a),
+        };
+        let (edge_ids, face_ids): (Vec<u32>, Vec<u32>) = edges.iter().copied().unzip();
+        guarded(|| {
+            let data = self.session.pin_mut().chamfer_with(
+                shape.raw(),
+                &edge_ids,
+                &face_ids,
+                first,
+                kind,
+                value,
+            )?;
+            Ok(Some(op_result(data)))
+        })
+    }
+
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, OcctError> {
         guarded(|| Ok(topology_from(self.session.topology(shape.raw())?)))
     }
@@ -311,6 +358,58 @@ impl Kernel for OcctKernel {
                 Point3::new(b.xmin, b.ymin, b.zmin),
                 Point3::new(b.xmax, b.ymax, b.zmax),
             ))
+        })
+    }
+
+    fn distance(
+        &self,
+        a: ShapeHandle,
+        a_part: SubShape,
+        b: ShapeHandle,
+        b_part: SubShape,
+    ) -> Result<Option<Distance>, OcctError> {
+        let part = |p: SubShape| match p {
+            SubShape::Whole => (0, 0),
+            SubShape::Face(i) => (1, i),
+            SubShape::Edge(i) => (2, i),
+            SubShape::Vertex(i) => (3, i),
+        };
+        guarded(|| {
+            let ((ak, ai), (bk, bi)) = (part(a_part), part(b_part));
+            let d = self.session.distance(a.raw(), ak, ai, b.raw(), bk, bi)?;
+            Ok(Some(Distance {
+                distance: d.distance,
+                on_a: Point3::new(d.ax, d.ay, d.az),
+                on_b: Point3::new(d.bx, d.by, d.bz),
+            }))
+        })
+    }
+
+    fn project_edges(
+        &self,
+        shapes: &[ShapeHandle],
+        view: &Plane,
+        deflection: f64,
+    ) -> Result<Option<ProjectedEdges>, OcctError> {
+        guarded(|| {
+            let raw: Vec<u64> = shapes.iter().map(|s| s.raw()).collect();
+            let data = self
+                .session
+                .project_edges(&raw, &plane_data(view), deflection.max(1e-4))?;
+            let lines = |polylines: &[ffi::PolylineData]| -> Vec<Vec<Point2>> {
+                polylines
+                    .iter()
+                    .map(|l| {
+                        let xs = l.points.iter().step_by(2);
+                        let ys = l.points.iter().skip(1).step_by(2);
+                        xs.zip(ys).map(|(x, y)| Point2::new(*x, *y)).collect()
+                    })
+                    .collect()
+            };
+            Ok(Some(ProjectedEdges {
+                visible: lines(&data.visible),
+                hidden: lines(&data.hidden),
+            }))
         })
     }
 

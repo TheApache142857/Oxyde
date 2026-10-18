@@ -162,6 +162,58 @@ fn a_revolve_axis_off_the_sketch_plane_is_an_error() {
     part.release(&mut kernel);
 }
 
+/// OpenCASCADE turns a profile lying across its axis into a solid that passes through
+/// itself, without an error; SolidWorks refuses the sketch. A profile touching the axis
+/// is a plain solid of revolution.
+#[test]
+fn a_profile_across_the_revolve_axis_is_refused() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (across, axis) = revolve_profile(-5.0, 10.0, 0.0, 20.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(across));
+    let bad = part.add_feature(revolve(
+        s1,
+        ExtrudeOp::Boss,
+        RevolveAxis::SketchLine(axis),
+        TAU,
+    ));
+    // A circle across the model Y axis, about which it is turned.
+    let mut disc = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    disc.circle(Point2::new(3.0, 40.0), 4.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(disc));
+    let round = part.add_feature(revolve(
+        s2,
+        ExtrudeOp::NewBody,
+        RevolveAxis::Axis(AxisRef::Standard(StandardAxis::Y)),
+        PI,
+    ));
+    part.rebuild(&mut kernel);
+    for feature in [bad, round] {
+        match part.status(feature) {
+            Some(FeatureStatus::Error(message)) => {
+                assert!(message.contains("crosses the axis"), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+    assert!(part.body().is_none(), "nothing was built");
+
+    // From the axis outwards: a cylinder of radius 10.
+    let (touching, axis) = revolve_profile(0.0, 10.0, 0.0, 20.0);
+    match part.edit(s1).unwrap() {
+        FeatureKind::Sketch(s) => *s = touching,
+        _ => unreachable!(),
+    }
+    match part.edit(bad).unwrap() {
+        FeatureKind::Revolve(r) => r.axis = RevolveAxis::SketchLine(axis),
+        _ => unreachable!(),
+    }
+    part.rebuild(&mut kernel);
+    assert_eq!(part.status(bad), Some(FeatureStatus::Ok));
+    assert_close(volume(&part, &kernel), PI * 100.0 * 20.0);
+    part.release(&mut kernel);
+}
+
 #[test]
 fn shell_hollows_the_part_and_names_its_inner_walls() {
     let mut kernel = OcctKernel::new();
@@ -322,6 +374,7 @@ fn a_fillet_on_a_smooth_edge_says_so() {
             FaceName::profile(slot, end.0),
         )],
         size: 1.0,
+        chamfer: Default::default(),
     }));
     part.rebuild(&mut kernel);
     match part.status(fillet) {
@@ -419,6 +472,7 @@ fn linear_pattern_copies_a_hole_and_its_instances_can_be_referenced() {
             FaceName::end_cap(base),
         )],
         size: 0.5,
+        chamfer: Default::default(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -583,6 +637,7 @@ fn mirror_copies_a_boss_through_a_plane() {
     let mirror = part.add_feature(FeatureKind::Mirror(Mirror {
         seeds: vec![lug],
         plane: PlaneRef::Standard(StandardPlane::Right),
+        bodies: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -709,6 +764,7 @@ fn a_pattern_or_mirror_of_the_first_boss_joins_its_body() {
     part.add_feature(FeatureKind::Mirror(Mirror {
         seeds: vec![base],
         plane: PlaneRef::Standard(StandardPlane::Right),
+        bodies: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -732,10 +788,12 @@ fn patterns_only_copy_extrusions_and_revolves() {
             FaceName::profile(base, 5),
         )],
         size: 1.0,
+        chamfer: Default::default(),
     }));
     let pattern = part.add_feature(FeatureKind::Mirror(Mirror {
         seeds: vec![fillet],
         plane: PlaneRef::Standard(StandardPlane::Right),
+        bodies: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert!(matches!(
@@ -889,5 +947,220 @@ fn a_sweep_refuses_a_path_in_pieces_or_the_profile_as_path() {
         other => panic!("a path in two pieces should fail, got {other:?}"),
     }
     assert!(matches!(part.status(same), Some(FeatureStatus::Error(_))));
+    part.release(&mut kernel);
+}
+
+/// Half a symmetric part, mirrored whole about the Right plane: one body, twice the
+/// volume, the copy's faces named after the half's and referred to by later features.
+#[test]
+fn a_body_mirrored_whole_makes_the_part_symmetric() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    // From x = 0 to 20, against the Right plane.
+    let half = block(&mut part, Point2::new(0.0, 0.0), 20.0, 10.0, 5.0);
+    let mirror = part.add_feature(FeatureKind::Mirror(Mirror {
+        seeds: Vec::new(),
+        plane: PlaneRef::Standard(StandardPlane::Right),
+        bodies: vec![oxyde_model::BodyId::new(half, 0)],
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let body = part.body().unwrap();
+    assert_eq!(body.solids.len(), 1, "joined to its image");
+    assert_close(volume(&part, &kernel), 2.0 * 20.0 * 10.0 * 5.0);
+    let (lo, hi) = kernel.bounds(body.solids[0].shape).unwrap();
+    assert!((lo.x + 20.0).abs() < 1e-6 && (hi.x - 20.0).abs() < 1e-6);
+    // The far end of the copy is the mirror's image of the half's right side (the
+    // rectangle's second line: entity 6, after its four corners).
+    let far = FaceName::new(FaceKey::Instance {
+        feature: mirror,
+        instance: [1, 0],
+        face: Box::new(FaceName::profile(half, 6)),
+    });
+    let found = body.naming.resolve_face(&far);
+    assert!(
+        matches!(found, oxyde_model::Resolution::Exact(_)),
+        "{far}: {found:?}"
+    );
+    // Features and bodies together are refused.
+    match part.edit(mirror).unwrap() {
+        FeatureKind::Mirror(m) => m.seeds = vec![half],
+        _ => unreachable!(),
+    }
+    part.rebuild(&mut kernel);
+    assert!(matches!(part.status(mirror), Some(FeatureStatus::Error(_))));
+    part.release(&mut kernel);
+}
+
+/// Chamfers with two distances, or a distance and an angle, on the top front edge of a
+/// 40 × 20 × 10 block (between its end cap at z = 10 and its side at y = 20).
+#[test]
+fn unequal_chamfers_take_two_distances_or_an_angle() {
+    use oxyde_model::ChamferShape;
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let boss = block(&mut part, Point2::new(0.0, 0.0), 40.0, 20.0, 10.0);
+    // The rectangle's third line, from (40, 20) to (0, 20): entity 7.
+    let edge = EdgeName::between(FaceName::profile(boss, 7), FaceName::end_cap(boss));
+    let bevel = part.add_feature(FeatureKind::Chamfer(EdgeBlend {
+        edges: vec![edge],
+        size: 2.0,
+        chamfer: ChamferShape::TwoDistances {
+            distance: 4.0,
+            flip: false,
+        },
+    }));
+    // How far along the top (z = 10) the chamfer starts from the side at y = 20.
+    let top_reach = |part: &Part| {
+        let body = part.body().unwrap();
+        body.topology
+            .vertices
+            .iter()
+            .filter(|v| (v.point.z - 10.0).abs() < 1e-6)
+            .map(|v| 20.0 - v.point.y)
+            .fold(f64::INFINITY, f64::min)
+    };
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    // A right triangle 2 by 4, 40 long.
+    assert_close(volume(&part, &kernel), 8000.0 - 0.5 * 2.0 * 4.0 * 40.0);
+    let unflipped = top_reach(&part);
+    // Flipped, the distances swap sides; the volume stays.
+    match part.edit(bevel).unwrap() {
+        FeatureKind::Chamfer(b) => {
+            b.chamfer = ChamferShape::TwoDistances {
+                distance: 4.0,
+                flip: true,
+            }
+        }
+        _ => unreachable!(),
+    }
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 8000.0 - 0.5 * 2.0 * 4.0 * 40.0);
+    let flipped = top_reach(&part);
+    let mut reaches = [unflipped, flipped];
+    reaches.sort_by(f64::total_cmp);
+    assert!(
+        (reaches[0] - 2.0).abs() < 1e-6 && (reaches[1] - 4.0).abs() < 1e-6,
+        "{reaches:?}"
+    );
+    // 3 mm and 30°: the other leg is 3 tan 30°. The angle is a dimension.
+    match part.edit(bevel).unwrap() {
+        FeatureKind::Chamfer(b) => {
+            b.size = 3.0;
+            b.chamfer = ChamferShape::AngleDistance {
+                angle: 30f64.to_radians(),
+                flip: false,
+            }
+        }
+        _ => unreachable!(),
+    }
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let leg = 3.0 * 30f64.to_radians().tan();
+    assert_close(volume(&part, &kernel), 8000.0 - 0.5 * 3.0 * leg * 40.0);
+    assert!(part.find_dimension("D2@Chamfer1").is_some());
+    part.release(&mut kernel);
+}
+
+/// A plane parallel to Front at `z`.
+fn front_plane_at(part: &mut Part, z: f64) -> FeatureId {
+    part.add_feature(FeatureKind::Plane(RefPlane {
+        base: PlaneRef::Standard(StandardPlane::Front),
+        offset: z,
+        flip: false,
+    }))
+}
+
+fn loft(profiles: Vec<FeatureId>, ruled: bool) -> FeatureKind {
+    FeatureKind::Loft(oxyde_model::Loft {
+        profiles,
+        op: ExtrudeOp::NewBody,
+        ruled,
+        bodies: Vec::new(),
+    })
+}
+
+#[test]
+fn lofts_go_through_their_sections() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    // Circles of radius 10 at z = 0 and 5 at z = 20: a cone's frustum.
+    let mut big = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let big_circle = big.circle(Point2::ORIGIN, 10.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(big));
+    let up = front_plane_at(&mut part, 20.0);
+    let mut small = Sketch::new(SketchPlane::Reference(up));
+    small.circle(Point2::ORIGIN, 5.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(small));
+    let cone = part.add_feature(loft(vec![s1, s2], false));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(
+        volume(&part, &kernel),
+        PI * 20.0 / 3.0 * (100.0 + 50.0 + 25.0),
+    );
+    // The side is named after the first section's circle; the ends are the caps.
+    let body = part.body().unwrap();
+    for name in [
+        FaceName::profile(cone, big_circle),
+        FaceName::start_cap(cone),
+        FaceName::end_cap(cone),
+    ] {
+        let found = body.naming.resolve_face(&name);
+        assert!(
+            matches!(found, oxyde_model::Resolution::Exact(_)),
+            "{name}: {found:?}"
+        );
+    }
+
+    // Squares of 20 and 10, ruled: a pyramid's frustum, whichever way each square was
+    // drawn.
+    let mut part = Part::new();
+    let mut base = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    base.rectangle(Point2::new(-10.0, -10.0), 20.0, 20.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(base));
+    let up = front_plane_at(&mut part, 10.0);
+    let mut top = Sketch::new(SketchPlane::Reference(up));
+    let g = &mut top.geometry;
+    let corners: Vec<_> = [(-5.0, -5.0), (-5.0, 5.0), (5.0, 5.0), (5.0, -5.0)]
+        .into_iter()
+        .map(|(x, y)| g.point(Point2::new(x, y)))
+        .collect();
+    for k in 0..4 {
+        g.line_between(corners[k], corners[(k + 1) % 4]);
+    }
+    let s2 = part.add_feature(FeatureKind::Sketch(top));
+    part.add_feature(loft(vec![s1, s2], true));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), 10.0 / 3.0 * (400.0 + 100.0 + 200.0));
+    part.release(&mut kernel);
+
+    // A circle into a square: the sections need not match.
+    let mut part = Part::new();
+    let mut round = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    round.circle(Point2::ORIGIN, 8.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(round));
+    let up = front_plane_at(&mut part, 15.0);
+    let mut square = Sketch::new(SketchPlane::Reference(up));
+    square.rectangle(Point2::new(-6.0, -6.0), 12.0, 12.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(square));
+    // And a sketch of two contours, which a loft refuses.
+    let mut two = Sketch::new(SketchPlane::Reference(up));
+    two.circle(Point2::new(30.0, 0.0), 1.0);
+    two.circle(Point2::new(40.0, 0.0), 1.0);
+    let s3 = part.add_feature(FeatureKind::Sketch(two));
+    let transition = part.add_feature(loft(vec![s1, s2], false));
+    let refused = part.add_feature(loft(vec![s1, s3], false));
+    part.rebuild(&mut kernel);
+    assert_eq!(part.status(transition), Some(FeatureStatus::Ok));
+    let v = volume(&part, &kernel);
+    assert!(v > 15.0 * 144.0 * 0.7 && v < 15.0 * PI * 64.0, "{v}");
+    match part.status(refused) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("one closed contour")),
+        other => panic!("expected an error, got {other:?}"),
+    }
     part.release(&mut kernel);
 }

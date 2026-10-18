@@ -34,6 +34,7 @@
 )]
 
 mod assembly_schema;
+pub mod drawing;
 pub mod gltf;
 pub mod material_library;
 pub mod obj;
@@ -588,15 +589,15 @@ mod tests {
     use std::io::Cursor;
 
     use oxyde_geom::Point2;
-    use std::f64::consts::{PI, TAU};
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-    use oxyde_model::Sweep;
     use oxyde_model::{
         AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, Extrude,
         ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, FeatureKind, LinearPattern, Mirror,
         PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
         SketchPlane, StandardAxis, StandardPlane,
     };
+    use oxyde_model::{Hole, HoleKind, Sweep};
     use oxyde_sketch::Constraint;
 
     use super::*;
@@ -624,6 +625,15 @@ mod tests {
         top.geometry.rename_dimension(hole_radius, "Hole").unwrap();
         top.geometry
             .constrain(Constraint::EqualRadius(circle, guide));
+        let pin = top.geometry.circle(Point2::new(-8.0, 0.0), 1.0);
+        top.geometry.constrain(Constraint::Diameter(pin, 2.0));
+        let dot = top.geometry.point(Point2::new(-8.0, 4.0));
+        let mark = top.geometry.point(Point2::new(-2.0, 4.0));
+        top.geometry
+            .constrain(Constraint::HorizontalPoints(dot, mark));
+        let below = top.geometry.point(Point2::new(-2.0, -4.0));
+        top.geometry
+            .constrain(Constraint::VerticalPoints(mark, below));
         let s2 = part.add_feature(FeatureKind::Sketch(top));
         let hole = part.add_feature(FeatureKind::Extrude(Extrude {
             sketch: s2,
@@ -637,6 +647,7 @@ mod tests {
         let round = part.add_feature(FeatureKind::Fillet(EdgeBlend {
             edges: vec![edge.clone()],
             size: 1.5,
+            chamfer: Default::default(),
         }));
         // A chamfer on an edge of the fillet face: nested names.
         let nested =
@@ -644,6 +655,10 @@ mod tests {
         let bevel = part.add_feature(FeatureKind::Chamfer(EdgeBlend {
             edges: vec![nested],
             size: 0.5,
+            chamfer: oxyde_model::ChamferShape::AngleDistance {
+                angle: 0.5,
+                flip: true,
+            },
         }));
         part.set_suppressed(bevel, true).unwrap();
 
@@ -702,6 +717,12 @@ mod tests {
         part.add_feature(FeatureKind::Mirror(Mirror {
             seeds: vec![hole, ring],
             plane: PlaneRef::Face(FaceName::start_cap(boss)),
+            bodies: Vec::new(),
+        }));
+        part.add_feature(FeatureKind::Mirror(Mirror {
+            seeds: Vec::new(),
+            plane: PlaneRef::Standard(StandardPlane::Right),
+            bodies: vec![BodyId::new(boss, 0)],
         }));
         // Bodies: the ring was made as a body of its own; combined into the first.
         part.add_feature(FeatureKind::Combine(Combine {
@@ -729,6 +750,64 @@ mod tests {
             op: ExtrudeOp::NewBody,
             bodies: vec![BodyId::new(boss, 0)],
         }));
+        // End conditions without a depth: through everything, and up to a face.
+        let mut slot = Sketch::new(SketchPlane::Reference(plane));
+        slot.circle(Point2::new(-10.0, 0.0), 1.5);
+        let s6 = part.add_feature(FeatureKind::Sketch(slot));
+        part.add_feature(FeatureKind::Extrude(Extrude {
+            sketch: s6,
+            op: ExtrudeOp::Cut,
+            extent: ExtrudeExtent::ThroughAll { both: true },
+            reverse: false,
+            bodies: Vec::new(),
+        }));
+        part.add_feature(FeatureKind::Extrude(Extrude {
+            sketch: s6,
+            op: ExtrudeOp::Boss,
+            extent: ExtrudeExtent::UpToSurface {
+                plane: PlaneRef::Face(FaceName::start_cap(boss)),
+            },
+            reverse: false,
+            bodies: Vec::new(),
+        }));
+        // A loft from the slot's circle to a square on a plane above it.
+        let mut square = Sketch::new(SketchPlane::Reference(plane));
+        square.rectangle(Point2::new(-12.0, -2.0), 4.0, 4.0);
+        let s8 = part.add_feature(FeatureKind::Sketch(square));
+        part.add_feature(FeatureKind::Loft(oxyde_model::Loft {
+            profiles: vec![s6, s8],
+            op: ExtrudeOp::NewBody,
+            ruled: true,
+            bodies: Vec::new(),
+        }));
+        // Holes at the points of a sketch on the top face: counterbored and blind, then
+        // countersunk through everything.
+        let mut spots = Sketch::new(SketchPlane::Face(FaceName::end_cap(boss)));
+        spots.geometry.point(Point2::new(-15.0, 5.0));
+        spots.geometry.point(Point2::new(15.0, 5.0));
+        let s7 = part.add_feature(FeatureKind::Sketch(spots));
+        part.add_feature(FeatureKind::Hole(Hole {
+            sketch: s7,
+            kind: HoleKind::Counterbore {
+                diameter: 11.0,
+                depth: 6.5,
+            },
+            diameter: 6.6,
+            depth: Some(9.0),
+            reverse: false,
+            bodies: vec![BodyId::new(boss, 0)],
+        }));
+        part.add_feature(FeatureKind::Hole(Hole {
+            sketch: s7,
+            kind: HoleKind::Countersink {
+                diameter: 13.4,
+                angle: FRAC_PI_2,
+            },
+            diameter: 6.6,
+            depth: None,
+            reverse: true,
+            bodies: Vec::new(),
+        }));
         let shell = part.add_feature(FeatureKind::Shell(Shell {
             faces: vec![FaceName::new(FaceKey::Instance {
                 feature: row,
@@ -747,6 +826,7 @@ mod tests {
                 FaceName::profile(boss, 2),
             )],
             size: 0.3,
+            chamfer: Default::default(),
         }));
         let depth = part.find_dimension("D1@Boss-Extrude1").unwrap();
         part.rename_dimension(depth, "Thickness").unwrap();

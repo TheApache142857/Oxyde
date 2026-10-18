@@ -118,6 +118,32 @@ impl OxydeApp {
 
 /// The curves of a sketch as polylines in sketch coordinates, with their construction flag.
 /// The origin point is left out.
+/// The lone points of a sketch (no curve's end or centre, not its origin, not
+/// construction): where holes go, and reference points.
+pub fn lone_points(sketch: &ConstrainedSketch) -> Vec<Point2> {
+    let mut used = std::collections::HashSet::new();
+    for e in sketch.entities() {
+        match e.geometry {
+            Geometry::Point(_) => {}
+            Geometry::Line { start, end } => used.extend([start, end]),
+            Geometry::Circle { center, .. } => {
+                used.insert(center);
+            }
+            Geometry::Arc { center, start, end } => used.extend([center, start, end]),
+        }
+    }
+    let origin = sketch.origin();
+    sketch
+        .entities()
+        .iter()
+        .filter(|e| !e.construction && Some(e.id) != origin && !used.contains(&e.id))
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn sketch_polylines(sketch: &ConstrainedSketch) -> Vec<(Vec<Point2>, bool)> {
     let at = |id| sketch.position(id).unwrap_or_default();
     let arc = |c: Point2, r: f64, a0: f64, sweep: f64, n: usize| -> Vec<Point2> {

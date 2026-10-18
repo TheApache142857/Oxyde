@@ -14,7 +14,10 @@ use oxyde_model::{
 use oxyde_render::Pick;
 
 use crate::app::OxydeApp;
-use crate::dialogs::{Answer, BlendDialog, Dialog, ExtrudeDialog, plane_name, positive_length};
+use crate::dialogs::{
+    Answer, BlendDialog, ChamferType, Dialog, EndCondition, ExtrudeDialog, plane_name,
+    positive_length,
+};
 use crate::features_ui::{
     AxisDialog, Choices, CombineDialog, PatternDialog, PatternKind, PlaneDialog, RevolveDialog,
     ShellDialog, SweepDialog,
@@ -191,7 +194,8 @@ fn degrees(ui: &mut egui::Ui, value: &mut f64) {
         egui::DragValue::new(value)
             .speed(1.0)
             .range(0.01..=360.0)
-            .suffix("°"),
+            .suffix("°")
+            .custom_parser(crate::dialogs::angle_parser),
     );
 }
 
@@ -504,8 +508,48 @@ impl OxydeApp {
                     d.sketch = Some(id);
                     true
                 }
+                // The surface Up To Surface goes to, while its box takes clicks.
+                other
+                    if d.end == EndCondition::UpToSurface
+                        && (d.up_to_next || d.up_to.is_none())
+                        && self.plane_of_pick(&other, d.editing).is_some() =>
+                {
+                    if let Some((plane, label)) = self.plane_of_pick(&other, d.editing) {
+                        d.up_to = Some(choose(&mut d.planes, plane, label));
+                        d.up_to_next = false;
+                    }
+                    true
+                }
                 // A body, or a face of one: in or out of the feature's scope.
                 other => match self.body_of_pick(&other) {
+                    Some(body) if d.op != ExtrudeOp::NewBody => {
+                        toggle(&mut d.bodies, body);
+                        true
+                    }
+                    _ => false,
+                },
+            },
+            Dialog::Hole(d) => match pick {
+                PanelPick::Feature(id) if self.is_sketch(id) && self.usable(id, d.editing) => {
+                    d.sketch = Some(id);
+                    true
+                }
+                other => match self.body_of_pick(&other) {
+                    Some(body) => {
+                        toggle(&mut d.bodies, body);
+                        true
+                    }
+                    None => false,
+                },
+            },
+            Dialog::Loft(d) => match &pick {
+                // Sketches go into the list in the order clicked; a second click takes
+                // one out.
+                PanelPick::Feature(id) if self.is_sketch(*id) && self.usable(*id, d.editing) => {
+                    toggle(&mut d.profiles, *id);
+                    true
+                }
+                other => match self.body_of_pick(other) {
                     Some(body) if d.op != ExtrudeOp::NewBody => {
                         toggle(&mut d.bodies, body);
                         true
@@ -620,6 +664,13 @@ impl OxydeApp {
                     }
                     _ => None,
                 };
+                let body = (d.kind == PatternKind::Mirror)
+                    .then(|| match &pick {
+                        PanelPick::Body(id) => Some(*id),
+                        PanelPick::Face(_) if d.bodies_next => self.body_of_pick(&pick),
+                        _ => None,
+                    })
+                    .flatten();
                 if let Some(id) = seed {
                     match d.seeds.iter().position(|s| *s == id) {
                         Some(i) => {
@@ -627,6 +678,9 @@ impl OxydeApp {
                         }
                         None => d.seeds.push(id),
                     }
+                    true
+                } else if let Some(body) = body {
+                    toggle(&mut d.bodies, body);
                     true
                 } else if d.kind == PatternKind::Mirror {
                     match self.plane_of_pick(&pick, d.editing) {
@@ -721,6 +775,11 @@ impl OxydeApp {
                 _ => Vec::new(),
             },
             Dialog::Blend(d) => d.edges.iter().filter_map(edge).collect(),
+            Dialog::Extrude(d) if d.end == EndCondition::UpToSurface => {
+                plane(d.up_to.and_then(|i| d.planes.get(i)).map(|(_, p)| p))
+                    .into_iter()
+                    .collect()
+            }
             Dialog::Shell(d) => d.faces.iter().filter_map(face).collect(),
             Dialog::Revolve(d) => match d.axes.get(d.axis).map(|(_, a)| a) {
                 Some(RevolveAxis::Axis(a)) => axis(Some(a)).into_iter().collect(),
@@ -757,6 +816,8 @@ impl OxydeApp {
             Some(Dialog::Extrude(d)) => d.sketch.into_iter().collect(),
             Some(Dialog::Revolve(d)) => d.sketch.into_iter().collect(),
             Some(Dialog::Sweep(d)) => d.profile.into_iter().chain(d.path).collect(),
+            Some(Dialog::Hole(d)) => d.sketch.into_iter().collect(),
+            Some(Dialog::Loft(d)) => d.profiles.clone(),
             Some(Dialog::Pattern(d)) => d.seeds.clone(),
             _ => Vec::new(),
         }
@@ -855,7 +916,7 @@ impl OxydeApp {
             Dialog::Extrude(d) => (
                 Icon::Extrude,
                 editing(d.editing, "Extrude", "Edit Extrude"),
-                d.sketch.is_some(),
+                d.feature().is_some(),
             ),
             Dialog::Revolve(d) => (
                 Icon::Revolve,
@@ -865,6 +926,11 @@ impl OxydeApp {
             Dialog::Sweep(d) => (
                 Icon::Sweep,
                 editing(d.editing, "Sweep", "Edit Sweep"),
+                d.feature().is_ok(),
+            ),
+            Dialog::Loft(d) => (
+                Icon::Loft,
+                editing(d.editing, "Loft", "Edit Loft"),
                 d.feature().is_ok(),
             ),
             Dialog::Blend(d) if d.fillet => (
@@ -878,6 +944,11 @@ impl OxydeApp {
                 !d.edges.is_empty(),
             ),
             Dialog::Shell(d) => (Icon::Shell, editing(d.editing, "Shell", "Edit Shell"), true),
+            Dialog::Hole(d) => (
+                Icon::Hole,
+                editing(d.editing, "Hole Wizard", "Edit Hole"),
+                d.feature().is_some(),
+            ),
             Dialog::Pattern(d) => {
                 let (icon, title) = match d.kind {
                     PatternKind::Linear => (Icon::LinearPattern, "Linear Pattern"),
@@ -885,7 +956,9 @@ impl OxydeApp {
                     PatternKind::Mirror => (Icon::Mirror, "Mirror"),
                 };
                 let directions = d.kind != PatternKind::Linear || !d.second || d.axis2.is_some();
-                (icon, title, !d.seeds.is_empty() && directions)
+                let copies =
+                    !d.seeds.is_empty() || (d.kind == PatternKind::Mirror && !d.bodies.is_empty());
+                (icon, title, copies && directions)
             }
             Dialog::Combine(d) => (
                 Icon::Combine,
@@ -909,8 +982,13 @@ impl OxydeApp {
             Dialog::Extrude(d) => self.extrude_body(ui, d),
             Dialog::Revolve(d) => self.revolve_body(ui, d),
             Dialog::Sweep(d) => self.sweep_body(ui, d),
+            Dialog::Loft(d) => self.loft_body(ui, d),
             Dialog::Blend(d) => self.blend_body(ui, d),
             Dialog::Shell(d) => self.shell_body(ui, d),
+            Dialog::Hole(d) => {
+                self.hole_body(ui, d);
+                self.bodies_box(ui, ExtrudeOp::Cut, &mut d.bodies);
+            }
             Dialog::Pattern(d) => self.pattern_body(ui, d),
             Dialog::Combine(d) => self.combine_body(ui, d),
             Dialog::RefPlane(d) => ref_plane_body(ui, d),
@@ -966,27 +1044,72 @@ impl OxydeApp {
         if selection_box(ui, &items, "Select a sketch in the tree").is_some() {
             d.sketch = None;
         }
+        let has_body = self.doc.part.body().is_some();
         section(ui, "Operation");
-        operation(ui, &mut d.op, self.doc.part.body().is_some());
+        operation(ui, &mut d.op, has_body);
         self.bodies_box(ui, d.op, &mut d.bodies);
         section(ui, "Direction");
         egui::Grid::new("extrude_panel")
             .num_columns(2)
             .show(ui, |ui| {
                 ui.label("End condition");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut d.mid_plane, false, "Blind");
-                    ui.radio_value(&mut d.mid_plane, true, "Mid-plane");
-                });
+                egui::ComboBox::from_id_salt("extrude_end")
+                    .selected_text(d.end.label())
+                    .show_ui(ui, |ui| {
+                        for (end, label, hint) in EndCondition::ALL {
+                            // Through All goes through bodies: there must be one.
+                            let through = matches!(
+                                end,
+                                EndCondition::ThroughAll | EndCondition::ThroughAllBoth
+                            );
+                            let enabled = !through || has_body || d.end == end;
+                            let response = ui.add_enabled(
+                                enabled,
+                                egui::SelectableLabel::new(d.end == end, label),
+                            );
+                            let response = if enabled {
+                                response.on_hover_text(hint)
+                            } else {
+                                response.on_disabled_hover_text("There is no body yet")
+                            };
+                            if response.clicked() {
+                                d.end = end;
+                                // Up To Surface waits for its surface.
+                                d.up_to_next =
+                                    end == EndCondition::UpToSurface && d.up_to.is_none();
+                            }
+                        }
+                    });
                 ui.end_row();
-                ui.label("Depth");
-                ui.horizontal(|ui| {
-                    positive_length(ui, &mut d.depth);
-                    dimension_note(ui, d.dimension.as_ref());
-                });
-                ui.end_row();
+                if d.end.has_depth() {
+                    ui.label("Depth");
+                    ui.horizontal(|ui| {
+                        positive_length(ui, &mut d.depth);
+                        dimension_note(ui, d.dimension.as_ref());
+                    });
+                    ui.end_row();
+                }
             });
-        if !d.mid_plane {
+        if d.end == EndCondition::UpToSurface {
+            if reference_box(
+                ui,
+                "extrude_up_to",
+                &d.planes,
+                &mut d.up_to,
+                d.up_to_next,
+                "Select a flat face or a plane",
+            ) {
+                d.up_to_next = true;
+            }
+            ui.label(
+                RichText::new(
+                    "It goes towards the surface, on whichever side of the sketch it is.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        if d.end.reversible() {
             ui.checkbox(&mut d.reverse, "Reverse direction");
         }
     }
@@ -1102,6 +1225,45 @@ impl OxydeApp {
         self.bodies_box(ui, d.op, &mut d.bodies);
     }
 
+    fn loft_body(&self, ui: &mut egui::Ui, d: &mut crate::features_ui::LoftDialog) {
+        section(ui, "Profiles, in order");
+        let items: Vec<(String, String)> = d
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    format!("{}. {}", i + 1, self.feature_name(*id)),
+                    String::new(),
+                )
+            })
+            .collect();
+        if let Some(i) = selection_box(ui, &items, "Click the sketches in the tree, in order") {
+            d.profiles.remove(i);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Reverse order")
+                .on_hover_text("The last profile first")
+                .clicked()
+            {
+                d.profiles.reverse();
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Each sketch is one closed contour; the solid goes through them in this order.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.checkbox(&mut d.ruled, "Straight between profiles")
+            .on_hover_text("Ruled: flat or straight sides from one profile to the next");
+        section(ui, "Operation");
+        operation(ui, &mut d.op, self.doc.part.body().is_some());
+        self.bodies_box(ui, d.op, &mut d.bodies);
+    }
+
     /// The bodies a join, cut or intersection works on, when the part has several.
     fn bodies_box(&self, ui: &mut egui::Ui, op: ExtrudeOp, bodies: &mut Vec<oxyde_model::BodyId>) {
         if op == ExtrudeOp::NewBody || self.body_count() < 2 {
@@ -1196,11 +1358,54 @@ impl OxydeApp {
         if let Some(i) = selection_box(ui, &items, "Click edges (or a face) in the graphics area") {
             d.edges.remove(i);
         }
+        if !d.fillet {
+            section(ui, "Chamfer type");
+            for (t, label, hint) in [
+                (
+                    ChamferType::Distance,
+                    "Distance",
+                    "The same distance on both faces (45°)",
+                ),
+                (
+                    ChamferType::TwoDistances,
+                    "Distance - Distance",
+                    "A distance on each face",
+                ),
+                (
+                    ChamferType::AngleDistance,
+                    "Angle - Distance",
+                    "A distance on one face, at an angle from it",
+                ),
+            ] {
+                ui.radio_value(&mut d.chamfer_type, t, label)
+                    .on_hover_text(hint);
+            }
+        }
         section(ui, if d.fillet { "Radius" } else { "Distance" });
         ui.horizontal(|ui| {
             positive_length(ui, &mut d.size);
             dimension_note(ui, d.dimension.as_ref());
         });
+        if !d.fillet && d.chamfer_type != ChamferType::Distance {
+            match d.chamfer_type {
+                ChamferType::TwoDistances => {
+                    section(ui, "Second distance");
+                    positive_length(ui, &mut d.second);
+                }
+                _ => {
+                    section(ui, "Angle");
+                    ui.add(
+                        egui::DragValue::new(&mut d.angle)
+                            .speed(0.5)
+                            .range(0.1..=89.9)
+                            .suffix("°")
+                            .custom_parser(crate::dialogs::angle_parser),
+                    );
+                }
+            }
+            ui.checkbox(&mut d.flip, "Flip direction")
+                .on_hover_text("The first distance on the edge's other face");
+        }
     }
 
     fn shell_body(&self, ui: &mut egui::Ui, d: &mut ShellDialog) {
@@ -1315,13 +1520,45 @@ impl OxydeApp {
             }
             PatternKind::Mirror => {
                 section(ui, "Mirror plane");
-                reference_box_set(
+                if reference_box_set(
                     ui,
                     "mirror_plane",
                     &d.planes,
                     &mut d.plane,
-                    true,
+                    !d.bodies_next,
                     "Select a plane or a flat face",
+                ) {
+                    d.bodies_next = false;
+                }
+                section(ui, "Bodies to mirror");
+                let items: Vec<(String, String)> = d
+                    .bodies
+                    .iter()
+                    .map(|b| (self.body_label(*b), String::new()))
+                    .collect();
+                if let Some(i) =
+                    selection_box(ui, &items, "None: the features above are copied instead")
+                {
+                    d.bodies.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(d.bodies_next, "Pick bodies")
+                        .on_hover_text(
+                            "Clicks on faces pick the bodies to mirror, until the plane's box is \
+                             clicked; the Solid Bodies folder picks them too",
+                        )
+                        .clicked()
+                    {
+                        d.bodies_next = !d.bodies_next;
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Each body is joined to its mirror image: half a symmetric part made whole.",
+                    )
+                    .small()
+                    .weak(),
                 );
             }
         }
@@ -1347,7 +1584,8 @@ fn ref_plane_body(ui: &mut egui::Ui, d: &mut PlaneDialog) {
             egui::DragValue::new(&mut d.offset)
                 .speed(0.1)
                 .range(-crate::dialogs::MAX_LENGTH..=crate::dialogs::MAX_LENGTH)
-                .suffix(" mm"),
+                .suffix(" mm")
+                .custom_parser(crate::dialogs::length_parser),
         );
         dimension_note(ui, d.dimension.as_ref());
     });

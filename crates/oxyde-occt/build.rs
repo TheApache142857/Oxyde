@@ -38,6 +38,8 @@ const CORE_TOOLKITS: &[&str] = &[
     "TKMesh",
     "TKShHealing",
     "TKXSBase",
+    // Hidden line removal, for the views of drawings.
+    "TKHLR",
     // XCAF documents, for reading the product structure of STEP assemblies.
     "TKCDF",
     "TKLCAF",

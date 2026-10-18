@@ -306,6 +306,7 @@ mod tests {
                 FaceName::end_cap(boss),
             )],
             size: 2.0,
+            chamfer: Default::default(),
         }));
         (part, s1, boss, width)
     }
@@ -355,7 +356,7 @@ mod tests {
         part.set_dimension(depth, 25.0).unwrap();
         assert_eq!(part.dimension(depth).unwrap().value, 25.0);
         match part.feature(boss).unwrap().kind() {
-            FeatureKind::Extrude(e) => assert_eq!(e.extent.depth(), 25.0),
+            FeatureKind::Extrude(e) => assert_eq!(e.extent.depth(), Some(25.0)),
             _ => unreachable!(),
         }
         let width = part.find_dimension("D1@Sketch1").unwrap();

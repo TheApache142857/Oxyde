@@ -106,6 +106,7 @@ fn an_edited_feature_is_previewed_where_it_stands() {
     let round = part.add_feature(FeatureKind::Fillet(EdgeBlend {
         edges: vec![edge.clone()],
         size: 2.0,
+        chamfer: Default::default(),
     }));
     part.rebuild(&mut kernel);
     let finished = body_volume(part.body().unwrap(), &kernel);
@@ -135,6 +136,7 @@ fn an_edited_feature_is_previewed_where_it_stands() {
     let huge = FeatureKind::Fillet(EdgeBlend {
         edges: vec![edge],
         size: 50.0,
+        chamfer: Default::default(),
     });
     let preview = part.preview(huge, Some(round), &mut kernel).unwrap();
     assert!(

@@ -455,7 +455,10 @@ fn dimensions_tab(
                             .speed(0.1)
                             .range(-max..=max),
                     }
-                    .suffix(d.unit.suffix());
+                    .suffix(d.unit.suffix())
+                    .custom_parser(move |text| {
+                        crate::quantity::parse(text, crate::quantity::Quantity::of(d.unit))
+                    });
                     let response = ui.add(drag);
                     if response.changed() {
                         if let Ok(value) = d.unit.from_display(edited) {

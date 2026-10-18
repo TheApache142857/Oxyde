@@ -196,6 +196,7 @@ fn pocket_with_fillets() -> PartDefinition {
     part.add_feature(FeatureKind::Fillet(EdgeBlend {
         edges: corners,
         size: 3.0,
+        chamfer: Default::default(),
     }));
     // The rim of the pocket on the top face: picked by name after a rebuild, since the
     // corner fillets changed the edges there.
@@ -219,6 +220,7 @@ fn pocket_with_fillets() -> PartDefinition {
     part.add_feature(FeatureKind::Fillet(EdgeBlend {
         edges: rim,
         size: 1.0,
+        chamfer: Default::default(),
     }));
     part.release(&mut kernel);
     part.definition()

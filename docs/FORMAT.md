@@ -124,21 +124,32 @@ Rules:
 | `type` | Fields |
 |---|---|
 | `sketch` | `plane` (PlaneRef); `entities` and `relations`, see below |
-| `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut` \| `intersect` \| `new_body`), `extent` (`{"type": "blind", "depth"}` \| `{"type": "mid_plane", "depth"}`), `reverse`, `bodies` (optional, see Bodies below) |
+| `extrude` | `sketch` (feature id), `operation` (`boss` \| `cut` \| `intersect` \| `new_body`), `extent` (see below), `reverse`, `bodies` (optional, see Bodies below) |
 | `revolve` | `sketch`, `operation`, `axis` (`{"sketch_line": entity id}` \| `{"axis": AxisRef}`), `angle` (radians, up to 2π), `mid_plane`, `reverse`, `bodies` (optional) |
 | `sweep` | `profile` (feature id of the sketch swept), `path` (feature id of the sketch followed: one chain of curves, open or closed), `operation`, `bodies` (optional) |
+| `loft` | `profiles` (feature ids of the sketches lofted through, in order, each one closed contour without holes), `operation`, `ruled` (optional, default false: smooth through them all; true: straight from one to the next), `bodies` (optional). Its side faces are named after the first profile's segments (`profile`), its ends `start_cap` and `end_cap` |
 | `fillet` | `edges` (list of EdgeRef), `radius` |
-| `chamfer` | `edges` (list of EdgeRef), `distance` |
+| `chamfer` | `edges` (list of EdgeRef), `distance`, `second` (optional, for an unequal chamfer): `{"type": "distance", "distance", "flip"}` (a distance along each face) \| `{"type": "angle", "angle", "flip"}` (radians, from the face `distance` runs along). `distance` runs along the face named first in each edge's sorted name, the other one with `flip` (optional, default false) |
 | `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
 | `plane` | Reference plane: `base` (PlaneRef), `offset` (mm, along the base normal), `flip` |
 | `axis` | Reference axis: `axis`: `{"along": AxisRef}` \| `{"two_planes": [PlaneRef, PlaneRef]}` |
 | `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
 | `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
-| `mirror` | `seeds`, `plane` (PlaneRef) |
+| `mirror` | `seeds`, `plane` (PlaneRef), `bodies` (optional, default empty): bodies mirrored whole, each joined to its image; a mirror has seeds or bodies, not both. A body's copy has its faces named as the mirror's instance `[1, 0]` of the body's own |
 | `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). `apply_colors` (optional, default false): the colours the STEP file gives its solids and faces are still to become appearances (see *Appearances*); Oxyde writes it only for a part it has not rebuilt yet, such as the parts of an imported assembly. |
 | `combine` | `target` (body), `tools` (bodies), `operation` (`join` \| `cut` \| `intersect`), `keep_tools` (optional, default false) |
+| `hole` | Holes at the lone points of a sketch (its points that are no curve's end or centre, not its origin, not construction): `sketch` (feature id), `kind` (`{"type": "simple"}` \| `{"type": "counterbore", "diameter", "depth"}` \| `{"type": "countersink", "diameter", "angle"}`, the counterbore's or countersink's diameter in mm, its depth in mm, the countersink's included angle in radians), `diameter` (the hole's, mm), `depth` (mm of full diameter from the sketch plane, with a 118° drill point under it; `null` goes through everything), `reverse` (drill along the sketch normal instead of against it), `bodies` (optional, as a `cut`'s). Each hole is the hole's half section turned about its axis; its faces are named as pattern copies, the instance being the point's entity id: `{"type": "instance", "feature": hole, "instance": [point, 0], "face": {"type": "profile", "feature": hole, "segment": n}}` with `n` 1 the top (above the face, never left), 2 the counterbore's wall or the countersink's cone, 3 the counterbore's floor, 4 the hole's wall, 5 its bottom or drill point |
 
-Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves and sweeps (their tool bodies are copied).
+An extrusion's `extent` is its end condition:
+
+| `extent` | Meaning |
+|---|---|
+| `{"type": "blind", "depth"}` | `depth` mm from the sketch plane, along its normal for a `boss` or a `new_body` and against it for a `cut` or an `intersect`; `reverse` flips the side |
+| `{"type": "mid_plane", "depth"}` | `depth` mm in all, half on each side of the sketch plane |
+| `{"type": "through_all", "both"}` | Through everything the part holds on the side a blind extrusion would take (`reverse` flips it), or on both sides with `both` (optional, default false). It reaches as far as the bodies' bounding boxes go along the sketch normal; a `cut` or an `intersect` goes 1% of their size further. No depth, so no `depth` dimension |
+| `{"type": "up_to_surface", "plane": PlaneRef}` | Up to a plane (a flat face's plane extends past its edges), towards it on whichever side of the sketch it is (`reverse` is ignored). The plane must not be parallel to the sketch normal nor pass through the sketch's contours. The face where it ends is named its `end_cap`. No `depth` dimension |
+
+Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves, sweeps, lofts and holes (their tool bodies are copied).
 
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
 **AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
@@ -153,7 +164,7 @@ A part may hold several separate solid bodies (as in Fusion 360 or Creo). A body
 - A `combine` changes its `target` body by its `tools`, which disappear unless `keep_tools`.
 - A body cut away entirely disappears. Face and edge names stay unique across all bodies.
 
-Every feature may also carry `dimension_names` (optional, default empty): custom names of its own dimensions, keyed by parameter: `depth` (extrude), `angle` (revolve, circular pattern), `radius` (fillet), `distance` (chamfer), `thickness` (shell), `offset` (reference plane), `spacing`, `count`, `spacing2`, `count2` (patterns). Unlisted parameters have default names numbered in that order within the feature: `D1`, `D2`…
+Every feature may also carry `dimension_names` (optional, default empty): custom names of its own dimensions, keyed by parameter: `depth` (a blind or mid-plane extrude), `angle` (revolve, circular pattern), `radius` (fillet), `distance`, `distance2` (two-distance chamfer) and `angle` (angle-distance chamfer), `thickness` (shell), `offset` (reference plane), `spacing`, `count`, `spacing2`, `count2` (patterns), `diameter`, `counter_diameter`, `counter_depth`, `angle` (countersink) and `depth` (blind) for holes. Unlisted parameters have default names numbered in that order within the feature: `D1`, `D2`…
 
 ### Sketches
 
@@ -177,11 +188,12 @@ Connected geometry shares point entities. The ids of lines, circles and arcs are
 | `fixed` | `point` |
 | `coincident` | `a`, `b` (points) |
 | `horizontal`, `vertical` | `line` |
+| `horizontal_points`, `vertical_points` | `a`, `b` (points): level with each other, or one above the other |
 | `parallel`, `perpendicular`, `equal_length` | `a`, `b` (lines) |
 | `equal_radius` | `a`, `b` (circles or arcs) |
 | `distance`, `horizontal_distance`, `vertical_distance` | `a`, `b` (points), `value` |
 | `length` | `line`, `value` |
-| `radius` | `curve`, `value` |
+| `radius`, `diameter` | `curve`, `value` |
 | `angle` | `a`, `b` (lines), `value`: counter-clockwise from `a` to `b` |
 | `point_on_line`, `midpoint` | `point`, `line` |
 | `point_on_circle` | `point`, `curve` |

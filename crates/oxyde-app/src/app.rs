@@ -10,13 +10,13 @@ use eframe::egui;
 use oxyde_geom::{Plane, Point3, Vec3};
 use oxyde_kernel::{Kernel, SurfaceKind};
 use oxyde_model::{
-    EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry,
-    Sketch, SketchPlane, StandardPlane,
+    EdgeName, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry, Sketch,
+    SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Pick, Scene};
 
-use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, ExtrudeDialog, plane_name};
+use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, plane_name};
 use crate::document::Document;
 use crate::equations_ui::EquationsWindow;
 use crate::features_ui::PatternKind;
@@ -73,9 +73,12 @@ pub enum Command {
     Extrude,
     Revolve,
     Sweep,
+    Loft,
     /// Fillet (true) or chamfer (false).
     Blend(bool),
     Shell,
+    /// Hole Wizard: holes at the points of a sketch.
+    Hole,
     Pattern(PatternKind),
     Combine,
     RefPlane,
@@ -203,8 +206,14 @@ pub struct OxydeApp {
     pub(crate) tab: CommandTab,
     /// A sketch tool clicked outside sketch mode: picked once the new sketch opens.
     pub(crate) pending_tool: Option<Tool>,
+    /// The sketch open is the hole positions of the Hole Wizard, which opens on leaving it.
+    pub(crate) hole_positions: bool,
     pub(crate) show_mass_properties: bool,
     pub(crate) show_measure: bool,
+    /// The distance Measure found between the two selected faces or edges, for the
+    /// document revision and selection it was measured for.
+    pub(crate) measure_cache: Option<crate::evaluate::MeasureCache>,
+    pub(crate) asm_measure_cache: Option<crate::evaluate::AsmMeasureCache>,
     /// Evaluate › Interference Detection, while its window is open (assemblies).
     pub(crate) interference: Option<crate::interference::InterferenceWindow>,
     /// Evaluate › Section View, while its window is open.
@@ -257,6 +266,8 @@ pub struct OxydeApp {
     pub(crate) mesh_export: Option<crate::mesh_export::MeshExportDialog>,
     /// File › Export › Image: the picture settings window.
     pub(crate) image_export: Option<crate::export::ImageExportDialog>,
+    /// File › Export › Drawing: the sheet's settings and its views.
+    pub(crate) drawing_export: Option<crate::drawing_export::DrawingExport>,
     /// The Render tab: its render and the meshes it is made from.
     pub(crate) render: crate::render_ui::RenderView,
     /// The Simulation tab: the study, its mesh and results.
@@ -307,8 +318,11 @@ impl OxydeApp {
             status: "Ready".to_owned(),
             tab: CommandTab::Features,
             pending_tool: None,
+            hole_positions: false,
             show_mass_properties: false,
             show_measure: false,
+            measure_cache: None,
+            asm_measure_cache: None,
             interference: None,
             section: None,
             visibility: Default::default(),
@@ -338,6 +352,7 @@ impl OxydeApp {
             locks: Default::default(),
             mesh_export: None,
             image_export: None,
+            drawing_export: None,
             render: Default::default(),
             simulation: Default::default(),
             wgpu_state: None,
@@ -499,7 +514,7 @@ impl OxydeApp {
     }
 
     /// The first selected face, if it is planar (usable as a sketch plane).
-    fn selected_planar_face(&self) -> Option<FaceName> {
+    pub(crate) fn selected_planar_face(&self) -> Option<FaceName> {
         let body = self.doc.part.body()?;
         self.selection.iter().find_map(|s| match s {
             Selected::Face(name) => {
@@ -789,6 +804,12 @@ impl OxydeApp {
         self.rebuild();
         self.viewport.request_fit();
         self.tab = CommandTab::Features;
+        // The Hole Wizard's positions are drawn: on to the holes.
+        if std::mem::take(&mut self.hole_positions) && keep && !empty {
+            self.selected_feature = Some(id);
+            self.begin_hole();
+            return;
+        }
         self.status = if empty {
             format!("Left {} with nothing drawn: it is removed", session.name)
         } else if keep {
@@ -799,6 +820,36 @@ impl OxydeApp {
         } else {
             format!("Discarded changes to {}", session.name)
         };
+    }
+
+    /// Writes the sketch being edited into the part as it is drawn now, without leaving
+    /// it: one undo step, as leaving it would make, with the rollback bar where it was
+    /// before the sketch was opened (the snapshot is the part as the user sees it).
+    pub(crate) fn commit_sketch(&mut self) {
+        let Some(session) = self.sketch.as_mut() else {
+            return;
+        };
+        if !session.changed() {
+            return;
+        }
+        let id = session.feature;
+        let editing_from = self
+            .doc
+            .part
+            .index_of(id)
+            .and_then(|i| self.doc.part.features().get(i + 1))
+            .map(|f| f.id());
+        let _ = self.doc.part.roll_back_to(session.restore_rollback);
+        self.doc.checkpoint();
+        if let Ok(FeatureKind::Sketch(sketch)) = self.doc.part.edit(id) {
+            sketch.geometry = session.sketch.clone();
+        }
+        let _ = self.doc.part.roll_back_to(editing_from);
+        // What is written is no longer a change of the session; and a new sketch with
+        // something in it is no longer an empty one to remove on leaving.
+        session.original = session.sketch.clone();
+        session.original_empty = false;
+        self.rebuild();
     }
 
     /// Replaces a feature's definition as one undo step and rebuilds.
@@ -824,16 +875,7 @@ impl OxydeApp {
 
     fn begin_extrude(&mut self) {
         let sketch = self.sketch_to_use();
-        self.open_dialog(Dialog::Extrude(ExtrudeDialog {
-            editing: None,
-            dimension: None,
-            sketch,
-            op: ExtrudeOp::Boss,
-            depth: 10.0,
-            mid_plane: false,
-            reverse: false,
-            bodies: Vec::new(),
-        }));
+        self.open_extrude(None, sketch, None);
         if sketch.is_none() {
             self.status = "Select the sketch to extrude in the tree".to_owned();
         }
@@ -844,13 +886,7 @@ impl OxydeApp {
         if edges.is_empty() {
             self.status = "Click the edges to round in the graphics area".to_owned();
         }
-        self.open_dialog(Dialog::Blend(BlendDialog {
-            editing: None,
-            dimension: None,
-            fillet,
-            size: if fillet { 2.0 } else { 1.0 },
-            edges,
-        }));
+        self.open_dialog(Dialog::Blend(BlendDialog::new(fillet, edges)));
     }
 
     pub(crate) fn run(&mut self, command: Command) {
@@ -868,8 +904,10 @@ impl OxydeApp {
             Command::Extrude => self.begin_extrude(),
             Command::Revolve => self.begin_revolve(),
             Command::Sweep => self.begin_sweep(),
+            Command::Loft => self.open_loft(None, None),
             Command::Blend(fillet) => self.begin_blend(fillet),
             Command::Shell => self.begin_shell(),
+            Command::Hole => self.begin_hole(),
             Command::Pattern(kind) => self.begin_pattern(kind),
             Command::Combine => self.open_combine(None, None),
             Command::RefPlane => self.open_ref_plane(None, None),
@@ -992,6 +1030,7 @@ impl OxydeApp {
         self.doc.release(&mut self.kernel);
         self.doc = doc;
         self.sketch = None;
+        self.hole_positions = false;
         self.mesh_export = None;
         self.render.clear();
         self.selection.clear();
@@ -1177,8 +1216,9 @@ impl OxydeApp {
 
     /// Saves to the current file, or asks for one. Returns whether the part was saved.
     pub(crate) fn save(&mut self) -> bool {
-        // A sketch being edited is closed (kept) first, so the file has it.
-        self.finish_sketch(true);
+        // A sketch being edited goes into the file as it is drawn now, and stays open, as
+        // in SolidWorks.
+        self.commit_sketch();
         match self.doc.path.clone() {
             Some(path) if !self.doc.read_only => self.save_to(&path),
             _ => self.save_as(),
@@ -1187,6 +1227,7 @@ impl OxydeApp {
 
     pub(crate) fn save_as(&mut self) -> bool {
         use oxyde_format::{LEGACY_PART_EXTENSION, PART_EXTENSION};
+        self.commit_sketch();
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("Oxyde part", &[PART_EXTENSION])
             .set_file_name(format!("{}.{PART_EXTENSION}", self.doc.display_name()))
@@ -1228,11 +1269,22 @@ impl OxydeApp {
             }
         }
         let mut file = self.doc.to_file();
-        file.properties.volume_mm3 = self
-            .doc
-            .part
-            .body()
-            .and_then(|body| bodies_volume(&self.kernel, body).ok());
+        match &self.sketch {
+            // In a sketch, the features after it are rolled back only while it is
+            // edited: the file has the bar where it was, and the volume of the last save.
+            Some(session) => {
+                file.definition.rollback = session
+                    .restore_rollback
+                    .and_then(|id| self.doc.part.index_of(id));
+            }
+            None => {
+                file.properties.volume_mm3 = self
+                    .doc
+                    .part
+                    .body()
+                    .and_then(|body| bodies_volume(&self.kernel, body).ok());
+            }
+        }
         match oxyde_format::save_part(path, &file) {
             Ok(()) => {
                 self.doc.path = Some(path.to_path_buf());
@@ -1365,7 +1417,44 @@ impl OxydeApp {
             let picks = self.viewport.picks_in(&b);
             self.box_select(picks, output.additive);
         }
+        // A right-click selects the face or edge under the pointer first, as in
+        // SolidWorks, so that the menu is about what the pointer is on.
+        if output.response.secondary_clicked() && self.dialog.is_none() {
+            let item = self.viewport.hovered().and_then(|pick| {
+                let body = self.shown_body()?;
+                match pick {
+                    Pick::Face(i) => body.naming.face(i).cloned().map(Selected::Face),
+                    Pick::Edge(i) => body.naming.edge(i).cloned().map(Selected::Edge),
+                }
+            });
+            if let Some(item) = item.filter(|item| !self.selection.contains(item)) {
+                self.selection = vec![item];
+                self.selected_plane = None;
+                self.scroll_to_feature = self.selection_creator();
+            }
+        }
+        // The feature that made what is selected, and the sketch it sweeps.
+        let made_by: Vec<(FeatureId, String)> = self
+            .selection_creator()
+            .and_then(|id| self.doc.part.feature(id))
+            .filter(|f| !matches!(f.kind(), FeatureKind::Import(_)))
+            .map(|f| {
+                std::iter::once(f.id())
+                    .chain(f.kind().swept_sketches())
+                    .filter_map(|id| Some((id, self.doc.part.feature(id)?.name().to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
         output.response.context_menu(|ui| {
+            for (id, name) in &made_by {
+                if ui.button(format!("Edit {name}")).clicked() {
+                    ui.close_menu();
+                    self.edit_feature(*id);
+                }
+            }
+            if !made_by.is_empty() {
+                ui.separator();
+            }
             if ui.button("Sketch").clicked() {
                 ui.close_menu();
                 self.run(Command::Sketch);
@@ -1480,7 +1569,7 @@ impl OxydeApp {
             }
             for (label, relation) in relations {
                 if ui.button(label).clicked() {
-                    session.add_relation(relation);
+                    session.add_relations(&relation);
                     ui.close_menu();
                 }
             }
@@ -1565,6 +1654,10 @@ impl OxydeApp {
     fn wants_planes(&self) -> bool {
         match &self.dialog {
             Some(Dialog::ChoosePlane | Dialog::RefPlane(_)) => true,
+            Some(Dialog::Extrude(d)) => {
+                d.end == crate::dialogs::EndCondition::UpToSurface
+                    && (d.up_to_next || d.up_to.is_none())
+            }
             Some(Dialog::Pattern(d)) => d.kind == PatternKind::Mirror,
             Some(Dialog::RefAxis(d)) => d.two_planes,
             _ => false,
@@ -1716,6 +1809,19 @@ impl OxydeApp {
                     painter.add(egui::Shape::line(path.clone(), stroke));
                 }
                 lines.push(path);
+            }
+            // Its lone points, as small crosses (hole positions): clicked like its curves.
+            let ink = if selected {
+                hovered_color
+            } else {
+                overlay_color(false)
+            };
+            for p in crate::display::lone_points(&result.solved) {
+                let c = to_screen(result.plane.to_world(p));
+                let stroke = egui::Stroke::new(1.4_f32, ink);
+                painter.line_segment([c - egui::vec2(4.0, 0.0), c + egui::vec2(4.0, 0.0)], stroke);
+                painter.line_segment([c - egui::vec2(0.0, 4.0), c + egui::vec2(0.0, 4.0)], stroke);
+                lines.push(vec![c, c]);
             }
             overlays.push((Overlay::Reference(id), OverlayShape::Polylines(lines)));
         }
@@ -2031,6 +2137,7 @@ impl OxydeApp {
             self.interference_window(ctx);
             self.mesh_export_window(ctx);
             self.image_export_window(ctx);
+            self.drawing_export_window(ctx);
             self.materials_window(ctx);
             self.preferences_window(ctx);
             self.debug_overlay(ctx, self.viewport_rect);
@@ -2075,6 +2182,7 @@ impl OxydeApp {
         self.evaluate_windows(ctx);
         self.mesh_export_window(ctx);
         self.image_export_window(ctx);
+        self.drawing_export_window(ctx);
         self.materials_window(ctx);
         self.preferences_window(ctx);
         self.debug_overlay(ctx, self.viewport_rect);

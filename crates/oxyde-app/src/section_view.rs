@@ -316,19 +316,6 @@ struct Piece {
     cap_area: f64,
 }
 
-/// The matrix that takes the plane's own frame (x along `x_dir`, z along the normal) to
-/// the world.
-fn plane_transform(p: &Plane) -> Transform {
-    let y = p.y_dir();
-    Transform {
-        rows: [
-            [p.x_dir.x, y.x, p.normal.x, p.origin.x],
-            [p.x_dir.y, y.y, p.normal.y, p.origin.y],
-            [p.x_dir.z, y.z, p.normal.z, p.origin.z],
-        ],
-    }
-}
-
 /// The half-space on the side `plane`'s normal points to, as a box big enough to hold
 /// everything within `reach` mm of the plane's origin.
 fn half_space<K: Kernel>(kernel: &mut K, plane: &Plane, reach: f64) -> Result<ShapeHandle, String> {
@@ -336,7 +323,7 @@ fn half_space<K: Kernel>(kernel: &mut K, plane: &Plane, reach: f64) -> Result<Sh
     let raw = kernel
         .make_box(Point3::new(-l, -l, 0.0), Vec3::new(2.0 * l, 2.0 * l, l))
         .map_err(|e| e.to_string())?;
-    let placed = kernel.transform(raw, &plane_transform(plane));
+    let placed = kernel.transform(raw, &Transform::from_plane(plane));
     kernel.release(raw);
     Ok(placed.map_err(|e| e.to_string())?.shape)
 }
@@ -1152,7 +1139,7 @@ mod tests {
             ..SectionSettings::default()
         }
         .section_plane();
-        let t = plane_transform(&plane);
+        let t = Transform::from_plane(&plane);
         // The frame's z goes along the normal, from the plane's origin.
         let on_axis = t.apply_point(Point3::new(0.0, 0.0, 3.0));
         assert!((on_axis - (plane.origin + plane.normal * 3.0)).length() < 1e-12);

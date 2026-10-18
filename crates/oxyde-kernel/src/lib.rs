@@ -402,6 +402,43 @@ impl std::fmt::Display for VolumeMeshError {
 
 impl std::error::Error for VolumeMeshError {}
 
+/// What sets an unequal chamfer's other side ([`Kernel::chamfer_with`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChamferSecond {
+    /// A distance along the other face, mm.
+    Distance(f64),
+    /// The bevel's angle from the reference face, radians.
+    Angle(f64),
+}
+
+/// Part of a shape to measure from: all of it, or one face, edge or vertex by index in
+/// its [`Topology`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubShape {
+    Whole,
+    Face(u32),
+    Edge(u32),
+    Vertex(u32),
+}
+
+/// The edges of shapes as a drawing view shows them ([`Kernel::project_edges`]): seen
+/// along a direction, in the view's frame (mm), split into the visible ones and those
+/// hidden behind faces.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ProjectedEdges {
+    pub visible: Vec<Vec<oxyde_geom::Point2>>,
+    pub hidden: Vec<Vec<oxyde_geom::Point2>>,
+}
+
+/// The shortest distance between two shapes ([`Kernel::distance`]), in mm, and the
+/// closest point on each.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Distance {
+    pub distance: f64,
+    pub on_a: Point3,
+    pub on_b: Point3,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Fuse,
@@ -460,6 +497,23 @@ pub trait Kernel {
         path_plane: &Plane,
         path: &SweepPath,
     ) -> Result<OpResult, Self::Error>;
+
+    /// Lofts a solid through closed contours, each drawn on its plane, in order: smooth
+    /// through them, or straight from one to the next with `ruled`. The contours should
+    /// run the same way round along the loft, or it twists.
+    ///
+    /// History sources: [`FaceSource::ProfileSegment`] for the side faces, named after the
+    /// first contour's segments, [`FaceSource::StartCap`] and [`FaceSource::EndCap`] for
+    /// the first and last contours. `Ok(None)` when the kernel cannot loft, which is the
+    /// default.
+    fn loft(
+        &mut self,
+        sections: &[(Plane, oxyde_geom::Loop)],
+        ruled: bool,
+    ) -> Result<Option<OpResult>, Self::Error> {
+        let _ = (sections, ruled);
+        Ok(None)
+    }
 
     /// Hollows a solid: removes the given faces (indices into the shape's
     /// [`Topology::faces`]) and turns the remaining faces into walls of thickness
@@ -521,6 +575,21 @@ pub trait Kernel {
         distance: f64,
     ) -> Result<OpResult, Self::Error>;
 
+    /// Bevels edges unequally: for each `(edge, face)` (indices into the shape's
+    /// [`Topology`]), `first` mm along that face (one of the edge's two), and the other
+    /// side set by `second`. Same history as [`Kernel::chamfer`]. `Ok(None)` when the
+    /// kernel cannot, which is the default.
+    fn chamfer_with(
+        &mut self,
+        shape: ShapeHandle,
+        edges: &[(u32, u32)],
+        first: f64,
+        second: ChamferSecond,
+    ) -> Result<Option<OpResult>, Self::Error> {
+        let _ = (shape, edges, first, second);
+        Ok(None)
+    }
+
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, Self::Error>;
 
     /// Display mesh; `deflection` is the maximum distance in mm between the mesh and the
@@ -552,6 +621,37 @@ pub trait Kernel {
     fn bounds(&self, shape: ShapeHandle) -> Result<(Point3, Point3), Self::Error>;
 
     fn topology_counts(&self, shape: ShapeHandle) -> Result<TopologyCounts, Self::Error>;
+
+    /// The shortest distance between part of `a` and part of `b` (each the whole shape,
+    /// or one of its faces, edges or vertices), with the closest point on each: what
+    /// Measure reports. Exact, from the geometry. `Ok(None)` when the kernel cannot
+    /// measure it, which is the default.
+    fn distance(
+        &self,
+        a: ShapeHandle,
+        a_part: SubShape,
+        b: ShapeHandle,
+        b_part: SubShape,
+    ) -> Result<Option<Distance>, Self::Error> {
+        let _ = (a, a_part, b, b_part);
+        Ok(None)
+    }
+
+    /// The edges of `shapes` seen as a drawing view shows them: orthographically, the eye
+    /// looking along −`view.normal`, with `view.x_dir` to its right; in `view`'s frame
+    /// (x along `x_dir`, y along `y_dir`), each edge a polyline within `deflection` mm,
+    /// sharp edges, smooth (tangent) edges and the outlines of curved faces alike, split
+    /// into visible and hidden ones. Shapes hide each other. `Ok(None)` when the kernel
+    /// cannot remove hidden lines, which is the default.
+    fn project_edges(
+        &self,
+        shapes: &[ShapeHandle],
+        view: &Plane,
+        deflection: f64,
+    ) -> Result<Option<ProjectedEdges>, Self::Error> {
+        let _ = (shapes, view, deflection);
+        Ok(None)
+    }
 
     /// Writes `shapes` to a STEP file at `path`, in millimetres, with their colours
     /// (`colors` is indexed like `shapes`; empty for none) as STEP colours per solid and

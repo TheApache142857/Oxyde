@@ -5,6 +5,115 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Third bug hunt: end conditions, a fuller sketcher, Measure (unreleased, October 2026)
+
+A read through the modelling engine and the application for bugs, behaviours nobody asked
+for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
+
+- **Edits to a sketch could be lost without a question.** With a saved part open, editing
+  a sketch and then closing the window, opening another file or starting a new one did
+  not ask to save: the drawing only counted as a change once the sketch was left. The
+  window title now shows `*` as soon as the sketch changes, and every way out asks.
+- **Saving no longer leaves the sketch.** Ctrl+S (or Save As) in a sketch saved it by
+  closing it first; it now writes the sketch as drawn, with the features after it as
+  they are, and stays in the sketch, as SolidWorks does. The save is one undo step.
+- **A revolve across its axis is refused.** A sketch lying on both sides of the axis of
+  revolution was turned into a solid passing through itself, without a word, which later
+  features then failed on in odd ways. The revolve now fails with "the sketch crosses the
+  axis", as SolidWorks refuses it; a contour touching the axis is still fine.
+- **Redo in sketches.** Ctrl+Y and the Redo button did nothing in a sketch; they now put
+  back what Undo took away there (and a change that is refused, such as a fillet with no
+  room, does not lose what Redo has).
+- **Deleting a feature takes it out of the configurations.** A deleted feature, or one
+  whose dimensions were configured, stayed in the ConfigurationManager's table as a
+  "(gone)" column.
+- **Study names that would share a results file are refused.** On Windows and macOS,
+  *Static 1* and *static 1* (or *Load/Case* and *Load_Case*) wrote the same `.oxyres`,
+  one study's results over the other's; New Study and Rename now tell them apart.
+- **Right-click selects what it is on.** A right-click on a face or an edge acted on what
+  was selected before; it now selects what is under the pointer first, as in SolidWorks.
+
+New, for daily work:
+
+- **Extrude end conditions** (the *End condition* list of the Extrude command, as
+  SolidWorks' Boss- and Cut-Extrude): *Blind* and *Mid Plane* as before, and
+  - *Through All*: through everything the part holds on that side (*Reverse direction*
+    picks the side), the usual way to cut a hole through a part whatever its thickness;
+  - *Through All - Both*: through everything on both sides of the sketch;
+  - *Up To Surface*: up to a flat face (its plane, past its edges) or a plane, picked in
+    the graphics area, the tree or the list; it goes towards it on whichever side it is,
+    and a face at an angle to the sketch is followed exactly. A surface parallel to the
+    direction, or one cutting through the sketch, is refused with why.
+  These have no depth dimension. In files: `extent` `through_all` and `up_to_surface`
+  (FORMAT.md §3).
+- **Loft** (Features tab, Insert menu, a shortcut to set): a solid through the closed
+  contours of several sketches, in the order picked (Ctrl+click them in the tree before,
+  or click them after; *Reverse order* turns the list round), smooth through them or
+  straight from one to the next: a square turning into a circle, a tapered handle. It
+  joins, cuts, intersects or makes a new body like an extrusion, previews live, absorbs
+  its sketches in the tree, and can be patterned and mirrored. Each sketch must be one
+  closed contour; contours drawn clockwise and counter-clockwise are turned to match, so
+  the loft does not twist. In files: the `loft` feature (FORMAT.md §3).
+- **Hole Wizard** (Features tab, Insert menu, a shortcut to set): holes at the points of
+  a sketch, *Clearance* (close, normal or loose fit), *Tapped* (the tap drill),
+  *Counterbore* (for socket head cap screws) or *Countersink* (90°, for flat heads),
+  sized for ISO metric screws M2 to M24 (every value editable; *Custom* keeps what is
+  typed), blind with a 118° drill point or *Through All*. Select a flat face first and
+  the command opens a sketch on it with the *Point* tool: click where the holes go, leave
+  the sketch, and the Hole Wizard opens with it (or select a sketch of points). Holes
+  keep their face names when points are added or removed, and can be patterned and
+  mirrored. In files: the `hole` feature (FORMAT.md §3).
+- **Drawings** (File › Export › *Drawing (PDF, SVG, DXF)*, and `oxyde-cli drawing`): the
+  front, top, right and isometric views of the part, or of the assembly's visible parts
+  where they sit, on an A4 to A0 sheet in first angle (ISO) or third angle projection,
+  at the largest standard scale that fits (or one chosen), with a frame and a title block
+  (title, part number, material, drawn by, date, scale, projection symbol). Hidden lines
+  are worked out exactly and dashed (the isometric view shows the visible edges only),
+  holes seen end on get centre marks, and the window previews the sheet. PDF and SVG are
+  the sheet at its size; DXF has the views at their true size, on layers, for laser,
+  waterjet and CAM programs. A first step towards drawing documents: no dimensions or
+  annotations yet, and nothing is saved but the file written.
+- **Diameter dimensions.** Smart Dimension on a full circle now gives its diameter (Ø), on
+  an arc its radius, as SolidWorks does; right-click offers the other. In files: the
+  `diameter` relation.
+- **Values typed as arithmetic and with units**, in the dimension window, the sketch tool
+  windows and the value fields of the commands, mates, equations and configurations:
+  `80/2`, `(120 - 2*6)/3`, `1in`, `3/8 in`, `2.5 cm + 1mm`, `45deg`, `pi/2 rad`; a
+  decimal comma is read as a point. Lengths are converted to millimetres and angles to
+  degrees.
+- **New sketch tools**: *Straight Slot* (the two centres, then the width: half circles
+  and tangent lines with a construction centerline), *Polygon* (centre then a corner;
+  the number of sides in the tool window; its corners on a construction circle, its
+  sides equal), *Point*, *3 Point Arc* (start, end, then a point on it), *Tangent Arc*
+  (from the end of a line, tangent to it) and *Extend*, next to Trim (as SolidWorks'
+  Extend Entities: point at a line or an arc near the end to lengthen, see the dashed
+  piece it would add, and click: a line goes straight on, an arc round its circle, up to
+  the next curve it meets, and its new end stays on that curve). A *Centerpoint Arc* now
+  goes the way the pointer turns from its start, clockwise or counter-clockwise, instead
+  of always counter-clockwise. Each has a shortcut to set in Preferences › Shortcuts.
+- **Chamfer types**: besides *Distance* (equal), *Distance - Distance* and *Angle -
+  Distance*, as SolidWorks offers them, with *Flip direction* to swap the faces; the
+  second distance or the angle is a dimension like the first (`D2@Chamfer1`). In files:
+  the chamfer's optional `second`.
+- **Mirror a whole body**: the Mirror command has a *Bodies to mirror* box (pick them in
+  the Solid Bodies folder, or click faces after *Pick bodies*); each body is joined to
+  its mirror image, so half a symmetric part becomes whole, as SolidWorks' Bodies to
+  Mirror. With one body and no feature selected, Mirror starts with it. In files: the
+  mirror's optional `bodies`.
+- **Convert Entities on a whole outline**: Ctrl+click a part edge to copy every edge
+  joined to it (a face's outline in the sketch plane) at once, as SolidWorks converts a
+  selected face.
+- **More relations** in the sketch's right-click menu: *Horizontal* and *Vertical*
+  between two points (to line up holes; in files `horizontal_points` and
+  `vertical_points`), *Collinear* for two lines, *Fix* for a line or an arc.
+- **Measure** tells the shortest distance between the two selected faces or edges, with
+  its dX, dY and dZ (in an assembly too, between faces of different components where
+  they sit), the *centre distance* between two holes, cylinders or circular edges, and
+  the diameter of a cylindrical face; Mass Properties gives the centre of mass.
+- **Edit a feature from the part.** Right-click a face or an edge: *Edit* the feature
+  that made it, or its sketch. In the tree, a feature that uses a sketch offers *Edit*
+  of that sketch too, and every feature *Roll back* (the bar above it) and *Roll to end*.
+
 ### Several studies per model, and thermal studies (0.0.7, October 2026)
 
 - **New Study.** The Simulation tab now opens on *New Study*, as Fusion 360's does: pick

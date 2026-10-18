@@ -28,8 +28,8 @@ pub struct ImageExportDialog {
 
 /// The solids to write, with their colours and materials: the part's body, or every
 /// visible part of the assembly moved to its place (copies, released after the export).
-struct ExportShapes {
-    shapes: Vec<ShapeHandle>,
+pub(crate) struct ExportShapes {
+    pub shapes: Vec<ShapeHandle>,
     colors: Vec<StepColors>,
     materials: Vec<Option<StepMaterial>>,
     /// Shapes made for the export alone.
@@ -98,6 +98,17 @@ impl OxydeApp {
             }
             ui.separator();
             if ui
+                .button("Drawing (PDF, SVG, DXF)…")
+                .on_hover_text(
+                    "The standard views on a sheet with a title block, hidden lines dashed; \
+                     DXF at true size, for laser and CAM",
+                )
+                .clicked()
+            {
+                ui.close_menu();
+                self.begin_drawing_export();
+            }
+            if ui
                 .button("Image (PNG)…")
                 .on_hover_text("A picture of the view at any size")
                 .clicked()
@@ -109,7 +120,7 @@ impl OxydeApp {
     }
 
     /// What to write: the part's solids, or the assembly's visible parts placed.
-    fn export_shapes(&mut self) -> Result<ExportShapes, String> {
+    pub(crate) fn export_shapes(&mut self) -> Result<ExportShapes, String> {
         match self.asm.as_ref() {
             None => {
                 let body = self
@@ -160,7 +171,7 @@ impl OxydeApp {
         }
     }
 
-    fn release_temporary(&mut self, shapes: &ExportShapes) {
+    pub(crate) fn release_temporary(&mut self, shapes: &ExportShapes) {
         for shape in &shapes.temporary {
             self.kernel.release(*shape);
         }

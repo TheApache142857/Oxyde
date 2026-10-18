@@ -146,14 +146,16 @@ impl OxydeApp {
                     (self.has_sketch(), self.has_body(), self.has_patternable());
                 let bodies = self.body_count() >= 2;
                 let two_sketches = self.sketches().len() >= 2;
-                let commands: [(Icon, &str, bool, Command); 13] = [
+                let commands: [(Icon, &str, bool, Command); 15] = [
                     (Icon::Sketch, "Sketch", true, Command::Sketch),
                     (Icon::Extrude, "Extrude", sketch, Command::Extrude),
                     (Icon::Revolve, "Revolve", sketch, Command::Revolve),
                     (Icon::Sweep, "Sweep", two_sketches, Command::Sweep),
+                    (Icon::Loft, "Loft", two_sketches, Command::Loft),
                     (Icon::Fillet, "Fillet", body, Command::Blend(true)),
                     (Icon::Chamfer, "Chamfer", body, Command::Blend(false)),
                     (Icon::Shell, "Shell", body, Command::Shell),
+                    (Icon::Hole, "Hole Wizard", body, Command::Hole),
                     (
                         Icon::LinearPattern,
                         "Linear Pattern",
@@ -169,7 +171,7 @@ impl OxydeApp {
                     (
                         Icon::Mirror,
                         "Mirror",
-                        seeds,
+                        seeds || body,
                         Command::Pattern(PatternKind::Mirror),
                     ),
                     (Icon::Combine, "Combine bodies", bodies, Command::Combine),
@@ -177,7 +179,7 @@ impl OxydeApp {
                     (Icon::RefAxis, "Reference Axis", true, Command::RefAxis),
                 ];
                 for (i, (icon, label, enabled, command)) in commands.into_iter().enumerate() {
-                    if i == 1 || i == 4 || i == 7 || i == 10 {
+                    if i == 1 || i == 5 || i == 9 || i == 12 {
                         ui.separator();
                     }
                     let clicked = ui
@@ -327,13 +329,20 @@ impl OxydeApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let sketching = self.sketch.is_some();
-                let can_redo = !sketching && self.doc.can_redo();
+                let can_redo = match &self.sketch {
+                    Some(session) => session.can_redo(),
+                    None => self.doc.can_redo(),
+                };
                 if icons::icon_button(ui, Icon::Redo, 22.0, can_redo)
                     .on_hover_text("Redo (Ctrl+Y)")
                     .clicked()
                 {
-                    self.redo();
+                    match self.sketch.as_mut() {
+                        Some(session) => {
+                            session.redo();
+                        }
+                        None => self.redo(),
+                    }
                 }
                 let can_undo = match &self.sketch {
                     Some(_) => true,
@@ -397,10 +406,12 @@ impl OxydeApp {
             (Some(Dialog::Extrude(d)), Command::Extrude) => d.editing.is_none(),
             (Some(Dialog::Revolve(d)), Command::Revolve) => d.editing.is_none(),
             (Some(Dialog::Sweep(d)), Command::Sweep) => d.editing.is_none(),
+            (Some(Dialog::Loft(d)), Command::Loft) => d.editing.is_none(),
             (Some(Dialog::Blend(d)), Command::Blend(fillet)) => {
                 d.editing.is_none() && d.fillet == fillet
             }
             (Some(Dialog::Shell(d)), Command::Shell) => d.editing.is_none(),
+            (Some(Dialog::Hole(d)), Command::Hole) => d.editing.is_none(),
             (Some(Dialog::Pattern(d)), Command::Pattern(kind)) => {
                 d.editing.is_none() && d.kind == kind
             }
@@ -436,6 +447,14 @@ impl OxydeApp {
             "Sweep a closed sketch along the curves of another sketch (a pipe along a bend), adding or removing material.\nSelect the profile first; the path is picked next.",
             Command::Sweep,
         );
+        self.command(
+            ui,
+            Icon::Loft,
+            "Loft",
+            self.sketches().len() >= 2,
+            "A solid through the closed contours of several sketches, in order (a square into a circle), adding or removing material.\nCtrl+click the sketches in the tree, or pick them after.",
+            Command::Loft,
+        );
         group_separator(ui);
         self.command(
             ui,
@@ -461,6 +480,16 @@ impl OxydeApp {
             "Hollow the part, removing the selected faces.",
             Command::Shell,
         );
+        self.command(
+            ui,
+            Icon::Hole,
+            "Hole Wizard",
+            body,
+            "Clearance, tapped, counterbored or countersunk holes, sized for ISO metric screws, \
+             at the lone points of a sketch.\nSketch points on a face first (Sketch › Point), \
+             then select the sketch.",
+            Command::Hole,
+        );
         group_separator(ui);
         self.command(
             ui,
@@ -482,8 +511,8 @@ impl OxydeApp {
             ui,
             Icon::Mirror,
             "Mirror",
-            seeds,
-            "Mirror features about a plane or a flat face.",
+            seeds || body,
+            "Mirror features, or whole bodies, about a plane or a flat face.",
             Command::Pattern(PatternKind::Mirror),
         );
         let bodies = self.body_count() >= 2;

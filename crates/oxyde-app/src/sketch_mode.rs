@@ -99,9 +99,21 @@ pub enum Tool {
     Centerline,
     Rectangle,
     CenterRectangle,
+    /// Straight slot, centre to centre: two half circles joined by tangent lines.
+    Slot,
     Circle,
     Arc,
+    /// Arc through three clicks: its start, its end, and a point on it.
+    ThreePointArc,
+    /// Arc from the end of a line, tangent to it.
+    TangentArc,
+    /// Regular polygon around a centre, its corners on a construction circle.
+    Polygon,
+    /// A lone sketch point (a hole's position, a reference).
+    Point,
     Trim,
+    /// Extend Entities: a line or arc lengthened to the next curve it meets.
+    Extend,
     Fillet,
     Offset,
     Convert,
@@ -110,7 +122,7 @@ pub enum Tool {
 
 impl Tool {
     /// The tools of the Sketch tab, in order, with icon and label.
-    pub const ALL: [(Tool, Icon, &'static str); 13] = [
+    pub const ALL: [(Tool, Icon, &'static str); 19] = [
         (Tool::Select, Icon::Select, "Select"),
         (Tool::Dimension, Icon::SmartDimension, "Smart Dimension"),
         (Tool::Line, Icon::Line, "Line"),
@@ -121,9 +133,15 @@ impl Tool {
             Icon::CenterRectangle,
             "Center Rectangle",
         ),
+        (Tool::Slot, Icon::Slot, "Straight Slot"),
         (Tool::Circle, Icon::Circle, "Circle"),
-        (Tool::Arc, Icon::Arc, "Arc"),
+        (Tool::Arc, Icon::Arc, "Centerpoint Arc"),
+        (Tool::ThreePointArc, Icon::ThreePointArc, "3 Point Arc"),
+        (Tool::TangentArc, Icon::TangentArc, "Tangent Arc"),
+        (Tool::Polygon, Icon::Polygon, "Polygon"),
+        (Tool::Point, Icon::Point, "Point"),
         (Tool::Trim, Icon::Trim, "Trim"),
+        (Tool::Extend, Icon::Extend, "Extend"),
         (Tool::Fillet, Icon::SketchFillet, "Sketch Fillet"),
         (Tool::Offset, Icon::Offset, "Offset Entities"),
         (Tool::Convert, Icon::Convert, "Convert Entities"),
@@ -138,8 +156,13 @@ impl Tool {
                 | Tool::Centerline
                 | Tool::Rectangle
                 | Tool::CenterRectangle
+                | Tool::Slot
                 | Tool::Circle
                 | Tool::Arc
+                | Tool::ThreePointArc
+                | Tool::TangentArc
+                | Tool::Polygon
+                | Tool::Point
         )
     }
 
@@ -155,8 +178,16 @@ impl Tool {
             Tool::Rectangle => "Click two opposite corners",
             Tool::CenterRectangle => "Click the centre (e.g. the origin), then a corner",
             Tool::Circle => "Click the centre, then a point on the circle",
-            Tool::Arc => "Click the centre, the start, then the end (counter-clockwise)",
+            Tool::Slot => "Click the centre of one end, then of the other, then the width",
+            Tool::ThreePointArc => "Click the start, the end, then a point the arc goes through",
+            Tool::TangentArc => "Click the end of a line, then where the arc ends",
+            Tool::Polygon => {
+                "Click the centre, then a corner (the number of sides is in the tool window)"
+            }
+            Tool::Point => "Click to place a point; it keeps what it snapped to",
+            Tool::Arc => "Click the centre, the start, then the end; the arc goes the way you turn",
             Tool::Trim => "Click the piece of a curve to remove, up to the nearest crossings",
+            Tool::Extend => "Click a line or an arc near the end to lengthen up to the next curve",
             Tool::Fillet => {
                 "Click the corner point where two lines meet, or the two lines one after the other"
             }
@@ -164,7 +195,7 @@ impl Tool {
                 "Click a curve to select its chain (Ctrl+click adds), then click on the side to offset to"
             }
             Tool::Convert => {
-                "Click an edge of the part lying in the sketch plane to copy it into the sketch"
+                "Click an edge of the part lying in the sketch plane to copy it into the sketch; Ctrl+click copies the whole outline it is part of"
             }
             Tool::Mirror => {
                 "Select what to mirror (Ctrl+click), then click the line or centerline to mirror about"
@@ -260,9 +291,18 @@ pub struct SketchSession {
     drag: Option<Drag>,
     labels: Vec<(Rect, RelationId)>,
     history: Vec<ConstrainedSketch>,
+    /// What Undo took back, for Redo; any new change forgets it.
+    undone: Vec<ConstrainedSketch>,
+    /// `undone` while a change is tried, given back if the change is refused.
+    redo_kept: Vec<ConstrainedSketch>,
     /// The radius and distance typed in the Sketch Fillet and Offset Entities windows.
     pub fillet_text: String,
     pub offset_text: String,
+    /// The number of sides of the next polygon.
+    pub polygon_sides: u32,
+    /// While a centerpoint arc's end is placed: the pointer's last angle about its centre,
+    /// and how far it has turned since the start (negative: clockwise).
+    arc_turn: Option<(f64, f64)>,
     /// The last fillet arc and its radius: the next fillet of the same radius is made
     /// equal to it instead of getting a dimension of its own.
     last_fillet: Option<(EntityId, f64)>,
@@ -313,8 +353,12 @@ impl SketchSession {
             drag: None,
             labels: Vec::new(),
             history: Vec::new(),
+            undone: Vec::new(),
+            redo_kept: Vec::new(),
             fillet_text: "5".to_owned(),
             offset_text: "10".to_owned(),
+            polygon_sides: 6,
+            arc_turn: None,
             last_fillet: None,
             preview: Vec::new(),
             value_preview: Vec::new(),
@@ -350,32 +394,74 @@ impl SketchSession {
             .is_some_and(|s| s == ConstraintState::Redundant)
     }
 
+    /// Records the sketch before a change, for Undo. What Undo took back is set aside: a
+    /// change made forgets it, a change refused (`drop_checkpoint`) gives it back.
     fn checkpoint(&mut self) {
         self.history.push(self.sketch.clone());
         if self.history.len() > UNDO_LIMIT {
             self.history.remove(0);
         }
+        self.redo_kept = std::mem::take(&mut self.undone);
         self.message = None;
+    }
+
+    /// A change refused after its checkpoint: the checkpoint goes and Redo has what it had
+    /// before (the caller puts the sketch back).
+    fn drop_checkpoint(&mut self) {
+        self.history.pop();
+        self.undone = std::mem::take(&mut self.redo_kept);
+    }
+
+    /// A change refused: the sketch as it was at its checkpoint, which goes.
+    fn refuse_change(&mut self) {
+        if let Some(previous) = self.history.pop() {
+            self.sketch = previous;
+        }
+        self.undone = std::mem::take(&mut self.redo_kept);
+        self.selection.clear();
+        self.pending.clear();
+        self.solve();
     }
 
     pub fn undo(&mut self) -> bool {
         let Some(previous) = self.history.pop() else {
             return false;
         };
-        self.sketch = previous;
+        self.undone
+            .push(std::mem::replace(&mut self.sketch, previous));
         self.selection.clear();
         self.pending.clear();
         self.solve();
         true
     }
 
+    /// Puts back what the last Undo took away.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.undone.pop() else {
+            return false;
+        };
+        self.history.push(std::mem::replace(&mut self.sketch, next));
+        self.selection.clear();
+        self.pending.clear();
+        self.solve();
+        true
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.undone.is_empty()
+    }
+
     pub fn set_tool(&mut self, tool: Tool) {
         self.tool = tool;
         self.pending.clear();
+        self.arc_turn = None;
         self.preview.clear();
         self.last_fillet = None;
         // Mirror and Offset keep the selection: it is what gets mirrored or offset.
-        if tool == Tool::Dimension || tool.draws() || matches!(tool, Tool::Trim | Tool::Fillet) {
+        if tool == Tool::Dimension
+            || tool.draws()
+            || matches!(tool, Tool::Trim | Tool::Extend | Tool::Fillet)
+        {
             self.selection.clear();
         }
     }
@@ -405,7 +491,7 @@ impl SketchSession {
                         self.message = Some(format!("Mirrored {} entities", entities.len()));
                     }
                     _ => {
-                        self.undo();
+                        self.refuse_change();
                         self.message =
                             Some("That mirror conflicts with the existing relations".to_owned());
                     }
@@ -420,6 +506,7 @@ impl SketchSession {
     pub fn cancel_operation(&mut self) -> bool {
         if !self.pending.is_empty() {
             self.pending.clear();
+            self.arc_turn = None;
             true
         } else if self.tool != Tool::Select {
             self.tool = Tool::Select;
@@ -453,15 +540,21 @@ impl SketchSession {
 
     // ---- Editing -----------------------------------------------------------------------------
 
-    /// Adds a relation, or refuses it when it conflicts with the existing ones.
-    pub fn add_relation(&mut self, relation: Constraint) -> bool {
+    /// Adds relations that make one together (Collinear is parallel and on the line) as
+    /// one step, or none of them when they conflict with the existing ones.
+    pub fn add_relations(&mut self, relations: &[Constraint]) -> bool {
         self.checkpoint();
-        let id = self.sketch.constrain(relation);
+        let ids: Vec<RelationId> = relations
+            .iter()
+            .map(|r| self.sketch.constrain(*r))
+            .collect();
         if self.solve() {
             true
         } else {
-            self.sketch.remove_relation(id);
-            self.history.pop();
+            for id in ids {
+                self.sketch.remove_relation(id);
+            }
+            self.drop_checkpoint();
             self.solve();
             self.message = Some("That relation conflicts with the existing ones".to_owned());
             false
@@ -478,7 +571,7 @@ impl SketchSession {
             true
         } else {
             self.sketch = previous;
-            self.history.pop();
+            self.drop_checkpoint();
             self.solve();
             self.message = Some("That dimension conflicts with the existing relations".to_owned());
             false
@@ -490,14 +583,14 @@ impl SketchSession {
         self.checkpoint();
         let previous = self.history.last().cloned().unwrap_or_default();
         if !self.sketch.set_dimension(id, value) {
-            self.history.pop();
+            self.drop_checkpoint();
             return false;
         }
         if self.solve() {
             true
         } else {
             self.sketch = previous;
-            self.history.pop();
+            self.drop_checkpoint();
             self.solve();
             self.message =
                 Some("That value cannot be reached with the existing relations".to_owned());
@@ -580,7 +673,7 @@ impl SketchSession {
         match self.sketch.rename_dimension(id, name) {
             Ok(()) => true,
             Err(e) => {
-                self.history.pop();
+                self.drop_checkpoint();
                 self.message = Some(e.to_string());
                 false
             }
@@ -655,9 +748,30 @@ impl SketchSession {
         self.sketch.trim(curve, at);
         if !self.solve() {
             self.sketch = previous;
-            self.history.pop();
+            self.drop_checkpoint();
             self.solve();
             self.message = Some("Trimming there conflicts with the existing relations".to_owned());
+        }
+        self.selection.clear();
+    }
+
+    /// Lengthens `curve` at the end nearer to `at` up to the next curve it meets.
+    fn extend(&mut self, curve: EntityId, at: Point2) {
+        self.checkpoint();
+        let previous = self.sketch.clone();
+        if !self.sketch.extend(curve, at) {
+            self.drop_checkpoint();
+            self.message = Some(
+                "Nothing to extend to: that end meets no curve, or another curve is joined to it"
+                    .to_owned(),
+            );
+            return;
+        }
+        if !self.solve() {
+            self.sketch = previous;
+            self.drop_checkpoint();
+            self.solve();
+            self.message = Some("Extending there conflicts with the existing relations".to_owned());
         }
         self.selection.clear();
     }
@@ -736,7 +850,7 @@ impl SketchSession {
         self.checkpoint();
         let previous = self.sketch.clone();
         let Some(arc) = self.sketch.fillet(first, second, radius) else {
-            self.history.pop();
+            self.drop_checkpoint();
             self.message = Some("No room there for a fillet of that radius".to_owned());
             return;
         };
@@ -753,7 +867,7 @@ impl SketchSession {
         }
         if !self.solve() {
             self.sketch = previous;
-            self.history.pop();
+            self.drop_checkpoint();
             self.solve();
             self.message = Some("That fillet conflicts with the existing relations".to_owned());
         }
@@ -825,7 +939,7 @@ impl SketchSession {
             }
             _ => {
                 self.sketch = previous;
-                self.history.pop();
+                self.drop_checkpoint();
                 self.solve();
                 self.message = Some("That offset conflicts with the existing relations".to_owned());
             }
@@ -846,39 +960,84 @@ impl SketchSession {
         (points, lines, rounds)
     }
 
-    /// Relations without a value that apply to the selection.
-    pub fn relation_options(&self) -> Vec<(&'static str, Constraint)> {
+    /// Relations without a value that apply to the selection, each made of one relation
+    /// or several (Collinear, Fix on a curve).
+    pub fn relation_options(&self) -> Vec<(&'static str, Vec<Constraint>)> {
         use Constraint::*;
         let (p, l, r) = self.selected_kinds();
-        match (p.len(), l.len(), r.len()) {
-            (1, 0, 0) => vec![("Fix", Fixed(p[0]))],
-            (2, 0, 0) => vec![("Coincident", Coincident(p[0], p[1]))],
-            (0, 1, 0) => vec![
-                ("Horizontal", Horizontal(l[0])),
-                ("Vertical", Vertical(l[0])),
+        let one = |label, c| (label, vec![c]);
+        // Fixing a curve fixes the points it stands on, as SolidWorks does.
+        let fix_points = |id: EntityId| -> Vec<Constraint> {
+            let points = match self.sketch.entity(id).map(|e| e.geometry) {
+                Some(Geometry::Line { start, end }) => vec![start, end],
+                Some(Geometry::Arc { center, start, end }) => vec![center, start, end],
+                _ => Vec::new(),
+            };
+            points
+                .into_iter()
+                .filter(|p| !self.sketch.is_fixed(*p))
+                .map(Fixed)
+                .collect()
+        };
+        match (p.as_slice(), l.as_slice(), r.as_slice()) {
+            ([a], [], []) => vec![one("Fix", Fixed(*a))],
+            ([a, b], [], []) => vec![
+                one("Coincident", Coincident(*a, *b)),
+                one("Horizontal", HorizontalPoints(*a, *b)),
+                one("Vertical", VerticalPoints(*a, *b)),
             ],
-            (0, 2, 0) => vec![
-                ("Parallel", Parallel(l[0], l[1])),
-                ("Perpendicular", Perpendicular(l[0], l[1])),
-                ("Equal", EqualLength(l[0], l[1])),
-            ],
-            (0, 0, 2) => {
-                let mut out = vec![("Equal", EqualRadius(r[0], r[1]))];
-                // Concentric: one centre, as SolidWorks ties the two centre points.
-                if let (Some(a), Some(b)) = (self.center_of(r[0]), self.center_of(r[1])) {
-                    if a != b {
-                        out.push(("Concentric", Coincident(a, b)));
-                    }
+            ([], [a], []) => {
+                let mut out = vec![
+                    one("Horizontal", Horizontal(*a)),
+                    one("Vertical", Vertical(*a)),
+                ];
+                let fix = fix_points(*a);
+                if !fix.is_empty() {
+                    out.push(("Fix", fix));
                 }
                 out
             }
-            (0, 1, 1) => vec![("Tangent", Tangent(l[0], r[0]))],
-            (1, 1, 0) => vec![
-                ("On line", PointOnLine(p[0], l[0])),
-                ("Midpoint", Midpoint(p[0], l[0])),
+            ([], [a, b], []) => {
+                let mut out = vec![
+                    one("Parallel", Parallel(*a, *b)),
+                    one("Perpendicular", Perpendicular(*a, *b)),
+                    one("Equal", EqualLength(*a, *b)),
+                ];
+                // Collinear: parallel, and an end of the second (one it does not share
+                // with the first) on the first.
+                let ends = |line| self.sketch.endpoints(line);
+                if let (Some((s0, s1)), Some((t0, t1))) = (ends(*a), ends(*b))
+                    && let Some(free) = [t0, t1].into_iter().find(|t| *t != s0 && *t != s1)
+                {
+                    out.push(("Collinear", vec![Parallel(*a, *b), PointOnLine(free, *a)]));
+                }
+                out
+            }
+            ([], [], [a]) => {
+                let fix = fix_points(*a);
+                if fix.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![("Fix", fix)]
+                }
+            }
+            ([], [], [a, b]) => {
+                let mut out = vec![one("Equal", EqualRadius(*a, *b))];
+                // Concentric: one centre, as SolidWorks ties the two centre points.
+                if let (Some(x), Some(y)) = (self.center_of(*a), self.center_of(*b))
+                    && x != y
+                {
+                    out.push(one("Concentric", Coincident(x, y)));
+                }
+                out
+            }
+            ([], [a], [b]) => vec![one("Tangent", Tangent(*a, *b))],
+            ([a], [b], []) => vec![
+                one("On line", PointOnLine(*a, *b)),
+                one("Midpoint", Midpoint(*a, *b)),
             ],
-            (1, 0, 1) => vec![("On circle", PointOnCircle(p[0], r[0]))],
-            (2, 1, 0) => vec![("Symmetric", Symmetric(p[0], p[1], l[0]))],
+            ([a], [], [b]) => vec![one("On circle", PointOnCircle(*a, *b))],
+            ([a, b], [c], []) => vec![one("Symmetric", Symmetric(*a, *b, *c))],
             _ => Vec::new(),
         }
     }
@@ -1193,6 +1352,7 @@ impl SketchSession {
             Tool::Select
             | Tool::Dimension
             | Tool::Trim
+            | Tool::Extend
             | Tool::Fillet
             | Tool::Offset
             | Tool::Convert
@@ -1305,6 +1465,101 @@ impl SketchSession {
                     self.pending.clear();
                 }
             },
+            Tool::Point => {
+                // On an existing point there is one already.
+                if !matches!(p.snap, Some(Snap::Point(_))) {
+                    self.checkpoint();
+                    self.realize(p);
+                    self.solve_new_shape(relations_before);
+                }
+            }
+            Tool::Slot => match *self.pending.as_slice() {
+                [a, b] => {
+                    if let Some(radius) = slot_radius(a.at, b.at, p.at) {
+                        self.checkpoint();
+                        self.slot(a, b, radius);
+                        self.solve_new_shape(relations_before);
+                    }
+                    self.pending.clear();
+                }
+                // The two centres, apart.
+                [a] if a.at.distance(p.at) <= 1e-6 => {}
+                _ => self.pending.push(p),
+            },
+            Tool::ThreePointArc => match *self.pending.as_slice() {
+                [start, end] => {
+                    if let Some((center, ccw)) = arc_through(start.at, end.at, p.at) {
+                        self.checkpoint();
+                        let s = self.realize(start);
+                        let e = self.realize(end);
+                        let c = self.sketch.point(center);
+                        // Arcs run counter-clockwise: from the end when the arc turns the
+                        // other way.
+                        if ccw {
+                            self.sketch.arc_between(c, s, e);
+                        } else {
+                            self.sketch.arc_between(c, e, s);
+                        }
+                        self.solve_new_shape(relations_before);
+                    }
+                    self.pending.clear();
+                }
+                [start] if start.at.distance(p.at) <= 1e-6 => {}
+                _ => self.pending.push(p),
+            },
+            Tool::TangentArc => match self.pending.first().copied() {
+                None => match p.snap {
+                    Some(Snap::Point(from)) if self.tangent_from(from).is_some() => {
+                        self.pending = vec![p];
+                    }
+                    _ => {
+                        self.message =
+                            Some("A tangent arc starts on the end of a line: click one".to_owned());
+                    }
+                },
+                Some(start) => {
+                    let line = match start.snap {
+                        Some(Snap::Point(from)) => self.tangent_from(from).map(|t| (from, t)),
+                        _ => None,
+                    };
+                    let Some((from, (line, direction))) = line else {
+                        self.pending.clear();
+                        return;
+                    };
+                    match tangent_arc_center(start.at, direction, p.at) {
+                        Some((center, ccw)) => {
+                            self.checkpoint();
+                            let end = self.realize(p);
+                            let c = self.sketch.point(center);
+                            let arc = if ccw {
+                                self.sketch.arc_between(c, from, end)
+                            } else {
+                                self.sketch.arc_between(c, end, from)
+                            };
+                            self.sketch.constrain(Constraint::Tangent(line, arc));
+                            self.solve_new_shape(relations_before);
+                        }
+                        None => {
+                            self.message = Some(
+                                "That end is straight ahead of the line: draw a line there"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    self.pending.clear();
+                }
+            },
+            Tool::Polygon => match self.pending.first().copied() {
+                None => self.pending = vec![p],
+                Some(center) => {
+                    if center.at.distance(p.at) > 1e-6 {
+                        self.checkpoint();
+                        self.polygon(center, p);
+                        self.solve_new_shape(relations_before);
+                    }
+                    self.pending.clear();
+                }
+            },
             Tool::Circle => match self.pending.first().copied() {
                 None => self.pending = vec![p],
                 Some(center) => {
@@ -1323,17 +1578,30 @@ impl SketchSession {
                 }
             },
             Tool::Arc => {
-                if self.pending.len() < 2 {
+                let [center, start] = *self.pending.as_slice() else {
                     if self
                         .pending
                         .first()
                         .is_none_or(|c| c.at.distance(p.at) > 1e-6)
                     {
                         self.pending.push(p);
+                        // From the start, the way the pointer turns sets the arc's way.
+                        if let [center, start] = *self.pending.as_slice() {
+                            let angle = (start.at.y - center.at.y).atan2(start.at.x - center.at.x);
+                            self.arc_turn = Some((angle, 0.0));
+                        }
                     }
                     return;
-                }
-                let (center, start) = (self.pending[0], self.pending[1]);
+                };
+                // Arcs run counter-clockwise: one drawn clockwise runs from its end.
+                let clockwise = self.arc_turn.take().is_some_and(|(_, turned)| turned < 0.0);
+                let arc = |sketch: &mut ConstrainedSketch, c, s, e| {
+                    if clockwise {
+                        sketch.arc_between(c, e, s)
+                    } else {
+                        sketch.arc_between(c, s, e)
+                    }
+                };
                 let radius = center.at.distance(start.at);
                 let (dx, dy) = (p.at.x - center.at.x, p.at.y - center.at.y);
                 let length = (dx * dx + dy * dy).sqrt();
@@ -1352,7 +1620,7 @@ impl SketchSession {
                     let before = self.sketch.clone();
                     let joined = match p.snap {
                         Some(Snap::Point(q)) if q != c && q != s => {
-                            self.sketch.arc_between(c, s, q);
+                            arc(&mut self.sketch, c, s, q);
                             self.solve()
                         }
                         _ => false,
@@ -1365,11 +1633,113 @@ impl SketchSession {
                         };
                         let e = self.sketch.point(at);
                         self.attach(e, snap);
-                        self.sketch.arc_between(c, s, e);
+                        arc(&mut self.sketch, c, s, e);
                         self.solve_new_shape(relations_before);
                     }
                 }
                 self.pending.clear();
+            }
+        }
+    }
+
+    /// Follows the pointer round a centerpoint arc's centre while its end is placed: the
+    /// way it turns from the start is the way the arc goes, as in SolidWorks.
+    fn track_arc_turn(&mut self, cursor: Point2) {
+        let (Tool::Arc, [center, _]) = (self.tool, self.pending.as_slice()) else {
+            return;
+        };
+        let Some((last, turned)) = self.arc_turn else {
+            return;
+        };
+        let angle = (cursor.y - center.at.y).atan2(cursor.x - center.at.x);
+        let step = (angle - last + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        self.arc_turn = Some((angle, turned + step));
+    }
+
+    /// The line a tangent arc starting at `point` continues, and the direction it leaves
+    /// in: the one line ending there.
+    fn tangent_from(&self, point: EntityId) -> Option<(EntityId, Point2)> {
+        let mut lines = self
+            .sketch
+            .entities()
+            .iter()
+            .filter_map(|e| match e.geometry {
+                Geometry::Line { start, end } if start == point || end == point => {
+                    Some((e.id, if end == point { start } else { end }))
+                }
+                _ => None,
+            });
+        let (line, other) = lines.next()?;
+        if lines.next().is_some() {
+            return None;
+        }
+        let (p, q) = (self.sketch.position(point)?, self.sketch.position(other)?);
+        let length = p.distance(q);
+        (length > 1e-9).then(|| {
+            (
+                line,
+                Point2::new((p.x - q.x) / length, (p.y - q.y) / length),
+            )
+        })
+    }
+
+    /// A straight slot from centre `a` to centre `b`, `radius` on each side of the line
+    /// between them: two half circles joined by lines tangent to them, the radii equal, and
+    /// a construction centerline between the centres (dimension it for the slot's length),
+    /// as SolidWorks' centre-to-centre slot.
+    fn slot(&mut self, a: Pending, b: Pending, radius: f64) {
+        let [a_left, a_right, b_right, b_left] = slot_corners(a.at, b.at, radius);
+        let c1 = self.realize(a);
+        let c2 = self.realize(b);
+        let (a_left, a_right) = (self.sketch.point(a_left), self.sketch.point(a_right));
+        let (b_left, b_right) = (self.sketch.point(b_left), self.sketch.point(b_right));
+        // Arcs run counter-clockwise: round a's end from its left side to its right, b's
+        // from its right side to its left.
+        let end_a = self.sketch.arc_between(c1, a_left, a_right);
+        let end_b = self.sketch.arc_between(c2, b_right, b_left);
+        let right = self.sketch.line_between(a_right, b_right);
+        let left = self.sketch.line_between(b_left, a_left);
+        for (line, arc) in [(right, end_a), (right, end_b), (left, end_b), (left, end_a)] {
+            self.sketch.constrain(Constraint::Tangent(line, arc));
+        }
+        self.sketch.constrain(Constraint::EqualRadius(end_a, end_b));
+        let axis = self.sketch.line_between(c1, c2);
+        self.sketch.set_construction(axis, true);
+        self.auto_relation(axis, a.at, b.at);
+    }
+
+    /// A regular polygon of `polygon_sides` sides around `center` with a corner at
+    /// `corner`: its corners on a construction circle (dimension it for the size), its
+    /// sides equal, as SolidWorks' inscribed polygon.
+    fn polygon(&mut self, center: Pending, corner: Pending) {
+        let points = polygon_corners(center.at, corner.at, self.polygon_sides);
+        let centre = self.realize(center);
+        let circle = self
+            .sketch
+            .circle_around(centre, center.at.distance(corner.at));
+        self.sketch.set_construction(circle, true);
+        let mut corners = Vec::with_capacity(points.len());
+        for (k, at) in points.into_iter().enumerate() {
+            corners.push(if k == 0 {
+                self.realize(corner)
+            } else {
+                self.sketch.point(at)
+            });
+        }
+        let next = corners.iter().cycle().skip(1);
+        let sides: Vec<EntityId> = corners
+            .iter()
+            .zip(next)
+            .map(|(a, b)| self.sketch.line_between(*a, *b))
+            .collect();
+        for corner in &corners {
+            self.sketch
+                .constrain(Constraint::PointOnCircle(*corner, circle));
+        }
+        for pair in sides.windows(2) {
+            if let [a, b] = pair {
+                self.sketch.constrain(Constraint::EqualLength(*a, *b));
             }
         }
     }
@@ -1416,13 +1786,43 @@ impl SketchSession {
         }
     }
 
+    /// Convert Entities with Ctrl: every part edge joined end to end with edge `index` (a
+    /// face's outline), as one step.
+    fn convert_chain(&mut self, index: usize) {
+        let chain = self.model.chain_of(index);
+        self.checkpoint();
+        for i in &chain {
+            self.add_converted(*i);
+        }
+        if self.solve() {
+            self.message = Some(format!("Converted {} edges", chain.len()));
+        } else {
+            self.refuse_change();
+            self.message =
+                Some("Those edges cannot be added with the existing relations".to_owned());
+        }
+    }
+
     /// Convert Entities: copies a part edge into the sketch, fixed where it is. Edges
     /// converted one after the other share their end points.
     fn convert(&mut self, index: usize) {
+        if self.model.curves.get(index).is_none() {
+            return;
+        }
+        self.checkpoint();
+        self.add_converted(index);
+        if !self.solve() {
+            self.refuse_change();
+            self.message = Some("That edge cannot be added with the existing relations".to_owned());
+        }
+    }
+
+    /// The copy of part edge `index`, fixed where it is, sharing end points with what is
+    /// there already; not solved.
+    fn add_converted(&mut self, index: usize) {
         let Some(curve) = self.model.curves.get(index).copied() else {
             return;
         };
-        self.checkpoint();
         match curve {
             ModelCurve::Line(a, b) => {
                 let (pa, pb) = (self.fixed_point_at(a), self.fixed_point_at(b));
@@ -1445,10 +1845,6 @@ impl SketchSession {
                 );
                 self.sketch.arc_between(c, s, e);
             }
-        }
-        if !self.solve() {
-            self.undo();
-            self.message = Some("That edge cannot be added with the existing relations".to_owned());
         }
     }
 
@@ -1589,16 +1985,33 @@ impl SketchSession {
             }
         }
 
-        // Relation glyphs.
+        // Relation glyphs: by a line's middle, or by both points a relation lines up.
         for relation in self.sketch.relations() {
-            let (line, glyph) = match relation.constraint {
-                Constraint::Horizontal(l) => (l, "H"),
-                Constraint::Vertical(l) => (l, "V"),
+            let (at, glyph) = match relation.constraint {
+                Constraint::Horizontal(l) => {
+                    (self.sketch.midpoint_of(l).into_iter().collect(), "H")
+                }
+                Constraint::Vertical(l) => (self.sketch.midpoint_of(l).into_iter().collect(), "V"),
+                Constraint::HorizontalPoints(a, b) => (
+                    [a, b]
+                        .iter()
+                        .filter_map(|p| self.sketch.position(*p))
+                        .collect(),
+                    "H",
+                ),
+                Constraint::VerticalPoints(a, b) => (
+                    [a, b]
+                        .iter()
+                        .filter_map(|p| self.sketch.position(*p))
+                        .collect(),
+                    "V",
+                ),
                 _ => continue,
             };
-            if let Some(mid) = self.sketch.midpoint_of(line) {
+            let at: Vec<Point2> = at;
+            for p in at {
                 painter.text(
-                    to_screen(mid) + Vec2::new(5.0, -5.0),
+                    to_screen(p) + Vec2::new(5.0, -5.0),
                     Align2::LEFT_BOTTOM,
                     glyph,
                     FontId::proportional(10.0),
@@ -1728,6 +2141,50 @@ impl SketchSession {
                     let path: Vec<Pos2> = corners.into_iter().map(to_screen).collect();
                     painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
                 }
+                Tool::Slot => {
+                    let path: Vec<Point2> = match self.pending.get(1) {
+                        None => vec![first.at, cursor],
+                        Some(end) => slot_radius(first.at, end.at, cursor)
+                            .map(|r| slot_outline(first.at, end.at, r))
+                            .unwrap_or_else(|| vec![first.at, end.at]),
+                    };
+                    let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
+                    painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
+                }
+                Tool::ThreePointArc => {
+                    let path: Vec<Point2> = match self.pending.get(1) {
+                        None => vec![first.at, cursor],
+                        Some(end) => match arc_through(first.at, end.at, cursor) {
+                            Some((c, true)) => arc_path(c, first.at, end.at),
+                            Some((c, false)) => arc_path(c, end.at, first.at),
+                            None => vec![first.at, end.at],
+                        },
+                    };
+                    let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
+                    painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
+                }
+                Tool::TangentArc => {
+                    let direction = match first.snap {
+                        Some(Snap::Point(from)) => self.tangent_from(from).map(|(_, d)| d),
+                        _ => None,
+                    };
+                    let path: Vec<Point2> =
+                        match direction.and_then(|d| tangent_arc_center(first.at, d, cursor)) {
+                            Some((c, true)) => arc_path(c, first.at, cursor),
+                            Some((c, false)) => arc_path(c, cursor, first.at),
+                            None => vec![first.at, cursor],
+                        };
+                    let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
+                    painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
+                }
+                Tool::Polygon => {
+                    let mut path = polygon_corners(first.at, cursor, self.polygon_sides);
+                    if let Some(start) = path.first().copied() {
+                        path.push(start);
+                    }
+                    let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
+                    painter.extend(Shape::dashed_line(&path, dashed, 5.0, 3.0));
+                }
                 Tool::Circle => {
                     let path: Vec<Pos2> = arc_points(
                         first.at,
@@ -1748,7 +2205,13 @@ impl SketchSession {
                             let c = first.at;
                             let a0 = (start.at.y - c.y).atan2(start.at.x - c.x);
                             let a1 = (cursor.y - c.y).atan2(cursor.x - c.x);
-                            let sweep = (a1 - a0).rem_euclid(std::f64::consts::TAU);
+                            let ccw = (a1 - a0).rem_euclid(std::f64::consts::TAU);
+                            let clockwise = self.arc_turn.is_some_and(|(_, t)| t < 0.0);
+                            let sweep = if clockwise {
+                                ccw - std::f64::consts::TAU
+                            } else {
+                                ccw
+                            };
                             arc_points(c, c.distance(start.at), a0, sweep, 48)
                                 .into_iter()
                                 .map(to_screen)
@@ -1759,7 +2222,9 @@ impl SketchSession {
                 }
                 Tool::Select
                 | Tool::Dimension
+                | Tool::Point
                 | Tool::Trim
+                | Tool::Extend
                 | Tool::Fillet
                 | Tool::Offset
                 | Tool::Convert
@@ -1893,6 +2358,22 @@ impl SketchSession {
                     .push([to_screen(s.closest_point(second, foot)?), to_screen(foot)]);
                 Some(g)
             }
+            Diameter(round, value) => {
+                // Across the circle through its centre, at 45°, arrows at both ends.
+                let center = at(self.center_of(round)?)?;
+                let r = value / 2.0 * std::f64::consts::FRAC_1_SQRT_2;
+                let (a, b) = (
+                    to_screen(Point2::new(center.x - r, center.y - r)),
+                    to_screen(Point2::new(center.x + r, center.y + r)),
+                );
+                let out = (b - a).normalized();
+                Some(DimensionGraphics {
+                    anchor: b + out * 24.0,
+                    text: format!("Ø{}", format_length(value)),
+                    lines: vec![[a, b + out * 12.0]],
+                    arrows: vec![(a, -out), (b, out)],
+                })
+            }
             Radius(round, value) => {
                 let center = at(self.center_of(round)?)?;
                 let rim = Point2::new(
@@ -1985,9 +2466,22 @@ fn dimension_options(s: &ConstrainedSketch, selection: &[EntityId]) -> Vec<Dimen
                 let length = s.line_length(*one).unwrap_or(0.0);
                 vec![option("Length…", Length(*one, length), length, false)]
             }
-            Some(Geometry::Circle { .. } | Geometry::Arc { .. }) => {
+            // A circle is dimensioned by its diameter, an arc by its radius, as in
+            // SolidWorks; the other is offered next.
+            Some(geometry @ (Geometry::Circle { .. } | Geometry::Arc { .. })) => {
                 let radius = s.radius_of(*one).unwrap_or(0.0);
-                vec![option("Radius…", Radius(*one, radius), radius, false)]
+                let by_radius = option("Radius…", Radius(*one, radius), radius, false);
+                let by_diameter = option(
+                    "Diameter…",
+                    Diameter(*one, 2.0 * radius),
+                    2.0 * radius,
+                    false,
+                );
+                if matches!(geometry, Geometry::Circle { .. }) {
+                    vec![by_diameter, by_radius]
+                } else {
+                    vec![by_radius, by_diameter]
+                }
             }
             _ => Vec::new(),
         },
@@ -2043,6 +2537,97 @@ fn dimension_options(s: &ConstrainedSketch, selection: &[EntityId]) -> Vec<Dimen
         },
         _ => Vec::new(),
     }
+}
+
+/// The centre of the arc from `start` to `end` through `through`, and whether it runs
+/// counter-clockwise from `start` to `end`. `None` when the three points are in line.
+fn arc_through(start: Point2, end: Point2, through: Point2) -> Option<(Point2, bool)> {
+    let (a, b, c) = (start, end, through);
+    let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
+    let scale = a.distance(b).max(a.distance(c)).max(1e-9);
+    if d.abs() < 1e-9 * scale * scale {
+        return None;
+    }
+    let (a2, b2, c2) = (
+        a.x * a.x + a.y * a.y,
+        b.x * b.x + b.y * b.y,
+        c.x * c.x + c.y * c.y,
+    );
+    let center = Point2::new(
+        (a2 * (b.y - c.y) + b2 * (c.y - a.y) + c2 * (a.y - b.y)) / d,
+        (a2 * (c.x - b.x) + b2 * (a.x - c.x) + c2 * (b.x - a.x)) / d,
+    );
+    let angle = |p: Point2| (p.y - center.y).atan2(p.x - center.x);
+    let tau = std::f64::consts::TAU;
+    let sweep = (angle(end) - angle(start)).rem_euclid(tau);
+    let to_through = (angle(through) - angle(start)).rem_euclid(tau);
+    Some((center, to_through < sweep))
+}
+
+/// The centre of the arc leaving `start` along the unit `direction` and ending at `end`,
+/// and whether it turns counter-clockwise (left). `None` when `end` is straight ahead or
+/// behind, which no arc tangent there reaches.
+fn tangent_arc_center(start: Point2, direction: Point2, end: Point2) -> Option<(Point2, bool)> {
+    let (dx, dy) = (end.x - start.x, end.y - start.y);
+    // To the left of the direction.
+    let (nx, ny) = (-direction.y, direction.x);
+    let across = dx * nx + dy * ny;
+    let length2 = dx * dx + dy * dy;
+    if across.abs() < 1e-9 * length2.sqrt().max(1e-9) {
+        return None;
+    }
+    let r = length2 / (2.0 * across);
+    Some((Point2::new(start.x + nx * r, start.y + ny * r), r > 0.0))
+}
+
+/// The most sides a polygon gets.
+const MAX_SIDES: u32 = 64;
+
+/// The half width of a slot from centre `a` to centre `b` whose side goes through `at`:
+/// its distance from the line between the centres. `None` on that line.
+fn slot_radius(a: Point2, b: Point2, at: Point2) -> Option<f64> {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let length = dx.hypot(dy);
+    if length < 1e-9 {
+        return None;
+    }
+    let r = ((at.x - a.x) * dy - (at.y - a.y) * dx).abs() / length;
+    (r > 1e-6).then_some(r)
+}
+
+/// The corners of a slot from `a` to `b`: by `a`, left then right of the way from `a` to
+/// `b`; by `b`, right then left (going round it counter-clockwise).
+fn slot_corners(a: Point2, b: Point2, radius: f64) -> [Point2; 4] {
+    let length = (b.x - a.x).hypot(b.y - a.y).max(1e-12);
+    let (nx, ny) = (
+        -(b.y - a.y) / length * radius,
+        (b.x - a.x) / length * radius,
+    );
+    let side = |c: Point2, s: f64| Point2::new(c.x + s * nx, c.y + s * ny);
+    [side(a, 1.0), side(a, -1.0), side(b, -1.0), side(b, 1.0)]
+}
+
+/// A slot's outline, closed, for its preview.
+fn slot_outline(a: Point2, b: Point2, radius: f64) -> Vec<Point2> {
+    let [a_left, a_right, b_right, b_left] = slot_corners(a, b, radius);
+    let mut path = arc_path(a, a_left, a_right);
+    path.extend(arc_path(b, b_right, b_left));
+    path.push(a_left);
+    path
+}
+
+/// The corners of a regular polygon of `sides` sides (3 to `MAX_SIDES`) around `center`,
+/// counter-clockwise from `corner`.
+fn polygon_corners(center: Point2, corner: Point2, sides: u32) -> Vec<Point2> {
+    let n = sides.clamp(3, MAX_SIDES);
+    let radius = center.distance(corner);
+    let start = (corner.y - center.y).atan2(corner.x - center.x);
+    (0..n)
+        .map(|k| {
+            let a = start + std::f64::consts::TAU * f64::from(k) / f64::from(n);
+            Point2::new(center.x + radius * a.cos(), center.y + radius * a.sin())
+        })
+        .collect()
 }
 
 fn perpendicular_foot(p: Point2, a: Point2, b: Point2) -> Point2 {
@@ -2262,7 +2847,9 @@ pub fn interact(
     };
     session.hover = match (session.drag, pointer, session.tool) {
         (_, _, Tool::Convert) => None,
-        (None, Some(p), Tool::Trim | Tool::Offset) => session.curve_hit(p, &to_screen),
+        (None, Some(p), Tool::Trim | Tool::Extend | Tool::Offset) => {
+            session.curve_hit(p, &to_screen)
+        }
         (None, Some(p), Tool::Fillet) => session.fillet_hit(p, &to_screen),
         (None, Some(p), tool) if !tool.draws() => session.hit(p, &to_screen),
         _ => None,
@@ -2279,8 +2866,15 @@ pub fn interact(
         _ => None,
     };
 
+    if let Some(at) = snapped.map(|(p, _)| p).or(cursor) {
+        session.track_arc_turn(at);
+    }
+
     session.preview = match (session.tool, session.hover, cursor) {
         (Tool::Fillet, Some(id), _) => session.fillet_preview_for(id),
+        (Tool::Extend, Some(id), Some(at)) => {
+            session.sketch.extend_preview(id, at).into_iter().collect()
+        }
         (Tool::Mirror, Some(id), _) if !additive => session.mirror_preview_for(id),
         (Tool::Offset, _, Some(at)) if !session.selection.is_empty() => session
             .offset_towards(at)
@@ -2328,9 +2922,19 @@ pub fn interact(
                         session.trim(curve, at);
                     }
                 }
+                Tool::Extend => {
+                    if let (Some(curve), Some(at)) = (session.hover, cursor) {
+                        session.extend(curve, at);
+                    }
+                }
                 Tool::Convert => {
                     if let Some(index) = session.model_hover {
-                        session.convert(index);
+                        // Ctrl+click: the whole outline the edge is part of.
+                        if additive {
+                            session.convert_chain(index);
+                        } else {
+                            session.convert(index);
+                        }
                     }
                 }
                 Tool::Mirror => {
@@ -2362,6 +2966,25 @@ pub fn interact(
 
 /// The window of a tool with a value: the fillet radius or the offset distance.
 fn tool_window(session: &mut SketchSession, ctx: &egui::Context, viewport: Rect) {
+    if session.tool == Tool::Polygon {
+        egui::Window::new("Polygon")
+            .id(egui::Id::new("sketch_tool_window"))
+            .fixed_pos(viewport.left_top() + Vec2::new(12.0, 12.0))
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Sides");
+                    ui.add(egui::DragValue::new(&mut session.polygon_sides).range(3..=MAX_SIDES));
+                });
+                ui.label(
+                    egui::RichText::new("Click the centre, then a corner")
+                        .weak()
+                        .small(),
+                );
+            });
+        return;
+    }
     let (title, label, hint) = match session.tool {
         Tool::Fillet => (
             "Sketch Fillet",
@@ -2401,13 +3024,10 @@ fn tool_window(session: &mut SketchSession, ctx: &egui::Context, viewport: Rect)
         });
 }
 
-/// A length typed by the user, in mm; a decimal comma is accepted.
+/// A positive length typed by the user, in mm: a number or arithmetic, with units
+/// (`quantity`).
 fn parse_length(text: &str) -> Option<f64> {
-    text.trim()
-        .replace(',', ".")
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
+    crate::quantity::parse(text, crate::quantity::Quantity::Length).filter(|v| *v > 0.0)
 }
 
 /// Distance from a point to a segment, in the sketch plane.
@@ -2454,6 +3074,11 @@ mod tests {
         let p = s.point(Point2::new(3.0, 8.0));
         let circle = s.circle(Point2::new(20.0, 0.0), 2.0);
         let other = s.circle(Point2::new(20.0, 10.0), 1.0);
+        let arc = s.arc(
+            Point2::new(40.0, 0.0),
+            Point2::new(43.0, 0.0),
+            Point2::new(40.0, 3.0),
+        );
 
         let first = |sel: &[EntityId]| dimension_options(&s, sel).into_iter().next().unwrap();
         let d = first(&[a, b]);
@@ -2478,7 +3103,11 @@ mod tests {
             first(&[a, circle]).relation,
             Constraint::PointLineDistance(..)
         ));
-        assert!(matches!(first(&[circle]).relation, Constraint::Radius(..)));
+        // A circle by its diameter, an arc by its radius.
+        assert!(
+            matches!(first(&[circle]).relation, Constraint::Diameter(c, d) if c == circle && (d - 4.0).abs() < 1e-9)
+        );
+        assert!(matches!(first(&[arc]).relation, Constraint::Radius(..)));
         assert!(matches!(first(&[a]).relation, Constraint::Length(..)));
     }
 
@@ -2498,10 +3127,13 @@ mod tests {
         assert!(session.click_dimension(Some(a)).is_none());
         let distance = session.click_dimension(Some(b)).unwrap();
         assert!(matches!(distance.relation, Constraint::LineDistance(..)));
-        // A circle at once: its radius.
-        let radius = session.click_dimension(Some(circle)).unwrap();
-        assert!(matches!(radius.relation, Constraint::Radius(..)));
+        // A circle at once: its diameter, which drives the circle.
+        let diameter = session.click_dimension(Some(circle)).unwrap();
+        assert!(matches!(diameter.relation, Constraint::Diameter(..)));
         assert!(session.selection.is_empty());
+        assert!(session.add_dimension(diameter.relation, 10.0));
+        let radius = session.sketch.radius_of(circle).unwrap();
+        assert!((radius - 5.0).abs() < 1e-9, "{radius}");
     }
 
     #[test]
@@ -2736,6 +3368,44 @@ mod tests {
         assert!(report.converged);
         // The converted circle and line cannot move; only the drawn circle's radius can.
         assert_eq!(report.degrees_of_freedom, 1);
+
+        // Ctrl+click: a face's whole outline at once, its corners shared.
+        let mut outline = super::SketchSession::new(
+            FeatureId::from_raw(2),
+            "Sketch2".to_owned(),
+            Plane::FRONT,
+            ConstrainedSketch::new(),
+            false,
+            None,
+        );
+        let corners = [
+            Point2::new(0.0, 0.0),
+            Point2::new(10.0, 0.0),
+            Point2::new(10.0, 5.0),
+            Point2::new(0.0, 5.0),
+        ];
+        let mut curves: Vec<ModelCurve> = corners
+            .iter()
+            .zip(corners.iter().cycle().skip(1))
+            .map(|(a, b)| ModelCurve::Line(*a, *b))
+            .collect();
+        curves.push(ModelCurve::Circle(Point2::new(30.0, 0.0), 2.0));
+        outline.model = ModelGeometry {
+            points: Vec::new(),
+            curves,
+        };
+        outline.convert_chain(1);
+        let lines = outline
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .count();
+        assert_eq!(lines, 4, "the rectangle, not the circle apart from it");
+        let profile = oxyde_geom::Profile::from_curves(&outline.sketch.profile_segments()).unwrap();
+        assert_eq!(profile.regions.len(), 1, "a closed outline");
+        assert!(outline.undo(), "one step");
+        assert!(outline.sketch.profile_segments().is_empty());
     }
 
     #[test]
@@ -2806,7 +3476,7 @@ mod tests {
     #[test]
     fn offset_tool_selects_a_chain_and_offsets_towards_the_click() {
         let mut s = ConstrainedSketch::new();
-        let [_, _, top, _] = s.rectangle(Point2::ORIGIN, 20.0, 10.0);
+        let [_, right, top, _] = s.rectangle(Point2::ORIGIN, 20.0, 10.0);
         let mut session = session(s);
         session.set_tool(Tool::Offset);
         session.offset_text = "2".to_owned();
@@ -2840,6 +3510,28 @@ mod tests {
             .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
             .count();
         assert_eq!(lines, 4);
+        // Redo puts the offset back; a new change forgets what was undone.
+        assert!(session.redo());
+        assert_eq!(
+            session
+                .sketch
+                .entities()
+                .iter()
+                .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+                .count(),
+            8
+        );
+        // A refused change keeps Redo; a change made forgets it.
+        assert!(session.undo());
+        session.fillet_text = "50".to_owned();
+        let corner = session.sketch.shared_corner(right, top);
+        session.click_fillet(corner);
+        assert!(session.message.is_some(), "no room for that fillet");
+        assert!(session.redo(), "Redo survives a refused change");
+        assert!(session.undo());
+        session.selection = vec![top];
+        session.toggle_construction();
+        assert!(!session.redo());
     }
 
     #[test]
@@ -2875,6 +3567,37 @@ mod tests {
             .expect("an arc was drawn");
         assert_eq!(arc, (bottom_end, top_end), "the arc shares the lines' ends");
         assert!(slot.report.as_ref().unwrap().converged);
+
+        // Turned clockwise from the start: the arc goes that way, from its end.
+        let mut s = ConstrainedSketch::new();
+        s.point(Point2::new(50.0, 50.0));
+        let mut clockwise = session(s);
+        clockwise.set_tool(Tool::Arc);
+        for at in [Point2::ORIGIN, Point2::new(5.0, 0.0)] {
+            clockwise.click_tool(Pending { at, snap: None });
+        }
+        for (x, y) in [(4.0, -3.0), (0.0, -5.0)] {
+            clockwise.track_arc_turn(Point2::new(x, y));
+        }
+        clockwise.click_tool(Pending {
+            at: Point2::new(0.0, -5.0),
+            snap: None,
+        });
+        let (start, end) = clockwise
+            .sketch
+            .entities()
+            .iter()
+            .find_map(|e| match e.geometry {
+                Geometry::Arc { start, end, .. } => Some((start, end)),
+                _ => None,
+            })
+            .unwrap();
+        let at = |id| clockwise.sketch.position(id).unwrap();
+        assert!(
+            at(start).distance(Point2::new(0.0, -5.0)) < 1e-9,
+            "a quarter, not three"
+        );
+        assert!(at(end).distance(Point2::new(5.0, 0.0)) < 1e-9);
 
         // Snapped to the middle of a line instead: a new point, kept there.
         let mut s = ConstrainedSketch::new();
@@ -2957,8 +3680,8 @@ mod tests {
 
         // Both ends fixed: no other length can be met, and nothing is shown.
         let (a, b) = session.sketch.endpoints(line).unwrap();
-        assert!(session.add_relation(Constraint::Fixed(a)));
-        assert!(session.add_relation(Constraint::Fixed(b)));
+        assert!(session.add_relations(&[Constraint::Fixed(a)]));
+        assert!(session.add_relations(&[Constraint::Fixed(b)]));
         assert!(!session.preview_set_dimension(id, 4.0));
         assert!(session.value_preview().is_empty());
     }
@@ -2989,6 +3712,271 @@ mod tests {
         moving.selection = vec![arc, circle];
         let options = moving.relation_options();
         assert!(options.iter().any(|(label, _)| *label == "Concentric"));
+    }
+
+    #[test]
+    fn points_line_up_lines_go_collinear_and_curves_are_fixed() {
+        let mut s = ConstrainedSketch::new();
+        let p = s.point(Point2::new(0.0, 0.0));
+        let q = s.point(Point2::new(10.0, 3.0));
+        let a = s.line(Point2::new(0.0, 10.0), Point2::new(10.0, 10.0));
+        let b = s.line(Point2::new(15.0, 12.0), Point2::new(25.0, 13.0));
+        let mut session = session(s);
+        let apply = |session: &mut SketchSession, selection: Vec<EntityId>, label: &str| {
+            session.selection = selection;
+            let options = session.relation_options();
+            let (_, relations) = options
+                .into_iter()
+                .find(|(l, _)| *l == label)
+                .unwrap_or_else(|| panic!("{label} offered"));
+            assert!(session.add_relations(&relations), "{label}");
+        };
+        apply(&mut session, vec![p, q], "Horizontal");
+        let (pp, qq) = (
+            session.sketch.position(p).unwrap(),
+            session.sketch.position(q).unwrap(),
+        );
+        assert!((pp.y - qq.y).abs() < 1e-9);
+        apply(&mut session, vec![a, b], "Collinear");
+        let at = |id| session.sketch.position(id).unwrap();
+        let (a0, a1) = session.sketch.endpoints(a).unwrap();
+        let (b0, b1) = session.sketch.endpoints(b).unwrap();
+        for end in [b0, b1] {
+            // On the line through a's ends.
+            let (s, e, p) = (at(a0), at(a1), at(end));
+            let across = ((e.x - s.x) * (p.y - s.y) - (e.y - s.y) * (p.x - s.x)) / s.distance(e);
+            assert!(across.abs() < 1e-6, "{p:?} is {across} off the line");
+        }
+        // Fixing the line fixes both its ends: it no longer moves.
+        apply(&mut session, vec![a], "Fix");
+        let (a0, a1) = session.sketch.endpoints(a).unwrap();
+        assert!(session.sketch.is_fixed(a0) && session.sketch.is_fixed(a1));
+        assert_eq!(
+            session.report.as_ref().unwrap().definition(a),
+            Some(oxyde_sketch::Definition::Fully)
+        );
+        // One undo takes the two relations of Fix away together.
+        assert!(session.undo());
+        assert!(!session.sketch.is_fixed(a0) && !session.sketch.is_fixed(a1));
+    }
+
+    #[test]
+    fn three_point_and_tangent_arcs() {
+        let mut s = ConstrainedSketch::new();
+        let base = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let (_, tip) = s.endpoints(base).unwrap();
+        let mut session = session(s);
+        // From (20, 0) to (30, 0) bulging down through (25, -5): a half circle about
+        // (25, 0), running counter-clockwise from (20, 0).
+        session.set_tool(Tool::ThreePointArc);
+        for at in [
+            Point2::new(20.0, 0.0),
+            Point2::new(30.0, 0.0),
+            Point2::new(25.0, -5.0),
+        ] {
+            session.click_tool(Pending { at, snap: None });
+        }
+        let arcs: Vec<(EntityId, EntityId, EntityId)> = session
+            .sketch
+            .entities()
+            .iter()
+            .filter_map(|e| match e.geometry {
+                Geometry::Arc { center, start, end } => Some((center, start, end)),
+                _ => None,
+            })
+            .collect();
+        let [(c, start, _)] = arcs.as_slice() else {
+            panic!("one arc: {arcs:?}")
+        };
+        let at = |s: &SketchSession, id| s.sketch.position(id).unwrap();
+        assert!(at(&session, *c).distance(Point2::new(25.0, 0.0)) < 1e-9);
+        assert!(at(&session, *start).distance(Point2::new(20.0, 0.0)) < 1e-9);
+
+        // From the line's end at (10, 0), on to (10, 10): a half circle turning left,
+        // tangent to the line.
+        session.set_tool(Tool::TangentArc);
+        session.click_tool(Pending {
+            at: Point2::new(10.0, 0.0),
+            snap: Some(Snap::Point(tip)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(10.0, 10.0),
+            snap: None,
+        });
+        assert!(has(
+            &session,
+            |r| matches!(r, Constraint::Tangent(l, _) if *l == base)
+        ));
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        let tangent = session
+            .sketch
+            .entities()
+            .iter()
+            .find_map(|e| match e.geometry {
+                Geometry::Arc { center, start, .. } if start == tip => Some(center),
+                _ => None,
+            })
+            .expect("an arc counter-clockwise from the line's end");
+        assert!(at(&session, tangent).distance(Point2::new(10.0, 5.0)) < 1e-6);
+        // Straight ahead of the line: no arc.
+        let before = session.sketch.clone();
+        session.click_tool(Pending {
+            at: Point2::new(10.0, 0.0),
+            snap: Some(Snap::Point(tip)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(20.0, 0.0),
+            snap: None,
+        });
+        assert_eq!(session.sketch, before);
+    }
+
+    /// The closed contours of the session's sketch, and their area.
+    fn profile_area(session: &SketchSession) -> (usize, f64) {
+        let profile = oxyde_geom::Profile::from_curves(&session.sketch.profile_segments())
+            .expect("a closed profile");
+        let area = profile
+            .regions
+            .iter()
+            .map(|r| r.outer.signed_area().abs())
+            .sum();
+        (profile.regions.len(), area)
+    }
+
+    #[test]
+    fn a_slot_is_two_half_circles_joined_by_tangent_lines() {
+        let mut session = session(ConstrainedSketch::new());
+        session.set_tool(Tool::Slot);
+        for at in [
+            Point2::new(0.0, 0.0),
+            Point2::new(20.0, 0.0),
+            Point2::new(10.0, 4.0),
+        ] {
+            session.click_tool(Pending { at, snap: None });
+        }
+        let count = |f: fn(&Geometry) -> bool, construction: bool| {
+            session
+                .sketch
+                .entities()
+                .iter()
+                .filter(|e| f(&e.geometry) && e.construction == construction)
+                .count()
+        };
+        assert_eq!(count(|g| matches!(g, Geometry::Arc { .. }), false), 2);
+        assert_eq!(count(|g| matches!(g, Geometry::Line { .. }), false), 2);
+        assert_eq!(count(|g| matches!(g, Geometry::Line { .. }), true), 1);
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        // Two centres and a width, the centerline horizontal.
+        assert_eq!(report.degrees_of_freedom, 4);
+        let (regions, area) = profile_area(&session);
+        assert_eq!(regions, 1);
+        let want = 20.0 * 8.0 + std::f64::consts::PI * 16.0;
+        assert!((area - want).abs() < 0.05 * want, "{area} vs {want}");
+        // One radius dimension sizes both ends.
+        let arc = session
+            .sketch
+            .entities()
+            .iter()
+            .find(|e| matches!(e.geometry, Geometry::Arc { .. }))
+            .unwrap()
+            .id;
+        assert!(session.add_dimension(Constraint::Radius(arc, 5.0), 5.0));
+        let radii: Vec<f64> = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Arc { .. }))
+            .map(|e| session.sketch.radius_of(e.id).unwrap())
+            .collect();
+        assert!(radii.iter().all(|r| (r - 5.0).abs() < 1e-6), "{radii:?}");
+    }
+
+    #[test]
+    fn a_polygon_has_equal_sides_on_its_construction_circle() {
+        let mut session = session(ConstrainedSketch::new());
+        let origin = session.sketch.origin().unwrap();
+        session.set_tool(Tool::Polygon);
+        session.polygon_sides = 6;
+        session.click_tool(Pending {
+            at: Point2::ORIGIN,
+            snap: Some(Snap::Point(origin)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(10.0, 0.0),
+            snap: None,
+        });
+        let lines: Vec<EntityId> = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(lines.len(), 6);
+        for line in &lines {
+            let length = session.sketch.line_length(*line).unwrap();
+            assert!((length - 10.0).abs() < 1e-6, "{length}");
+        }
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        // On the origin: its size and how it is turned are left.
+        assert_eq!(report.degrees_of_freedom, 2);
+        let (regions, area) = profile_area(&session);
+        assert_eq!(regions, 1);
+        let hexagon = 1.5 * 3f64.sqrt() * 100.0;
+        assert!((area - hexagon).abs() < 1e-6, "{area}");
+    }
+
+    #[test]
+    fn a_point_keeps_what_it_snapped_to() {
+        let mut s = ConstrainedSketch::new();
+        let line = s.line(Point2::new(0.0, 0.0), Point2::new(10.0, 0.0));
+        let mut session = session(s);
+        session.set_tool(Tool::Point);
+        session.click_tool(Pending {
+            at: Point2::new(4.0, 0.0),
+            snap: Some(Snap::OnCurve(line)),
+        });
+        session.click_tool(Pending {
+            at: Point2::new(3.0, 7.0),
+            snap: None,
+        });
+        assert!(has(
+            &session,
+            |c| matches!(c, Constraint::PointOnLine(_, l) if *l == line)
+        ));
+        let points = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| matches!(e.geometry, Geometry::Point(_)))
+            .count();
+        // The origin, the line's two ends and the two new points.
+        assert_eq!(points, 5);
+        assert!(session.report.as_ref().unwrap().converged);
+    }
+
+    #[test]
+    fn extending_in_the_session_can_be_undone() {
+        let mut s = ConstrainedSketch::new();
+        let h = s.line(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0));
+        s.line(Point2::new(8.0, -3.0), Point2::new(8.0, 3.0));
+        let mut session = session(s);
+        let before = session.sketch.clone();
+        session.set_tool(Tool::Extend);
+        // Behind the start: nothing to meet, nothing changes, nothing to undo.
+        session.extend(h, Point2::new(0.5, 0.0));
+        assert_eq!(session.sketch, before);
+        assert!(session.message.is_some());
+        session.extend(h, Point2::new(3.5, 0.0));
+        let (_, end) = session.sketch.endpoints(h).unwrap();
+        let at = session.sketch.position(end).unwrap();
+        assert!((at.x - 8.0).abs() < 1e-7 && at.y.abs() < 1e-7, "{at:?}");
+        assert!(session.undo());
+        assert_eq!(session.sketch, before);
+        assert!(!session.undo(), "the refused extension made no undo step");
     }
 
     #[test]

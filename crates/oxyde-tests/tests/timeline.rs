@@ -36,6 +36,7 @@ fn fillet(edges: Vec<EdgeName>, radius: f64) -> FeatureKind {
     FeatureKind::Fillet(EdgeBlend {
         edges,
         size: radius,
+        chamfer: Default::default(),
     })
 }
 
@@ -229,6 +230,7 @@ fn lost_reference_is_reported_and_the_rest_still_builds() {
     let bevel = part.add_feature(FeatureKind::Chamfer(EdgeBlend {
         edges: vec![good],
         size: 2.0,
+        chamfer: Default::default(),
     }));
 
     part.rebuild(&mut kernel);

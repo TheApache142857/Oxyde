@@ -78,6 +78,8 @@ pub fn feature_icon(kind: &FeatureKind) -> Icon {
         FeatureKind::Extrude(_) => Icon::Extrude,
         FeatureKind::Revolve(_) => Icon::Revolve,
         FeatureKind::Sweep(_) => Icon::Sweep,
+        FeatureKind::Hole(_) => Icon::Hole,
+        FeatureKind::Loft(_) => Icon::Loft,
         FeatureKind::Fillet(_) => Icon::Fillet,
         FeatureKind::Chamfer(_) => Icon::Chamfer,
         FeatureKind::Shell(_) => Icon::Shell,
@@ -697,6 +699,15 @@ impl OxydeApp {
         }
         let id = entry.id;
         let is_sketch = entry.type_name == "Sketch";
+        // The sketches it sweeps, to edit them without unfolding it.
+        let sketches: Vec<(FeatureId, String)> = feature
+            .map(|f| f.kind().swept_sketches())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| Some((s, self.doc.part.feature(s)?.name().to_owned())))
+            .collect();
+        let index = self.doc.part.index_of(id);
+        let rolled_back = self.doc.part.rollback_position().is_some();
         // Suppress, Hide and Delete act on the whole multi-selection when the row is in it.
         let targets = self.targets_of(id);
         let many = targets.len() > 1;
@@ -716,6 +727,12 @@ impl OxydeApp {
             if ui.button(edit).clicked() {
                 *action = Some(Action::Edit(id));
                 ui.close_menu();
+            }
+            for (sketch, name) in &sketches {
+                if ui.button(format!("Edit {name}")).clicked() {
+                    *action = Some(Action::Edit(*sketch));
+                    ui.close_menu();
+                }
             }
             if ui.button("Rename…").clicked() {
                 *action = Some(Action::Rename(id));
@@ -744,6 +761,20 @@ impl OxydeApp {
             let label = if suppressed { "Unsuppress" } else { "Suppress" };
             if ui.button(count(label)).clicked() {
                 *action = Some(Action::Suppress(targets.clone(), !suppressed));
+                ui.close_menu();
+            }
+            // SolidWorks' Rollback: the part as it was before this feature.
+            if let Some(index) = index
+                && ui
+                    .button("Roll back")
+                    .on_hover_text("Move the rollback bar above this feature")
+                    .clicked()
+            {
+                *action = Some(Action::RollTo(index));
+                ui.close_menu();
+            }
+            if rolled_back && ui.button("Roll to end").clicked() {
+                *action = Some(Action::RollTo(usize::MAX));
                 ui.close_menu();
             }
             ui.separator();
@@ -833,6 +864,12 @@ impl OxydeApp {
                 }
             }
             Action::RollTo(active) => {
+                // Past the last feature (`usize::MAX`): to the end.
+                let count = self.doc.part.features().len();
+                let current = self.doc.part.rollback_position().unwrap_or(count);
+                if active.min(count) == current.min(count) {
+                    return;
+                }
                 let before = self.doc.part.features().get(active).map(|f| f.id());
                 self.doc.checkpoint();
                 if self.doc.part.roll_back_to(before).is_ok() {
@@ -897,18 +934,7 @@ impl OxydeApp {
         self.selected_feature = Some(id);
         match kind.clone() {
             FeatureKind::Sketch(_) => self.edit_sketch(id, false),
-            FeatureKind::Extrude(e) => {
-                self.open_dialog(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
-                    editing: Some(id),
-                    dimension: self.parameter_full_name(id, FeatureParameter::Depth),
-                    sketch: Some(e.sketch),
-                    op: e.op,
-                    depth: e.extent.depth(),
-                    mid_plane: matches!(e.extent, oxyde_model::ExtrudeExtent::MidPlane { .. }),
-                    reverse: e.reverse,
-                    bodies: e.bodies.clone(),
-                }));
-            }
+            FeatureKind::Extrude(e) => self.open_extrude(Some(id), Some(e.sketch), Some(&e)),
             FeatureKind::Fillet(b) | FeatureKind::Chamfer(b) => {
                 let fillet = matches!(kind, FeatureKind::Fillet(_));
                 let parameter = if fillet {
@@ -916,17 +942,30 @@ impl OxydeApp {
                 } else {
                     FeatureParameter::Distance
                 };
-                self.open_dialog(Dialog::Blend(crate::dialogs::BlendDialog {
-                    editing: Some(id),
-                    dimension: self.parameter_full_name(id, parameter),
-                    fillet,
-                    size: b.size,
-                    edges: b.edges,
-                }));
+                let mut dialog = crate::dialogs::BlendDialog::new(fillet, b.edges);
+                dialog.editing = Some(id);
+                dialog.dimension = self.parameter_full_name(id, parameter);
+                dialog.size = b.size;
+                match b.chamfer {
+                    oxyde_model::ChamferShape::Equal => {}
+                    oxyde_model::ChamferShape::TwoDistances { distance, flip } => {
+                        dialog.chamfer_type = crate::dialogs::ChamferType::TwoDistances;
+                        dialog.second = distance;
+                        dialog.flip = flip;
+                    }
+                    oxyde_model::ChamferShape::AngleDistance { angle, flip } => {
+                        dialog.chamfer_type = crate::dialogs::ChamferType::AngleDistance;
+                        dialog.angle = angle.to_degrees();
+                        dialog.flip = flip;
+                    }
+                }
+                self.open_dialog(Dialog::Blend(dialog));
             }
             FeatureKind::Revolve(r) => self.open_revolve(Some(id), Some(r.sketch), r.op, Some(&r)),
             FeatureKind::Sweep(s) => self.open_sweep(Some(id), Some(&s)),
             FeatureKind::Shell(shell) => self.open_shell(Some(id), Some(&shell)),
+            FeatureKind::Hole(hole) => self.open_hole(id, &hole),
+            FeatureKind::Loft(l) => self.open_loft(Some(id), Some(&l)),
             FeatureKind::Combine(c) => self.open_combine(Some(id), Some(&c)),
             FeatureKind::Plane(plane) => self.open_ref_plane(Some(id), Some(&plane)),
             FeatureKind::Axis(axis) => self.open_ref_axis(Some(id), Some(&axis)),

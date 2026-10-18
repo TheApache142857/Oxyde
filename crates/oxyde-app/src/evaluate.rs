@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use oxyde_assembly::Primitive;
-use oxyde_kernel::{CurveKind, EdgeInfo, FaceInfo, Kernel, SurfaceKind};
+use oxyde_kernel::{CurveKind, Distance, EdgeInfo, FaceInfo, Kernel, SubShape, SurfaceKind};
 
 use crate::app::{OxydeApp, Selected};
 use crate::assembly::AsmSelected;
@@ -59,6 +59,63 @@ fn circle_text(e: &EdgeInfo, topology: &oxyde_kernel::Topology) -> Option<String
     })
 }
 
+/// What Measure measured last: the document revision and selection, and the distance.
+pub(crate) type MeasureCache = ((u64, Vec<Selected>), Option<Distance>);
+
+/// The same in an assembly: its revision and selection, and the distance.
+pub(crate) type AsmMeasureCache = ((u64, Vec<AsmSelected>), Option<Distance>);
+
+/// The radius of a cylindrical face: how far its vertices lie from its axis.
+fn face_radius(f: &FaceInfo, topology: &oxyde_kernel::Topology) -> Option<f64> {
+    if f.surface != SurfaceKind::Cylinder {
+        return None;
+    }
+    let axis = f.axis?;
+    let vertex = f
+        .edges
+        .iter()
+        .filter_map(|e| topology.edges.get(*e as usize))
+        .find_map(|e| e.vertices.first())?;
+    Some(axis.distance_to(topology.vertices.get(*vertex as usize)?.point))
+}
+
+/// Something round Measure can take the centre of: a cylinder's axis (a line), or a
+/// circular edge's centre on its axis.
+struct Round {
+    axis: oxyde_geom::Axis,
+    /// A circle has a centre; a cylinder only an axis.
+    circle: bool,
+}
+
+impl Round {
+    fn of_face(f: &FaceInfo) -> Option<Round> {
+        if !matches!(f.surface, SurfaceKind::Cylinder | SurfaceKind::Cone) {
+            return None;
+        }
+        Some(Round {
+            axis: f.axis?,
+            circle: false,
+        })
+    }
+
+    fn of_edge(e: &EdgeInfo) -> Option<Round> {
+        (e.curve == CurveKind::Circle).then_some(Round {
+            axis: e.axis?,
+            circle: true,
+        })
+    }
+
+    /// Between two centres, or between two parallel axes (a hole's and a circle's
+    /// included): SolidWorks' centre distance. `None` for axes at an angle.
+    fn centre_distance(&self, other: &Round) -> Option<f64> {
+        if self.circle && other.circle {
+            return Some(self.axis.origin.distance(other.axis.origin));
+        }
+        let parallel = self.axis.direction.cross(other.axis.direction).length() < 1e-9;
+        parallel.then(|| self.axis.distance_to(other.axis.origin))
+    }
+}
+
 fn mass_text(kg: f64) -> String {
     if kg >= 1.0 {
         format!("{kg:.3} kg")
@@ -102,6 +159,19 @@ impl OxydeApp {
             return;
         };
         let volume = crate::app::bodies_volume(&self.kernel, body).ok();
+        // The bodies' centres weighed by their volumes: the centre of mass of a part of
+        // one material.
+        let centre = (|| {
+            let mut sum = oxyde_geom::Vec3::ZERO;
+            let mut total = 0.0;
+            for solid in &body.solids {
+                let v = self.kernel.volume(solid.shape).ok()?;
+                let c = self.kernel.centre_of_mass(solid.shape).ok()?;
+                sum = sum + c.to_vec() * v;
+                total += v;
+            }
+            (total > 0.0).then(|| sum * (1.0 / total))
+        })();
         let topology = &body.topology;
         let area: f64 = topology.faces.iter().map(|f| f.area).sum();
         // The kernel's exact box: vertices, centroids and edge middles all lie on one
@@ -126,6 +196,13 @@ impl OxydeApp {
                     volume.map_or_else(|| "?".to_owned(), |v| format!("{v:.2} mm³")),
                 );
                 row(ui, "Surface area", format!("{area:.2} mm²"));
+                if let Some(c) = centre {
+                    row(
+                        ui,
+                        "Centre of mass",
+                        format!("X {:.2}  Y {:.2}  Z {:.2} mm", c.x, c.y, c.z),
+                    );
+                }
                 if lo[0].is_finite() {
                     row(
                         ui,
@@ -153,19 +230,15 @@ impl OxydeApp {
                         row(
                             ui,
                             "Mass",
-                            volume.map_or_else(|| "?".to_owned(), |v| mass_text(material.mass_kg(v))),
+                            volume
+                                .map_or_else(|| "?".to_owned(), |v| mass_text(material.mass_kg(v))),
                         );
                     } else {
                         row(ui, "Density", "unknown".to_owned());
                     }
                 }
             });
-        if self
-            .doc
-            .part
-            .material()
-            .is_some_and(|m| !m.has_density())
-        {
+        if self.doc.part.material().is_some_and(|m| !m.has_density()) {
             ui.label(
                 egui::RichText::new(
                     "The material has no density (the file it came from gave none): set one in \
@@ -301,6 +374,7 @@ impl OxydeApp {
             self.asm_measure_ui(ui);
             return;
         }
+        let gap = self.measured_gap();
         let Some(body) = self.doc.part.body() else {
             ui.label("There is no solid yet.");
             return;
@@ -340,10 +414,14 @@ impl OxydeApp {
             .spacing([16.0, 4.0])
             .show(ui, |ui| {
                 for (i, f) in faces.iter().enumerate() {
+                    let mut text = format!("{:.3} mm²", f.area);
+                    if let Some(radius) = face_radius(f, &body.topology) {
+                        text.push_str(&format!("  Ø {:.3}", radius * 2.0));
+                    }
                     row(
                         ui,
                         &format!("Face {} ({})", i + 1, surface_name(f.surface)),
-                        format!("{:.3} mm²", f.area),
+                        text,
                     );
                 }
                 for (i, e) in edges.iter().enumerate() {
@@ -365,35 +443,149 @@ impl OxydeApp {
                     let total: f64 = edges.iter().map(|e| e.length).sum();
                     row(ui, "Total length", format!("{total:.3} mm"));
                 }
+                // Two faces or edges: how far apart they are, and where.
+                if let Some(d) = gap {
+                    row(ui, "Distance", format!("{:.3} mm", d.distance));
+                    let v = d.on_b - d.on_a;
+                    row(
+                        ui,
+                        "dX, dY, dZ",
+                        format!("{:.3}, {:.3}, {:.3} mm", v.x.abs(), v.y.abs(), v.z.abs()),
+                    );
+                }
+                let rounds: Vec<Round> = faces
+                    .iter()
+                    .filter_map(|f| Round::of_face(f))
+                    .chain(edges.iter().filter_map(|e| Round::of_edge(e)))
+                    .collect();
+                if let ([a, b], 2) = (rounds.as_slice(), faces.len() + edges.len())
+                    && let Some(centres) = a.centre_distance(b)
+                {
+                    row(ui, "Centre distance", format!("{centres:.3} mm"));
+                }
                 // Two flat faces: the angle between them, and their distance if parallel.
-                if let [a, b] = faces.as_slice() {
-                    if let (Some(na), Some(nb)) = (a.normal, b.normal) {
-                        let cos = na.dot(nb).clamp(-1.0, 1.0);
-                        let angle = cos.acos().to_degrees();
-                        let folded = angle.min(180.0 - angle);
-                        row(ui, "Angle", format!("{folded:.3}°"));
-                        if folded < 1e-3 {
-                            let distance = (b.centroid - a.centroid).dot(na).abs();
-                            row(ui, "Distance", format!("{distance:.3} mm"));
-                        }
+                if let [a, b] = faces.as_slice()
+                    && let (Some(na), Some(nb)) = (a.normal, b.normal)
+                {
+                    let cos = na.dot(nb).clamp(-1.0, 1.0);
+                    let angle = cos.acos().to_degrees();
+                    let folded = angle.min(180.0 - angle);
+                    row(ui, "Angle", format!("{folded:.3}°"));
+                    if folded < 1e-3 {
+                        let distance = (b.centroid - a.centroid).dot(na).abs();
+                        row(ui, "Normal distance", format!("{distance:.3} mm"));
                     }
                 }
                 // Two straight edges: the angle between them.
-                if let [a, b] = edges.as_slice() {
-                    if let (Some(aa), Some(ab)) = (&a.axis, &b.axis) {
-                        if a.curve == CurveKind::Line && b.curve == CurveKind::Line {
-                            let cos = aa.direction.dot(ab.direction).clamp(-1.0, 1.0);
-                            let angle = cos.acos().to_degrees();
-                            row(ui, "Angle", format!("{:.3}°", angle.min(180.0 - angle)));
-                        }
-                    }
+                if let [a, b] = edges.as_slice()
+                    && let (Some(aa), Some(ab)) = (&a.axis, &b.axis)
+                    && a.curve == CurveKind::Line
+                    && b.curve == CurveKind::Line
+                {
+                    let cos = aa.direction.dot(ab.direction).clamp(-1.0, 1.0);
+                    let angle = cos.acos().to_degrees();
+                    row(ui, "Angle", format!("{:.3}°", angle.min(180.0 - angle)));
                 }
             });
+    }
+
+    /// The shortest distance between the two faces or edges selected in the part, worked
+    /// out by the kernel once per selection and rebuild.
+    fn measured_gap(&mut self) -> Option<Distance> {
+        let key = (self.doc.revision, self.selection.clone());
+        if let Some((cached, gap)) = &self.measure_cache
+            && *cached == key
+        {
+            return *gap;
+        }
+        let gap = (|| {
+            let body = self.doc.part.body()?;
+            let part = |s: &Selected| -> Option<(oxyde_kernel::ShapeHandle, SubShape)> {
+                match s {
+                    Selected::Face(name) => {
+                        let i = body.naming.find_face(name)?;
+                        let solid = body.solid_of_face(i)?;
+                        Some((solid.shape, SubShape::Face(solid.local_face(i)?)))
+                    }
+                    Selected::Edge(name) => {
+                        let i = body.naming.find_edge(name)?;
+                        let solid = body.solid_of_edge(i)?;
+                        Some((solid.shape, SubShape::Edge(solid.local_edge(i)?)))
+                    }
+                }
+            };
+            let [a, b] = self.selection.as_slice() else {
+                return None;
+            };
+            let ((sa, pa), (sb, pb)) = (part(a)?, part(b)?);
+            self.kernel.distance(sa, pa, sb, pb).ok().flatten()
+        })();
+        self.measure_cache = Some((key, gap));
+        gap
+    }
+
+    /// The shortest distance between the two faces or edges selected in the assembly,
+    /// where their components sit: placed copies of their solids measured by the kernel,
+    /// once per selection and change of the assembly.
+    fn asm_measured_gap(&mut self) -> Option<Distance> {
+        let doc = self.asm.as_ref()?;
+        let key = (doc.revision, doc.selection.clone());
+        if let Some((cached, gap)) = &self.asm_measure_cache
+            && *cached == key
+        {
+            return *gap;
+        }
+        // Each item: its solid placed in the assembly, and the face or edge on the copy.
+        let mut placed: Vec<(oxyde_kernel::ShapeHandle, SubShape)> = Vec::new();
+        if let [a, b] = doc.selection.as_slice() {
+            for item in [a, b] {
+                let found = (|| {
+                    let (o, face, edge) = match item {
+                        AsmSelected::Face(o, name) => (o, Some(name), None),
+                        AsmSelected::Edge(o, name) => (o, None, Some(name)),
+                        _ => return None,
+                    };
+                    let body = doc.part_at(o)?.part.body()?;
+                    let (solid, part) = match (face, edge) {
+                        (Some(name), _) => {
+                            let i = body.naming.find_face(name)?;
+                            let solid = body.solid_of_face(i)?;
+                            (solid, SubShape::Face(solid.local_face(i)?))
+                        }
+                        (_, Some(name)) => {
+                            let i = body.naming.find_edge(name)?;
+                            let solid = body.solid_of_edge(i)?;
+                            (solid, SubShape::Edge(solid.local_edge(i)?))
+                        }
+                        _ => return None,
+                    };
+                    Some((solid.shape, part, doc.occurrence_placement(o)?))
+                })();
+                let Some((shape, part, placement)) = found else {
+                    break;
+                };
+                // A moved copy keeps its faces and edges in order.
+                match self.kernel.transform(shape, &placement.transform()) {
+                    Ok(copy) => placed.push((copy.shape, part)),
+                    Err(_) => break,
+                }
+            }
+        }
+        let gap = match placed.as_slice() {
+            [(a, pa), (b, pb)] => self.kernel.distance(*a, *pa, *b, *pb).ok().flatten(),
+            _ => None,
+        };
+        for (shape, _) in placed {
+            self.kernel.release(shape);
+        }
+        self.asm_measure_cache = Some((key, gap));
+        gap
     }
 
     /// Areas, lengths, and the angle and distance between two faces or edges selected in
     /// the assembly, where they sit.
     fn asm_measure_ui(&mut self, ui: &mut egui::Ui) {
+        let gap = self.asm_measured_gap();
         let Some(doc) = self.asm.as_ref() else {
             return;
         };
@@ -461,6 +653,15 @@ impl OxydeApp {
                 if faces.len() > 1 {
                     let total: f64 = faces.iter().map(|(_, a, _)| a).sum();
                     row(ui, "Total area", format!("{total:.3} mm²"));
+                }
+                if let Some(d) = gap {
+                    row(ui, "Distance", format!("{:.3} mm", d.distance));
+                    let v = d.on_b - d.on_a;
+                    row(
+                        ui,
+                        "dX, dY, dZ",
+                        format!("{:.3}, {:.3}, {:.3} mm", v.x.abs(), v.y.abs(), v.z.abs()),
+                    );
                 }
                 // Two things with a direction: the angle between them, and the distance
                 // between two parallel planes or a plane and a point.

@@ -67,8 +67,19 @@ fn base_name(t: StudyType) -> &'static str {
 fn unique_name(base: &str, taken: &[String]) -> String {
     (1..)
         .map(|n| format!("{base} {n}"))
-        .find(|name| !taken.contains(name))
+        .find(|name| !taken.iter().any(|t| same_file(t, name)))
         .unwrap_or_else(|| base.to_owned())
+}
+
+/// Whether two study names would give one results file (`<study file>-<study>.oxyres`):
+/// the same once made safe for a file name and compared without case, as Windows and
+/// macOS compare file names.
+fn same_file(a: &str, b: &str) -> bool {
+    let key = |name: &str| {
+        let path = crate::simulation_files::results_path(std::path::Path::new("s.oxysim"), name);
+        path.to_string_lossy().to_lowercase()
+    };
+    key(a) == key(b)
 }
 
 /// The entries of a New Study menu; the type picked, once one is.
@@ -237,8 +248,20 @@ impl OxydeApp {
         if name.is_empty() || name.chars().any(char::is_control) {
             return Err("A study needs a name".to_owned());
         }
-        if self.simulation.others.iter().any(|p| p.study.name == name) {
-            return Err(format!("Another study is called {name}"));
+        if let Some(other) = self
+            .simulation
+            .others
+            .iter()
+            .find(|p| same_file(&p.study.name, name))
+        {
+            return Err(if other.study.name == name {
+                format!("Another study is called {name}")
+            } else {
+                format!(
+                    "{name} would share its results file with {}: choose another name",
+                    other.study.name
+                )
+            });
         }
         self.simulation.study.name = name.to_owned();
         Ok(())
@@ -420,6 +443,11 @@ mod tests {
         assert_eq!(unique_name("Thermal", &taken), "Thermal 1");
         assert_eq!(type_label(StudyType::TransientThermal), "Transient Thermal");
         assert_eq!(base_name(StudyType::ThermalStress), "Thermal Stress");
+        // Names one file name apart are the same study's results.
+        let taken = vec!["static 1".to_owned()];
+        assert_eq!(unique_name("Static", &taken), "Static 2");
+        assert!(same_file("Load/Case", "load_case"));
+        assert!(!same_file("Load 1", "Load 2"));
     }
 
     fn view_with(names: &[&str]) -> crate::simulation_ui::SimulationView {

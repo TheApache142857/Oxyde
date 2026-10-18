@@ -74,9 +74,17 @@ pub enum FeatureParameter {
     Spacing2,
     /// Number of instances in the second direction of a linear pattern.
     Count2,
+    /// Diameter of a hole.
+    Diameter,
+    /// Diameter of a hole's counterbore or countersink.
+    CounterDiameter,
+    /// Depth of a hole's counterbore.
+    CounterDepth,
+    /// A chamfer's distance on its other side.
+    Distance2,
 }
 
-const PARAMETERS: [(FeatureParameter, &str, &str); 10] = [
+const PARAMETERS: [(FeatureParameter, &str, &str); 14] = [
     (FeatureParameter::Depth, "depth", "Depth"),
     (FeatureParameter::Radius, "radius", "Radius"),
     (FeatureParameter::Distance, "distance", "Distance"),
@@ -95,6 +103,18 @@ const PARAMETERS: [(FeatureParameter, &str, &str); 10] = [
         "count2",
         "Instances (direction 2)",
     ),
+    (FeatureParameter::Diameter, "diameter", "Diameter"),
+    (
+        FeatureParameter::CounterDiameter,
+        "counter_diameter",
+        "Counterbore or countersink diameter",
+    ),
+    (
+        FeatureParameter::CounterDepth,
+        "counter_depth",
+        "Counterbore depth",
+    ),
+    (FeatureParameter::Distance2, "distance2", "Second distance"),
 ];
 
 impl FeatureParameter {
@@ -286,6 +306,8 @@ pub enum FeatureKind {
     Mirror(Mirror),
     Import(Import),
     Combine(Combine),
+    Hole(Hole),
+    Loft(Loft),
 }
 
 impl FeatureKind {
@@ -318,6 +340,12 @@ impl FeatureKind {
             FeatureKind::Mirror(_) => "Mirror",
             FeatureKind::Import(_) => "Imported",
             FeatureKind::Combine(_) => "Combine",
+            FeatureKind::Hole(_) => "Hole",
+            FeatureKind::Loft(l) => match l.op {
+                ExtrudeOp::Boss | ExtrudeOp::NewBody => "Loft",
+                ExtrudeOp::Cut => "Cut-Loft",
+                ExtrudeOp::Intersect => "Intersect-Loft",
+            },
         }
     }
 
@@ -331,11 +359,27 @@ impl FeatureKind {
             | FeatureKind::Axis(_)
             | FeatureKind::Mirror(_)
             | FeatureKind::Import(_)
-            | FeatureKind::Combine(_) => Vec::new(),
-            FeatureKind::Extrude(e) => vec![(P::Depth, e.extent.depth())],
+            | FeatureKind::Combine(_)
+            | FeatureKind::Loft(_) => Vec::new(),
+            FeatureKind::Extrude(e) => e
+                .extent
+                .depth()
+                .map(|d| (P::Depth, d))
+                .into_iter()
+                .collect(),
             FeatureKind::Revolve(r) => vec![(P::Angle, r.angle)],
             FeatureKind::Fillet(b) => vec![(P::Radius, b.size)],
-            FeatureKind::Chamfer(b) => vec![(P::Distance, b.size)],
+            FeatureKind::Chamfer(b) => {
+                let mut out = vec![(P::Distance, b.size)];
+                match b.chamfer {
+                    ChamferShape::Equal => {}
+                    ChamferShape::TwoDistances { distance, .. } => {
+                        out.push((P::Distance2, distance));
+                    }
+                    ChamferShape::AngleDistance { angle, .. } => out.push((P::Angle, angle)),
+                }
+                out
+            }
             FeatureKind::Shell(s) => vec![(P::Thickness, s.thickness)],
             FeatureKind::Plane(p) => vec![(P::Offset, p.offset)],
             FeatureKind::LinearPattern(l) => {
@@ -352,6 +396,22 @@ impl FeatureKind {
             FeatureKind::CircularPattern(c) => {
                 vec![(P::Angle, c.angle), (P::Count, f64::from(c.count))]
             }
+            FeatureKind::Hole(h) => {
+                let mut out = vec![(P::Diameter, h.diameter)];
+                match h.kind {
+                    HoleKind::Simple => {}
+                    HoleKind::Counterbore { diameter, depth } => {
+                        out.push((P::CounterDiameter, diameter));
+                        out.push((P::CounterDepth, depth));
+                    }
+                    HoleKind::Countersink { diameter, angle } => {
+                        out.push((P::CounterDiameter, diameter));
+                        out.push((P::Angle, angle));
+                    }
+                }
+                out.extend(h.depth.map(|d| (P::Depth, d)));
+                out
+            }
         }
     }
 
@@ -362,6 +422,15 @@ impl FeatureKind {
         use FeatureParameter as P;
         match self {
             FeatureKind::LinearPattern(_) => vec![P::Spacing, P::Count, P::Spacing2, P::Count2],
+            FeatureKind::Extrude(_) => vec![P::Depth],
+            FeatureKind::Chamfer(_) => vec![P::Distance, P::Distance2, P::Angle],
+            FeatureKind::Hole(_) => vec![
+                P::Diameter,
+                P::CounterDiameter,
+                P::CounterDepth,
+                P::Angle,
+                P::Depth,
+            ],
             other => other.parameters().into_iter().map(|(p, _)| p).collect(),
         }
     }
@@ -383,16 +452,26 @@ impl FeatureKind {
         use FeatureParameter as P;
         let count = || value.round().max(1.0).min(f64::from(u32::MAX)) as u32;
         match (self, parameter) {
-            (FeatureKind::Extrude(e), P::Depth) => {
-                e.extent = match e.extent {
-                    ExtrudeExtent::Blind { .. } => ExtrudeExtent::Blind { depth: value },
-                    ExtrudeExtent::MidPlane { .. } => ExtrudeExtent::MidPlane { depth: value },
-                };
-            }
+            (FeatureKind::Extrude(e), P::Depth) => match &mut e.extent {
+                ExtrudeExtent::Blind { depth } | ExtrudeExtent::MidPlane { depth } => {
+                    *depth = value;
+                }
+                ExtrudeExtent::ThroughAll { .. } | ExtrudeExtent::UpToSurface { .. } => {
+                    return false;
+                }
+            },
             (FeatureKind::Revolve(r), P::Angle) => r.angle = value,
             (FeatureKind::Fillet(b), P::Radius) | (FeatureKind::Chamfer(b), P::Distance) => {
                 b.size = value;
             }
+            (FeatureKind::Chamfer(b), P::Distance2) => match &mut b.chamfer {
+                ChamferShape::TwoDistances { distance, .. } => *distance = value,
+                _ => return false,
+            },
+            (FeatureKind::Chamfer(b), P::Angle) => match &mut b.chamfer {
+                ChamferShape::AngleDistance { angle, .. } => *angle = value,
+                _ => return false,
+            },
             (FeatureKind::Shell(s), P::Thickness) => s.thickness = value,
             (FeatureKind::Plane(p), P::Offset) => p.offset = value,
             (FeatureKind::LinearPattern(l), P::Spacing) => l.first.spacing = value,
@@ -407,6 +486,25 @@ impl FeatureKind {
             },
             (FeatureKind::CircularPattern(c), P::Angle) => c.angle = value,
             (FeatureKind::CircularPattern(c), P::Count) => c.count = count(),
+            (FeatureKind::Hole(h), P::Diameter) => h.diameter = value,
+            (FeatureKind::Hole(h), P::Depth) => match &mut h.depth {
+                Some(depth) => *depth = value,
+                None => return false,
+            },
+            (FeatureKind::Hole(h), P::CounterDiameter) => match &mut h.kind {
+                HoleKind::Counterbore { diameter, .. } | HoleKind::Countersink { diameter, .. } => {
+                    *diameter = value;
+                }
+                HoleKind::Simple => return false,
+            },
+            (FeatureKind::Hole(h), P::CounterDepth) => match &mut h.kind {
+                HoleKind::Counterbore { depth, .. } => *depth = value,
+                _ => return false,
+            },
+            (FeatureKind::Hole(h), P::Angle) => match &mut h.kind {
+                HoleKind::Countersink { angle, .. } => *angle = value,
+                _ => return false,
+            },
             _ => return false,
         }
         true
@@ -429,6 +527,9 @@ impl FeatureKind {
             FeatureKind::Extrude(e) => {
                 out.push(e.sketch);
                 out.extend(e.bodies.iter().map(|b| b.feature));
+                if let ExtrudeExtent::UpToSurface { plane } = &e.extent {
+                    plane.collect_features(&mut out);
+                }
             }
             FeatureKind::Revolve(r) => {
                 out.push(r.sketch);
@@ -468,11 +569,20 @@ impl FeatureKind {
             FeatureKind::Mirror(m) => {
                 out.extend(&m.seeds);
                 m.plane.collect_features(&mut out);
+                out.extend(m.bodies.iter().map(|b| b.feature));
             }
             FeatureKind::Import(_) => {}
             FeatureKind::Combine(c) => {
                 out.push(c.target.feature);
                 out.extend(c.tools.iter().map(|b| b.feature));
+            }
+            FeatureKind::Hole(h) => {
+                out.push(h.sketch);
+                out.extend(h.bodies.iter().map(|b| b.feature));
+            }
+            FeatureKind::Loft(l) => {
+                out.extend(&l.profiles);
+                out.extend(l.bodies.iter().map(|b| b.feature));
             }
         }
         out.sort();
@@ -485,7 +595,11 @@ impl FeatureKind {
     pub fn is_patternable(&self) -> bool {
         matches!(
             self,
-            FeatureKind::Extrude(_) | FeatureKind::Revolve(_) | FeatureKind::Sweep(_)
+            FeatureKind::Extrude(_)
+                | FeatureKind::Revolve(_)
+                | FeatureKind::Sweep(_)
+                | FeatureKind::Hole(_)
+                | FeatureKind::Loft(_)
         )
     }
 
@@ -496,6 +610,8 @@ impl FeatureKind {
             FeatureKind::Extrude(e) => vec![e.sketch],
             FeatureKind::Revolve(r) => vec![r.sketch],
             FeatureKind::Sweep(s) => vec![s.profile, s.path],
+            FeatureKind::Hole(h) => vec![h.sketch],
+            FeatureKind::Loft(l) => l.profiles.clone(),
             _ => Vec::new(),
         }
     }
@@ -506,6 +622,8 @@ impl FeatureKind {
             FeatureKind::Extrude(e) => Some(e.op),
             FeatureKind::Revolve(r) => Some(r.op),
             FeatureKind::Sweep(s) => Some(s.op),
+            FeatureKind::Hole(_) => Some(ExtrudeOp::Cut),
+            FeatureKind::Loft(l) => Some(l.op),
             _ => None,
         }
     }
@@ -657,18 +775,29 @@ impl ExtrudeOp {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Where an extrusion ends: SolidWorks' end conditions.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExtrudeExtent {
     /// From the sketch plane, `depth` in one direction.
     Blind { depth: f64 },
     /// `depth` in total, centred on the sketch plane.
     MidPlane { depth: f64 },
+    /// From the sketch plane through everything the part holds in that direction (Through
+    /// All); with `both`, through everything on either side of the sketch plane (Through
+    /// All - Both). A cut through all goes a little further, so no skin is left.
+    ThroughAll { both: bool },
+    /// From the sketch plane up to a plane: a flat face of the part (its plane, extended
+    /// beyond the face), a reference plane or a standard one (Up To Surface). It goes
+    /// towards the plane, whichever side it is on.
+    UpToSurface { plane: PlaneRef },
 }
 
 impl ExtrudeExtent {
-    pub fn depth(self) -> f64 {
+    /// The depth of a blind or mid-plane extrusion; the other end conditions have none.
+    pub fn depth(&self) -> Option<f64> {
         match self {
-            ExtrudeExtent::Blind { depth } | ExtrudeExtent::MidPlane { depth } => depth,
+            ExtrudeExtent::Blind { depth } | ExtrudeExtent::MidPlane { depth } => Some(*depth),
+            ExtrudeExtent::ThroughAll { .. } | ExtrudeExtent::UpToSurface { .. } => None,
         }
     }
 }
@@ -704,6 +833,33 @@ impl Extrude {
 pub struct EdgeBlend {
     pub edges: Vec<EdgeName>,
     pub size: f64,
+    /// A chamfer's shape (a fillet's is always [`ChamferShape::Equal`]).
+    pub chamfer: ChamferShape,
+}
+
+/// How a chamfer bevels its edges, as SolidWorks' chamfer types.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ChamferShape {
+    /// `size` along both faces: a 45° bevel.
+    #[default]
+    Equal,
+    /// `size` along one face of each edge and `distance` along the other.
+    TwoDistances { distance: f64, flip: bool },
+    /// `size` along one face of each edge, the bevel at `angle` (radians) from it.
+    AngleDistance { angle: f64, flip: bool },
+}
+
+impl ChamferShape {
+    /// Whether the faces swap: `size` then runs along the second face of each edge's
+    /// name rather than the first (names are sorted, so this is stable).
+    pub fn flipped(self) -> bool {
+        match self {
+            ChamferShape::Equal => false,
+            ChamferShape::TwoDistances { flip, .. } | ChamferShape::AngleDistance { flip, .. } => {
+                flip
+            }
+        }
+    }
 }
 
 /// What a revolve turns about.
@@ -826,9 +982,58 @@ pub struct CircularPattern {
     pub reverse: bool,
 }
 
-/// Mirror image of features through a plane.
+/// Mirror image of features, or of whole bodies, through a plane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mirror {
+    /// Features whose tool bodies are copied (extrusions, revolves, sweeps, holes).
     pub seeds: Vec<FeatureId>,
     pub plane: PlaneRef,
+    /// Bodies mirrored whole, each joined to its mirror image (SolidWorks' Bodies to
+    /// Mirror with Merge solids): half a symmetric part made whole. A mirror copies
+    /// features or bodies, not both.
+    pub bodies: Vec<BodyId>,
+}
+
+/// A solid lofted through the closed contours of several sketches, in order (SolidWorks'
+/// Loft): a transition from a square to a circle, a tapered handle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loft {
+    /// The sketches lofted through, in order, each one closed contour (no holes).
+    pub profiles: Vec<FeatureId>,
+    pub op: ExtrudeOp,
+    /// Straight from one contour to the next, rather than smooth through them all.
+    pub ruled: bool,
+    /// Bodies it joins, cuts or intersects; empty = automatic, as for [`Extrude`].
+    pub bodies: Vec<BodyId>,
+}
+
+/// The shape of a hole's mouth, as SolidWorks' Hole Wizard types.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HoleKind {
+    /// A plain drilled hole (clearance or tap drill).
+    Simple,
+    /// A counterbore for a socket head: its diameter and depth (mm).
+    Counterbore { diameter: f64, depth: f64 },
+    /// A countersink for a flat head: its diameter at the face (mm) and its included angle
+    /// (radians, 90° for ISO screws).
+    Countersink { diameter: f64, angle: f64 },
+}
+
+/// Holes drilled at the points of a sketch (Hole Wizard): one at each lone point of the
+/// sketch (not the ends or centres of its curves, nor its origin), along the sketch's
+/// normal into the part, cutting the bodies like a Cut-Extrude.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hole {
+    /// The sketch whose points place the holes, usually on a face of the part.
+    pub sketch: FeatureId,
+    pub kind: HoleKind,
+    /// Of the hole itself (mm).
+    pub diameter: f64,
+    /// How deep the full diameter goes from the sketch plane (mm), with a 118° drill point
+    /// under it; `None` goes through everything (no point).
+    pub depth: Option<f64>,
+    /// Drill out of the face instead of into it (along the sketch normal).
+    pub reverse: bool,
+    /// Bodies it cuts; empty = every body.
+    pub bodies: Vec<BodyId>,
 }

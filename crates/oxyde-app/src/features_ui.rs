@@ -7,14 +7,15 @@
 //! viewport or the timeline while the command is open adds to the lists.
 
 use oxyde_model::{
-    AxisRef, BodyId, CircularPattern, Combine, CombineOp, ExtrudeOp, FaceName, Feature, FeatureId,
-    FeatureKind, FeatureParameter, LinearPattern, Mirror, PatternDirection, PlaneRef, RefAxis,
-    RefPlane, Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane, Sweep,
+    AxisRef, BodyId, CircularPattern, Combine, CombineOp, Extrude, ExtrudeExtent, ExtrudeOp,
+    FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, LinearPattern, Mirror,
+    PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, StandardAxis,
+    StandardPlane, Sweep,
 };
 use oxyde_sketch::Geometry;
 
 use crate::app::{OxydeApp, Selected};
-use crate::dialogs::{Dialog, plane_name};
+use crate::dialogs::{Dialog, EndCondition, plane_name};
 
 /// Labelled choices for a combo box.
 pub type Choices<T> = Vec<(String, T)>;
@@ -125,6 +126,34 @@ pub struct PatternDialog {
     pub equal_spacing: bool,
     pub planes: Choices<PlaneRef>,
     pub plane: usize,
+    /// Mirror: bodies mirrored whole, each joined to its image.
+    pub bodies: Vec<BodyId>,
+    /// Mirror: clicks on faces pick bodies to mirror rather than the mirror plane.
+    pub bodies_next: bool,
+}
+
+/// The Loft command.
+pub struct LoftDialog {
+    pub editing: Option<FeatureId>,
+    /// The sketches lofted through, in the order picked.
+    pub profiles: Vec<FeatureId>,
+    pub op: ExtrudeOp,
+    pub ruled: bool,
+    pub bodies: Vec<BodyId>,
+}
+
+impl LoftDialog {
+    pub fn feature(&self) -> Result<FeatureKind, &'static str> {
+        if self.profiles.len() < 2 {
+            return Err("Pick two sketches at least, in order");
+        }
+        Ok(FeatureKind::Loft(oxyde_model::Loft {
+            profiles: self.profiles.clone(),
+            op: self.op,
+            ruled: self.ruled,
+            bodies: self.bodies.clone(),
+        }))
+    }
 }
 
 pub struct PlaneDialog {
@@ -183,8 +212,13 @@ impl ShellDialog {
 impl PatternDialog {
     /// `part` puts the seeds in timeline order.
     pub fn feature(&self, part: &oxyde_model::Part) -> Result<FeatureKind, &'static str> {
-        if self.seeds.is_empty() {
-            return Err("Choose at least one feature to copy");
+        let mirroring_bodies = self.kind == PatternKind::Mirror && !self.bodies.is_empty();
+        if self.seeds.is_empty() && !mirroring_bodies {
+            return Err(if self.kind == PatternKind::Mirror {
+                "Choose features to copy, or bodies to mirror"
+            } else {
+                "Choose at least one feature to copy"
+            });
         }
         let mut seeds = self.seeds.clone();
         seeds.sort_by_key(|id| part.index_of(*id));
@@ -230,6 +264,7 @@ impl PatternDialog {
                 FeatureKind::Mirror(Mirror {
                     seeds,
                     plane: plane.clone(),
+                    bodies: self.bodies.clone(),
                 })
             }
         })
@@ -578,7 +613,27 @@ impl OxydeApp {
             plane: 0,
             axes,
             planes,
+            bodies: Vec::new(),
+            bodies_next: false,
         };
+        // A mirror of the body selected in the tree, or of the part's only body when there
+        // is no feature to copy: half a symmetric part made whole.
+        if kind == PatternKind::Mirror && editing.is_none() {
+            let only_body = self
+                .doc
+                .part
+                .body()
+                .filter(|b| b.solids.len() == 1)
+                .and_then(|b| b.solids.first())
+                .map(|s| s.id);
+            let body = self
+                .selected_body
+                .or_else(|| d.seeds.is_empty().then_some(only_body).flatten());
+            if let Some(body) = body {
+                d.seeds.clear();
+                d.bodies = vec![body];
+            }
+        }
         // A selected edge or face is the most likely direction; a second one, the second
         // direction.
         if editing.is_none() {
@@ -633,6 +688,7 @@ impl OxydeApp {
             }
             Some(FeatureKind::Mirror(m)) => {
                 d.seeds = m.seeds.clone();
+                d.bodies = m.bodies.clone();
                 d.planes = with_current(d.planes, Some(&m.plane));
                 d.plane = position(&d.planes, Some(&m.plane));
             }
@@ -651,14 +707,77 @@ impl OxydeApp {
         self.open_dialog(Dialog::Pattern(d));
     }
 
+    /// The Loft command: through the sketches selected in the tree (in the order they
+    /// were selected), or none yet; or the loft `editing` as `existing` defines it.
+    pub(crate) fn open_loft(
+        &mut self,
+        editing: Option<FeatureId>,
+        existing: Option<&oxyde_model::Loft>,
+    ) {
+        let profiles = match existing {
+            Some(l) => l.profiles.clone(),
+            None => self
+                .selected_feature_set()
+                .into_iter()
+                .filter(|id| {
+                    matches!(
+                        self.doc.part.feature(*id).map(|f| f.kind()),
+                        Some(FeatureKind::Sketch(_))
+                    )
+                })
+                .collect(),
+        };
+        self.open_dialog(Dialog::Loft(LoftDialog {
+            editing,
+            profiles,
+            op: existing.map_or(ExtrudeOp::Boss, |l| l.op),
+            ruled: existing.is_some_and(|l| l.ruled),
+            bodies: existing.map(|l| l.bodies.clone()).unwrap_or_default(),
+        }));
+        if existing.is_none() {
+            self.status = "Click the sketches to loft through in the tree, in order".to_owned();
+        }
+    }
+
     pub(crate) fn begin_pattern(&mut self, kind: PatternKind) {
-        if self.seed_choices(None).is_empty() {
+        // A mirror can mirror the body itself.
+        let mirror_body = kind == PatternKind::Mirror && self.doc.part.body().is_some();
+        if self.seed_choices(None).is_empty() && !mirror_body {
             self.status =
                 "Patterns and mirrors copy extrusions, revolves and sweeps: add one first"
                     .to_owned();
             return;
         }
         self.open_pattern(None, kind, None);
+    }
+
+    /// The Extrude command: a new extrusion of `sketch` (`existing` = `None`), or the
+    /// feature `editing` as `existing` defines it.
+    pub(crate) fn open_extrude(
+        &mut self,
+        editing: Option<FeatureId>,
+        sketch: Option<FeatureId>,
+        existing: Option<&Extrude>,
+    ) {
+        let up_to = match existing.map(|e| &e.extent) {
+            Some(ExtrudeExtent::UpToSurface { plane }) => Some(plane),
+            _ => None,
+        };
+        let planes = with_current(self.plane_choices(editing), up_to);
+        let up_to = up_to.map(|p| position(&planes, Some(p)));
+        self.open_dialog(Dialog::Extrude(crate::dialogs::ExtrudeDialog {
+            editing,
+            dimension: editing.and_then(|id| self.parameter_full_name(id, FeatureParameter::Depth)),
+            sketch: existing.map(|e| e.sketch).or(sketch),
+            op: existing.map_or(ExtrudeOp::Boss, |e| e.op),
+            end: existing.map_or(EndCondition::Blind, |e| EndCondition::of(&e.extent)),
+            depth: existing.and_then(|e| e.extent.depth()).unwrap_or(10.0),
+            reverse: existing.is_some_and(|e| e.reverse),
+            planes,
+            up_to,
+            up_to_next: false,
+            bodies: existing.map(|e| e.bodies.clone()).unwrap_or_default(),
+        }));
     }
 
     pub(crate) fn open_ref_plane(

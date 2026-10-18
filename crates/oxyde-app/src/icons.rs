@@ -16,9 +16,13 @@ pub enum Icon {
     Extrude,
     Revolve,
     Sweep,
+    /// Loft: a square at the bottom turning into a circle at the top.
+    Loft,
     Fillet,
     Chamfer,
     Shell,
+    /// Hole Wizard: a block with a counterbored hole.
+    Hole,
     LinearPattern,
     CircularPattern,
     Mirror,
@@ -53,8 +57,20 @@ pub enum Icon {
     CenterRectangle,
     Circle,
     Arc,
+    /// 3 Point Arc: an arc through its two ends and a point between.
+    ThreePointArc,
+    /// Tangent Arc: a line going on into an arc.
+    TangentArc,
+    /// Straight Slot: a stadium with its centerline.
+    Slot,
+    /// Polygon: a hexagon in its construction circle.
+    Polygon,
+    /// Point: a sketch point.
+    Point,
     SmartDimension,
     Trim,
+    /// Extend Entities: a line lengthened, dashed, up to another one.
+    Extend,
     SketchFillet,
     Offset,
     Convert,
@@ -454,6 +470,26 @@ fn draw(pen: &Pen, icon: Icon) {
             let (x, y) = around[0];
             pen.head((x + 1.2, y - 1.6), 1.0, -1.2, 4.0, ACCENT);
         }
+        Loft => {
+            // A square seen from the side at the bottom, a circle (an ellipse) at the top,
+            // their sides joined.
+            let bottom = [(3.0, 18.0), (13.0, 22.0), (21.0, 18.0), (11.0, 14.0)];
+            let top = Pen::arc_points(12.0, 5.5, 5.0, 2.2, 0.0, TAU);
+            pen.poly(
+                &[
+                    (3.0, 18.0),
+                    (7.0, 5.5),
+                    (17.0, 5.5),
+                    (21.0, 18.0),
+                    (13.0, 22.0),
+                ],
+                BODY,
+                INK,
+            );
+            pen.poly(&bottom, BODY_TOP, INK);
+            pen.fill(&top, BODY_TOP);
+            pen.closed(&top, 1.2, ACCENT);
+        }
         Sweep => {
             // A round profile at the bottom left, carried along a bent path to the top
             // right: a pipe elbow, drawn as its two straight runs and the bend.
@@ -539,6 +575,16 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.fill(&[(5.0, 9.0), (8.5, 5.5), (8.5, 7.0), (5.0, 10.5)], INK);
             pen.line(&[(13.0, 9.0), (16.5, 5.5)], 1.6, ACCENT);
             pen.line(&[(5.0, 9.0), (13.0, 9.0)], 1.6, ACCENT);
+        }
+        Hole => {
+            pen.solid(2.0, 10.0, 14.0, 11.0, 6.0);
+            // A counterbored hole in the top face, its axis going down into the block.
+            let counterbore = Pen::arc_points(12.0, 7.0, 4.4, 1.9, 0.0, TAU);
+            pen.fill(&counterbore, BODY_SIDE);
+            pen.closed(&counterbore, 1.2, INK);
+            let hole = Pen::arc_points(12.0, 7.6, 2.3, 1.0, 0.0, TAU);
+            pen.fill(&hole, INK);
+            pen.dashed(&[(12.0, 9.0), (12.0, 23.0)], 1.0, ACCENT, 2.0, 1.5);
         }
         LinearPattern => {
             for x in [2.0, 9.5, 17.0] {
@@ -683,6 +729,44 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.vertex(3.0, 15.0, INK);
             pen.vertex(21.0, 15.0, INK);
         }
+        ThreePointArc => {
+            pen.arc(12.0, 17.0, 9.0, PI, TAU, 2.0, SKETCH);
+            pen.vertex(3.0, 17.0, INK);
+            pen.vertex(21.0, 17.0, INK);
+            pen.vertex(12.0, 8.0, ACCENT);
+        }
+        TangentArc => {
+            pen.line(&[(2.0, 19.0), (12.0, 19.0)], 2.0, SKETCH);
+            pen.arc(12.0, 12.0, 7.0, FRAC_PI_2, -FRAC_PI_2, 2.0, ACCENT);
+            pen.vertex(12.0, 19.0, INK);
+            pen.vertex(12.0, 5.0, INK);
+        }
+        Slot => {
+            // Two half circles of radius 5 about (7, 12) and (17, 12), joined.
+            pen.arc(7.0, 12.0, 5.0, FRAC_PI_2, 3.0 * FRAC_PI_2, 2.0, SKETCH);
+            pen.arc(17.0, 12.0, 5.0, -FRAC_PI_2, FRAC_PI_2, 2.0, SKETCH);
+            pen.line(&[(7.0, 7.0), (17.0, 7.0)], 2.0, SKETCH);
+            pen.line(&[(7.0, 17.0), (17.0, 17.0)], 2.0, SKETCH);
+            pen.dashed(&[(7.0, 12.0), (17.0, 12.0)], 1.0, INK, 2.0, 1.5);
+            pen.vertex(7.0, 12.0, INK);
+            pen.vertex(17.0, 12.0, INK);
+        }
+        Polygon => {
+            pen.ring(12.0, 12.0, 9.0, 0.8, INK);
+            let corners: Vec<(f32, f32)> = (0..6)
+                .map(|k| {
+                    let a = k as f32 * TAU / 6.0;
+                    (12.0 + 9.0 * a.cos(), 12.0 + 9.0 * a.sin())
+                })
+                .collect();
+            pen.closed(&corners, 2.0, SKETCH);
+            pen.vertex(12.0, 12.0, INK);
+        }
+        Point => {
+            pen.line(&[(12.0, 5.0), (12.0, 19.0)], 0.8, INK);
+            pen.line(&[(5.0, 12.0), (19.0, 12.0)], 0.8, INK);
+            pen.circle(12.0, 12.0, 3.2, SKETCH, Some((1.2, INK)));
+        }
         SmartDimension => {
             pen.line(&[(4.0, 20.0), (20.0, 20.0)], 2.0, SKETCH);
             pen.line(&[(4.0, 18.0), (4.0, 6.0)], 1.0, INK);
@@ -706,6 +790,14 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.ring(20.0, 18.5, 2.0, 1.4, INK);
             pen.line(&[(16.0, 16.8), (20.5, 9.0)], 1.4, INK);
             pen.line(&[(19.0, 16.8), (14.5, 9.0)], 1.4, INK);
+        }
+        Extend => {
+            // A line, the piece added to it dashed with an arrow, and the line it reaches.
+            pen.line(&[(19.0, 3.0), (19.0, 21.0)], 2.0, SKETCH);
+            pen.line(&[(2.0, 12.0), (10.0, 12.0)], 2.0, SKETCH);
+            pen.dashed(&[(10.0, 12.0), (18.0, 12.0)], 1.8, ACCENT, 2.5, 1.5);
+            pen.head((17.0, 12.0), 1.0, 0.0, 3.5, ACCENT);
+            pen.vertex(10.0, 12.0, INK);
         }
         SketchFillet => {
             // A corner cut back to a tangent arc; the sharp corner it replaced, dashed.
@@ -1443,16 +1535,18 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 87] = {
+pub const ALL: [Icon; 95] = {
     use Icon::*;
     [
         Sketch,
         Extrude,
         Revolve,
         Sweep,
+        Loft,
         Fillet,
         Chamfer,
         Shell,
+        Hole,
         LinearPattern,
         CircularPattern,
         Mirror,
@@ -1480,8 +1574,14 @@ pub const ALL: [Icon; 87] = {
         CenterRectangle,
         Circle,
         Arc,
+        ThreePointArc,
+        TangentArc,
+        Slot,
+        Polygon,
+        Point,
         SmartDimension,
         Trim,
+        Extend,
         SketchFillet,
         Offset,
         Convert,

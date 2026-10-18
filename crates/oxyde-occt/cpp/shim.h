@@ -20,6 +20,10 @@ namespace oxyde::occt {
 // Shared structs, defined by the cxx-generated header.
 struct AxisData;
 struct BoundsData;
+struct LoftSectionData;
+struct DistanceData;
+struct PolylineData;
+struct ProjectionData;
 struct MeshData;
 struct OpResultData;
 struct PlaneData;
@@ -42,6 +46,7 @@ public:
                          double dx, double dy, double dz);
     OpResultData revolve(const PlaneData& plane, rust::Slice<const RegionData> regions,
                          const AxisData& axis, double angle);
+    OpResultData loft(rust::Slice<const LoftSectionData> sections, bool ruled);
     OpResultData sweep(const PlaneData& plane, rust::Slice<const RegionData> regions,
                        const PlaneData& path_plane, rust::Slice<const SegmentData> path);
     OpResultData shell(std::uint64_t shape, rust::Slice<const std::uint32_t> faces,
@@ -53,6 +58,9 @@ public:
                         double radius);
     OpResultData chamfer(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
                          double distance);
+    OpResultData chamfer_with(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
+                              rust::Slice<const std::uint32_t> faces, double first,
+                              std::uint8_t kind, double second);
     void release(std::uint64_t shape);
 
     TopologyData topology(std::uint64_t shape) const;
@@ -61,6 +69,10 @@ public:
     double volume(std::uint64_t shape) const;
     PointData centre_of_mass(std::uint64_t shape) const;
     BoundsData bounds(std::uint64_t shape) const;
+    DistanceData distance(std::uint64_t a, std::uint8_t a_kind, std::uint32_t a_index,
+                          std::uint64_t b, std::uint8_t b_kind, std::uint32_t b_index) const;
+    ProjectionData project_edges(rust::Slice<const std::uint64_t> shapes, const PlaneData& view,
+                                 double deflection) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;
     VolumeMeshData volume_mesh(std::uint64_t shape, const VolumeMeshOptionsData& options) const;
 

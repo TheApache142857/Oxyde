@@ -74,6 +74,15 @@ impl Configurations {
         self.list.iter().position(|c| c.name == name)
     }
 
+    /// Forgets a feature deleted from the part: whether it is suppressed, and its own
+    /// dimensions and those of its sketch, in every configuration.
+    pub(crate) fn forget_feature(&mut self, id: FeatureId) {
+        for c in &mut self.list {
+            c.suppressed.remove(&id);
+            c.dimensions.retain(|r, _| r.feature != id);
+        }
+    }
+
     /// Unique, valid names and an active index in range.
     pub(crate) fn validate(&self) -> Result<(), ModelError> {
         let mut seen = std::collections::HashSet::new();
@@ -453,6 +462,19 @@ mod tests {
 
     fn depth_of(part: &Part, depth: DimensionRef) -> f64 {
         part.dimension(depth).unwrap().value
+    }
+
+    #[test]
+    fn a_deleted_feature_leaves_the_configurations() {
+        let (mut part, depth, other) = part();
+        part.add_configuration("Thick").unwrap();
+        part.configure_dimension(depth).unwrap();
+        part.configure_feature(other).unwrap();
+        part.delete(other).unwrap();
+        assert!(part.configurations().configured_features().is_empty());
+        assert_eq!(part.configurations().configured_dimensions(), vec![depth]);
+        part.delete(depth.feature).unwrap();
+        assert!(part.configurations().configured_dimensions().is_empty());
     }
 
     #[test]

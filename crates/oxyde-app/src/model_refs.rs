@@ -56,7 +56,44 @@ fn on_ccw_arc(center: Point2, start: Point2, end: Point2, p: Point2) -> bool {
     at <= sweep
 }
 
+impl ModelCurve {
+    /// Its two ends, or none for a full circle.
+    fn ends(&self) -> Option<[Point2; 2]> {
+        match *self {
+            ModelCurve::Line(a, b) => Some([a, b]),
+            ModelCurve::Arc { start, end, .. } => Some([start, end]),
+            ModelCurve::Circle(..) => None,
+        }
+    }
+}
+
 impl ModelGeometry {
+    /// The curves joined end to end with curve `index`, itself included, in no particular
+    /// order: a face's outline in the sketch plane, for Convert Entities to copy at once.
+    pub fn chain_of(&self, index: usize) -> Vec<usize> {
+        let near = |a: Point2, b: Point2| a.distance(b) < 1e-6;
+        let mut chain = vec![index];
+        let mut k = 0;
+        while let Some(&current) = chain.get(k) {
+            k += 1;
+            let Some(ends) = self.curves.get(current).and_then(ModelCurve::ends) else {
+                continue;
+            };
+            for (i, curve) in self.curves.iter().enumerate() {
+                if chain.contains(&i) {
+                    continue;
+                }
+                let joined = curve
+                    .ends()
+                    .is_some_and(|other| ends.iter().any(|a| other.iter().any(|b| near(*a, *b))));
+                if joined {
+                    chain.push(i);
+                }
+            }
+        }
+        chain
+    }
+
     pub fn from_body(topology: &Topology, plane: &Plane) -> Self {
         let mut out = Self::default();
         let vertex = |i: u32| topology.vertices.get(i as usize).map(|v| v.point);

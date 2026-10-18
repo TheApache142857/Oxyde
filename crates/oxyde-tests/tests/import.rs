@@ -57,6 +57,7 @@ fn imported_box_is_named_and_can_be_built_on() {
     part.add_feature(FeatureKind::Fillet(EdgeBlend {
         edges: vec![edge],
         size: 2.0,
+        chamfer: Default::default(),
     }));
 
     // And a boss sketched on the Front plane, fused with the imported body.

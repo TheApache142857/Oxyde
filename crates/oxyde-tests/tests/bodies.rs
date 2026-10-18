@@ -148,6 +148,7 @@ fn a_fillet_works_on_the_body_of_its_edges() {
             FaceName::end_cap(b),
         )],
         size: 2.0,
+        chamfer: Default::default(),
     }));
     part.rebuild(&mut kernel);
     assert_ok(&part);
@@ -193,6 +194,7 @@ fn a_single_body_part_builds_as_before() {
             FaceName::end_cap(a),
         )],
         size: 1.0,
+        chamfer: Default::default(),
     }));
     part.rebuild(&mut kernel);
     assert_ok(&part);

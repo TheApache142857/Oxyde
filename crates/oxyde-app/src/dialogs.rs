@@ -5,7 +5,8 @@
 use eframe::egui;
 use oxyde_format::Properties;
 use oxyde_model::{
-    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, StandardPlane,
+    EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FeatureId, FeatureKind, PlaneRef,
+    StandardPlane,
 };
 use oxyde_sketch::{Constraint, RelationId};
 
@@ -15,6 +16,76 @@ use crate::features_ui::{
 };
 use crate::sketch_mode;
 
+/// Where an extrusion ends, as SolidWorks lists the end conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndCondition {
+    Blind,
+    ThroughAll,
+    ThroughAllBoth,
+    UpToSurface,
+    MidPlane,
+}
+
+impl EndCondition {
+    /// Every end condition, with its label and what it does.
+    pub const ALL: [(EndCondition, &'static str, &'static str); 5] = [
+        (
+            EndCondition::Blind,
+            "Blind",
+            "A depth from the sketch plane",
+        ),
+        (
+            EndCondition::ThroughAll,
+            "Through All",
+            "Through everything the part holds on that side of the sketch",
+        ),
+        (
+            EndCondition::ThroughAllBoth,
+            "Through All - Both",
+            "Through everything the part holds, on both sides of the sketch",
+        ),
+        (
+            EndCondition::UpToSurface,
+            "Up To Surface",
+            "Up to a flat face or a plane (extended past its edges), whichever side it is on",
+        ),
+        (
+            EndCondition::MidPlane,
+            "Mid Plane",
+            "A depth in all, half on each side of the sketch plane",
+        ),
+    ];
+
+    pub fn label(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(e, ..)| *e == self)
+            .map_or("", |(_, label, _)| label)
+    }
+
+    /// The end condition an extrusion has.
+    pub fn of(extent: &ExtrudeExtent) -> Self {
+        match extent {
+            ExtrudeExtent::Blind { .. } => EndCondition::Blind,
+            ExtrudeExtent::MidPlane { .. } => EndCondition::MidPlane,
+            ExtrudeExtent::ThroughAll { both: false } => EndCondition::ThroughAll,
+            ExtrudeExtent::ThroughAll { both: true } => EndCondition::ThroughAllBoth,
+            ExtrudeExtent::UpToSurface { .. } => EndCondition::UpToSurface,
+        }
+    }
+
+    /// Whether it ends at a depth typed in.
+    pub fn has_depth(self) -> bool {
+        matches!(self, EndCondition::Blind | EndCondition::MidPlane)
+    }
+
+    /// Whether it goes one way, which can be reversed (Up To Surface goes towards its
+    /// surface by itself).
+    pub fn reversible(self) -> bool {
+        matches!(self, EndCondition::Blind | EndCondition::ThroughAll)
+    }
+}
+
 pub struct ExtrudeDialog {
     /// The feature being edited, or `None` for a new one.
     pub editing: Option<FeatureId>,
@@ -23,29 +94,53 @@ pub struct ExtrudeDialog {
     /// The sketch to extrude; picked in the timeline.
     pub sketch: Option<FeatureId>,
     pub op: ExtrudeOp,
+    pub end: EndCondition,
+    /// For the end conditions with a depth.
     pub depth: f64,
-    pub mid_plane: bool,
     pub reverse: bool,
+    /// What Up To Surface can go up to: the standard planes, the reference planes before
+    /// the feature, the selected flat faces and the faces picked since.
+    pub planes: crate::features_ui::Choices<PlaneRef>,
+    /// The plane Up To Surface goes up to, in `planes`.
+    pub up_to: Option<usize>,
+    /// The Up To Surface box takes the next flat face or plane clicked.
+    pub up_to_next: bool,
     /// Bodies it joins, cuts or intersects; empty = automatic.
     pub bodies: Vec<oxyde_model::BodyId>,
 }
 
 impl ExtrudeDialog {
-    /// The extrusion as it stands, once a sketch is chosen.
+    /// The extrusion as it stands, once a sketch (and for Up To Surface, a surface) is
+    /// chosen.
     pub fn feature(&self) -> Option<FeatureKind> {
-        let extent = if self.mid_plane {
-            ExtrudeExtent::MidPlane { depth: self.depth }
-        } else {
-            ExtrudeExtent::Blind { depth: self.depth }
+        let extent = match self.end {
+            EndCondition::Blind => ExtrudeExtent::Blind { depth: self.depth },
+            EndCondition::MidPlane => ExtrudeExtent::MidPlane { depth: self.depth },
+            EndCondition::ThroughAll => ExtrudeExtent::ThroughAll { both: false },
+            EndCondition::ThroughAllBoth => ExtrudeExtent::ThroughAll { both: true },
+            EndCondition::UpToSurface => ExtrudeExtent::UpToSurface {
+                plane: self.planes.get(self.up_to?)?.1.clone(),
+            },
         };
         Some(FeatureKind::Extrude(Extrude {
             sketch: self.sketch?,
             op: self.op,
             extent,
-            reverse: self.reverse && !self.mid_plane,
+            reverse: self.reverse && self.end.reversible(),
             bodies: self.bodies.clone(),
         }))
     }
+}
+
+/// A chamfer's type, as SolidWorks lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChamferType {
+    /// One distance on both faces.
+    Distance,
+    /// A distance on each face.
+    TwoDistances,
+    /// A distance on one face and an angle from it.
+    AngleDistance,
 }
 
 pub struct BlendDialog {
@@ -56,9 +151,46 @@ pub struct BlendDialog {
     pub size: f64,
     /// Picked in the viewport while the command is open.
     pub edges: Vec<EdgeName>,
+    /// A chamfer's type, its other distance and its angle (degrees), and whether its
+    /// sides swap.
+    pub chamfer_type: ChamferType,
+    pub second: f64,
+    pub angle: f64,
+    pub flip: bool,
 }
 
 impl BlendDialog {
+    /// A new fillet (`fillet`) or chamfer of `edges`.
+    pub fn new(fillet: bool, edges: Vec<EdgeName>) -> Self {
+        Self {
+            editing: None,
+            dimension: None,
+            fillet,
+            size: if fillet { 2.0 } else { 1.0 },
+            edges,
+            chamfer_type: ChamferType::Distance,
+            second: 2.0,
+            angle: 45.0,
+            flip: false,
+        }
+    }
+
+    /// The chamfer shape the dialog sets.
+    fn chamfer(&self) -> oxyde_model::ChamferShape {
+        use oxyde_model::ChamferShape;
+        match self.chamfer_type {
+            ChamferType::Distance => ChamferShape::Equal,
+            ChamferType::TwoDistances => ChamferShape::TwoDistances {
+                distance: self.second,
+                flip: self.flip,
+            },
+            ChamferType::AngleDistance => ChamferShape::AngleDistance {
+                angle: self.angle.to_radians(),
+                flip: self.flip,
+            },
+        }
+    }
+
     /// The fillet or chamfer as it stands, once it has edges.
     pub fn feature(&self) -> Option<FeatureKind> {
         if self.edges.is_empty() {
@@ -67,6 +199,11 @@ impl BlendDialog {
         let blend = EdgeBlend {
             edges: self.edges.clone(),
             size: self.size,
+            chamfer: if self.fillet {
+                Default::default()
+            } else {
+                self.chamfer()
+            },
         };
         Some(if self.fillet {
             FeatureKind::Fillet(blend)
@@ -90,8 +227,11 @@ pub enum Dialog {
     Extrude(ExtrudeDialog),
     Revolve(RevolveDialog),
     Sweep(SweepDialog),
+    Loft(crate::features_ui::LoftDialog),
     Blend(BlendDialog),
     Shell(ShellDialog),
+    /// Hole Wizard.
+    Hole(crate::hole_wizard::HoleDialog),
     /// Linear pattern, circular pattern or mirror.
     Pattern(PatternDialog),
     Combine(crate::features_ui::CombineDialog),
@@ -136,8 +276,10 @@ impl Dialog {
             Dialog::Extrude(_)
                 | Dialog::Revolve(_)
                 | Dialog::Sweep(_)
+                | Dialog::Loft(_)
                 | Dialog::Blend(_)
                 | Dialog::Shell(_)
+                | Dialog::Hole(_)
                 | Dialog::Pattern(_)
                 | Dialog::Combine(_)
                 | Dialog::RefPlane(_)
@@ -154,8 +296,10 @@ impl Dialog {
             Dialog::Extrude(_)
                 | Dialog::Revolve(_)
                 | Dialog::Sweep(_)
+                | Dialog::Loft(_)
                 | Dialog::Blend(_)
                 | Dialog::Shell(_)
+                | Dialog::Hole(_)
                 | Dialog::Pattern(_)
                 | Dialog::Combine(_)
                 | Dialog::RefPlane(_)
@@ -169,8 +313,10 @@ impl Dialog {
             Dialog::Extrude(d) => d.editing,
             Dialog::Revolve(d) => d.editing,
             Dialog::Sweep(d) => d.editing,
+            Dialog::Loft(d) => d.editing,
             Dialog::Blend(d) => d.editing,
             Dialog::Shell(d) => d.editing,
+            Dialog::Hole(d) => d.editing,
             Dialog::Pattern(d) => d.editing,
             Dialog::Combine(d) => d.editing,
             Dialog::RefPlane(d) => d.editing,
@@ -223,13 +369,18 @@ pub(crate) fn ok_cancel(ui: &mut egui::Ui, ok_label: &str) -> Answer {
     answer
 }
 
-/// A number typed by the user; a decimal comma is accepted.
-pub(crate) fn parse_value(text: &str) -> Option<f64> {
-    text.trim()
-        .replace(',', ".")
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite())
+/// A value typed by the user: a number or arithmetic, with units (see `quantity`):
+/// degrees for an angle, else millimetres.
+pub(crate) fn parse_value(text: &str, angle: bool) -> Option<f64> {
+    use crate::quantity::{Quantity, parse};
+    parse(
+        text,
+        if angle {
+            Quantity::Angle
+        } else {
+            Quantity::Length
+        },
+    )
 }
 
 /// The largest length a value field takes, in mm (a kilometre). Every value field has a
@@ -272,8 +423,20 @@ pub(crate) fn positive_length(ui: &mut egui::Ui, value: &mut f64) {
         egui::DragValue::new(value)
             .speed(0.1)
             .range(0.001..=MAX_LENGTH)
-            .suffix(" mm"),
-    );
+            .suffix(" mm")
+            .custom_parser(length_parser),
+    )
+    .on_hover_text("Drag, or click and type a length: 12.5, 80/2, 1in, 3/8 in");
+}
+
+/// What a length field reads typed text with: arithmetic and units (`quantity`).
+pub(crate) fn length_parser(text: &str) -> Option<f64> {
+    crate::quantity::parse(text, crate::quantity::Quantity::Length)
+}
+
+/// What an angle field reads typed text with: arithmetic and units, in degrees.
+pub(crate) fn angle_parser(text: &str) -> Option<f64> {
+    crate::quantity::parse(text, crate::quantity::Quantity::Angle)
 }
 
 pub fn plane_name(plane: StandardPlane) -> &'static str {
@@ -360,8 +523,10 @@ impl OxydeApp {
             Dialog::Extrude(_)
             | Dialog::Revolve(_)
             | Dialog::Sweep(_)
+            | Dialog::Loft(_)
             | Dialog::Blend(_)
             | Dialog::Shell(_)
+            | Dialog::Hole(_)
             | Dialog::Pattern(_)
             | Dialog::Combine(_)
             | Dialog::RefPlane(_)
@@ -397,7 +562,7 @@ impl OxydeApp {
                             }
                         });
                     // The sketch as the value would make it, drawn dashed over it.
-                    let met = match (parse_value(text), sketch.as_mut()) {
+                    let met = match (parse_value(text, *angle), sketch.as_mut()) {
                         (Some(typed), Some(session)) => {
                             let before = session.value_preview().to_vec();
                             let met = match target {
@@ -427,11 +592,15 @@ impl OxydeApp {
                             true
                         }
                     };
-                    if parse_value(text).is_none() {
+                    if parse_value(text, *angle).is_none() {
                         ui.label(
-                            egui::RichText::new("Type a number")
-                                .small()
-                                .color(crate::theme::tokens().err),
+                            egui::RichText::new(if *angle {
+                                "Type an angle: 30, 90/4, 1.2rad"
+                            } else {
+                                "Type a length: 12.5, 80/2, 1in, 3/8 in"
+                            })
+                            .small()
+                            .color(crate::theme::tokens().err),
                         );
                     } else if !met {
                         ui.label(
@@ -441,7 +610,7 @@ impl OxydeApp {
                         );
                     }
                     answer = ok_cancel(ui, "OK");
-                    if matches!(answer, Answer::Ok) && parse_value(text).is_none() {
+                    if matches!(answer, Answer::Ok) && parse_value(text, *angle).is_none() {
                         answer = Answer::Open;
                     }
                 });
@@ -546,7 +715,17 @@ impl OxydeApp {
             }
             Dialog::Revolve(d) => self.apply_revolve(d),
             Dialog::Sweep(d) => self.apply_sweep(d),
+            Dialog::Loft(d) => {
+                if let Ok(kind) = d.feature() {
+                    self.add_or_replace(d.editing, kind);
+                }
+            }
             Dialog::Shell(d) => self.apply_shell(d),
+            Dialog::Hole(d) => {
+                if let Some(kind) = d.feature() {
+                    self.add_or_replace(d.editing, kind);
+                }
+            }
             Dialog::Pattern(d) => self.apply_pattern(d),
             Dialog::Combine(d) => self.apply_combine(d),
             Dialog::RefPlane(d) => self.apply_ref_plane(d),
@@ -554,9 +733,13 @@ impl OxydeApp {
             Dialog::Appearance(d) => self.apply_appearance(d),
             Dialog::ChoosePlane => {}
             Dialog::Dimension {
-                target, name, text, ..
+                target,
+                name,
+                text,
+                angle,
+                ..
             } => {
-                let Some(typed) = parse_value(&text) else {
+                let Some(typed) = parse_value(&text, angle) else {
                     return;
                 };
                 if let Some(session) = self.sketch.as_mut() {

@@ -25,11 +25,16 @@
 #include <BRepOffsetAPI_MakeOffsetShape.hxx>
 #include <BRepOffsetAPI_MakePipe.hxx>
 #include <BRepOffsetAPI_MakeThickSolid.hxx>
+#include <BRepOffsetAPI_ThruSections.hxx>
 #include <BRepOffset_Mode.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeRevol.hxx>
+#include <BRepLib.hxx>
 #include <BRepTools.hxx>
+#include <HLRAlgo_Projector.hxx>
+#include <HLRBRep_Algo.hxx>
+#include <HLRBRep_HLRToShape.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
 #include <GC_MakeArcOfCircle.hxx>
@@ -1158,6 +1163,60 @@ OpResultData Session::extrude(const PlaneData& plane, rust::Slice<const RegionDa
     });
 }
 
+OpResultData Session::loft(rust::Slice<const LoftSectionData> sections, bool ruled) {
+    return guarded("loft", [&] {
+        if (sections.size() < 2) {
+            throw std::invalid_argument("a loft needs two sections at least");
+        }
+        BRepOffsetAPI_ThruSections loft(Standard_True, ruled ? Standard_True : Standard_False,
+                                         1e-6);
+        // The first section's edges name the side faces, as an extrusion's profile does.
+        std::vector<SegmentMark> marks;
+        TopoDS_Wire first;
+        for (std::size_t i = 0; i < sections.size(); ++i) {
+            const LoftSectionData& section = sections[i];
+            if (section.region.loops.empty()) {
+                throw std::invalid_argument("a loft section without a contour");
+            }
+            const Frame frame(section.plane);
+            std::vector<SegmentMark> section_marks;
+            const TopoDS_Wire wire = make_wire(section.region.loops[0], frame, section_marks);
+            if (i == 0) {
+                first = wire;
+                marks = section_marks;
+            }
+            loft.AddWire(wire);
+        }
+        loft.CheckCompatibility(Standard_True);
+        loft.Build();
+        if (!loft.IsDone()) {
+            throw std::runtime_error("the loft could not be made (sections too different?)");
+        }
+        TopoDS_Shape result = loft.Shape();
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+        check_valid(result, "the loft is not a valid solid (do the sections twist?)");
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        for (TopExp_Explorer it(loft.FirstShape(), TopAbs_FACE); it.More(); it.Next()) {
+            add_source(out, result_faces, it.Current(), SourceKind::StartCap, 0, 0);
+        }
+        for (TopExp_Explorer it(loft.LastShape(), TopAbs_FACE); it.More(); it.Next()) {
+            add_source(out, result_faces, it.Current(), SourceKind::EndCap, 0, 0);
+        }
+        // Side faces: those holding an edge of the first section.
+        record_unnamed_profile_faces(first, marks, result_faces, out);
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
 OpResultData Session::revolve(const PlaneData& plane, rust::Slice<const RegionData> regions,
                               const AxisData& axis, double angle) {
     return guarded("revolve", [&] {
@@ -1506,6 +1565,54 @@ OpResultData Session::chamfer(std::uint64_t shape, rust::Slice<const std::uint32
     });
 }
 
+OpResultData Session::chamfer_with(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
+                                   rust::Slice<const std::uint32_t> faces, double first,
+                                   std::uint8_t kind, double second) {
+    return guarded("chamfer", [&] {
+        if (edges.empty() || edges.size() != faces.size()) {
+            throw std::invalid_argument("each edge to chamfer needs its reference face");
+        }
+        const TopoDS_Shape input = get(shape);
+        TopTools_IndexedMapOfShape input_edges;
+        TopExp::MapShapes(input, TopAbs_EDGE, input_edges);
+        TopTools_IndexedMapOfShape input_faces;
+        TopExp::MapShapes(input, TopAbs_FACE, input_faces);
+
+        BRepFilletAPI_MakeChamfer maker(input);
+        for (std::size_t i = 0; i < edges.size(); ++i) {
+            const TopoDS_Edge& edge = edge_at(input_edges, edges[i]);
+            if (faces[i] >= static_cast<std::uint32_t>(input_faces.Extent())) {
+                throw std::out_of_range("no such face to chamfer along");
+            }
+            const TopoDS_Face& face = TopoDS::Face(input_faces(static_cast<int>(faces[i]) + 1));
+            if (kind == 1) {
+                maker.AddDA(first, second, edge, face);
+            } else {
+                maker.Add(first, second, edge, face);
+            }
+        }
+        build_blend(maker, "chamfer");
+        const char* const failed = "chamfer failed (sizes too large for the selected edges?)";
+        if (!maker.IsDone()) {
+            throw std::runtime_error(failed);
+        }
+        const TopoDS_Shape result = maker.Shape();
+        check_valid(result, failed);
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
+        record_kept_faces(maker, input, 0, result_faces, out);
+        record_generated_faces(maker, input, 0, TopAbs_EDGE, SourceKind::InputEdge,
+                               result_faces, out);
+        record_generated_faces(maker, input, 0, TopAbs_VERTEX, SourceKind::InputVertex,
+                               result_faces, out);
+
+        out.shape = insert(result);
+        return out;
+    });
+}
+
 void Session::release(std::uint64_t shape) {
     arena().release(shape);
 }
@@ -1772,6 +1879,114 @@ BoundsData Session::bounds(std::uint64_t shape) const {
         }
         BoundsData out{};
         box.Get(out.xmin, out.ymin, out.zmin, out.xmax, out.ymax, out.zmax);
+        return out;
+    });
+}
+
+namespace {
+
+// The edges of `edges` (a compound from hidden line removal, in the view's frame) as
+// polylines of (x, y) pairs, each within `deflection` of the edge.
+void append_polylines(const TopoDS_Shape& edges, double deflection,
+                      rust::Vec<PolylineData>& out) {
+    if (edges.IsNull()) {
+        return;
+    }
+    // The edges come out with curves on the view plane only.
+    BRepLib::BuildCurves3d(edges);
+    for (TopExp_Explorer it(edges, TopAbs_EDGE); it.More(); it.Next()) {
+        const TopoDS_Edge& edge = TopoDS::Edge(it.Current());
+        if (BRep_Tool::Degenerated(edge)) {
+            continue;
+        }
+        BRepAdaptor_Curve curve(edge);
+        PolylineData line{};
+        GCPnts_TangentialDeflection points(curve, 0.2, deflection, 2);
+        for (int i = 1; i <= points.NbPoints(); ++i) {
+            const gp_Pnt p = points.Value(i);
+            line.points.push_back(p.X());
+            line.points.push_back(p.Y());
+        }
+        if (line.points.size() >= 4) {
+            out.push_back(std::move(line));
+        }
+    }
+}
+
+} // namespace
+
+ProjectionData Session::project_edges(rust::Slice<const std::uint64_t> shapes,
+                                      const PlaneData& view, double deflection) const {
+    return guarded("project_edges", [&] {
+        BRep_Builder builder;
+        TopoDS_Compound all;
+        builder.MakeCompound(all);
+        for (const std::uint64_t shape : shapes) {
+            builder.Add(all, get(shape));
+        }
+        // The eye looks along -normal: the projector's main direction points to it.
+        const gp_Ax2 frame(gp_Pnt(view.ox, view.oy, view.oz), gp_Dir(view.nx, view.ny, view.nz),
+                           gp_Dir(view.xx, view.xy, view.xz));
+        Handle(HLRBRep_Algo) algo = new HLRBRep_Algo();
+        algo->Add(all);
+        algo->Projector(HLRAlgo_Projector(frame));
+        algo->Update();
+        algo->Hide();
+        HLRBRep_HLRToShape extract(algo);
+        ProjectionData out{};
+        // Sharp edges, smooth (tangent) edges and the outlines of curved faces.
+        append_polylines(extract.VCompound(), deflection, out.visible);
+        append_polylines(extract.Rg1LineVCompound(), deflection, out.visible);
+        append_polylines(extract.OutLineVCompound(), deflection, out.visible);
+        append_polylines(extract.HCompound(), deflection, out.hidden);
+        append_polylines(extract.Rg1LineHCompound(), deflection, out.hidden);
+        append_polylines(extract.OutLineHCompound(), deflection, out.hidden);
+        return out;
+    });
+}
+
+namespace {
+
+// Part of a shape: the whole of it (kind 0), or its face (1), edge (2) or vertex (3) at
+// `index` in the order `topology` lists them.
+TopoDS_Shape sub_shape(const TopoDS_Shape& shape, std::uint8_t kind, std::uint32_t index) {
+    if (kind == 0) {
+        return shape;
+    }
+    if (kind > 3) {
+        throw std::invalid_argument("unknown kind of sub-shape");
+    }
+    const TopAbs_ShapeEnum type = kind == 1 ? TopAbs_FACE : kind == 2 ? TopAbs_EDGE : TopAbs_VERTEX;
+    TopTools_IndexedMapOfShape map;
+    TopExp::MapShapes(shape, type, map);
+    if (index >= static_cast<std::uint32_t>(map.Extent())) {
+        throw std::out_of_range("no such face, edge or vertex");
+    }
+    return map(static_cast<int>(index) + 1);
+}
+
+} // namespace
+
+DistanceData Session::distance(std::uint64_t a, std::uint8_t a_kind, std::uint32_t a_index,
+                               std::uint64_t b, std::uint8_t b_kind,
+                               std::uint32_t b_index) const {
+    return guarded("distance", [&] {
+        const TopoDS_Shape first = sub_shape(get(a), a_kind, a_index);
+        const TopoDS_Shape second = sub_shape(get(b), b_kind, b_index);
+        BRepExtrema_DistShapeShape extrema(first, second);
+        if (!extrema.IsDone() || extrema.NbSolution() < 1) {
+            throw std::runtime_error("the distance could not be measured");
+        }
+        const gp_Pnt pa = extrema.PointOnShape1(1);
+        const gp_Pnt pb = extrema.PointOnShape2(1);
+        DistanceData out{};
+        out.distance = extrema.Value();
+        out.ax = pa.X();
+        out.ay = pa.Y();
+        out.az = pa.Z();
+        out.bx = pb.X();
+        out.by = pb.Y();
+        out.bz = pb.Z();
         return out;
     });
 }

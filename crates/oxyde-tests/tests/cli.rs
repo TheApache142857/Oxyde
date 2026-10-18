@@ -1,5 +1,5 @@
-//! The command line (`oxyde-cli`) driven as a library: `eval`, `check`, `export` and
-//! `snapshot` on a part whose measures are known by hand, and on a part imported from a
+//! The command line (`oxyde-cli`) driven as a library: `eval`, `check`, `export`,
+//! `snapshot` and `drawing` on a part whose measures are known by hand, and on a part imported from a
 //! STEP file. Cargo only exposes a binary to its own crate's tests, so the commands are
 //! run through [`oxyde_cli::run`] with the arguments the shell would pass.
 //!
@@ -107,6 +107,7 @@ fn filleted_box(path: &Path, radius: f64) {
     part.add_feature(FeatureKind::Fillet(EdgeBlend {
         edges: vec![edge],
         size: radius,
+        chamfer: Default::default(),
     }));
     save(path, &part);
     part.release(&mut kernel);
@@ -480,4 +481,85 @@ fn a_step_import_evaluates_and_checks_against_its_own_measures() {
         file.to_str().unwrap(),
     ]);
     assert_eq!(code, EXIT_OK, "{out}{err}");
+}
+
+#[test]
+fn drawing_writes_the_views_on_a_sheet_as_pdf_svg_and_dxf() {
+    let dir = scratch("drawing");
+    let part = dir.join("box.oxyprt");
+    filleted_box(&part, R);
+    for name in ["box.pdf", "box.svg", "box.dxf"] {
+        let file = dir.join(name);
+        let (code, out, err) = run(&[
+            "drawing",
+            part.to_str().unwrap(),
+            "--out",
+            file.to_str().unwrap(),
+            "--sheet",
+            "a3",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}{err}");
+        assert!(out.contains("scale"), "{out}");
+    }
+    assert!(
+        std::fs::read(dir.join("box.pdf"))
+            .unwrap()
+            .starts_with(b"%PDF-1.4")
+    );
+    let svg = std::fs::read_to_string(dir.join("box.svg")).unwrap();
+    assert!(svg.contains("width=\"420mm\"") && svg.contains("<path"));
+
+    // The DXF is at the views' true size: among its visible lines, the box's 20 mm
+    // height seen from the front, and its 30 mm depth seen from the top.
+    let dxf = std::fs::read_to_string(dir.join("box.dxf")).unwrap();
+    let pairs: Vec<(&str, &str)> = dxf
+        .lines()
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .filter_map(|p| match p {
+            [code, value] => Some((code.trim(), value.trim())),
+            _ => None,
+        })
+        .collect();
+    let mut lines: Vec<(String, [f64; 4])> = Vec::new();
+    let mut i = 0;
+    while i < pairs.len() {
+        if pairs[i] == ("0", "LINE") {
+            let mut layer = String::new();
+            let mut xy = [0.0; 4];
+            let mut j = i + 1;
+            while j < pairs.len() && pairs[j].0 != "0" {
+                let value = pairs[j].1;
+                match pairs[j].0 {
+                    "8" => layer = value.to_owned(),
+                    "10" => xy[0] = value.parse().unwrap(),
+                    "20" => xy[1] = value.parse().unwrap(),
+                    "11" => xy[2] = value.parse().unwrap(),
+                    "21" => xy[3] = value.parse().unwrap(),
+                    _ => {}
+                }
+                j += 1;
+            }
+            lines.push((layer, xy));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let vertical = |length: f64| {
+        lines.iter().any(|(layer, [x0, y0, x1, y1])| {
+            layer == "VISIBLE" && (x0 - x1).abs() < 1e-6 && ((y1 - y0).abs() - length).abs() < 1e-3
+        })
+    };
+    assert!(vertical(20.0) && vertical(30.0), "true size");
+    assert!(lines.iter().any(|(layer, _)| layer == "SHEET"));
+
+    let (code, _, err) = run(&[
+        "drawing",
+        part.to_str().unwrap(),
+        "--out",
+        dir.join("box.png").to_str().unwrap(),
+    ]);
+    assert_eq!(code, EXIT_ERROR);
+    assert!(err.contains(".pdf"), "{err}");
 }

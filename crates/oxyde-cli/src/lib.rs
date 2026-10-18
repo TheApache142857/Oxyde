@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use oxyde_format::stl::{self, StlQuality, StlUnit};
 use oxyde_format::{FormatError, Properties, load_part};
-use oxyde_format::{gltf, obj, threemf};
+use oxyde_format::{drawing, gltf, obj, threemf};
 use oxyde_kernel::{Kernel, Mesh, StepMaterial};
 use oxyde_model::{FeatureStatus, Finish, ModelError, Part};
 use oxyde_occt::{OcctError, OcctKernel};
@@ -827,6 +827,123 @@ pub fn snapshot(
     Ok(rebuilt.features())
 }
 
+// ---- Drawing ---------------------------------------------------------------------------------
+
+/// The standard views of the rebuilt part, hidden lines removed, laid out on a sheet:
+/// what File › Export › Drawing makes, titled after the file.
+pub fn drawing_sheet(
+    rebuilt: &Rebuilt,
+    size: drawing::SheetSize,
+    projection: drawing::Projection,
+    show_hidden: bool,
+) -> Result<drawing::Sheet> {
+    let body = rebuilt
+        .part
+        .body()
+        .ok_or_else(|| Error("the part has no solid to draw".to_owned()))?;
+    let shapes = body.shapes();
+    let mut size_mm: f64 = 1.0;
+    for shape in &shapes {
+        let (lo, hi) = rebuilt.kernel.bounds(*shape)?;
+        size_mm = size_mm.max(lo.distance(hi));
+    }
+    let deflection = (size_mm * 1e-3).max(0.005);
+    let mut views = Vec::new();
+    for kind in drawing::ViewKind::ALL {
+        let edges = rebuilt
+            .kernel
+            .project_edges(&shapes, &kind.plane(), deflection)?
+            .ok_or_else(|| Error("the kernel cannot remove hidden lines".to_owned()))?;
+        let lines = |lines: Vec<Vec<oxyde_geom::Point2>>| {
+            lines
+                .into_iter()
+                .map(|l| l.into_iter().map(|p| [p.x, p.y]).collect())
+                .collect()
+        };
+        views.push((
+            kind,
+            drawing::ViewEdges {
+                visible: lines(edges.visible),
+                hidden: lines(edges.hidden),
+            },
+        ));
+    }
+    let title = drawing::TitleBlock {
+        title: rebuilt
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        part_number: rebuilt.properties.part_number.clone(),
+        material: rebuilt
+            .part
+            .material()
+            .map_or_else(|| rebuilt.properties.material.clone(), |m| m.name.clone()),
+        drawn_by: String::new(),
+        date: drawing::today(),
+    };
+    Ok(drawing::layout(
+        views,
+        size,
+        projection,
+        None,
+        title,
+        show_hidden,
+    ))
+}
+
+/// Rebuilds `path` and writes its drawing to `out`, PDF, SVG or DXF by the extension;
+/// returns the features' statuses and the sheet's scale.
+pub fn drawing(
+    path: &Path,
+    out: &Path,
+    size: drawing::SheetSize,
+    projection: drawing::Projection,
+    show_hidden: bool,
+) -> Result<(Vec<FeatureReport>, f64)> {
+    let rebuilt = rebuild(path)?;
+    let sheet = drawing_sheet(&rebuilt, size, projection, show_hidden)?;
+    let extension = out
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let bytes = match extension.as_str() {
+        "pdf" => drawing::to_pdf(&sheet),
+        "svg" => drawing::to_svg(&sheet).into_bytes(),
+        "dxf" => drawing::to_dxf(&sheet).into_bytes(),
+        other => {
+            return Err(Error(format!(
+                "cannot write a drawing as .{other}: use .pdf, .svg or .dxf"
+            )));
+        }
+    };
+    std::fs::write(out, bytes).map_err(|e| Error(format!("{}: {e}", out.display())))?;
+    Ok((rebuilt.features(), sheet.scale))
+}
+
+/// A sheet size, as `--sheet` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SheetArg {
+    A4,
+    A3,
+    A2,
+    A1,
+    A0,
+}
+
+impl From<SheetArg> for drawing::SheetSize {
+    fn from(sheet: SheetArg) -> Self {
+        match sheet {
+            SheetArg::A4 => drawing::SheetSize::A4,
+            SheetArg::A3 => drawing::SheetSize::A3,
+            SheetArg::A2 => drawing::SheetSize::A2,
+            SheetArg::A1 => drawing::SheetSize::A1,
+            SheetArg::A0 => drawing::SheetSize::A0,
+        }
+    }
+}
+
 // ---- Command line ----------------------------------------------------------------------------
 
 #[derive(Debug, Parser)]
@@ -889,6 +1006,24 @@ enum Command {
         width: usize,
         #[arg(long, default_value_t = 768)]
         height: usize,
+    },
+    /// Rebuild a part and write its front, top, right and isometric views on a sheet with
+    /// a title block, hidden lines dashed: PDF (.pdf), SVG (.svg) or DXF (.dxf, at the
+    /// views' true size). Exit 1 if a feature failed (the drawing is still written).
+    Drawing {
+        /// The .oxyprt file.
+        part: PathBuf,
+        /// Where to write; the extension picks the format.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, value_enum, default_value_t = SheetArg::A4)]
+        sheet: SheetArg,
+        /// Third angle projection (top view above the front) instead of first angle.
+        #[arg(long)]
+        third_angle: bool,
+        /// Leave the hidden lines out.
+        #[arg(long)]
+        no_hidden: bool,
     },
 }
 
@@ -970,6 +1105,28 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
             let features = snapshot(&part, &file, view.into(), width, height)?;
             let failed = write_failures(out, &features)?;
             writeln!(out, "wrote {} ({width}x{height})", file.display())?;
+            Ok(if failed { EXIT_FAILED } else { EXIT_OK })
+        }
+        Command::Drawing {
+            part,
+            out: file,
+            sheet,
+            third_angle,
+            no_hidden,
+        } => {
+            let projection = if third_angle {
+                drawing::Projection::ThirdAngle
+            } else {
+                drawing::Projection::FirstAngle
+            };
+            let (features, scale) = drawing(&part, &file, sheet.into(), projection, !no_hidden)?;
+            let failed = write_failures(out, &features)?;
+            writeln!(
+                out,
+                "wrote {} (scale {})",
+                file.display(),
+                drawing::scale_text(scale)
+            )?;
             Ok(if failed { EXIT_FAILED } else { EXIT_OK })
         }
     }

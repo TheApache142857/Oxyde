@@ -52,6 +52,7 @@ pub fn bracket() -> Part {
             FaceName::end_cap(base),
         )],
         size: 4.0,
+        chamfer: Default::default(),
     }));
 
     // Break the top inside edge of the upright.
@@ -61,6 +62,7 @@ pub fn bracket() -> Part {
             FaceName::end_cap(wall),
         )],
         size: 2.0,
+        chamfer: Default::default(),
     }));
 
     part

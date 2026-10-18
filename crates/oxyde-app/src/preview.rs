@@ -186,8 +186,10 @@ impl OxydeApp {
             Dialog::Extrude(d) => d.feature(),
             Dialog::Revolve(d) => d.feature().ok(),
             Dialog::Sweep(d) => d.feature().ok(),
+            Dialog::Loft(d) => d.feature().ok(),
             Dialog::Blend(d) => d.feature(),
             Dialog::Shell(d) => Some(d.feature()),
+            Dialog::Hole(d) => d.feature(),
             Dialog::Pattern(d) => d.feature(&self.doc.part).ok(),
             Dialog::Combine(d) => d.feature().ok(),
             Dialog::RefPlane(d) => d.feature(),
@@ -377,6 +379,7 @@ mod tests {
         let round = doc.part.add_feature(FeatureKind::Fillet(EdgeBlend {
             edges: vec![edge],
             size: 2.0,
+            chamfer: Default::default(),
         }));
         let s2 = doc.part.add_feature(rectangle(10.0, 10.0));
         doc.rebuild(kernel)

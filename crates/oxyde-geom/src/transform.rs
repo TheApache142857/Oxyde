@@ -109,6 +109,20 @@ impl Transform {
         Self::from_matrix_about(m, axis.origin)
     }
 
+    /// The rigid motion that takes the world's frame to `plane`'s own: x along its
+    /// `x_dir`, y along its `y_dir`, z along its normal, the origin to its origin. A shape
+    /// made about the world origin is placed on the plane this way.
+    pub fn from_plane(plane: &Plane) -> Transform {
+        let (x, y, n, o) = (plane.x_dir, plane.y_dir(), plane.normal, plane.origin);
+        Transform {
+            rows: [
+                [x.x, y.x, n.x, o.x],
+                [x.y, y.y, n.y, o.y],
+                [x.z, y.z, n.z, o.z],
+            ],
+        }
+    }
+
     /// Mirror image through a plane.
     pub fn mirror(plane: &Plane) -> Transform {
         let n = plane.normal;

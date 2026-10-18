@@ -495,6 +495,68 @@ fn trimming_a_curve_nothing_crosses_deletes_it() {
 }
 
 #[test]
+fn extending_a_line_reaches_the_next_curve() {
+    let mut s = ConstrainedSketch::new();
+    let h = s.line(Point2::new(0.0, 0.0), Point2::new(4.0, 0.0));
+    s.constrain(Horizontal(h));
+    let near = s.line(Point2::new(6.0, -3.0), Point2::new(6.0, 3.0));
+    s.line(Point2::new(9.0, -3.0), Point2::new(9.0, 3.0));
+    // Behind the start there is nothing to meet.
+    assert!(s.extend_preview(h, Point2::new(0.5, 0.0)).is_none());
+    let preview = s.extend_preview(h, Point2::new(3.5, 0.1)).unwrap();
+    assert!(close(preview[0], 4.0, 0.0) && close(preview[1], 6.0, 0.0));
+    let (_, old_end) = s.endpoints(h).unwrap();
+    assert!(s.extend(h, Point2::new(3.5, 0.1)));
+    let (start, end) = s.endpoints(h).unwrap();
+    assert!(close(s.position(start).unwrap(), 0.0, 0.0));
+    assert!(close(s.position(end).unwrap(), 6.0, 0.0));
+    assert!(s.entity(old_end).is_none());
+    assert!(
+        s.relations()
+            .iter()
+            .any(|r| r.constraint == PointOnLine(end, near))
+    );
+    assert!(s.solve().unwrap().converged);
+    // Again: on to the next one.
+    assert!(s.extend(h, Point2::new(5.5, 0.0)));
+    let (_, end) = s.endpoints(h).unwrap();
+    assert!(close(s.position(end).unwrap(), 9.0, 0.0));
+}
+
+#[test]
+fn extending_an_arc_follows_its_circle() {
+    let mut s = ConstrainedSketch::new();
+    // A quarter arc from (5, 0) to (0, 5), and a horizontal line through y = -3 under it.
+    let arc = s.arc(Point2::ORIGIN, Point2::new(5.0, 0.0), Point2::new(0.0, 5.0));
+    s.line(Point2::new(-10.0, -3.0), Point2::new(10.0, -3.0));
+    // Its start goes clockwise down to (4, -3).
+    assert!(s.extend(arc, Point2::new(4.9, 0.8)));
+    let Geometry::Arc { start, end, .. } = s.entity(arc).unwrap().geometry else {
+        panic!("not an arc");
+    };
+    assert!(close(s.position(start).unwrap(), 4.0, -3.0));
+    assert!(close(s.position(end).unwrap(), 0.0, 5.0));
+    // Its end goes counter-clockwise round to (-4, -3).
+    assert!(s.extend(arc, Point2::new(-0.8, 4.9)));
+    let Geometry::Arc { end, .. } = s.entity(arc).unwrap().geometry else {
+        panic!("not an arc");
+    };
+    assert!(close(s.position(end).unwrap(), -4.0, -3.0));
+    assert!(s.solve().unwrap().converged);
+}
+
+#[test]
+fn connected_ends_and_circles_do_not_extend() {
+    let mut s = ConstrainedSketch::new();
+    let [bottom, ..] = s.rectangle(Point2::ORIGIN, 10.0, 5.0);
+    s.line(Point2::new(20.0, -5.0), Point2::new(20.0, 5.0));
+    // Both ends of the rectangle's side are corners.
+    assert!(!s.extend(bottom, Point2::new(9.0, 0.0)));
+    let circle = s.circle(Point2::new(30.0, 0.0), 2.0);
+    assert!(!s.extend(circle, Point2::new(32.0, 0.0)));
+}
+
+#[test]
 fn the_origin_is_a_fixed_point_that_survives_deletions() {
     let mut s = ConstrainedSketch::new();
     let origin = s.ensure_origin(Point2::ORIGIN);

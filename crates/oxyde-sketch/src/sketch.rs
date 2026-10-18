@@ -55,6 +55,10 @@ pub enum Constraint {
     Coincident(EntityId, EntityId),
     Horizontal(EntityId),
     Vertical(EntityId),
+    /// Two points level with each other (on one horizontal line).
+    HorizontalPoints(EntityId, EntityId),
+    /// Two points one above the other (on one vertical line).
+    VerticalPoints(EntityId, EntityId),
     Parallel(EntityId, EntityId),
     Perpendicular(EntityId, EntityId),
     EqualLength(EntityId, EntityId),
@@ -70,6 +74,9 @@ pub enum Constraint {
     Length(EntityId, f64),
     /// Radius of a circle or arc.
     Radius(EntityId, f64),
+    /// Diameter of a circle or arc (what Smart Dimension gives a full circle, as in
+    /// SolidWorks).
+    Diameter(EntityId, f64),
     /// Angle from the first line to the second, counter-clockwise.
     Angle(EntityId, EntityId, f64),
     /// A point on the infinite extension of a line.
@@ -97,8 +104,15 @@ impl Constraint {
     pub fn entities(&self) -> Vec<EntityId> {
         use Constraint::*;
         match *self {
-            Fixed(a) | Horizontal(a) | Vertical(a) | Length(a, _) | Radius(a, _) => vec![a],
+            Fixed(a)
+            | Horizontal(a)
+            | Vertical(a)
+            | Length(a, _)
+            | Radius(a, _)
+            | Diameter(a, _) => vec![a],
             Coincident(a, b)
+            | HorizontalPoints(a, b)
+            | VerticalPoints(a, b)
             | Parallel(a, b)
             | Perpendicular(a, b)
             | EqualLength(a, b)
@@ -140,6 +154,7 @@ impl Constraint {
             | VerticalDistance(_, _, v)
             | Length(_, v)
             | Radius(_, v)
+            | Diameter(_, v)
             | Angle(_, _, v)
             | PointLineDistance(_, _, v)
             | LineDistance(_, _, v) => Some(v),
@@ -480,6 +495,7 @@ impl ConstrainedSketch {
                 | VerticalDistance(_, _, v)
                 | Length(_, v)
                 | Radius(_, v)
+                | Diameter(_, v)
                 | Angle(_, _, v)
                 | PointLineDistance(_, _, v)
                 | LineDistance(_, _, v),
@@ -780,6 +796,8 @@ impl ConstrainedSketch {
             match *c {
                 Fixed(p) => layout.expect(p, Kind::Point, i)?,
                 Coincident(a, b)
+                | HorizontalPoints(a, b)
+                | VerticalPoints(a, b)
                 | Distance(a, b, _)
                 | HorizontalDistance(a, b, _)
                 | VerticalDistance(a, b, _) => {
@@ -799,7 +817,7 @@ impl ConstrainedSketch {
                     layout.expect(a, Kind::Round, i)?;
                     layout.expect(b, Kind::Round, i)?;
                 }
-                Radius(r, _) => layout.expect(r, Kind::Round, i)?,
+                Radius(r, _) | Diameter(r, _) => layout.expect(r, Kind::Round, i)?,
                 Symmetric(a, b, l) => {
                     layout.expect(a, Kind::Point, i)?;
                     layout.expect(b, Kind::Point, i)?;
@@ -1254,6 +1272,8 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
             }
             Horizontal(l) => out.push(direction(l).1),
             Vertical(l) => out.push(direction(l).0),
+            HorizontalPoints(a, b) => out.push(self.point(b).1 - self.point(a).1),
+            VerticalPoints(a, b) => out.push(self.point(b).0 - self.point(a).0),
             Parallel(a, b) => out.push(folded(direction(a), direction(b), 0.0)),
             Perpendicular(a, b) => out.push(folded(direction(a), direction(b), FRAC_PI_2)),
             EqualLength(a, b) => out.push(length(direction(a)) - length(direction(b))),
@@ -1267,6 +1287,7 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
             }
             Length(l, d) => out.push(length(direction(l)) - k(d)),
             Radius(r, value) => out.push(self.round(r).1 - k(value)),
+            Diameter(r, value) => out.push(self.round(r).1 * k(2.0) - k(value)),
             Angle(a, b, angle) => {
                 let (u, v) = (direction(a), direction(b));
                 let between = v.1.atan2(v.0) - u.1.atan2(u.0) - k(angle);
