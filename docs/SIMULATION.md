@@ -304,6 +304,21 @@ is still open:
   where it got to. A direct solve (faer, §5.4) would now matter only for much larger
   meshes or many load cases.
 
+  **Memory.** A solve's peak memory grows with the nodes, measured on the lattice
+  mesher's 100 mm cube held on one face and loaded on the other (every core, `oxyde-sim`
+  optimised as in the app's debug build, the peak footprint from `/usr/bin/time -l`):
+
+  | Element type | Nodes | Elements | Peak memory | Mesh + solve |
+  |---|---|---|---|---|
+  | ten-node | 156 153 | 106 032 | 2.7 GB | 0.1 + 4.8 s |
+  | ten-node | 336 635 | 225 624 | 5.3 GB | 0.2 + 13.1 s |
+  | four-node | 79 408 | 416 832 | 1.9 GB | 0.4 + 4.3 s |
+  | four-node | 202 785 | 1 100 220 | 4.9 GB | 1.0 + 16.9 s |
+
+  About 16 KB per node with ten-node elements and 24 KB with four-node ones (whose nodes
+  are each in more elements); the Preferences' memory budget is turned into a node limit
+  with 17 and 25 KB, and checked on Netgen's meshes as on the lattice mesher's.
+
   The automatic element size aims at about 2 800 lattice cells inside the model, at least
   two across its walls (from twice its volume over its area).
 

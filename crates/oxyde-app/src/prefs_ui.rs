@@ -1,4 +1,4 @@
-//! Tools › Preferences: graphics, navigation, keyboard shortcuts and debugging. Changes
+//! Tools › Preferences: graphics, navigation, keyboard shortcuts, simulation and debugging. Changes
 //! apply at once and are saved as they are made. Also the debug overlay drawn over the
 //! viewport, and the dispatch of keyboard shortcuts to commands.
 
@@ -18,6 +18,7 @@ pub enum PrefsTab {
     Graphics,
     Navigation,
     Shortcuts,
+    Simulation,
     Debug,
 }
 
@@ -118,6 +119,7 @@ impl OxydeApp {
                         (PrefsTab::Graphics, "Graphics"),
                         (PrefsTab::Navigation, "Navigation"),
                         (PrefsTab::Shortcuts, "Shortcuts"),
+                        (PrefsTab::Simulation, "Simulation"),
                         (PrefsTab::Debug, "Debug"),
                     ] {
                         let text = RichText::new(label).size(14.0);
@@ -138,6 +140,7 @@ impl OxydeApp {
                         PrefsTab::Graphics => self.graphics_page(ui),
                         PrefsTab::Navigation => self.navigation_page(ui),
                         PrefsTab::Shortcuts => self.shortcuts_page(ui),
+                        PrefsTab::Simulation => self.simulation_page(ui),
                         PrefsTab::Debug => self.debug_page(ui),
                     });
             });
@@ -468,6 +471,49 @@ impl OxydeApp {
                     ui.end_row();
                 }
             });
+    }
+
+    fn simulation_page(&mut self, ui: &mut egui::Ui) {
+        let p = &mut self.prefs.simulation;
+        crate::property_manager::section(ui, "Memory");
+        egui::Grid::new("simulation_prefs")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Memory budget");
+                ui.add(
+                    egui::DragValue::new(&mut p.memory_budget_gb)
+                        .range(0.5..=1024.0)
+                        .speed(0.1)
+                        .max_decimals(1)
+                        .suffix(" GB"),
+                )
+                .on_hover_text(
+                    "The most memory a study may take. A finer mesh is refused before it is \
+                     solved, rather than filling the memory and slowing the computer down.",
+                );
+                ui.end_row();
+                ui.label("");
+                ui.label(
+                    RichText::new(format!(
+                        "About {} nodes with high quality (10-node) elements, {} with draft \
+                         (4-node) ones",
+                        crate::simulation_ui::max_nodes(p.memory_budget_gb, true),
+                        crate::simulation_ui::max_nodes(p.memory_budget_gb, false),
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.end_row();
+            });
+        ui.label(
+            RichText::new(
+                "Keep it under the computer's memory, leaving room for the rest: half of it \
+                 is a safe choice.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     fn debug_page(&mut self, ui: &mut egui::Ui) {

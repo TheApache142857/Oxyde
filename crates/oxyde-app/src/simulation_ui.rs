@@ -140,6 +140,9 @@ pub struct SimulationPrefs {
     pub bands: u32,
     /// The mesh's edges over the plot.
     pub show_mesh: bool,
+    /// The most memory a study may take, GB: a mesh with more nodes than it allows is
+    /// refused before it is solved (Preferences › Simulation).
+    pub memory_budget_gb: f64,
 }
 
 impl Default for SimulationPrefs {
@@ -151,6 +154,7 @@ impl Default for SimulationPrefs {
             custom_scale: 1.0,
             bands: 16,
             show_mesh: false,
+            memory_budget_gb: 8.0,
         }
     }
 }
@@ -787,8 +791,39 @@ fn surface_area(s: &SurfaceMesh) -> f64 {
         .sum()
 }
 
-/// More nodes than this and the mesh is refused: the matrix alone would pass 500 MB.
-const MAX_NODES: usize = 250_000;
+/// What a static solve takes at its peak per node of the mesh, bytes: the matrix, the
+/// multigrid hierarchy, the vectors and the stresses. Measured on the lattice mesher's
+/// cubes (a 100 mm cube, every core): ten-node elements 16 KB per node at 156 000 and
+/// 337 000 nodes, four-node ones 24 KB at 79 000 and 203 000 (a node of a four-node mesh
+/// is in more elements); rounded up.
+const BYTES_PER_NODE_QUADRATIC: f64 = 17_000.0;
+const BYTES_PER_NODE_LINEAR: f64 = 25_000.0;
+
+/// The most nodes a mesh may have to stay within `budget_gb` of memory.
+pub(crate) fn max_nodes(budget_gb: f64, quadratic: bool) -> usize {
+    let per_node = if quadratic {
+        BYTES_PER_NODE_QUADRATIC
+    } else {
+        BYTES_PER_NODE_LINEAR
+    };
+    let budget = if budget_gb.is_finite() {
+        budget_gb.max(0.25)
+    } else {
+        8.0
+    };
+    (budget * 1e9 / per_node) as usize
+}
+
+/// Why a mesh with `nodes` nodes is refused, and what to do about it.
+fn too_many_nodes(nodes: usize, budget_gb: f64, quadratic: bool) -> String {
+    format!(
+        "the mesh would have {nodes} nodes, more than the memory budget of {} GB allows \
+         (about {} nodes): choose a larger element size, or raise the budget in \
+         Preferences › Simulation",
+        format_number(budget_gb),
+        max_nodes(budget_gb, quadratic)
+    )
+}
 
 // ---- The application side ------------------------------------------------------------------
 
@@ -1367,7 +1402,7 @@ impl OxydeApp {
             options: MeshOptions {
                 element_size: h,
                 quadratic,
-                max_nodes: MAX_NODES,
+                max_nodes: max_nodes(self.prefs.simulation.memory_budget_gb, quadratic),
                 separate_bodies: true,
             },
             study,
@@ -1375,6 +1410,7 @@ impl OxydeApp {
             names: surfaces.bodies.iter().map(|b| b.name.clone()).collect(),
             mode,
             detect,
+            budget_gb: self.prefs.simulation.memory_budget_gb,
         };
         let faces = surfaces.faces.clone();
         let bodies: Vec<(String, String)> = surfaces
@@ -3151,6 +3187,8 @@ struct ThreadInput {
     mode: RunMode,
     /// Look for contacts within this tolerance, mm.
     detect: Option<f64>,
+    /// Preferences › Simulation's memory budget, GB, for the messages.
+    budget_gb: f64,
 }
 
 /// The solids meshed by Netgen on a worker kernel, each on its own, into one mesh whose
@@ -3231,6 +3269,7 @@ fn study_thread(
         names,
         mode,
         detect,
+        budget_gb,
     } = input;
     let report_progress = |stage: &'static str, fraction: f64| {
         if let Ok(mut s) = shared.lock() {
@@ -3252,6 +3291,13 @@ fn study_thread(
             cancel,
             &|f| report_progress("Meshing (Netgen)", f * span),
         ) {
+            // Netgen has no limit of its own: the budget is checked on what it made.
+            Ok(mesh) if mesh.nodes.len() > options.max_nodes => {
+                return Err(format!(
+                    "Meshing failed: {}",
+                    too_many_nodes(mesh.nodes.len(), budget_gb, options.quadratic)
+                ));
+            }
             Ok(mesh) => netgen_result = Some(mesh),
             Err(VolumeMeshError::Unsupported) => {
                 note = Some("this Oxyde was built without Netgen".to_owned());
@@ -3278,7 +3324,13 @@ fn study_thread(
             let (mesh, report) = oxyde_sim::mesh_solids(&solids, &options, cancel, &|f| {
                 report_progress("Meshing", f * span)
             })
-            .map_err(|e| format!("Meshing failed: {e}"))?;
+            .map_err(|e| match e {
+                oxyde_sim::MeshError::TooManyNodes(n) => format!(
+                    "Meshing failed: {}",
+                    too_many_nodes(n, budget_gb, options.quadratic)
+                ),
+                e => format!("Meshing failed: {e}"),
+            })?;
             (mesh, report, "lattice")
         }
     };
@@ -3514,6 +3566,23 @@ mod tests {
         }];
         let groups = material_groups_of(&open, &Study::default(), false);
         assert!(groups[0].paths.is_empty() && groups[0].can_apply);
+    }
+
+    #[test]
+    fn the_memory_budget_sets_the_node_limit() {
+        // 8 GB: about 470 000 nodes of ten-node elements, 320 000 of four-node ones.
+        assert_eq!(max_nodes(8.0, true), 470_588);
+        assert_eq!(max_nodes(8.0, false), 320_000);
+        assert_eq!(max_nodes(16.0, true), 2 * max_nodes(8.0, true));
+        // Nonsense falls back to something usable.
+        assert_eq!(max_nodes(f64::NAN, true), max_nodes(8.0, true));
+        assert_eq!(max_nodes(0.0, true), max_nodes(0.25, true));
+        let why = too_many_nodes(1_590_020, 8.0, true);
+        assert!(
+            why.contains("1590020 nodes") && why.contains("8 GB"),
+            "{why}"
+        );
+        assert!(why.contains("Preferences › Simulation"), "{why}");
     }
 
     #[test]

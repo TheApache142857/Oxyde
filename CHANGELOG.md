@@ -7,6 +7,14 @@ release yet; the git history has every detail.
 
 ### Materials a click away, a maximum element size (unreleased, October 2026)
 
+- **A memory budget for simulations** (Tools › Preferences › *Simulation*, 8 GB by
+  default): a mesh with more nodes than the budget allows is refused before it is solved,
+  with how many nodes it would have and how many fit, instead of the fixed limit of
+  250 000 nodes. It applies to Netgen's meshes too, which had no limit. The page says
+  about how many nodes fit (some 470 000 ten-node or 320 000 four-node at 8 GB: a solve
+  takes about 16 KB per node with ten-node elements and 24 KB with four-node ones, which
+  sit in more elements each).
+
 - **A Material row in every tree.** The part's tree has a *Material* row above the
   features (SolidWorks' `Material <not specified>`), and in an assembly every part
   shows its Material row under it, without expanding it. Clicking the row lists the
