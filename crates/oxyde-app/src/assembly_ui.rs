@@ -1025,8 +1025,11 @@ impl OxydeApp {
             let saved = oxyde_format::load_part(path).and_then(|mut file| {
                 let old_name = file.definition.material.as_ref().map(|m| m.name.clone());
                 file.definition.material = material.clone();
+                // The loaded copy shows its imported STEP colours as appearances, but the
+                // file may not hold them yet: it still asks the import to apply them on
+                // the next rebuild, which would cover the material again on reopening.
                 if clear {
-                    file.definition.appearances = Default::default();
+                    file.definition.clear_appearances();
                 }
                 file.properties.material = match &material {
                     Some(m) => m.name.clone(),

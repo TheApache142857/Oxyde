@@ -38,6 +38,12 @@ for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
   spacing, the number of instances and every option under it. Its list button showed an
   empty square instead of an arrow, and so did the button removing an appearance's
   texture.
+- **A material given to imported parts from an assembly keeps its look.** Parts written
+  by a STEP assembly import and never opened on their own showed the material's look
+  until the assembly was opened again, when the colours of the STEP file came back over
+  it (glass-clear polycarbonate panels turned opaque white). *Apply and remove
+  appearances* now removes those colours from the files for good. Parts already given a
+  material this way need it applied once more.
 
 New, for daily work:
 

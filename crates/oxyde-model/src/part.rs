@@ -231,6 +231,21 @@ pub struct PartDefinition {
     pub configurations: Configurations,
 }
 
+impl PartDefinition {
+    /// Takes away every appearance of the part, the colours its imported STEP files have
+    /// not given it yet included: an import feature still due to apply them would put them
+    /// back as appearances on the next rebuild, over the material. Used on a part file
+    /// that has not been rebuilt, such as a material given to parts from an assembly.
+    pub fn clear_appearances(&mut self) {
+        self.appearances = Appearances::default();
+        for feature in &mut self.features {
+            if let FeatureKind::Import(import) = &mut feature.kind {
+                import.apply_colors = false;
+            }
+        }
+    }
+}
+
 /// A part document: its timeline and the cached results of the last rebuild.
 ///
 /// Cached bodies hold kernel shapes; call [`Part::release`] with the same kernel before
