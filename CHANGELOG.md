@@ -5,6 +5,29 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### An MCP server: Claude models with Oxyde (October 2026)
+
+- **`oxyde-mcp`, a Model Context Protocol server.** An AI assistant (Claude Code, Claude
+  Desktop, any MCP client) can now make parts and assemblies with Oxyde's own features and
+  save them as ordinary `.oxyprt` and `.oxyasm` files: sketches made of rectangles, rounded
+  rectangles, circles, slots, polygons, polylines with fillets and arcs, lines and text, each
+  one fully defined with SolidWorks-style dimensions from the origin, so that every dimension
+  can be changed afterwards in the application; extrusions with every end condition,
+  revolves, fillets, chamfers, shells, linear and circular patterns, mirrors, holes,
+  reference planes and axes, lofts, sweeps, combines, STEP import, variables, equations,
+  materials and appearances; then assemblies of those parts with mates. It sees what it
+  made through sections read back as lines, arcs, circles, slots and hole grids, a depth
+  probe, measurements, rendered pictures, and a comparison with a reference (a STEP file or
+  a part it is remodelling) giving the material in common, extra and missing. See the
+  README for setting it up.
+- **Patterns of patterns.** A linear pattern, a circular pattern or a mirror can now copy
+  patterns and mirrors of features, as in SolidWorks: a row of holes patterned into a grid,
+  or a pattern mirrored to the other side, copies every instance. A pattern holding a boss
+  and a cut together cannot be copied again, and says so.
+- **Text in sketches, through the MCP server:** a line of text in any TrueType font on the
+  computer, with a size, a letter spacing, an angle, an alignment and an oblique slant,
+  becomes closed outlines to extrude or cut. The application has no text tool yet.
+
 ### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 
 A read through the modelling engine and the application for bugs, behaviours nobody asked
