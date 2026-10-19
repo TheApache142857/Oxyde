@@ -39,3 +39,7 @@ opt-level = 3
 # The finite element solver too: a study would take minutes unoptimized.
 [profile.dev.package.oxyde-sim]
 opt-level = 3
+
+# The MCP server's mesh sampling and probing (compare, probe) would take minutes unoptimized.
+[profile.dev.package.oxyde-mcp]
+opt-level = 3

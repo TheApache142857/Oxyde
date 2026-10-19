@@ -114,7 +114,7 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt -p oxyde-geom -p oxyde-sketch -p oxyde-kernel -p oxyde-occt -p oxyde-model `
-            -p oxyde-assembly -p oxyde-format -p oxyde-render -p oxyde-app -p oxyde-tests --check
+            -p oxyde-assembly -p oxyde-format -p oxyde-render -p oxyde-app -p oxyde-mcp -p oxyde-tests --check
 
       - name: Clippy (warnings shown, not yet errors; see the Linux job)
         run: cargo clippy --workspace --all-targets

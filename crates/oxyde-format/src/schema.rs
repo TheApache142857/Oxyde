@@ -1754,3 +1754,33 @@ fn sorted(mut faces: Vec<FaceName>) -> Vec<FaceName> {
     faces.dedup();
     faces
 }
+
+// ---- Single values -------------------------------------------------------------------------
+
+/// A feature as an entry of `model.json`'s `features`.
+pub(crate) fn feature_value(feature: &Feature) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(feature_dto(feature))
+}
+
+/// A feature from an entry of `model.json`'s `features`. An import feature cannot be read
+/// this way: its file is an entry of the archive, which a lone value does not carry.
+pub(crate) fn feature_from_value(value: serde_json::Value) -> Result<Feature, String> {
+    let dto: FeatureDto = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    feature_from(dto, &HashMap::new())
+}
+
+pub(crate) fn face_value(face: &FaceName) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(face_dto(face))
+}
+
+pub(crate) fn face_from_value(value: serde_json::Value) -> Result<FaceName, serde_json::Error> {
+    serde_json::from_value(value).map(face_from)
+}
+
+pub(crate) fn edge_value(edge: &EdgeName) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(edge_dto(edge))
+}
+
+pub(crate) fn edge_from_value(value: serde_json::Value) -> Result<EdgeName, serde_json::Error> {
+    serde_json::from_value(value).map(edge_from)
+}

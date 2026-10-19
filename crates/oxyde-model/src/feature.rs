@@ -591,16 +591,21 @@ impl FeatureKind {
     }
 
     /// Whether the feature can be the seed of a pattern or a mirror: it adds or removes
-    /// material with a tool body.
+    /// material with a tool body, or it is a pattern or a mirror of such features (whose
+    /// copies are copied in turn, as SolidWorks patterns a pattern).
     pub fn is_patternable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             FeatureKind::Extrude(_)
-                | FeatureKind::Revolve(_)
-                | FeatureKind::Sweep(_)
-                | FeatureKind::Hole(_)
-                | FeatureKind::Loft(_)
-        )
+            | FeatureKind::Revolve(_)
+            | FeatureKind::Sweep(_)
+            | FeatureKind::Hole(_)
+            | FeatureKind::Loft(_)
+            | FeatureKind::LinearPattern(_)
+            | FeatureKind::CircularPattern(_) => true,
+            // A mirror of whole bodies makes no tool to copy.
+            FeatureKind::Mirror(m) => m.bodies.is_empty(),
+            _ => false,
+        }
     }
 
     /// The sketches the feature sweeps, if it is an extrusion, a revolve or a sweep: its

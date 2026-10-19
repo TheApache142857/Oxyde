@@ -803,6 +803,118 @@ fn patterns_only_copy_extrusions_and_revolves() {
     part.release(&mut kernel);
 }
 
+#[test]
+fn patterns_and_mirrors_copy_patterns_and_mirrors() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 100.0, 50.0, 10.0);
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(base)));
+    let circle = sketch.circle(Point2::new(10.0, 10.0), 3.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(sketch));
+    let hole = part.add_feature(cut(s2, 10.0));
+    let along = |axis, spacing, count| PatternDirection {
+        axis: AxisRef::Standard(axis),
+        spacing,
+        count,
+        reverse: false,
+    };
+    // Two holes along X, then that pair (seed and pattern) twice along Y: four holes, as
+    // SolidWorks patterns a pattern.
+    let row = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole],
+        first: along(StandardAxis::X, 20.0, 2),
+        second: None,
+    }));
+    let rows = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole, row],
+        first: along(StandardAxis::Y, 15.0, 2),
+        second: None,
+    }));
+    // Mirrored through the middle of the plate: eight holes.
+    let middle = part.add_feature(FeatureKind::Plane(RefPlane {
+        base: PlaneRef::Standard(StandardPlane::Right),
+        offset: 50.0,
+        flip: false,
+    }));
+    let mirror = part.add_feature(FeatureKind::Mirror(Mirror {
+        seeds: vec![hole, row, rows],
+        plane: PlaneRef::Reference(middle),
+        bodies: Vec::new(),
+    }));
+    // A fillet on the rim of a copy of a copy of a copy: its name nests the instances.
+    let wall = FaceName::new(FaceKey::Instance {
+        feature: mirror,
+        instance: [1, 0],
+        face: Box::new(FaceName::new(FaceKey::Instance {
+            feature: rows,
+            instance: [1, 0],
+            face: Box::new(FaceName::new(FaceKey::Instance {
+                feature: row,
+                instance: [1, 0],
+                face: Box::new(FaceName::profile(hole, circle)),
+            })),
+        })),
+    });
+    part.add_feature(FeatureKind::Fillet(EdgeBlend {
+        edges: vec![EdgeName::between(wall, FaceName::end_cap(base))],
+        size: 0.5,
+        chamfer: Default::default(),
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let rim = 0.25 * (1.0 - PI / 4.0) * 2.0 * PI * 3.0;
+    let actual = volume(&part, &kernel);
+    let expected = 50000.0 - 8.0 * hole_volume() - rim;
+    assert!(
+        (actual - expected).abs() < 0.5,
+        "got {actual}, expected {expected}"
+    );
+
+    // More rows: the mirror follows, the fillet stays on its hole.
+    let count = part.find_dimension("D2@LPattern2").unwrap();
+    part.set_dimension(count, 3.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    let actual = volume(&part, &kernel);
+    let expected = 50000.0 - 12.0 * hole_volume() - rim;
+    assert!(
+        (actual - expected).abs() < 0.5,
+        "got {actual}, expected {expected}"
+    );
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_pattern_of_a_boss_and_a_cut_cannot_be_patterned_again() {
+    let mut kernel = OcctKernel::new();
+    let (mut part, _, hole, _) = plate_with_hole();
+    let peg = block(&mut part, Point2::new(40.0, 5.0), 5.0, 5.0, 15.0);
+    let mixed = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole, peg],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 20.0,
+            count: 2,
+            reverse: false,
+        },
+        second: None,
+    }));
+    let again = part.add_feature(FeatureKind::Mirror(Mirror {
+        seeds: vec![mixed],
+        plane: PlaneRef::Standard(StandardPlane::Right),
+        bodies: Vec::new(),
+    }));
+    part.rebuild(&mut kernel);
+    assert_eq!(part.status(mixed), Some(FeatureStatus::Ok));
+    match part.status(again) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("do not all add"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
 // ---- Sweep -----------------------------------------------------------------------------------
 
 /// A round profile of radius `r` at (`x`, 0) on the Front plane.
