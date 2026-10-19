@@ -499,6 +499,7 @@ pub(crate) fn linear_pattern(session: &mut Session, args: &Value) -> Result<Tool
             seeds,
             first,
             second,
+            skip: Vec::new(),
         }),
         args,
     )
@@ -518,6 +519,7 @@ pub(crate) fn circular_pattern(session: &mut Session, args: &Value) -> Result<To
             count: args::count(args, "count")?,
             equal_spacing,
             reverse: args::bool(args, "reverse", false)?,
+            skip: Vec::new(),
         }),
         args,
     )

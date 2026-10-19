@@ -280,13 +280,18 @@ impl OxydeApp {
         }
     }
 
+    /// The feature the preview builds (the one edited, or the id a new one would get),
+    /// while the preview is of the document as it is now.
+    pub(crate) fn preview_feature(&self) -> Option<FeatureId> {
+        live(&self.doc, self.preview.as_ref())
+            .and_then(|p| p.built.as_ref())
+            .map(FeaturePreview::feature)
+    }
+
     /// A click on a face the preview makes, as what it stands for: a fillet or chamfer
     /// face for the edge it rounds.
     pub(crate) fn unpreview_pick(&self, pick: PanelPick) -> PanelPick {
-        let made_by = live(&self.doc, self.preview.as_ref())
-            .and_then(|p| p.built.as_ref())
-            .map(FeaturePreview::feature);
-        match (&pick, made_by) {
+        match (&pick, self.preview_feature()) {
             (PanelPick::Face(face), Some(id)) => match &face.key {
                 FaceKey::FromEdge { feature, edge } if *feature == id => {
                     PanelPick::Edge(edge.clone())

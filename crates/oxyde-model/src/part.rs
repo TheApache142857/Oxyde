@@ -6,7 +6,7 @@
 //! feature the resulting body and the persistent names of all its faces, edges and
 //! vertices.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 
 use oxyde_geom::{Axis, Path as SweepPath, PathError, Plane, Profile, ProfileError, Transform};
@@ -1065,20 +1065,35 @@ fn build_feature<K: Kernel>(
             }
             FeatureKind::LinearPattern(pattern) => {
                 let instances = linear_instances(&ctx, pattern, &mut warnings)?;
-                let (body, tool) = build_instances(&ctx, &pattern.seeds, &instances, kernel)?;
+                let skip = skipped_instances(
+                    &pattern.skip,
+                    &instances,
+                    LinearPattern::instance_label,
+                    &mut warnings,
+                );
+                let (body, tool) =
+                    build_instances(&ctx, &pattern.seeds, &instances, &skip, kernel)?;
                 result.produced = Some(body);
                 result.tool = tool;
             }
             FeatureKind::CircularPattern(pattern) => {
                 let instances = circular_instances(&ctx, pattern, &mut warnings)?;
-                let (body, tool) = build_instances(&ctx, &pattern.seeds, &instances, kernel)?;
+                let skip = skipped_instances(
+                    &pattern.skip,
+                    &instances,
+                    CircularPattern::instance_label,
+                    &mut warnings,
+                );
+                let (body, tool) =
+                    build_instances(&ctx, &pattern.seeds, &instances, &skip, kernel)?;
                 result.produced = Some(body);
                 result.tool = tool;
             }
             FeatureKind::Mirror(mirror) => {
                 let instances = mirror_instances(&ctx, mirror, &mut warnings)?;
                 if mirror.bodies.is_empty() {
-                    let (body, tool) = build_instances(&ctx, &mirror.seeds, &instances, kernel)?;
+                    let (body, tool) =
+                        build_instances(&ctx, &mirror.seeds, &instances, &BTreeSet::new(), kernel)?;
                     result.produced = Some(body);
                     result.tool = tool;
                 } else if mirror.seeds.is_empty() {
@@ -2758,6 +2773,45 @@ fn circular_instances(
         .collect())
 }
 
+/// The instances of a pattern to leave out (SolidWorks' Instances to Skip), of those it
+/// has. A key that is not one of them, the seed's or one gone with a smaller count, is
+/// ignored with a warning: a change of count must not make the pattern fail.
+fn skipped_instances(
+    skip: &[[u32; 2]],
+    instances: &[Instance],
+    label: fn([u32; 2]) -> String,
+    warnings: &mut Vec<String>,
+) -> BTreeSet<[u32; 2]> {
+    if skip.is_empty() {
+        return BTreeSet::new();
+    }
+    let existing: BTreeSet<[u32; 2]> = instances.iter().map(|(key, _)| *key).collect();
+    let (kept, ignored): (BTreeSet<[u32; 2]>, BTreeSet<[u32; 2]>) =
+        skip.iter().partition(|key| existing.contains(*key));
+    if ignored.contains(&[0, 0]) {
+        warnings.push(format!(
+            "the seed {} cannot be skipped: it is kept",
+            label([0, 0])
+        ));
+    }
+    let gone: Vec<String> = ignored
+        .iter()
+        .filter(|key| **key != [0, 0])
+        .map(|key| label(*key))
+        .collect();
+    match gone.as_slice() {
+        [] => {}
+        [one] => warnings.push(format!(
+            "the skipped instance {one} is no longer in the pattern"
+        )),
+        many => warnings.push(format!(
+            "the skipped instances {} are no longer in the pattern",
+            many.join(", ")
+        )),
+    }
+    kept
+}
+
 fn mirror_instances(
     ctx: &Context<'_>,
     mirror: &Mirror,
@@ -2834,10 +2888,11 @@ fn mirror_bodies<K: Kernel>(
     }
 }
 
-/// Copies the tools of `seeds` to every instance and does with each copy what the seed
-/// did: joined to or cut from the same bodies, or a new body. Faces of a copy are named
-/// after the seed's face and the instance. A seed may be a pattern or a mirror itself, whose
-/// copies are then copied (a pattern of a pattern, a mirror of a pattern).
+/// Copies the tools of `seeds` to every instance but those in `skip` and does with each
+/// copy what the seed did: joined to or cut from the same bodies, or a new body. Faces of a
+/// copy are named after the seed's face and the instance. A seed may be a pattern or a
+/// mirror itself, whose copies are then copied (a pattern of a pattern, a mirror of a
+/// pattern).
 ///
 /// Returns the bodies, and the copies as the feature's own tool when they all do the same
 /// to the same bodies, so that the feature can be copied in turn; `None` when they differ
@@ -2846,6 +2901,7 @@ fn build_instances<K: Kernel>(
     ctx: &Context<'_>,
     seeds: &[FeatureId],
     instances: &[Instance],
+    skip: &BTreeSet<[u32; 2]>,
     kernel: &mut K,
 ) -> Result<(Body, Option<ToolBody>), String> {
     let id = ctx.feature().id;
@@ -2854,6 +2910,9 @@ fn build_instances<K: Kernel>(
     }
     if instances.is_empty() {
         return Err("the pattern has a single instance".to_owned());
+    }
+    if instances.iter().all(|(key, _)| skip.contains(key)) {
+        return Err("every instance but the seed is skipped".to_owned());
     }
     let mut tools = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -2899,6 +2958,14 @@ fn build_instances<K: Kernel>(
         for tool in &tools {
             for (piece, piece_names) in tool.pieces() {
                 for (key, transform) in instances {
+                    if skip.contains(key) {
+                        // A skipped copy keeps its body number, so that the bodies of the
+                        // copies after it keep theirs, and what refers to them stays on them.
+                        if tool.op == ToolOp::NewBody {
+                            new_bodies += 1;
+                        }
+                        continue;
+                    }
                     let copy = kernel
                         .transform(piece, transform)
                         .map_err(|e| e.to_string())?;
@@ -3238,11 +3305,13 @@ mod tests {
             seeds: vec![boss],
             first: direction(StandardAxis::X),
             second: None,
+            skip: Vec::new(),
         });
         let two_ways = FeatureKind::LinearPattern(LinearPattern {
             seeds: vec![boss],
             first: direction(StandardAxis::X),
             second: Some(direction(StandardAxis::Y)),
+            skip: Vec::new(),
         });
         let pattern = part.add_feature(one_way.clone());
         let dimension = |parameter| DimensionRef {

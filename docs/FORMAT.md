@@ -133,8 +133,8 @@ Rules:
 | `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
 | `plane` | Reference plane: `base` (PlaneRef), `offset` (mm, along the base normal), `flip` |
 | `axis` | Reference axis: `axis`: `{"along": AxisRef}` \| `{"two_planes": [PlaneRef, PlaneRef]}` |
-| `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
-| `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
+| `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}`, `skip` (optional, see below) |
+| `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse`, `skip` (optional, see below) |
 | `mirror` | `seeds`, `plane` (PlaneRef), `bodies` (optional, default empty): bodies mirrored whole, each joined to its image; a mirror has seeds or bodies, not both. A body's copy has its faces named as the mirror's instance `[1, 0]` of the body's own |
 | `import` | `file_name` (the original file's name, for display), `file`: the archive entry holding the STEP file (`imports/<id>.step`). Its solids are joined to the newest body (or make the first). `apply_colors` (optional, default false): the colours the STEP file gives its solids and faces are still to become appearances (see *Appearances*); Oxyde writes it only for a part it has not rebuilt yet, such as the parts of an imported assembly. |
 | `combine` | `target` (body), `tools` (bodies), `operation` (`join` \| `cut` \| `intersect`), `keep_tools` (optional, default false) |
@@ -151,12 +151,14 @@ An extrusion's `extent` is its end condition:
 
 Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves, sweeps, lofts and holes (their tool bodies are copied).
 
+`skip` (optional, absent when empty) lists the instances a linear or circular pattern leaves out, as SolidWorks' *Instances to Skip*: each by its position in the pattern, the `instance` its faces are named with (see FaceRef), `[i, j]` with `i` counted along `direction` and `j` along `direction2` from 0 at the seed, `[i, 0]` round a circular pattern's axis. `"skip": [[1, 1]]` leaves out the centre of a 3 × 3 grid, and that same instance stays out when the spacing changes or a count grows. Writers write the list sorted and without duplicates. A position the pattern does not have, the seed's `[0, 0]` or one beyond a count that was lowered, is ignored with a warning on the feature (not an error), and is left out again once a count brings it back. A pattern leaving out every instance but the seed fails, as a single instance does.
+
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
 **AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
 
 ### Bodies
 
-A part may hold several separate solid bodies (as in Fusion 360 or Creo). A body is named by the feature that made it and which of that feature's bodies it is: `{"feature": 7, "index": 0}` (`index` optional, default 0; a pattern of a `new_body` feature makes one body per copy, numbered in order).
+A part may hold several separate solid bodies (as in Fusion 360 or Creo). A body is named by the feature that made it and which of that feature's bodies it is: `{"feature": 7, "index": 0}` (`index` optional, default 0; a pattern of a `new_body` feature makes one body per copy, numbered in order, seed by seed; an instance it skips keeps its number unused, so the others keep theirs).
 
 - `operation` of an extrusion, a revolve or a sweep: `boss` joins the swept solid to a body (the first `boss` of a part makes its first body), `cut` removes it from bodies, `intersect` keeps only what it shares with a body, `new_body` keeps it as a body of its own.
 - `bodies` lists the bodies a `boss`, `cut` or `intersect` works on. Absent or empty means automatic: a `boss` or an `intersect` goes into the body the sketch's face is on (else the newest body), a `cut` goes through every body. Several bodies in a `boss` are joined into the first.

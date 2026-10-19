@@ -130,6 +130,14 @@ pub struct PatternDialog {
     pub bodies: Vec<BodyId>,
     /// Mirror: clicks on faces pick bodies to mirror rather than the mirror plane.
     pub bodies_next: bool,
+    /// Linear and circular: the instances left out (SolidWorks' Instances to Skip), by their
+    /// key in the pattern; sorted. It keeps those a lower count takes away, so that raising
+    /// the count again brings them back, but the feature only gets the ones there are.
+    pub skip: Vec<[u32; 2]>,
+    /// Clicks on the pattern's copies leave them out rather than being refused.
+    pub skip_next: bool,
+    /// Whether the panel lists every copy by number, to tick the ones to skip.
+    pub skip_numbers: bool,
 }
 
 /// The Loft command.
@@ -210,6 +218,67 @@ impl ShellDialog {
 }
 
 impl PatternDialog {
+    /// The number of instances in each direction as the panel stands: along the first
+    /// direction (or round the axis), and along the second.
+    fn counts(&self) -> (u32, u32) {
+        match self.kind {
+            PatternKind::Linear if self.second => (self.count.max(1), self.count2.max(1)),
+            PatternKind::Linear | PatternKind::Circular => (self.count.max(1), 1),
+            PatternKind::Mirror => (1, 1),
+        }
+    }
+
+    /// How many copies the pattern makes, the seed not counted, skipped ones counted.
+    pub fn copies(&self) -> usize {
+        let (along, across) = self.counts();
+        (along as usize * across as usize).saturating_sub(1)
+    }
+
+    /// The `index`-th copy, row after row as the model makes them: `[1, 0]`, `[2, 0]`…
+    pub fn copy(&self, index: usize) -> [u32; 2] {
+        let along = self.counts().0 as usize;
+        let k = index + 1;
+        [(k % along) as u32, (k / along) as u32]
+    }
+
+    /// Whether `instance` is one of the copies the pattern makes as the panel stands.
+    fn has_copy(&self, [i, j]: [u32; 2]) -> bool {
+        let (along, across) = self.counts();
+        [i, j] != [0, 0] && i < along && j < across
+    }
+
+    /// The instances to skip that the pattern has, row after row as [`Self::copy`] lists
+    /// them.
+    pub fn skipped(&self) -> Vec<[u32; 2]> {
+        let mut skipped = self.skip_list();
+        skipped.sort_by_key(|[i, j]| (*j, *i));
+        skipped
+    }
+
+    /// Whether the panel leaves `instance` out.
+    pub fn is_skipped(&self, instance: [u32; 2]) -> bool {
+        self.skip.binary_search(&instance).is_ok()
+    }
+
+    /// Leaves a copy out, or puts it back. The seed is always made.
+    pub fn toggle_skip(&mut self, instance: [u32; 2]) {
+        match self.skip.binary_search(&instance) {
+            Ok(i) => {
+                self.skip.remove(i);
+            }
+            Err(i) if instance != [0, 0] => self.skip.insert(i, instance),
+            Err(_) => {}
+        }
+    }
+
+    /// An instance as SolidWorks shows it, counted from 1: `(2, 1)`, or `(2)` round an axis.
+    pub fn instance_label(&self, instance: [u32; 2]) -> String {
+        match self.kind {
+            PatternKind::Circular => CircularPattern::instance_label(instance),
+            PatternKind::Linear | PatternKind::Mirror => LinearPattern::instance_label(instance),
+        }
+    }
+
     /// `part` puts the seeds in timeline order.
     pub fn feature(&self, part: &oxyde_model::Part) -> Result<FeatureKind, &'static str> {
         let mirroring_bodies = self.kind == PatternKind::Mirror && !self.bodies.is_empty();
@@ -249,6 +318,7 @@ impl PatternDialog {
                         reverse: self.reverse,
                     },
                     second,
+                    skip: self.skip_list(),
                 })
             }
             PatternKind::Circular => FeatureKind::CircularPattern(CircularPattern {
@@ -258,6 +328,7 @@ impl PatternDialog {
                 count: self.count,
                 equal_spacing: self.equal_spacing,
                 reverse: self.reverse,
+                skip: self.skip_list(),
             }),
             PatternKind::Mirror => {
                 let (_, plane) = self.planes.get(self.plane).ok_or("Choose a mirror plane")?;
@@ -268,6 +339,15 @@ impl PatternDialog {
                 })
             }
         })
+    }
+
+    /// The instances to skip the feature gets: those the pattern has, sorted.
+    fn skip_list(&self) -> Vec<[u32; 2]> {
+        self.skip
+            .iter()
+            .copied()
+            .filter(|key| self.has_copy(*key))
+            .collect()
     }
 }
 
@@ -327,6 +407,14 @@ fn with_current<T: PartialEq + Clone>(mut choices: Choices<T>, current: Option<&
         }
     }
     choices
+}
+
+/// A pattern's instances to skip, sorted and without duplicates, as the dialog keeps them.
+fn sorted_skip(skip: &[[u32; 2]]) -> Vec<[u32; 2]> {
+    let mut skip = skip.to_vec();
+    skip.sort_unstable();
+    skip.dedup();
+    skip
 }
 
 impl OxydeApp {
@@ -615,6 +703,9 @@ impl OxydeApp {
             planes,
             bodies: Vec::new(),
             bodies_next: false,
+            skip: Vec::new(),
+            skip_next: false,
+            skip_numbers: false,
         };
         // A mirror of the body selected in the tree, or of the part's only body when there
         // is no feature to copy: half a symmetric part made whole.
@@ -676,6 +767,7 @@ impl OxydeApp {
                     d.count2 = second.count;
                     d.reverse2 = second.reverse;
                 }
+                d.skip = sorted_skip(&p.skip);
             }
             Some(FeatureKind::CircularPattern(p)) => {
                 d.seeds = p.seeds.clone();
@@ -685,6 +777,7 @@ impl OxydeApp {
                 d.count = p.count;
                 d.equal_spacing = p.equal_spacing;
                 d.reverse = p.reverse;
+                d.skip = sorted_skip(&p.skip);
             }
             Some(FeatureKind::Mirror(m)) => {
                 d.seeds = m.seeds.clone();

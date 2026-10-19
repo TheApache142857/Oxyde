@@ -522,6 +522,9 @@ pub(crate) enum KindDto {
         direction: DirectionDto,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         direction2: Option<DirectionDto>,
+        /// Instances left out, by their `[i, j]` in the pattern; absent when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip: Vec<[u32; 2]>,
     },
     CircularPattern {
         seeds: Vec<u32>,
@@ -533,6 +536,9 @@ pub(crate) enum KindDto {
         equal_spacing: bool,
         #[serde(default)]
         reverse: bool,
+        /// Instances left out, `[i, 0]`; absent when none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip: Vec<[u32; 2]>,
     },
     Mirror {
         seeds: Vec<u32>,
@@ -1001,6 +1007,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             seeds: ids(&pattern.seeds),
             direction: direction_dto(&pattern.first),
             direction2: pattern.second.as_ref().map(direction_dto),
+            skip: skip_list(&pattern.skip),
         },
         FeatureKind::CircularPattern(pattern) => KindDto::CircularPattern {
             seeds: ids(&pattern.seeds),
@@ -1009,6 +1016,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             count: pattern.count,
             equal_spacing: pattern.equal_spacing,
             reverse: pattern.reverse,
+            skip: skip_list(&pattern.skip),
         },
         FeatureKind::Mirror(mirror) => KindDto::Mirror {
             seeds: ids(&mirror.seeds),
@@ -1068,6 +1076,15 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
 
 fn ids(features: &[FeatureId]) -> Vec<u32> {
     features.iter().map(|f| f.raw()).collect()
+}
+
+/// A pattern's instances to skip, sorted and without duplicates: the same list is written
+/// the same way whatever order it was made in.
+fn skip_list(skip: &[[u32; 2]]) -> Vec<[u32; 2]> {
+    let mut list = skip.to_vec();
+    list.sort_unstable();
+    list.dedup();
+    list
 }
 
 fn operation_dto(op: ExtrudeOp) -> OperationDto {
@@ -1542,10 +1559,12 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             seeds,
             direction,
             direction2,
+            skip,
         } => FeatureKind::LinearPattern(LinearPattern {
             seeds: ids_from(seeds),
             first: direction_from(direction),
             second: direction2.map(direction_from),
+            skip: skip_list(&skip),
         }),
         KindDto::CircularPattern {
             seeds,
@@ -1554,6 +1573,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             count,
             equal_spacing,
             reverse,
+            skip,
         } => FeatureKind::CircularPattern(CircularPattern {
             seeds: ids_from(seeds),
             axis: axis_from(axis),
@@ -1561,6 +1581,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             count,
             equal_spacing,
             reverse,
+            skip: skip_list(&skip),
         }),
         KindDto::Mirror {
             seeds,

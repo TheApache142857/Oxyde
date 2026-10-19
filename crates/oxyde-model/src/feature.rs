@@ -972,6 +972,21 @@ pub struct LinearPattern {
     pub seeds: Vec<FeatureId>,
     pub first: PatternDirection,
     pub second: Option<PatternDirection>,
+    /// Instances left out (SolidWorks' Instances to Skip), by their position `[i, j]` in
+    /// the pattern, the key their faces are named with ([`FaceKey::Instance`]); so an
+    /// instance stays skipped when the counts or the spacing change. Sorted, without
+    /// duplicates; the seed `[0, 0]` is never skipped (a rebuild warns about it).
+    ///
+    /// [`FaceKey::Instance`]: crate::FaceKey::Instance
+    pub skip: Vec<[u32; 2]>,
+}
+
+impl LinearPattern {
+    /// An instance as SolidWorks shows it: its place in each direction counted from 1, so
+    /// the seed is `(1, 1)`.
+    pub fn instance_label([i, j]: [u32; 2]) -> String {
+        format!("({}, {})", u64::from(i) + 1, u64::from(j) + 1)
+    }
 }
 
 /// Copies of features around an axis.
@@ -985,6 +1000,17 @@ pub struct CircularPattern {
     pub count: u32,
     pub equal_spacing: bool,
     pub reverse: bool,
+    /// Instances left out, as [`LinearPattern::skip`]: `[i, 0]` for the instance `i` steps
+    /// round from the seed.
+    pub skip: Vec<[u32; 2]>,
+}
+
+impl CircularPattern {
+    /// An instance as SolidWorks shows it: counted from 1 round the axis, so the seed is
+    /// `(1)`.
+    pub fn instance_label([i, _]: [u32; 2]) -> String {
+        format!("({})", u64::from(i) + 1)
+    }
 }
 
 /// Mirror image of features, or of whole bodies, through a plane.

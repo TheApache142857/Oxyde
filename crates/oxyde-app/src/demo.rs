@@ -125,6 +125,7 @@ pub fn flange() -> Part {
         count: 6,
         equal_spacing: true,
         reverse: false,
+        skip: Vec::new(),
     }));
     if let Ok(bolts) = part.parse_expression("6") {
         let _ = part.add_global("Bolts", bolts);
