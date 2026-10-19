@@ -1,22 +1,126 @@
 # Oxyde
 
-An open-source, parametric, feature-based 3D CAD modeler — written in Rust, with a thin C++ bridge to the [OpenCASCADE](https://dev.opencascade.org/) geometry kernel.
+**An open-source parametric 3D CAD modeller in the manner of SolidWorks**, written in Rust on the
+[OpenCASCADE](https://dev.opencascade.org/) geometry kernel. Sketch, constrain, extrude, fillet,
+assemble, render and simulate, with every part saved as an open, documented file.
 
-> **Status: pre-alpha.** A first desktop application is written: a tabbed command bar with icons (Features, Sketch, Evaluate, Render, Simulation) and a SolidWorks-style PropertyManager (select first, then run the command) with a live preview of every feature in the viewport (the faces it makes tinted, red for cuts, and why it fails before OK), timeline with a draggable rollback bar, interactive sketch mode with a constraint solver (relations, Smart Dimension between any two entities, snapping, trim, fully/under-defined colouring), extrude, revolve and sweep (a profile along a path) joining, cutting, intersecting or making new bodies (multi-body parts with Combine), fillet, chamfer, shell, reference planes and axes, linear and circular patterns, mirror, persistent face/edge naming, SolidWorks-style dimension names (`D1@Sketch1`), global variables and equations, configurations (named variants of a part, each with its own dimension values and suppressed features, in a ConfigurationManager tab), STEP import (as an *Imported* feature to build on, with the colours and the materials Fusion 360 and SolidWorks write) and export, STEP assembly import (one part file per part, one assembly file per assembly, e.g. from a SolidWorks STEP AP242 export), mass properties, measuring, a Section View (the model cut open by a plane) and Interference Detection in assemblies, a GPU-rendered 3D viewport with picking, appearances (colour, transparency and colour textures on faces, bodies, parts or components) with floor reflections and optional subsurface scattering, a Render tab (a path tracer on the GPU or the CPU with materials, environment light, soft shadows and glass, saved as PNG), a Simulation tab (a linear static study, as SolidWorks Simulation: fixtures and loads on faces, the model meshed into tetrahedra by Netgen and solved, contacts between bodies as in Fusion 360, von Mises stress, displacement, factor of safety and contact pressure drawn on the deformed model; studies and results saved as `.oxysim` and `.oxyres`), an Export menu (STEP, IGES, STL, OBJ, 3MF and glTF with mesh settings and a preview, PNG images, and drawings: the standard views with hidden lines and centre marks on a sheet with a title block, as PDF, SVG or DXF at true size), a Hole Wizard (ISO clearance, tapped, counterbored and countersunk holes), extrusions through all or up to a surface, `.oxyprt` save/load, and edit locks so two windows do not edit one file. **Assemblies** (`.oxyasm`): insert part files and sub-assemblies, mate them (coincident, concentric, parallel, perpendicular, distance, angle) with a live preview, move free components with Alt+drag while mates hold, fixed/floating components with degrees of freedom shown in the tree, parts and sub-assemblies edited in place with the rest of the assembly ghosted around them, and a bill of materials (top level, parts only or indented) exported as CSV. A Preferences window covers viewport colours and display, navigation, configurable keyboard shortcuts and debugging overlays. Builds and runs on Windows with OpenCASCADE 8, on macOS (Apple Silicon) with Homebrew's OpenCASCADE, and on Linux with the OpenCASCADE 7.8 that Debian and Ubuntu ship; `packaging/` bundles the Windows and macOS executables.
+<!-- Screenshot: docs/images/oxyde.png, a part in the viewport with the feature tree. -->
 
-## Goals
+> **Pre-alpha.** Oxyde is young and moves fast. It is usable for real parts, but expect rough
+> edges, and keep copies of files you care about. Bug reports are welcome in
+> [Issues](https://github.com/TheApache142857/Oxyde/issues).
 
-- Sketch → constrain → extrude / revolve / sweep / cut → fillet / chamfer, with a full, editable feature tree.
-- Assemblies with mates, and 2D drawings with a bill of materials.
-- Exchange with every other CAD system through **STEP**, Parasolid XT, IGES, STL/3MF and DXF.
-- **Open, documented native file formats** (`.oxyprt` parts, `.oxyasm` assemblies, `.oxydrw` drawings) that any tool — BOM extractors, viewers, scripts — can read without Oxyde installed.
+## Download
 
-## Non-goals
+Installers for Windows and macOS are on the [Releases](https://github.com/TheApache142857/Oxyde/releases) page.
 
-- Reading or writing native SolidWorks (or other proprietary) files. Interop goes through open formats.
-- Writing our own B-rep kernel *now*. The kernel sits behind a Rust trait so it can be replaced later.
+| Platform | File |
+|---|---|
+| Windows 10/11 (x64) | `Oxyde-Setup-<version>.exe` installs for your user only, no administrator rights needed. `Oxyde-<version>-windows-x64.msi` installs for every user, for IT departments. The `.zip` runs without installing. |
+| macOS 12+ (Apple Silicon) | `Oxyde-<version>-macos-arm64.dmg`: drag Oxyde to Applications. |
+| Linux | No package yet: [build from source](#building-from-source). |
 
-## Architecture at a glance
+The builds are not code-signed yet. On Windows, SmartScreen may warn about an unrecognised app:
+choose *More info* › *Run anyway*. On macOS, the first launch is refused as from an unidentified
+developer: right-click Oxyde in Applications and choose *Open*.
+
+New to it? *File › Open demo bracket* loads a finished part to look around in.
+
+## What it does
+
+If you know SolidWorks, you know where things are: the same feature names (`Sketch1`,
+`Boss-Extrude1`, `Fillet1`), the same dimension names (`D1@Sketch1`), select first and then run
+the command, and a PropertyManager panel with a live preview, OK and Cancel.
+
+**Parts**
+- A feature tree with a rollback bar: change a dimension or edit a feature, and everything
+  after it rebuilds. Faces and edges keep their names across rebuilds, so fillets and
+  sketches on faces stay where they were.
+- Extrude (blind, mid plane, through all, up to a surface) and revolve, as a boss, a cut, an
+  intersection or a new body; sweep, loft, fillet, chamfer, shell, the Hole Wizard (ISO
+  clearance, tapped, counterbored and countersunk holes), linear and circular patterns, mirror,
+  reference planes and axes, multi-body parts.
+- Global variables, equations (`"D1@Sketch1" = "Width" * 2`) and configurations, each with its
+  own dimensions and suppressed features.
+- Values typed as arithmetic with units: `80/2`, `3/8 in`, `45deg`.
+
+**Sketches**
+- Lines, arcs, circles, slots and polygons, sketch fillets and offsets, and Convert Entities
+  from part edges.
+- A constraint solver: relations, Smart Dimension (lengths, angles, radii, diameters), snapping,
+  trim and extend, and colours showing what is fully defined.
+
+**Assemblies** (`.oxyasm`)
+- Insert parts and sub-assemblies; coincident, concentric, parallel, perpendicular, distance and
+  angle mates with a live preview; drag free components while mates hold.
+- Edit parts in place with the rest ghosted around them, interference detection, and a bill of
+  materials exported as CSV.
+
+**Seeing and checking**
+- A GPU viewport with section views, appearances (colours, transparency, textures) and measuring:
+  distances, centre distances, diameters, mass properties.
+- A **Render** tab: a path tracer on the GPU or the CPU, with materials, environment light, soft
+  shadows and glass, saved as PNG.
+- A **Simulation** tab: static stress, thermal, transient thermal and thermal stress studies, as
+  in SolidWorks Simulation and Fusion 360. Fixtures, loads and contacts; meshed with Netgen;
+  stress, displacement, factor of safety and temperature drawn on the model.
+
+**Exchange**
+- Import STEP parts and assemblies (with the colours and materials SolidWorks and Fusion 360
+  write) and build on them.
+- Export STEP, IGES, STL, OBJ, 3MF, glTF and PNG.
+- Drawings: front, top, right and isometric views with hidden lines and a title block, as PDF,
+  SVG or DXF at true size.
+
+## Why Oxyde
+
+- **Open files.** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain JSON,
+  documented in [`docs/FORMAT.md`](docs/FORMAT.md). A script, a viewer or a BOM tool can read them
+  without Oxyde installed.
+- **The model is the timeline.** A part file holds the features that make it, not a frozen
+  shape: it rebuilds the same way every time.
+- **Interoperability through open standards**, STEP first. Oxyde does not read or write
+  SolidWorks or other proprietary files.
+- **A replaceable kernel.** OpenCASCADE sits behind a Rust trait, so the geometry engine can
+  change without rewriting the rest.
+
+## Building from source
+
+Windows (x64, MSVC) is the main platform: Visual Studio 2022 with the C++ workload, Rust 1.85+
+and OpenCASCADE 7.7+ (8.0 tested), through vcpkg. macOS (Apple Silicon) builds with Homebrew's
+OpenCASCADE, Linux with the OpenCASCADE 7.8 of Debian and Ubuntu. The full instructions,
+including Netgen and packaging, are in [`docs/BUILDING.md`](docs/BUILDING.md).
+
+```powershell
+cargo run --release -p oxyde-app    # the application
+cargo test --workspace              # unit and end-to-end tests
+```
+
+## Command line
+
+`oxyde-cli` rebuilds a `.oxyprt` through OpenCASCADE without opening a window, for scripts and
+continuous integration:
+
+```powershell
+cargo run -p oxyde-cli -- eval part.oxyprt [--json]           # feature statuses; per body volume, area, centre of mass, bounds, face/edge/vertex counts
+cargo run -p oxyde-cli -- check part.oxyprt --expect expected.json [--tol 1e-3]   # pass/fail table against expected measures
+cargo run -p oxyde-cli -- export part.oxyprt --out part.step   # or part.stl (binary, mm)
+cargo run -p oxyde-cli -- snapshot part.oxyprt --out part.png [--view iso|front|top|right] [--width 1024 --height 768]
+cargo run -p oxyde-cli -- drawing part.oxyprt --out part.pdf [--sheet a4|a3|a2|a1|a0] [--third-angle] [--no-hidden]   # or .svg, .dxf (true size)
+```
+
+Exit code 1 when a feature failed to rebuild or a check did not pass, 2 when the command could not
+run. `expected.json` holds any of `bodies`, `volume`, `area`, `centre_of_mass`, `bounds` (`min`,
+`max`), `faces`, `edges`, `vertices`; counts must match exactly, volume and area within the
+relative tolerance, coordinates within the tolerance times the part's size. `eval --json` writes
+the same object the tests in `crates/oxyde-tests/tests/cli.rs` read back.
+
+## How it is built
+
+Rust owns the application; C++ is only a thin shim around OpenCASCADE. The design decisions and
+rules are in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), the Render and Simulation tabs in
+[`docs/RENDERING.md`](docs/RENDERING.md) and [`docs/SIMULATION.md`](docs/SIMULATION.md), and what
+changed recently in [`CHANGELOG.md`](CHANGELOG.md).
 
 ```
             oxyde-app
@@ -43,35 +147,13 @@ An open-source, parametric, feature-based 3D CAD modeler — written in Rust, wi
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking; path tracer for the Render tab (the application runs the same one on the GPU) |
 | `oxyde-app` | Desktop application (UI and viewport) |
-| `oxyde-sim` | Finite element simulation: a tetrahedral mesher for closed triangle meshes, a linear static solver (ten-node elements, conjugate gradients), result plots in colour bands; depends on no other crate |
+| `oxyde-sim` | Finite element simulation: a tetrahedral mesher for closed triangle meshes, linear static and thermal solvers, result plots in colour bands; depends on no other crate |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/FORMAT.md`](docs/FORMAT.md), and [`CHANGELOG.md`](CHANGELOG.md) for what changed recently.
-
-## Building
-
-**Windows (x64, MSVC)** is the main platform: you need Visual Studio 2022 with the C++ workload, Rust 1.85+, and OpenCASCADE 7.7+ (8.0 tested; vcpkg recommended). **macOS (Apple Silicon)** builds with `brew install opencascade`; **Linux** with the distribution's OpenCASCADE 7.8. Full instructions, bundling and releasing: [`docs/BUILDING.md`](docs/BUILDING.md).
-
-```powershell
-cargo run --release -p oxyde-app              # the application (File › Open demo bracket)
-cargo test --workspace                        # unit + end-to-end tests
-```
-
-## Command line
-
-`oxyde-cli` rebuilds a `.oxyprt` through OpenCASCADE without opening a window, for scripts, agents and continuous integration:
-
-```powershell
-cargo run -p oxyde-cli -- eval part.oxyprt [--json]           # feature statuses; per body volume, area, centre of mass, bounds, face/edge/vertex counts
-cargo run -p oxyde-cli -- check part.oxyprt --expect expected.json [--tol 1e-3]   # pass/fail table against expected measures
-cargo run -p oxyde-cli -- export part.oxyprt --out part.step   # or part.stl (binary, mm)
-cargo run -p oxyde-cli -- snapshot part.oxyprt --out part.png [--view iso|front|top|right] [--width 1024 --height 768]
-cargo run -p oxyde-cli -- drawing part.oxyprt --out part.pdf [--sheet a4|a3|a2|a1|a0] [--third-angle] [--no-hidden]   # or .svg, .dxf (true size)
-```
-
-Exit code 1 when a feature failed to rebuild or a check did not pass, 2 when the command could not run. `expected.json` holds any of `bodies`, `volume`, `area`, `centre_of_mass`, `bounds` (`min`, `max`), `faces`, `edges`, `vertices`; counts must match exactly, volume and area within the relative tolerance, coordinates within the tolerance times the part's size. `eval --json` writes the same object the tests in `crates/oxyde-tests/tests/cli.rs` read back.
-
 ## License
 
-[MIT](LICENSE). OpenCASCADE itself is distributed under LGPL-2.1 with an additional exception, which is compatible with this project being MIT-licensed.
+Oxyde is [MIT](LICENSE)-licensed. The installers also ship OpenCASCADE and Netgen (the
+Simulation tab's mesher), both under the LGPL 2.1 and linked dynamically, so they can be
+replaced; [`packaging/THIRD-PARTY.txt`](packaging/THIRD-PARTY.txt) gives the details and where
+their sources are.
