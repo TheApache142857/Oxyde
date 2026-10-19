@@ -113,6 +113,9 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   a title block, on A4 to A0, as PDF, SVG or DXF at true size.
 - **Command line** `oxyde-cli`: rebuild a part without a window, then measure, check, export,
   picture or draw it (see below).
+- **MCP server** `oxyde-mcp`: an AI assistant such as Claude models parts and assemblies with
+  Oxyde's own features, looks at them and compares them with a STEP file it is remodelling
+  (see below).
 
 ## Build and run
 
@@ -145,6 +148,24 @@ run. `expected.json` holds any of `bodies`, `volume`, `area`, `centre_of_mass`, 
 relative tolerance, coordinates within the tolerance times the part's size. `eval --json` writes
 the same object the tests in `crates/oxyde-tests/tests/cli.rs` read back.
 
+## MCP server
+
+`oxyde-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server: through it an
+AI assistant builds parts feature by feature (fully defined sketches with SolidWorks-style
+dimensions, extrusions, revolves, fillets, shells, patterns, mirrors, holes, lofts, sweeps,
+equations), assembles them with mates, and checks its work with sections, probes, renders and a
+comparison against a reference part or STEP file. Its files are ordinary `.oxyprt` and `.oxyasm`
+files, to open and edit in the application. To use it from Claude Code, build it and register it,
+with the OpenCASCADE DLLs on `PATH` as for the tests:
+
+```sh
+cargo build -p oxyde-mcp
+claude mcp add oxyde -- C:/path/to/Oxyde/target/debug/oxyde-mcp.exe
+```
+
+`oxyde-mcp --tools` prints its tools and their arguments, and `oxyde-mcp --batch calls.jsonl`
+runs tool calls from a file (one `{"tool": ..., "arguments": {...}}` per line) without a client.
+
 ## Architecture
 
 Rust owns the application; C++ is only a thin shim around OpenCASCADE, behind a `Kernel` trait so
@@ -166,6 +187,7 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, result plots; depends on no other crate |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
+| `oxyde-mcp` | MCP server: an AI assistant models, inspects and compares parts and assemblies |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |
 
 ## Licence

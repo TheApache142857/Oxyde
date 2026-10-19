@@ -106,7 +106,8 @@ impl ToolOp {
 }
 
 /// The solid an extrusion, a revolve or a sweep swept, kept so that patterns and mirrors can copy
-/// it and do the same with the copies.
+/// it and do the same with the copies. A pattern or a mirror keeps the copies it made the same
+/// way, so that it can be patterned or mirrored in turn (SolidWorks' pattern of a pattern).
 #[derive(Debug)]
 struct ToolBody {
     shape: ShapeHandle,
@@ -117,6 +118,20 @@ struct ToolBody {
     op: ToolOp,
     /// The bodies it joined, cut or intersected.
     targets: Vec<BodyId>,
+    /// A pattern's or a mirror's other copies, beyond `shape`, with the names of their
+    /// faces; always owned. Empty for the tool of a single feature.
+    more: Vec<(ShapeHandle, Vec<Option<FaceName>>)>,
+}
+
+impl ToolBody {
+    /// Every solid of the tool, with the names of its faces.
+    fn pieces(&self) -> impl Iterator<Item = (ShapeHandle, &[Option<FaceName>])> {
+        std::iter::once((self.shape, self.names.as_slice())).chain(
+            self.more
+                .iter()
+                .map(|(shape, names)| (*shape, names.as_slice())),
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -160,6 +175,9 @@ impl FeatureResult {
         if let Some(tool) = self.tool {
             if tool.owned {
                 kernel.release(tool.shape);
+            }
+            for (shape, _) in tool.more {
+                kernel.release(shape);
             }
         }
     }
@@ -1053,13 +1071,10 @@ fn build_feature<K: Kernel>(
                     LinearPattern::instance_label,
                     &mut warnings,
                 );
-                result.produced = Some(build_instances(
-                    &ctx,
-                    &pattern.seeds,
-                    &instances,
-                    &skip,
-                    kernel,
-                )?);
+                let (body, tool) =
+                    build_instances(&ctx, &pattern.seeds, &instances, &skip, kernel)?;
+                result.produced = Some(body);
+                result.tool = tool;
             }
             FeatureKind::CircularPattern(pattern) => {
                 let instances = circular_instances(&ctx, pattern, &mut warnings)?;
@@ -1069,25 +1084,26 @@ fn build_feature<K: Kernel>(
                     CircularPattern::instance_label,
                     &mut warnings,
                 );
-                result.produced = Some(build_instances(
-                    &ctx,
-                    &pattern.seeds,
-                    &instances,
-                    &skip,
-                    kernel,
-                )?);
+                let (body, tool) =
+                    build_instances(&ctx, &pattern.seeds, &instances, &skip, kernel)?;
+                result.produced = Some(body);
+                result.tool = tool;
             }
             FeatureKind::Mirror(mirror) => {
                 let instances = mirror_instances(&ctx, mirror, &mut warnings)?;
-                result.produced = Some(if mirror.bodies.is_empty() {
-                    build_instances(&ctx, &mirror.seeds, &instances, &BTreeSet::new(), kernel)?
+                if mirror.bodies.is_empty() {
+                    let (body, tool) =
+                        build_instances(&ctx, &mirror.seeds, &instances, &BTreeSet::new(), kernel)?;
+                    result.produced = Some(body);
+                    result.tool = tool;
                 } else if mirror.seeds.is_empty() {
-                    mirror_bodies(&ctx, &mirror.bodies, &instances, kernel)?
+                    result.produced =
+                        Some(mirror_bodies(&ctx, &mirror.bodies, &instances, kernel)?);
                 } else {
                     return Err(
                         "a mirror copies features or bodies, not both: make two mirrors".to_owned(),
                     );
-                });
+                }
             }
             FeatureKind::Import(import) => {
                 let (body, appearances) = build_import(&ctx, import, kernel)?;
@@ -1585,6 +1601,7 @@ fn apply_named_tool<K: Kernel>(
                 names: tool_names,
                 op: copies_op,
                 targets,
+                more: Vec::new(),
             },
         )),
         Err(e) => {
@@ -2873,14 +2890,20 @@ fn mirror_bodies<K: Kernel>(
 
 /// Copies the tools of `seeds` to every instance but those in `skip` and does with each
 /// copy what the seed did: joined to or cut from the same bodies, or a new body. Faces of a
-/// copy are named after the seed's face and the instance.
+/// copy are named after the seed's face and the instance. A seed may be a pattern or a
+/// mirror itself, whose copies are then copied (a pattern of a pattern, a mirror of a
+/// pattern).
+///
+/// Returns the bodies, and the copies as the feature's own tool when they all do the same
+/// to the same bodies, so that the feature can be copied in turn; `None` when they differ
+/// or make new bodies.
 fn build_instances<K: Kernel>(
     ctx: &Context<'_>,
     seeds: &[FeatureId],
     instances: &[Instance],
     skip: &BTreeSet<[u32; 2]>,
     kernel: &mut K,
-) -> Result<Body, String> {
+) -> Result<(Body, Option<ToolBody>), String> {
     let id = ctx.feature().id;
     if seeds.is_empty() {
         return Err("no features to copy".to_owned());
@@ -2896,42 +2919,64 @@ fn build_instances<K: Kernel>(
         let (feature, result) = ctx.earlier(*seed)?;
         if !feature.kind.is_patternable() {
             return Err(format!(
-                "{} cannot be copied: only extrusions, revolves, sweeps and holes can, for now",
+                "{} cannot be copied: only extrusions, revolves, sweeps, lofts, holes, patterns \
+                 and mirrors of features can",
                 feature.name
             ));
         }
-        let tool = result
-            .tool
-            .as_ref()
-            .ok_or_else(|| format!("{} is suppressed or has errors", feature.name))?;
+        let copies_features = matches!(
+            feature.kind,
+            FeatureKind::LinearPattern(_)
+                | FeatureKind::CircularPattern(_)
+                | FeatureKind::Mirror(_)
+        );
+        let tool = match &result.tool {
+            Some(tool) => tool,
+            None if copies_features && !matches!(result.status, FeatureStatus::Error(_)) => {
+                return Err(format!(
+                    "{} cannot be copied: the features it copies do not all add, or all remove, \
+                     material on the same bodies",
+                    feature.name
+                ));
+            }
+            None => return Err(format!("{} is suppressed or has errors", feature.name)),
+        };
         tools.push(tool);
     }
+    // The copies stay as this feature's tool when they all do one thing to the same bodies.
+    let keep = tools.first().is_some_and(|first| {
+        tools
+            .iter()
+            .all(|t| t.op != ToolOp::NewBody && t.op == first.op && t.targets == first.targets)
+    });
 
     let mut work = Working::from(ctx.body);
     let mut new_bodies = 0;
     let mut copies: Vec<(ShapeHandle, Vec<Option<FaceName>>)> = Vec::new();
+    let mut kept: Vec<(ShapeHandle, Vec<Option<FaceName>>)> = Vec::new();
     let outcome = (|| -> Result<(), String> {
         for tool in &tools {
-            for (key, transform) in instances {
-                if skip.contains(key) {
-                    // A skipped copy keeps its body number, so that the bodies of the copies
-                    // after it keep theirs, and what refers to them stays on them.
-                    if tool.op == ToolOp::NewBody {
-                        new_bodies += 1;
+            for (piece, piece_names) in tool.pieces() {
+                for (key, transform) in instances {
+                    if skip.contains(key) {
+                        // A skipped copy keeps its body number, so that the bodies of the
+                        // copies after it keep theirs, and what refers to them stays on them.
+                        if tool.op == ToolOp::NewBody {
+                            new_bodies += 1;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let copy = kernel
-                    .transform(tool.shape, transform)
-                    .map_err(|e| e.to_string())?;
-                let names =
-                    copy.history
+                    let copy = kernel
+                        .transform(piece, transform)
+                        .map_err(|e| e.to_string())?;
+                    let names = copy
+                        .history
                         .faces
                         .iter()
                         .map(|sources| {
                             sources.iter().find_map(|source| match *source {
                                 FaceSource::InputFace { input: 0, face } => {
-                                    tool.names.get(face as usize).cloned().flatten().map(
+                                    piece_names.get(face as usize).cloned().flatten().map(
                                         |seed_face| {
                                             FaceName::new(FaceKey::Instance {
                                                 feature: id,
@@ -2945,13 +2990,14 @@ fn build_instances<K: Kernel>(
                             })
                         })
                         .collect();
-                if tool.op == ToolOp::NewBody {
-                    let body = BodyId::new(id, new_bodies);
-                    new_bodies += 1;
-                    // The copy is the new body's shape.
-                    work.push(body, copy.shape, names, true, kernel)?;
-                } else {
-                    copies.push((copy.shape, names));
+                    if tool.op == ToolOp::NewBody {
+                        let body = BodyId::new(id, new_bodies);
+                        new_bodies += 1;
+                        // The copy is the new body's shape.
+                        work.push(body, copy.shape, names, true, kernel)?;
+                    } else {
+                        copies.push((copy.shape, names));
+                    }
                 }
             }
             // Every copy of a seed at once: one boolean per copy would redo the work on a
@@ -2995,8 +3041,12 @@ fn build_instances<K: Kernel>(
                     }
                 }
             }
-            for (shape, _) in copies.drain(..) {
-                kernel.release(shape);
+            if keep {
+                kept.append(&mut copies);
+            } else {
+                for (shape, _) in copies.drain(..) {
+                    kernel.release(shape);
+                }
             }
         }
         Ok(())
@@ -3005,8 +3055,32 @@ fn build_instances<K: Kernel>(
         kernel.release(shape);
     }
     match outcome {
-        Ok(()) => Ok(work.finish(id)),
+        Ok(()) => {
+            let tool = match (keep, tools.first()) {
+                (true, Some(first)) if !kept.is_empty() => {
+                    let (shape, names) = kept.remove(0);
+                    Some(ToolBody {
+                        shape,
+                        owned: true,
+                        names,
+                        op: first.op,
+                        targets: first.targets.clone(),
+                        more: kept,
+                    })
+                }
+                _ => {
+                    for (shape, _) in kept {
+                        kernel.release(shape);
+                    }
+                    None
+                }
+            };
+            Ok((work.finish(id), tool))
+        }
         Err(e) => {
+            for (shape, _) in kept {
+                kernel.release(shape);
+            }
             work.abort(kernel);
             Err(e)
         }

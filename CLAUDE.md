@@ -47,7 +47,8 @@ The documentation, and what each file is for:
 
 ## Quality gate, before every commit
 
-Run these one after the other, never at the same time:
+This is the only check: there is no hosted CI. GitHub Actions are switched off for the repository because
+they cost paid minutes; add no workflow under `.github/`. Run these one after the other, never at the same time:
 
 ```
 cargo fmt -p <each crate you touched> --check

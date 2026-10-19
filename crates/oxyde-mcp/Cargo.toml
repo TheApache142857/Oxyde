@@ -1,0 +1,29 @@
+[package]
+name = "oxyde-mcp"
+description = "Model Context Protocol server for Oxyde: lets an AI agent model parts and assemblies feature by feature, inspect them and compare them with a reference."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "oxyde-mcp"
+path = "src/main.rs"
+
+[dependencies]
+oxyde-geom = { workspace = true }
+oxyde-sketch = { workspace = true }
+oxyde-kernel = { workspace = true }
+oxyde-occt = { workspace = true }
+oxyde-model = { workspace = true }
+oxyde-assembly = { workspace = true }
+oxyde-format = { workspace = true }
+oxyde-render = { workspace = true }
+oxyde-cli = { workspace = true }
+png = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

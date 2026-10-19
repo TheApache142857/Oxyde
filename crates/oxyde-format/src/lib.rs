@@ -584,6 +584,51 @@ pub fn load_assembly(path: &Path) -> Result<AssemblyFile, FormatError> {
     read_assembly(BufReader::new(File::open(path)?))
 }
 
+/// Features and persistent names one at a time, in the JSON form `model.json` gives them
+/// (FORMAT.md §3), for tools that build or read a part feature by feature (`oxyde-mcp`).
+pub mod values {
+    use oxyde_model::{EdgeName, FaceName, Feature, ModelError};
+
+    use crate::{FormatError, MODEL, schema};
+
+    fn json_error(source: serde_json::Error) -> FormatError {
+        FormatError::Json {
+            entry: MODEL,
+            source,
+        }
+    }
+
+    /// A feature as an entry of `model.json`'s `features`.
+    pub fn feature_to_json(feature: &Feature) -> Result<serde_json::Value, FormatError> {
+        schema::feature_value(feature).map_err(json_error)
+    }
+
+    /// A feature from an entry of `model.json`'s `features`, with the `id` and `name` it
+    /// gives. Import features are refused: their file is an entry of the archive.
+    pub fn feature_from_json(value: serde_json::Value) -> Result<Feature, FormatError> {
+        schema::feature_from_value(value)
+            .map_err(|e| FormatError::InvalidModel(ModelError::InvalidDefinition(e)))
+    }
+
+    /// A face name as a FaceRef.
+    pub fn face_to_json(face: &FaceName) -> Result<serde_json::Value, FormatError> {
+        schema::face_value(face).map_err(json_error)
+    }
+
+    pub fn face_from_json(value: serde_json::Value) -> Result<FaceName, FormatError> {
+        schema::face_from_value(value).map_err(json_error)
+    }
+
+    /// An edge name as an EdgeRef.
+    pub fn edge_to_json(edge: &EdgeName) -> Result<serde_json::Value, FormatError> {
+        schema::edge_value(edge).map_err(json_error)
+    }
+
+    pub fn edge_from_json(value: serde_json::Value) -> Result<EdgeName, FormatError> {
+        schema::edge_from_value(value).map_err(json_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
