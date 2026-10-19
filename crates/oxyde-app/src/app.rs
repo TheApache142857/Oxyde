@@ -300,7 +300,35 @@ pub struct OxydeApp {
 impl OxydeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
         crate::theme::load_fonts(&cc.egui_ctx);
-        let mut app = Self {
+        let mut app = Self::blank(crate::prefs::Preferences::load(), file);
+        let (materials, problem) = crate::materials::load();
+        app.materials = materials;
+        if let Some(problem) = problem {
+            app.status = problem;
+        }
+        app.apply_preferences(&cc.egui_ctx);
+        app.wgpu_state = cc.wgpu_render_state.clone();
+        if let Some(state) = &cc.wgpu_render_state {
+            let info = state.adapter.get_info();
+            app.viewport.enable_gpu(
+                crate::gpu::GpuViewport::new(
+                    state,
+                    if app.prefs.graphics.antialiasing {
+                        crate::gpu::DEFAULT_SAMPLES
+                    } else {
+                        1
+                    },
+                ),
+                format!("GPU: {} ({:?})", info.name, info.backend),
+            );
+        }
+        app
+    }
+
+    /// The application before it has a window: an empty part, the standard materials, no
+    /// GPU, and nothing applied to egui yet. Tests build it to draw panels headlessly.
+    pub(crate) fn blank(prefs: crate::prefs::Preferences, file: Option<PathBuf>) -> Self {
+        Self {
             kernel: OcctKernel::new(),
             doc: Document::new(),
             viewport: Viewport::new(),
@@ -356,12 +384,12 @@ impl OxydeApp {
             render: Default::default(),
             simulation: Default::default(),
             wgpu_state: None,
-            prefs: crate::prefs::Preferences::load(),
+            prefs,
             prefs_window: Default::default(),
             debug_stats: Default::default(),
             viewport_rect: egui::Rect::NOTHING,
             // The file to open, if any, is opened by the splash screen's last step.
-            splash: crate::splash::Splash::new(file.clone()),
+            splash: crate::splash::Splash::new(file),
             texture_cache: Default::default(),
             materials: oxyde_model::MaterialLibrary::standard(),
             materials_window: Default::default(),
@@ -369,30 +397,7 @@ impl OxydeApp {
             job: None,
             internal_error: None,
             failed_frames: 0,
-        };
-        let (materials, problem) = crate::materials::load();
-        app.materials = materials;
-        if let Some(problem) = problem {
-            app.status = problem;
         }
-        app.apply_preferences(&cc.egui_ctx);
-        app.wgpu_state = cc.wgpu_render_state.clone();
-        if let Some(state) = &cc.wgpu_render_state {
-            let info = state.adapter.get_info();
-            app.viewport.enable_gpu(
-                crate::gpu::GpuViewport::new(
-                    state,
-                    if app.prefs.graphics.antialiasing {
-                        crate::gpu::DEFAULT_SAMPLES
-                    } else {
-                        1
-                    },
-                ),
-                format!("GPU: {} ({:?})", info.name, info.backend),
-            );
-        }
-        let _ = file;
-        app
     }
 
     // ---- Model changes -----------------------------------------------------------------------

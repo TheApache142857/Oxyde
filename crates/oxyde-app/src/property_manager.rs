@@ -1685,4 +1685,155 @@ mod tests {
         });
         assert!(selection < 60.0, "a selection box is {selection} high");
     }
+
+    /// The window the panels are drawn in: as tall as a laptop's, wide enough for the left
+    /// panel to take its default width.
+    const SCREEN: egui::Vec2 = egui::vec2(1200.0, 900.0);
+
+    /// The tallest a row or a box of a panel may be. A selection box's list is the tallest
+    /// thing in a panel, and it scrolls past 110 points.
+    const ROW_LIMIT: f32 = 130.0;
+
+    /// A PropertyManager as the left panel draws it.
+    struct Drawn {
+        /// The rectangle of every widget and layout egui laid out.
+        widgets: Vec<egui::Rect>,
+        /// Where the PropertyManager starts and ends in the panel.
+        top: f32,
+        bottom: f32,
+    }
+
+    /// Draws the open command's PropertyManager in the left panel, set up as the app sets
+    /// it up. Twice: grids and scroll areas size themselves on the first frame.
+    fn draw_panel(ctx: &egui::Context, app: &mut OxydeApp) -> Drawn {
+        let (mut top, mut bottom) = (0.0, 0.0);
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, SCREEN)),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::SidePanel::left("feature_manager")
+                    .resizable(true)
+                    .default_width(290.0)
+                    .min_width(220.0)
+                    .show(ctx, |ui| {
+                        top = ui.cursor().top();
+                        app.property_manager(ui);
+                        bottom = ui.cursor().top();
+                    });
+            });
+        }
+        let widgets = ctx.viewport(|v| {
+            v.prev_pass
+                .widgets
+                .layers()
+                .flat_map(|(_, widgets)| widgets.iter().map(|w| w.rect))
+                .filter(|r| r.is_finite())
+                .collect()
+        });
+        Drawn {
+            widgets,
+            top,
+            bottom,
+        }
+    }
+
+    /// Opens a command's panel.
+    type OpenPanel = fn(&mut OxydeApp);
+
+    /// Every PropertyManager panel, opened on an empty part as its command opens it, with
+    /// the options that show the most of it.
+    fn panels() -> Vec<(&'static str, OpenPanel)> {
+        vec![
+            ("Sketch", |app| app.open_dialog(Dialog::ChoosePlane)),
+            ("Extrude", |app| app.open_extrude(None, None, None)),
+            ("Extrude up to a surface", |app| {
+                app.open_extrude(None, None, None);
+                if let Some(Dialog::Extrude(d)) = &mut app.dialog {
+                    d.end = EndCondition::UpToSurface;
+                }
+            }),
+            ("Revolve", |app| app.begin_revolve()),
+            ("Sweep", |app| app.begin_sweep()),
+            ("Loft", |app| app.open_loft(None, None)),
+            ("Fillet", |app| {
+                app.open_dialog(Dialog::Blend(BlendDialog::new(true, Vec::new())));
+            }),
+            ("Chamfer", |app| {
+                let mut d = BlendDialog::new(false, Vec::new());
+                d.chamfer_type = ChamferType::AngleDistance;
+                app.open_dialog(Dialog::Blend(d));
+            }),
+            ("Shell", |app| app.open_shell(None, None)),
+            ("Hole Wizard", |app| app.begin_hole()),
+            ("Linear Pattern", |app| {
+                app.open_pattern(None, PatternKind::Linear, None);
+                if let Some(Dialog::Pattern(d)) = &mut app.dialog {
+                    d.second = true;
+                    d.second_next = true;
+                }
+            }),
+            ("Circular Pattern", |app| {
+                app.open_pattern(None, PatternKind::Circular, None);
+            }),
+            ("Mirror", |app| {
+                app.open_pattern(None, PatternKind::Mirror, None)
+            }),
+            ("Combine", |app| app.open_combine(None, None)),
+            ("Plane", |app| app.open_ref_plane(None, None)),
+            ("Axis", |app| app.open_ref_axis(None, None)),
+            ("Axis where two planes meet", |app| {
+                app.open_ref_axis(None, None);
+                if let Some(Dialog::RefAxis(d)) = &mut app.dialog {
+                    d.two_planes = true;
+                }
+            }),
+        ]
+    }
+
+    /// No row or box of any panel grows past a few lines, and every panel fits in the
+    /// window with room to spare: a right-to-left layout straight in a reference box once
+    /// stretched Linear Pattern's Direction 1 box to the bottom of the window, hiding
+    /// everything under it.
+    #[test]
+    fn panels_fit_in_the_window() {
+        let ctx = egui::Context::default();
+        let mut app = OxydeApp::blank(crate::prefs::Preferences::default(), None);
+        crate::theme::load_fonts(&ctx);
+        app.apply_preferences(&ctx);
+        // Every panel is checked before failing, to name all the panels a change broke.
+        let mut problems = Vec::new();
+        for (name, open) in panels() {
+            open(&mut app);
+            assert!(
+                app.dialog.as_ref().is_some_and(Dialog::is_panel),
+                "{name} opened no panel"
+            );
+            let drawn = draw_panel(&ctx, &mut app);
+            assert!(drawn.widgets.len() > 10, "{name} drew next to nothing");
+            let height = drawn.bottom - drawn.top;
+            if drawn.bottom > SCREEN.y - 100.0 {
+                problems.push(format!(
+                    "the {name} panel is {height} high and leaves no room for the tree"
+                ));
+            }
+            // The panel, its frame and the resize handle hold the whole PropertyManager, or
+            // all of it the window shows.
+            let bottom = drawn.bottom.min(SCREEN.y);
+            let tallest = drawn
+                .widgets
+                .iter()
+                .filter(|r| !(r.top() <= drawn.top + 10.0 && r.bottom() >= bottom - 30.0))
+                .max_by(|a, b| a.height().total_cmp(&b.height()));
+            if let Some(rect) = tallest.filter(|r| r.height() > ROW_LIMIT) {
+                problems.push(format!(
+                    "a row of the {name} panel is {} high, at {rect:?}",
+                    rect.height()
+                ));
+            }
+            app.close_dialog();
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
 }

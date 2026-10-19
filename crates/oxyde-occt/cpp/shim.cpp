@@ -111,10 +111,6 @@
 #include <gp_Trsf.hxx>
 #include <gp_Vec.hxx>
 
-#ifdef OXYDE_NETGEN
-#include "oxyde-occt/cpp/netgen_mesh.h"
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -2004,12 +2000,28 @@ TopologyCounts Session::topology_counts(std::uint64_t shape) const {
     });
 }
 
-VolumeMeshData Session::volume_mesh(std::uint64_t shape,
-                                    const VolumeMeshOptionsData& options) const {
+void MeshMonitor::request_stop() const {
+    inner.request_stop();
+}
+
+MeshProgressData MeshMonitor::progress() const {
+    MeshProgressData out;
+    out.task = rust::String(inner.task());
+    out.percent = inner.percent();
+    return out;
+}
+
+std::unique_ptr<MeshMonitor> new_mesh_monitor() {
+    return std::make_unique<MeshMonitor>();
+}
+
+VolumeMeshData Session::volume_mesh(std::uint64_t shape, const VolumeMeshOptionsData& options,
+                                    const MeshMonitor& monitor) const {
     return guarded("volume_mesh", [&]() -> VolumeMeshData {
 #ifndef OXYDE_NETGEN
         (void)shape;
         (void)options;
+        (void)monitor;
         throw std::runtime_error("this build of Oxyde has no Netgen");
 #else
         const TopoDS_Shape s = get(shape);
@@ -2028,7 +2040,7 @@ VolumeMeshData Session::volume_mesh(std::uint64_t shape,
         o.segments_per_edge = options.segments_per_edge;
         o.second_order = options.second_order;
         o.optimize_steps = static_cast<int>(options.optimize_steps);
-        netgen_bridge::Result mesh = netgen_bridge::mesh_solid(solids(1), o);
+        netgen_bridge::Result mesh = netgen_bridge::mesh_solid(solids(1), o, monitor.inner);
 
         // Netgen numbers the faces its own way: name each by its index in the shape's
         // topology, which is what persistent face names resolve to.

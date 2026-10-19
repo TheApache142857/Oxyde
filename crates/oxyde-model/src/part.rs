@@ -244,6 +244,43 @@ impl PartDefinition {
             }
         }
     }
+
+    /// Takes from `built`, the same timeline once rebuilt, what its import features did on
+    /// that rebuild: the colours and the material their STEP files gave the part, which
+    /// this definition's imports are still due to apply. Used before writing a change
+    /// into a part file that was never rebuilt on its own (from an assembly): without it,
+    /// the next rebuild applies them again, over what the change did, such as a STEP
+    /// material coming back on a part whose material was removed.
+    ///
+    /// Changes nothing and returns false when no import of this definition is still due
+    /// to apply its file's colours, or when `built` is not the same timeline.
+    pub fn settle_imports(&mut self, built: &PartDefinition) -> bool {
+        let pending = self
+            .features
+            .iter()
+            .any(|f| matches!(&f.kind, FeatureKind::Import(i) if i.apply_colors));
+        if !pending {
+            return false;
+        }
+        // The same timeline but for what the rebuild turned off (an import rolled back or
+        // suppressed in `built` is still pending there, and makes them differ).
+        let settled = |features: &[Feature]| {
+            let mut features = features.to_vec();
+            for feature in &mut features {
+                if let FeatureKind::Import(import) = &mut feature.kind {
+                    import.apply_colors = false;
+                }
+            }
+            features
+        };
+        if settled(&self.features) != built.features {
+            return false;
+        }
+        self.features = built.features.clone();
+        self.appearances = built.appearances.clone();
+        self.material = built.material.clone();
+        true
+    }
 }
 
 /// A part document: its timeline and the cached results of the last rebuild.
@@ -3142,6 +3179,45 @@ mod tests {
         part.replace_feature(pattern, one_way).unwrap();
         assert!(part.feature(pattern).unwrap().parameter_names().is_empty());
         assert!(Part::from_definition(part.definition()).is_ok());
+    }
+
+    #[test]
+    fn imports_settle_only_from_the_same_timeline() {
+        let mut part = Part::new();
+        let id = part.add_feature(FeatureKind::Import(Import::new(
+            "bar.step",
+            crate::feature::FileData::new(b"ISO-10303-21;".to_vec()),
+        )));
+        let unbuilt = part.definition();
+        // What a rebuild leaves: the colour and the material of the file, applied once.
+        let mut built = unbuilt.clone();
+        if let FeatureKind::Import(import) = &mut built.features[0].kind {
+            import.apply_colors = false;
+        }
+        let red = Appearance::colored([200, 40, 40]);
+        built.appearances.set_body(BodyId::new(id, 0), Some(red));
+        built.material = Material::from_step("Acier", 7850.0);
+
+        let mut settled = unbuilt.clone();
+        assert!(settled.settle_imports(&built));
+        assert_eq!(settled, built);
+        // Nothing left to apply: nothing to take.
+        let mut again = settled.clone();
+        again.appearances = Appearances::default();
+        assert!(!again.settle_imports(&built));
+        assert!(again.appearances.is_empty());
+
+        // Another timeline (here another file) is not taken from.
+        let mut other = built.clone();
+        if let FeatureKind::Import(import) = &mut other.features[0].kind {
+            import.file_name = "other.step".to_owned();
+        }
+        let mut kept = unbuilt.clone();
+        assert!(!kept.settle_imports(&other));
+        assert_eq!(kept, unbuilt);
+        // Nor is a copy whose import was not rebuilt (rolled back, suppressed).
+        assert!(!kept.settle_imports(&unbuilt));
+        assert_eq!(kept, unbuilt);
     }
 
     #[test]

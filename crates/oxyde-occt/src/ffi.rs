@@ -252,6 +252,13 @@ pub(crate) mod bridge {
         triangle_faces: Vec<u32>,
     }
 
+    /// Where a volume mesh is: Netgen's task (empty before it starts) and its percent
+    /// within that task.
+    struct MeshProgressData {
+        task: String,
+        percent: f64,
+    }
+
     // ---- STEP colours -----------------------------------------------------------------------
 
     /// A colour of a solid or a face in a STEP file; `present` false where there is none.
@@ -464,11 +471,23 @@ pub(crate) mod bridge {
         /// Version of the Netgen the shim was built with, or "" without one.
         fn netgen_version() -> String;
 
-        /// Fills the one solid of `shape` with tetrahedra (Netgen, one call at a time).
+        /// A volume mesh's progress and request to stop; thread-safe.
+        type MeshMonitor;
+
+        fn new_mesh_monitor() -> Result<UniquePtr<MeshMonitor>>;
+
+        /// Asks the mesh `monitor` was given to stop at Netgen's next check.
+        fn request_stop(self: &MeshMonitor);
+
+        fn progress(self: &MeshMonitor) -> Result<MeshProgressData>;
+
+        /// Fills the one solid of `shape` with tetrahedra (Netgen, one call at a time),
+        /// reporting to `monitor` while it runs; fails once `monitor` is asked to stop.
         fn volume_mesh(
             self: &Session,
             shape: u64,
             options: &VolumeMeshOptionsData,
+            monitor: &MeshMonitor,
         ) -> Result<VolumeMeshData>;
 
         /// Writes the shapes with their colours (`colors` indexed like `shapes`, or empty)
@@ -496,3 +515,8 @@ pub(crate) mod bridge {
 }
 
 pub(crate) use bridge::*;
+
+// SAFETY: a `MeshMonitor` is an atomic flag and a mutex-guarded copy of Netgen's progress
+// (cpp/netgen_mesh.h); every method may be called from any thread.
+unsafe impl Send for MeshMonitor {}
+unsafe impl Sync for MeshMonitor {}

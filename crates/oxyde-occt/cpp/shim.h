@@ -12,6 +12,8 @@
 
 #include <TopoDS_Shape.hxx>
 
+#include "oxyde-occt/cpp/netgen_mesh.h"
+
 #include <cstdint>
 #include <memory>
 
@@ -25,6 +27,7 @@ struct DistanceData;
 struct PolylineData;
 struct ProjectionData;
 struct MeshData;
+struct MeshProgressData;
 struct OpResultData;
 struct PlaneData;
 struct PointData;
@@ -38,6 +41,18 @@ struct TopologyCounts;
 struct TopologyData;
 struct VolumeMeshData;
 struct VolumeMeshOptionsData;
+
+// A volume mesh's progress and request to stop, shared with the Rust thread watching it.
+// Thread-safe; meaningful without Netgen too (it then never moves).
+class MeshMonitor {
+public:
+    void request_stop() const;
+    MeshProgressData progress() const;
+
+    netgen_bridge::Monitor inner;
+};
+
+std::unique_ptr<MeshMonitor> new_mesh_monitor();
 
 class Session {
 public:
@@ -74,7 +89,8 @@ public:
     ProjectionData project_edges(rust::Slice<const std::uint64_t> shapes, const PlaneData& view,
                                  double deflection) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;
-    VolumeMeshData volume_mesh(std::uint64_t shape, const VolumeMeshOptionsData& options) const;
+    VolumeMeshData volume_mesh(std::uint64_t shape, const VolumeMeshOptionsData& options,
+                               const MeshMonitor& monitor) const;
 
     void export_step(rust::Slice<const std::uint64_t> shapes,
                      rust::Slice<const StepShapeColors> colors,

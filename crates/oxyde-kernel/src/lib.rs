@@ -30,6 +30,7 @@
 )]
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use oxyde_geom::{Axis, Path as SweepPath, Plane, Point3, Profile, Transform, Vec3};
 
@@ -389,6 +390,8 @@ pub enum VolumeMeshError {
     /// The mesher was there and failed, or the shape is not one solid; the message says
     /// why.
     Failed(String),
+    /// [`MeshWatch::cancel`] was set while the mesher ran.
+    Cancelled,
 }
 
 impl std::fmt::Display for VolumeMeshError {
@@ -396,11 +399,24 @@ impl std::fmt::Display for VolumeMeshError {
         match self {
             VolumeMeshError::Unsupported => write!(f, "no volume mesher in this kernel"),
             VolumeMeshError::Failed(message) => write!(f, "volume meshing failed: {message}"),
+            VolumeMeshError::Cancelled => write!(f, "volume meshing was cancelled"),
         }
     }
 }
 
 impl std::error::Error for VolumeMeshError {}
+
+/// What a volume mesh in progress ([`Kernel::volume_mesh_watched`]) listens to and
+/// reports to. A large mesh can take minutes: without this it shows no progress and cannot
+/// be stopped.
+#[derive(Clone, Copy)]
+pub struct MeshWatch<'a> {
+    /// Set from any thread to stop the mesher at its next check.
+    pub cancel: &'a AtomicBool,
+    /// How far the mesh is, 0 to 1 and never going back, with what the mesher is doing
+    /// ("Meshing the faces"). Called every so often from a thread of the kernel's own.
+    pub progress: &'a (dyn Fn(f64, &'static str) + Sync),
+}
 
 /// What sets an unequal chamfer's other side ([`Kernel::chamfer_with`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -697,6 +713,21 @@ pub trait Kernel {
     ) -> Result<VolumeMesh, VolumeMeshError> {
         let _ = (shape, options);
         Err(VolumeMeshError::Unsupported)
+    }
+
+    /// [`Kernel::volume_mesh`], reporting its progress and stopping with
+    /// [`VolumeMeshError::Cancelled`] when `watch.cancel` is set. The default checks the
+    /// flag before meshing only, for kernels whose mesher cannot be watched.
+    fn volume_mesh_watched(
+        &self,
+        shape: ShapeHandle,
+        options: &VolumeMeshOptions,
+        watch: MeshWatch<'_>,
+    ) -> Result<VolumeMesh, VolumeMeshError> {
+        if watch.cancel.load(Ordering::Relaxed) {
+            return Err(VolumeMeshError::Cancelled);
+        }
+        self.volume_mesh(shape, options)
     }
 
     /// Frees a shape. Releasing an unknown or already released handle does nothing.

@@ -1,13 +1,17 @@
 //! Netgen's volume mesher through `OcctKernel::volume_mesh`: a box, a filleted box and a
-//! cylinder, first and second order, checked against the kernel's own geometry. Skipped
-//! (with a note on stderr) when the build has no Netgen; then the kernel must say so.
+//! cylinder, first and second order, checked against the kernel's own geometry, and its
+//! progress and stopping while it runs. Skipped (with a note on stderr) when the build
+//! has no Netgen; then the kernel must say so.
 
 use oxyde_geom::{Curve2, Plane, Point2, Point3, Profile, ProfileSegment, Vec3};
 use oxyde_kernel::{
-    CurveKind, Kernel, ShapeHandle, SurfaceKind, TET_EDGES, TRIANGLE_EDGES, Topology, VolumeMesh,
-    VolumeMeshError, VolumeMeshOptions,
+    CurveKind, Kernel, MeshWatch, ShapeHandle, SurfaceKind, TET_EDGES, TRIANGLE_EDGES, Topology,
+    VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
 use oxyde_occt::OcctKernel;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 /// The kernel, or `None` (after checking it reports the mesher missing) without Netgen.
 fn kernel_with_netgen() -> Option<OcctKernel> {
@@ -365,4 +369,67 @@ fn two_solids_are_refused() {
         Err(VolumeMeshError::Failed(message)) => assert!(message.contains("one solid")),
         other => panic!("{other:?}"),
     }
+}
+
+/// The kernel's mesher reports where it is while it runs, never going back, and stops
+/// when asked; the mesh after a stopped one is made as usual.
+#[test]
+fn a_mesh_reports_progress_and_can_be_stopped() {
+    let Some(mut kernel) = kernel_with_netgen() else {
+        return;
+    };
+    let shape = kernel
+        .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
+        .unwrap();
+    let fine = options(1.0, false);
+
+    let reports = Mutex::new(Vec::new());
+    let cancel = AtomicBool::new(false);
+    let progress = |f: f64, stage: &'static str| reports.lock().unwrap().push((f, stage));
+    let watch = MeshWatch {
+        cancel: &cancel,
+        progress: &progress,
+    };
+    let mesh = kernel.volume_mesh_watched(shape, &fine, watch).unwrap();
+    assert!(!mesh.tets.is_empty());
+    let reports = reports.into_inner().unwrap();
+    assert!(!reports.is_empty(), "no progress reported");
+    for pair in reports.windows(2) {
+        assert!(pair[1].0 >= pair[0].0, "{reports:?}");
+    }
+    assert!(reports.iter().all(|(f, _)| (0.0..=1.0).contains(f)));
+    assert!(
+        reports.iter().any(|(_, s)| *s == "Optimising the volume"),
+        "{reports:?}"
+    );
+
+    // Stopped from its first report: no mesh, and quickly.
+    let cancel = AtomicBool::new(false);
+    let stop = |_: f64, _: &'static str| cancel.store(true, Ordering::Relaxed);
+    let watch = MeshWatch {
+        cancel: &cancel,
+        progress: &stop,
+    };
+    let started = Instant::now();
+    assert_eq!(
+        kernel.volume_mesh_watched(shape, &fine, watch),
+        Err(VolumeMeshError::Cancelled)
+    );
+    let stopped = started.elapsed();
+
+    // A cancel set before the call meshes nothing at all.
+    let watch = MeshWatch {
+        cancel: &cancel,
+        progress: &|_, _| {},
+    };
+    assert_eq!(
+        kernel.volume_mesh_watched(shape, &fine, watch),
+        Err(VolumeMeshError::Cancelled)
+    );
+
+    // Netgen's stop flag is not left set for the next mesh.
+    let started = Instant::now();
+    let again = kernel.volume_mesh(shape, &fine).unwrap();
+    assert_eq!(again.tets.len(), mesh.tets.len());
+    assert!(stopped < started.elapsed(), "{stopped:?}");
 }

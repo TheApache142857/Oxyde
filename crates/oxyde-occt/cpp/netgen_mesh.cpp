@@ -11,9 +11,12 @@
 #include <netgen_version.hpp>
 #endif
 
+#include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace oxyde::occt::netgen_bridge {
 
@@ -33,11 +36,68 @@ std::uint32_t node_index(netgen::PointIndex pi) {
     return static_cast<std::uint32_t>(i);
 }
 
+// While Netgen meshes, copies its progress to the monitor every so often and passes on a
+// request to stop through `multithread.terminate`, which Netgen's loops check. Made and
+// destroyed under Netgen's lock, so it only ever sees the mesh it was made for.
+class Watcher {
+public:
+    explicit Watcher(const Monitor& monitor) : monitor_(monitor), thread_([this] { run(); }) {}
+
+    ~Watcher() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            done_ = true;
+        }
+        wake_.notify_all();
+        thread_.join();
+    }
+
+    Watcher(const Watcher&) = delete;
+    Watcher& operator=(const Watcher&) = delete;
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!done_) {
+            copy();
+            wake_.wait_for(lock, std::chrono::milliseconds(50));
+        }
+    }
+
+    void copy() {
+        if (monitor_.stop_requested()) {
+            netgen::multithread.terminate = 1;
+        }
+        // Netgen points `task` at string literals; the length is capped all the same.
+        const char* task = netgen::multithread.task;
+        std::string text;
+        if (task != nullptr) {
+            std::size_t n = 0;
+            while (n < 80 && task[n] != '\0') {
+                ++n;
+            }
+            text.assign(task, n);
+        }
+        monitor_.set(std::move(text), netgen::multithread.percent);
+    }
+
+    const Monitor& monitor_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    bool done_ = false;
+    // Last, so it starts once everything it uses is there.
+    std::thread thread_;
+};
+
 } // namespace
 
-Result mesh_solid(const TopoDS_Shape& solid, const Options& options) {
+Result mesh_solid(const TopoDS_Shape& solid, const Options& options, const Monitor& monitor) {
     const std::lock_guard<std::mutex> lock(netgen_mutex());
     netgen::multithread.terminate = 0;
+    // The last mesh's task would otherwise read as this one's progress.
+    netgen::multithread.task = "";
+    netgen::multithread.percent = 0.0;
+    const Watcher watcher(monitor);
 
     auto geometry = std::make_shared<netgen::OCCGeometry>(solid);
     auto mesh = std::make_shared<netgen::Mesh>();
@@ -52,7 +112,12 @@ Result mesh_solid(const TopoDS_Shape& solid, const Options& options) {
     mp.optsteps3d = options.optimize_steps;
     mp.uselocalh = true;
 
-    if (geometry->GenerateMesh(mesh, mp) != 0 || !mesh) {
+    const int status = geometry->GenerateMesh(mesh, mp);
+    // A stopped Netgen may return what it had so far as if it were done.
+    if (monitor.stop_requested()) {
+        throw std::runtime_error("cancelled");
+    }
+    if (status != 0 || !mesh) {
         throw std::runtime_error("Netgen could not fill the solid with tetrahedra");
     }
     if (mesh->GetNE() == 0) {

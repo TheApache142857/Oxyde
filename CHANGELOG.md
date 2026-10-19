@@ -5,7 +5,7 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### Third bug hunt: end conditions, a fuller sketcher, Measure (unreleased, October 2026)
+### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 
 A read through the modelling engine and the application for bugs, behaviours nobody asked
 for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
@@ -30,6 +30,11 @@ for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
 - **Study names that would share a results file are refused.** On Windows and macOS,
   *Static 1* and *static 1* (or *Load/Case* and *Load_Case*) wrote the same `.oxyres`,
   one study's results over the other's; New Study and Rename now tell them apart.
+- **Meshing with Netgen shows its progress and can be cancelled.** The progress stayed
+  at 0 % until Netgen had meshed a whole body, so a fine mesh looked stuck for minutes,
+  and Cancel did not reach Netgen: it went on taking the processor and memory in the
+  background. The progress now follows Netgen through *Meshing the faces*, *Optimising
+  the faces*, *Filling the volume* and *Optimising the volume*, and Cancel stops it.
 - **Right-click selects what it is on.** A right-click on a face or an edge acted on what
   was selected before; it now selects what is under the pointer first, as in SolidWorks.
 - **Direction and axis boxes are one line high again.** In Linear and Circular Pattern,
@@ -44,6 +49,12 @@ for and what SolidWorks and Fusion 360 users reach for every day. Fixed:
   it (glass-clear polycarbonate panels turned opaque white). *Apply and remove
   appearances* now removes those colours from the files for good. Parts already given a
   material this way need it applied once more.
+- **A material removed from imported parts in an assembly stays removed.** On such parts,
+  never opened on their own, removing the material wrote the file with the colours and
+  the material of the STEP file still to be applied, as when it was imported:
+  the material the STEP file names came back the next time the assembly was opened (or
+  after editing a component in place), with its weight in the bill of materials. The
+  file now gets the part as the assembly shows it.
 
 New, for daily work:
 
@@ -125,6 +136,8 @@ New, for daily work:
 - **Edit a feature from the part.** Right-click a face or an edge: *Edit* the feature
   that made it, or its sketch. In the tree, a feature that uses a sketch offers *Edit*
   of that sketch too, and every feature *Roll back* (the bar above it) and *Roll to end*.
+- Version 0.0.8, with the end conditions, Loft, the Hole Wizard, drawings, the new
+  sketch tools and the fixes above.
 
 ### Several studies per model, and thermal studies (0.0.7, October 2026)
 

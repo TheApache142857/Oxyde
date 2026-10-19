@@ -30,6 +30,9 @@ mod ffi;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use oxyde_geom::{
     Axis, Curve2, Loop, Path as SweepPath, Plane, Point2, Point3, Profile, ProfileSegment,
@@ -37,9 +40,9 @@ use oxyde_geom::{
 };
 use oxyde_kernel::{
     BooleanOp, ChamferSecond, CurveKind, Distance, EdgeInfo, FaceInfo, FaceMesh, FaceSource,
-    Kernel, Mesh, OpHistory, OpResult, ProjectedEdges, ShapeHandle, StepAssembly, StepColor,
-    StepColors, StepImport, StepInstance, StepMaterial, StepNode, StepNodeContent, SubShape,
-    SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh, VolumeMeshError,
+    Kernel, Mesh, MeshWatch, OpHistory, OpResult, ProjectedEdges, ShapeHandle, StepAssembly,
+    StepColor, StepColors, StepImport, StepInstance, StepMaterial, StepNode, StepNodeContent,
+    SubShape, SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh, VolumeMeshError,
     VolumeMeshOptions,
 };
 
@@ -500,25 +503,62 @@ impl Kernel for OcctKernel {
         shape: ShapeHandle,
         options: &VolumeMeshOptions,
     ) -> Result<VolumeMesh, VolumeMeshError> {
+        let cancel = AtomicBool::new(false);
+        let watch = MeshWatch {
+            cancel: &cancel,
+            progress: &|_, _| {},
+        };
+        self.volume_mesh_watched(shape, options, watch)
+    }
+
+    fn volume_mesh_watched(
+        &self,
+        shape: ShapeHandle,
+        options: &VolumeMeshOptions,
+        watch: MeshWatch<'_>,
+    ) -> Result<VolumeMesh, VolumeMeshError> {
         if !ffi::has_netgen() {
             return Err(VolumeMeshError::Unsupported);
         }
-        guarded(|| {
-            let data = self.session.volume_mesh(
-                shape.raw(),
-                &ffi::VolumeMeshOptionsData {
-                    max_size: options.max_size,
-                    min_size: options.min_size,
-                    grading: options.grading,
-                    curvature_safety: options.curvature_safety,
-                    segments_per_edge: options.segments_per_edge,
-                    second_order: options.second_order,
-                    optimize_steps: options.optimize_steps,
-                },
-            )?;
-            volume_mesh_from(&data).map_err(OcctError::Occt)
-        })
-        .map_err(|e| VolumeMeshError::Failed(e.message().to_owned()))
+        if watch.cancel.load(Ordering::Relaxed) {
+            return Err(VolumeMeshError::Cancelled);
+        }
+        let failed = |e: OcctError| VolumeMeshError::Failed(e.message().to_owned());
+        let monitor = guarded(|| Ok(ffi::new_mesh_monitor()?)).map_err(failed)?;
+        let Some(monitor) = monitor.as_ref() else {
+            return Err(VolumeMeshError::Failed("no mesh monitor".to_owned()));
+        };
+        let data = ffi::VolumeMeshOptionsData {
+            max_size: options.max_size,
+            min_size: options.min_size,
+            grading: options.grading,
+            curvature_safety: options.curvature_safety,
+            segments_per_edge: options.segments_per_edge,
+            second_order: options.second_order,
+            optimize_steps: options.optimize_steps,
+        };
+        // Netgen has no callback: a thread of ours reads the monitor while the shim meshes
+        // on this one, and passes a cancel on. Dropping `finished` ends it at once.
+        let (finished, done) = mpsc::channel::<()>();
+        let result = std::thread::scope(|scope| {
+            let watcher = std::thread::Builder::new()
+                .name("oxyde mesh watch".into())
+                .spawn_scoped(scope, move || watch_mesh(monitor, watch, &done));
+            let result = guarded(|| {
+                let mesh = self.session.volume_mesh(shape.raw(), &data, monitor)?;
+                volume_mesh_from(&mesh).map_err(OcctError::Occt)
+            });
+            drop(finished);
+            // Without a watcher the mesh still runs, unwatched; a panic in it is its own.
+            if let Ok(watcher) = watcher {
+                let _ = watcher.join();
+            }
+            result
+        });
+        if watch.cancel.load(Ordering::Relaxed) {
+            return Err(VolumeMeshError::Cancelled);
+        }
+        result.map_err(failed)
     }
 
     fn release(&mut self, shape: ShapeHandle) {
@@ -867,6 +907,105 @@ fn mesh_from(data: ffi::MeshData) -> Mesh {
 /// is where each of `oxyde_kernel::TET_EDGES` (01 12 02 03 13 23) finds its node.
 const NETGEN_TET_EDGE: [usize; 6] = [4, 7, 5, 6, 8, 9];
 
+/// Netgen's tasks as parts of a whole mesh, in the order it runs them: the label the
+/// progress shows, and where each starts and ends as a fraction of the whole. The shares
+/// are rough, from timing an imported part of 87 faces at 19 000 nodes: optimising the
+/// faces took a fifth of the time, filling the volume another, optimising it half.
+const NETGEN_STAGES: [(&str, f64, f64); 6] = [
+    ("Analysing the shape", 0.0, 0.03),
+    ("Meshing the edges", 0.03, 0.05),
+    ("Meshing the faces", 0.05, 0.1),
+    ("Optimising the faces", 0.1, 0.3),
+    ("Filling the volume", 0.3, 0.5),
+    ("Optimising the volume", 0.5, 1.0),
+];
+
+/// Which of [`NETGEN_STAGES`] a Netgen task belongs to. Its top-level tasks are "Analyse
+/// Edges", "Mesh Edges", "Mesh Surface", "Optimizing surface", "Volume meshing" and
+/// "Volume optimization", and the steps inside them name what they work on; `None` for a
+/// task that does not say.
+fn netgen_stage(task: &str) -> Option<usize> {
+    let task = task.to_ascii_lowercase();
+    let optimising = task.contains("optimi");
+    if task.contains("volume") {
+        Some(if optimising { 5 } else { 4 })
+    } else if task.contains("surface") {
+        Some(if optimising { 3 } else { 2 })
+    } else if task.starts_with("analyse") {
+        Some(0)
+    } else if task.contains("edge") {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Netgen's task and percent turned into one fraction of the whole mesh that never goes
+/// back: Netgen starts its percent again at every task, and inner steps come and go.
+#[derive(Default)]
+struct NetgenProgress {
+    stage: usize,
+    /// Netgen's percent as the stage began, left over from the task before, until it
+    /// moves.
+    stale: Option<f64>,
+    fraction: f64,
+    reported: Option<(f64, usize)>,
+}
+
+impl NetgenProgress {
+    /// The fraction and the stage's label, when either moved since the last report.
+    fn update(&mut self, task: &str, percent: f64) -> Option<(f64, &'static str)> {
+        if task.is_empty() {
+            return None;
+        }
+        if let Some(stage) = netgen_stage(task)
+            && stage > self.stage
+        {
+            self.stage = stage;
+            self.stale = Some(percent);
+        }
+        if self.stale.is_some_and(|stale| stale != percent) {
+            self.stale = None;
+        }
+        let &(label, start, end) = NETGEN_STAGES.get(self.stage)?;
+        let within = if self.stale.is_some() || !percent.is_finite() {
+            0.0
+        } else {
+            (percent / 100.0).clamp(0.0, 1.0)
+        };
+        self.fraction = self.fraction.max(start + (end - start) * within);
+        let now = (self.fraction, self.stage);
+        if self
+            .reported
+            .is_some_and(|(fraction, stage)| stage == now.1 && now.0 - fraction < 0.002)
+        {
+            return None;
+        }
+        self.reported = Some(now);
+        Some((now.0, label))
+    }
+}
+
+/// Reports the mesh's progress and passes a cancel on, every tenth of a second until
+/// `finished` says the mesh is over.
+fn watch_mesh(monitor: &ffi::MeshMonitor, watch: MeshWatch<'_>, finished: &Receiver<()>) {
+    let mut progress = NetgenProgress::default();
+    loop {
+        if watch.cancel.load(Ordering::Relaxed) {
+            monitor.request_stop();
+        }
+        if let Ok(p) = monitor.progress()
+            && let Some((fraction, label)) = progress.update(&p.task, p.percent)
+        {
+            (watch.progress)(fraction, label);
+        }
+        match finished.recv_timeout(Duration::from_millis(100)) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
 /// Netgen's TRIG6 edge nodes are on the edges 12 02 01, each opposite the corner of its
 /// number; this is where each of `oxyde_kernel::TRIANGLE_EDGES` (01 12 20) finds its node.
 const NETGEN_TRIANGLE_EDGE: [usize; 3] = [5, 3, 4];
@@ -1033,7 +1172,9 @@ fn curve_kind(kind: ffi::CurveKind) -> CurveKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{density_kg_per_m3, ffi, sub, triple, volume_mesh_from};
+    use super::{
+        NetgenProgress, density_kg_per_m3, ffi, netgen_stage, sub, triple, volume_mesh_from,
+    };
     use oxyde_kernel::{TET_EDGES, TRIANGLE_EDGES};
 
     /// One ten-node tetrahedron as Netgen could hand it over: inverted, with its four
@@ -1132,5 +1273,50 @@ mod tests {
         assert!((density_kg_per_m3(0.00003) - 30.0).abs() < 1e-6);
         assert_eq!(density_kg_per_m3(0.0), 0.0);
         assert_eq!(density_kg_per_m3(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn netgen_tasks_are_put_in_their_stage() {
+        assert_eq!(netgen_stage("Analyse Edges"), Some(0));
+        assert_eq!(netgen_stage("Mesh Edges"), Some(1));
+        assert_eq!(netgen_stage("Mesh Surface"), Some(2));
+        assert_eq!(netgen_stage("Optimizing surface"), Some(3));
+        assert_eq!(netgen_stage("Volume meshing"), Some(4));
+        assert_eq!(netgen_stage("Volume optimization"), Some(5));
+        assert_eq!(netgen_stage("Optimize Volume: Swap Improve"), Some(5));
+        assert_eq!(netgen_stage("Delaunay meshing"), None);
+    }
+
+    #[test]
+    fn netgen_progress_never_goes_back() {
+        let mut p = NetgenProgress::default();
+        // Nothing before Netgen names a task.
+        assert_eq!(p.update("", 0.0), None);
+        let (f, label) = p.update("Analyse Edges", 50.0).unwrap();
+        assert_eq!(label, "Analysing the shape");
+        assert!(f > 0.0 && f < 0.03);
+        // A new task's percent is the last one's until it moves: no jump to its end.
+        let (f, label) = p.update("Mesh Surface", 50.0).unwrap();
+        assert_eq!(label, "Meshing the faces");
+        assert!((f - 0.05).abs() < 1e-9, "{f}");
+        let (f, _) = p.update("Mesh Surface", 60.0).unwrap();
+        assert!((f - 0.08).abs() < 1e-9, "{f}");
+        // An inner step of an earlier stage, or a percent going down, moves nothing back.
+        assert_eq!(p.update("EdgeSwapping (2D)", 10.0), None);
+        let mut last = f;
+        for (task, percent) in [
+            ("Volume meshing", 0.0),
+            ("Volume meshing", 90.0),
+            ("Volume optimization", 90.0),
+            ("Volume optimization", 30.0),
+            ("Volume optimization", 100.0),
+        ] {
+            if let Some((f, _)) = p.update(task, percent) {
+                assert!(f >= last && f <= 1.0, "{f} after {last}");
+                last = f;
+            }
+        }
+        assert!((last - 1.0).abs() < 1e-9, "{last}");
+        assert!(p.update("Volume optimization", f64::NAN).is_none());
     }
 }

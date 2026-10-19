@@ -174,7 +174,7 @@ The app is signed **ad hoc** (Apple Silicon runs no unsigned code) unless `OXYDE
 
 ## 5. Releasing
 
-Executables are built by hand, on a machine of each kind (no hosted build service is used): `packaging\bundle.ps1` on a Windows PC gives the zip, the `.exe` installer and the `.msi`, `packaging/bundle-macos.sh` on an Apple Silicon Mac gives the `.dmg` and the zip. Both read the version from the workspace `Cargo.toml` and check the bundle by running it with `--version`. A Mac is needed for the `.dmg`: OpenCASCADE's dylibs, `codesign` and `hdiutil` exist only there. To release: bump the version, run both scripts, tag the commit (`git tag v0.0.7`) and attach the files to a GitHub release of that tag.
+Executables are built by hand, on a machine of each kind (no hosted build service is used): `packaging\bundle.ps1` on a Windows PC gives the zip, the `.exe` installer and the `.msi`, `packaging/bundle-macos.sh` on an Apple Silicon Mac gives the `.dmg` and the zip. Both read the version from the workspace `Cargo.toml` and check the bundle by running it with `--version`. A Mac is needed for the `.dmg`: OpenCASCADE's dylibs, `codesign` and `hdiutil` exist only there. To release: bump the version, run both scripts, tag the commit (`git tag v0.0.8`) and attach the files to a GitHub release of that tag.
 
 ## 6. Troubleshooting
 

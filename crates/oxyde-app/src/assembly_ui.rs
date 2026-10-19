@@ -1021,8 +1021,20 @@ impl OxydeApp {
                 ));
                 continue;
             }
+            let built = match doc.docs.get(path) {
+                Some(Ok(crate::assembly::Loaded::Part(p))) => Some(p.part.definition()),
+                _ => None,
+            };
             // The file first: a part that cannot be saved is left as it was.
             let saved = oxyde_format::load_part(path).and_then(|mut file| {
+                // A part file the import of a STEP assembly wrote and nobody rebuilt on
+                // its own still asks its import to apply the STEP colours and material on
+                // the next rebuild, where the loaded copy has them already: they go into
+                // the file as the loaded copy has them, or a material removed here would
+                // come back on reopening.
+                if let Some(built) = &built {
+                    file.definition.settle_imports(built);
+                }
                 let old_name = file.definition.material.as_ref().map(|m| m.name.clone());
                 file.definition.material = material.clone();
                 // The loaded copy shows its imported STEP colours as appearances, but the

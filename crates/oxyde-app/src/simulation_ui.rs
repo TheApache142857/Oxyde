@@ -43,7 +43,8 @@ use oxyde_format::simulation::{StudyType, TransientSettings};
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
-    FaceMesh, FaceSource, Kernel, Mesh, ShapeHandle, VolumeMesh, VolumeMeshError, VolumeMeshOptions,
+    FaceMesh, FaceSource, Kernel, Mesh, MeshWatch, ShapeHandle, VolumeMesh, VolumeMeshError,
+    VolumeMeshOptions,
 };
 use oxyde_model::{FaceName, Material, Mechanical, Thermal};
 use oxyde_occt::OcctKernel;
@@ -4193,13 +4194,14 @@ impl SolveInput {
 /// The solids meshed by Netgen on a worker kernel, each on its own, into one mesh whose
 /// boundary facets carry the faces' labels; the copies are freed whatever happens. First
 /// order from Netgen, made ten-node by `TetMesh::make_quadratic` when asked: the solver's
-/// ten-node elements are straight-sided.
+/// ten-node elements are straight-sided. `progress` hears how far the whole is and what
+/// Netgen is doing, while it does it, and `cancel` stops Netgen where it is.
 fn netgen_mesh(
     inputs: &[NetgenInput],
     h: f64,
     quadratic: bool,
     cancel: &AtomicBool,
-    progress: &dyn Fn(f64),
+    progress: &(dyn Fn(f64, &'static str) + Sync),
 ) -> Result<TetMesh, VolumeMeshError> {
     let Some(mut kernel) = OcctKernel::open_worker() else {
         return Err(VolumeMeshError::Failed(
@@ -4212,19 +4214,19 @@ fn netgen_mesh(
     };
     let mut mesh = TetMesh::default();
     let mut result = Ok(());
+    let count = inputs.len().max(1) as f64;
     for (k, input) in inputs.iter().enumerate() {
         if result.is_ok() {
-            if cancel.load(Ordering::Relaxed) {
-                result = Err(VolumeMeshError::Failed("cancelled".to_owned()));
-            } else {
-                match kernel.volume_mesh(input.shape, &options) {
-                    Ok(v) => append_volume_mesh(&mut mesh, &v, input),
-                    Err(e) => result = Err(e),
-                }
+            let watch = MeshWatch {
+                cancel,
+                progress: &|f, stage| progress((k as f64 + f) / count, stage),
+            };
+            match kernel.volume_mesh_watched(input.shape, &options, watch) {
+                Ok(v) => append_volume_mesh(&mut mesh, &v, input),
+                Err(e) => result = Err(e),
             }
         }
         kernel.release(input.shape);
-        progress((k + 1) as f64 / inputs.len().max(1) as f64);
     }
     result?;
     if quadratic {
@@ -4287,7 +4289,7 @@ fn study_thread(
             options.element_size,
             options.quadratic,
             cancel,
-            &|f| report_progress("Meshing (Netgen)", f * span),
+            &|f, stage| report_progress(stage, f * span),
         ) {
             // Netgen has no limit of its own: the budget is checked on what it made.
             Ok(mesh) if mesh.nodes.len() > options.max_nodes => {
@@ -4301,6 +4303,7 @@ fn study_thread(
                 note = Some("this Oxyde was built without Netgen".to_owned());
             }
             Err(VolumeMeshError::Failed(why)) => note = Some(format!("Netgen failed: {why}")),
+            Err(VolumeMeshError::Cancelled) => return Err("cancelled".to_owned()),
         }
     }
     if cancel.load(Ordering::Relaxed) {

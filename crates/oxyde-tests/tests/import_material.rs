@@ -1,15 +1,15 @@
 //! A material given to an imported part that has never been rebuilt (a part file written
 //! by an assembly's STEP import, given a material from the assembly) keeps its look when
 //! the file is opened again: the STEP colours the import was still due to apply do not
-//! come back over it.
-//!
-//! One test, as the other STEP tests: OpenCASCADE's STEP translators run behind a lock.
+//! come back over it. Nor does the material the STEP file names come back on such a part
+//! whose material was removed from the assembly.
 
 use std::io::Cursor;
 
+use oxyde_format::step_import::{ImportedDocument, plan_step_import};
 use oxyde_format::{PartFile, read_part, write_part};
 use oxyde_geom::{Point3, Vec3};
-use oxyde_kernel::{Kernel, StepColor, StepColors};
+use oxyde_kernel::{Kernel, StepColor, StepColors, StepMaterial};
 use oxyde_model::{Appearance, FeatureKind, FileData, Import, Material, Part, PartDefinition};
 use oxyde_occt::OcctKernel;
 
@@ -118,4 +118,83 @@ fn material_survives_reopening_an_imported_part() {
     }
     reopened.release(&mut kernel);
     part.release(&mut kernel);
+}
+
+#[test]
+fn removed_material_stays_removed_from_an_imported_part() {
+    let mut kernel = OcctKernel::new();
+
+    // ---- A red steel box, written to STEP with its colour and its material.
+    let shape = kernel
+        .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
+        .unwrap();
+    let colors = StepColors {
+        solids: vec![Some(StepColor {
+            rgb: RED,
+            transparency: 0.0,
+        })],
+        faces: vec![None; 6],
+    };
+    let steel = StepMaterial {
+        name: "Acier".to_owned(),
+        description: String::new(),
+        density: 7850.0,
+    };
+    let path = std::env::temp_dir().join(format!(
+        "oxyde-import-removed-material-{}.step",
+        std::process::id()
+    ));
+    kernel
+        .export_step(&[shape], &[colors], &[Some(steel)], &path)
+        .unwrap();
+    kernel.release(shape);
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    // ---- The part file the import of a STEP assembly writes: made of the STEP material,
+    // never rebuilt, so its import still has the colour (and the material) to apply.
+    let tree = kernel.read_step_assembly(&bytes).unwrap();
+    let plan = plan_step_import(&tree, "Bar.step").unwrap();
+    let ImportedDocument::Part(file) = &plan.top().unwrap().document else {
+        panic!("a single part");
+    };
+    let unbuilt = file.definition.clone();
+    assert_eq!(
+        unbuilt.material.as_ref().map(|m| m.name.as_str()),
+        Some("Acier")
+    );
+    assert!(unbuilt.appearances.is_empty());
+
+    // ---- The copy an assembly loads, rebuilt; the material removed from it is what the
+    // user sees: no material, the STEP colour.
+    let mut loaded = Part::from_definition(unbuilt.clone()).unwrap();
+    loaded.rebuild(&mut kernel);
+    let built = loaded.definition();
+    loaded.set_material(None);
+    let seen = looks(&loaded);
+    assert!(seen.iter().all(|l| *l == Some((RED, 0.0))), "{seen:?}");
+    loaded.release(&mut kernel);
+
+    // ---- Only the material taken out of the file: the import puts the STEP material back
+    // on reopening, since the part has none.
+    let mut kept = unbuilt.clone();
+    kept.material = None;
+    let mut reopened = reopen(kept, &mut kernel);
+    assert_eq!(reopened.material().map(|m| m.name.as_str()), Some("Acier"));
+    reopened.release(&mut kernel);
+
+    // ---- Settled from the loaded copy first, as the assembly writes it: no material and
+    // the same look, after any number of reopenings.
+    let mut settled = unbuilt;
+    assert!(settled.settle_imports(&built));
+    settled.material = None;
+    let mut reopened = reopen(settled, &mut kernel);
+    for _ in 0..2 {
+        assert!(reopened.material().is_none(), "{:?}", reopened.material());
+        assert_eq!(looks(&reopened), seen);
+        let definition = reopened.definition();
+        reopened.release(&mut kernel);
+        reopened = reopen(definition, &mut kernel);
+    }
+    reopened.release(&mut kernel);
 }
