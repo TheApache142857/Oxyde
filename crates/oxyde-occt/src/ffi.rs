@@ -201,6 +201,16 @@ pub(crate) mod bridge {
         bz: f64,
     }
 
+    /// The point of an edge closest to another point, and the edge's unit tangent there.
+    struct EdgeTangentData {
+        x: f64,
+        y: f64,
+        z: f64,
+        tx: f64,
+        ty: f64,
+        tz: f64,
+    }
+
     /// A polyline of a drawing view: (x, y) pairs.
     struct PolylineData {
         points: Vec<f64>,
@@ -453,6 +463,17 @@ pub(crate) mod bridge {
             b_kind: u8,
             b_index: u32,
         ) -> Result<DistanceData>;
+
+        /// The point of edge `edge` of `shape` (by index in its topology) closest to
+        /// (`x`, `y`, `z`), and the edge's unit tangent there, along its curve.
+        fn edge_tangent(
+            self: &Session,
+            shape: u64,
+            edge: u32,
+            x: f64,
+            y: f64,
+            z: f64,
+        ) -> Result<EdgeTangentData>;
 
         /// The edges of `shapes` seen along -normal of `view` (orthographic, hidden line
         /// removal), in the view's frame, each polyline within `deflection` mm.

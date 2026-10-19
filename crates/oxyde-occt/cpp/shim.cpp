@@ -1987,6 +1987,45 @@ DistanceData Session::distance(std::uint64_t a, std::uint8_t a_kind, std::uint32
     });
 }
 
+EdgeTangentData Session::edge_tangent(std::uint64_t shape, std::uint32_t edge, double x,
+                                      double y, double z) const {
+    return guarded("edge_tangent", [&] {
+        const TopoDS_Edge e = TopoDS::Edge(sub_shape(get(shape), 2, edge));
+        if (BRep_Tool::Degenerated(e)) {
+            throw std::runtime_error("the edge has no length");
+        }
+        // The parameter of the point of the edge nearest the one given: inside the edge, or
+        // at one of its ends.
+        const TopoDS_Vertex near = BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, z)).Vertex();
+        BRepExtrema_DistShapeShape extrema(near, e);
+        if (!extrema.IsDone() || extrema.NbSolution() < 1) {
+            throw std::runtime_error("the point of the edge nearest the point was not found");
+        }
+        double t = 0.0;
+        if (extrema.SupportTypeShape2(1) == BRepExtrema_IsOnEdge) {
+            extrema.ParOnEdgeS2(1, t);
+        } else {
+            t = BRep_Tool::Parameter(TopoDS::Vertex(extrema.SupportOnShape2(1)), e);
+        }
+        const BRepAdaptor_Curve curve(e);
+        gp_Pnt p;
+        gp_Vec d1;
+        curve.D1(t, p, d1);
+        if (d1.Magnitude() < 1e-12) {
+            throw std::runtime_error("the edge has no direction at that point");
+        }
+        d1.Normalize();
+        EdgeTangentData out{};
+        out.x = p.X();
+        out.y = p.Y();
+        out.z = p.Z();
+        out.tx = d1.X();
+        out.ty = d1.Y();
+        out.tz = d1.Z();
+        return out;
+    });
+}
+
 TopologyCounts Session::topology_counts(std::uint64_t shape) const {
     return guarded("topology_counts", [&] {
         const TopoDS_Shape s = get(shape);

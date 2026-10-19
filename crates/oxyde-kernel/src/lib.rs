@@ -455,6 +455,16 @@ pub struct Distance {
     pub on_b: Point3,
 }
 
+/// Where an edge passes closest to a point, and which way it runs there
+/// ([`Kernel::edge_tangent`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeTangent {
+    /// The point of the edge closest to the one asked about.
+    pub point: Point3,
+    /// Unit length, along the edge's curve as it is parametrised.
+    pub tangent: Vec3,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BooleanOp {
     Fuse,
@@ -650,6 +660,20 @@ pub trait Kernel {
         b_part: SubShape,
     ) -> Result<Option<Distance>, Self::Error> {
         let _ = (a, a_part, b, b_part);
+        Ok(None)
+    }
+
+    /// The point of edge `edge` of `shape` (by index in its [`Topology`]) closest to
+    /// `near`, and the edge's direction there: what a plane normal to a curve is built
+    /// from. Exact, from the edge's curve, whatever its kind (a line, a circle, an ellipse,
+    /// a spline). `Ok(None)` when the kernel cannot tell, which is the default.
+    fn edge_tangent(
+        &self,
+        shape: ShapeHandle,
+        edge: u32,
+        near: Point3,
+    ) -> Result<Option<EdgeTangent>, Self::Error> {
+        let _ = (shape, edge, near);
         Ok(None)
     }
 

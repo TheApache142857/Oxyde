@@ -157,7 +157,7 @@ fn reference_planes_are_previewed_too() {
     let mut kernel = OcctKernel::new();
     let (mut part, _, _) = block_and_sketch();
     part.rebuild(&mut kernel);
-    let plane = FeatureKind::Plane(RefPlane {
+    let plane = FeatureKind::Plane(RefPlane::Offset {
         base: PlaneRef::Standard(StandardPlane::Top),
         offset: 30.0,
         flip: false,

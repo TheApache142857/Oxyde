@@ -192,7 +192,7 @@ impl OxydeApp {
             Dialog::Hole(d) => d.feature(),
             Dialog::Pattern(d) => d.feature(&self.doc.part).ok(),
             Dialog::Combine(d) => d.feature().ok(),
-            Dialog::RefPlane(d) => d.feature(),
+            Dialog::RefPlane(d) => d.feature().ok(),
             Dialog::RefAxis(d) => d.feature(),
             _ => None,
         }?;

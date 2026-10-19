@@ -19,8 +19,8 @@ use crate::dialogs::{
     positive_length,
 };
 use crate::features_ui::{
-    AxisDialog, Choices, CombineDialog, PatternDialog, PatternKind, PlaneDialog, RevolveDialog,
-    ShellDialog, SweepDialog,
+    AxisDialog, Choices, CombineDialog, PatternDialog, PatternKind, RevolveDialog, ShellDialog,
+    SweepDialog,
 };
 use crate::icons::{self, Icon};
 
@@ -33,6 +33,12 @@ pub enum PanelPick {
     Plane(StandardPlane),
     Face(FaceName),
     Edge(EdgeName),
+    /// A corner of the body (the Plane command draws the one under the pointer).
+    Vertex(oxyde_model::VertexName),
+    /// A point of a sketch, by entity id.
+    SketchPoint(FeatureId, u32),
+    /// A line, an arc or a circle of a sketch, by entity id.
+    SketchCurve(FeatureId, u32),
 }
 
 /// Fill and outline of the active selection box.
@@ -322,7 +328,7 @@ impl OxydeApp {
     }
 
     /// Whether `id` comes before the feature being edited (or the rollback bar).
-    fn usable(&self, id: FeatureId, editing: Option<FeatureId>) -> bool {
+    pub(crate) fn usable(&self, id: FeatureId, editing: Option<FeatureId>) -> bool {
         let Some(index) = self.doc.part.index_of(id) else {
             return false;
         };
@@ -452,7 +458,12 @@ impl OxydeApp {
             PanelPick::Face(f) => body.is_some_and(|b| b.naming.find_face(f).is_some()),
             PanelPick::Edge(e) => body.is_some_and(|b| b.naming.find_edge(e).is_some()),
             PanelPick::Body(id) => body.is_some_and(|b| b.solid(*id).is_some()),
-            PanelPick::Feature(_) | PanelPick::Plane(_) => true,
+            PanelPick::Vertex(v) => body.is_some_and(|b| b.naming.find_vertex(v).is_some()),
+            // Sketches are checked by the command, which knows what comes before it.
+            PanelPick::Feature(_)
+            | PanelPick::Plane(_)
+            | PanelPick::SketchPoint(..)
+            | PanelPick::SketchCurve(..) => true,
         }
     }
 
@@ -715,13 +726,7 @@ impl OxydeApp {
                     }
                 }
             }
-            Dialog::RefPlane(d) => match self.plane_of_pick(&pick, d.editing) {
-                Some((plane, label)) => {
-                    d.base = choose(&mut d.planes, plane, label);
-                    true
-                }
-                None => false,
-            },
+            Dialog::RefPlane(d) => self.plane_pick(d, &pick),
             Dialog::Appearance(d) => self.appearance_pick(d, pick),
             Dialog::RefAxis(d) => {
                 if d.two_planes {
@@ -805,9 +810,7 @@ impl OxydeApp {
                     v
                 }
             },
-            Dialog::RefPlane(d) => plane(d.planes.get(d.base).map(|(_, p)| p))
-                .into_iter()
-                .collect(),
+            Dialog::RefPlane(d) => self.plane_dialog_picks(d),
             Dialog::RefAxis(d) if !d.two_planes => axis(d.axes.get(d.axis).map(|(_, a)| a))
                 .into_iter()
                 .collect(),
@@ -825,6 +828,7 @@ impl OxydeApp {
             Some(Dialog::Hole(d)) => d.sketch.into_iter().collect(),
             Some(Dialog::Loft(d)) => d.profiles.clone(),
             Some(Dialog::Pattern(d)) => d.seeds.clone(),
+            Some(Dialog::RefPlane(d)) => d.features(),
             _ => Vec::new(),
         }
     }
@@ -971,7 +975,7 @@ impl OxydeApp {
                 editing(d.editing, "Combine", "Edit Combine"),
                 d.target.is_some() && !d.tools.is_empty(),
             ),
-            Dialog::RefPlane(_) => (Icon::RefPlane, "Plane", true),
+            Dialog::RefPlane(d) => (Icon::RefPlane, "Plane", d.feature().is_ok()),
             Dialog::RefAxis(_) => (Icon::RefAxis, "Axis", true),
             Dialog::Appearance(d) => {
                 let (title, ready) = self.appearance_header(d);
@@ -997,7 +1001,7 @@ impl OxydeApp {
             }
             Dialog::Pattern(d) => self.pattern_body(ui, d),
             Dialog::Combine(d) => self.combine_body(ui, d),
-            Dialog::RefPlane(d) => ref_plane_body(ui, d),
+            Dialog::RefPlane(d) => crate::plane_ui::ref_plane_body(ui, d),
             Dialog::RefAxis(d) => ref_axis_body(ui, d),
             Dialog::Appearance(d) => return self.appearance_body(ui, d),
             _ => {}
@@ -1572,30 +1576,6 @@ impl OxydeApp {
             ui.label(RichText::new(d.dimensions.join(", ")).small().weak());
         }
     }
-}
-
-fn ref_plane_body(ui: &mut egui::Ui, d: &mut PlaneDialog) {
-    section(ui, "Offset from");
-    reference_box_set(
-        ui,
-        "plane_base",
-        &d.planes,
-        &mut d.base,
-        true,
-        "Select a plane or a flat face",
-    );
-    section(ui, "Distance");
-    ui.horizontal(|ui| {
-        ui.add(
-            egui::DragValue::new(&mut d.offset)
-                .speed(0.1)
-                .range(-crate::dialogs::MAX_LENGTH..=crate::dialogs::MAX_LENGTH)
-                .suffix(" mm")
-                .custom_parser(crate::dialogs::length_parser),
-        );
-        dimension_note(ui, d.dimension.as_ref());
-    });
-    ui.checkbox(&mut d.flip, "Flip offset");
 }
 
 fn ref_axis_body(ui: &mut egui::Ui, d: &mut AxisDialog) {

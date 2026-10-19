@@ -45,7 +45,7 @@ Rules:
 ```
 
 - `kind`: `"part"`, `"assembly"` or `"drawing"`; `"simulation"` and `"simulation_results"` for §8 and §9.
-- `format_version`: 1 for parts, assemblies and drawings. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
+- `format_version`: 1 for assemblies and drawings. Parts are 1 when every reference plane in them is an offset plane and 2 when one is made another way (at an angle, through a line, through three points, normal to a curve: the `plane` feature's `construction`, §3), so readers of version 1 still open the others. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
 - `units` are display units. Values in `model.json` are always millimetres.
 
@@ -131,7 +131,7 @@ Rules:
 | `fillet` | `edges` (list of EdgeRef), `radius` |
 | `chamfer` | `edges` (list of EdgeRef), `distance`, `second` (optional, for an unequal chamfer): `{"type": "distance", "distance", "flip"}` (a distance along each face) \| `{"type": "angle", "angle", "flip"}` (radians, from the face `distance` runs along). `distance` runs along the face named first in each edge's sorted name, the other one with `flip` (optional, default false) |
 | `shell` | `faces` (list of FaceRef: the faces removed, may be empty), `thickness`, `outward` |
-| `plane` | Reference plane: `base` (PlaneRef), `offset` (mm, along the base normal), `flip` |
+| `plane` | Reference plane. `construction` (optional, default `offset`; any other needs `format_version` 2) says how it is made, and which keys it has; a key a construction does not use is left out. `offset`: `base` (PlaneRef), `offset` (mm, along the base normal), `flip` (on the other side); Oxyde writes these without `construction`. `angle`: `base` (PlaneRef), `line` (AxisRef: a line lying in the base), `angle` (radians), `flip`: the base turned about the line by the angle, counter-clockwise looking against the line's direction (clockwise with `flip`), its frame turned with it. `through_line`: `line` (AxisRef), `plane` (PlaneRef), `perpendicular` (optional, default false), `flip`: through the line, parallel to the plane (the line must be parallel to it; the plane's frame, moved) or perpendicular to it (the plane turned a quarter turn about the line's projection on it). `three_points`: `points` ([PointRef, PointRef, PointRef]), `flip`: origin at the first, x axis towards the second, normal the side from which the three run counter-clockwise. `normal_to_curve`: `curve` (CurveRef), `point` (PointRef), `flip`: through the point, its normal along the curve where the curve passes closest to the point, the x axis the model axis least aligned with the normal, projected (as for a face). Except for `offset` and `angle`, `flip` reverses the normal |
 | `axis` | Reference axis: `axis`: `{"along": AxisRef}` \| `{"two_planes": [PlaneRef, PlaneRef]}` |
 | `linear_pattern` | `seeds` (feature ids), `direction` and optional `direction2`: `{"axis": AxisRef, "spacing", "count", "reverse"}` |
 | `circular_pattern` | `seeds`, `axis` (AxisRef), `angle` (radians: total with `equal_spacing`, else between instances), `count`, `equal_spacing`, `reverse` |
@@ -152,7 +152,9 @@ An extrusion's `extent` is its end condition:
 Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves, sweeps, lofts and holes (their tool bodies are copied).
 
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
-**AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis) or `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal).
+**AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis), `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal) or `{"sketch_axis": {"sketch": feature id, "entity": entity id}}` (a line of a sketch, from its start point to its end point; a revolve's own `{"sketch_line": entity id}` is a line of the revolve's sketch).
+**PointRef**: `{"vertex": VertexRef}` (a corner of the body) or `{"sketch_point": {"sketch": feature id, "entity": entity id}}` (a point of a sketch: the end of a line, a centre, a lone point).
+**CurveRef**: `{"edge": EdgeRef}` (an edge of any shape) or `{"sketch_curve": {"sketch": feature id, "entity": entity id}}` (a line, an arc or a circle of a sketch).
 
 ### Bodies
 

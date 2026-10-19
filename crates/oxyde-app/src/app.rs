@@ -102,6 +102,12 @@ pub enum CommandTab {
 pub(crate) enum Overlay {
     Plane(StandardPlane),
     Reference(FeatureId),
+    /// A corner of the shown body, by index in its topology: a point for the Plane command.
+    Vertex(u32),
+    /// A point of a sketch, by entity id.
+    SketchPoint(FeatureId, u32),
+    /// A line, an arc or a circle of a sketch, by entity id.
+    SketchCurve(FeatureId, u32),
 }
 
 /// Where an overlay is on screen.
@@ -110,6 +116,8 @@ pub(crate) enum OverlayShape {
     Segment(egui::Pos2, egui::Pos2),
     /// Curves of a sketch.
     Polylines(Vec<Vec<egui::Pos2>>),
+    /// A point.
+    Dot(egui::Pos2),
 }
 
 /// The colour of planes, axes and sketches drawn over the viewport.
@@ -1406,6 +1414,19 @@ impl OxydeApp {
                         self.selected_plane = None;
                     }
                 }
+                // Points and sketch curves are only offered while the Plane command is open.
+                Some(Overlay::Vertex(i)) => {
+                    let name = self.shown_body().and_then(|b| b.naming.vertex(i).cloned());
+                    if let Some(name) = name {
+                        self.offer_to_panel(PanelPick::Vertex(name));
+                    }
+                }
+                Some(Overlay::SketchPoint(id, entity)) => {
+                    self.offer_to_panel(PanelPick::SketchPoint(id, entity));
+                }
+                Some(Overlay::SketchCurve(id, entity)) => {
+                    self.offer_to_panel(PanelPick::SketchCurve(id, entity));
+                }
                 None => {
                     let taken = match self.panel_pick(pick) {
                         Some(panel_pick) => self.offer_to_panel(panel_pick),
@@ -1778,6 +1799,18 @@ impl OxydeApp {
             draw_reference(geometry, name, true);
         }
 
+        // The Plane command takes points and the curves of sketches one by one: each curve
+        // is clicked on its own, and the point nearest the pointer is drawn and clicked.
+        let plane_dialog = match &self.dialog {
+            Some(Dialog::RefPlane(d)) => Some(d),
+            _ => None,
+        };
+        let held_curves: Vec<(FeatureId, u32)> = plane_dialog
+            .map(|d| d.held_sketch_curves())
+            .unwrap_or_default();
+        let mut entity_overlays = Vec::new();
+        let mut points: Vec<(Overlay, egui::Pos2)> = Vec::new();
+
         // Sketches: shown ones, the selected one and those the open command uses.
         for feature in self.doc.part.features() {
             let id = feature.id();
@@ -1793,11 +1826,23 @@ impl OxydeApp {
             };
             let hovered_color = egui::Color32::from_rgb(230, 120, 0);
             let mut lines = Vec::new();
-            for (points, construction) in crate::display::sketch_polylines(&result.solved) {
-                let path: Vec<egui::Pos2> = points
+            for (entity, curve, construction) in crate::display::sketch_curves(&result.solved) {
+                let path: Vec<egui::Pos2> = curve
                     .into_iter()
                     .map(|p| to_screen(result.plane.to_world(p)))
                     .collect();
+                if plane_dialog.is_some() {
+                    if held_curves.contains(&(id, entity)) {
+                        painter.add(egui::Shape::line(
+                            path.clone(),
+                            egui::Stroke::new(3.5_f32, overlay_color(true)),
+                        ));
+                    }
+                    entity_overlays.push((
+                        Overlay::SketchCurve(id, entity),
+                        OverlayShape::Polylines(vec![path.clone()]),
+                    ));
+                }
                 let color = if selected {
                     hovered_color
                 } else {
@@ -1828,7 +1873,48 @@ impl OxydeApp {
                 painter.line_segment([c - egui::vec2(0.0, 4.0), c + egui::vec2(0.0, 4.0)], stroke);
                 lines.push(vec![c, c]);
             }
+            if plane_dialog.is_some() {
+                for e in result.solved.entities() {
+                    if let oxyde_sketch::Geometry::Point(p) = e.geometry {
+                        let at = to_screen(result.plane.to_world(p));
+                        points.push((Overlay::SketchPoint(id, e.id.0), at));
+                    }
+                }
+            }
             overlays.push((Overlay::Reference(id), OverlayShape::Polylines(lines)));
+        }
+
+        if let Some(d) = plane_dialog {
+            if let Some(body) = self.shown_body() {
+                for (i, v) in body.topology.vertices.iter().enumerate() {
+                    points.push((Overlay::Vertex(i as u32), to_screen(v.point)));
+                }
+            }
+            // The points it holds, then the one the pointer is on, which takes the click
+            // before the edge or face under it.
+            for p in self.plane_dialog_points(d) {
+                painter.circle_filled(to_screen(p), 4.5, overlay_color(true));
+            }
+            let nearest = pointer.and_then(|at| {
+                points
+                    .iter()
+                    .map(|(overlay, p)| (p.distance(at), *overlay, *p))
+                    .filter(|(distance, ..)| *distance < POINT_PICK_RADIUS)
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+            });
+            let mut front = Vec::new();
+            if let Some((_, overlay, p)) = nearest {
+                painter.circle_filled(p, 4.5, crate::theme::tokens().accent);
+                painter.circle_stroke(
+                    p,
+                    6.5,
+                    egui::Stroke::new(1.0_f32, crate::theme::tokens().accent),
+                );
+                front.push((overlay, OverlayShape::Dot(p)));
+            }
+            front.append(&mut entity_overlays);
+            front.append(&mut overlays);
+            overlays = front;
         }
 
         // The origin: three short axes of fixed screen length.
@@ -2032,6 +2118,7 @@ pub(crate) fn overlay_at(
             line.windows(2)
                 .any(|w| segment_distance(p, w[0], w[1]) < 5.0)
         }),
+        OverlayShape::Dot(c) => c.distance(p) < POINT_PICK_RADIUS,
     });
     if let Some((overlay, _)) = near {
         return Some(*overlay);
@@ -2044,6 +2131,10 @@ pub(crate) fn overlay_at(
         _ => None,
     })
 }
+
+/// How near the pointer a point must be, in pixels, to be picked rather than the edge or
+/// face under it.
+const POINT_PICK_RADIUS: f32 = 8.0;
 
 /// Mesh precision: about a thousandth of the part size.
 /// The meshes of every body of a part, one after the other, so that faces and edges are
