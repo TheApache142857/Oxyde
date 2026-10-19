@@ -4,7 +4,7 @@
 [OpenCASCADE](https://dev.opencascade.org/) geometry kernel. Sketch, constrain, extrude, fillet,
 assemble, render and simulate, with every part saved as an open, documented file.
 
-<!-- Screenshot: docs/images/oxyde.png, a part in the viewport with the feature tree. -->
+![The two demo parts, a bracket and a flange, rendered by Oxyde's path tracer](docs/images/oxyde.png)
 
 > **Pre-alpha.** Oxyde is young and moves fast. It is usable for real parts, but expect rough
 > edges, and keep copies of files you care about. Bug reports are welcome in
