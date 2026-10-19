@@ -170,6 +170,7 @@ fn plate_with_holes() -> PartDefinition {
             count: 3,
             reverse: false,
         }),
+        skip: Vec::new(),
     }));
     part.definition()
 }

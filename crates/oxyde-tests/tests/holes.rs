@@ -180,6 +180,7 @@ fn a_hole_needs_points_and_can_be_patterned() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     match part.status(nothing) {

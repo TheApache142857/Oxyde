@@ -8,7 +8,7 @@
 
 use eframe::egui::{self, Color32, RichText, Stroke};
 use oxyde_model::{
-    AxisRef, CombineOp, EdgeName, ExtrudeOp, FaceName, FeatureId, FeatureKind, PlaneRef,
+    AxisRef, CombineOp, EdgeName, ExtrudeOp, FaceKey, FaceName, FeatureId, FeatureKind, PlaneRef,
     RevolveAxis, SketchPlane, StandardPlane,
 };
 use oxyde_render::Pick;
@@ -467,9 +467,46 @@ impl OxydeApp {
         }
     }
 
+    /// The instance of the open linear or circular pattern that a face or an edge clicked
+    /// in the viewport belongs to, if it is one of the copies the pattern makes: in its
+    /// preview, or in the part when the pattern is edited without one.
+    fn copy_of_pick(&self, pick: &PanelPick) -> Option<[u32; 2]> {
+        let Some(Dialog::Pattern(d)) = &self.dialog else {
+            return None;
+        };
+        if d.kind == PatternKind::Mirror {
+            return None;
+        }
+        let made_by = self.preview_feature();
+        let instance = |face: &FaceName| match &face.key {
+            FaceKey::Instance {
+                feature, instance, ..
+            } if Some(*feature) == made_by || Some(*feature) == d.editing => Some(*instance),
+            _ => None,
+        };
+        match pick {
+            PanelPick::Face(face) => instance(face),
+            PanelPick::Edge(edge) => edge.faces.iter().find_map(instance),
+            _ => None,
+        }
+    }
+
     /// Offers a click to the open command. Returns true when the command took it.
     pub(crate) fn offer_to_panel(&mut self, pick: PanelPick) -> bool {
         let pick = self.unpreview_pick(pick);
+        // A copy the open pattern makes is left out while its Instances to Skip take
+        // clicks, as SolidWorks does; it is never a reference for the pattern itself.
+        if let Some(instance) = self.copy_of_pick(&pick) {
+            match &mut self.dialog {
+                Some(Dialog::Pattern(d)) if d.skip_next => d.toggle_skip(instance),
+                _ => {
+                    self.status = "That is one of the pattern's copies: turn on Pick instances, \
+                                   under Instances to Skip, to leave it out"
+                        .to_owned();
+                }
+            }
+            return true;
+        }
         // A feature can only use what exists before it: not what it makes itself (shown
         // by its preview), nor, when it is edited in the finished part, what later
         // features made or changed (which would stop the file from opening).
@@ -698,6 +735,11 @@ impl OxydeApp {
                     true
                 } else if let Some(body) = body {
                     toggle(&mut d.bodies, body);
+                    true
+                } else if d.skip_next && matches!(pick, PanelPick::Face(_) | PanelPick::Edge(_)) {
+                    self.status = "Click a copy of the pattern to leave it out, or a direction's \
+                                   box first to pick a direction"
+                        .to_owned();
                     true
                 } else if d.kind == PatternKind::Mirror {
                     match self.plane_of_pick(&pick, d.editing) {
@@ -1454,7 +1496,7 @@ impl OxydeApp {
         match d.kind {
             PatternKind::Linear => {
                 section(ui, "Direction 1");
-                let first_active = !(d.second && d.second_next);
+                let first_active = !(d.second && d.second_next) && !d.skip_next;
                 if reference_box_set(
                     ui,
                     "pattern_axis",
@@ -1464,6 +1506,7 @@ impl OxydeApp {
                     "Select an edge, a face or an axis",
                 ) {
                     d.second_next = false;
+                    d.skip_next = false;
                 }
                 egui::Grid::new("pattern_d1").num_columns(2).show(ui, |ui| {
                     ui.label("Spacing");
@@ -1478,6 +1521,7 @@ impl OxydeApp {
                 if ui.checkbox(&mut d.second, "Direction 2").changed() {
                     // Turned on: the next click sets it.
                     d.second_next = d.second;
+                    d.skip_next &= !d.second;
                 }
                 if d.second {
                     if reference_box(
@@ -1485,10 +1529,11 @@ impl OxydeApp {
                         "pattern_axis2",
                         &d.axes,
                         &mut d.axis2,
-                        d.second_next,
+                        d.second_next && !d.skip_next,
                         "Select an edge, a face or an axis",
                     ) {
                         d.second_next = true;
+                        d.skip_next = false;
                     }
                     egui::Grid::new("pattern_d2").num_columns(2).show(ui, |ui| {
                         ui.label("Spacing");
@@ -1500,17 +1545,20 @@ impl OxydeApp {
                     });
                     ui.checkbox(&mut d.reverse2, "Reverse direction 2");
                 }
+                instances_to_skip(ui, d);
             }
             PatternKind::Circular => {
                 section(ui, "Axis");
-                reference_box_set(
+                if reference_box_set(
                     ui,
                     "pattern_axis",
                     &d.axes,
                     &mut d.axis,
-                    true,
+                    !d.skip_next,
                     "Select a round edge or face, or an axis",
-                );
+                ) {
+                    d.skip_next = false;
+                }
                 egui::Grid::new("pattern_circ")
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -1527,6 +1575,7 @@ impl OxydeApp {
                     });
                 ui.checkbox(&mut d.equal_spacing, "Equal spacing");
                 ui.checkbox(&mut d.reverse, "Reverse direction");
+                instances_to_skip(ui, d);
             }
             PatternKind::Mirror => {
                 section(ui, "Mirror plane");
@@ -1575,6 +1624,59 @@ impl OxydeApp {
         if !d.dimensions.is_empty() {
             ui.label(RichText::new(d.dimensions.join(", ")).small().weak());
         }
+    }
+}
+
+/// SolidWorks' Instances to Skip: the copies a linear or circular pattern leaves out. They
+/// are clicked in the graphics area while *Pick instances* is on, or ticked in the list of
+/// every copy by number; a copy left out is no longer there to click, so it is put back
+/// from the box or the list.
+fn instances_to_skip(ui: &mut egui::Ui, d: &mut PatternDialog) {
+    section(ui, "Instances to Skip");
+    let skipped = d.skipped();
+    let items: Vec<(String, String)> = skipped
+        .iter()
+        .map(|instance| (d.instance_label(*instance), String::new()))
+        .collect();
+    let removed = selection_box(ui, &items, "None: every instance is made");
+    if let Some(instance) = removed.and_then(|i| skipped.get(i)) {
+        d.toggle_skip(*instance);
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .selectable_label(d.skip_next, "Pick instances")
+            .on_hover_text(
+                "Clicks on the copies in the graphics area leave them out, until a direction's \
+                 box is clicked",
+            )
+            .clicked()
+        {
+            d.skip_next = !d.skip_next;
+        }
+        if ui
+            .selectable_label(d.skip_numbers, "List by number")
+            .on_hover_text("Every copy, numbered from the seed, to tick the ones to leave out")
+            .clicked()
+        {
+            d.skip_numbers = !d.skip_numbers;
+        }
+    });
+    if d.skip_numbers {
+        let row = ui.spacing().interact_size.y;
+        egui::ScrollArea::vertical()
+            .id_salt("pattern_instance_list")
+            .max_height(110.0)
+            .auto_shrink([false, true])
+            .show_rows(ui, row, d.copies(), |ui, rows| {
+                for index in rows {
+                    let instance = d.copy(index);
+                    let mut skip = d.is_skipped(instance);
+                    let label = format!("Skip {}", d.instance_label(instance));
+                    if ui.checkbox(&mut skip, label).changed() {
+                        d.toggle_skip(instance);
+                    }
+                }
+            });
     }
 }
 
@@ -1676,7 +1778,8 @@ mod tests {
 
     /// A PropertyManager as the left panel draws it.
     struct Drawn {
-        /// The rectangle of every widget and layout egui laid out.
+        /// The rectangle of every widget and layout egui laid out, as far as it shows: a
+        /// scrolling list is as high as its viewport, not as all its rows.
         widgets: Vec<egui::Rect>,
         /// Where the PropertyManager starts and ends in the panel.
         top: f32,
@@ -1708,7 +1811,7 @@ mod tests {
             v.prev_pass
                 .widgets
                 .layers()
-                .flat_map(|(_, widgets)| widgets.iter().map(|w| w.rect))
+                .flat_map(|(_, widgets)| widgets.iter().map(|w| w.interact_rect))
                 .filter(|r| r.is_finite())
                 .collect()
         });
@@ -1752,6 +1855,17 @@ mod tests {
                 if let Some(Dialog::Pattern(d)) = &mut app.dialog {
                     d.second = true;
                     d.second_next = true;
+                }
+            }),
+            ("Linear Pattern skipping instances", |app| {
+                app.open_pattern(None, PatternKind::Linear, None);
+                if let Some(Dialog::Pattern(d)) = &mut app.dialog {
+                    d.second = true;
+                    d.count = 10;
+                    d.count2 = 10;
+                    d.skip = vec![[0, 1], [1, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5]];
+                    d.skip_numbers = true;
+                    d.skip_next = true;
                 }
             }),
             ("Circular Pattern", |app| {
@@ -1815,5 +1929,106 @@ mod tests {
             app.close_dialog();
         }
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// Instances to Skip: a click on a copy in the preview is refused until *Pick instances*
+    /// is on, then leaves the copy out of the preview. The part is not touched before OK,
+    /// which records one undo step; Cancel leaves no trace.
+    #[test]
+    fn copies_clicked_while_picking_instances_are_left_out() {
+        use oxyde_geom::Point2;
+        use oxyde_model::{Extrude, LinearPattern, PatternDirection, Sketch, StandardAxis};
+
+        let ctx = egui::Context::default();
+        let mut app = OxydeApp::blank(crate::prefs::Preferences::default(), None);
+        // A plate with a hole, patterned three times along X.
+        let part = &mut app.doc.part;
+        let mut plate = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        plate.rectangle(Point2::ORIGIN, 100.0, 20.0);
+        let s1 = part.add_feature(FeatureKind::Sketch(plate));
+        let base = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            10.0,
+        )));
+        let mut drawing = Sketch::new(SketchPlane::Face(FaceName::end_cap(base)));
+        let circle = drawing.circle(Point2::new(10.0, 10.0), 3.0);
+        let s2 = part.add_feature(FeatureKind::Sketch(drawing));
+        let hole = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s2,
+            ExtrudeOp::Cut,
+            10.0,
+        )));
+        let pattern = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![hole],
+            first: PatternDirection {
+                axis: AxisRef::Standard(StandardAxis::X),
+                spacing: 20.0,
+                count: 3,
+                reverse: false,
+            },
+            second: None,
+            skip: Vec::new(),
+        }));
+        app.rebuild();
+        let saved = (app.doc.undo_depth(), app.doc.modified);
+        let copy = |i: u32| {
+            FaceName::new(FaceKey::Instance {
+                feature: pattern,
+                instance: [i, 0],
+                face: Box::new(FaceName::profile(hole, circle)),
+            })
+        };
+        let in_part = |app: &OxydeApp, i| {
+            let body = app.doc.part.body().unwrap();
+            body.naming.find_face(&copy(i)).is_some()
+        };
+        let shown = |app: &OxydeApp, i| {
+            let body = app.shown_body().unwrap();
+            body.naming.find_face(&copy(i)).is_some()
+        };
+        let skip = |app: &OxydeApp| match &app.dialog {
+            Some(Dialog::Pattern(d)) => d.skip.clone(),
+            _ => panic!("no pattern panel"),
+        };
+        let edit = |app: &mut OxydeApp| {
+            let kind = app.doc.part.feature(pattern).unwrap().kind().clone();
+            app.open_pattern(Some(pattern), PatternKind::Linear, Some(&kind));
+            app.sync_preview(&ctx);
+        };
+
+        edit(&mut app);
+        assert!(shown(&app, 1));
+        assert!(app.offer_to_panel(PanelPick::Face(copy(1))));
+        assert!(app.status.contains("Pick instances"), "{}", app.status);
+        assert!(skip(&app).is_empty());
+        if let Some(Dialog::Pattern(d)) = &mut app.dialog {
+            d.skip_next = true;
+        }
+        assert!(app.offer_to_panel(PanelPick::Face(copy(1))));
+        assert_eq!(skip(&app), [[1, 0]]);
+        app.sync_preview(&ctx);
+        assert!(!shown(&app, 1));
+        assert!(shown(&app, 2));
+        assert!(in_part(&app, 1));
+        assert_eq!((app.doc.undo_depth(), app.doc.modified), saved);
+
+        // Cancel: the part as it was, nothing to undo or save.
+        app.close_dialog();
+        assert!(in_part(&app, 1));
+        assert_eq!((app.doc.undo_depth(), app.doc.modified), saved);
+
+        // OK, the copy ticked in the list: one undo step, and the part leaves it out.
+        edit(&mut app);
+        let Some(Dialog::Pattern(mut d)) = app.dialog.take() else {
+            panic!("no pattern panel");
+        };
+        d.toggle_skip(d.copy(0));
+        app.clear_preview();
+        app.apply_dialog(Dialog::Pattern(d), &ctx);
+        assert_eq!(app.doc.undo_depth(), saved.0 + 1);
+        assert!(!in_part(&app, 1));
+        assert!(in_part(&app, 2));
+        app.doc.release(&mut app.kernel);
     }
 }

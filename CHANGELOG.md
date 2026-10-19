@@ -35,6 +35,54 @@ release yet; the git history has every detail.
   (FORMAT.md §3). A part holding one of these planes is written as `format_version` 2,
   which older versions of Oxyde refuse with a clear message; parts with offset planes only
   are written exactly as before, as version 1, and still open in them.
+- **The MCP server makes them too:** its `ref_plane` tool builds a plane at an angle about
+  a line lying in a plane, or through a line parallel or perpendicular to a plane, besides
+  an offset plane. Planes through three points or normal to a curve go through
+  `add_feature` with the feature's JSON.
+
+### Instances to Skip in patterns (unreleased, October 2026)
+
+- **Instances to Skip** in Linear and Circular Pattern, as in SolidWorks: a pattern can
+  leave some of its copies out, for a grid of holes with a gap in it or a vent whose
+  corners stay solid, where it took several patterns before. Under *Instances to Skip* in
+  the pattern's panel, turn on *Pick instances* and click the copies in the graphics area,
+  or click *List by number* and tick them: *(2, 1)* is the second copy along the first
+  direction, the seed being *(1, 1)*; round an axis, *(2)* is the next one round. The
+  preview shows the pattern without them; the box lists them, each with a button putting
+  it back. The seed cannot be left out.
+- A skipped copy is known by its place in the pattern, so it stays out when the spacing
+  or the counts change. When a lower count takes it away (a dimension, an equation, a
+  configuration), the pattern is built with a warning saying it is no longer there, and
+  it is left out again once the count comes back. In the panel, lowering a count simply
+  drops it from the list, until the count is raised again.
+- In a pattern of a new body, the bodies of the other copies keep their numbers when one
+  is skipped, so a Combine or an extrusion working on one of them stays on it.
+- In files: `skip` on `linear_pattern` and `circular_pattern`, absent when nothing is
+  skipped (FORMAT.md §3). Older versions of Oxyde ignore it and make every copy.
+
+### An MCP server: Claude models with Oxyde (October 2026)
+
+- **`oxyde-mcp`, a Model Context Protocol server.** An AI assistant (Claude Code, Claude
+  Desktop, any MCP client) can now make parts and assemblies with Oxyde's own features and
+  save them as ordinary `.oxyprt` and `.oxyasm` files: sketches made of rectangles, rounded
+  rectangles, circles, slots, polygons, polylines with fillets and arcs, lines and text, each
+  one fully defined with SolidWorks-style dimensions from the origin, so that every dimension
+  can be changed afterwards in the application; extrusions with every end condition,
+  revolves, fillets, chamfers, shells, linear and circular patterns, mirrors, holes,
+  reference planes and axes, lofts, sweeps, combines, STEP import, variables, equations,
+  materials and appearances; then assemblies of those parts with mates. It sees what it
+  made through sections read back as lines, arcs, circles, slots and hole grids, a depth
+  probe, measurements, rendered pictures, and a comparison with a reference (a STEP file or
+  a part it is remodelling) giving the material in common, extra and missing. See the
+  README for setting it up.
+- **Patterns of patterns.** A linear pattern, a circular pattern or a mirror can now copy
+  patterns and mirrors of features, as in SolidWorks: a row of holes patterned into a grid,
+  or a pattern mirrored to the other side, copies every instance. A pattern holding a boss
+  and a cut together cannot be copied again, and says so.
+- **Text in sketches, through the MCP server:** a line of text in any TrueType font on the
+  computer, with a size, a letter spacing, an angle, an alignment and an oblique slant,
+  becomes closed outlines to extrude or cut. The application has no text tool yet.
+
 
 ### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 

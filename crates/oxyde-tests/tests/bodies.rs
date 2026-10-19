@@ -173,11 +173,40 @@ fn a_pattern_of_a_new_body_makes_bodies() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_ok(&part);
     assert_eq!(bodies(&part), 3);
     close(volume(&part, &kernel), 3.0 * 8000.0);
+    part.release(&mut kernel);
+}
+
+/// A copy left out keeps its body number, so the copies after it keep theirs and a feature
+/// that works on one of them stays on it.
+#[test]
+fn skipped_copies_of_a_new_body_leave_the_numbers_of_the_others_alone() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let (b, _) = block(&mut part, 0.0, ExtrudeOp::NewBody);
+    let pattern = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![b],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 50.0,
+            count: 4,
+            reverse: false,
+        },
+        second: None,
+        skip: vec![[1, 0]],
+    }));
+    part.rebuild(&mut kernel);
+    assert_ok(&part);
+    assert_eq!(bodies(&part), 3);
+    let body = part.body().unwrap();
+    assert!(body.solid(BodyId::new(pattern, 0)).is_none());
+    assert!(body.solid(BodyId::new(pattern, 1)).is_some());
+    assert!(body.solid(BodyId::new(pattern, 2)).is_some());
     part.release(&mut kernel);
 }
 

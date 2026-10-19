@@ -619,6 +619,51 @@ pub fn load_assembly(path: &Path) -> Result<AssemblyFile, FormatError> {
     read_assembly(BufReader::new(File::open(path)?))
 }
 
+/// Features and persistent names one at a time, in the JSON form `model.json` gives them
+/// (FORMAT.md §3), for tools that build or read a part feature by feature (`oxyde-mcp`).
+pub mod values {
+    use oxyde_model::{EdgeName, FaceName, Feature, ModelError};
+
+    use crate::{FormatError, MODEL, schema};
+
+    fn json_error(source: serde_json::Error) -> FormatError {
+        FormatError::Json {
+            entry: MODEL,
+            source,
+        }
+    }
+
+    /// A feature as an entry of `model.json`'s `features`.
+    pub fn feature_to_json(feature: &Feature) -> Result<serde_json::Value, FormatError> {
+        schema::feature_value(feature).map_err(json_error)
+    }
+
+    /// A feature from an entry of `model.json`'s `features`, with the `id` and `name` it
+    /// gives. Import features are refused: their file is an entry of the archive.
+    pub fn feature_from_json(value: serde_json::Value) -> Result<Feature, FormatError> {
+        schema::feature_from_value(value)
+            .map_err(|e| FormatError::InvalidModel(ModelError::InvalidDefinition(e)))
+    }
+
+    /// A face name as a FaceRef.
+    pub fn face_to_json(face: &FaceName) -> Result<serde_json::Value, FormatError> {
+        schema::face_value(face).map_err(json_error)
+    }
+
+    pub fn face_from_json(value: serde_json::Value) -> Result<FaceName, FormatError> {
+        schema::face_from_value(value).map_err(json_error)
+    }
+
+    /// An edge name as an EdgeRef.
+    pub fn edge_to_json(edge: &EdgeName) -> Result<serde_json::Value, FormatError> {
+        schema::edge_value(edge).map_err(json_error)
+    }
+
+    pub fn edge_from_json(value: serde_json::Value) -> Result<EdgeName, FormatError> {
+        schema::edge_from_value(value).map_err(json_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -739,6 +784,7 @@ mod tests {
                 count: 2,
                 reverse: true,
             }),
+            skip: vec![[1, 1], [2, 0]],
         }));
         part.add_feature(FeatureKind::CircularPattern(CircularPattern {
             seeds: vec![ring],
@@ -747,6 +793,7 @@ mod tests {
             count: 4,
             equal_spacing: true,
             reverse: false,
+            skip: vec![[2, 0]],
         }));
         part.add_feature(FeatureKind::Mirror(Mirror {
             seeds: vec![hole, ring],
@@ -1163,6 +1210,64 @@ mod tests {
             model["equations"][1]["expression"],
             "\"Thickness@Boss-Extrude1\" / 4"
         );
+    }
+
+    /// A pattern's Instances to Skip are written sorted and without duplicates, and only
+    /// when it has some, so that one set of instances is always written the same way.
+    #[test]
+    fn instances_to_skip_are_written_sorted_and_only_when_there_are_some() {
+        let mut part = Part::new();
+        let mut base = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        base.rectangle(Point2::ORIGIN, 10.0, 10.0);
+        let s1 = part.add_feature(FeatureKind::Sketch(base));
+        let boss = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            5.0,
+        )));
+        let direction = |axis| PatternDirection {
+            axis: AxisRef::Standard(axis),
+            spacing: 20.0,
+            count: 3,
+            reverse: false,
+        };
+        part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![boss],
+            first: direction(StandardAxis::X),
+            second: Some(direction(StandardAxis::Y)),
+            skip: vec![[2, 1], [1, 1], [2, 1], [0, 2]],
+        }));
+        part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+            seeds: vec![boss],
+            axis: AxisRef::Standard(StandardAxis::Z),
+            angle: TAU,
+            count: 4,
+            equal_spacing: true,
+            reverse: false,
+            skip: Vec::new(),
+        }));
+        let file = PartFile {
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties: Properties::default(),
+        };
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert_eq!(
+            model["features"][2]["skip"],
+            serde_json::json!([[0, 2], [1, 1], [2, 1]])
+        );
+        assert!(model["features"][3].get("skip").is_none(), "{model}");
+        drop(archive);
+        let back = read_part(Cursor::new(&bytes)).unwrap();
+        let FeatureKind::LinearPattern(pattern) = back.definition.features[2].kind() else {
+            panic!("not a linear pattern");
+        };
+        assert_eq!(pattern.skip, [[0, 2], [1, 1], [2, 1]]);
     }
 
     #[test]
