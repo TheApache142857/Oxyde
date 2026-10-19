@@ -53,7 +53,7 @@ use std::path::Path;
 use std::collections::HashMap;
 
 use oxyde_assembly::Assembly;
-use oxyde_model::{FeatureKind, ModelError, Part, PartDefinition};
+use oxyde_model::{FeatureKind, ModelError, Part, PartDefinition, RefPlane};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -61,9 +61,17 @@ use assembly_schema::AssemblyModel;
 pub use schema::Properties;
 use schema::{Manifest, PartModel, TextureTable, Units, import_entry};
 
-/// The `format_version` written by this crate, and the newest it can read, for parts,
-/// assemblies and drawings.
+/// The `format_version` written by this crate, and the newest it can read, for assemblies
+/// and drawings; parts and simulation documents holding only what version 1 knows are
+/// written with it too.
 pub const FORMAT_VERSION: u32 = 1;
+
+/// The newest `format_version` of parts this crate reads: 2 adds the reference planes
+/// other than offset ones (at an angle, through a line, through three points, normal to a
+/// curve). A part is written with 1 when it holds only what version 1 knows, so older
+/// readers still open it, and refuse the others with a clear message instead of failing
+/// on a plane they cannot read.
+pub const PART_FORMAT_VERSION: u32 = 2;
 
 /// The newest `format_version` of simulation studies and results this crate reads: 2 adds
 /// thermal studies. A document is written with 1 when it holds only what version 1 knows,
@@ -112,6 +120,7 @@ impl DocumentKind {
     fn newest_version(kind: &str) -> u32 {
         match kind {
             "simulation" | "simulation_results" => SIMULATION_FORMAT_VERSION,
+            "part" => PART_FORMAT_VERSION,
             _ => FORMAT_VERSION,
         }
     }
@@ -277,14 +286,36 @@ fn read_manifest<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Manifest
     if manifest.format != FORMAT_NAME {
         return Err(FormatError::NotOxyde);
     }
-    let newest = DocumentKind::newest_version(&manifest.kind);
-    if manifest.format_version > newest {
+    check_version(
+        manifest.format_version,
+        DocumentKind::newest_version(&manifest.kind),
+    )?;
+    Ok(manifest)
+}
+
+/// Refuses a document newer than the newest version a reader knows.
+fn check_version(found: u32, newest: u32) -> Result<(), FormatError> {
+    if found > newest {
         return Err(FormatError::UnsupportedVersion {
-            found: manifest.format_version,
+            found,
             supported: newest,
         });
     }
-    Ok(manifest)
+    Ok(())
+}
+
+/// The `format_version` a part is written with: 2 when it holds a reference plane other
+/// than an offset one (version 1 readers could not read it), else 1, which readers of
+/// version 1 still open.
+pub fn part_version(definition: &PartDefinition) -> u32 {
+    let new_plane = definition.features.iter().any(
+        |f| matches!(f.kind(), FeatureKind::Plane(p) if !matches!(p, RefPlane::Offset { .. })),
+    );
+    if new_plane {
+        PART_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
 }
 
 fn expect_kind(manifest: &Manifest, kind: DocumentKind) -> Result<(), FormatError> {
@@ -320,7 +351,11 @@ pub fn document_kind(path: &Path) -> Result<(DocumentKind, String), FormatError>
 
 /// Writes a part document as a ZIP archive (`.oxyprt`).
 pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, FormatError> {
-    let manifest = manifest(DocumentKind::Part, &part.document_id);
+    let manifest = manifest_version(
+        DocumentKind::Part,
+        &part.document_id,
+        part_version(&part.definition),
+    );
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
@@ -637,10 +672,10 @@ mod tests {
     use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
     use oxyde_model::{
-        AxisRef, BodyId, CircularPattern, Combine, CombineOp, EdgeBlend, EdgeName, Extrude,
-        ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, FeatureKind, LinearPattern, Mirror,
-        PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
-        SketchPlane, StandardAxis, StandardPlane,
+        AxisRef, BodyId, CircularPattern, Combine, CombineOp, CurveRef, EdgeBlend, EdgeName,
+        Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, FeatureKind, LinearPattern, Mirror,
+        PatternDirection, PlaneRef, PointRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell,
+        Sketch, SketchPlane, StandardAxis, StandardPlane, VertexName,
     };
     use oxyde_model::{Hole, HoleKind, Sweep};
     use oxyde_sketch::Constraint;
@@ -708,11 +743,10 @@ mod tests {
         part.set_suppressed(bevel, true).unwrap();
 
         // Reference geometry, a revolve, patterns, a mirror and a shell.
-        let plane = part.add_feature(FeatureKind::Plane(RefPlane {
-            base: PlaneRef::Standard(StandardPlane::Top),
-            offset: 25.0,
-            flip: false,
-        }));
+        let plane = part.add_feature(FeatureKind::Plane(RefPlane::offset(
+            PlaneRef::Standard(StandardPlane::Top),
+            25.0,
+        )));
         let axis = part.add_feature(FeatureKind::Axis(RefAxis::TwoPlanes(
             PlaneRef::Standard(StandardPlane::Front),
             PlaneRef::Reference(plane),
@@ -796,6 +830,88 @@ mod tests {
             path: s5,
             op: ExtrudeOp::NewBody,
             bodies: vec![BodyId::new(boss, 0)],
+        }));
+        // Reference planes of every construction but the offset one above.
+        let corner = |faces: [FaceName; 3]| {
+            let mut faces = faces.to_vec();
+            faces.sort();
+            PointRef::Vertex(VertexName { faces, part: 0 })
+        };
+        let top_edge = EdgeName::between(FaceName::profile(boss, 3), FaceName::end_cap(boss));
+        part.add_feature(FeatureKind::Plane(RefPlane::Angle {
+            base: PlaneRef::Face(FaceName::end_cap(boss)),
+            line: AxisRef::Edge(top_edge.clone()),
+            angle: PI / 6.0,
+            flip: true,
+        }));
+        part.add_feature(FeatureKind::Plane(RefPlane::ThroughLine {
+            line: AxisRef::SketchLine {
+                sketch: s3,
+                entity: centerline.0,
+            },
+            plane: PlaneRef::Standard(StandardPlane::Right),
+            perpendicular: true,
+            flip: false,
+        }));
+        part.add_feature(FeatureKind::Plane(RefPlane::ThroughLine {
+            line: AxisRef::Edge(top_edge),
+            plane: PlaneRef::Reference(plane),
+            perpendicular: false,
+            flip: false,
+        }));
+        part.add_feature(FeatureKind::Plane(RefPlane::ThreePoints {
+            points: [
+                corner([
+                    FaceName::profile(boss, 1),
+                    FaceName::profile(boss, 2),
+                    FaceName::end_cap(boss),
+                ]),
+                PointRef::SketchPoint {
+                    sketch: s2,
+                    entity: dot.0,
+                },
+                corner([
+                    FaceName::profile(boss, 3),
+                    FaceName::profile(boss, 4),
+                    FaceName::start_cap(boss),
+                ]),
+            ],
+            flip: false,
+        }));
+        let (path_line, path_start) = match part.feature(s5).map(|f| f.kind()) {
+            Some(FeatureKind::Sketch(s)) => s
+                .geometry
+                .entities()
+                .iter()
+                .find_map(|e| match e.geometry {
+                    oxyde_sketch::Geometry::Line { start, .. } => Some((e.id.0, start.0)),
+                    _ => None,
+                })
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        part.add_feature(FeatureKind::Plane(RefPlane::NormalToCurve {
+            curve: CurveRef::SketchCurve {
+                sketch: s5,
+                entity: path_line,
+            },
+            point: PointRef::SketchPoint {
+                sketch: s5,
+                entity: path_start,
+            },
+            flip: true,
+        }));
+        part.add_feature(FeatureKind::Plane(RefPlane::NormalToCurve {
+            curve: CurveRef::Edge(EdgeName::between(
+                FaceName::profile(boss, 1),
+                FaceName::profile(boss, 2),
+            )),
+            point: corner([
+                FaceName::profile(boss, 1),
+                FaceName::profile(boss, 2),
+                FaceName::start_cap(boss),
+            ]),
+            flip: false,
         }));
         // End conditions without a depth: through everything, and up to a face.
         let mut slot = Sketch::new(SketchPlane::Reference(plane));
@@ -947,6 +1063,73 @@ mod tests {
     }
 
     #[test]
+    fn offset_planes_are_written_as_before_and_constructions_named() {
+        let bytes = write_part(Cursor::new(Vec::new()), &sample())
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        let planes: Vec<&serde_json::Value> = model["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["type"] == "plane")
+            .collect();
+        // The offset plane has exactly the keys it always had.
+        let mut keys: Vec<&str> = planes[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["base", "flip", "id", "name", "offset", "suppressed", "type"]
+        );
+        let constructions: Vec<&str> = planes[1..]
+            .iter()
+            .map(|p| p["construction"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            constructions,
+            [
+                "angle",
+                "through_line",
+                "through_line",
+                "three_points",
+                "normal_to_curve",
+                "normal_to_curve"
+            ]
+        );
+        assert_eq!(planes[1]["angle"], PI / 6.0);
+        assert!(planes[2]["line"]["sketch_axis"]["entity"].is_u64());
+        assert_eq!(planes[2]["perpendicular"], true);
+        assert!(planes[4]["points"][1]["sketch_point"]["sketch"].is_u64());
+        assert!(planes[5]["curve"]["sketch_curve"].is_object());
+        assert!(planes[6]["curve"]["edge"]["faces"].is_array());
+    }
+
+    #[test]
+    fn a_plane_missing_a_key_of_its_construction_is_refused() {
+        let model = r#"{ "next_feature_id": 2, "features": [
+            { "id": 1, "name": "Plane1", "type": "plane", "construction": "angle",
+              "base": { "standard": "top" }, "angle": 0.5 } ] }"#;
+        let bytes = archive_with(&[(MANIFEST, MANIFEST_V1), (MODEL, model), (PROPERTIES, "{}")]);
+        match read_part(Cursor::new(bytes)) {
+            Err(FormatError::InvalidModel(error)) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("Plane1") && message.contains("`line`"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_part_round_trips() {
         let part = PartFile::new();
         assert_eq!(round_trip(&part), part);
@@ -962,7 +1145,8 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
         assert_eq!(manifest["format"], "oxyde");
-        assert_eq!(manifest["format_version"], FORMAT_VERSION);
+        // The sample holds planes at an angle and through points: version 2.
+        assert_eq!(manifest["format_version"], PART_FORMAT_VERSION);
         assert_eq!(manifest["kind"], "part");
     }
 
@@ -1099,15 +1283,65 @@ mod tests {
 
     #[test]
     fn newer_versions_are_refused() {
-        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":2");
+        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":3");
         let bytes = archive_with(&[(MANIFEST, &manifest)]);
         assert!(matches!(
             read_part(Cursor::new(bytes)),
+            Err(FormatError::UnsupportedVersion {
+                found: 3,
+                supported: 2
+            })
+        ));
+    }
+
+    fn written_version(part: &PartFile) -> u64 {
+        let bytes = write_part(Cursor::new(Vec::new()), part)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        manifest["format_version"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_part_is_version_2_only_with_a_new_plane_construction() {
+        assert_eq!(written_version(&PartFile::new()), 1);
+        // Offset planes are version 1, as they always were.
+        let mut part = Part::new();
+        part.add_feature(FeatureKind::Plane(RefPlane::offset(
+            PlaneRef::Standard(StandardPlane::Top),
+            5.0,
+        )));
+        let mut file = PartFile::new();
+        file.definition = part.definition();
+        assert_eq!(written_version(&file), 1);
+        // A plane through three points needs version 2.
+        part.add_feature(FeatureKind::Plane(RefPlane::ThreePoints {
+            points: [1, 2, 3].map(|entity| PointRef::SketchPoint {
+                sketch: oxyde_model::FeatureId::from_raw(1),
+                entity,
+            }),
+            flip: false,
+        }));
+        file.definition = part.definition();
+        assert_eq!(written_version(&file), 2);
+        // And reads back.
+        assert_eq!(round_trip(&file), file);
+    }
+
+    #[test]
+    fn a_reader_of_version_1_refuses_a_part_with_a_new_plane() {
+        // What Oxyde 0.0.8 and older do with it: version 1 is the newest they know.
+        let version = written_version(&sample());
+        assert!(matches!(
+            check_version(version as u32, FORMAT_VERSION),
             Err(FormatError::UnsupportedVersion {
                 found: 2,
                 supported: 1
             })
         ));
+        assert!(check_version(version as u32, PART_FORMAT_VERSION).is_ok());
     }
 
     #[test]

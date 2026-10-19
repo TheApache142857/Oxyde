@@ -7,7 +7,7 @@ use oxyde_geom::{Axis, Plane, Point2};
 use oxyde_sketch::ConstrainedSketch;
 
 use crate::dimensions::DimensionUnit;
-use crate::naming::{EdgeName, FaceName};
+use crate::naming::{EdgeName, FaceName, VertexName};
 
 /// Stable identity of a feature within a part. Never reused, even after deletion, and
 /// unaffected by renaming or reordering.
@@ -381,7 +381,13 @@ impl FeatureKind {
                 out
             }
             FeatureKind::Shell(s) => vec![(P::Thickness, s.thickness)],
-            FeatureKind::Plane(p) => vec![(P::Offset, p.offset)],
+            FeatureKind::Plane(p) => match p {
+                RefPlane::Offset { offset, .. } => vec![(P::Offset, *offset)],
+                RefPlane::Angle { angle, .. } => vec![(P::Angle, *angle)],
+                RefPlane::ThroughLine { .. }
+                | RefPlane::ThreePoints { .. }
+                | RefPlane::NormalToCurve { .. } => Vec::new(),
+            },
             FeatureKind::LinearPattern(l) => {
                 let mut out = vec![
                     (P::Spacing, l.first.spacing),
@@ -473,7 +479,8 @@ impl FeatureKind {
                 _ => return false,
             },
             (FeatureKind::Shell(s), P::Thickness) => s.thickness = value,
-            (FeatureKind::Plane(p), P::Offset) => p.offset = value,
+            (FeatureKind::Plane(RefPlane::Offset { offset, .. }), P::Offset) => *offset = value,
+            (FeatureKind::Plane(RefPlane::Angle { angle, .. }), P::Angle) => *angle = value,
             (FeatureKind::LinearPattern(l), P::Spacing) => l.first.spacing = value,
             (FeatureKind::LinearPattern(l), P::Count) => l.first.count = count(),
             (FeatureKind::LinearPattern(l), P::Spacing2) => match &mut l.second {
@@ -549,7 +556,7 @@ impl FeatureKind {
                 }
             }
             FeatureKind::Shell(s) => faces(&s.faces, &mut out),
-            FeatureKind::Plane(p) => p.base.collect_features(&mut out),
+            FeatureKind::Plane(p) => p.collect_features(&mut out),
             FeatureKind::Axis(RefAxis::Along(axis)) => axis.collect_features(&mut out),
             FeatureKind::Axis(RefAxis::TwoPlanes(a, b)) => {
                 a.collect_features(&mut out);
@@ -710,6 +717,12 @@ pub enum AxisRef {
     Edge(EdgeName),
     /// The axis of a cylindrical or conical face, or the normal of a planar face.
     Face(FaceName),
+    /// A line of a sketch (a centerline or not), by its entity id, running from its start
+    /// point to its end point.
+    SketchLine {
+        sketch: FeatureId,
+        entity: u32,
+    },
 }
 
 impl AxisRef {
@@ -719,6 +732,47 @@ impl AxisRef {
             AxisRef::Reference(id) => out.push(*id),
             AxisRef::Edge(edge) => edge.faces.iter().for_each(|f| f.key.collect_features(out)),
             AxisRef::Face(face) => face.key.collect_features(out),
+            AxisRef::SketchLine { sketch, .. } => out.push(*sketch),
+        }
+    }
+}
+
+/// A point picked for a feature: a corner of the body or a point of a sketch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointRef {
+    /// A vertex of the body, named by the faces meeting there.
+    Vertex(VertexName),
+    /// A point of a sketch (the end of a line, the centre of a circle, a lone point), by
+    /// its entity id.
+    SketchPoint { sketch: FeatureId, entity: u32 },
+}
+
+impl PointRef {
+    pub fn collect_features(&self, out: &mut Vec<FeatureId>) {
+        match self {
+            PointRef::Vertex(vertex) => vertex
+                .faces
+                .iter()
+                .for_each(|f| f.key.collect_features(out)),
+            PointRef::SketchPoint { sketch, .. } => out.push(*sketch),
+        }
+    }
+}
+
+/// A curve picked for a feature: an edge of the body or a curve of a sketch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CurveRef {
+    /// An edge of any kind: straight, circular or any other curve.
+    Edge(EdgeName),
+    /// A line, an arc or a circle of a sketch, by its entity id.
+    SketchCurve { sketch: FeatureId, entity: u32 },
+}
+
+impl CurveRef {
+    pub fn collect_features(&self, out: &mut Vec<FeatureId>) {
+        match self {
+            CurveRef::Edge(edge) => edge.faces.iter().for_each(|f| f.key.collect_features(out)),
+            CurveRef::SketchCurve { sketch, .. } => out.push(*sketch),
         }
     }
 }
@@ -935,14 +989,92 @@ pub struct Shell {
     pub outward: bool,
 }
 
-/// Reference plane at a distance from another plane or a planar face.
+/// Reference plane: the most used constructions of SolidWorks' Plane command. Every one
+/// refers to geometry by persistent name, so the plane follows it through rebuilds.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RefPlane {
-    pub base: PlaneRef,
-    /// Distance along the base normal (mm).
-    pub offset: f64,
-    /// Offset to the other side.
-    pub flip: bool,
+pub enum RefPlane {
+    /// Parallel to a plane or a flat face, `offset` (mm) along its normal; `flip` puts it
+    /// on the other side. Its frame is the base's, moved.
+    Offset {
+        base: PlaneRef,
+        offset: f64,
+        flip: bool,
+    },
+    /// Through a line lying in a plane or a flat face, turned about that line by `angle`
+    /// (radians) from it: counter-clockwise looking against the line's direction (the
+    /// right-hand rule), clockwise with `flip`. Its frame is the base's, turned with it, so
+    /// a sketch on it turns as the angle changes.
+    Angle {
+        base: PlaneRef,
+        line: AxisRef,
+        angle: f64,
+        flip: bool,
+    },
+    /// Through a line (a straight edge, a sketch line, an axis), parallel or perpendicular
+    /// to a plane or a flat face. Parallel, its normal is the plane's; perpendicular, it is
+    /// the plane turned a quarter turn about the line's shadow on it, as for
+    /// [`RefPlane::Angle`]. `flip` reverses the normal.
+    ThroughLine {
+        line: AxisRef,
+        plane: PlaneRef,
+        perpendicular: bool,
+        flip: bool,
+    },
+    /// Through three points: its origin at the first, its x axis towards the second, its
+    /// normal the side from which the three run counter-clockwise (`flip` reverses it).
+    ThreePoints { points: [PointRef; 3], flip: bool },
+    /// Through a point, normal to a curve where the curve passes closest to the point (at
+    /// the point, when it is on the curve: the end of a sweep path, a vertex of an edge).
+    /// Its normal runs along the curve (`flip` reverses it); its origin is the point.
+    NormalToCurve {
+        curve: CurveRef,
+        point: PointRef,
+        flip: bool,
+    },
+}
+
+impl RefPlane {
+    /// A plane `offset` (mm) from `base`.
+    pub fn offset(base: PlaneRef, offset: f64) -> Self {
+        RefPlane::Offset {
+            base,
+            offset,
+            flip: false,
+        }
+    }
+
+    /// Whether the plane is flipped: on the other side, turned the other way, or with its
+    /// normal reversed, depending on its construction.
+    pub fn flipped(&self) -> bool {
+        match self {
+            RefPlane::Offset { flip, .. }
+            | RefPlane::Angle { flip, .. }
+            | RefPlane::ThroughLine { flip, .. }
+            | RefPlane::ThreePoints { flip, .. }
+            | RefPlane::NormalToCurve { flip, .. } => *flip,
+        }
+    }
+
+    pub fn collect_features(&self, out: &mut Vec<FeatureId>) {
+        match self {
+            RefPlane::Offset { base, .. } => base.collect_features(out),
+            RefPlane::Angle { base, line, .. } => {
+                base.collect_features(out);
+                line.collect_features(out);
+            }
+            RefPlane::ThroughLine { line, plane, .. } => {
+                line.collect_features(out);
+                plane.collect_features(out);
+            }
+            RefPlane::ThreePoints { points, .. } => {
+                points.iter().for_each(|p| p.collect_features(out));
+            }
+            RefPlane::NormalToCurve { curve, point, .. } => {
+                curve.collect_features(out);
+                point.collect_features(out);
+            }
+        }
+    }
 }
 
 /// Reference axis.

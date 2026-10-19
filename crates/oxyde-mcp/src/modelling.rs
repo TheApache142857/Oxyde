@@ -107,7 +107,7 @@ pub(crate) fn plane_ref(session: &mut Session, value: &Value) -> Result<PlaneRef
         let id = session.change(|doc| {
             add_named(
                 doc,
-                FeatureKind::Plane(RefPlane {
+                FeatureKind::Plane(RefPlane::Offset {
                     base,
                     offset: offset.abs(),
                     flip,
@@ -594,19 +594,40 @@ pub(crate) fn hole(session: &mut Session, args: &Value) -> Result<ToolOutput> {
     )
 }
 
+/// A reference plane: at an offset from `base`, at an angle to it about a `line` lying in
+/// it, or through a `line` parallel or perpendicular to it. Planes through three points or
+/// normal to a curve take references the tools do not select (corners, sketch points), so
+/// they are made with `add_feature` and the feature's JSON.
 pub(crate) fn ref_plane(session: &mut Session, args: &Value) -> Result<ToolOutput> {
     let base = plane_ref(session, args::get(args, "base")?)?;
-    let offset = args::f64(args, "offset")?;
-    let flip = args::bool(args, "flip", false)? != (offset < 0.0);
-    add(
-        session,
-        FeatureKind::Plane(RefPlane {
+    let flip = args::bool(args, "flip", false)?;
+    let plane = match (args::opt(args, "line"), args::opt_f64(args, "angle")?) {
+        (Some(line), Some(angle)) => RefPlane::Angle {
             base,
-            offset: offset.abs(),
+            line: axis_ref(session, line)?,
+            // A negative angle turns the other way, as the flip does.
+            angle: angle.abs().to_radians(),
+            flip: flip != (angle < 0.0),
+        },
+        (Some(line), None) => RefPlane::ThroughLine {
+            line: axis_ref(session, line)?,
+            plane: base,
+            perpendicular: args::bool(args, "perpendicular", false)?,
             flip,
-        }),
-        args,
-    )
+        },
+        (None, Some(_)) => {
+            return Err("an angle turns the plane about a \"line\" lying in the base".to_owned());
+        }
+        (None, None) => {
+            let offset = args::f64(args, "offset")?;
+            RefPlane::Offset {
+                base,
+                offset: offset.abs(),
+                flip: flip != (offset < 0.0),
+            }
+        }
+    };
+    add(session, FeatureKind::Plane(plane), args)
 }
 
 pub(crate) fn ref_axis(session: &mut Session, args: &Value) -> Result<ToolOutput> {

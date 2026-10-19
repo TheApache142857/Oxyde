@@ -54,7 +54,7 @@ fn block(part: &mut Part) -> FeatureId {
 
 /// A plane parallel to Front, at `z`.
 fn front_at(part: &mut Part, z: f64) -> FeatureId {
-    part.add_feature(FeatureKind::Plane(RefPlane {
+    part.add_feature(FeatureKind::Plane(RefPlane::Offset {
         base: PlaneRef::Standard(StandardPlane::Front),
         offset: z,
         flip: false,

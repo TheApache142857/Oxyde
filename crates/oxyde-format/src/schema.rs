@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, HashMap};
 use oxyde_geom::Point2;
 use oxyde_model::{
     Appearance, Appearances, AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp,
-    ConfigurationText, ConfigurationsText, EdgeBlend, EdgeName, EquationText, Equations,
+    ConfigurationText, ConfigurationsText, CurveRef, EdgeBlend, EdgeName, EquationText, Equations,
     EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
     FeatureKind, FeatureParameter, FileData, GlobalText, Hole, HoleKind, Import, LinearPattern,
     Loft, Material, MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef,
-    RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
+    PointRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
     StandardPlane, Sweep, Texture, Thermal, VertexName,
 };
 use oxyde_sketch::{
@@ -507,12 +507,7 @@ pub(crate) enum KindDto {
         outward: bool,
     },
     /// Reference plane.
-    Plane {
-        base: PlaneDto,
-        offset: f64,
-        #[serde(default)]
-        flip: bool,
-    },
+    Plane(RefPlaneDto),
     /// Reference axis.
     Axis {
         axis: RefAxisDto,
@@ -679,6 +674,82 @@ pub(crate) enum AxisRefDto {
     Reference(u32),
     Edge(EdgeRefDto),
     Face(FaceRefDto),
+    /// A line of a sketch (`sketch_axis`: a revolve's own `sketch_line` is a bare id).
+    SketchAxis(SketchEntityDto),
+}
+
+/// A reference plane's keys. A plane without `construction` is an offset plane, as files
+/// have always had it, and is still written so; the other constructions name theirs. Each
+/// construction has its own keys, and a key it does not use is left out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub(crate) struct RefPlaneDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub construction: Option<PlaneConstructionDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<PlaneDto>,
+    /// Millimetres, along the base normal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<AxisRefDto>,
+    /// Radians.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angle: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plane: Option<PlaneDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perpendicular: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub points: Option<[PointRefDto; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curve: Option<CurveRefDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point: Option<PointRefDto>,
+    #[serde(default)]
+    pub flip: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PlaneConstructionDto {
+    Offset,
+    Angle,
+    ThroughLine,
+    ThreePoints,
+    NormalToCurve,
+}
+
+impl PlaneConstructionDto {
+    fn name(self) -> &'static str {
+        match self {
+            PlaneConstructionDto::Offset => "offset",
+            PlaneConstructionDto::Angle => "angle",
+            PlaneConstructionDto::ThroughLine => "through_line",
+            PlaneConstructionDto::ThreePoints => "three_points",
+            PlaneConstructionDto::NormalToCurve => "normal_to_curve",
+        }
+    }
+}
+
+/// A point or a curve of a sketch, by the sketch's feature id and the entity's id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SketchEntityDto {
+    pub sketch: u32,
+    pub entity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PointRefDto {
+    Vertex(VertexRefDto),
+    SketchPoint(SketchEntityDto),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CurveRefDto {
+    Edge(EdgeRefDto),
+    SketchCurve(SketchEntityDto),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -992,11 +1063,7 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
             thickness: shell.thickness,
             outward: shell.outward,
         },
-        FeatureKind::Plane(plane) => KindDto::Plane {
-            base: plane_dto(&plane.base),
-            offset: plane.offset,
-            flip: plane.flip,
-        },
+        FeatureKind::Plane(plane) => KindDto::Plane(ref_plane_dto(plane)),
         FeatureKind::Axis(axis) => KindDto::Axis {
             axis: match axis {
                 RefAxis::Along(axis) => RefAxisDto::Along(axis_dto(axis)),
@@ -1106,6 +1173,73 @@ fn plane_dto(plane: &PlaneRef) -> PlaneDto {
     }
 }
 
+fn ref_plane_dto(plane: &RefPlane) -> RefPlaneDto {
+    let mut out = RefPlaneDto {
+        flip: plane.flipped(),
+        ..RefPlaneDto::default()
+    };
+    match plane {
+        // No `construction`: offset planes are written as they always were.
+        RefPlane::Offset { base, offset, .. } => {
+            out.base = Some(plane_dto(base));
+            out.offset = Some(*offset);
+        }
+        RefPlane::Angle {
+            base, line, angle, ..
+        } => {
+            out.construction = Some(PlaneConstructionDto::Angle);
+            out.base = Some(plane_dto(base));
+            out.line = Some(axis_dto(line));
+            out.angle = Some(*angle);
+        }
+        RefPlane::ThroughLine {
+            line,
+            plane,
+            perpendicular,
+            ..
+        } => {
+            out.construction = Some(PlaneConstructionDto::ThroughLine);
+            out.line = Some(axis_dto(line));
+            out.plane = Some(plane_dto(plane));
+            out.perpendicular = Some(*perpendicular);
+        }
+        RefPlane::ThreePoints { points, .. } => {
+            out.construction = Some(PlaneConstructionDto::ThreePoints);
+            out.points = Some(points.each_ref().map(point_dto));
+        }
+        RefPlane::NormalToCurve { curve, point, .. } => {
+            out.construction = Some(PlaneConstructionDto::NormalToCurve);
+            out.curve = Some(match curve {
+                CurveRef::Edge(edge) => CurveRefDto::Edge(edge_dto(edge)),
+                CurveRef::SketchCurve { sketch, entity } => {
+                    CurveRefDto::SketchCurve(sketch_entity_dto(*sketch, *entity))
+                }
+            });
+            out.point = Some(point_dto(point));
+        }
+    }
+    out
+}
+
+fn sketch_entity_dto(sketch: FeatureId, entity: u32) -> SketchEntityDto {
+    SketchEntityDto {
+        sketch: sketch.raw(),
+        entity,
+    }
+}
+
+fn point_dto(point: &PointRef) -> PointRefDto {
+    match point {
+        PointRef::Vertex(vertex) => PointRefDto::Vertex(VertexRefDto {
+            faces: vertex.faces.iter().map(face_dto).collect(),
+            part: vertex.part,
+        }),
+        PointRef::SketchPoint { sketch, entity } => {
+            PointRefDto::SketchPoint(sketch_entity_dto(*sketch, *entity))
+        }
+    }
+}
+
 fn axis_dto(axis: &AxisRef) -> AxisRefDto {
     match axis {
         AxisRef::Standard(StandardAxis::X) => AxisRefDto::Standard(StandardAxisDto::X),
@@ -1114,6 +1248,9 @@ fn axis_dto(axis: &AxisRef) -> AxisRefDto {
         AxisRef::Reference(id) => AxisRefDto::Reference(id.raw()),
         AxisRef::Edge(edge) => AxisRefDto::Edge(edge_dto(edge)),
         AxisRef::Face(face) => AxisRefDto::Face(face_dto(face)),
+        AxisRef::SketchLine { sketch, entity } => {
+            AxisRefDto::SketchAxis(sketch_entity_dto(*sketch, *entity))
+        }
     }
 }
 
@@ -1546,11 +1683,9 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             thickness,
             outward,
         }),
-        KindDto::Plane { base, offset, flip } => FeatureKind::Plane(RefPlane {
-            base: plane_from(base),
-            offset,
-            flip,
-        }),
+        KindDto::Plane(plane) => {
+            FeatureKind::Plane(ref_plane_from(plane).map_err(|e| format!("{}: {e}", dto.name))?)
+        }
         KindDto::Axis { axis } => FeatureKind::Axis(match axis {
             RefAxisDto::Along(axis) => RefAxis::Along(axis_from(axis)),
             RefAxisDto::TwoPlanes([a, b]) => RefAxis::TwoPlanes(plane_from(a), plane_from(b)),
@@ -1691,6 +1826,63 @@ fn plane_from(dto: PlaneDto) -> PlaneRef {
     }
 }
 
+/// A reference plane from its keys; fails when its construction lacks one it needs.
+fn ref_plane_from(dto: RefPlaneDto) -> Result<RefPlane, String> {
+    let construction = dto.construction.unwrap_or(PlaneConstructionDto::Offset);
+    let need = |key: &str| format!("a plane by `{}` needs `{key}`", construction.name());
+    let flip = dto.flip;
+    Ok(match construction {
+        PlaneConstructionDto::Offset => RefPlane::Offset {
+            base: plane_from(dto.base.ok_or_else(|| need("base"))?),
+            offset: dto.offset.ok_or_else(|| need("offset"))?,
+            flip,
+        },
+        PlaneConstructionDto::Angle => RefPlane::Angle {
+            base: plane_from(dto.base.ok_or_else(|| need("base"))?),
+            line: axis_from(dto.line.ok_or_else(|| need("line"))?),
+            angle: dto.angle.ok_or_else(|| need("angle"))?,
+            flip,
+        },
+        PlaneConstructionDto::ThroughLine => RefPlane::ThroughLine {
+            line: axis_from(dto.line.ok_or_else(|| need("line"))?),
+            plane: plane_from(dto.plane.ok_or_else(|| need("plane"))?),
+            perpendicular: dto.perpendicular.unwrap_or(false),
+            flip,
+        },
+        PlaneConstructionDto::ThreePoints => RefPlane::ThreePoints {
+            points: dto
+                .points
+                .ok_or_else(|| need("points"))?
+                .map(point_ref_from),
+            flip,
+        },
+        PlaneConstructionDto::NormalToCurve => RefPlane::NormalToCurve {
+            curve: match dto.curve.ok_or_else(|| need("curve"))? {
+                CurveRefDto::Edge(edge) => CurveRef::Edge(edge_from(edge)),
+                CurveRefDto::SketchCurve(e) => CurveRef::SketchCurve {
+                    sketch: FeatureId::from_raw(e.sketch),
+                    entity: e.entity,
+                },
+            },
+            point: point_ref_from(dto.point.ok_or_else(|| need("point"))?),
+            flip,
+        },
+    })
+}
+
+fn point_ref_from(dto: PointRefDto) -> PointRef {
+    match dto {
+        PointRefDto::Vertex(vertex) => PointRef::Vertex(VertexName {
+            faces: sorted(vertex.faces.into_iter().map(face_from).collect()),
+            part: vertex.part,
+        }),
+        PointRefDto::SketchPoint(e) => PointRef::SketchPoint {
+            sketch: FeatureId::from_raw(e.sketch),
+            entity: e.entity,
+        },
+    }
+}
+
 fn axis_from(dto: AxisRefDto) -> AxisRef {
     match dto {
         AxisRefDto::Standard(StandardAxisDto::X) => AxisRef::Standard(StandardAxis::X),
@@ -1699,6 +1891,10 @@ fn axis_from(dto: AxisRefDto) -> AxisRef {
         AxisRefDto::Reference(id) => AxisRef::Reference(FeatureId::from_raw(id)),
         AxisRefDto::Edge(edge) => AxisRef::Edge(edge_from(edge)),
         AxisRefDto::Face(face) => AxisRef::Face(face_from(face)),
+        AxisRefDto::SketchAxis(e) => AxisRef::SketchLine {
+            sketch: FeatureId::from_raw(e.sketch),
+            entity: e.entity,
+        },
     }
 }
 

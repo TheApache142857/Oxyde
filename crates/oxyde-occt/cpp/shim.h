@@ -24,6 +24,7 @@ struct AxisData;
 struct BoundsData;
 struct LoftSectionData;
 struct DistanceData;
+struct EdgeTangentData;
 struct PolylineData;
 struct ProjectionData;
 struct MeshData;
@@ -86,6 +87,8 @@ public:
     BoundsData bounds(std::uint64_t shape) const;
     DistanceData distance(std::uint64_t a, std::uint8_t a_kind, std::uint32_t a_index,
                           std::uint64_t b, std::uint8_t b_kind, std::uint32_t b_index) const;
+    EdgeTangentData edge_tangent(std::uint64_t shape, std::uint32_t edge, double x, double y,
+                                 double z) const;
     ProjectionData project_edges(rust::Slice<const std::uint64_t> shapes, const PlaneData& view,
                                  double deflection) const;
     TopologyCounts topology_counts(std::uint64_t shape) const;

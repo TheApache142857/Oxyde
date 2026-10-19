@@ -406,7 +406,7 @@ fn contours_that_cross_are_not_extruded() {
 fn sketch_on_a_reference_plane() {
     let mut kernel = OcctKernel::new();
     let mut part = Part::new();
-    let plane = part.add_feature(FeatureKind::Plane(RefPlane {
+    let plane = part.add_feature(FeatureKind::Plane(RefPlane::Offset {
         base: PlaneRef::Standard(StandardPlane::Top),
         offset: 30.0,
         flip: false,
@@ -986,11 +986,10 @@ fn patterns_and_mirrors_copy_patterns_and_mirrors() {
         skip: Vec::new(),
     }));
     // Mirrored through the middle of the plate: eight holes.
-    let middle = part.add_feature(FeatureKind::Plane(RefPlane {
-        base: PlaneRef::Standard(StandardPlane::Right),
-        offset: 50.0,
-        flip: false,
-    }));
+    let middle = part.add_feature(FeatureKind::Plane(RefPlane::offset(
+        PlaneRef::Standard(StandardPlane::Right),
+        50.0,
+    )));
     let mirror = part.add_feature(FeatureKind::Mirror(Mirror {
         seeds: vec![hole, row, rows],
         plane: PlaneRef::Reference(middle),
@@ -1335,7 +1334,7 @@ fn unequal_chamfers_take_two_distances_or_an_angle() {
 
 /// A plane parallel to Front at `z`.
 fn front_plane_at(part: &mut Part, z: f64) -> FeatureId {
-    part.add_feature(FeatureKind::Plane(RefPlane {
+    part.add_feature(FeatureKind::Plane(RefPlane::Offset {
         base: PlaneRef::Standard(StandardPlane::Front),
         offset: z,
         flip: false,

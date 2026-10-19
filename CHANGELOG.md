@@ -5,6 +5,41 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Planes at an angle, through edges and through points (unreleased, October 2026)
+
+- **The Plane command builds planes the way SolidWorks' does.** Its panel has a first, a
+  second and a third reference, each with the constraints that fit what it holds
+  (*Offset*, *At angle*, *Parallel*, *Perpendicular*, *Coincident*), and says *Fully
+  defined* once they make a plane, or what is still missing. Besides a plane at an offset
+  from a plane or a flat face, as before, it makes:
+  - a plane **at an angle** to a plane or a flat face, turning about a line lying in it:
+    an edge of the face, a line or centerline of a sketch, or an axis. The angle is a
+    dimension, `D1@Plane1`, shown in degrees, which equations can drive; a sketch on the
+    plane turns with it. *Flip angle* turns it the other way;
+  - a plane **through a line, parallel or perpendicular** to a plane: through an edge and
+    square to the Front plane, say;
+  - a plane **through three points**: corners of the part or points of sketches, its
+    origin at the first and its x axis towards the second;
+  - a plane **normal to a curve** at a point: an edge of any shape (straight, round, the
+    spline of an imported STEP file) or a line, an arc or a circle of a sketch, at one of
+    its corners or sketch points, where the profile of a sweep goes.
+
+  Pick a face, then one of its edges, and the plane starts at an angle about the edge;
+  pick an edge, then a point, and it starts normal to the edge. A corner is picked with
+  the pointer on it (the one under the pointer is drawn as a dot), and so are the points,
+  lines and arcs of the sketches shown; clicking something the panel holds takes it out.
+  Each reference is held by its persistent name, so the plane follows the part through
+  rebuilds; when its references no longer make a plane, the tree says why ("the line does
+  not lie in the plane", "the three points are in line", "line 3 of Sketch2 no longer
+  exists") and the part is left as it was. In files: the `plane` feature's `construction`
+  (FORMAT.md §3). A part holding one of these planes is written as `format_version` 2,
+  which older versions of Oxyde refuse with a clear message; parts with offset planes only
+  are written exactly as before, as version 1, and still open in them.
+- **The MCP server makes them too:** its `ref_plane` tool builds a plane at an angle about
+  a line lying in a plane, or through a line parallel or perpendicular to a plane, besides
+  an offset plane. Planes through three points or normal to a curve go through
+  `add_feature` with the feature's JSON.
+
 ### Instances to Skip in patterns (unreleased, October 2026)
 
 - **Instances to Skip** in Linear and Circular Pattern, as in SolidWorks: a pattern can
@@ -47,6 +82,7 @@ release yet; the git history has every detail.
 - **Text in sketches, through the MCP server:** a line of text in any TrueType font on the
   computer, with a size, a letter spacing, an angle, an alignment and an oblique slant,
   becomes closed outlines to extrude or cut. The application has no text tool yet.
+
 
 ### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 

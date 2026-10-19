@@ -144,7 +144,9 @@ pub fn lone_points(sketch: &ConstrainedSketch) -> Vec<Point2> {
         .collect()
 }
 
-pub fn sketch_polylines(sketch: &ConstrainedSketch) -> Vec<(Vec<Point2>, bool)> {
+/// The curves of a sketch as polylines in its plane, each with its entity id and whether it
+/// is construction geometry.
+pub fn sketch_curves(sketch: &ConstrainedSketch) -> Vec<(u32, Vec<Point2>, bool)> {
     let at = |id| sketch.position(id).unwrap_or_default();
     let arc = |c: Point2, r: f64, a0: f64, sweep: f64, n: usize| -> Vec<Point2> {
         (0..=n)
@@ -172,7 +174,7 @@ pub fn sketch_polylines(sketch: &ConstrainedSketch) -> Vec<(Vec<Point2>, bool)> 
                     arc(c, c.distance(s), a0, sweep, 40)
                 }
             };
-            Some((points, e.construction))
+            Some((e.id.0, points, e.construction))
         })
         .collect()
 }

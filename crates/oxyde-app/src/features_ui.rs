@@ -9,8 +9,8 @@
 use oxyde_model::{
     AxisRef, BodyId, CircularPattern, Combine, CombineOp, Extrude, ExtrudeExtent, ExtrudeOp,
     FaceName, Feature, FeatureId, FeatureKind, FeatureParameter, LinearPattern, Mirror,
-    PatternDirection, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, StandardAxis,
-    StandardPlane, Sweep,
+    PatternDirection, PlaneRef, RefAxis, Revolve, RevolveAxis, Shell, StandardAxis, StandardPlane,
+    Sweep,
 };
 use oxyde_sketch::Geometry;
 
@@ -162,15 +162,6 @@ impl LoftDialog {
             bodies: self.bodies.clone(),
         }))
     }
-}
-
-pub struct PlaneDialog {
-    pub editing: Option<FeatureId>,
-    pub dimension: Option<String>,
-    pub planes: Choices<PlaneRef>,
-    pub base: usize,
-    pub offset: f64,
-    pub flip: bool,
 }
 
 pub struct AxisDialog {
@@ -362,17 +353,6 @@ impl CombineDialog {
             tools: self.tools.clone(),
             op: self.op,
             keep_tools: self.keep_tools,
-        }))
-    }
-}
-
-impl PlaneDialog {
-    pub fn feature(&self) -> Option<FeatureKind> {
-        let (_, base) = self.planes.get(self.base)?;
-        Some(FeatureKind::Plane(RefPlane {
-            base: base.clone(),
-            offset: self.offset,
-            flip: self.flip,
         }))
     }
 }
@@ -873,34 +853,6 @@ impl OxydeApp {
         }));
     }
 
-    pub(crate) fn open_ref_plane(
-        &mut self,
-        editing: Option<FeatureId>,
-        existing: Option<&RefPlane>,
-    ) {
-        let planes = with_current(self.plane_choices(editing), existing.map(|p| &p.base));
-        let mut base = position(&planes, existing.map(|p| &p.base));
-        if existing.is_none() {
-            // Offset from the selected face, or the selected plane.
-            if let Some(i) = planes.iter().position(|(_, p)| match p {
-                PlaneRef::Face(_) => true,
-                PlaneRef::Standard(s) => self.selected_plane == Some(*s),
-                PlaneRef::Reference(id) => self.selected_feature == Some(*id),
-            }) {
-                base = i;
-            }
-        }
-        self.open_dialog(Dialog::RefPlane(PlaneDialog {
-            editing,
-            dimension: editing
-                .and_then(|id| self.parameter_full_name(id, FeatureParameter::Offset)),
-            planes,
-            base,
-            offset: existing.map_or(10.0, |p| p.offset),
-            flip: existing.is_some_and(|p| p.flip),
-        }));
-    }
-
     pub(crate) fn open_ref_axis(&mut self, editing: Option<FeatureId>, existing: Option<&RefAxis>) {
         let mut axes = self.axis_choices(editing);
         let mut planes = self.plane_choices(editing);
@@ -1023,12 +975,6 @@ impl OxydeApp {
         let body = self.doc.part.body()?;
         let index = body.naming.find_face(face)?;
         body.solid_of_face(index).map(|s| s.id)
-    }
-
-    pub(crate) fn apply_ref_plane(&mut self, d: PlaneDialog) {
-        if let Some(kind) = d.feature() {
-            self.add_or_replace(d.editing, kind);
-        }
     }
 
     pub(crate) fn apply_ref_axis(&mut self, d: AxisDialog) {

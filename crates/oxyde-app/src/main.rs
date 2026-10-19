@@ -52,6 +52,7 @@ mod materials;
 mod materials_ui;
 mod mesh_export;
 mod model_refs;
+mod plane_ui;
 mod prefs;
 mod prefs_ui;
 mod preview;

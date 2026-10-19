@@ -11,9 +11,7 @@ use oxyde_model::{
 use oxyde_sketch::{Constraint, RelationId};
 
 use crate::app::{OxydeApp, PendingAction};
-use crate::features_ui::{
-    AxisDialog, PatternDialog, PlaneDialog, RevolveDialog, ShellDialog, SweepDialog,
-};
+use crate::features_ui::{AxisDialog, PatternDialog, RevolveDialog, ShellDialog, SweepDialog};
 use crate::sketch_mode;
 
 /// Where an extrusion ends, as SolidWorks lists the end conditions.
@@ -235,7 +233,7 @@ pub enum Dialog {
     /// Linear pattern, circular pattern or mirror.
     Pattern(PatternDialog),
     Combine(crate::features_ui::CombineDialog),
-    RefPlane(PlaneDialog),
+    RefPlane(crate::plane_ui::PlaneDialog),
     RefAxis(AxisDialog),
     /// Colour, transparency and texture of faces, a body, the part or a component.
     Appearance(crate::appearance_ui::AppearanceDialog),

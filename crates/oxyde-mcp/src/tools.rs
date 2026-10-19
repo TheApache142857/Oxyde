@@ -276,9 +276,15 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "ref_plane",
-            "A reference plane at a distance from a plane or a flat face.",
-            json!({ "base": any(PLANE), "offset": number("mm"), "flip": boolean(""), "name": string("") }),
-            &["base", "offset"],
+            "A reference plane: at \"offset\" mm from \"base\" (a plane or a flat face); or turned by \
+            \"angle\" degrees about \"line\" (an edge, an axis) lying in \"base\"; or through \"line\", \
+            parallel to \"base\" or \"perpendicular\" to it. Planes through three points or normal to a \
+            curve: add_feature with the plane feature's JSON.",
+            json!({ "base": any(PLANE), "offset": number("mm"), "line": any(AXIS),
+                "angle": number("Degrees about the line; negative turns the other way."),
+                "perpendicular": boolean("Through the line, square to the base (default parallel)."),
+                "flip": boolean("Other side, other way round, or normal reversed."), "name": string("") }),
+            &["base"],
         ),
         tool(
             "ref_axis",

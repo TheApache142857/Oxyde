@@ -39,11 +39,11 @@ use oxyde_geom::{
     Transform, Vec3,
 };
 use oxyde_kernel::{
-    BooleanOp, ChamferSecond, CurveKind, Distance, EdgeInfo, FaceInfo, FaceMesh, FaceSource,
-    Kernel, Mesh, MeshWatch, OpHistory, OpResult, ProjectedEdges, ShapeHandle, StepAssembly,
-    StepColor, StepColors, StepImport, StepInstance, StepMaterial, StepNode, StepNodeContent,
-    SubShape, SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh, VolumeMeshError,
-    VolumeMeshOptions,
+    BooleanOp, ChamferSecond, CurveKind, Distance, EdgeInfo, EdgeTangent, FaceInfo, FaceMesh,
+    FaceSource, Kernel, Mesh, MeshWatch, OpHistory, OpResult, ProjectedEdges, ShapeHandle,
+    StepAssembly, StepColor, StepColors, StepImport, StepInstance, StepMaterial, StepNode,
+    StepNodeContent, SubShape, SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh,
+    VolumeMeshError, VolumeMeshOptions,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -384,6 +384,23 @@ impl Kernel for OcctKernel {
                 distance: d.distance,
                 on_a: Point3::new(d.ax, d.ay, d.az),
                 on_b: Point3::new(d.bx, d.by, d.bz),
+            }))
+        })
+    }
+
+    fn edge_tangent(
+        &self,
+        shape: ShapeHandle,
+        edge: u32,
+        near: Point3,
+    ) -> Result<Option<EdgeTangent>, OcctError> {
+        guarded(|| {
+            let t = self
+                .session
+                .edge_tangent(shape.raw(), edge, near.x, near.y, near.z)?;
+            Ok(Some(EdgeTangent {
+                point: Point3::new(t.x, t.y, t.z),
+                tangent: Vec3::new(t.tx, t.ty, t.tz),
             }))
         })
     }

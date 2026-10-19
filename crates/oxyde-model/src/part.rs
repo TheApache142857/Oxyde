@@ -7,10 +7,16 @@
 //! vertices.
 
 use std::collections::{BTreeSet, HashSet};
+use std::f64::consts::TAU;
 use std::fmt;
 
-use oxyde_geom::{Axis, Path as SweepPath, PathError, Plane, Profile, ProfileError, Transform};
-use oxyde_kernel::{BooleanOp, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind};
+use oxyde_geom::{
+    Axis, Path as SweepPath, PathError, Plane, Point2, Point3, Profile, ProfileError, Transform,
+    Vec3,
+};
+use oxyde_kernel::{
+    BooleanOp, CurveKind, FaceSource, Kernel, OpHistory, OpResult, ShapeHandle, SurfaceKind,
+};
 use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 
 use crate::appearance::{Appearance, Appearances};
@@ -19,10 +25,10 @@ use crate::configurations::Configurations;
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
-    AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp, EdgeBlend, Extrude,
-    ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Hole, HoleKind, Import,
-    LinearPattern, Loft, Mirror, PlaneRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
-    SketchPlane, Sweep,
+    AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp, CurveRef, EdgeBlend,
+    Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, Hole, HoleKind, Import,
+    LinearPattern, Loft, Mirror, PlaneRef, PointRef, RefAxis, RefPlane, Revolve, RevolveAxis,
+    Shell, Sketch, SketchPlane, Sweep,
 };
 use crate::material::Material;
 use crate::naming::{FaceKey, FaceName, Resolution};
@@ -953,6 +959,175 @@ impl<'a> Context<'a> {
                     .or_else(|| face.normal.and_then(|n| Axis::new(face.centroid, n)))
                     .ok_or_else(|| format!("face {name} has no axis"))
             }
+            AxisRef::SketchLine { sketch, entity } => {
+                let (name, solved) = self.solved_sketch(*sketch)?;
+                let (start, end) = match solved.solved.entity(EntityId(*entity)) {
+                    Some(e) => match e.geometry {
+                        Geometry::Line { start, end } => (start, end),
+                        _ => return Err(format!("entity {entity} of {name} is not a line")),
+                    },
+                    None => return Err(gone_from_sketch("line", *entity, name)),
+                };
+                let point = |id: EntityId| {
+                    solved
+                        .solved
+                        .position(id)
+                        .map(|p| solved.plane.to_world(p))
+                        .ok_or_else(|| format!("line {entity} of {name} has lost an end"))
+                };
+                let (a, b) = (point(start)?, point(end)?);
+                Axis::new(a, b - a).ok_or_else(|| format!("line {entity} of {name} has no length"))
+            }
+        }
+    }
+
+    /// The solved geometry of an earlier sketch, with its name: what references to its
+    /// points and curves read.
+    fn solved_sketch(&self, sketch: FeatureId) -> Result<(&'a str, &'a SketchResult), String> {
+        let (feature, result) = self.earlier(sketch)?;
+        let name = feature.name.as_str();
+        if matches!(result.status, FeatureStatus::Error(_)) {
+            return Err(format!("{name} has errors"));
+        }
+        let solved = result
+            .sketch
+            .as_ref()
+            .ok_or_else(|| format!("{name} is suppressed or has errors"))?;
+        Ok((name, solved))
+    }
+
+    fn point(&self, point: &PointRef, warnings: &mut Vec<String>) -> Result<Point3, String> {
+        match point {
+            PointRef::Vertex(name) => {
+                let body = self
+                    .body
+                    .ok_or_else(|| format!("vertex {name} not found: no body yet"))?;
+                let index = resolve(body.naming.resolve_vertex(name), "vertex", name, warnings)?;
+                body.topology
+                    .vertices
+                    .get(index as usize)
+                    .map(|v| v.point)
+                    .ok_or_else(|| format!("vertex {name} no longer exists: select it again"))
+            }
+            PointRef::SketchPoint { sketch, entity } => {
+                let (name, solved) = self.solved_sketch(*sketch)?;
+                match solved.solved.entity(EntityId(*entity)) {
+                    Some(e) => match e.geometry {
+                        Geometry::Point(p) => Ok(solved.plane.to_world(p)),
+                        _ => Err(format!("entity {entity} of {name} is not a point")),
+                    },
+                    None => Err(gone_from_sketch("point", *entity, name)),
+                }
+            }
+        }
+    }
+
+    /// Where a curve passes closest to `near`, and which way it runs there (unit length).
+    fn curve_tangent<K: Kernel>(
+        &self,
+        curve: &CurveRef,
+        near: Point3,
+        kernel: &K,
+        warnings: &mut Vec<String>,
+    ) -> Result<(Point3, Vec3), String> {
+        match curve {
+            CurveRef::Edge(name) => {
+                let body = self.body()?;
+                let index = resolve(body.naming.resolve_edge(name), "edge", name, warnings)?;
+                let edge = body
+                    .topology
+                    .edges
+                    .get(index as usize)
+                    .ok_or_else(|| format!("edge {name} no longer exists: select it again"))?;
+                // The kernel knows every kind of curve; lines and circles are worked out
+                // here when it cannot tell.
+                let local = body
+                    .solid_of_edge(index)
+                    .and_then(|s| Some((s.shape, s.local_edge(index)?)));
+                if let Some((shape, local)) = local
+                    && let Some(t) = kernel
+                        .edge_tangent(shape, local, near)
+                        .map_err(|e| format!("edge {name}: {e}"))?
+                {
+                    return Ok((t.point, t.tangent));
+                }
+                match (edge.curve, edge.axis) {
+                    (CurveKind::Line, Some(line)) => {
+                        let t = (near - line.origin)
+                            .dot(line.direction)
+                            .clamp(0.0, edge.length);
+                        Ok((line.origin + line.direction * t, line.direction))
+                    }
+                    (CurveKind::Circle, Some(axis)) => {
+                        let v = near - axis.origin;
+                        let along = v.dot(axis.direction);
+                        let tangent = axis
+                            .direction
+                            .cross(v - axis.direction * along)
+                            .normalized()
+                            .ok_or_else(|| format!("the point is on the axis of edge {name}"))?;
+                        Ok((near - axis.direction * along, tangent))
+                    }
+                    _ => Err(format!(
+                        "the direction of edge {name} cannot be worked out: pick another curve"
+                    )),
+                }
+            }
+            CurveRef::SketchCurve { sketch, entity } => {
+                let (name, solved) = self.solved_sketch(*sketch)?;
+                let plane = &solved.plane;
+                let local = near - plane.origin;
+                let q = Point2::new(local.dot(plane.x_dir), local.dot(plane.y_dir()));
+                let geometry = solved
+                    .solved
+                    .entity(EntityId(*entity))
+                    .map(|e| e.geometry)
+                    .ok_or_else(|| gone_from_sketch("curve", *entity, name))?;
+                let at = |id: EntityId| {
+                    solved
+                        .solved
+                        .position(id)
+                        .ok_or_else(|| format!("curve {entity} of {name} has lost a point"))
+                };
+                let (point, (tx, ty)) = match geometry {
+                    Geometry::Point(_) => {
+                        return Err(format!("entity {entity} of {name} is a point, not a curve"));
+                    }
+                    Geometry::Line { start, end } => {
+                        let (a, b) = (at(start)?, at(end)?);
+                        let (dx, dy) = (b.x - a.x, b.y - a.y);
+                        let length = dx.hypot(dy);
+                        if length <= 1e-9 {
+                            return Err(format!("line {entity} of {name} has no length"));
+                        }
+                        let t = (((q.x - a.x) * dx + (q.y - a.y) * dy) / (length * length))
+                            .clamp(0.0, 1.0);
+                        (
+                            Point2::new(a.x + dx * t, a.y + dy * t),
+                            (dx / length, dy / length),
+                        )
+                    }
+                    Geometry::Circle { center, radius } => {
+                        let c = at(center)?;
+                        circle_point(c, radius, (q.y - c.y).atan2(q.x - c.x))
+                    }
+                    Geometry::Arc { center, start, end } => {
+                        let (c, s, e) = (at(center)?, at(start)?, at(end)?);
+                        let radius = (s.x - c.x).hypot(s.y - c.y);
+                        let from = (s.y - c.y).atan2(s.x - c.x);
+                        let sweep = ((e.y - c.y).atan2(e.x - c.x) - from).rem_euclid(TAU);
+                        let sweep = if sweep <= 1e-12 { TAU } else { sweep };
+                        // Counter-clockwise from the start; past the end, the nearer end.
+                        let mut t = ((q.y - c.y).atan2(q.x - c.x) - from).rem_euclid(TAU);
+                        if t > sweep {
+                            t = if t - sweep < TAU - t { sweep } else { 0.0 };
+                        }
+                        circle_point(c, radius, from + t)
+                    }
+                };
+                let tangent = plane.x_dir * tx + plane.y_dir() * ty;
+                Ok((plane.to_world(point), tangent))
+            }
         }
     }
 
@@ -1058,7 +1233,7 @@ fn build_feature<K: Kernel>(
                 result.produced = Some(build_shell(&ctx, shell, kernel, &mut warnings)?);
             }
             FeatureKind::Plane(plane) => {
-                result.reference = Some(build_ref_plane(&ctx, plane, &mut warnings)?);
+                result.reference = Some(build_ref_plane(&ctx, plane, kernel, &mut warnings)?);
             }
             FeatureKind::Axis(axis) => {
                 result.reference = Some(build_ref_axis(&ctx, axis, &mut warnings)?);
@@ -1165,6 +1340,20 @@ fn resolve(
         )),
         Resolution::Lost => Err(format!("{what} {name} no longer exists: select it again")),
     }
+}
+
+/// Why a reference to a point or a curve of a sketch no longer holds: it was deleted.
+fn gone_from_sketch(what: &str, entity: u32, sketch: &str) -> String {
+    format!("{what} {entity} of {sketch} no longer exists: select it again")
+}
+
+/// The point of a circle at `angle`, and its counter-clockwise direction there.
+fn circle_point(center: Point2, radius: f64, angle: f64) -> (Point2, (f64, f64)) {
+    let (sin, cos) = angle.sin_cos();
+    (
+        Point2::new(center.x + radius * cos, center.y + radius * sin),
+        (-sin, cos),
+    )
 }
 
 fn face_plane(body: &Body, index: u32) -> Option<Plane> {
@@ -2663,18 +2852,123 @@ fn build_combine<K: Kernel>(
     }
 }
 
-fn build_ref_plane(
+fn build_ref_plane<K: Kernel>(
     ctx: &Context<'_>,
     plane: &RefPlane,
+    kernel: &K,
     warnings: &mut Vec<String>,
 ) -> Result<ReferenceGeometry, String> {
-    let base = ctx.plane(&plane.base, warnings)?;
-    let offset = if plane.flip {
-        -plane.offset
-    } else {
-        plane.offset
+    let built = match plane {
+        RefPlane::Offset { base, offset, flip } => {
+            let base = ctx.plane(base, warnings)?;
+            base.offset(if *flip { -offset } else { *offset })
+        }
+        RefPlane::Angle {
+            base,
+            line,
+            angle,
+            flip,
+        } => {
+            let base = ctx.plane(base, warnings)?;
+            let line = ctx.axis(line, warnings)?;
+            if line.direction.dot(base.normal).abs() > 1e-6
+                || (line.origin - base.origin).dot(base.normal).abs() > 1e-6
+            {
+                return Err("the line does not lie in the plane".to_owned());
+            }
+            turned_about(&base, &line, if *flip { -angle } else { *angle })
+        }
+        RefPlane::ThroughLine {
+            line,
+            plane,
+            perpendicular,
+            flip,
+        } => {
+            let line = ctx.axis(line, warnings)?;
+            let plane = ctx.plane(plane, warnings)?;
+            let across = line.direction.dot(plane.normal);
+            let built = if *perpendicular {
+                // A quarter turn about the line's shadow on the plane: the plane through
+                // the line, square to the other one.
+                let height = (line.origin - plane.origin).dot(plane.normal);
+                let shadow = Axis::new(
+                    line.origin - plane.normal * height,
+                    line.direction - plane.normal * across,
+                )
+                .filter(|_| across.abs() < 1.0 - 1e-9)
+                .ok_or_else(|| {
+                    "the line is normal to the plane: every plane through it is perpendicular to it"
+                        .to_owned()
+                })?;
+                turned_about(&plane, &shadow, std::f64::consts::FRAC_PI_2)
+            } else {
+                if across.abs() > 1e-6 {
+                    return Err("the line is not parallel to the plane".to_owned());
+                }
+                plane.offset((line.origin - plane.origin).dot(plane.normal))
+            };
+            reversed_if(built, *flip)
+        }
+        RefPlane::ThreePoints { points, flip } => {
+            let [a, b, c] = [
+                ctx.point(&points[0], warnings)?,
+                ctx.point(&points[1], warnings)?,
+                ctx.point(&points[2], warnings)?,
+            ];
+            let (ab, ac) = (b - a, c - a);
+            let size = ab.length().max(ac.length()).max(1.0);
+            if [ab, ac, c - b].iter().any(|v| v.length() <= 1e-6 * size) {
+                return Err("two of the points are the same point".to_owned());
+            }
+            let normal = ab.cross(ac);
+            let normal = (normal.length() > 1e-9 * ab.length() * ac.length())
+                .then(|| normal.normalized())
+                .flatten();
+            let (Some(normal), Some(x_dir)) = (normal, ab.normalized()) else {
+                return Err("the three points are in line".to_owned());
+            };
+            reversed_if(
+                Plane {
+                    origin: a,
+                    x_dir,
+                    normal,
+                },
+                *flip,
+            )
+        }
+        RefPlane::NormalToCurve { curve, point, flip } => {
+            let at = ctx.point(point, warnings)?;
+            let (_, tangent) = ctx.curve_tangent(curve, at, kernel, warnings)?;
+            let frame = Plane::from_point_normal(at, tangent)
+                .ok_or_else(|| "the curve has no direction at that point".to_owned())?;
+            reversed_if(
+                Plane {
+                    origin: at,
+                    ..frame
+                },
+                *flip,
+            )
+        }
     };
-    Ok(ReferenceGeometry::Plane(base.offset(offset)))
+    Ok(ReferenceGeometry::Plane(built))
+}
+
+/// `plane` turned by `angle` (radians, right-hand rule) about `line`, its frame with it.
+fn turned_about(plane: &Plane, line: &Axis, angle: f64) -> Plane {
+    plane.transformed(&Transform::rotation(line, angle))
+}
+
+/// The plane with its normal reversed when `flip` is set (its x axis kept, so that its
+/// frame stays right-handed).
+fn reversed_if(plane: Plane, flip: bool) -> Plane {
+    if flip {
+        Plane {
+            normal: -plane.normal,
+            ..plane
+        }
+    } else {
+        plane
+    }
 }
 
 fn build_ref_axis(
