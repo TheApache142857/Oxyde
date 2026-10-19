@@ -15,6 +15,9 @@
 //!   heat flows and fluxes, convection, radiation, heat made inside bodies), on the same
 //!   meshes and contacts, solved with the same multigrid; their temperatures expand the
 //!   model in a thermal stress study ([`solve::ThermalStrain`]).
+//! - [`topology`] optimizes a static study's shape: the stiffest one that keeps a given
+//!   share of the mass (SIMP densities, a density filter, optimality criteria), and cuts
+//!   it out of the mesh as a closed surface.
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
 //! - [`material`] holds the elastic properties, and a guess of them from a material's
@@ -57,6 +60,7 @@ pub mod mesher;
 pub mod plot;
 pub mod solve;
 pub mod thermal;
+pub mod topology;
 
 pub use contact::{
     Contact, ContactCandidate, ContactKind, ContactResult, ContactSolve, detect_contacts,
@@ -73,6 +77,10 @@ pub use solve::{
 pub use thermal::{
     Frame, InternalHeat, KELVIN, ThermalError, ThermalLoad, ThermalLoadKind, ThermalMaterial,
     ThermalResults, ThermalStudy, ThermalSummary, Transient, solve_thermal,
+};
+pub use topology::{
+    Preserve, Pull, Shape, Symmetry, TopologyError, TopologyResults, TopologyStep, TopologyStudy,
+    optimize, shape,
 };
 
 /// A label on no face: a boundary facet the mesher could not tie to a model face.

@@ -1,7 +1,8 @@
 //! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it (forces
 //! and pressures, or heat), how its bodies touch, how it is meshed and which mechanical and
 //! thermal properties the study uses instead of the materials' own. A document holds any
-//! number of studies of four types: static, thermal, transient thermal and thermal stress.
+//! number of studies of five types: static, thermal, transient thermal, thermal stress and
+//! topology (the lightest shape that carries a static study's loads).
 //!
 //! A study document refers to the model it studies (a part or an assembly file, by relative
 //! path and document id) and to its faces by persistent name, never by index, so a study
@@ -113,18 +114,103 @@ pub enum StudyType {
     /// The steady temperatures, then the stresses of the expansion they cause with the
     /// fixtures and loads of a static study ([`Study::reference_temperature`]).
     ThermalStress,
+    /// Topology optimization: the stiffest shape that keeps a share of the model's mass
+    /// under fixtures, forces and pressures ([`Study::topology`]).
+    Topology,
 }
 
 impl StudyType {
-    /// Whether it takes fixtures, forces, pressures and gravity.
+    /// Whether it takes fixtures, forces and pressures.
     pub fn is_structural(self) -> bool {
+        matches!(
+            self,
+            StudyType::Static | StudyType::ThermalStress | StudyType::Topology
+        )
+    }
+
+    /// Whether it takes gravity: a topology study does not, its weight changing with the
+    /// shape.
+    pub fn takes_gravity(self) -> bool {
+        matches!(self, StudyType::Static | StudyType::ThermalStress)
+    }
+
+    /// Whether its results are displacements and stresses (a topology study's are
+    /// densities).
+    pub fn has_stresses(self) -> bool {
         matches!(self, StudyType::Static | StudyType::ThermalStress)
     }
 
     /// Whether it takes thermal loads.
     pub fn is_thermal(self) -> bool {
-        !matches!(self, StudyType::Static)
+        matches!(
+            self,
+            StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress
+        )
     }
+}
+
+/// What a topology study looks for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopologySettings {
+    /// The share of the model's mass to keep, between 0 and 1 (both excluded).
+    pub target_mass: f64,
+    /// mm: the thinnest member wanted; `None` for the finest the mesh allows.
+    pub member_size: Option<f64>,
+    /// Iterations at most, each one static solve.
+    pub iterations: u32,
+    /// Faces whose material stays.
+    pub preserved: Vec<PreservedRegion>,
+    /// Planes the shape is mirrored about; `None` for none.
+    pub symmetry: Option<SymmetryPlanes>,
+    /// The direction a mould is pulled off the shape along; `None` for none.
+    pub pull: Option<PullDirection>,
+}
+
+impl Default for TopologySettings {
+    fn default() -> Self {
+        Self {
+            target_mass: 0.5,
+            member_size: None,
+            iterations: 60,
+            preserved: Vec::new(),
+            symmetry: None,
+            pull: None,
+        }
+    }
+}
+
+/// Planes a topology study's shape is mirrored about: through `point`, parallel to the
+/// standard planes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SymmetryPlanes {
+    /// Parallel to the Right plane (normal to X), the Top plane (Y) and the Front plane
+    /// (Z); at least one.
+    pub planes: [bool; 3],
+    /// mm, in world coordinates; the origin for the standard planes themselves.
+    pub point: [f64; 3],
+}
+
+/// The direction a mould is pulled off a topology study's shape along: going that way the
+/// shape never widens, so it has no undercut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PullDirection {
+    /// In world coordinates (Y up); only its direction counts, not zero.
+    pub direction: [f64; 3],
+    /// mm: a two-part mould, pulled off both ways from the plane through this point across
+    /// the direction; `None` for one way.
+    pub parting: Option<[f64; 3]>,
+}
+
+/// Faces a topology study keeps material under: the elements on them, and those within
+/// `depth` of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreservedRegion {
+    /// `Preserve-1`… unique like a fixture's.
+    pub name: String,
+    pub faces: Vec<StudyFace>,
+    /// mm, 0 for the elements on the faces only.
+    pub depth: f64,
+    pub suppressed: bool,
 }
 
 /// How a transient thermal study marches in time.
@@ -168,6 +254,9 @@ pub struct Study {
     /// The temperature at which a thermal stress study's model is free of stress, °C;
     /// ignored by the other types.
     pub reference_temperature: f64,
+    /// A topology study's target, member size and preserved regions; ignored by the other
+    /// types.
+    pub topology: TopologySettings,
 }
 
 impl Study {
@@ -189,6 +278,7 @@ impl Study {
             thermal_materials: BTreeMap::new(),
             transient: TransientSettings::default(),
             reference_temperature: 20.0,
+            topology: TopologySettings::default(),
         }
     }
 }
@@ -355,17 +445,24 @@ pub enum MeshSize {
     ElementSize(f64),
 }
 
-/// The `format_version` `file` is written with: 2 when a study is not static (version 1
-/// readers would refuse it anyway), else 1, which readers of version 1 still open.
+/// The `format_version` `file` is written with: the oldest that knows every study type in
+/// it (readers of an older version would refuse the newer types anyway), so a document of
+/// static studies still opens in version 1 readers.
 pub fn simulation_version(file: &SimulationFile) -> u32 {
-    if file
-        .studies
+    file.studies
         .iter()
-        .any(|s| s.study_type != StudyType::Static)
-    {
-        SIMULATION_FORMAT_VERSION
-    } else {
-        FORMAT_VERSION
+        .map(|s| type_version(s.study_type))
+        .max()
+        .unwrap_or(FORMAT_VERSION)
+}
+
+/// The first `format_version` that has studies (and results) of type `t`: 1 static, 2 the
+/// thermal ones, 3 topology.
+pub(crate) fn type_version(t: StudyType) -> u32 {
+    match t {
+        StudyType::Static => FORMAT_VERSION,
+        StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress => 2,
+        StudyType::Topology => SIMULATION_FORMAT_VERSION,
     }
 }
 
@@ -481,6 +578,78 @@ struct StudyDto {
     /// °C; only in a thermal stress study.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reference_temperature: Option<f64>,
+    /// Only in a topology study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology: Option<TopologyDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TopologyDto {
+    /// 0 to 1.
+    #[serde(default = "default_target_mass")]
+    target_mass: f64,
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    member_size: Option<f64>,
+    #[serde(default = "default_iterations")]
+    iterations: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preserved: Vec<PreservedDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symmetry: Option<SymmetryDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pull: Option<PullDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SymmetryDto {
+    planes: Vec<StandardPlaneDto>,
+    /// mm.
+    #[serde(default)]
+    point: [f64; 3],
+}
+
+/// A standard plane, by its SolidWorks name.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StandardPlaneDto {
+    Right,
+    Top,
+    Front,
+}
+
+const STANDARD_PLANES: [StandardPlaneDto; 3] = [
+    StandardPlaneDto::Right,
+    StandardPlaneDto::Top,
+    StandardPlaneDto::Front,
+];
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PullDto {
+    direction: [f64; 3],
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parting: Option<[f64; 3]>,
+}
+
+fn default_target_mass() -> f64 {
+    TopologySettings::default().target_mass
+}
+
+fn default_iterations() -> u32 {
+    TopologySettings::default().iterations
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PreservedDto {
+    name: String,
+    #[serde(default)]
+    faces: Vec<StudyFaceDto>,
+    /// mm.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    depth: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    suppressed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -491,6 +660,7 @@ pub(crate) enum StudyTypeDto {
     Thermal,
     TransientThermal,
     ThermalStress,
+    Topology,
 }
 
 impl StudyTypeDto {
@@ -500,6 +670,7 @@ impl StudyTypeDto {
             StudyType::Thermal => StudyTypeDto::Thermal,
             StudyType::TransientThermal => StudyTypeDto::TransientThermal,
             StudyType::ThermalStress => StudyTypeDto::ThermalStress,
+            StudyType::Topology => StudyTypeDto::Topology,
         }
     }
 
@@ -509,6 +680,7 @@ impl StudyTypeDto {
             StudyTypeDto::Thermal => StudyType::Thermal,
             StudyTypeDto::TransientThermal => StudyType::TransientThermal,
             StudyTypeDto::ThermalStress => StudyType::ThermalStress,
+            StudyTypeDto::Topology => StudyType::Topology,
         }
     }
 
@@ -884,6 +1056,40 @@ fn study_dto(study: &Study) -> StudyDto {
         }),
         reference_temperature: (study.study_type == StudyType::ThermalStress)
             .then_some(study.reference_temperature),
+        topology: (study.study_type == StudyType::Topology).then(|| {
+            let t = &study.topology;
+            TopologyDto {
+                target_mass: t.target_mass,
+                member_size: t.member_size,
+                iterations: t.iterations,
+                preserved: t
+                    .preserved
+                    .iter()
+                    .map(|p| PreservedDto {
+                        name: p.name.clone(),
+                        faces: faces_dto(&p.faces),
+                        depth: p.depth,
+                        suppressed: p.suppressed,
+                    })
+                    .collect(),
+                symmetry: t
+                    .symmetry
+                    .filter(|s| s.planes.contains(&true))
+                    .map(|s| SymmetryDto {
+                        planes: STANDARD_PLANES
+                            .iter()
+                            .zip(s.planes)
+                            .filter(|(_, on)| *on)
+                            .map(|(p, _)| *p)
+                            .collect(),
+                        point: s.point,
+                    }),
+                pull: t.pull.map(|p| PullDto {
+                    direction: p.direction,
+                    parting: p.parting,
+                }),
+            }
+        }),
     }
 }
 
@@ -1094,6 +1300,9 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
                 "a thermal study has a force, a pressure or gravity".to_owned(),
             ));
         }
+        if matches!(load_kind, LoadKind::Gravity { .. }) && !study_type.takes_gravity() {
+            return Err(item("a topology study has gravity".to_owned()));
+        }
         loads.push(Load {
             name: l.name,
             kind: load_kind,
@@ -1215,6 +1424,81 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         }
         (_, None) => 20.0,
     };
+    let topology = match (study_type, dto.topology) {
+        (StudyType::Topology, Some(t)) => {
+            let target_mass = finite(t.target_mass, "the target mass")?;
+            if !(target_mass > 0.0 && target_mass < 1.0) {
+                return Err("the target mass is not between 0 and 1".to_owned());
+            }
+            let member_size = match t.member_size {
+                Some(size) => {
+                    let size = finite(size, "the member size")?;
+                    if size <= 0.0 {
+                        return Err("the member size is not positive".to_owned());
+                    }
+                    Some(size)
+                }
+                None => None,
+            };
+            if !(1..=10_000).contains(&t.iterations) {
+                return Err("the iterations are not from 1 to 10 000".to_owned());
+            }
+            let mut preserved = Vec::with_capacity(t.preserved.len());
+            for p in t.preserved {
+                named(&p.name)?;
+                let item = |e: String| format!("{}: {e}", p.name);
+                let depth = finite(p.depth, "the depth").map_err(item)?;
+                if depth < 0.0 {
+                    return Err(item("the depth is negative".to_owned()));
+                }
+                preserved.push(PreservedRegion {
+                    faces: faces_from(p.faces, kind).map_err(item)?,
+                    depth,
+                    suppressed: p.suppressed,
+                    name: p.name,
+                });
+            }
+            let symmetry = match t.symmetry {
+                Some(s) => {
+                    if s.planes.is_empty() {
+                        return Err("the symmetry has no plane".to_owned());
+                    }
+                    Some(SymmetryPlanes {
+                        planes: STANDARD_PLANES.map(|p| s.planes.contains(&p)),
+                        point: finite_vector(s.point, "the symmetry point")?,
+                    })
+                }
+                None => None,
+            };
+            let pull = match t.pull {
+                Some(p) => {
+                    let direction = finite_vector(p.direction, "the pull direction")?;
+                    if direction.iter().all(|x| *x == 0.0) {
+                        return Err("the pull direction is a zero vector".to_owned());
+                    }
+                    Some(PullDirection {
+                        direction,
+                        parting: match p.parting {
+                            Some(q) => Some(finite_vector(q, "the parting point")?),
+                            None => None,
+                        },
+                    })
+                }
+                None => None,
+            };
+            TopologySettings {
+                target_mass,
+                member_size,
+                iterations: t.iterations,
+                preserved,
+                symmetry,
+                pull,
+            }
+        }
+        (StudyType::Topology, None) => TopologySettings::default(),
+        (_, Some(_)) => return Err("only a topology study has a target mass".to_owned()),
+        (_, None) => TopologySettings::default(),
+    };
 
     Ok(Study {
         name: dto.name,
@@ -1237,6 +1521,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         thermal_materials,
         transient,
         reference_temperature,
+        topology,
     })
 }
 
@@ -1433,7 +1718,50 @@ mod tests {
             detection: ContactDetection::Manual,
             suppressed: false,
         });
-        file.studies = vec![study, second, thermal, stress];
+        let mut topology = Study::of_type("Topology 1", StudyType::Topology);
+        topology.fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: vec![base(2)],
+            suppressed: false,
+        });
+        topology.loads.push(Load {
+            name: "Force-1".to_owned(),
+            kind: LoadKind::Force {
+                faces: vec![base(5)],
+                newtons: 500.0,
+                direction: ForceDirection::Vector([0.0, -1.0, 0.0]),
+            },
+            suppressed: false,
+        });
+        topology.topology = TopologySettings {
+            target_mass: 0.3,
+            member_size: Some(4.0),
+            iterations: 80,
+            preserved: vec![
+                PreservedRegion {
+                    name: "Preserve-1".to_owned(),
+                    faces: vec![base(6)],
+                    depth: 2.0,
+                    suppressed: false,
+                },
+                PreservedRegion {
+                    name: "Preserve-2".to_owned(),
+                    faces: vec![base(7)],
+                    depth: 0.0,
+                    suppressed: true,
+                },
+            ],
+            symmetry: Some(SymmetryPlanes {
+                planes: [true, false, true],
+                point: [30.0, 0.0, 5.0],
+            }),
+            pull: Some(PullDirection {
+                direction: [0.0, 1.0, 0.0],
+                parting: Some([0.0, 12.5, 0.0]),
+            }),
+        };
+        file.studies = vec![study, second, thermal, stress, topology];
         file
     }
 
@@ -1558,11 +1886,36 @@ mod tests {
         let stress = &v["studies"][3];
         assert_eq!(stress["type"], "thermal_stress");
         assert_eq!(stress["reference_temperature"], 22.0);
+        assert!((0..4).all(|i| v["studies"][i].get("topology").is_none()));
+        let topology = &v["studies"][4];
+        assert_eq!(topology["type"], "topology");
+        let t = &topology["topology"];
+        assert_eq!(t["target_mass"], 0.3);
+        assert_eq!(t["member_size"], 4.0);
+        assert_eq!(t["iterations"], 80);
+        assert_eq!(t["preserved"][0]["name"], "Preserve-1");
+        assert_eq!(t["preserved"][0]["depth"], 2.0);
+        assert_eq!(
+            t["preserved"][0]["faces"][0]["face"]["key"]["type"],
+            "end_cap"
+        );
+        assert!(t["preserved"][1].get("depth").is_none());
+        assert_eq!(t["preserved"][1]["suppressed"], true);
+        assert_eq!(
+            t["symmetry"],
+            serde_json::json!({ "planes": ["right", "front"], "point": [30.0, 0.0, 5.0] })
+        );
+        assert_eq!(
+            t["pull"],
+            serde_json::json!({ "direction": [0.0, 1.0, 0.0], "parting": [0.0, 12.5, 0.0] })
+        );
     }
 
     #[test]
-    fn static_studies_are_written_as_version_1() {
+    fn documents_are_written_with_the_oldest_version_that_holds_them() {
         let mut file = sample();
+        assert_eq!(simulation_version(&file), 3);
+        file.studies.truncate(4);
         assert_eq!(simulation_version(&file), 2);
         file.studies.truncate(2);
         assert_eq!(simulation_version(&file), 1);
@@ -1675,6 +2028,65 @@ mod tests {
             &|s| s.replace("\"type\": \"thermal_stress\"", "\"type\": \"thermal\""),
             "fixtures",
         );
+        // The first study has gravity.
+        refused(
+            &|s| s.replacen("\"type\": \"static\"", "\"type\": \"topology\"", 1),
+            "a topology study has gravity",
+        );
+        refused(
+            &|s| s.replace("\"type\": \"topology\"", "\"type\": \"static\""),
+            "only a topology study",
+        );
+        refused(
+            &|s| s.replace("\"target_mass\": 0.3", "\"target_mass\": 1.0"),
+            "target mass",
+        );
+        refused(
+            &|s| s.replace("\"member_size\": 4.0", "\"member_size\": 0.0"),
+            "member size",
+        );
+        refused(
+            &|s| s.replace("\"depth\": 2.0", "\"depth\": -2.0"),
+            "depth is negative",
+        );
+        refused(&|s| s.replace("Preserve-1", "Force-1"), "two items");
+        // The topology study's controls, edited in the JSON.
+        let control = |edit: fn(&mut serde_json::Value)| {
+            move |s: &str| {
+                let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+                edit(&mut v["studies"][4]["topology"]);
+                serde_json::to_string(&v).unwrap()
+            }
+        };
+        refused(
+            &control(|t| t["symmetry"]["planes"] = serde_json::json!([])),
+            "no plane",
+        );
+        refused(
+            &control(|t| t["pull"]["direction"] = serde_json::json!([0, 0, 0])),
+            "pull direction is a zero vector",
+        );
+        assert!(matches!(
+            read_simulation(Cursor::new(edited(
+                &good,
+                SIMULATION,
+                control(|t| t["symmetry"]["planes"] = serde_json::json!(["left"]))
+            ))),
+            Err(FormatError::Json { .. })
+        ));
+        // Without them, a study has neither.
+        let plain = read_simulation(Cursor::new(edited(
+            &good,
+            SIMULATION,
+            control(|t| {
+                let t = t.as_object_mut().unwrap();
+                t.remove("symmetry");
+                t.remove("pull");
+            }),
+        )))
+        .unwrap();
+        let t = &plain.studies[4].topology;
+        assert_eq!((t.symmetry, t.pull), (None, None));
         // An unknown study or contact type is an error, as unknown features are.
         assert!(matches!(
             read_simulation(Cursor::new(

@@ -1,8 +1,9 @@
 //! The Simulation tab's studies, as Fusion 360 keeps them: the tab opens on *New Study*,
-//! which makes a static stress, thermal, transient thermal or thermal stress study, and a
-//! model has as many as wanted, each with its own fixtures, loads, contacts, mesh settings,
-//! material overrides and results. One is open at a time; the panel's list switches
-//! between them, and *Save* writes them all to the model's `.oxysim`.
+//! which makes a static stress, thermal, transient thermal, thermal stress or topology
+//! study, and a model has as many as wanted, each with its own fixtures, loads, contacts,
+//! mesh settings, material overrides and results. One is open at a time; the panel's list
+//! switches between them, and *Save* writes them all to the model's `.oxysim`. The Topology
+//! tab lists the topology studies only, and opens one when it is chosen.
 //!
 //! The open study lives where the rest of the tab expects it (`SimulationView::study`,
 //! `done`); the others wait in `SimulationView::others`, in order, with their results.
@@ -22,7 +23,7 @@ pub(crate) struct Parked {
 }
 
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 5] = [
     (
         StudyType::Static,
         "Static Stress",
@@ -43,6 +44,11 @@ pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
         "Thermal Stress",
         "The steady temperatures, then the stresses of the expansion they cause, with fixtures and loads",
     ),
+    (
+        StudyType::Topology,
+        "Topology",
+        "The stiffest shape that keeps a share of the mass under fixtures and loads: material kept where the loads need it, taken away elsewhere",
+    ),
 ];
 
 /// What the panel and the menus call a study type.
@@ -60,6 +66,7 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::Thermal => "Thermal",
         StudyType::TransientThermal => "Transient",
         StudyType::ThermalStress => "Thermal Stress",
+        StudyType::Topology => "Topology",
     }
 }
 
@@ -191,6 +198,8 @@ impl OxydeApp {
                     "select faces, add temperatures, heat and cooling, then Run".to_owned(),
                 StudyType::ThermalStress =>
                     "select faces, add fixtures and temperatures or heat, then Run".to_owned(),
+                StudyType::Topology =>
+                    "select faces, add fixtures, loads and regions to keep, then Run".to_owned(),
             }
         );
     }
@@ -319,6 +328,7 @@ impl OxydeApp {
                             StudyType::Thermal => crate::icons::Icon::TemperaturePlot,
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
+                            StudyType::Topology => crate::icons::Icon::Topology,
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {
@@ -352,10 +362,74 @@ impl OxydeApp {
         }
     }
 
+    /// The Topology tab's panel while no topology study is open: what topology
+    /// optimization does, New Topology Study, and the model's topology studies if another
+    /// study is open.
+    pub(crate) fn topology_chooser(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            crate::icons::small(ui, crate::icons::Icon::Topology, 26.0);
+            ui.strong("Topology optimization");
+        });
+        ui.label(
+            egui::RichText::new(
+                "Fix the part and load it as in a static study, say how much of its mass to \
+                 keep, and Oxyde finds the stiffest shape: material stays where the loads need \
+                 it and goes elsewhere. Faces with fixtures and loads keep their material; \
+                 Preserve Region keeps more.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+        let running = self.simulation.job.is_some();
+        if ui
+            .add_enabled(!running, egui::Button::new("New Topology Study"))
+            .clicked()
+        {
+            self.new_study(StudyType::Topology);
+        }
+        let list = self.simulation.study_list();
+        let mut open = None;
+        for (i, (name, t)) in list.iter().enumerate() {
+            if *t == StudyType::Topology && ui.link(name).clicked() {
+                open = Some(i);
+            }
+        }
+        ui.add_space(4.0);
+        if ui
+            .small_button("Open…")
+            .on_hover_text("Open the studies saved for this model (.oxysim)")
+            .clicked()
+        {
+            self.open_study();
+        }
+        if let Some(i) = open {
+            self.switch_study(i);
+        }
+    }
+
+    /// The Topology tab was chosen: when the open study is not a topology study, the
+    /// model's first one opens, if it has one.
+    pub(crate) fn enter_topology(&mut self) {
+        if self.topology_study_open() || self.simulation.job.is_some() {
+            return;
+        }
+        let first = self
+            .simulation
+            .study_list()
+            .iter()
+            .position(|(_, t)| *t == StudyType::Topology);
+        if let Some(i) = first {
+            self.switch_study(i);
+        }
+    }
+
     /// The open study's line at the top of the panel: its name and type, the list of the
-    /// model's studies, New Study, Rename and Delete.
+    /// model's studies (the topology ones in the Topology tab), New Study, Rename and
+    /// Delete.
     pub(crate) fn study_bar(&mut self, ui: &mut egui::Ui) {
         let list = self.simulation.study_list();
+        let topology_only = self.topology_tab_open();
         let running = self.simulation.job.is_some();
         let mut switch_to = None;
         let mut new_type = None;
@@ -372,6 +446,9 @@ impl OxydeApp {
                     .width((ui.available_width() - 80.0).max(120.0))
                     .show_ui(ui, |ui| {
                         for (i, (name, t)) in list.iter().enumerate() {
+                            if topology_only && *t != StudyType::Topology {
+                                continue;
+                            }
                             let text = format!("{name} — {}", type_label(*t));
                             if ui
                                 .selectable_label(i == self.simulation.active, text)
@@ -383,11 +460,21 @@ impl OxydeApp {
                     })
                     .response
                     .on_hover_text("The model's studies: pick one to open it");
-                ui.menu_button("New", |ui| {
-                    new_type = new_study_menu(ui);
-                })
-                .response
-                .on_hover_text("A new study of this model");
+                if topology_only {
+                    if ui
+                        .button("New")
+                        .on_hover_text("A new topology study of this model")
+                        .clicked()
+                    {
+                        new_type = Some(StudyType::Topology);
+                    }
+                } else {
+                    ui.menu_button("New", |ui| {
+                        new_type = new_study_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("A new study of this model");
+                }
             });
         });
         ui.horizontal(|ui| match self.simulation.renaming.as_mut() {

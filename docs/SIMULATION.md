@@ -406,3 +406,116 @@ results files with a thermal study are `format_version` 2.
   (`−E α ΔT`). Through OpenCASCADE: a bar part held at one end and convected at the other,
   in one body and in two bodies tied by a detected contact, against the series
   resistances.
+
+## 8. Topology studies
+
+**Decided (October 2026):** topology optimization is a study type, `topology`, as
+SolidWorks has its topology study and Fusion 360 its shape optimization, saved in the
+`.oxysim` with its target and preserved regions and its densities in the `.oxyres`
+(`format_version` 3, FORMAT.md §8–§9). It has a tab of its own, *Topology*, next to
+Simulation, which is the same set of studies showing the topology ones.
+
+- **The problem:** least compliance (`Fᵀu`, the work of the loads) for a share of the
+  model's mass, under a static study's fixtures, forces, pressures and contacts. Gravity is
+  refused: the weight would change with the shape, and the usual scheme handles that badly.
+- **SIMP** (`oxyde_sim::topology`): a design density per element, the stiffness the
+  material's times `ε + ρ̃³ (1 − ε)`, `ε = 10⁻⁶`. Multigrid copes with that contrast: the
+  cantilever of the tests takes about 15 conjugate gradient iterations per solve.
+- **The density filter:** `ρ̃` is the design averaged over a sphere of radius `r`, weights
+  `max(0, r − d) V`, so members are about `2r` thick at least. `r` is half the *thinnest
+  member* typed, and 1.5 element sizes at least (the size from each element's volume, as a
+  regular tetrahedron's edge), which is also the automatic radius. Neighbours are found in a
+  grid of cells `r` wide, sorted by cell, so sums go in the same order on any number of
+  threads; the filter is applied on the fly rather than stored, since a radius of two
+  elements reaches some 300 neighbours.
+- **The update:** optimality criteria, densities times `√(−∂c/∂ρ / λ ∂m/∂ρ)`, moving 0.2 at
+  most, `λ` by bisection on its logarithm. The filtered mass is linear in the design, so its
+  slopes are worked out once, and every update meets the target exactly. It stops when no
+  density moves by 0.01, or after 15 iterations when the compliance has changed by less
+  than 0.05 % over five with the mass on target, or at the iteration limit.
+- **Kept elements:** those with a face on a fixture's, a load's or a preserved region's
+  faces, and those whose centre is within a region's depth of its faces (exact distance to
+  the faces' triangles, in a grid).
+- **Manufacturing controls** (October 2026), as SolidWorks' topology study and Fusion
+  360's shape optimization have them, set in the Target section and saved in the study
+  (`symmetry`, `pull`, FORMAT.md §8):
+  - *Symmetry*: up to three planes parallel to the standard planes through a point (the
+    origin by default: the standard planes themselves). The density filter averages around
+    each element's mirror images (every combination of the planes) as well as around its
+    centre: `wᵢⱼ = Σ_g max(0, r − |g cᵢ − cⱼ|)`. A reflection moves both centres alike and
+    undoes itself, so the weights stay symmetric and the same sum still carries the slopes
+    back; and the filtered density is a function of position that is the same at mirror
+    images, so the shape is mirrored on any mesh, the design densities left free. Tying
+    each element's design density to the nearest element to its mirror image (groups
+    followed through by union–find) was tried first: exact on a symmetric mesh, but on one
+    that is not, nearest is not one-to-one, a group can hold two elements on one side and
+    one on the other, and a beam whose stiffness does not care which side its material is
+    on came out as lopsided as without symmetry. The nearest mirror image still mirrors the
+    kept elements, and a plane across which less than half of the model (by volume) has
+    one is refused, which catches a part not modelled about the origin. The filter costs
+    as many neighbour sums as there are images (two to eight), small beside the solve.
+  - *Pull direction*: a mould pulled off along a direction, one way (the shape standing on
+    its far side) or both ways from a parting plane through a point. Each element's
+    neighbour behind it is, among the elements about one element behind (and on the same
+    side of the parting plane), the one closest to the line through its centre along the
+    direction; after the filter each density is capped at its neighbour's, from the back
+    to the front, so densities never grow going along the direction and nothing hangs over
+    void. Each element's compliance slope goes to the element whose density it took. The
+    mass is then linear in the design only while those stay the same, so its slopes and
+    the design's budget are worked out again each iteration, and the mass comes to the
+    target as the design settles. The elements behind kept ones are kept, so a kept element
+    is never capped. Capping after the filter keeps the densities exactly monotone (capped
+    before it and then filtered they would be only nearly so, the filter's normalisation
+    at the model's faces breaking it); filling material in behind instead (a maximum from
+    the front) was tried and shaped no better.
+  - A pull across a symmetry plane is refused unless it goes both ways from that plane: a
+    mould pulled one way cannot give a mirrored shape.
+  - **Grey when pulled in the plane of bending.** Pulled along the direction the part bends
+    in (a cantilever loaded down and pulled up), the densities stay grey: a grey column of
+    density ρ is as stiff in bending as a solid block ρ of its height (both go as the cube),
+    so SIMP has nothing to push them to solid or void, and a higher penalty (4, 5) did not
+    get them out either. Pulled across the bending (through a plate's thickness, the usual
+    casting), the shapes come out as crisp as without a pull. The density projection still
+    to do should cure it.
+- **Solves:** the static solver was split so that what does not change between iterations
+  (fixtures' frames, contact pairs, loads, the matrix's pattern, element geometry) is
+  prepared once (`solve::Prepared`), each iteration assembling the matrix with the elements
+  scaled and starting from the last displacements. The element energies `uₑᵀKₑuₑ` are
+  integrated as the stiffness is. A full solve first gives the whole part's compliance, to
+  say what the material taken away costs.
+- **The shape** (`oxyde_sim::shape`): the densities averaged at the corners by volume, cut
+  at the threshold by marching tetrahedra (the triangles' way round taken from the edges'
+  middles, which never fall together, so a node exactly on the threshold does not flip
+  one), and the mesh's boundary facets clipped to the side above it, sharing the cut's
+  points: a closed surface. Taubin smoothing (λ 0.5, μ −0.53, eight rounds in the
+  application) moves the cut's points only, so the faces the shape keeps stay where the
+  model's are. The application draws it with the boundary of the mesh at 12 % opacity
+  around it, and writes it as binary STL.
+- **Tests:** a 60 × 20 × 10 mm cantilever held at one end and loaded on a strip of the
+  other keeps 40 % of its mass to 1 %, comes out about 3.4 times as flexible as the whole
+  bar (the same mass spread evenly would be 15.6 times), its shape cut at half density
+  holds 40 % of the volume to 6 %, and held and loaded elements stay solid; the same
+  densities on one thread and on every core; preserved regions stay solid, and too much
+  kept or a target out of range is refused; shapes are closed (every edge used once each
+  way), full densities give the whole boundary and its volume exactly, and a cut through
+  elements holds the solid's volume. With the controls: on a beam meshed symmetrically
+  about its middle planes, held at both ends and loaded near one, symmetry about two planes
+  gives densities equal to 10⁻⁹ where without it they differ by more than 0.1, and the
+  loaded faces' mirror images stay solid; a plane the model is not symmetric about is
+  refused; the cantilever pulled up, or both ways from its middle, has no element denser
+  than the one behind it (without the pull some are by more than 0.2) and its mass on
+  target to 2 %; a one-way pull across a symmetry plane and a zero direction are refused;
+  the controls give the same densities on one thread and on every core; and on a real
+  part, the beam meshed by the lattice mesher (not symmetric: its own centroid is 0.06 mm
+  off the middle plane), symmetry and a two-way pull through its thickness put the shape's
+  centre of mass within 0.1 mm of that plane (0.03 mm; 0.23 mm without symmetry, the
+  beam's bending stiffness not caring which side its material is on) and no more mass in
+  the outer half of the thickness than in the middle. An ignored test writes a finer cantilever's shape to
+  an OBJ file (`OXYDE_TOPOLOGY_OBJ`): 36 864 four-node elements, 60 iterations in 30 s in a
+  debug build (`oxyde-sim` optimised), the shape a hollow box section with openings near
+  the root, as bending wants.
+
+Still to do: a stress limit as well as a mass target, a projection of the densities for
+crisper shapes (which should also make shapes pulled in the plane of bending solid or void),
+a pull direction picked from a face or an edge (the file takes any vector, the panel offers
+the axes), and promoting the shape into a part rather than exporting it.

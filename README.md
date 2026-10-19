@@ -105,6 +105,10 @@ what changed in each version is in the [changelog](CHANGELOG.md).
 - **Simulation tab:** static stress, thermal, transient thermal and thermal stress studies, with
   fixtures, loads and contacts between bodies, meshed into tetrahedra by Netgen; stress,
   displacement, factor of safety and temperature drawn on the model.
+- **Topology tab:** topology optimization, the stiffest shape that keeps a share of the
+  part's mass under its fixtures and loads, with regions to keep, a thinnest member,
+  symmetry planes and a mould's pull direction; the shape is shown as a smooth surface and
+  exported as STL.
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,
@@ -163,7 +167,7 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-assembly` | Assemblies: components, mates and the 3D mate solver, bill of materials |
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking; the Render tab's path tracer |
-| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, result plots; depends on no other crate |
+| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, topology optimization, result plots; depends on no other crate |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |

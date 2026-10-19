@@ -4,8 +4,9 @@
 //! saved next to a model as `<model>.oxysim` open with it.
 //!
 //! A study document names its part or assembly by relative path and document id, and holds
-//! the fixtures, loads, contacts, mesh settings and material overrides by persistent face
-//! name. A results document holds the mesh and the nodal fields, tied to the study by its
+//! the fixtures, loads, contacts, mesh settings and material overrides (and a topology
+//! study's target and preserved regions) by persistent face name. A results document holds
+//! the mesh and the nodal fields (a topology study's element densities), tied to the study by its
 //! document id and to the model by a fingerprint (a hash of every part and assembly file's
 //! definition and of the study itself), so results of an earlier model are told apart when
 //! they are opened. After *Run*, the results of a saved study are written next to it.
@@ -15,22 +16,24 @@ use std::path::{Path, PathBuf};
 
 use oxyde_format::results::{
     DocumentHash, Elements, Extreme, Fingerprint, NodalFields, ResultBody, ResultFacet, ResultMesh,
-    ResultsFile, SolverInfo, TemperatureFrame, ThermalFields,
+    ResultsFile, SolverInfo, TemperatureFrame, ThermalFields, TopologyFields, TopologyIteration,
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
     FixtureKind as FileFixtureKind, ForceDirection, Load, LoadKind as FileLoadKind, MeshQuality,
-    MeshSettings, MeshSize, Mesher, ModelKind, SimulationFile, StudiedModel, Study as FileStudy,
-    StudyFace,
+    MeshSettings, MeshSize, Mesher, ModelKind, PreservedRegion, PullDirection, SimulationFile,
+    StudiedModel, Study as FileStudy, StudyFace, SymmetryPlanes,
 };
 use oxyde_format::{AssemblyFile, PartFile};
-use oxyde_sim::{ContactKind, Facet, Frame, Results, TetMesh, ThermalResults};
+use oxyde_sim::{
+    ContactKind, Facet, Frame, Results, TetMesh, ThermalResults, TopologyResults, TopologyStep,
+};
 
 use crate::app::OxydeApp;
 use crate::assembly::{Loaded, Occurrence};
 use crate::simulation_ui::{
     Done, ElementQuality, ItemKind, LoadDirection, MesherChoice, SimFace, Study, StudyContact,
-    StudyItem, StudyMesh,
+    StudyItem, StudyMesh, TopologyGoal,
 };
 
 /// Where the open study is saved, and its document id.
@@ -171,9 +174,27 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
                     watts: *watts,
                 },
             )),
+            ItemKind::Preserve { depth } => out.topology.preserved.push(PreservedRegion {
+                name: item.name.clone(),
+                faces: on,
+                depth: *depth,
+                suppressed: false,
+            }),
         }
     }
-    if study.gravity && study.study_type.is_structural() {
+    out.topology.target_mass = study.topology.target_mass;
+    out.topology.member_size = study.topology.member_size;
+    out.topology.iterations = study.topology.iterations;
+    let goal = &study.topology;
+    out.topology.symmetry = goal.symmetry.contains(&true).then_some(SymmetryPlanes {
+        planes: goal.symmetry,
+        point: goal.symmetry_point,
+    });
+    out.topology.pull = goal.pull.map(|direction| PullDirection {
+        direction,
+        parting: goal.parting,
+    });
+    if study.gravity && study.study_type.takes_gravity() {
         out.loads.push(Load {
             name: "Gravity-1".to_owned(),
             kind: FileLoadKind::Gravity {
@@ -307,6 +328,22 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
             }),
         }
     }
+    for p in file.topology.preserved.iter().filter(|p| !p.suppressed) {
+        study.items.push(StudyItem {
+            name: p.name.clone(),
+            kind: ItemKind::Preserve { depth: p.depth },
+            faces: faces(&p.faces),
+        });
+    }
+    study.topology = TopologyGoal {
+        target_mass: file.topology.target_mass,
+        member_size: file.topology.member_size,
+        iterations: file.topology.iterations,
+        symmetry: file.topology.symmetry.map_or([false; 3], |s| s.planes),
+        symmetry_point: file.topology.symmetry.map_or([0.0; 3], |s| s.point),
+        pull: file.topology.pull.map(|p| p.direction),
+        parting: file.topology.pull.and_then(|p| p.parting),
+    };
     for c in file.contacts.iter().filter(|c| !c.suppressed) {
         if let ContactDetection::Automatic { tolerance } = c.detection {
             study.contact_tolerance = tolerance;
@@ -398,7 +435,8 @@ pub(crate) fn results_file(
     let thermal_summary = done.thermal.as_ref().map(ThermalResults::summary);
     let extreme = |(value, node): (f64, u32)| Extreme { value, node };
     let iterations = done.results.as_ref().map_or(0, |r| r.iterations)
-        + done.thermal.as_ref().map_or(0, |t| t.iterations);
+        + done.thermal.as_ref().map_or(0, |t| t.iterations)
+        + done.topology.as_ref().map_or(0, |t| t.solver_iterations);
     let residual = done
         .results
         .as_ref()
@@ -422,7 +460,12 @@ pub(crate) fn results_file(
         solver: SolverInfo {
             program: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
             mesher: done.mesher.to_owned(),
-            method: "pcg+amg".to_owned(),
+            method: if done.topology.is_some() {
+                "simp+oc, pcg+amg"
+            } else {
+                "pcg+amg"
+            }
+            .to_owned(),
             iterations: iterations as u64,
             residual,
             seconds: done.mesh_seconds + done.solve_seconds,
@@ -477,6 +520,21 @@ pub(crate) fn results_file(
                 })
                 .collect(),
         }),
+        topology: done.topology.as_ref().map(|t| TopologyFields {
+            density: t.density.clone(),
+            initial_compliance: t.initial_compliance,
+            converged: t.converged,
+            filter_radius: t.filter_radius,
+            history: t
+                .history
+                .iter()
+                .map(|s| TopologyIteration {
+                    compliance: s.compliance,
+                    mass_fraction: s.mass_fraction,
+                    change: s.change,
+                })
+                .collect(),
+        }),
     }
 }
 
@@ -485,6 +543,7 @@ pub(crate) struct LoadedResults {
     pub mesh: TetMesh,
     pub results: Option<Results>,
     pub thermal: Option<ThermalResults>,
+    pub topology: Option<TopologyResults>,
 }
 
 /// The mesh and results a `.oxyres` holds, or why they cannot be used.
@@ -519,7 +578,7 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
     mesh.validate()?;
     let f = &file.fields;
     let n = mesh.nodes.len();
-    let results = if file.study_type.is_structural() {
+    let results = if file.study_type.has_stresses() {
         if [
             f.displacement.len(),
             f.stress.len(),
@@ -566,10 +625,33 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
         }),
         None => None,
     };
+    let topology = match &file.topology {
+        Some(t) if t.density.len() != mesh.tets.len() => {
+            return Err("its densities do not match its mesh".to_owned());
+        }
+        Some(t) => Some(TopologyResults {
+            density: t.density.clone(),
+            initial_compliance: t.initial_compliance,
+            history: t
+                .history
+                .iter()
+                .map(|s| TopologyStep {
+                    compliance: s.compliance,
+                    mass_fraction: s.mass_fraction,
+                    change: s.change,
+                })
+                .collect(),
+            converged: t.converged,
+            solver_iterations: file.solver.iterations as usize,
+            filter_radius: t.filter_radius,
+        }),
+        None => None,
+    };
     Ok(LoadedResults {
         mesh,
         results,
         thermal,
+        topology,
     })
 }
 
@@ -918,6 +1000,7 @@ impl OxydeApp {
             file.study_type,
             loaded.results,
             loaded.thermal,
+            loaded.topology,
             faces,
             bodies,
             file.fingerprint,
@@ -1011,6 +1094,70 @@ mod tests {
         study.study_type = StudyType::ThermalStress;
         let file = file_study(&study);
         assert_eq!((file.fixtures.len(), file.loads.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_topology_study_and_its_results_survive_their_files() {
+        let mut study = Study::of_type(StudyType::Topology, "Topology 1");
+        study.add(ItemKind::Fixed, vec![face(2)]);
+        study.add(
+            ItemKind::Force {
+                newtons: -500.0,
+                direction: LoadDirection::Y,
+            },
+            vec![face(3)],
+        );
+        study.add(ItemKind::Preserve { depth: 2.5 }, vec![face(4), face(5)]);
+        study.topology = TopologyGoal {
+            target_mass: 0.35,
+            member_size: Some(6.0),
+            iterations: 90,
+            symmetry: [false, true, false],
+            symmetry_point: [0.0, 12.5, 0.0],
+            pull: Some([0.0, -1.0, 0.0]),
+            parting: Some([0.0, 12.5, 0.0]),
+        };
+        // Gravity is not written for a topology study: readers would refuse it.
+        study.gravity = true;
+        let file = file_study(&study);
+        assert!(file.loads.iter().all(|l| l.name != "Gravity-1"));
+        assert_eq!(file.topology.preserved.len(), 1);
+        assert_eq!(file.topology.target_mass, 0.35);
+        let mut back = study_of(&file);
+        back.made.clear();
+        study.made.clear();
+        study.gravity = false;
+        assert_eq!(back, study);
+
+        // The densities and the iterations, through a results file and back.
+        let mut mesh = TetMesh::structured_box([0.0; 3], [2.0, 1.0, 1.0], [2, 1, 1]);
+        mesh.make_quadratic();
+        // Its facets on no face of a model: the results have no label table.
+        for f in &mut mesh.facets {
+            f.label = oxyde_sim::NO_LABEL;
+        }
+        let elements = mesh.tets.len();
+        let topology = TopologyResults {
+            density: (0..elements).map(|e| e as f64 / elements as f64).collect(),
+            initial_compliance: 3.0,
+            history: vec![TopologyStep {
+                compliance: 7.5,
+                mass_fraction: 0.35,
+                change: 0.004,
+            }],
+            converged: true,
+            solver_iterations: 120,
+            filter_radius: 0.75,
+        };
+        let done = Done::for_test(mesh, StudyType::Topology, Some(topology.clone()));
+        let file = results_file(&done, "sim", "Topology 1", Fingerprint::default());
+        let bytes = oxyde_format::results::write_results(std::io::Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let read = oxyde_format::results::read_results(std::io::Cursor::new(bytes)).unwrap();
+        let loaded = mesh_and_results(&read).unwrap();
+        assert!(loaded.results.is_none() && loaded.thermal.is_none());
+        assert_eq!(loaded.topology, Some(topology));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Simulation results (`.oxyres`): the mesh a study was solved on and the fields computed
-//! at its nodes (displacements and stresses, temperatures and heat flux), kept apart from
+//! at its nodes (displacements and stresses, temperatures and heat flux) or, for a topology
+//! study, its elements' densities, kept apart from
 //! the study (`.oxysim`) so studies stay small and diff cleanly while results can be
 //! thrown away and computed again.
 //!
@@ -20,11 +21,11 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::simulation::{
     Study, StudyFace, StudyFaceDto, StudyType, StudyTypeDto, study_face_dto, study_face_from,
+    type_version,
 };
 use crate::{
-    AssemblyFile, DocumentKind, FORMAT_VERSION, FormatError, MANIFEST, PartFile,
-    SIMULATION_FORMAT_VERSION, assembly_json, expect_kind, from_json, manifest_version, model_json,
-    read_entry, read_manifest, to_json, write_file,
+    AssemblyFile, DocumentKind, FormatError, MANIFEST, PartFile, assembly_json, expect_kind,
+    from_json, manifest_version, model_json, read_entry, read_manifest, to_json, write_file,
 };
 
 /// File extension of simulation results.
@@ -49,6 +50,7 @@ const CONTACT_PRESSURE: &str = "fields/contact_pressure.bin";
 const TEMPERATURE: &str = "fields/temperature.bin";
 const HEAT_FLUX: &str = "fields/heat_flux.bin";
 const TEMPERATURE_HISTORY: &str = "fields/temperature_history.bin";
+const DENSITY: &str = "fields/density.bin";
 
 /// A results document as stored on disk.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +76,8 @@ pub struct ResultsFile {
     pub fields: NodalFields,
     /// Temperatures and heat flux: a thermal, transient thermal or thermal stress study's.
     pub thermal: Option<ThermalFields>,
+    /// The elements' densities and how they were reached: a topology study's.
+    pub topology: Option<TopologyFields>,
 }
 
 /// What the results were computed from, to tell whether they still hold.
@@ -327,9 +331,36 @@ pub struct TemperatureFrame {
     pub temperature: Vec<f64>,
 }
 
+/// A topology study's densities, and how the optimization went.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TopologyFields {
+    /// The density of each element, 0 (void) to 1 (solid).
+    pub density: Vec<f64>,
+    /// N·mm: the compliance (the work of the loads) of the whole model, before material
+    /// was taken away.
+    pub initial_compliance: f64,
+    /// The densities settled before the iteration limit.
+    pub converged: bool,
+    /// mm: the radius densities were averaged over.
+    pub filter_radius: f64,
+    /// Every iteration, in order; the last is the design of `density`.
+    pub history: Vec<TopologyIteration>,
+}
+
+/// One iteration of a topology optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TopologyIteration {
+    /// N·mm.
+    pub compliance: f64,
+    /// The design's mass as a share of the model's.
+    pub mass_fraction: f64,
+    /// The largest change of a density the iteration made.
+    pub change: f64,
+}
+
 /// Whether a study of `t` computes displacements and stresses.
 fn structural(t: StudyType) -> bool {
-    t.is_structural()
+    t.has_stresses()
 }
 
 /// Writes a results document as a ZIP archive (`.oxyres`), after checking it the way a
@@ -451,6 +482,15 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             f64s(p.iter()),
         ));
     }
+    if let Some(t) = &file.topology {
+        entries.push(entry(
+            DENSITY,
+            Dtype::F64,
+            1,
+            t.density.len(),
+            f64s(t.density.iter()),
+        ));
+    }
 
     let model = ResultsDto {
         simulation: file.simulation_id.clone(),
@@ -471,14 +511,16 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             .collect(),
         entries: entries.iter().map(|(e, _)| e.clone()).collect(),
         times,
+        topology: file.topology.as_ref().map(|t| TopologyDto {
+            initial_compliance: t.initial_compliance,
+            converged: t.converged,
+            filter_radius: t.filter_radius,
+            history: t.history.clone(),
+        }),
     };
 
-    // Version 1 readers know static results only.
-    let version = if file.study_type == StudyType::Static {
-        FORMAT_VERSION
-    } else {
-        SIMULATION_FORMAT_VERSION
-    };
+    // The oldest version that has results of this type, as for studies.
+    let version = type_version(file.study_type);
     let manifest = manifest_version(DocumentKind::SimulationResults, &file.document_id, version);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
@@ -643,6 +685,26 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
     } else {
         None
     };
+    let topology = if study_type == StudyType::Topology {
+        let density = read_f64s(
+            &array(DENSITY, Dtype::F64, &[1])?
+                .ok_or_else(|| missing(DENSITY))?
+                .0,
+        );
+        let t = dto
+            .topology
+            .as_ref()
+            .ok_or_else(|| invalid("a topology study's results have no topology".to_owned()))?;
+        Some(TopologyFields {
+            density,
+            initial_compliance: t.initial_compliance,
+            converged: t.converged,
+            filter_radius: t.filter_radius,
+            history: t.history.clone(),
+        })
+    } else {
+        None
+    };
     let thermal = if study_type.is_thermal() {
         let temperature = read_f64s(
             &array(TEMPERATURE, Dtype::F64, &[1])?
@@ -722,6 +784,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             contact_pressure,
         },
         thermal,
+        topology,
     };
     validate(&file).map_err(invalid)?;
     Ok(file)
@@ -805,6 +868,33 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
         (None, false) => {}
         (Some(_), false) => return Err("static results have temperatures".to_owned()),
         (None, true) => return Err("thermal results have no temperatures".to_owned()),
+    }
+    match (&file.topology, file.study_type == StudyType::Topology) {
+        (Some(t), true) => {
+            if t.density.len() != elements {
+                return Err(format!(
+                    "{} densities for {elements} elements",
+                    t.density.len()
+                ));
+            }
+            if t.density.iter().any(|d| !(0.0..=1.0).contains(d)) {
+                return Err("a density is not between 0 and 1".to_owned());
+            }
+            if t.history.is_empty() {
+                return Err("a topology study's results have no iteration".to_owned());
+            }
+            let numbers = t
+                .history
+                .iter()
+                .flat_map(|s| [s.compliance, s.mass_fraction, s.change])
+                .chain([t.initial_compliance, t.filter_radius]);
+            if numbers.into_iter().any(|v| !v.is_finite()) {
+                return Err("a topology result is not a finite number".to_owned());
+            }
+        }
+        (None, false) => {}
+        (Some(_), false) => return Err("these results have densities".to_owned()),
+        (None, true) => return Err("topology results have no densities".to_owned()),
     }
     if mesh.elements.nodes().any(|n| n as usize >= nodes) {
         return Err(format!(
@@ -891,6 +981,19 @@ struct ResultsDto {
     /// s: the times of a transient study's temperature frames.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     times: Vec<f64>,
+    /// A topology study's optimization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology: Option<TopologyDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct TopologyDto {
+    /// N·mm.
+    initial_compliance: f64,
+    converged: bool,
+    /// mm.
+    filter_radius: f64,
+    history: Vec<TopologyIteration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1014,6 +1117,7 @@ fn fixed<T: Copy, const N: usize>(values: &[T]) -> Vec<[T; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SIMULATION_FORMAT_VERSION;
     use oxyde_assembly::ComponentId;
     use oxyde_model::{FaceName, FeatureId};
 
@@ -1128,7 +1232,96 @@ mod tests {
                 contact_pressure: Some(vec![0.0, 0.5, 0.5, 0.5, 0.0]),
             },
             thermal: None,
+            topology: None,
         }
+    }
+
+    /// The sample as a topology study's results: densities and the iterations only.
+    fn topology_sample() -> ResultsFile {
+        let mut file = sample();
+        file.study = "Topology 1".to_owned();
+        file.study_type = StudyType::Topology;
+        file.fields = NodalFields::default();
+        file.summary = Summary::default();
+        let step = |compliance: f64, change: f64| TopologyIteration {
+            compliance,
+            mass_fraction: 0.4,
+            change,
+        };
+        file.topology = Some(TopologyFields {
+            density: vec![1.0, 0.125],
+            initial_compliance: 12.5,
+            converged: true,
+            filter_radius: 1.5,
+            history: vec![step(80.0, 0.2), step(31.5, 0.05), step(30.0, 0.008)],
+        });
+        file
+    }
+
+    #[test]
+    fn topology_results_round_trip() {
+        let file = topology_sample();
+        let written = bytes(&file);
+        assert_eq!(read_results(Cursor::new(&written)).unwrap(), file);
+        let mut archive = ZipArchive::new(Cursor::new(&written)).unwrap();
+        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        assert!(names.iter().all(|n| n != STRESS && n != TEMPERATURE));
+        assert!(names.iter().any(|n| n == DENSITY));
+        let json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert_eq!(json["type"], "topology");
+        assert_eq!(json["topology"]["initial_compliance"], 12.5);
+        assert_eq!(json["topology"]["converged"], true);
+        assert_eq!(json["topology"]["history"][1]["compliance"], 31.5);
+        assert_eq!(json["topology"]["history"][2]["change"], 0.008);
+        let density = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == DENSITY)
+            .unwrap();
+        assert_eq!(
+            (&density["count"], &density["components"]),
+            (&2.into(), &1.into())
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 3);
+        // Static results say nothing of topology.
+        let mut archive = ZipArchive::new(Cursor::new(bytes(&sample()))).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert!(json.get("topology").is_none());
+    }
+
+    #[test]
+    fn inconsistent_topology_results_are_not_written() {
+        let refused =
+            |file: ResultsFile, why: &str| match write_results(Cursor::new(Vec::new()), &file) {
+                Err(FormatError::InvalidResults(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected invalid results ({why}), got {other:?}"),
+            };
+        let mut short = topology_sample();
+        if let Some(t) = short.topology.as_mut() {
+            t.density.pop();
+        }
+        refused(short, "1 densities for 2 elements");
+        let mut over = topology_sample();
+        if let Some(t) = over.topology.as_mut() {
+            t.density[1] = 1.5;
+        }
+        refused(over, "between 0 and 1");
+        let mut none = topology_sample();
+        if let Some(t) = none.topology.as_mut() {
+            t.history.clear();
+        }
+        refused(none, "no iteration");
+        let mut empty = topology_sample();
+        empty.topology = None;
+        refused(empty, "no densities");
+        let mut stressed = sample();
+        stressed.topology = topology_sample().topology;
+        refused(stressed, "have densities");
     }
 
     /// The sample as a transient thermal study's results: temperatures only.

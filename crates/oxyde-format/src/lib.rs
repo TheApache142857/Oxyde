@@ -66,9 +66,9 @@ use schema::{Manifest, PartModel, TextureTable, Units, import_entry};
 pub const FORMAT_VERSION: u32 = 1;
 
 /// The newest `format_version` of simulation studies and results this crate reads: 2 adds
-/// thermal studies. A document is written with 1 when it holds only what version 1 knows,
-/// so older readers still open static studies.
-pub const SIMULATION_FORMAT_VERSION: u32 = 2;
+/// thermal studies, 3 topology studies. A document is written with the oldest version that
+/// holds what it has, so older readers still open static (and thermal) studies.
+pub const SIMULATION_FORMAT_VERSION: u32 = 3;
 
 const FORMAT_NAME: &str = "oxyde";
 const MANIFEST: &str = "manifest.json";

@@ -5,6 +5,46 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Topology optimization (October 2026)
+
+- **A Topology tab, and topology studies.** *Topology* is a new study type in the
+  Simulation tab's New Study, as SolidWorks has its topology study and Fusion 360 its shape
+  optimization, and it has a tab of its own next to Simulation, which shows the topology
+  studies only. Hold and load the part as in a static study (Fixed Geometry, Roller/Slider,
+  Force, Pressure), say how much of its mass to keep (half by default), and *Run* takes
+  material away where the loads need it least until that much is left: the stiffest shape
+  for that mass. The viewport shows the shape that remains as a smooth surface, the whole
+  part faint around it; a *Threshold* slider makes it thinner or thicker, and *Export STL*
+  writes it out, to print it or to model a part over it. The panel says how much of the
+  mass is kept and what that costs in stiffness ("1.9 times as flexible as the whole
+  part"). Parts of several bodies and assemblies are optimized with their contacts.
+- **Material that stays.** The faces of fixtures and loads keep their material; *Preserve
+  Region* keeps that of other faces (mounting faces, bolt holes), as deep under them as set
+  in the panel. *Thinnest member* keeps bars and walls from coming out thinner than wanted;
+  by default they can be as thin as the mesh allows, about three elements.
+- **Symmetry and a pull direction**, the manufacturing controls of SolidWorks' topology
+  study and Fusion 360's shape optimization, in the Target section. *Symmetry* mirrors the
+  shape across the Right, Top or Front plane (any of them, or planes parallel to them at a
+  position typed) whatever the loads, the kept regions too. *Pull direction* (±X, ±Y, ±Z)
+  gives a shape a mould pulled off that way can release: going along it the shape never
+  widens, so it has no undercut; *Both ways* is a two-part mould, the shape narrowing away
+  from a parting plane on each side. A plane the part is not symmetric about is refused,
+  and so is a pull one way across a symmetry plane. Pulled across the way the part bends
+  (through a plate's thickness, as most castings are) the shape is as crisp as without;
+  pulled in that plane (a beam loaded down and pulled up) it comes out grey, neither solid
+  nor void, until a later version sharpens the densities.
+- **How it works:** each element of the mesh gets a density, its stiffness going as the
+  cube of it, the densities averaged over a small sphere so no member is thinner than it,
+  and moved by optimality criteria, one static solve per iteration (60 at most by default,
+  fewer once the shape settles). Gravity is not taken: the weight would change with the
+  shape.
+- **Files:** topology studies are saved in the `.oxysim` with their target, member size,
+  iterations, preserved regions, symmetry planes and pull direction, and their results in
+  the `.oxyres`: each element's density and every iteration's compliance and mass (`type`
+  `topology`, `fields/density.bin`; FORMAT.md §8–§9). A document holding a topology study
+  is written as `format_version` 3, which earlier versions of Oxyde refuse; the others are
+  written as before.
+
 ### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 
 A read through the modelling engine and the application for bugs, behaviours nobody asked

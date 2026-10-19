@@ -1,5 +1,5 @@
-//! The menus, the tabbed command bar (Features, Sketch, Evaluate, Render — SolidWorks'
-//! CommandManager) and the heads-up view toolbar over the viewport.
+//! The menus, the tabbed command bar (Features, Sketch, Evaluate, Render, Simulation,
+//! Topology — SolidWorks' CommandManager) and the heads-up view toolbar over the viewport.
 
 use eframe::egui;
 use oxyde_render::StandardView;
@@ -321,11 +321,15 @@ impl OxydeApp {
                 (CommandTab::Evaluate, "Evaluate"),
                 (CommandTab::Render, "Render"),
                 (CommandTab::Simulation, "Simulation"),
+                (CommandTab::Topology, "Topology"),
             ] {
                 let text = egui::RichText::new(label).size(13.0);
                 let text = if self.tab == tab { text.strong() } else { text };
                 if ui.selectable_label(self.tab == tab, text).clicked() {
                     self.tab = tab;
+                    if tab == CommandTab::Topology {
+                        self.enter_topology();
+                    }
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -371,6 +375,7 @@ impl OxydeApp {
                     CommandTab::Evaluate => self.evaluate_tab(ui),
                     CommandTab::Render => self.render_tab(ui),
                     CommandTab::Simulation => self.simulation_tab(ui),
+                    CommandTab::Topology => self.topology_tab(ui),
                 });
             });
     }

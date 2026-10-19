@@ -40,8 +40,10 @@ pub enum AsmTab {
     Evaluate,
     /// The assembly drawn by the path tracer (`render_ui`).
     Render,
-    /// A linear static study of the assembly, its parts bonded (`simulation_ui`).
+    /// The assembly's studies, its parts in contact (`simulation_ui`).
     Simulation,
+    /// The topology studies of the assembly (`simulation_ui`).
+    Topology,
 }
 
 /// The mate types offered, in the order shown.
@@ -1331,6 +1333,7 @@ impl OxydeApp {
                 (AsmTab::Evaluate, "Evaluate"),
                 (AsmTab::Render, "Render"),
                 (AsmTab::Simulation, "Simulation"),
+                (AsmTab::Topology, "Topology"),
             ] {
                 let text = RichText::new(label).size(13.0);
                 let text = if self.asm_tab == tab {
@@ -1340,6 +1343,9 @@ impl OxydeApp {
                 };
                 if ui.selectable_label(self.asm_tab == tab, text).clicked() {
                     self.asm_tab = tab;
+                    if tab == AsmTab::Topology {
+                        self.enter_topology();
+                    }
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1372,6 +1378,10 @@ impl OxydeApp {
         }
         if self.asm_tab == AsmTab::Simulation {
             ui.horizontal(|ui| self.simulation_tab(ui));
+            return;
+        }
+        if self.asm_tab == AsmTab::Topology {
+            ui.horizontal(|ui| self.topology_tab(ui));
             return;
         }
         // Fix/Float: every selected component, named after the first.
@@ -1546,7 +1556,7 @@ impl OxydeApp {
         if self.asm_tab == AsmTab::Render {
             self.render_panel(ui);
         }
-        if self.asm_tab == AsmTab::Simulation {
+        if matches!(self.asm_tab, AsmTab::Simulation | AsmTab::Topology) {
             self.simulation_panel(ui);
         }
         self.mate_manager(ui);

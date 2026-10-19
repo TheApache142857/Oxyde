@@ -93,8 +93,11 @@ pub enum CommandTab {
     Evaluate,
     /// The model drawn by the path tracer (`render_ui`).
     Render,
-    /// A linear static study (`simulation_ui`).
+    /// The model's studies: static, thermal and topology (`simulation_ui`).
     Simulation,
+    /// The same studies, the topology ones only: topology optimization given a tab of its
+    /// own next to Simulation (`simulation_ui`).
+    Topology,
 }
 
 /// A plane or axis drawn over the viewport, which can be clicked.
@@ -2169,7 +2172,9 @@ impl OxydeApp {
                 if self.tab == CommandTab::Render && self.sketch.is_none() {
                     self.render_panel(ui);
                 }
-                if self.tab == CommandTab::Simulation && self.sketch.is_none() {
+                if matches!(self.tab, CommandTab::Simulation | CommandTab::Topology)
+                    && self.sketch.is_none()
+                {
                     self.simulation_panel(ui);
                 }
                 self.property_manager(ui);

@@ -1,6 +1,7 @@
 //! The Simulation tab's path through the real kernel: a part's export meshes, labelled by
 //! face, filled with tetrahedra by `oxyde_sim`'s mesher and solved, against beam theory
-//! and, for the thermal studies, against conduction along a bar.
+//! and, for the thermal studies, against conduction along a bar; and a topology study's,
+//! the beam optimized down to a share of its mass.
 
 use oxyde_geom::Point2;
 use oxyde_kernel::{Kernel, Mesh, VolumeMeshError, VolumeMeshOptions};
@@ -9,8 +10,9 @@ use oxyde_model::{
 };
 use oxyde_occt::OcctKernel;
 use oxyde_sim::{
-    Contact, ContactKind, Elastic, Fixture, FixtureKind, Load, LoadKind, MeshOptions, SolveOptions,
-    Study, SurfaceMesh, TetMesh, ThermalLoad, ThermalLoadKind, ThermalMaterial, ThermalStudy,
+    Contact, ContactKind, Elastic, Fixture, FixtureKind, Load, LoadKind, MeshOptions, Pull,
+    SolveOptions, Study, SurfaceMesh, Symmetry, TetMesh, ThermalLoad, ThermalLoadKind,
+    ThermalMaterial, ThermalStudy, TopologyResults, TopologyStudy,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -159,6 +161,139 @@ fn a_cantilever_part_deflects_as_beam_theory_says() {
         delta > 0.97 && delta < 1.12,
         "tip {delta} mm, beam theory 1 mm"
     );
+}
+
+/// A topology study of the same beam, as the Topology tab runs it: held at one end, 1 kN
+/// down on the other, 30 % of its mass kept, optimized with `symmetry` and `pull`. The mesh,
+/// the results and the held and loaded faces' labels.
+fn optimized_beam(
+    symmetry: Option<Symmetry>,
+    pull: Option<Pull>,
+) -> (TetMesh, TopologyResults, Vec<u32>, Vec<u32>) {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    block(&mut part, 0.0, 200.0, ExtrudeOp::Boss);
+    part.rebuild(&mut kernel);
+    let (solids, ends) = surfaces(&part, &kernel);
+    let at = |x: f64| -> Vec<u32> {
+        ends.iter()
+            .filter(|(_, e)| (e - x).abs() < 1e-3)
+            .map(|e| e.0)
+            .collect()
+    };
+    let (fixed, loaded) = (at(0.0), at(200.0));
+    assert_eq!((fixed.len(), loaded.len()), (1, 1), "{ends:?}");
+    let options = MeshOptions {
+        element_size: 4.0,
+        quadratic: false,
+        ..MeshOptions::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let (mesh, _) = oxyde_sim::mesh_solids(&solids, &options, &cancel, &|_| {}).unwrap();
+    let study = TopologyStudy {
+        study: Study {
+            fixtures: vec![Fixture {
+                kind: FixtureKind::Fixed,
+                labels: fixed.clone(),
+            }],
+            loads: vec![Load {
+                kind: LoadKind::Force {
+                    total: 1000.0,
+                    direction: Some([0.0, -1.0, 0.0]),
+                },
+                labels: loaded.clone(),
+            }],
+            gravity: None,
+            contacts: Vec::new(),
+        },
+        target: 0.3,
+        member_size: None,
+        preserved: Vec::new(),
+        max_iterations: 25,
+        symmetry,
+        pull,
+    };
+    let steel = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
+    let r = oxyde_sim::optimize(
+        &mesh,
+        &[steel],
+        &study,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    (mesh, r, fixed, loaded)
+}
+
+#[test]
+fn a_cantilever_part_is_optimized_down_to_its_target_mass() {
+    let (mesh, r, fixed, loaded) = optimized_beam(None, None);
+    assert!(
+        (r.mass_fraction() - 0.3).abs() < 0.01,
+        "{}",
+        r.mass_fraction()
+    );
+    // Less stiff than the whole beam, and far stiffer than the same mass spread evenly
+    // (0.3³ of the stiffness: 37 times as flexible).
+    let flexible = r.compliance() / r.initial_compliance;
+    assert!(flexible > 1.0 && flexible < 10.0, "{flexible}");
+    // The held and the loaded ends stay solid, and the shape cut at half density keeps
+    // them and about the mass.
+    for f in mesh
+        .facets
+        .iter()
+        .filter(|f| fixed.contains(&f.label) || loaded.contains(&f.label))
+    {
+        assert_eq!(r.density[f.tet as usize], 1.0);
+    }
+    let shape = oxyde_sim::shape(&mesh, &r.density, 0.5, 8);
+    assert!(
+        fixed
+            .iter()
+            .chain(&loaded)
+            .all(|l| shape.labels.contains(l))
+    );
+    let kept = shape.volume() / mesh.volume();
+    assert!(kept > 0.15 && kept < 0.5, "{kept}");
+}
+
+#[test]
+fn a_part_optimized_with_symmetry_and_a_pull_direction() {
+    // The beam (20 mm thick, z = 0 to 20) mirrored across the Front plane moved to its
+    // middle, and cast in a two-part mould pulled off along Z from the same plane.
+    let (mesh, r, _, _) = optimized_beam(
+        Some(Symmetry {
+            point: [0.0, 0.0, 10.0],
+            planes: [false, false, true],
+        }),
+        Some(Pull {
+            direction: [0.0, 0.0, 1.0],
+            parting: Some([0.0, 0.0, 10.0]),
+        }),
+    );
+    assert!(
+        (r.mass_fraction() - 0.3).abs() < 0.02,
+        "{}",
+        r.mass_fraction()
+    );
+    // Its mass, its moment about the plane (an element's volume times its centre's height
+    // integrates the height over it exactly), and the mass in the middle and the outer half
+    // of the thickness.
+    let (mut mass, mut moment, mut slab) = (0.0, 0.0, [0.0; 2]);
+    for (e, t) in mesh.tets.iter().enumerate() {
+        let z = t.iter().map(|&i| mesh.nodes[i as usize][2]).sum::<f64>() / 4.0;
+        let m = r.density[e] * mesh.tet_volume(e).unwrap().abs();
+        mass += m;
+        moment += m * (z - 10.0);
+        slab[usize::from((z - 10.0).abs() > 5.0)] += m;
+    }
+    // Mirrored, the shape has its centre of mass on the plane, to 0.5 % of the thickness:
+    // this mesh is not symmetric (its own centroid is 0.06 mm off the plane), and without
+    // symmetry the shape's is 0.23 mm off.
+    assert!((moment / mass).abs() < 0.1, "{} mm", moment / mass);
+    // Going away from the parting plane no density grows: the outer half holds no more.
+    assert!(slab[1] <= slab[0], "{slab:?}");
 }
 
 #[test]

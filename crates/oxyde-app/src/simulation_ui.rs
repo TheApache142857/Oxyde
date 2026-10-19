@@ -1,7 +1,14 @@
 //! The Simulation tab: studies of the part or assembly, as SolidWorks Simulation and
 //! Fusion 360 run them (`docs/SIMULATION.md`). The tab starts on *New Study*, which makes
-//! a static, thermal, transient thermal or thermal stress study; a model has any number
-//! of them, one shown at a time (`simulation_studies.rs`).
+//! a static, thermal, transient thermal, thermal stress or topology study; a model has any
+//! number of them, one shown at a time (`simulation_studies.rs`). The Topology tab, next
+//! to it, shows the same studies, the topology ones only.
+//!
+//! A topology study takes a static study's fixtures, forces and pressures, and *Preserve
+//! Region* faces where material must stay; *Run* takes material away where the loads do
+//! not need it (`oxyde_sim::optimize`) until the target mass is left, and the viewport
+//! shows the shape that remains, a smoothed surface cut at a density threshold, which
+//! *Export STL* writes out.
 //!
 //! In a static study, select faces, then *Fixed Geometry*, *Roller/Slider*, *Force* or
 //! *Pressure* makes a fixture or a load on them; *Gravity* adds the model's weight. A
@@ -52,7 +59,8 @@ use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
     ContactCandidate, ContactKind, Elastic, FixtureKind, LoadKind, MeshOptions, MeshReport,
     NO_LABEL, Quantity, Results, SolveOptions, Summary, SurfaceMesh, TetMesh, ThermalLoadKind,
-    ThermalMaterial, ThermalProps, ThermalResults, ThermalStudy, ThermalSummary,
+    ThermalMaterial, ThermalProps, ThermalResults, ThermalStudy, ThermalSummary, TopologyResults,
+    TopologyStudy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,10 +95,12 @@ pub enum PlotChoice {
     Temperature,
     /// W/m², the length of the heat flux.
     HeatFlux,
+    /// A topology study's shape: the material kept.
+    Shape,
 }
 
 impl PlotChoice {
-    pub(crate) const ALL: [PlotChoice; 7] = [
+    pub(crate) const ALL: [PlotChoice; 8] = [
         PlotChoice::Temperature,
         PlotChoice::HeatFlux,
         PlotChoice::VonMises,
@@ -98,11 +108,21 @@ impl PlotChoice {
         PlotChoice::Displacement,
         PlotChoice::FactorOfSafety,
         PlotChoice::ContactPressure,
+        PlotChoice::Shape,
     ];
 
     /// Whether it plots a thermal study's results.
     pub(crate) fn is_thermal(self) -> bool {
         matches!(self, PlotChoice::Temperature | PlotChoice::HeatFlux)
+    }
+
+    /// Whether a study of `t` has it.
+    pub(crate) fn fits(self, t: StudyType) -> bool {
+        match self {
+            PlotChoice::Shape => t == StudyType::Topology,
+            p if p.is_thermal() => t.is_thermal(),
+            _ => t.has_stresses(),
+        }
     }
 
     fn quantity(self) -> Option<Quantity> {
@@ -111,7 +131,10 @@ impl PlotChoice {
             PlotChoice::FirstPrincipal => Some(Quantity::FirstPrincipal),
             PlotChoice::Displacement => Some(Quantity::Displacement),
             PlotChoice::FactorOfSafety => Some(Quantity::FactorOfSafety),
-            PlotChoice::ContactPressure | PlotChoice::Temperature | PlotChoice::HeatFlux => None,
+            PlotChoice::ContactPressure
+            | PlotChoice::Temperature
+            | PlotChoice::HeatFlux
+            | PlotChoice::Shape => None,
         }
     }
 
@@ -120,6 +143,7 @@ impl PlotChoice {
             PlotChoice::ContactPressure => "Contact pressure",
             PlotChoice::Temperature => "Temperature",
             PlotChoice::HeatFlux => "Heat flux",
+            PlotChoice::Shape => "Shape",
             other => other.quantity().map_or("", Quantity::label),
         }
     }
@@ -129,6 +153,7 @@ impl PlotChoice {
             PlotChoice::ContactPressure => "MPa",
             PlotChoice::Temperature => "°C",
             PlotChoice::HeatFlux => "W/m²",
+            PlotChoice::Shape => "",
             other => other.quantity().map_or("", Quantity::unit),
         }
     }
@@ -172,6 +197,12 @@ pub struct SimulationPrefs {
     /// The most memory a study may take, GB: a mesh with more nodes than it allows is
     /// refused before it is solved (Preferences › Simulation).
     pub memory_budget_gb: f64,
+    /// A topology study's shape is cut where the density is this, 0 to 1.
+    pub shape_threshold: f64,
+    /// The shape smoothed, rather than showing the mesh's facets.
+    pub smooth_shape: bool,
+    /// The whole model drawn faintly around a topology study's shape.
+    pub show_original: bool,
 }
 
 impl Default for SimulationPrefs {
@@ -184,6 +215,9 @@ impl Default for SimulationPrefs {
             bands: 16,
             show_mesh: false,
             memory_budget_gb: 8.0,
+            shape_threshold: 0.5,
+            smooth_shape: true,
+            show_original: true,
         }
     }
 }
@@ -294,10 +328,15 @@ pub enum ItemKind {
     InternalHeat {
         watts: f64,
     },
+    /// A topology study's preserved region: its material stays, on the faces and this deep
+    /// under them, mm.
+    Preserve {
+        depth: f64,
+    },
 }
 
 /// The names items are numbered after, as SolidWorks names them.
-pub(crate) const ITEM_BASES: [&str; 11] = [
+pub(crate) const ITEM_BASES: [&str; 12] = [
     "Fixed",
     "Roller/Slider",
     "Force",
@@ -308,6 +347,7 @@ pub(crate) const ITEM_BASES: [&str; 11] = [
     "Convection",
     "Radiation",
     "Internal Heat",
+    "Preserve",
     "Contact",
 ];
 
@@ -341,15 +381,16 @@ impl ItemKind {
             ItemKind::Convection { .. } => "Convection",
             ItemKind::Radiation { .. } => "Radiation",
             ItemKind::InternalHeat { .. } => "Internal Heat",
+            ItemKind::Preserve { .. } => "Preserve",
         }
     }
 
     /// Whether a study of `t` takes it.
     pub(crate) fn fits(&self, t: StudyType) -> bool {
-        if self.is_thermal() {
-            t.is_thermal()
-        } else {
-            t.is_structural()
+        match self {
+            ItemKind::Preserve { .. } => t == StudyType::Topology,
+            k if k.is_thermal() => t.is_thermal(),
+            _ => t.is_structural(),
         }
     }
 }
@@ -440,6 +481,43 @@ impl StudyContact {
     ];
 }
 
+/// What a topology study looks for; its preserved regions are items.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TopologyGoal {
+    /// The share of the model's mass to keep, 0 to 1.
+    pub target_mass: f64,
+    /// mm: the thinnest member wanted; `None` for the finest the mesh allows.
+    pub member_size: Option<f64>,
+    /// Iterations at most, each one static solve.
+    pub iterations: u32,
+    /// Mirrored across the planes parallel to the Right, Top and Front planes through
+    /// `symmetry_point`.
+    pub symmetry: [bool; 3],
+    /// mm: the point the symmetry planes pass through; the origin for the standard planes.
+    pub symmetry_point: [f64; 3],
+    /// The direction a mould is pulled off the shape along, in world coordinates; `None`
+    /// for none.
+    pub pull: Option<[f64; 3]>,
+    /// mm: a two-part mould, pulled off both ways from the plane through this point across
+    /// the pull direction; `None` for one way.
+    pub parting: Option<[f64; 3]>,
+}
+
+impl Default for TopologyGoal {
+    fn default() -> Self {
+        let file = oxyde_format::simulation::TopologySettings::default();
+        Self {
+            target_mass: file.target_mass,
+            member_size: file.member_size,
+            iterations: file.iterations,
+            symmetry: [false; 3],
+            symmetry_point: [0.0; 3],
+            pull: None,
+            parting: None,
+        }
+    }
+}
+
 /// The study: what holds the model and what loads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Study {
@@ -458,6 +536,8 @@ pub struct Study {
     pub transient: TransientSettings,
     /// The temperature a thermal stress study's model is free of stress at, °C.
     pub reference_temperature: f64,
+    /// A topology study's target mass, member size and iterations.
+    pub topology: TopologyGoal,
     pub contacts: Vec<StudyContact>,
     /// mm: how close faces of different bodies must be to be found in contact.
     pub contact_tolerance: f64,
@@ -486,6 +566,7 @@ impl Study {
             thermal_overrides: BTreeMap::new(),
             transient: TransientSettings::default(),
             reference_temperature: 20.0,
+            topology: TopologyGoal::default(),
             contacts: Vec::new(),
             contact_tolerance: 0.1,
             contacts_found: false,
@@ -680,6 +761,7 @@ struct Outcome {
     report: MeshReport,
     results: Option<Results>,
     thermal: Option<ThermalResults>,
+    topology: Option<TopologyResults>,
     mesh_seconds: f64,
     solve_seconds: f64,
     /// Faces found facing each other, when contacts were looked for.
@@ -737,6 +819,8 @@ pub(crate) struct Done {
     /// Temperatures and heat flux (a thermal, transient or thermal stress study).
     pub(crate) thermal: Option<ThermalResults>,
     thermal_summary: Option<ThermalSummary>,
+    /// The densities of a topology study.
+    pub(crate) topology: Option<TopologyResults>,
     pub(crate) mesh_seconds: f64,
     pub(crate) solve_seconds: f64,
     diagonal: f64,
@@ -753,15 +837,15 @@ pub(crate) struct Done {
 impl Done {
     /// Whether it holds results (not just a mesh).
     pub(crate) fn solved(&self) -> bool {
-        self.results.is_some() || self.thermal.is_some()
+        self.results.is_some() || self.thermal.is_some() || self.topology.is_some()
     }
 
     /// Whether it can draw `plot`.
     pub(crate) fn has(&self, plot: PlotChoice) -> bool {
-        if plot.is_thermal() {
-            self.thermal.is_some()
-        } else {
-            self.results.is_some()
+        match plot {
+            PlotChoice::Shape => self.topology.is_some(),
+            p if p.is_thermal() => self.thermal.is_some(),
+            _ => self.results.is_some(),
         }
     }
 
@@ -777,12 +861,53 @@ impl Done {
     /// The values of `plot` at each node: temperatures at `frame` of a transient study.
     fn values(&self, plot: PlotChoice, frame: Option<usize>) -> Vec<f64> {
         match (plot, &self.thermal, &self.results) {
+            (PlotChoice::Shape, _, _) => vec![0.0; self.mesh.nodes.len()],
             (PlotChoice::Temperature, Some(t), _) => frame
                 .and_then(|f| t.frames.get(f))
                 .map_or_else(|| t.temperature.clone(), |f| f.temperature.clone()),
             (PlotChoice::HeatFlux, Some(t), _) => t.heat_flux_magnitude(),
             (p, _, Some(r)) if !p.is_thermal() => p.values(r),
             _ => vec![0.0; self.mesh.nodes.len()],
+        }
+    }
+}
+
+#[cfg(test)]
+impl Done {
+    /// A run's outcome as a test makes it: `mesh`, one body, and a topology study's
+    /// densities.
+    pub(crate) fn for_test(
+        mesh: TetMesh,
+        study_type: StudyType,
+        topology: Option<TopologyResults>,
+    ) -> Done {
+        let report = MeshReport {
+            element_size: 0.0,
+            nodes: mesh.nodes.len(),
+            elements: mesh.tets.len(),
+            volume: mesh.volume(),
+            model_volume: mesh.volume(),
+            dropped: 0,
+        };
+        Done {
+            id: 0,
+            revision: 0,
+            assembly: false,
+            mesh,
+            report,
+            study_type,
+            results: None,
+            summary: None,
+            thermal: None,
+            thermal_summary: None,
+            topology,
+            mesh_seconds: 0.0,
+            solve_seconds: 0.0,
+            diagonal: 1.0,
+            mesher: "lattice",
+            faces: BTreeMap::new(),
+            bodies: vec![("Body".to_owned(), "part:x".to_owned())],
+            fingerprint: None,
         }
     }
 }
@@ -797,6 +922,10 @@ struct PlotKey {
     show_mesh: bool,
     /// The transient study's time shown.
     frame: Option<usize>,
+    /// A topology study's shape: the density it is cut at, smoothed, the model around it.
+    threshold: f64,
+    smooth: bool,
+    ghost: bool,
 }
 
 /// The legend of the plot shown.
@@ -848,6 +977,8 @@ pub struct SimulationView {
     pub(crate) playing: Option<Instant>,
     /// The open study's new name, while it is being renamed.
     pub(crate) renaming: Option<String>,
+    /// The share of the mesh's volume the topology shape shown holds.
+    pub(crate) shape_fraction: Option<f64>,
 }
 
 impl SimulationView {
@@ -1036,16 +1167,31 @@ fn too_many_nodes(nodes: usize, budget_gb: f64, quadratic: bool) -> String {
 // ---- The application side ------------------------------------------------------------------
 
 impl OxydeApp {
-    /// Whether the Simulation tab is open and in charge of the viewport.
+    /// Whether the Simulation tab, or the Topology tab with a topology study open, is
+    /// open and in charge of the viewport.
     pub(crate) fn simulation_active(&self) -> bool {
-        let tab = match self.asm {
+        let simulation = match self.asm {
             Some(_) => self.asm_tab == crate::assembly_ui::AsmTab::Simulation,
             None => self.tab == crate::app::CommandTab::Simulation,
         };
+        let tab = simulation || (self.topology_tab_open() && self.topology_study_open());
         tab && self.sketch.is_none()
             && self.section.is_none()
             && self.mesh_export.is_none()
             && !self.busy()
+    }
+
+    /// Whether the Topology tab is the one open.
+    pub(crate) fn topology_tab_open(&self) -> bool {
+        match self.asm {
+            Some(_) => self.asm_tab == crate::assembly_ui::AsmTab::Topology,
+            None => self.tab == crate::app::CommandTab::Topology,
+        }
+    }
+
+    /// Whether the open study is a topology study.
+    pub(crate) fn topology_study_open(&self) -> bool {
+        self.simulation.started && self.simulation.study.study_type == StudyType::Topology
     }
 
     fn document_key(&self) -> (bool, String) {
@@ -1121,6 +1267,7 @@ impl OxydeApp {
             self.asm_scene = None;
         }
         self.simulation.legend = None;
+        self.simulation.shape_fraction = None;
     }
 
     fn poll_simulation(&mut self, ctx: &egui::Context) {
@@ -1165,6 +1312,9 @@ impl OxydeApp {
                         o.mesh_seconds, o.report.nodes, o.report.elements
                     ),
                 };
+                if let Some(t) = &o.topology {
+                    self.status = topology_summary(t, seconds);
+                }
                 if let Some(note) = &o.note {
                     self.status =
                         format!("{} ({note}; meshed with the lattice mesher)", self.status);
@@ -1181,7 +1331,7 @@ impl OxydeApp {
                         self.status = format!("{count} contact(s) found between the bodies");
                     }
                 }
-                let solved = o.results.is_some() || o.thermal.is_some();
+                let solved = o.results.is_some() || o.thermal.is_some() || o.topology.is_some();
                 // Contacts Run found and bonded itself are now in the study it solved: the
                 // fingerprint says so, unless the model changed meanwhile (then the
                 // results are stale and are not saved).
@@ -1203,6 +1353,7 @@ impl OxydeApp {
                     summary,
                     thermal_summary,
                     thermal: o.thermal,
+                    topology: o.topology,
                     mesh_seconds: o.mesh_seconds,
                     solve_seconds: o.solve_seconds,
                     diagonal: job.diagonal,
@@ -1534,6 +1685,9 @@ impl OxydeApp {
         let mut loads = Vec::new();
         let mut thermal_loads = Vec::new();
         let mut internal = Vec::new();
+        let mut preserved = Vec::new();
+        // A topology study's weight would change with its shape: it takes none.
+        let gravity = study.gravity && study_type.takes_gravity();
         for item in study.items.iter().filter(|i| i.kind.fits(study_type)) {
             let labels = surfaces.labels(&item.faces);
             if labels.is_empty() && !mesh_only {
@@ -1599,6 +1753,10 @@ impl OxydeApp {
                     bodies.dedup();
                     internal.push(oxyde_sim::InternalHeat { bodies, watts });
                 }
+                ItemKind::Preserve { depth } => preserved.push(oxyde_sim::Preserve {
+                    labels,
+                    depth: depth.max(0.0),
+                }),
             }
         }
         if !mesh_only {
@@ -1608,9 +1766,15 @@ impl OxydeApp {
                         .to_owned(),
                 );
             }
-            if study_type == StudyType::Static && loads.is_empty() && !study.gravity {
+            if study_type == StudyType::Static && loads.is_empty() && !gravity {
                 return Err(
                     "Nothing loads the model: select faces and add a Force or a Pressure, or turn on Gravity"
+                        .to_owned(),
+                );
+            }
+            if study_type == StudyType::Topology && loads.is_empty() {
+                return Err(
+                    "Nothing loads the model: select faces and add a Force or a Pressure"
                         .to_owned(),
                 );
             }
@@ -1624,7 +1788,7 @@ impl OxydeApp {
         let structural = oxyde_sim::Study {
             fixtures,
             loads,
-            gravity: study.gravity.then_some([0.0, -9.81, 0.0]),
+            gravity: gravity.then_some([0.0, -9.81, 0.0]),
             contacts: contacts.clone(),
         };
         let transient = (study_type == StudyType::TransientThermal).then(|| oxyde_sim::Transient {
@@ -1658,9 +1822,7 @@ impl OxydeApp {
                         ));
                     }
                 }
-                if study.gravity
-                    && !mesh_only
-                    && body.material.as_ref().is_none_or(|m| m.density <= 0.0)
+                if gravity && !mesh_only && body.material.as_ref().is_none_or(|m| m.density <= 0.0)
                 {
                     return Err(format!(
                         "Gravity needs a density: {} has none (apply a material)",
@@ -1713,6 +1875,26 @@ impl OxydeApp {
                 study: structural,
                 materials: elastic()?,
                 reference: study.reference_temperature,
+            },
+            StudyType::Topology => SolveInput::Topology {
+                study: TopologyStudy {
+                    study: structural,
+                    target: study.topology.target_mass,
+                    member_size: study.topology.member_size,
+                    preserved,
+                    max_iterations: study.topology.iterations.max(1) as usize,
+                    symmetry: study.topology.symmetry.contains(&true).then_some(
+                        oxyde_sim::Symmetry {
+                            point: study.topology.symmetry_point,
+                            planes: study.topology.symmetry,
+                        },
+                    ),
+                    pull: study.topology.pull.map(|direction| oxyde_sim::Pull {
+                        direction,
+                        parting: study.topology.parting,
+                    }),
+                },
+                materials: elastic()?,
             },
         })
     }
@@ -1827,6 +2009,7 @@ impl OxydeApp {
         self.status = match mode {
             RunMode::Mesh => "Meshing…",
             RunMode::FindContacts => "Looking for contacts…",
+            RunMode::Run if study_type == StudyType::Topology => "Optimizing the shape…",
             RunMode::Run => "Running the study…",
         }
         .to_owned();
@@ -1886,6 +2069,7 @@ impl OxydeApp {
         study_type: StudyType,
         results: Option<Results>,
         thermal: Option<ThermalResults>,
+        topology: Option<TopologyResults>,
         faces: BTreeMap<u32, SimFace>,
         bodies: Vec<(String, String)>,
         fingerprint: Fingerprint,
@@ -1931,6 +2115,7 @@ impl OxydeApp {
             summary,
             thermal,
             thermal_summary,
+            topology,
             mesh_seconds: 0.0,
             solve_seconds: solver.seconds,
             diagonal,
@@ -2021,6 +2206,32 @@ impl OxydeApp {
             self.prefs.simulation.plot = p;
             self.simulation.prefs_dirty = true;
         }
+        if plot == Some(PlotChoice::Shape) {
+            let key = PlotKey {
+                id: done.id,
+                plot,
+                scale: 0.0,
+                bands: 0,
+                show_mesh: false,
+                frame: None,
+                threshold: prefs.shape_threshold.clamp(0.01, 0.99),
+                smooth: prefs.smooth_shape,
+                ghost: prefs.show_original,
+            };
+            if self.simulation.shown == Some(key) {
+                return;
+            }
+            let Some(t) = done.topology.as_ref() else {
+                return;
+            };
+            let (scene, fraction) =
+                shape_scene(&done.mesh, &t.density, key.threshold, key.smooth, key.ghost);
+            self.show_scene(scene);
+            self.simulation.shown = Some(key);
+            self.simulation.legend = None;
+            self.simulation.shape_fraction = Some(fraction);
+            return;
+        }
         // A transient study's temperatures at the time picked.
         let frame = done
             .thermal
@@ -2034,6 +2245,9 @@ impl OxydeApp {
             bands: prefs.bands.clamp(2, 64),
             show_mesh: prefs.show_mesh || !done.solved(),
             frame,
+            threshold: 0.0,
+            smooth: false,
+            ghost: false,
         };
         if self.simulation.shown == Some(key) {
             return;
@@ -2164,6 +2378,14 @@ impl OxydeApp {
             .collect();
         let mut scene = Scene::from_mesh(&kernel_mesh);
         scene.set_materials(materials, Vec::new());
+        self.show_scene(scene);
+        self.simulation.shown = Some(key);
+        self.simulation.legend = legend;
+        self.simulation.shape_fraction = None;
+    }
+
+    /// `scene` in the viewport in place of the model's, until the plot hides.
+    fn show_scene(&mut self, scene: Scene) {
         // Looked at, not picked: the faces are the plot's, not the model's.
         self.viewport.pickable = Some((0, 0));
         self.viewport.set_scene(scene, false);
@@ -2172,8 +2394,70 @@ impl OxydeApp {
             Some(asm) => self.asm_scene = Some(asm.revision),
             None => self.scene_revision = Some(self.scene_key()),
         }
-        self.simulation.shown = Some(key);
-        self.simulation.legend = legend;
+    }
+
+    /// Export STL: the topology study's shape as the panel sets it (threshold, smoothing),
+    /// to a binary STL file.
+    fn export_shape(&mut self) {
+        let prefs = &self.prefs.simulation;
+        let shape = self.simulation.done.as_ref().and_then(|d| {
+            let t = d.topology.as_ref()?;
+            Some(oxyde_sim::shape(
+                &d.mesh,
+                &t.density,
+                prefs.shape_threshold.clamp(0.01, 0.99),
+                if prefs.smooth_shape {
+                    SHAPE_SMOOTHING
+                } else {
+                    0
+                },
+            ))
+        });
+        let Some(shape) = shape else {
+            self.status = "Nothing to export: run the topology study first".to_owned();
+            return;
+        };
+        if shape.triangles.is_empty() {
+            self.status = "Nothing is denser than the threshold: lower it in the panel".to_owned();
+            return;
+        }
+        let name = format!("{} shape", self.simulation.study.name);
+        let folder = match &self.asm {
+            Some(asm) => asm.path.clone(),
+            None => self.doc.path.clone(),
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("STL", &["stl"])
+            .set_file_name(format!("{name}.stl"));
+        if let Some(dir) = folder.as_deref().and_then(std::path::Path::parent) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if !crate::assembly_ui::has_extension(&path, "stl") {
+            path.set_extension("stl");
+        }
+        let mesh = Mesh {
+            faces: vec![FaceMesh {
+                positions: shape
+                    .positions
+                    .iter()
+                    .map(|p| p.map(|v| v as f32))
+                    .collect(),
+                triangles: shape.triangles,
+            }],
+            edges: Vec::new(),
+        };
+        let triangles = oxyde_format::stl::triangles(&mesh, 1.0);
+        self.status = match oxyde_format::stl::save(&path, &name, &triangles, true) {
+            Ok(()) => format!(
+                "Exported the shape ({} triangles) to {}",
+                triangles.len(),
+                path.display()
+            ),
+            Err(e) => format!("Could not write {}: {e}", path.display()),
+        };
     }
 
     /// After the viewport is drawn: the fixtures and loads as symbols on their faces
@@ -2245,6 +2529,7 @@ impl OxydeApp {
         let heat_color = egui::Color32::from_rgb(235, 120, 25);
         let hot_color = egui::Color32::from_rgb(215, 45, 35);
         let cool_color = egui::Color32::from_rgb(40, 125, 215);
+        let keep_color = egui::Color32::from_rgb(25, 150, 150);
         if !self.simulation.started {
             return;
         }
@@ -2363,6 +2648,16 @@ impl OxydeApp {
                     ItemKind::InternalHeat { .. } => {
                         painter.circle_filled(tip, 6.0, heat_color);
                         painter.circle_filled(tip, 2.5, egui::Color32::from_rgb(255, 225, 120));
+                    }
+                    ItemKind::Preserve { .. } => {
+                        // A teal square on the face: its material stays.
+                        let square = egui::Rect::from_center_size(tip, egui::vec2(11.0, 11.0));
+                        painter.rect_filled(square, 2.0, keep_color);
+                        painter.rect_stroke(
+                            square,
+                            2.0,
+                            egui::Stroke::new(width * 0.7, egui::Color32::WHITE),
+                        );
                     }
                 }
             }
@@ -2496,8 +2791,16 @@ impl OxydeApp {
             "Plot hidden: Show Results in the panel, or a plot button".to_owned()
         } else if !s.started {
             "New Study: pick what to study in the panel".to_owned()
+        } else if let (Some(_), Some(fraction)) = (&s.shown, s.shape_fraction) {
+            format!(
+                "Cut at {:.0} % density: the shape holds {:.0} % of the volume",
+                self.prefs.simulation.shape_threshold * 100.0,
+                fraction * 100.0
+            )
         } else if s.done.is_none() {
-            if s.study.study_type.is_structural() {
+            if s.study.study_type == StudyType::Topology {
+                "Select faces, add fixtures, loads and regions to keep, then Run".to_owned()
+            } else if s.study.study_type.is_structural() {
                 "Select faces, add fixtures and loads, then Run".to_owned()
             } else {
                 "Select faces, add temperatures, heat and cooling, then Run".to_owned()
@@ -2533,10 +2836,6 @@ impl OxydeApp {
     /// The Simulation tab's buttons: New Study, then those of the open study's type.
     pub(crate) fn simulation_tab(&mut self, ui: &mut egui::Ui) {
         use crate::icons::{Icon, command_button};
-        let has_model = match &self.asm {
-            Some(asm) => !asm.leaves(&asm.assembly).is_empty(),
-            None => self.doc.part.body().is_some(),
-        };
         let running = self.simulation.job.is_some();
         // New Study, a menu of the study types, as Fusion 360's first button.
         let response = command_button(ui, Icon::NewStudy, "New Study", !running, false)
@@ -2563,6 +2862,36 @@ impl OxydeApp {
         if !self.simulation.started {
             return;
         }
+        self.study_buttons(ui);
+    }
+
+    /// The Topology tab's buttons: New Topology Study, then the open topology study's.
+    pub(crate) fn topology_tab(&mut self, ui: &mut egui::Ui) {
+        use crate::icons::{Icon, command_button};
+        let running = self.simulation.job.is_some();
+        if command_button(ui, Icon::Topology, "New Topology Study", !running, false)
+            .on_hover_text(
+                "A new topology study: the stiffest shape that keeps a share of the model's \
+                 mass under its loads",
+            )
+            .clicked()
+        {
+            self.new_study(StudyType::Topology);
+        }
+        if self.topology_study_open() {
+            self.study_buttons(ui);
+        }
+    }
+
+    /// The buttons of the open study's type: its fixtures and loads, contacts, Mesh and
+    /// Run, its plots.
+    fn study_buttons(&mut self, ui: &mut egui::Ui) {
+        use crate::icons::{Icon, command_button};
+        let has_model = match &self.asm {
+            Some(asm) => !asm.leaves(&asm.assembly).is_empty(),
+            None => self.doc.part.body().is_some(),
+        };
+        let running = self.simulation.job.is_some();
         let study_type = self.simulation.study.study_type;
         let has_faces = !self.selected_sim_faces().is_empty();
         let enabled = has_model && !running;
@@ -2624,19 +2953,37 @@ impl OxydeApp {
                 ItemKind::Pressure { mpa: 1.0 },
                 "A pressure on the selected faces, pressing into them",
             );
-            if command_button(
-                ui,
-                Icon::Gravity,
-                "Gravity",
-                enabled,
-                self.simulation.study.gravity,
-            )
-            .on_hover_text("The model's own weight, from its materials' densities, downwards (−Y)")
-            .clicked()
+            if study_type.takes_gravity()
+                && command_button(
+                    ui,
+                    Icon::Gravity,
+                    "Gravity",
+                    enabled,
+                    self.simulation.study.gravity,
+                )
+                .on_hover_text(
+                    "The model's own weight, from its materials' densities, downwards (−Y)",
+                )
+                .clicked()
             {
                 self.simulation.study.gravity = !self.simulation.study.gravity;
                 self.simulation.show_plot = false;
             }
+        }
+        if study_type == StudyType::Topology {
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            item_button(
+                self,
+                ui,
+                Icon::Preserve,
+                "Preserve Region",
+                ItemKind::Preserve { depth: 0.0 },
+                "Keep the material of the selected faces, and as deep under them as set in the \
+                 panel: mounting faces, bolt holes. The faces of fixtures and loads keep theirs \
+                 anyway",
+            );
         }
         if study_type.is_thermal() {
             if study_type.is_structural() {
@@ -2729,7 +3076,11 @@ impl OxydeApp {
                 self.cancel_simulation();
             }
         } else if command_button(ui, Icon::RunStudy, "Run", has_model, false)
-            .on_hover_text("Mesh the model and solve the study")
+            .on_hover_text(if study_type == StudyType::Topology {
+                "Mesh the model and find the stiffest shape that keeps the target mass"
+            } else {
+                "Mesh the model and solve the study"
+            })
             .clicked()
         {
             self.run_simulation(RunMode::Run);
@@ -2773,15 +3124,16 @@ impl OxydeApp {
                 PlotChoice::FactorOfSafety,
                 "The yield strength over the von Mises stress: below 1, the part yields",
             ),
+            (
+                Icon::Topology,
+                "Shape",
+                PlotChoice::Shape,
+                "The material kept: the shape cut where the density is the panel's threshold",
+            ),
         ];
         let mut show = None;
         for (icon, label, plot, hint) in plots {
-            let fits = if plot.is_thermal() {
-                study_type.is_thermal()
-            } else {
-                study_type.is_structural()
-            };
-            if !fits {
+            if !plot.fits(study_type) {
                 continue;
             }
             let available = done.is_some_and(|d| d.has(plot));
@@ -2796,6 +3148,16 @@ impl OxydeApp {
             {
                 show = Some(plot);
             }
+        }
+        let can_export = done.is_some_and(|d| d.topology.is_some());
+        if study_type == StudyType::Topology
+            && command_button(ui, Icon::ExportMesh, "Export STL", can_export, false)
+                .on_hover_text(
+                    "Write the shape as shown to an STL file: to print it, or to model a part over it",
+                )
+                .clicked()
+        {
+            self.export_shape();
         }
         if let Some(plot) = show {
             self.show_plot(Some(plot));
@@ -2821,6 +3183,14 @@ impl OxydeApp {
         let element_size = self.simulation_element_size();
         let mut action: Option<PanelAction> = None;
         let max_height = (ui.available_height() * 0.7).max(160.0);
+        if self.topology_tab_open() && !self.topology_study_open() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.topology_chooser(ui);
+            });
+            ui.add_space(4.0);
+            return;
+        }
         if !self.simulation.started {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -3004,20 +3374,25 @@ impl OxydeApp {
                         .show(ui, |ui| {
                             let mut any = false;
                             for (i, item) in study.items.iter_mut().enumerate() {
-                                if item.kind.is_fixture() {
+                                if item.kind.is_fixture()
+                                    || matches!(item.kind, ItemKind::Preserve { .. })
+                                {
                                     continue;
                                 }
                                 any = true;
                                 item_row(ui, i, item, selected, &mut action);
                             }
-                            if ui
-                                .checkbox(&mut study.gravity, "Gravity (9.81 m/s², −Y)")
-                                .on_hover_text("The model's weight, from its materials' densities")
-                                .changed()
+                            if study_type.takes_gravity()
+                                && ui
+                                    .checkbox(&mut study.gravity, "Gravity (9.81 m/s², −Y)")
+                                    .on_hover_text(
+                                        "The model's weight, from its materials' densities",
+                                    )
+                                    .changed()
                             {
                                 action.get_or_insert(PanelAction::Edited);
                             }
-                            if !any && !study.gravity {
+                            if !any && !(study.gravity && study_type.takes_gravity()) {
                                 let hint = if study_type == StudyType::ThermalStress {
                                     "Optional: the expansion loads the model. Select faces, then Force or Pressure"
                                 } else {
@@ -3026,6 +3401,38 @@ impl OxydeApp {
                                 ui.label(egui::RichText::new(hint).small().weak());
                             }
                         });
+                    }
+                    if study_type == StudyType::Topology {
+                        egui::CollapsingHeader::new("Target")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                if topology_goal_rows(ui, &mut study.topology, element_size) {
+                                    action.get_or_insert(PanelAction::Edited);
+                                }
+                            });
+                        egui::CollapsingHeader::new("Preserved regions")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                let mut any = false;
+                                for (i, item) in study.items.iter_mut().enumerate() {
+                                    if !matches!(item.kind, ItemKind::Preserve { .. }) {
+                                        continue;
+                                    }
+                                    any = true;
+                                    item_row(ui, i, item, selected, &mut action);
+                                }
+                                if !any {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "The faces of fixtures and loads keep their material. \
+                                             To keep more (mounting faces, bolt holes), select \
+                                             faces, then Preserve Region",
+                                        )
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
+                            });
                     }
                     let selected_contact = &mut self.simulation.selected_contact;
                     egui::CollapsingHeader::new("Contacts")
@@ -3272,6 +3679,37 @@ impl OxydeApp {
                                     }
                                 });
                             }
+                            if let Some(t) = done.and_then(|d| d.topology.as_ref()) {
+                                ui.label(format!(
+                                    "{:.0} % of the mass kept (the target: {:.0} %)",
+                                    t.mass_fraction() * 100.0,
+                                    study.topology.target_mass * 100.0
+                                ));
+                                ui.label(format!(
+                                    "{} times as flexible as the whole part",
+                                    format_number(
+                                        t.compliance() / t.initial_compliance.max(f64::MIN_POSITIVE)
+                                    )
+                                ))
+                                .on_hover_text(
+                                    "Its compliance (the work the loads do) over the whole \
+                                     part's: what the material taken away costs in stiffness",
+                                );
+                                let settled = if t.converged {
+                                    "settled".to_owned()
+                                } else {
+                                    "stopped at the limit: more iterations may still improve it"
+                                        .to_owned()
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} iterations, {settled}",
+                                        t.history.len()
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                            }
                             match done.and_then(|d| d.summary.map(|s| (d, s))) {
                                 Some((d, s)) => {
                                     ui.label(format!(
@@ -3329,7 +3767,8 @@ impl OxydeApp {
                             }
                             if let Some(d) = done.filter(|d| d.solved()) {
                                 let iterations = d.results.as_ref().map_or(0, |r| r.iterations)
-                                    + d.thermal.as_ref().map_or(0, |t| t.iterations);
+                                    + d.thermal.as_ref().map_or(0, |t| t.iterations)
+                                    + d.topology.as_ref().map_or(0, |t| t.solver_iterations);
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Solved in {:.1} s, {iterations} iterations, {} mesh",
@@ -3347,21 +3786,64 @@ impl OxydeApp {
                             {
                                 action = Some(PanelAction::ShowPlot(shown));
                             }
+                            if study_type == StudyType::Topology {
+                                egui::Grid::new("topology_plot")
+                                    .num_columns(2)
+                                    .spacing([10.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.label("Threshold");
+                                        ui.add(
+                                            egui::Slider::new(&mut p.shape_threshold, 0.05..=0.95)
+                                                .fixed_decimals(2),
+                                        )
+                                        .on_hover_text(
+                                            "Where the shape is cut: material denser than this is \
+                                             kept. Higher gives a lighter, thinner shape",
+                                        );
+                                        ui.end_row();
+                                        ui.label("");
+                                        ui.checkbox(&mut p.smooth_shape, "Smooth");
+                                        ui.end_row();
+                                        ui.label("");
+                                        ui.checkbox(&mut p.show_original, "Show the whole part");
+                                        ui.end_row();
+                                    });
+                                if let Some(f) = self.simulation.shape_fraction {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "The shape holds {:.0} % of the volume",
+                                            f * 100.0
+                                        ))
+                                        .small(),
+                                    );
+                                }
+                                if ui
+                                    .add_enabled(
+                                        done.is_some_and(|d| d.topology.is_some()),
+                                        egui::Button::new("Export STL…"),
+                                    )
+                                    .on_hover_text(
+                                        "Write the shape as shown to an STL file: to print it, \
+                                         or to model a part over it",
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(PanelAction::ExportShape);
+                                }
+                            } else {
                             egui::Grid::new("simulation_plot")
                                 .num_columns(2)
                                 .spacing([10.0, 4.0])
                                 .show(ui, |ui| {
                                     ui.label("Plot");
                                     // The plots of the study's type.
-                                    let fits = |c: PlotChoice| {
-                                        if c.is_thermal() {
-                                            study_type.is_thermal()
-                                        } else {
-                                            study_type.is_structural()
-                                        }
-                                    };
+                                    let fits = |c: PlotChoice| c.fits(study_type);
+                                    // The plot shown, else the one chosen if the study
+                                    // has it, else its first.
                                     let shown = done
                                         .and_then(|d| d.plot_for(p.plot))
+                                        .or_else(|| Some(p.plot).filter(|c| fits(*c)))
+                                        .or_else(|| PlotChoice::ALL.into_iter().find(|c| fits(*c)))
                                         .unwrap_or(p.plot);
                                     egui::ComboBox::from_id_salt("simulation_plot_choice")
                                         .selected_text(shown.label())
@@ -3419,6 +3901,7 @@ impl OxydeApp {
                                     ui.checkbox(&mut p.show_mesh, "Show the mesh");
                                     ui.end_row();
                                 });
+                            }
                         });
                 });
         });
@@ -3439,6 +3922,7 @@ impl OxydeApp {
                 self.save_study(false);
             }
             Some(PanelAction::OpenResults) => self.open_results(),
+            Some(PanelAction::ExportShape) => self.export_shape(),
             Some(PanelAction::SaveResults) => {
                 self.save_results(true);
             }
@@ -3571,6 +4055,8 @@ enum PanelAction {
     SaveStudy,
     OpenResults,
     SaveResults,
+    /// Export a topology study's shape as STL.
+    ExportShape,
     /// A contact picked: its faces selected.
     SelectContact(usize),
     DeleteContact(usize),
@@ -3797,10 +4283,237 @@ fn item_row(
                     .changed();
             });
         }
+        ItemKind::Preserve { depth } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(depth)
+                            .range(0.0..=1e4)
+                            .speed(0.1)
+                            .prefix("depth ")
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text(
+                        "How deep under the faces the material stays; 0 keeps the elements on them",
+                    )
+                    .changed();
+            });
+        }
     }
     if changed {
         action.get_or_insert(PanelAction::Edited);
     }
+}
+
+/// A topology study's target mass, thinnest member, iterations and manufacturing controls
+/// (symmetry planes, a pull direction); whether one changed. `element_size` is the mesh's,
+/// to start a typed member size from.
+fn topology_goal_rows(
+    ui: &mut egui::Ui,
+    goal: &mut TopologyGoal,
+    element_size: Option<f64>,
+) -> bool {
+    let mut changed = false;
+    egui::Grid::new("topology_goal")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Mass to keep");
+            let mut percent = goal.target_mass * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut percent)
+                        .range(1.0..=99.0)
+                        .speed(0.5)
+                        .max_decimals(1)
+                        .suffix(" %"),
+                )
+                .on_hover_text(
+                    "The share of the model's mass the shape keeps; the rest is taken where the \
+                     loads need it least",
+                )
+                .changed()
+            {
+                goal.target_mass = percent / 100.0;
+                changed = true;
+            }
+            ui.end_row();
+            ui.label("Thinnest member");
+            ui.horizontal(|ui| match goal.member_size.as_mut() {
+                Some(size) => {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(size)
+                                .range(0.01..=1e4)
+                                .speed(0.1)
+                                .max_decimals(2)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text(
+                            "No bar or wall of the shape comes out thinner than about this; it \
+                             cannot be finer than three elements",
+                        )
+                        .changed();
+                    if ui
+                        .small_button("Automatic")
+                        .on_hover_text("As fine as the mesh allows: about three elements")
+                        .clicked()
+                    {
+                        goal.member_size = None;
+                        changed = true;
+                    }
+                }
+                None => {
+                    ui.label(egui::RichText::new("from the mesh").small().weak());
+                    if ui
+                        .small_button("Set")
+                        .on_hover_text("Type the thinnest member wanted, for a sturdier shape")
+                        .clicked()
+                    {
+                        let h = element_size.unwrap_or(1.0);
+                        goal.member_size = Some((4.0 * h * 100.0).round() / 100.0);
+                        changed = true;
+                    }
+                }
+            });
+            ui.end_row();
+            ui.label("Iterations");
+            changed |= ui
+                .add(egui::DragValue::new(&mut goal.iterations).range(1..=1000))
+                .on_hover_text(
+                    "At most; each is a static solve. The optimization stops sooner once the \
+                     shape has settled",
+                )
+                .changed();
+            ui.end_row();
+            changed |= manufacturing_rows(ui, goal);
+        });
+    changed
+}
+
+/// The axes' names, for the planes' positions and the pull directions.
+const AXES: [&str; 3] = ["X", "Y", "Z"];
+
+/// A topology study's symmetry planes and pull direction, as rows of the Target grid;
+/// whether one changed.
+fn manufacturing_rows(ui: &mut egui::Ui, goal: &mut TopologyGoal) -> bool {
+    let mut changed = false;
+    ui.label("Symmetry");
+    ui.horizontal(|ui| {
+        for (on, name) in goal.symmetry.iter_mut().zip(["Right", "Top", "Front"]) {
+            changed |= ui
+                .checkbox(on, name)
+                .on_hover_text(format!(
+                    "Mirror the shape across the {name} plane, or the plane parallel to it at \
+                     the position below, whatever the loads; the kept regions are mirrored too"
+                ))
+                .changed();
+        }
+    });
+    ui.end_row();
+    if goal.symmetry.contains(&true) {
+        ui.label("Planes at");
+        ui.horizontal(|ui| {
+            let planes = goal.symmetry_point.iter_mut().zip(goal.symmetry).zip(AXES);
+            for ((at, _), axis) in planes.filter(|((_, on), _)| *on) {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(at)
+                            .speed(0.1)
+                            .max_decimals(3)
+                            .prefix(format!("{axis} "))
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text("Where the plane crosses its axis; 0 for the standard plane")
+                    .changed();
+            }
+        });
+        ui.end_row();
+    }
+    ui.label("Pull direction");
+    // The six directions along the axes; another one, read from a file, is shown as it is.
+    let axis_of = |d: [f64; 3]| -> Option<(usize, f64)> {
+        let mut along = d.iter().enumerate().filter(|(_, v)| **v != 0.0);
+        match (along.next(), along.next()) {
+            (Some((a, v)), None) => Some((a, v.signum())),
+            _ => None,
+        }
+    };
+    let label = |d: Option<[f64; 3]>| match d {
+        None => "None".to_owned(),
+        Some(d) => axis_of(d)
+            .and_then(|(a, sign)| {
+                let name = AXES.get(a)?;
+                Some(format!(
+                    "{}{name}",
+                    if sign > 0.0 { "+" } else { "\u{2212}" }
+                ))
+            })
+            .unwrap_or_else(|| "Custom".to_owned()),
+    };
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("topology_pull")
+            .selected_text(label(goal.pull))
+            .show_ui(ui, |ui| {
+                let along = (0..3).flat_map(|a| {
+                    [1.0, -1.0]
+                        .map(|sign| Some(std::array::from_fn(|b| if b == a { sign } else { 0.0 })))
+                });
+                for choice in std::iter::once(None).chain(along) {
+                    let selected = goal.pull.and_then(axis_of) == choice.and_then(axis_of)
+                        && goal.pull.is_some() == choice.is_some();
+                    if ui.selectable_label(selected, label(choice)).clicked() && !selected {
+                        goal.pull = choice;
+                        changed = true;
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "The direction a mould is pulled off the shape along: going that way the shape \
+                 never widens, so it has no undercut, as if it stood on its far side",
+            );
+        if goal.pull.is_some() {
+            let mut both = goal.parting.is_some();
+            if ui
+                .checkbox(&mut both, "Both ways")
+                .on_hover_text(
+                    "A two-part mould: pulled off both ways from a parting plane across the \
+                     direction, the shape never widening going away from it",
+                )
+                .changed()
+            {
+                goal.parting = both.then_some(goal.symmetry_point);
+                changed = true;
+            }
+        }
+    });
+    ui.end_row();
+    // A two-way pull along an axis: where its parting plane crosses it.
+    let parting = goal
+        .pull
+        .and_then(axis_of)
+        .zip(goal.parting.as_mut())
+        .and_then(|((a, _), p)| Some((p.get_mut(a)?, AXES.get(a)?)));
+    if let Some((at, axis)) = parting {
+        ui.label("Parting plane at");
+        changed |= ui
+            .add(
+                egui::DragValue::new(at)
+                    .speed(0.1)
+                    .max_decimals(3)
+                    .prefix(format!("{axis} "))
+                    .suffix(" mm"),
+            )
+            .on_hover_text(
+                "Where the parting plane crosses the pull's axis; on a symmetry plane across \
+                 the pull, it must be that plane",
+            )
+            .changed();
+        ui.end_row();
+    }
+    changed
 }
 
 /// A transient study's time settings; whether one changed.
@@ -4175,6 +4888,11 @@ enum SolveInput {
         /// °C.
         reference: f64,
     },
+    /// The static study solved again and again as material is taken away.
+    Topology {
+        study: TopologyStudy,
+        materials: Vec<Elastic>,
+    },
 }
 
 impl SolveInput {
@@ -4183,6 +4901,7 @@ impl SolveInput {
         match self {
             SolveInput::Static { study, .. } => study.contacts = contacts,
             SolveInput::Thermal { study, .. } => study.contacts = contacts,
+            SolveInput::Topology { study, .. } => study.study.contacts = contacts,
             SolveInput::ThermalStress { thermal, study, .. } => {
                 thermal.contacts = contacts.clone();
                 study.contacts = contacts;
@@ -4354,6 +5073,7 @@ fn study_thread(
             report,
             results: None,
             thermal: None,
+            topology: None,
             mesh_seconds,
             solve_seconds: 0.0,
             candidates,
@@ -4404,7 +5124,7 @@ fn study_thread(
         other => format!("The study failed: {other}"),
     };
     let options = SolveOptions::default();
-    let (results, thermal) = match &solve {
+    let (results, thermal, topology) = match &solve {
         SolveInput::Static { study, materials } => {
             let r = oxyde_sim::solve(
                 &mesh,
@@ -4415,7 +5135,16 @@ fn study_thread(
                 &solving(0.0, 1.0),
             )
             .map_err(static_error)?;
-            (Some(r), None)
+            (Some(r), None, None)
+        }
+        SolveInput::Topology { study, materials } => {
+            let optimizing = |f: f64| report_progress("Optimizing", span + (1.0 - span) * f);
+            let t = oxyde_sim::optimize(&mesh, materials, study, &options, cancel, &optimizing)
+                .map_err(|e| match e {
+                    oxyde_sim::TopologyError::Solve(e) => static_error(e),
+                    other => capitalized(&other.to_string()),
+                })?;
+            (None, None, Some(t))
         }
         SolveInput::Thermal { study, materials } => {
             let t = oxyde_sim::solve_thermal(
@@ -4427,7 +5156,7 @@ fn study_thread(
                 &solving(0.0, 1.0),
             )
             .map_err(thermal_error)?;
-            (None, Some(t))
+            (None, Some(t), None)
         }
         SolveInput::ThermalStress {
             thermal,
@@ -4459,7 +5188,7 @@ fn study_thread(
                 &solving(0.4, 1.0),
             )
             .map_err(static_error)?;
-            (Some(r), Some(t))
+            (Some(r), Some(t), None)
         }
     };
     Ok(Outcome {
@@ -4467,12 +5196,110 @@ fn study_thread(
         report,
         results,
         thermal,
+        topology,
         mesh_seconds,
         solve_seconds: start.elapsed().as_secs_f64(),
         candidates,
         mesher,
         note,
     })
+}
+
+/// Rounds of smoothing a topology study's shape gets, shown and exported.
+const SHAPE_SMOOTHING: usize = 8;
+/// The shape's colour, and the whole model's faint one around it.
+const SHAPE_COLOR: [u8; 3] = [110, 165, 225];
+const GHOST_COLOR: [u8; 3] = [200, 205, 212];
+const GHOST_OPACITY: f32 = 0.12;
+
+/// A topology study's shape as a scene: the surface where the density is `threshold`, in
+/// one colour, and the whole model faintly around it when `ghost`; with the share of the
+/// mesh's volume the shape holds.
+fn shape_scene(
+    mesh: &TetMesh,
+    density: &[f64],
+    threshold: f64,
+    smooth: bool,
+    ghost: bool,
+) -> (Scene, f64) {
+    let shape = oxyde_sim::shape(
+        mesh,
+        density,
+        threshold,
+        if smooth { SHAPE_SMOOTHING } else { 0 },
+    );
+    let fraction = shape.volume() / mesh.volume().max(f64::MIN_POSITIVE);
+    let mut faces = faces_by_label(&shape.positions, &shape.triangles, &shape.labels);
+    let mut materials = vec![
+        RenderMaterial {
+            color: Some(SHAPE_COLOR),
+            ..RenderMaterial::default()
+        };
+        faces.len()
+    ];
+    if ghost {
+        let triangles: Vec<[u32; 3]> = mesh.facets.iter().map(|f| mesh.facet_corners(f)).collect();
+        let labels: Vec<u32> = mesh.facets.iter().map(|f| f.label).collect();
+        let around = faces_by_label(&mesh.nodes, &triangles, &labels);
+        materials.extend(std::iter::repeat_n(
+            RenderMaterial {
+                color: Some(GHOST_COLOR),
+                opacity: GHOST_OPACITY,
+                ..RenderMaterial::default()
+            },
+            around.len(),
+        ));
+        faces.extend(around);
+    }
+    let mut scene = Scene::from_mesh(&Mesh {
+        faces,
+        edges: Vec::new(),
+    });
+    scene.set_materials(materials, Vec::new());
+    (scene, fraction)
+}
+
+/// Triangles grouped into faces by label, each face with points of its own: the model's
+/// faces are shaded flat to their edges, as in the model, and the cut through the material
+/// (`NO_LABEL`, last) smoothly.
+fn faces_by_label(positions: &[[f64; 3]], triangles: &[[u32; 3]], labels: &[u32]) -> Vec<FaceMesh> {
+    let mut groups: BTreeMap<u32, (FaceMesh, BTreeMap<u32, u32>)> = BTreeMap::new();
+    for (t, &label) in triangles.iter().zip(labels) {
+        let (face, local) = groups.entry(label).or_insert_with(|| {
+            (
+                FaceMesh {
+                    positions: Vec::new(),
+                    triangles: Vec::new(),
+                },
+                BTreeMap::new(),
+            )
+        });
+        let corners = t.map(|i| {
+            *local.entry(i).or_insert_with(|| {
+                let p = positions.get(i as usize).copied().unwrap_or_default();
+                face.positions.push(p.map(|v| v as f32));
+                (face.positions.len() - 1) as u32
+            })
+        });
+        face.triangles.push(corners);
+    }
+    groups.into_values().map(|(face, _)| face).collect()
+}
+
+/// One line on a topology study's outcome, for the status bar.
+fn topology_summary(t: &TopologyResults, seconds: f64) -> String {
+    let flexible = t.compliance() / t.initial_compliance.max(f64::MIN_POSITIVE);
+    format!(
+        "Topology optimized in {seconds:.1} s: {:.0} % of the mass kept, {} times as flexible as the whole part, {} iterations{}",
+        t.mass_fraction() * 100.0,
+        format_number(flexible),
+        t.history.len(),
+        if t.converged {
+            ""
+        } else {
+            " (the limit: the shape may still change)"
+        }
+    )
 }
 
 /// `text` with its first letter in capitals, for a message of its own.
@@ -4500,6 +5327,11 @@ mod tests {
         let partial: SimulationPrefs = serde_json::from_str(r#"{ "bands": 8 }"#).unwrap();
         assert_eq!(partial.bands, 8);
         assert!(partial.deformed);
+        // Preferences saved before topology studies get their settings.
+        assert_eq!(partial.shape_threshold, 0.5);
+        assert!(partial.smooth_shape && partial.show_original);
+        let shape: SimulationPrefs = serde_json::from_str(r#"{ "plot": "shape" }"#).unwrap();
+        assert_eq!(shape.plot, PlotChoice::Shape);
     }
 
     #[test]
@@ -4570,8 +5402,42 @@ mod tests {
         study.add(ItemKind::Fixed, Vec::new());
         study.add(ItemKind::Pressure { mpa: 1.0 }, Vec::new());
         study.add(ItemKind::Fixed, Vec::new());
+        study.add(ItemKind::Preserve { depth: 2.0 }, Vec::new());
         let names: Vec<&str> = study.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["Fixed-1", "Pressure-1", "Fixed-2"]);
+        assert_eq!(names, ["Fixed-1", "Pressure-1", "Fixed-2", "Preserve-1"]);
+        // Read back from a file, the counters go on from the names.
+        study.made.clear();
+        study.recount();
+        study.add(ItemKind::Preserve { depth: 0.0 }, Vec::new());
+        assert_eq!(study.items[4].name, "Preserve-2");
+    }
+
+    #[test]
+    fn a_topology_study_takes_fixtures_loads_and_preserved_regions_but_no_gravity() {
+        let t = StudyType::Topology;
+        assert!(ItemKind::Fixed.fits(t) && ItemKind::Pressure { mpa: 1.0 }.fits(t));
+        assert!(ItemKind::Preserve { depth: 1.0 }.fits(t));
+        assert!(!ItemKind::Temperature { celsius: 20.0 }.fits(t));
+        assert!(!ItemKind::Preserve { depth: 1.0 }.fits(StudyType::Static));
+        assert!(!t.takes_gravity() && StudyType::Static.takes_gravity());
+        // Its plot is the shape; the stress plots are the others'.
+        assert!(PlotChoice::Shape.fits(t) && !PlotChoice::VonMises.fits(t));
+        assert!(!PlotChoice::Shape.fits(StudyType::Static));
+        let study = Study::of_type(t, "Topology 1");
+        assert_eq!(study.topology, TopologyGoal::default());
+        assert!(study.topology.target_mass > 0.0 && study.topology.target_mass < 1.0);
+    }
+
+    #[test]
+    fn a_shape_scene_holds_the_shape_and_the_model_around_it() {
+        let mesh = TetMesh::structured_box([0.0; 3], [10.0, 4.0, 2.0], [5, 2, 1]);
+        let density: Vec<f64> = (0..mesh.tets.len())
+            .map(|e| if e < mesh.tets.len() / 2 { 1.0 } else { 0.0 })
+            .collect();
+        let (_, fraction) = shape_scene(&mesh, &density, 0.5, true, true);
+        assert!(fraction > 0.2 && fraction < 0.8, "{fraction}");
+        let (_, all) = shape_scene(&mesh, &vec![1.0; mesh.tets.len()], 0.5, false, false);
+        assert!((all - 1.0).abs() < 1e-9, "{all}");
     }
 
     #[test]

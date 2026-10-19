@@ -118,6 +118,11 @@ pub enum Icon {
     Safety,
     /// New Study: a study sheet with a green plus.
     NewStudy,
+    /// Topology: a bracket hollowed into a truss inside the dashed outline of the block it
+    /// was.
+    Topology,
+    /// Preserve Region: a block with its top face kept, and a padlock.
+    Preserve,
     /// Temperature: a thermometer, red.
     Temperature,
     /// Heat Power: orange arrows into a block, a flame.
@@ -174,6 +179,8 @@ const HEAT: Color32 = Color32::from_rgb(235, 120, 25);
 const HOT: Color32 = Color32::from_rgb(220, 45, 35);
 /// A fluid carrying heat away.
 const COOL: Color32 = Color32::from_rgb(40, 125, 215);
+/// Material a topology study keeps.
+const KEEP: Color32 = Color32::from_rgb(25, 150, 150);
 const WHITE: Color32 = Color32::WHITE;
 
 /// Draws on the 24-unit grid of one icon.
@@ -1187,6 +1194,72 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.line(&[(14.0, 17.0), (20.0, 17.0)], 2.2, WHITE);
             pen.line(&[(17.0, 14.0), (17.0, 20.0)], 2.2, WHITE);
         }
+        Topology => {
+            // The block it was, dashed, and what is left of it: a wall where it is held,
+            // two arms meeting at the loaded tip, a strut between them.
+            pen.dashed(
+                &[
+                    (2.0, 4.0),
+                    (22.0, 4.0),
+                    (22.0, 20.0),
+                    (2.0, 20.0),
+                    (2.0, 4.0),
+                ],
+                1.0,
+                INK,
+                2.0,
+                1.6,
+            );
+            pen.poly(
+                &[(2.0, 4.0), (5.5, 4.0), (5.5, 20.0), (2.0, 20.0)],
+                BODY,
+                INK,
+            );
+            pen.poly(
+                &[
+                    (5.5, 4.0),
+                    (9.0, 4.0),
+                    (22.0, 10.5),
+                    (22.0, 13.5),
+                    (5.5, 8.5),
+                ],
+                BODY_TOP,
+                INK,
+            );
+            pen.poly(
+                &[
+                    (5.5, 20.0),
+                    (9.0, 20.0),
+                    (22.0, 13.5),
+                    (22.0, 10.5),
+                    (5.5, 15.5),
+                ],
+                BODY_SIDE,
+                INK,
+            );
+            pen.poly(
+                &[(10.0, 7.8), (12.5, 9.0), (12.5, 15.0), (10.0, 16.2)],
+                BODY,
+                INK,
+            );
+        }
+        Preserve => {
+            pen.block(3.0, 11.0, 12.0, 9.0, 5.0, [KEEP, BODY, BODY_SIDE]);
+            // A padlock: its shackle, then its body.
+            pen.line(
+                &Pen::arc_points(18.5, 9.0, 2.6, 2.8, PI, 2.0 * PI),
+                1.8,
+                INK,
+            );
+            pen.line(&[(15.9, 9.0), (15.9, 10.5)], 1.8, INK);
+            pen.line(&[(21.1, 9.0), (21.1, 10.5)], 1.8, INK);
+            pen.poly(
+                &[(14.5, 10.5), (22.5, 10.5), (22.5, 17.0), (14.5, 17.0)],
+                ACCENT,
+                INK,
+            );
+            pen.circle(18.5, 13.5, 1.1, INK, None);
+        }
         Temperature => {
             // A thermometer: the tube, the bulb, the red column.
             pen.poly(
@@ -1535,7 +1608,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 95] = {
+pub const ALL: [Icon; 97] = {
     use Icon::*;
     [
         Sketch,
@@ -1609,6 +1682,8 @@ pub const ALL: [Icon; 95] = {
         Displacement,
         Safety,
         NewStudy,
+        Topology,
+        Preserve,
         Temperature,
         HeatPower,
         HeatFlux,
