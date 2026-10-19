@@ -1520,7 +1520,7 @@ impl Cutter<'_> {
 
 /// Taubin's λ|μ smoothing: a shrinking Laplacian step, then a growing one, `rounds` times,
 /// over the points not `fixed`.
-fn smooth(shape: &mut Shape, fixed: &[bool], rounds: usize) {
+pub(crate) fn smooth(shape: &mut Shape, fixed: &[bool], rounds: usize) {
     let n = shape.positions.len();
     let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); n];
     for t in &shape.triangles {

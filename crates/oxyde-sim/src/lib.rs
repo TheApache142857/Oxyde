@@ -18,6 +18,10 @@
 //! - [`topology`] optimizes a static study's shape: the stiffest one that keeps a given
 //!   share of the mass (SIMP densities, a density filter, optimality criteria), and cuts
 //!   it out of the mesh as a closed surface.
+//! - [`generative`] grows shapes between bodies to keep and bodies to stay clear of
+//!   (generative design, as Fusion 360 has it), on a grid of voxels solved by geometric
+//!   multigrid, for a material and a way of making them, and cuts them out as smooth
+//!   closed surfaces.
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
 //! - [`material`] holds the elastic properties, and a guess of them from a material's
@@ -53,6 +57,7 @@
 mod amg;
 mod bvh;
 pub mod contact;
+pub mod generative;
 pub mod material;
 mod math;
 pub mod mesh;

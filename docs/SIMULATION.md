@@ -558,3 +558,213 @@ Still to do: a stress limit as well as a mass target, a projection of the densit
 crisper shapes (which should also make shapes pulled in the plane of bending solid or void),
 a pull direction picked from a face or an edge (the file takes any vector, the panel offers
 the axes), and promoting the shape into a part rather than exporting it.
+
+## 9. Generative design
+
+**Decided (October 2026, the owner):** a *Generative Design* tab like Fusion 360's
+generative design workspace takes the Topology tab's place. Topology studies (§8) stay a
+study type in the Simulation tab's *New Study*, as Fusion 360 keeps shape optimization in
+its Simulation workspace, and documents holding them open as before. The first objective is
+the stiffest shape for a mass target, each outcome's factor of safety reported; the lightest
+shape for a factor of safety comes next. An outcome becomes a new part (a faceted solid, the
+preserve bodies exact) or a mesh file. Studies are saved as a `generative` type in the
+`.oxysim` and their outcomes in its `.oxyres` (FORMAT.md §8–§9, `format_version` 4).
+
+**Why topology studies were not it.** A topology study carves the part that was modelled:
+the shape stays inside it, and at half its mass it reads as that part with holes in it.
+Generative design starts from what has to be there and nothing more (the faces things bolt
+to, the room other things need, the space between them empty) and grows material through
+that space. The branching, organic shapes Fusion 360 is known for come from that: a space
+much larger than what is kept (a tenth of it or less), solved on a fine grid, cut by a
+smooth surface.
+
+**What the user sets up**, as in Fusion 360, whose help is the reference for names and
+behaviour:
+
+- **The design space**, from bodies of the part, each given a role and drawn in its colour.
+  *Preserve* bodies (green) are kept as they are: bosses, rings round bolt holes, pads.
+  *Obstacle* bodies (red, see-through) are where no material may go: bolts, a shaft, the
+  room a tool or a neighbouring part needs, each with an *offset* that grows it. A *Starting
+  Shape* body (yellow, optional) is where the material starts. Bodies with no role are left
+  out. Without a starting shape, material may go anywhere in the box around the preserve
+  bodies, grown on every side by a margin (a tenth of the box's largest side by default);
+  with one, only inside it. Fusion 360 starts from a bounding box too, or from the starting
+  shape instead; its help does not say whether outcomes may leave the starting shape, and
+  keeping them inside makes it a design space one can model. Obstacles only take material
+  away, so they should reach past the box (Fusion's help gives the same advice).
+- **Design conditions:** *Fixed Geometry*, *Roller/Slider*, *Force* and *Pressure*, as in a
+  static study, on faces of preserve bodies: Fusion 360 asks for them there too, and
+  *Generate* refuses a fixture or a load elsewhere. No gravity, as in topology studies.
+  Load cases (several sets of loads, the stiffest shape for all of them) come later.
+- **Objective and limits:** *Maximize stiffness* for a *mass target* in kg: the whole
+  outcome's mass, preserve bodies included, the same for every material (Fusion 360's
+  target is a mass too, not a share). A target under the preserve bodies' mass or over the
+  whole design space's is refused. A *safety factor* (2 by default) that each outcome's
+  estimated factor of safety is held against in the results; it becomes a limit with
+  *Minimize mass*.
+- **Manufacturing:** one or more methods, each with outcomes of its own. *Unrestricted*.
+  *Additive*, with a build direction (+X, +Y, +Z, −X, −Y, −Z, any of them, a set of outcomes
+  for each, as in Fusion 360) and an overhang angle (45°, the only one at first). *2-axis
+  cutting* along X, Y or Z: the shape the same all along it, a profile a water jet or a laser
+  cuts. *Casting*, with an ejection direction, one way or both ways from a parting plane
+  through a point (the topology studies' pull direction). For the whole study, the *minimum
+  thickness* and *symmetry* planes, as in topology studies. Milling (2.5, 3 and 5 axes, with
+  tool directions and diameter) comes later. Directions are the axes for now, since the grid
+  is aligned with them.
+- **Materials:** one or more, copied from the library into the study; every material is
+  tried with every method and direction, each pair an *outcome*. None listed: the part's
+  own.
+- **Settings:** the resolution (the grid's voxel size, from coarse to fine as a mesh's
+  density is, or typed in mm) and the iteration limit.
+
+*Generate* runs the outcomes one after another in the background on this computer (Fusion
+360 sends them to Autodesk's servers), each shown as it finishes; *Stop* keeps the finished
+ones. *Explore* lists them as cards with a picture, the material and method, the mass, the
+largest displacement and the estimated factor of safety, sortable, beside a plot of mass
+against displacement. The outcome picked is drawn in the viewport with a slider through its
+iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ or 3MF.
+
+**How it works** (`oxyde_sim::generative`, pure Rust, no new dependency):
+
+- **The grid.** The design space's box cut into cubic voxels, placed so that the symmetry
+  planes fall between voxels, which makes the mirror exact. Each voxel is *preserve* (its
+  centre inside a preserve body, or a fixture's or a load's face passing through it),
+  *obstacle* (its centre inside an obstacle grown by its offset: never material), *outside*
+  (out of the starting shape: never material) or *design*. Inside is decided from the bodies'
+  tessellations by the lattice mesher's parity test (`mesher.rs`). An obstacle over a
+  preserve body is refused.
+- **The elements:** eight-node bricks, trilinear and all alike, so one 24 × 24 stiffness per
+  material, scaled for each voxel by `E_min + ρ̄³ (E − E_min)`, `E_min` a millionth of `E`
+  (SIMP, as in §8). No matrix is assembled at the finest level: each brick's product is
+  worked out once, by the columns of its stiffness (the rows' sums side by side, which the
+  compiler vectorises), into a buffer kept from one product to the next, then summed at each
+  node in the order of its corners, so the sums are the same on any number of threads.
+  Gathered node by node instead, each node working out its own rows of the eight bricks
+  around it, a product took twice as long. Memory goes as a few numbers per voxel, not as a
+  matrix's nonzeros. Void voxels stay bricks, at a millionth of the stiffness. Making them
+  springs at their corners (their bricks' diagonals) instead, to skip their products, was
+  tried: springs hold to the ground, a void continuum does not, and with two hundred
+  thousand of them the optimizer spread specks of material through the box near the
+  loaded ring to lean on them, a load path to nowhere as stiff as the bracket itself, at
+  twice the mass target.
+- **The solve:** conjugate gradients to a residual of 10⁻⁵ of the loads, preconditioned by
+  geometric multigrid on the grid's own levels, each halving the one above along every axis
+  with two voxels or more, down to a couple of hundred nodes factored densely; each
+  optimization iteration starts from the last displacements. The coarse levels are Galerkin
+  products, exact for nested trilinear grids: each coarse cell's 24 × 24 matrix is its eight
+  children's seen through the interpolation, worked out one coarse cell at a time and kept in
+  single precision (it only preconditions). They carry the fixtures down with no special
+  case; averaged moduli were not tried. Fixtures project: a held node keeps only the motions its fixtures allow (`P`),
+  the operator is `P K P + d (I − P)`, `d` the node's own stiffness (so the coarse levels
+  see the held directions at the right scale), and conjugate gradients stay in the allowed
+  motions. Smoothing is Chebyshev's on block Jacobi, degree 2, the finest level's interval
+  bounded by the brick's own (no assembly of bricks has a larger top of `D⁻¹K` than one
+  brick), the coarse levels' found by 20 power iterations from a pseudo-random start, with
+  a fifth to spare. From a smooth start, a mode held to a few nodes can be missed: with
+  coarse cells over void left out (tried with the springs above), one was, the smoother
+  amplified it, and conjugate gradients went from about 40 iterations to hundreds.
+- **Fixtures and loads** act through samples of their faces every half voxel. Each sample
+  lands in the voxel holding it, made a preserve voxel (a thin preserve body has no voxel
+  centre in it), or, in an obstacle voxel, in the nearest preserve voxel around. A fixture
+  holds that voxel's corner nearest the sample (a roller only along the face's normal, two
+  directions where its faces meet at an angle); a load spreads its sample's share of the
+  force, by area, over the voxel's corners by trilinear weights.
+- **The optimization:** §8's density filter over the voxels that are not void (its radius
+  half the minimum thickness, 1.5 voxels at least; across the cut only for 2-axis cutting,
+  so whole columns stay alike), then a smoothed Heaviside projection, `η` 0.5 and `β` from 1,
+  doubled when no design density moves by 0.01 or after 25 iterations, up to 32, so that the
+  shape comes out solid or void, not grey. Optimality criteria as in §8 (moves of 0.2, then
+  0.1 from `β` 8; design densities kept over 0.001 so that any can come back), the mass
+  target met by the projected densities, linearised at each iteration: it is met once the
+  design settles. The design starts uniform at the density whose projection weighs the
+  target. Settled, at `β` 32: no design density moving by 0.01, or, as the densities go back
+  and forth at the move limit once the shape is crisp, the compliance steady to 0.1 % over
+  ten iterations with the mass on target to 1 %. The projection is also what §8's shapes
+  pulled in the plane of bending lack.
+- **Manufacturing on the grid:** symmetry ties each voxel's design to its mirror images (one
+  value, the slopes summed); 2-axis cutting keeps one value per column along the direction;
+  casting caps each voxel at the one behind it along the direction (§8's pull, the
+  neighbour exact on a grid); additive applies Langelaar's filter (2016, 2017): a layer is
+  printed only where the 3 × 3 voxels under it hold it up, smoothly, with its adjoint for the
+  slopes, and the first layer stands on the build plate.
+- **Each outcome** keeps its densities at the end and every tenth iteration (one byte per
+  voxel, as the files keep them: the densities before the projection, which the surface is
+  cut from, below), its history (compliance, mass, largest change), its mass,
+  its compliance (the work of the loads on the displacements solved) and largest
+  displacement, and an estimate of its largest von Mises stress and smallest factor of
+  safety at the centres of its solid voxels, leaving out those the fixtures and loads act
+  through, where stress is singular. Voxel corners concentrate stress, so the estimate is
+  rough: *Create Part* and a static study give the exact one.
+- **The surface:** the densities before the projection cut at half (where the projected
+  ones are half too: the projection keeps half where it is) by marching tetrahedra on the
+  lattice through the voxels' centres, a layer of empty ones all around, each cell cut along
+  its Kuhn split (no ambiguous case, a closed surface, as §8's shape). The projected
+  densities are all but 0 or 1, so a surface cut from them passes midway between every
+  solid voxel and its void neighbour and steps from voxel to voxel, which twelve rounds of
+  smoothing did not hide; before the projection they vary smoothly over the filter's
+  radius and place it between the centres. On the lattice through the centres a member one
+  voxel thin keeps its place; cut at the voxels' corners (densities averaged there, as §8
+  does on its elements), such a member vanished, every corner of it at half, and a test
+  bracket's surface held half its material. The threshold, 127.5, is no byte, so no
+  triangle is flat. Then Taubin's smoothing, every point free. The preserve bodies are drawn
+  exact over it.
+- **Create Part:** the surface decimated (quadric edge collapse) to as many triangles as the
+  kernel handles well, sewn into a solid by a new `Kernel` operation (a solid from a closed
+  triangle mesh, ARCHITECTURE.md §4), fused with the exact preserve bodies, the obstacles cut
+  away, and written as STEP into a new part's *Imported* feature, kept as an imported STEP
+  file is: no change to `.oxyprt`. If the fuse fails, the outcome and the preserve bodies
+  stay separate bodies of the part.
+
+**Order of the work**, each step a commit with its tests and documents:
+
+1. The engine: the grid from bodies, the bricks, multigrid, SIMP with the filter and the
+   projection, the controls on the grid (symmetry, cutting, casting), the surface. Tests in
+   `oxyde-sim` (grids from boxes) and `oxyde-tests` (a bracket whose preserve bosses and
+   obstacles are modelled through OpenCASCADE), and an ignored timing test that sets the
+   resolution's range and picks the coarse levels.
+2. The files: the `generative` study and its results (FORMAT.md §8–§9, version 4), with
+   round trips.
+3. The tab: the Topology tab becomes Generative Design; setting up, *Generate*, *Explore*
+   with its plot, *Export*.
+4. *Create Part*.
+5. Additive, and load cases.
+6. *Minimize mass* for a safety factor (a stress limit aggregated by a p-norm, the method of
+   moving asymptotes in place of optimality criteria), a displacement limit, milling, and
+   assemblies.
+
+**Built (October 2026): step 1**, the engine, `oxyde_sim::generative` (`Grid::build`,
+`generate`, `surface`, `voxel_size`), not yet in the application.
+
+- **Tests** in `oxyde-sim`: the brick (rigid motions cost nothing, a uniform strain what the
+  material says); the operator (its cells' matrices summed, symmetric, a roller and a nearly
+  void cell among them); conjugate gradients against a dense solve, and, with a slab of
+  nearly void voxels every fourth, in under 80 iterations and the same on one thread and on
+  eight; grids from boxes (pads and an obstacle grown by its offset sorted to the voxel, a
+  box made symmetric about a plane off its middle, a starting shape, the held face's nodes,
+  the load's forces adding up to it); studies set up wrong refused (a face on no preserve
+  body, an obstacle in a preserve body, nothing held, too many voxels, a target out of
+  reach, 2-axis cutting with a preserve body and an obstacle in line, a one-way pull across
+  a symmetry plane); a bracket of two pads grown to its mass target to 2 %, stiffer than it
+  started, its pads joined, its preserve voxels solid, its surface closed and holding the
+  volume its mass says to 15 % (a grey design would not); the same outcome on one thread
+  and on eight; symmetry exact to the byte, 2-axis cutting the same all along each column,
+  casting never denser in front (one way and both ways); surfaces closed, holding a block's
+  volume. In `oxyde-tests` (`generative.rs`), a bracket modelled through OpenCASCADE as
+  three bodies of a part, two rings and a post between them, the bores held and loaded:
+  the outcome on target to 3 %, nothing in the post, the rings solid and joined.
+- **Timings** (`generative_timings`, ignored, the same bracket, 0.12 kg of steel to keep;
+  Ryzen 7 5800X, 16 threads, a debug build with `oxyde-sim` optimised):
+
+  | Resolution | Voxels | An iteration | Conjugate gradient iterations a solve | Outcome |
+  |---|---|---|---|---|
+  | 0 | 21 840 of 2.27 mm | 0.7 s | 50 | 150 iterations in 103 s |
+  | 0.5 (default) | 211 120 of 1.06 mm | 5.4 s | 80 | settled after 148 iterations, 13 min |
+
+  The mass stays on target throughout, and the shapes are what generative design gives: on
+  the bracket at 0.5, a curved web from the held ring sweeping round to the loaded one,
+  ribbed, open where the post passes. The solves take about 25 conjugate gradient
+  iterations at first and more as the shape sharpens and solid stands next to void. Void
+  voxels cost as much as solid ones, most of the box by the end: leaving them out of the
+  solve without grounding them (a weak operator that leaves translations free, unlike the
+  springs) is what would pay most, then cheaper coarse levels (node stencils instead of a
+  matrix per cell).
