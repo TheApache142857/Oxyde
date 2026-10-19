@@ -705,6 +705,7 @@ mod tests {
                 count: 2,
                 reverse: true,
             }),
+            skip: vec![[1, 1], [2, 0]],
         }));
         part.add_feature(FeatureKind::CircularPattern(CircularPattern {
             seeds: vec![ring],
@@ -713,6 +714,7 @@ mod tests {
             count: 4,
             equal_spacing: true,
             reverse: false,
+            skip: vec![[2, 0]],
         }));
         part.add_feature(FeatureKind::Mirror(Mirror {
             seeds: vec![hole, ring],
@@ -979,6 +981,64 @@ mod tests {
             model["equations"][1]["expression"],
             "\"Thickness@Boss-Extrude1\" / 4"
         );
+    }
+
+    /// A pattern's Instances to Skip are written sorted and without duplicates, and only
+    /// when it has some, so that one set of instances is always written the same way.
+    #[test]
+    fn instances_to_skip_are_written_sorted_and_only_when_there_are_some() {
+        let mut part = Part::new();
+        let mut base = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        base.rectangle(Point2::ORIGIN, 10.0, 10.0);
+        let s1 = part.add_feature(FeatureKind::Sketch(base));
+        let boss = part.add_feature(FeatureKind::Extrude(Extrude::blind(
+            s1,
+            ExtrudeOp::Boss,
+            5.0,
+        )));
+        let direction = |axis| PatternDirection {
+            axis: AxisRef::Standard(axis),
+            spacing: 20.0,
+            count: 3,
+            reverse: false,
+        };
+        part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+            seeds: vec![boss],
+            first: direction(StandardAxis::X),
+            second: Some(direction(StandardAxis::Y)),
+            skip: vec![[2, 1], [1, 1], [2, 1], [0, 2]],
+        }));
+        part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+            seeds: vec![boss],
+            axis: AxisRef::Standard(StandardAxis::Z),
+            angle: TAU,
+            count: 4,
+            equal_spacing: true,
+            reverse: false,
+            skip: Vec::new(),
+        }));
+        let file = PartFile {
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties: Properties::default(),
+        };
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert_eq!(
+            model["features"][2]["skip"],
+            serde_json::json!([[0, 2], [1, 1], [2, 1]])
+        );
+        assert!(model["features"][3].get("skip").is_none(), "{model}");
+        drop(archive);
+        let back = read_part(Cursor::new(&bytes)).unwrap();
+        let FeatureKind::LinearPattern(pattern) = back.definition.features[2].kind() else {
+            panic!("not a linear pattern");
+        };
+        assert_eq!(pattern.skip, [[0, 2], [1, 1], [2, 1]]);
     }
 
     #[test]

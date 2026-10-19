@@ -459,6 +459,7 @@ fn linear_pattern_copies_a_hole_and_its_instances_can_be_referenced() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     // A fillet on the rim of the second hole: a reference to a pattern instance.
     let instance_wall = FaceName::new(FaceKey::Instance {
@@ -525,6 +526,7 @@ fn two_direction_pattern() {
             count: 3,
             reverse: false,
         }),
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -575,6 +577,7 @@ fn pattern_directions_along_edges() {
         seeds: vec![hole],
         first: direction(along_x.clone(), 20.0, 4),
         second: Some(direction(along_y, 15.0, 3)),
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -615,6 +618,7 @@ fn circular_pattern_about_the_axis_of_a_cylindrical_face() {
         count: 6,
         equal_spacing: true,
         reverse: false,
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -622,6 +626,153 @@ fn circular_pattern_about_the_axis_of_a_cylindrical_face() {
         volume(&part, &kernel),
         PI * 900.0 * 5.0 - 6.0 * PI * 9.0 * 5.0,
     );
+    part.release(&mut kernel);
+}
+
+/// A 100 × 70 × 10 plate with a 3 × 3 grid of Ø6 holes 20 mm apart, the first at (10, 10),
+/// leaving out the instances in `skip`. Returns the part, the pattern and the seed hole's
+/// wall.
+fn grid_of_holes(skip: Vec<[u32; 2]>) -> (Part, FeatureId, FaceName) {
+    let mut part = Part::new();
+    let base = block(&mut part, Point2::ORIGIN, 100.0, 70.0, 10.0);
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(base)));
+    let circle = sketch.circle(Point2::new(10.0, 10.0), 3.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(sketch));
+    let hole = part.add_feature(cut(s2, 10.0));
+    let direction = |axis| PatternDirection {
+        axis: AxisRef::Standard(axis),
+        spacing: 20.0,
+        count: 3,
+        reverse: false,
+    };
+    let pattern = part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole],
+        first: direction(StandardAxis::X),
+        second: Some(direction(StandardAxis::Y)),
+        skip,
+    }));
+    (part, pattern, FaceName::profile(hole, circle))
+}
+
+const GRID_PLATE: f64 = 100.0 * 70.0 * 10.0;
+
+/// Whether the copy of the seed hole's wall in `instance` of `pattern` is in the part.
+fn has_copy(part: &Part, pattern: FeatureId, instance: [u32; 2], wall: &FaceName) -> bool {
+    let copy = FaceName::new(FaceKey::Instance {
+        feature: pattern,
+        instance,
+        face: Box::new(wall.clone()),
+    });
+    part.body()
+        .expect("part has a body")
+        .naming
+        .find_face(&copy)
+        .is_some()
+}
+
+#[test]
+fn instances_to_skip_leave_copies_out_and_stay_with_their_instance() {
+    let mut kernel = OcctKernel::new();
+    let (mut part, pattern, wall) = grid_of_holes(vec![[1, 1]]);
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    // Eight holes: the centre one is left out.
+    assert_close(volume(&part, &kernel), GRID_PLATE - 8.0 * hole_volume());
+    assert!(!has_copy(&part, pattern, [1, 1], &wall));
+    assert!(has_copy(&part, pattern, [2, 1], &wall));
+
+    // A fourth column: the same instance stays out, the new column is whole.
+    let columns = part.find_dimension("D2@LPattern1").unwrap();
+    part.set_dimension(columns, 4.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), GRID_PLATE - 11.0 * hole_volume());
+    assert!(!has_copy(&part, pattern, [1, 1], &wall));
+    assert!(has_copy(&part, pattern, [3, 1], &wall));
+
+    // Wider spacing moves the holes; the one left out is still the same.
+    let spacing = part.find_dimension("D1@LPattern1").unwrap();
+    part.set_dimension(spacing, 22.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), GRID_PLATE - 11.0 * hole_volume());
+    assert!(!has_copy(&part, pattern, [1, 1], &wall));
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_skipped_instance_a_lower_count_takes_away_is_a_warning() {
+    let mut kernel = OcctKernel::new();
+    let (mut part, pattern, _) = grid_of_holes(vec![[2, 2]]);
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), GRID_PLATE - 8.0 * hole_volume());
+
+    // Two rows: the corner left out is no longer in the pattern. A warning, not an error,
+    // and the six holes there are now are all made.
+    let rows = part.find_dimension("D4@LPattern1").unwrap();
+    part.set_dimension(rows, 2.0).unwrap();
+    part.rebuild(&mut kernel);
+    match part.status(pattern) {
+        Some(FeatureStatus::Warning(message)) => {
+            assert!(message.contains("(3, 3)"), "{message}");
+            assert!(message.contains("no longer in the pattern"), "{message}");
+        }
+        other => panic!("expected a warning, got {other:?}"),
+    }
+    assert_close(volume(&part, &kernel), GRID_PLATE - 6.0 * hole_volume());
+
+    // Three rows again: the corner is left out again.
+    part.set_dimension(rows, 3.0).unwrap();
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), GRID_PLATE - 8.0 * hole_volume());
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_circular_pattern_skips_instances_but_never_the_seed() {
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let mut disc = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    disc.circle(Point2::ORIGIN, 30.0);
+    let s1 = part.add_feature(FeatureKind::Sketch(disc));
+    let plate = part.add_feature(boss(s1, 5.0));
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(plate)));
+    sketch.circle(Point2::new(20.0, 0.0), 3.0);
+    let s2 = part.add_feature(FeatureKind::Sketch(sketch));
+    let hole = part.add_feature(cut(s2, 5.0));
+    let pattern = part.add_feature(FeatureKind::CircularPattern(CircularPattern {
+        seeds: vec![hole],
+        axis: AxisRef::Standard(StandardAxis::Z),
+        angle: TAU,
+        count: 6,
+        equal_spacing: true,
+        reverse: false,
+        skip: vec![[0, 0], [2, 0], [4, 0]],
+    }));
+    part.rebuild(&mut kernel);
+    // The seed stays, with a warning; two of the five copies are left out.
+    match part.status(pattern) {
+        Some(FeatureStatus::Warning(message)) => {
+            assert!(message.contains("seed (1)"), "{message}");
+        }
+        other => panic!("expected a warning, got {other:?}"),
+    }
+    let disc_volume = PI * 900.0 * 5.0;
+    let one_hole = PI * 9.0 * 5.0;
+    assert_close(volume(&part, &kernel), disc_volume - 4.0 * one_hole);
+
+    // Every copy left out: nothing is patterned, which is an error as a single instance is.
+    if let Ok(FeatureKind::CircularPattern(p)) = part.edit(pattern) {
+        p.skip = (1..6).map(|i| [i, 0]).collect();
+    }
+    part.rebuild(&mut kernel);
+    match part.status(pattern) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("skipped"), "{message}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    assert_close(volume(&part, &kernel), disc_volume - one_hole);
     part.release(&mut kernel);
 }
 
@@ -725,6 +876,7 @@ fn pattern_copies_that_overlap_each_other() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);
@@ -759,6 +911,7 @@ fn a_pattern_or_mirror_of_the_first_boss_joins_its_body() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     // Mirrored through the Right plane: touching it, merged with it.
     part.add_feature(FeatureKind::Mirror(Mirror {
@@ -917,6 +1070,7 @@ fn a_cut_sweep_removes_material_and_a_sweep_can_be_patterned() {
             reverse: false,
         },
         second: None,
+        skip: Vec::new(),
     }));
     part.rebuild(&mut kernel);
     assert_all_ok(&part);

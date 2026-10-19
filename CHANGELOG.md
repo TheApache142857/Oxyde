@@ -5,6 +5,26 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Instances to Skip in patterns (unreleased, October 2026)
+
+- **Instances to Skip** in Linear and Circular Pattern, as in SolidWorks: a pattern can
+  leave some of its copies out, for a grid of holes with a gap in it or a vent whose
+  corners stay solid, where it took several patterns before. Under *Instances to Skip* in
+  the pattern's panel, turn on *Pick instances* and click the copies in the graphics area,
+  or click *List by number* and tick them: *(2, 1)* is the second copy along the first
+  direction, the seed being *(1, 1)*; round an axis, *(2)* is the next one round. The
+  preview shows the pattern without them; the box lists them, each with a button putting
+  it back. The seed cannot be left out.
+- A skipped copy is known by its place in the pattern, so it stays out when the spacing
+  or the counts change. When a lower count takes it away (a dimension, an equation, a
+  configuration), the pattern is built with a warning saying it is no longer there, and
+  it is left out again once the count comes back. In the panel, lowering a count simply
+  drops it from the list, until the count is raised again.
+- In a pattern of a new body, the bodies of the other copies keep their numbers when one
+  is skipped, so a Combine or an extrusion working on one of them stays on it.
+- In files: `skip` on `linear_pattern` and `circular_pattern`, absent when nothing is
+  skipped (FORMAT.md §3). Older versions of Oxyde ignore it and make every copy.
+
 ### Third bug hunt: end conditions, a fuller sketcher, Measure (0.0.8, October 2026)
 
 A read through the modelling engine and the application for bugs, behaviours nobody asked
