@@ -33,11 +33,24 @@ release yet; the git history has every detail.
   (through a plate's thickness, as most castings are) the shape is as crisp as without;
   pulled in that plane (a beam loaded down and pulled up) it comes out grey, neither solid
   nor void, until a later version sharpens the densities.
+- **Keep it in one piece.** Material nothing loads can come out floating: a preserved
+  ring around a hole the loads do not reach, held or not, ends up on its own, as it would in
+  SolidWorks or Fusion 360's shape optimization. *Keep it in one piece* (in the Target
+  section, on for new studies) joins every piece holding a fixture, a load or a preserved
+  region to the rest by a bar as thick as the thinnest member, where it adds least material,
+  and takes away loose bits holding none of them; the panel says how much was added. Without
+  it, or at another threshold, the panel says when the shape is in pieces and which
+  fixtures, loads and preserved regions are on the pieces the loads do not reach. In files:
+  `one_piece` in the study's `topology`, and `joining` in the results (FORMAT.md §8–§9).
 - **How it works:** each element of the mesh gets a density, its stiffness going as the
   cube of it, the densities averaged over a small sphere so no member is thinner than it,
   and moved by optimality criteria, one static solve per iteration (60 at most by default,
   fewer once the shape settles). Gravity is not taken: the weight would change with the
-  shape.
+  shape. New topology studies mesh with four-node elements (*Draft*): the shape comes from
+  the elements' densities, which they give as well as ten-node ones with a seventh of the
+  unknowns, so every iteration is several times quicker (on a servo arm meshed at 0.3 mm,
+  5 s instead of about 100); the Mesh section says so when a topology study is set to
+  ten-node elements.
 - **Files:** topology studies are saved in the `.oxysim` with their target, member size,
   iterations, preserved regions, symmetry planes and pull direction, and their results in
   the `.oxyres`: each element's density and every iteration's compliance and mass (`type`

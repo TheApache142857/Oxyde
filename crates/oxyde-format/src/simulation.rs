@@ -164,6 +164,9 @@ pub struct TopologySettings {
     pub symmetry: Option<SymmetryPlanes>,
     /// The direction a mould is pulled off the shape along; `None` for none.
     pub pull: Option<PullDirection>,
+    /// *Keep it in one piece*: pieces of the shape holding a fixture, a load or a preserved
+    /// region joined to the one the loads are on, loose bits taken away.
+    pub one_piece: bool,
 }
 
 impl Default for TopologySettings {
@@ -175,6 +178,7 @@ impl Default for TopologySettings {
             preserved: Vec::new(),
             symmetry: None,
             pull: None,
+            one_piece: false,
         }
     }
 }
@@ -599,6 +603,8 @@ struct TopologyDto {
     symmetry: Option<SymmetryDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pull: Option<PullDto>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    one_piece: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1088,6 +1094,7 @@ fn study_dto(study: &Study) -> StudyDto {
                     direction: p.direction,
                     parting: p.parting,
                 }),
+                one_piece: t.one_piece,
             }
         }),
     }
@@ -1493,6 +1500,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
                 preserved,
                 symmetry,
                 pull,
+                one_piece: t.one_piece,
             }
         }
         (StudyType::Topology, None) => TopologySettings::default(),
@@ -1760,6 +1768,7 @@ mod tests {
                 direction: [0.0, 1.0, 0.0],
                 parting: Some([0.0, 12.5, 0.0]),
             }),
+            one_piece: true,
         };
         file.studies = vec![study, second, thermal, stress, topology];
         file
@@ -1893,6 +1902,7 @@ mod tests {
         assert_eq!(t["target_mass"], 0.3);
         assert_eq!(t["member_size"], 4.0);
         assert_eq!(t["iterations"], 80);
+        assert_eq!(t["one_piece"], true);
         assert_eq!(t["preserved"][0]["name"], "Preserve-1");
         assert_eq!(t["preserved"][0]["depth"], 2.0);
         assert_eq!(

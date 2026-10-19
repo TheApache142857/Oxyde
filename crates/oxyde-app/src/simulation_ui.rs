@@ -501,6 +501,9 @@ pub struct TopologyGoal {
     /// mm: a two-part mould, pulled off both ways from the plane through this point across
     /// the pull direction; `None` for one way.
     pub parting: Option<[f64; 3]>,
+    /// *Keep it in one piece*: pieces holding a fixture, a load or a kept region joined to
+    /// the rest, loose bits taken away. On for new studies: a part is made in one piece.
+    pub one_piece: bool,
 }
 
 impl Default for TopologyGoal {
@@ -514,6 +517,7 @@ impl Default for TopologyGoal {
             symmetry_point: [0.0; 3],
             pull: None,
             parting: None,
+            one_piece: true,
         }
     }
 }
@@ -570,7 +574,17 @@ impl Study {
             contacts: Vec::new(),
             contact_tolerance: 0.1,
             contacts_found: false,
-            mesh: StudyMesh::default(),
+            mesh: StudyMesh {
+                // A topology study's shape comes from its elements' densities, which
+                // four-node elements give as well as ten-node ones with about a seventh of
+                // the unknowns: every iteration that much quicker.
+                quality: if study_type == StudyType::Topology {
+                    ElementQuality::Draft
+                } else {
+                    ElementQuality::High
+                },
+                ..StudyMesh::default()
+            },
             made: BTreeMap::new(),
         }
     }
@@ -979,6 +993,8 @@ pub struct SimulationView {
     pub(crate) renaming: Option<String>,
     /// The share of the mesh's volume the topology shape shown holds.
     pub(crate) shape_fraction: Option<f64>,
+    /// The pieces the topology shape shown falls into, the largest first.
+    pub(crate) shape_pieces: Vec<oxyde_sim::Piece>,
 }
 
 impl SimulationView {
@@ -1268,6 +1284,7 @@ impl OxydeApp {
         }
         self.simulation.legend = None;
         self.simulation.shape_fraction = None;
+        self.simulation.shape_pieces.clear();
     }
 
     fn poll_simulation(&mut self, ctx: &egui::Context) {
@@ -1893,6 +1910,7 @@ impl OxydeApp {
                         direction,
                         parting: study.topology.parting,
                     }),
+                    one_piece: study.topology.one_piece,
                 },
                 materials: elastic()?,
             },
@@ -2226,10 +2244,12 @@ impl OxydeApp {
             };
             let (scene, fraction) =
                 shape_scene(&done.mesh, &t.density, key.threshold, key.smooth, key.ghost);
+            let pieces = oxyde_sim::pieces(&done.mesh, &t.density, key.threshold);
             self.show_scene(scene);
             self.simulation.shown = Some(key);
             self.simulation.legend = None;
             self.simulation.shape_fraction = Some(fraction);
+            self.simulation.shape_pieces = pieces;
             return;
         }
         // A transient study's temperatures at the time picked.
@@ -2382,6 +2402,7 @@ impl OxydeApp {
         self.simulation.shown = Some(key);
         self.simulation.legend = legend;
         self.simulation.shape_fraction = None;
+        self.simulation.shape_pieces.clear();
     }
 
     /// `scene` in the viewport in place of the model's, until the plot hides.
@@ -2792,8 +2813,13 @@ impl OxydeApp {
         } else if !s.started {
             "New Study: pick what to study in the panel".to_owned()
         } else if let (Some(_), Some(fraction)) = (&s.shown, s.shape_fraction) {
+            let pieces = if s.shape_pieces.len() > 1 {
+                format!(", in {} pieces (see the panel)", s.shape_pieces.len())
+            } else {
+                String::new()
+            };
             format!(
-                "Cut at {:.0} % density: the shape holds {:.0} % of the volume",
+                "Cut at {:.0} % density: the shape holds {:.0} % of the volume{pieces}",
                 self.prefs.simulation.shape_threshold * 100.0,
                 fraction * 100.0
             )
@@ -3598,6 +3624,19 @@ impl OxydeApp {
                                     });
                                     ui.end_row();
                                 });
+                            if study_type == StudyType::Topology
+                                && m.quality == ElementQuality::High
+                            {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Ten-node elements make every iteration about seven \
+                                         times as long as four-node ones, which give a \
+                                         topology study's shape as well: Draft is enough here",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_rgb(210, 140, 30)),
+                                );
+                            }
                             if ui.button("Mesh only").clicked() {
                                 action = Some(PanelAction::Mesh);
                             }
@@ -3709,6 +3748,20 @@ impl OxydeApp {
                                     .small()
                                     .weak(),
                                 );
+                                if let Some(text) = t.joining.as_ref().and_then(joining_text) {
+                                    ui.label(egui::RichText::new(text).small());
+                                }
+                                let warning = done.map_or_else(Vec::new, |d| {
+                                    piece_warning(study, &d.faces, &self.simulation.shape_pieces)
+                                });
+                                for (k, line) in warning.iter().enumerate() {
+                                    let text = egui::RichText::new(line).small();
+                                    ui.label(if k == 0 {
+                                        text.color(egui::Color32::from_rgb(210, 140, 30))
+                                    } else {
+                                        text
+                                    });
+                                }
                             }
                             match done.and_then(|d| d.summary.map(|s| (d, s))) {
                                 Some((d, s)) => {
@@ -4384,6 +4437,18 @@ fn topology_goal_rows(
                 .on_hover_text(
                     "At most; each is a static solve. The optimization stops sooner once the \
                      shape has settled",
+                )
+                .changed();
+            ui.end_row();
+            ui.label("");
+            changed |= ui
+                .checkbox(&mut goal.one_piece, "Keep it in one piece")
+                .on_hover_text(
+                    "Once optimized, the pieces that hold a fixture, a load or a preserved \
+                     region but that the loads do not reach are joined to the rest by a bar as \
+                     thick as the thinnest member, where it adds least material; loose bits \
+                     holding none of them are taken away. Without it, material nothing loads \
+                     can be left floating",
                 )
                 .changed();
             ui.end_row();
@@ -5289,8 +5354,13 @@ fn faces_by_label(positions: &[[f64; 3]], triangles: &[[u32; 3]], labels: &[u32]
 /// One line on a topology study's outcome, for the status bar.
 fn topology_summary(t: &TopologyResults, seconds: f64) -> String {
     let flexible = t.compliance() / t.initial_compliance.max(f64::MIN_POSITIVE);
+    let joined = t
+        .joining
+        .as_ref()
+        .and_then(joining_text)
+        .map_or_else(String::new, |text| format!("; {}", text.to_lowercase()));
     format!(
-        "Topology optimized in {seconds:.1} s: {:.0} % of the mass kept, {} times as flexible as the whole part, {} iterations{}",
+        "Topology optimized in {seconds:.1} s: {:.0} % of the mass kept, {} times as flexible as the whole part, {} iterations{}{joined}",
         t.mass_fraction() * 100.0,
         format_number(flexible),
         t.history.len(),
@@ -5300,6 +5370,102 @@ fn topology_summary(t: &TopologyResults, seconds: f64) -> String {
             " (the limit: the shape may still change)"
         }
     )
+}
+
+/// What *Keep it in one piece* did, in a line; `None` when it had nothing to do.
+fn joining_text(j: &oxyde_sim::Joining) -> Option<String> {
+    let mut parts = Vec::new();
+    if j.joined > 0 {
+        parts.push(format!(
+            "{} {} to the rest ({:+.1} % of the mass)",
+            j.joined,
+            if j.joined == 1 {
+                "piece joined"
+            } else {
+                "pieces joined"
+            },
+            j.added_mass * 100.0
+        ));
+    }
+    if j.removed > 0 {
+        parts.push(format!(
+            "{} loose {} taken away ({:.1} % of the mass)",
+            j.removed,
+            if j.removed == 1 { "bit" } else { "bits" },
+            j.removed_mass * 100.0
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("Kept in one piece: {}", parts.join(", ")))
+}
+
+/// What the panel says of a topology shape that falls into pieces: their number, then the
+/// fixtures, loads and preserved regions on each piece the loads do not reach, and how many
+/// loose bits hold none of them. Empty for a shape in one piece. `faces` gives each label's
+/// face.
+fn piece_warning(
+    study: &Study,
+    faces: &BTreeMap<u32, SimFace>,
+    pieces: &[oxyde_sim::Piece],
+) -> Vec<String> {
+    if pieces.len() < 2 {
+        return Vec::new();
+    }
+    // Each item's labels, and whether it is a load.
+    let items: Vec<(&str, bool, Vec<u32>)> = study
+        .items
+        .iter()
+        .filter(|i| i.kind.fits(study.study_type))
+        .map(|i| {
+            let labels = faces
+                .iter()
+                .filter(|(_, f)| i.faces.contains(f))
+                .map(|(l, _)| *l)
+                .collect();
+            let load = matches!(i.kind, ItemKind::Force { .. } | ItemKind::Pressure { .. });
+            (i.name.as_str(), load, labels)
+        })
+        .collect();
+    let on = |p: &oxyde_sim::Piece| -> Vec<(&str, bool)> {
+        items
+            .iter()
+            .filter(|(_, _, labels)| labels.iter().any(|l| p.labels.binary_search(l).is_ok()))
+            .map(|(name, load, _)| (*name, *load))
+            .collect()
+    };
+    // The piece the loads are on: the largest that has one (they come largest first).
+    let main = pieces
+        .iter()
+        .position(|p| on(p).iter().any(|(_, load)| *load))
+        .unwrap_or(0);
+    let mut lines = vec![format!(
+        "The shape is in {} pieces at this threshold:",
+        pieces.len()
+    )];
+    let mut loose = 0;
+    for (k, p) in pieces.iter().enumerate().filter(|(k, _)| *k != main) {
+        let _ = k;
+        let names: Vec<&str> = on(p).iter().map(|(name, _)| *name).collect();
+        match names.as_slice() {
+            [] => loose += 1,
+            [one] => lines.push(format!("{one} is on a piece the loads do not reach")),
+            [first @ .., last] => lines.push(format!(
+                "{} and {last} are on a piece the loads do not reach",
+                first.join(", ")
+            )),
+        }
+    }
+    if loose > 0 {
+        lines.push(format!(
+            "{loose} loose {} holding none of them",
+            if loose == 1 { "bit" } else { "bits" }
+        ));
+    }
+    lines.push(if study.topology.one_piece {
+        "Kept in one piece at 50 %: lower the threshold to see it whole".to_owned()
+    } else {
+        "Keep it in one piece (Target) joins them; or load what should stay joined".to_owned()
+    });
+    lines
 }
 
 /// `text` with its first letter in capitals, for a message of its own.
@@ -5425,7 +5591,73 @@ mod tests {
         assert!(!PlotChoice::Shape.fits(StudyType::Static));
         let study = Study::of_type(t, "Topology 1");
         assert_eq!(study.topology, TopologyGoal::default());
+        // Four-node elements: the densities are the elements', and every iteration is a
+        // seventh of the work. A part is made in one piece.
+        assert_eq!(study.mesh.quality, ElementQuality::Draft);
+        assert!(study.topology.one_piece);
+        assert_eq!(Study::default().mesh.quality, ElementQuality::High);
         assert!(study.topology.target_mass > 0.0 && study.topology.target_mass < 1.0);
+    }
+
+    #[test]
+    fn a_shape_in_pieces_says_what_the_loads_do_not_reach() {
+        let mut study = Study::of_type(StudyType::Topology, "Topology 1");
+        study.add(ItemKind::Fixed, vec![face(1, None)]);
+        study.add(
+            ItemKind::Force {
+                newtons: 10.0,
+                direction: LoadDirection::Y,
+            },
+            vec![face(2, None)],
+        );
+        study.add(ItemKind::Fixed, vec![face(3, None)]);
+        study.add(ItemKind::Preserve { depth: 1.0 }, vec![face(4, None)]);
+        let faces: BTreeMap<u32, SimFace> = (1..=4).map(|k| (k * 10, face(k, None))).collect();
+        let piece = |labels: &[u32], volume: f64| oxyde_sim::Piece {
+            labels: labels.to_vec(),
+            volume,
+        };
+        // In one piece, nothing to say.
+        assert!(piece_warning(&study, &faces, &[piece(&[10, 20, 30, 40], 9.0)]).is_empty());
+        // The held and loaded piece, a held one the load does not reach, and a loose bit.
+        let lines = piece_warning(
+            &study,
+            &faces,
+            &[
+                piece(&[30, 40], 12.0),
+                piece(&[10, 20], 8.0),
+                piece(&[], 0.5),
+            ],
+        );
+        assert_eq!(lines[0], "The shape is in 3 pieces at this threshold:");
+        assert_eq!(
+            lines[1],
+            "Fixed-2 and Preserve-1 are on a piece the loads do not reach"
+        );
+        assert_eq!(lines[2], "1 loose bit holding none of them");
+        assert!(lines[3].starts_with("Kept in one piece"));
+        study.topology.one_piece = false;
+        let lines = piece_warning(&study, &faces, &[piece(&[10, 20], 8.0), piece(&[40], 1.0)]);
+        assert_eq!(lines[1], "Preserve-1 is on a piece the loads do not reach");
+        assert!(lines[2].starts_with("Keep it in one piece (Target) joins them"));
+    }
+
+    #[test]
+    fn what_joining_did_reads_in_a_line() {
+        let none = oxyde_sim::Joining::default();
+        assert_eq!(joining_text(&none), None);
+        let both = oxyde_sim::Joining {
+            joined: 1,
+            added_mass: 0.0123,
+            removed: 2,
+            removed_mass: 0.004,
+        };
+        assert_eq!(
+            joining_text(&both).as_deref(),
+            Some(
+                "Kept in one piece: 1 piece joined to the rest (+1.2 % of the mass), 2 loose bits taken away (0.4 % of the mass)"
+            )
+        );
     }
 
     #[test]

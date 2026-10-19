@@ -345,6 +345,21 @@ pub struct TopologyFields {
     pub filter_radius: f64,
     /// Every iteration, in order; the last is the design of `density`.
     pub history: Vec<TopologyIteration>,
+    /// What *Keep it in one piece* did to `density`, when the study asked for it.
+    pub joining: Option<TopologyJoining>,
+}
+
+/// What *Keep it in one piece* did to a topology study's densities.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct TopologyJoining {
+    /// Pieces joined to the one the loads are on.
+    pub joined: u32,
+    /// The mass added to join them, a share of the model's.
+    pub added_mass: f64,
+    /// Loose bits taken away: pieces holding no fixture, load or preserved region.
+    pub removed: u32,
+    /// Their mass, a share of the model's.
+    pub removed_mass: f64,
 }
 
 /// One iteration of a topology optimization.
@@ -516,6 +531,7 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             converged: t.converged,
             filter_radius: t.filter_radius,
             history: t.history.clone(),
+            joining: t.joining,
         }),
     };
 
@@ -701,6 +717,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             converged: t.converged,
             filter_radius: t.filter_radius,
             history: t.history.clone(),
+            joining: t.joining,
         })
     } else {
         None
@@ -887,7 +904,12 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
                 .history
                 .iter()
                 .flat_map(|s| [s.compliance, s.mass_fraction, s.change])
-                .chain([t.initial_compliance, t.filter_radius]);
+                .chain([t.initial_compliance, t.filter_radius])
+                .chain(
+                    t.joining
+                        .iter()
+                        .flat_map(|j| [j.added_mass, j.removed_mass]),
+                );
             if numbers.into_iter().any(|v| !v.is_finite()) {
                 return Err("a topology result is not a finite number".to_owned());
             }
@@ -994,6 +1016,8 @@ struct TopologyDto {
     /// mm.
     filter_radius: f64,
     history: Vec<TopologyIteration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    joining: Option<TopologyJoining>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1254,6 +1278,12 @@ mod tests {
             converged: true,
             filter_radius: 1.5,
             history: vec![step(80.0, 0.2), step(31.5, 0.05), step(30.0, 0.008)],
+            joining: Some(TopologyJoining {
+                joined: 1,
+                added_mass: 0.0125,
+                removed: 2,
+                removed_mass: 0.002,
+            }),
         });
         file
     }
@@ -1274,6 +1304,20 @@ mod tests {
         assert_eq!(json["topology"]["converged"], true);
         assert_eq!(json["topology"]["history"][1]["compliance"], 31.5);
         assert_eq!(json["topology"]["history"][2]["change"], 0.008);
+        assert_eq!(json["topology"]["joining"]["joined"], 1);
+        assert_eq!(json["topology"]["joining"]["added_mass"], 0.0125);
+        assert_eq!(json["topology"]["joining"]["removed"], 2);
+        // Without the joining, no key.
+        let mut plain = topology_sample();
+        if let Some(t) = plain.topology.as_mut() {
+            t.joining = None;
+        }
+        let written = bytes(&plain);
+        assert_eq!(read_results(Cursor::new(&written)).unwrap(), plain);
+        let mut archive = ZipArchive::new(Cursor::new(&written)).unwrap();
+        let plain_json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert!(plain_json["topology"].get("joining").is_none());
         let density = json["entries"]
             .as_array()
             .unwrap()

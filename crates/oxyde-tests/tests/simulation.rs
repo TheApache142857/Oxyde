@@ -212,6 +212,7 @@ fn optimized_beam(
         max_iterations: 25,
         symmetry,
         pull,
+        one_piece: false,
     };
     let steel = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
     let r = oxyde_sim::optimize(

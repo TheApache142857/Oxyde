@@ -37,19 +37,25 @@
 //!
 //! [`shape`] turns the densities into a closed triangle surface at a threshold (marching
 //! tetrahedra, capped where the shape meets the model's own faces), for the viewport and
-//! for export.
+//! for export; [`pieces`] tells how many pieces it falls into and what each holds. With
+//! *Keep it in one piece* ([`TopologyStudy::one_piece`]), pieces that hold a fixture, a load
+//! or a kept region but that the loads do not reach are joined to the rest by a bar as thick
+//! as the thinnest member, along the path that needs the least material added, and loose
+//! bits holding none of them are taken away: the minimum compliance has no reason to join
+//! what carries no load, and a part has to be in one piece.
 
 // Indices into the mesh (checked by `TetMesh::validate` when the study is prepared) and
 // into arrays sized here, one value per element or per node.
 #![allow(clippy::indexing_slicing)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::material::Elastic;
 use crate::math::{V3, add, cross, dot, lerp, norm, normalize, scale, sub};
-use crate::mesh::TetMesh;
+use crate::mesh::{FACES, TetMesh};
 use crate::solve::{
     Preconditioner, Prepared, Problem, SolveError, SolveOptions, Study, element_energies,
     thread_count,
@@ -59,8 +65,18 @@ use crate::solve::{
 const VOID_STIFFNESS: f64 = 1e-6;
 /// SIMP's penalty: stiffness goes as the density to this power.
 const PENALTY: f64 = 3.0;
+/// The residual the iterations' solves stop at, as a fraction of the loads: what their
+/// slopes need, and a fifth fewer conjugate gradient iterations than a static study's
+/// tolerance. The whole part's solve keeps the study's, its compliance being reported.
+const ITERATION_TOLERANCE: f64 = 1e-5;
 /// The most a design density moves in one iteration.
 const MOVE_LIMIT: f64 = 0.2;
+/// *Keep it in one piece* joins the shape cut at this density: the one the application
+/// shows by default.
+const JOIN_THRESHOLD: f64 = 0.5;
+/// What a path through material already there costs, per volume, against 1 through void:
+/// of the ways through the shape, the shortest.
+const JOIN_LENGTH_COST: f64 = 1e-3;
 /// The optimization has settled when no density moves by more than this…
 const SETTLED_CHANGE: f64 = 0.01;
 /// …or, after this many iterations, the compliance has stopped changing (by this fraction
@@ -97,6 +113,10 @@ pub struct TopologyStudy {
     pub symmetry: Option<Symmetry>,
     /// The direction a mould is pulled off along; `None` for none.
     pub pull: Option<Pull>,
+    /// *Keep it in one piece*: once optimized, the pieces of the shape cut at half density
+    /// that hold a fixture, a load or a kept region are joined to the one the loads are on,
+    /// and loose bits holding none of them taken away.
+    pub one_piece: bool,
 }
 
 /// Planes the shape is mirrored about, through `point` and parallel to the standard planes:
@@ -149,6 +169,29 @@ pub struct TopologyResults {
     pub solver_iterations: usize,
     /// mm: the filter's radius.
     pub filter_radius: f64,
+    /// What *Keep it in one piece* did, when it was asked for.
+    pub joining: Option<Joining>,
+}
+
+/// What *Keep it in one piece* did to the shape.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Joining {
+    /// Pieces joined to the rest, and the mass added to join them, a share of the model's.
+    pub joined: usize,
+    pub added_mass: f64,
+    /// Loose bits taken away (pieces holding no fixture, load or kept region), and their
+    /// mass, a share of the model's.
+    pub removed: usize,
+    pub removed_mass: f64,
+}
+
+/// A connected piece of the shape cut at a threshold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Piece {
+    /// The labels of the model's faces it reaches, in order, without [`crate::NO_LABEL`].
+    pub labels: Vec<u32>,
+    /// mm³, about: the volume of the elements it is in, each by its share of corners in it.
+    pub volume: f64,
 }
 
 impl TopologyResults {
@@ -263,17 +306,24 @@ pub fn optimize(
     {
         return Err(TopologyError::PullAcrossSymmetry);
     }
-    // Sensitivities need no more than this; the solves of a series start close anyway.
-    let options = SolveOptions {
+    let full_options = SolveOptions {
         tolerance: options.tolerance.max(1e-7),
+        ..*options
+    };
+    let step_options = SolveOptions {
+        tolerance: options.tolerance.max(ITERATION_TOLERANCE),
         ..*options
     };
     let problem = Problem {
         mesh,
         materials,
         study: &study.study,
-        options: &options,
+        options: &full_options,
         strain: None,
+    };
+    let step = Problem {
+        options: &step_options,
+        ..problem
     };
     let prepared = Prepared::new(&problem, Preconditioner::Multigrid)?;
     let elements = mesh.tets.len();
@@ -389,7 +439,7 @@ pub fn optimize(
         let at = |f: f64| {
             progress(0.05 + 0.95 * (iteration as f64 + f) / iterations as f64);
         };
-        let solved = prepared.solve(&problem, Some(&stiffness), Some(&last), cancel, &at)?;
+        let solved = prepared.solve(&step, Some(&stiffness), Some(&last), cancel, &at)?;
         solver_iterations += solved.iterations;
         let energies =
             element_energies(mesh, materials, &prepared.geometries, &solved.displacement);
@@ -465,6 +515,38 @@ pub fn optimize(
             break;
         }
     }
+    let joining = study.one_piece.then(|| {
+        let mut anchors: Vec<u32> = study
+            .study
+            .fixtures
+            .iter()
+            .flat_map(|f| f.labels.iter())
+            .chain(study.preserved.iter().flat_map(|p| p.labels.iter()))
+            .chain(study.study.loads.iter().flat_map(|l| l.labels.iter()))
+            .copied()
+            .collect();
+        anchors.sort_unstable();
+        anchors.dedup();
+        let mut loads: Vec<u32> = study
+            .study
+            .loads
+            .iter()
+            .flat_map(|l| l.labels.iter())
+            .copied()
+            .collect();
+        loads.sort_unstable();
+        loads.dedup();
+        let joint = Joint {
+            mesh,
+            filter: &filter,
+            volume: &volume,
+            mass: &mass,
+            size,
+            symmetry: symmetry.as_ref(),
+            chain: chain.as_ref(),
+        };
+        joint.join(&anchors, &loads, &mut density)
+    });
     progress(1.0);
     Ok(TopologyResults {
         density,
@@ -473,7 +555,313 @@ pub fn optimize(
         converged,
         solver_iterations,
         filter_radius: radius,
+        joining,
     })
+}
+
+/// What joining the pieces of a shape works with.
+struct Joint<'a> {
+    mesh: &'a TetMesh,
+    filter: &'a Filter<'a>,
+    volume: &'a [f64],
+    mass: &'a [f64],
+    /// mm: the elements' typical edge.
+    size: f64,
+    symmetry: Option<&'a Symmetry>,
+    chain: Option<&'a Chain>,
+}
+
+impl Joint<'_> {
+    /// Joins the pieces of `density`'s shape (cut at [`JOIN_THRESHOLD`]) that reach one of
+    /// the `anchors` labels to the largest one reaching a `loads` label, one at a time, the
+    /// largest first, by the cheapest path through the elements (material missing, then
+    /// length) grown to the filter's radius, mirrored and shadowed along the pull like the
+    /// shape; and takes away the pieces reaching no anchor. Both sorted.
+    fn join(&self, anchors: &[u32], loads: &[u32], density: &mut [f64]) -> Joining {
+        let mesh = self.mesh;
+        let elements = mesh.tets.len();
+        let total: f64 = self.mass.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let neighbours = face_neighbours(mesh);
+        let mut joining = Joining::default();
+        // Each pass takes the loose bits away or joins one piece; a bridge that joined
+        // nothing ends it rather than being laid again.
+        for _ in 0..elements.min(1000) {
+            let rho = corner_densities(mesh, density);
+            let (corner, count) = piece_of_corners(mesh, &rho, JOIN_THRESHOLD);
+            if count <= 1 {
+                break;
+            }
+            let element = piece_of_elements(mesh, &corner);
+            let described = describe(mesh, &corner, count);
+            let reaches = |p: usize, labels: &[u32]| {
+                described[p]
+                    .labels
+                    .iter()
+                    .any(|l| labels.binary_search(l).is_ok())
+            };
+            let loose: Vec<bool> = (0..count).map(|p| !reaches(p, anchors)).collect();
+            if loose.contains(&true) && loose.contains(&false) {
+                for e in 0..elements {
+                    let p = element[e];
+                    if p != NONE && loose[p as usize] {
+                        joining.removed_mass += self.mass[e] * density[e] / total;
+                        density[e] = 0.0;
+                    }
+                }
+                joining.removed += loose.iter().filter(|l| **l).count();
+                continue;
+            }
+            let larger = |a: &usize, b: &usize| {
+                described[*a]
+                    .volume
+                    .total_cmp(&described[*b].volume)
+                    .then(b.cmp(a))
+            };
+            let Some(main) = (0..count)
+                .filter(|&p| reaches(p, loads))
+                .max_by(larger)
+                .or_else(|| (0..count).max_by(larger))
+            else {
+                break;
+            };
+            let Some(other) = (0..count).filter(|&p| p != main).max_by(larger) else {
+                break;
+            };
+            let cost = |e: usize| self.volume[e] * ((1.0 - density[e]).max(0.0) + JOIN_LENGTH_COST);
+            let Some(path) = cheapest_path(
+                &neighbours,
+                cost,
+                |e| element[e] == other as u32,
+                |e| element[e] == main as u32,
+            ) else {
+                break;
+            };
+            // The path grown into a bar as thick as the thinnest member.
+            let filter = self.filter;
+            let mut bridge = vec![false; elements];
+            for &e in &path {
+                let c = filter.centres[e as usize];
+                filter.around(c, |j| {
+                    if norm(sub(c, filter.centres[j as usize])) <= filter.radius {
+                        bridge[j as usize] = true;
+                    }
+                });
+            }
+            if let Some(s) = self.symmetry {
+                // The planes were checked when the study was prepared.
+                let _ = mirror_kept(filter, self.volume, s, self.size, &mut bridge);
+            }
+            if let Some(chain) = self.chain {
+                chain.shadow(&mut bridge);
+            }
+            let mut added = 0.0;
+            for (e, _) in bridge.iter().enumerate().filter(|(_, b)| **b) {
+                added += self.mass[e] * (1.0 - density[e]).max(0.0);
+                density[e] = 1.0;
+            }
+            if added <= 0.0 {
+                break;
+            }
+            joining.joined += 1;
+            joining.added_mass += added / total;
+        }
+        joining
+    }
+}
+
+/// Each element's neighbours across its four faces, in [`FACES`] order, [`NONE`] on the
+/// boundary.
+fn face_neighbours(mesh: &TetMesh) -> Vec<[u32; 4]> {
+    let mut out = vec![[NONE; 4]; mesh.tets.len()];
+    let mut open: HashMap<[u32; 3], (u32, usize)> = HashMap::new();
+    for (e, t) in mesh.tets.iter().enumerate() {
+        for (k, face) in FACES.iter().enumerate() {
+            let mut key = face.map(|i| t[i]);
+            key.sort_unstable();
+            match open.remove(&key) {
+                Some((other, side)) => {
+                    out[e][k] = other;
+                    out[other as usize][side] = e as u32;
+                }
+                None => {
+                    open.insert(key, (e as u32, k));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The cheapest chain of face neighbours from an element where `from` holds to one where
+/// `to` does, entering element `e` costing `cost(e)` (not negative): Dijkstra's, ties going
+/// to the lower index. The elements after the first, in order.
+fn cheapest_path(
+    neighbours: &[[u32; 4]],
+    cost: impl Fn(usize) -> f64,
+    from: impl Fn(usize) -> bool,
+    to: impl Fn(usize) -> bool,
+) -> Option<Vec<u32>> {
+    let n = neighbours.len();
+    let mut best = vec![f64::INFINITY; n];
+    let mut previous = vec![NONE; n];
+    // Costs are not negative, so their bits order as they do.
+    let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+    for e in (0..n).filter(|&e| from(e)) {
+        best[e] = 0.0;
+        heap.push(Reverse((0, e as u32)));
+    }
+    while let Some(Reverse((bits, e))) = heap.pop() {
+        let (d, e) = (f64::from_bits(bits), e as usize);
+        if d > best[e] {
+            continue;
+        }
+        if to(e) {
+            let mut path = vec![e as u32];
+            let mut at = e;
+            while previous[at] != NONE {
+                at = previous[at] as usize;
+                path.push(at as u32);
+            }
+            path.reverse();
+            return Some(path);
+        }
+        for &j in neighbours[e].iter().filter(|&&j| j != NONE) {
+            let next = d + cost(j as usize);
+            if next < best[j as usize] {
+                best[j as usize] = next;
+                previous[j as usize] = e as u32;
+                heap.push(Reverse((next.to_bits(), j)));
+            }
+        }
+    }
+    None
+}
+
+/// The pieces of the shape cut at `threshold`, as [`shape`] cuts it, the largest first. The
+/// material above the threshold in an element is convex (the density varies linearly in
+/// it), so corners above it in one element are in one piece: the pieces are those corners,
+/// joined through the elements they share.
+pub fn pieces(mesh: &TetMesh, density: &[f64], threshold: f64) -> Vec<Piece> {
+    if density.len() != mesh.tets.len() || mesh.validate().is_err() {
+        return Vec::new();
+    }
+    let rho = corner_densities(mesh, density);
+    let (corner, count) = piece_of_corners(mesh, &rho, threshold);
+    let mut out = describe(mesh, &corner, count);
+    out.sort_by(|a, b| b.volume.total_cmp(&a.volume));
+    out
+}
+
+/// The elements' densities averaged at their corners, by volume.
+fn corner_densities(mesh: &TetMesh, density: &[f64]) -> Vec<f64> {
+    let n = mesh.nodes.len();
+    let mut sum = vec![0.0; n];
+    let mut weight = vec![0.0; n];
+    for (e, t) in mesh.tets.iter().enumerate() {
+        let v = mesh.tet_volume(e).unwrap_or(0.0).abs();
+        for &i in t {
+            sum[i as usize] += v * density[e];
+            weight[i as usize] += v;
+        }
+    }
+    sum.iter()
+        .zip(&weight)
+        .map(|(s, w)| if *w > 0.0 { s / w } else { 0.0 })
+        .collect()
+}
+
+/// Each corner's piece ([`NONE`] below the threshold), numbered in the order of their
+/// first corner, and how many there are.
+fn piece_of_corners(mesh: &TetMesh, rho: &[f64], threshold: f64) -> (Vec<u32>, usize) {
+    let n = rho.len();
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    fn find(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            let up = parent[parent[i as usize] as usize];
+            parent[i as usize] = up;
+            i = up;
+        }
+        i
+    }
+    for t in &mesh.tets {
+        let mut first = NONE;
+        for &i in t.iter().filter(|&&i| rho[i as usize] >= threshold) {
+            if first == NONE {
+                first = i;
+                continue;
+            }
+            let (a, b) = (find(&mut parent, first), find(&mut parent, i));
+            if a != b {
+                parent[a.max(b) as usize] = a.min(b);
+            }
+        }
+    }
+    let mut number = vec![NONE; n];
+    let mut out = vec![NONE; n];
+    let mut count = 0;
+    for i in 0..n {
+        if rho[i] < threshold {
+            continue;
+        }
+        let root = find(&mut parent, i as u32) as usize;
+        if number[root] == NONE {
+            number[root] = count;
+            count += 1;
+        }
+        out[i] = number[root];
+    }
+    (out, count as usize)
+}
+
+/// Each element's piece: the one its corners above the threshold are in, [`NONE`] when
+/// none is.
+fn piece_of_elements(mesh: &TetMesh, corner: &[u32]) -> Vec<u32> {
+    mesh.tets
+        .iter()
+        .map(|t| {
+            t.iter()
+                .map(|&i| corner[i as usize])
+                .find(|&p| p != NONE)
+                .unwrap_or(NONE)
+        })
+        .collect()
+}
+
+/// The pieces' labels and volumes, by their numbers.
+fn describe(mesh: &TetMesh, corner: &[u32], count: usize) -> Vec<Piece> {
+    let mut out = vec![
+        Piece {
+            labels: Vec::new(),
+            volume: 0.0,
+        };
+        count
+    ];
+    for (e, t) in mesh.tets.iter().enumerate() {
+        let inside: Vec<u32> = t
+            .iter()
+            .map(|&i| corner[i as usize])
+            .filter(|&p| p != NONE)
+            .collect();
+        if let Some(&p) = inside.first() {
+            let v = mesh.tet_volume(e).unwrap_or(0.0).abs();
+            out[p as usize].volume += v * inside.len() as f64 / 4.0;
+        }
+    }
+    for f in mesh.facets.iter().filter(|f| f.label != crate::NO_LABEL) {
+        if let Some(p) = mesh
+            .facet_corners(f)
+            .iter()
+            .map(|&i| corner[i as usize])
+            .find(|&p| p != NONE)
+        {
+            out[p as usize].labels.push(f.label);
+        }
+    }
+    for piece in &mut out {
+        piece.labels.sort_unstable();
+        piece.labels.dedup();
+    }
+    out
 }
 
 /// Each design density's ratio of its compliance slope to its mass slope (for growing it),
@@ -976,24 +1364,10 @@ impl Shape {
 /// `smoothing` rounds of Taubin's smoothing (which keeps the volume) move the cut's
 /// points, never those on the model's faces.
 pub fn shape(mesh: &TetMesh, density: &[f64], threshold: f64, smoothing: usize) -> Shape {
-    let n = mesh.nodes.len();
     if density.len() != mesh.tets.len() || mesh.validate().is_err() {
         return Shape::default();
     }
-    let mut sum = vec![0.0; n];
-    let mut weight = vec![0.0; n];
-    for (e, t) in mesh.tets.iter().enumerate() {
-        let v = mesh.tet_volume(e).unwrap_or(0.0).abs();
-        for &i in t {
-            sum[i as usize] += v * density[e];
-            weight[i as usize] += v;
-        }
-    }
-    let rho: Vec<f64> = sum
-        .iter()
-        .zip(&weight)
-        .map(|(s, w)| if *w > 0.0 { s / w } else { 0.0 })
-        .collect();
+    let rho = corner_densities(mesh, density);
     let mut cut = Cutter {
         mesh,
         rho: &rho,
@@ -1244,6 +1618,7 @@ mod tests {
             max_iterations: 40,
             symmetry: None,
             pull: None,
+            one_piece: false,
         };
         (mesh, study)
     }
@@ -1691,6 +2066,96 @@ mod tests {
             let v = s.volume();
             assert!((v - solid).abs() < 0.2 * solid, "{v} for {solid}");
         }
+    }
+
+    /// A 30 × 10 × 10 mm box of 2 mm cells, solid where `solid` says of an element's
+    /// centre: its mesh and densities.
+    fn blocks(solid: impl Fn(V3) -> bool) -> (TetMesh, Vec<f64>) {
+        let mesh = TetMesh::structured_box([0.0; 3], [30.0, 10.0, 10.0], [15, 5, 5]);
+        let density = centres(&mesh)
+            .iter()
+            .map(|&c| if solid(c) { 1.0 } else { 0.0 })
+            .collect();
+        (mesh, density)
+    }
+
+    #[test]
+    fn pieces_tell_what_each_holds() {
+        // The ends, apart: one on the −X face (label 0), one on +X (1), both on the sides.
+        let (mesh, density) = blocks(|c| c[0] < 8.0 || c[0] > 22.0);
+        let p = pieces(&mesh, &density, 0.5);
+        assert_eq!(p.len(), 2);
+        assert!(p[0].labels.contains(&0) != p[1].labels.contains(&0));
+        assert!(
+            p.iter()
+                .all(|p| p.labels.contains(&2) && !p.labels.contains(&crate::NO_LABEL))
+        );
+        // Each holds about its share of the box: 8 mm of 30, give or take a layer.
+        assert!(p.iter().all(|p| (p.volume - 800.0).abs() < 200.0), "{p:?}");
+        // Joined in the middle, one piece.
+        let (mesh, density) = blocks(|c| c[0] < 8.0 || c[0] > 22.0 || c[1] < 4.0);
+        assert_eq!(pieces(&mesh, &density, 0.5).len(), 1);
+    }
+
+    #[test]
+    fn a_piece_the_loads_do_not_reach_is_joined_and_loose_bits_go() {
+        // The held end (−X), the loaded end (+X) apart from it, and a loose bit on top in
+        // between that holds nothing.
+        let (mesh, mut density) = blocks(|c| {
+            c[0] < 8.0
+                || c[0] > 22.0
+                || ((13.0..17.0).contains(&c[0]) && c[1] > 7.0 && (3.0..7.0).contains(&c[2]))
+        });
+        assert_eq!(pieces(&mesh, &density, 0.5).len(), 3);
+        let centre = centres(&mesh);
+        let volume: Vec<f64> = (0..mesh.tets.len())
+            .map(|e| mesh.tet_volume(e).unwrap())
+            .collect();
+        let filter = Filter::new(&centre, 3.0, 1, None);
+        let joint = Joint {
+            mesh: &mesh,
+            filter: &filter,
+            volume: &volume,
+            mass: &volume,
+            size: 2.0,
+            symmetry: None,
+            chain: None,
+        };
+        let joining = joint.join(&[0, 1], &[1], &mut density);
+        assert_eq!((joining.joined, joining.removed), (1, 1), "{joining:?}");
+        let after = pieces(&mesh, &density, 0.5);
+        assert_eq!(after.len(), 1);
+        assert!(after[0].labels.contains(&0) && after[0].labels.contains(&1));
+        // A bar about 6 mm thick across the 14 mm gap: a small share of the box.
+        assert!(
+            joining.added_mass > 0.02 && joining.added_mass < 0.25,
+            "{joining:?}"
+        );
+        assert!(joining.removed_mass > 0.0 && joining.removed_mass < 0.05);
+        // The joined shape is closed, in one piece.
+        assert!(is_closed(&shape(&mesh, &density, 0.5, 0)));
+    }
+
+    #[test]
+    fn a_cantilever_kept_in_one_piece_comes_out_in_one_piece() {
+        // Ten iterations on a coarse mesh: a grey design, whose cut at half density falls
+        // apart without the joining.
+        let (mesh, mut study) = cantilever([12, 4, 2]);
+        study.max_iterations = 10;
+        let loose = run(&mesh, &study);
+        assert!(loose.joining.is_none());
+        study.one_piece = true;
+        let r = run(&mesh, &study);
+        let joining = r.joining.unwrap();
+        let after = pieces(&mesh, &r.density, 0.5);
+        assert_eq!(after.len(), 1, "{joining:?}");
+        // The held end (label 0) and the loaded strip (7) in it. The bar is as thick as the
+        // thinnest member, here 16 mm in a 20 × 10 mm beam: some of its mass.
+        assert!(after[0].labels.contains(&0) && after[0].labels.contains(&7));
+        assert!(joining.added_mass < 0.3, "{joining:?}");
+        // Joining changes nothing where the shape was already in one piece.
+        let before = pieces(&mesh, &loose.density, 0.5).len();
+        assert_eq!(joining.joined + joining.removed == 0, before == 1);
     }
 
     #[test]

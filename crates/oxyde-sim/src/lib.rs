@@ -79,8 +79,8 @@ pub use thermal::{
     ThermalResults, ThermalStudy, ThermalSummary, Transient, solve_thermal,
 };
 pub use topology::{
-    Preserve, Pull, Shape, Symmetry, TopologyError, TopologyResults, TopologyStep, TopologyStudy,
-    optimize, shape,
+    Joining, Piece, Preserve, Pull, Shape, Symmetry, TopologyError, TopologyResults, TopologyStep,
+    TopologyStudy, optimize, pieces, shape,
 };
 
 /// A label on no face: a boundary facet the mesher could not tie to a model face.

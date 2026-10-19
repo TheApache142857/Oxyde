@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use oxyde_format::results::{
     DocumentHash, Elements, Extreme, Fingerprint, NodalFields, ResultBody, ResultFacet, ResultMesh,
     ResultsFile, SolverInfo, TemperatureFrame, ThermalFields, TopologyFields, TopologyIteration,
+    TopologyJoining,
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
@@ -26,7 +27,8 @@ use oxyde_format::simulation::{
 };
 use oxyde_format::{AssemblyFile, PartFile};
 use oxyde_sim::{
-    ContactKind, Facet, Frame, Results, TetMesh, ThermalResults, TopologyResults, TopologyStep,
+    ContactKind, Facet, Frame, Joining, Results, TetMesh, ThermalResults, TopologyResults,
+    TopologyStep,
 };
 
 use crate::app::OxydeApp;
@@ -194,6 +196,7 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
         direction,
         parting: goal.parting,
     });
+    out.topology.one_piece = goal.one_piece;
     if study.gravity && study.study_type.takes_gravity() {
         out.loads.push(Load {
             name: "Gravity-1".to_owned(),
@@ -343,6 +346,7 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
         symmetry_point: file.topology.symmetry.map_or([0.0; 3], |s| s.point),
         pull: file.topology.pull.map(|p| p.direction),
         parting: file.topology.pull.and_then(|p| p.parting),
+        one_piece: file.topology.one_piece,
     };
     for c in file.contacts.iter().filter(|c| !c.suppressed) {
         if let ContactDetection::Automatic { tolerance } = c.detection {
@@ -534,6 +538,12 @@ pub(crate) fn results_file(
                     change: s.change,
                 })
                 .collect(),
+            joining: t.joining.map(|j| TopologyJoining {
+                joined: j.joined as u32,
+                added_mass: j.added_mass,
+                removed: j.removed as u32,
+                removed_mass: j.removed_mass,
+            }),
         }),
     }
 }
@@ -644,6 +654,12 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
             converged: t.converged,
             solver_iterations: file.solver.iterations as usize,
             filter_radius: t.filter_radius,
+            joining: t.joining.map(|j| Joining {
+                joined: j.joined as usize,
+                added_mass: j.added_mass,
+                removed: j.removed as usize,
+                removed_mass: j.removed_mass,
+            }),
         }),
         None => None,
     };
@@ -1116,6 +1132,7 @@ mod tests {
             symmetry_point: [0.0, 12.5, 0.0],
             pull: Some([0.0, -1.0, 0.0]),
             parting: Some([0.0, 12.5, 0.0]),
+            one_piece: false,
         };
         // Gravity is not written for a topology study: readers would refuse it.
         study.gravity = true;
@@ -1148,6 +1165,12 @@ mod tests {
             converged: true,
             solver_iterations: 120,
             filter_radius: 0.75,
+            joining: Some(Joining {
+                joined: 1,
+                added_mass: 0.0125,
+                removed: 0,
+                removed_mass: 0.0,
+            }),
         };
         let done = Done::for_test(mesh, StudyType::Topology, Some(topology.clone()));
         let file = results_file(&done, "sim", "Topology 1", Fingerprint::default());

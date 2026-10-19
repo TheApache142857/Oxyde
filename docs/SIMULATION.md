@@ -514,6 +514,45 @@ Simulation, which is the same set of studies showing the topology ones.
   an OBJ file (`OXYDE_TOPOLOGY_OBJ`): 36 864 four-node elements, 60 iterations in 30 s in a
   debug build (`oxyde-sim` optimised), the shape a hollow box section with openings near
   the root, as bending wants.
+- **Speed** (`oxyde-tests/tests/topology_timings.rs`, ignored, on a real part; times
+  taken while the application ran a study beside them, so on the slow side). The owner's
+  Servo Arm, 45 × 12 × 6 mm with a 24-tooth spline, held at the hub and loaded at an end
+  hole: Netgen at 1 mm makes 74 308 elements, graded down around the teeth (their mean edge
+  0.29 mm). As ten-node elements, 122 170 nodes and about 7 s an iteration: 2.7 s to
+  assemble the matrix and build the multigrid hierarchy, the rest 25 to 35 conjugate
+  gradient iterations; the filter, the slopes and the update take 0.2 s. As four-node
+  elements, 18 369 nodes and 1.5 s an iteration, settled after 35 iterations in 51 s. At
+  0.3 mm, 352 484 elements: 524 137 nodes as ten-node elements (about 100 s an iteration, as
+  the owner met it), 73 311 as four-node ones and 4 to 8 s an iteration (assembly 0.2 s,
+  multigrid 1 s, the filter and the update 1 s). So topology studies are made with
+  four-node elements by default (the panel warns when one is set to ten-node elements):
+  the shape comes from the elements' densities, which they give as well. The iterations'
+  solves stop at a residual of 10⁻⁵ of the loads instead of the static study's 10⁻⁸ (the
+  whole part's solve keeps it): over four iterations at 0.3 mm, 148 conjugate gradient
+  iterations instead of 187, 25 s instead of 33. Building the multigrid hierarchy once for
+  several iterations would save most of the remaining second.
+- **In one piece** (`oxyde_sim::pieces`, *Keep it in one piece*). Least compliance has no
+  reason to join what carries no load: on the owner's Servo Arm, held at the hub and both
+  right-hand holes and loaded at the far left one, 70 % of the mass kept, the ring preserved
+  around the far right hole came out on its own (the hub and the nearer hole hold the load,
+  and the spare 30 % was taken from where it mattered least). The shape cut at a threshold
+  is in pieces exactly as its corners above the threshold are joined through the elements
+  they share (the material above it in an element is convex, the density being linear
+  there), so the pieces are a union-find over the corners, each with the faces it reaches.
+  The panel names the fixtures, loads and preserved regions on each piece the loads do not
+  reach, at the threshold shown. With *Keep it in one piece* (on for new studies; FORMAT.md
+  §8 `one_piece`), once optimized, the shape cut at half density loses the pieces that reach
+  no fixture, load or preserved region, and every other piece is joined to the largest one a
+  load is on, the largest first: Dijkstra's through the elements' face neighbours, entering
+  an element costing the material it lacks (plus a thousandth of its volume, so the shortest
+  of the ways through material is taken), the path grown to the filter's radius (a bar as
+  thick as the thinnest member), mirrored and shadowed along the pull like the shape. On the
+  Servo Arm, one piece joined for 0.14 % more mass, by a bar 0.9 mm thick (the automatic
+  thinnest member on a mesh graded down to the spline's teeth; a typed one makes it
+  sturdier); 16 iterations in 27 s at 0.3 mm. Tests: pieces counted and what each reaches; a
+  held block, a loaded one apart and a loose bit: the bit taken away, the blocks joined, one
+  closed shape; a grey cantilever kept in one piece comes out in one piece with its held and
+  loaded faces.
 
 Still to do: a stress limit as well as a mass target, a projection of the densities for
 crisper shapes (which should also make shapes pulled in the plane of bending solid or void),
