@@ -919,3 +919,31 @@ makes them.
   unrestricted and a 2-axis cutting outcome on target to 10 %, the cut the same down every
   column, the additive one failed and saying why, a surface and a scene, the outcomes saved
   and read back the same.
+
+**Built (October 2026): step 4**, *Create Part*: the outcome picked becomes a part file
+(asked for, next to the model by default), made on a job with a worker kernel while the part
+stays on show.
+
+- **The surface simplified** (`oxyde_sim::generative::decimate`): quadric edge collapse
+  (Garland and Heckbert) down to 8 000 triangles, each collapse kept only when the surface
+  stays a closed manifold (the ends sharing no neighbour but the edge's two triangles give
+  them, no end left with three triangles) and turns no triangle over; ties to the lower
+  indices, so it repeats exactly. Then split into its closed pieces (`solid_pieces`), specks
+  under a thousandth of the largest left out.
+- **A solid of each piece** by a new `Kernel` operation, `solid_from_mesh` (ARCHITECTURE.md
+  §4): OCCT's `BRepBuilderAPI_MakeShapeOnMesh` makes one planar face per triangle with shared
+  edges, which come back loose and are gathered into a shell, checked closed, made a solid,
+  turned outward and checked valid.
+- **Fused with the preserve bodies, the obstacles cut away**: copies of the exact bodies
+  (made on the UI thread, so the job works on shapes of its own) in one fuse and one cut. A
+  fuse that fails leaves the preserve bodies as bodies of their own; a cut that fails leaves
+  the obstacles' room in; the status says which. The result goes to STEP, with the outcome's
+  material, into the Imported feature of a new part in that material, kept as an imported
+  STEP file is: no change to `.oxyprt`. The panel then offers to open it.
+- **Tests**: in `oxyde-sim`, a sphere of 20 480 triangles brought to 2 000 stays a closed
+  manifold on the sphere to 0.1 mm with its volume to 1 %, the same on every run; an outcome's
+  surface brought to a quarter likewise; pieces found, the largest first, specks left out. In
+  `oxyde-tests`, the OpenCASCADE bracket's outcome: its 15 000 triangles brought to 6 000
+  (0.02 s), a solid of exactly the mesh's volume (1 s), fused with the rings and cut by the
+  post in one solid (1.3 s, a debug build with OCCT's release libraries), written as STEP and
+  read back the same.

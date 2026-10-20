@@ -18,6 +18,10 @@ release yet; the git history has every detail.
   factor) to compare them, draws the one picked with its iterations on a slider, and *Export*
   writes it as STL, OBJ or 3MF. The outcomes are saved beside the study and come back with
   it. Topology studies are still made in the Simulation tab, under New Study.
+- **Create Part.** The outcome picked becomes a part file of its own: its surface made a
+  solid, joined to the exact preserve bodies, the obstacles cut away, in the outcome's
+  material, ready to be refined with features or studied in the Simulation tab. The part
+  being studied stays open; the panel offers to open the new one.
 - **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
   Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
   clear of, the mass target, safety factor, minimum thickness and resolution, the ways of

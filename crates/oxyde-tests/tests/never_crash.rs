@@ -76,6 +76,10 @@ impl Kernel for PanickingKernel {
         panic!("boolean has a bug")
     }
 
+    fn solid_from_mesh(&mut self, _: &[[f64; 3]], _: &[[u32; 3]]) -> Result<OpResult, NeverError> {
+        panic!("solid_from_mesh has a bug")
+    }
+
     fn fillet(&mut self, _: ShapeHandle, _: &[u32], _: f64) -> Result<OpResult, NeverError> {
         panic!("fillet has a bug")
     }

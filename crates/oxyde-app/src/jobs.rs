@@ -95,6 +95,12 @@ pub enum Outcome {
         /// A new part named after the file: no undo step, nothing unsaved.
         fresh: Option<String>,
     },
+    /// A part made from a generative outcome and saved to `path`: what was done (or why it
+    /// could not be made).
+    PartCreated {
+        path: PathBuf,
+        result: Result<String, String>,
+    },
     /// A STEP assembly read, and the files it would become.
     StepPlanned {
         plan: Result<ImportPlan, String>,
@@ -181,7 +187,7 @@ impl OxydeApp {
         self.job.is_some()
     }
 
-    fn start_job<F>(&mut self, title: &str, work: F)
+    pub(crate) fn start_job<F>(&mut self, title: &str, work: F)
     where
         F: FnOnce(&mut OcctKernel, &Progress) -> Outcome + Send + 'static,
     {
@@ -474,6 +480,7 @@ impl OxydeApp {
                 file_name,
                 fresh,
             } => self.part_imported(part, &file_name, fresh),
+            Outcome::PartCreated { path, result } => self.part_created(path, result),
             Outcome::StepPlanned { plan, path, source } => match plan {
                 Ok(plan) => self.write_step_plan(&plan, &path, &source),
                 Err(e) => self.status = format!("Could not import {source}: {e}"),

@@ -12,6 +12,8 @@
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeShape.hxx>
+#include <BRepBuilderAPI_MakeShapeOnMesh.hxx>
+#include <limits>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -1420,6 +1422,70 @@ OpResultData Session::transform(std::uint64_t shape, rust::Slice<const double> r
                        SourceKind::InputFace, 0, static_cast<std::uint32_t>(j - 1));
         }
 
+        out.shape = insert(result);
+        return out;
+    });
+}
+
+OpResultData Session::solid_from_mesh(rust::Slice<const double> points,
+                                      rust::Slice<const std::uint32_t> triangles) {
+    return guarded("solid from mesh", [&] {
+        if (points.size() % 3 != 0 || triangles.size() % 3 != 0 || triangles.empty()) {
+            throw std::invalid_argument("a mesh needs points and triangles, in threes");
+        }
+        const std::size_t nodes = points.size() / 3;
+        const std::size_t count = triangles.size() / 3;
+        if (nodes > static_cast<std::size_t>(std::numeric_limits<int>::max()) || count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument("too many triangles");
+        }
+        Handle(Poly_Triangulation) mesh = new Poly_Triangulation(
+            static_cast<int>(nodes), static_cast<int>(count), Standard_False);
+        for (std::size_t i = 0; i < nodes; ++i) {
+            mesh->SetNode(static_cast<int>(i) + 1,
+                          gp_Pnt(points[3 * i], points[3 * i + 1], points[3 * i + 2]));
+        }
+        for (std::size_t t = 0; t < count; ++t) {
+            const std::uint32_t a = triangles[3 * t];
+            const std::uint32_t b = triangles[3 * t + 1];
+            const std::uint32_t c = triangles[3 * t + 2];
+            if (a >= nodes || b >= nodes || c >= nodes) {
+                throw std::invalid_argument("a triangle refers to a point past the points");
+            }
+            mesh->SetTriangle(static_cast<int>(t) + 1,
+                              Poly_Triangle(static_cast<int>(a) + 1, static_cast<int>(b) + 1,
+                                            static_cast<int>(c) + 1));
+        }
+        BRepBuilderAPI_MakeShapeOnMesh maker(mesh);
+        maker.Build();
+        if (!maker.IsDone()) {
+            throw std::runtime_error("the triangles make no shell");
+        }
+        // The faces come back loose, their edges shared: one shell of them all.
+        BRep_Builder builder;
+        TopoDS_Shell shell;
+        builder.MakeShell(shell);
+        for (TopExp_Explorer face(maker.Shape(), TopAbs_FACE); face.More(); face.Next()) {
+            builder.Add(shell, face.Current());
+        }
+        if (!BRep_Tool::IsClosed(shell)) {
+            throw std::runtime_error("the triangles do not close a volume");
+        }
+        shell.Closed(Standard_True);
+        BRepBuilderAPI_MakeSolid solid(shell);
+        if (!solid.IsDone()) {
+            throw std::runtime_error("the shell makes no solid");
+        }
+        TopoDS_Shape result = solid.Solid();
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(result, props);
+        if (props.Mass() < 0.0) {
+            result.Reverse();
+        }
+        check_valid(result, "the solid made from the triangles is not valid");
+
+        TopTools_IndexedMapOfShape result_faces;
+        TopExp::MapShapes(result, TopAbs_FACE, result_faces);
+        OpResultData out = empty_result(result_faces);
         out.shape = insert(result);
         return out;
     });

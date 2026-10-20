@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,12 +32,13 @@ use oxyde_format::simulation::{
     AxisDirection, GenerativeMethod, GenerativeObstacle, GenerativeSettings, MeshSize,
     OutcomeMethod, StudyType, SymmetryPlanes,
 };
-use oxyde_kernel::{FaceMesh, Mesh};
-use oxyde_model::{BodyId, Material, Mechanical};
+use oxyde_geom::Transform;
+use oxyde_kernel::{BooleanOp, FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
+use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical, Part};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, DesignSpace, Direction, GenerativeError, GenerativeStudy, Grid, MAX_VOXELS, Method,
-    Obstacle, Voxel, generate_on, surface, voxel_size,
+    Obstacle, Voxel, decimate, generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -52,6 +54,9 @@ const OUTCOME_COLOR: [u8; 3] = [175, 182, 192];
 const GHOST_OPACITY: f32 = 0.22;
 /// Rounds of Taubin's smoothing an outcome's surface is drawn and exported with.
 pub(crate) const SMOOTHING: usize = 12;
+/// The triangles an outcome's surface is simplified to for *Create Part*: one face each,
+/// as many as the kernel fuses with the preserve bodies in a few seconds.
+const PART_TRIANGLES: usize = 8000;
 
 // ---- Roles ---------------------------------------------------------------------------------
 
@@ -998,6 +1003,8 @@ pub(crate) struct GenView {
     looked_for: Option<String>,
     /// The voxels the resolution gives, by what it was worked out from.
     estimate: Option<(u64, Option<(f64, usize)>)>,
+    /// The part file *Create Part* made last, to open.
+    pub(crate) created: Option<PathBuf>,
 }
 
 impl GenView {
@@ -1024,6 +1031,9 @@ enum GenAction {
     Pick(u32),
     Show(bool),
     Export,
+    CreatePart,
+    /// Open the part *Create Part* made.
+    OpenCreated,
     OpenStudy,
     SaveStudy,
     OpenResults,
@@ -1580,6 +1590,124 @@ impl OxydeApp {
         };
     }
 
+    /// Create Part: the picked outcome as a new part file, made off the UI thread (its
+    /// surface simplified, a solid made of each piece, fused with copies of the preserve
+    /// bodies, the obstacles cut away, written as STEP into the new part's Imported feature,
+    /// in the outcome's material). The open part stays open; the panel offers the new one.
+    pub(crate) fn create_part(&mut self) {
+        let Some(shape) = self.outcome_shape() else {
+            self.status = "Create Part: pick an outcome first".to_owned();
+            return;
+        };
+        let view = &self.simulation.generative;
+        let Some(o) = view
+            .generated
+            .as_ref()
+            .zip(view.picked)
+            .and_then(|(g, id)| g.outcome(id))
+        else {
+            return;
+        };
+        let (id, material_name) = (o.id, o.material.clone());
+        let g = &self.simulation.study.generative;
+        let material = g
+            .materials
+            .iter()
+            .find(|m| m.name == material_name)
+            .cloned()
+            .or_else(|| self.doc.part.material().cloned());
+        let Some(body) = self.doc.part.body() else {
+            return;
+        };
+        let preserve: Vec<ShapeHandle> = g
+            .preserve
+            .iter()
+            .filter_map(|b| body.solid(*b).map(|s| s.shape))
+            .collect();
+        let obstacles: Vec<ShapeHandle> = g
+            .obstacles
+            .iter()
+            .filter_map(|o| body.solid(o.body).map(|s| s.shape))
+            .collect();
+        let stem = self.doc.display_name();
+        let name = format!("{stem} {} outcome {id}", self.simulation.study.name);
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("Oxyde part", &[oxyde_format::PART_EXTENSION])
+            .set_file_name(format!("{name}.{}", oxyde_format::PART_EXTENSION));
+        if let Some(dir) = self.doc.path.as_deref().and_then(std::path::Path::parent) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if !crate::assembly_ui::has_extension(&path, oxyde_format::PART_EXTENSION) {
+            path.set_extension(oxyde_format::PART_EXTENSION);
+        }
+        // Copies of the bodies to keep and to cut, so the job works on shapes of its own
+        // while the part stays on show.
+        let copy = |kernel: &mut oxyde_occt::OcctKernel, shapes: &[ShapeHandle]| {
+            shapes
+                .iter()
+                .filter_map(|s| kernel.transform(*s, &Transform::IDENTITY).ok())
+                .map(|r| r.shape)
+                .collect::<Vec<_>>()
+        };
+        let preserve = copy(&mut self.kernel, &preserve);
+        let obstacles = copy(&mut self.kernel, &obstacles);
+        let input = PartInput {
+            shape,
+            preserve,
+            obstacles,
+            material,
+            file_name: format!("{name}.step"),
+        };
+        self.simulation.generative.created = None;
+        let target = path.clone();
+        self.start_job(
+            &format!("Making a part of outcome {id}"),
+            move |kernel, progress| {
+                let result = make_outcome_part(kernel, input, &|what| progress.say(what)).and_then(
+                    |(part, note)| {
+                        progress.say("Saving the part");
+                        let file = oxyde_format::PartFile {
+                            document_id: oxyde_format::new_document_id(),
+                            definition: part.definition(),
+                            properties: oxyde_format::Properties {
+                                material: part
+                                    .material()
+                                    .map(|m| m.name.clone())
+                                    .unwrap_or_default(),
+                                ..oxyde_format::Properties::default()
+                            },
+                        };
+                        let saved = oxyde_format::save_part(&target, &file)
+                            .map(|()| note)
+                            .map_err(|e| format!("could not save {}: {e}", target.display()));
+                        let mut part = part;
+                        part.release(kernel);
+                        saved
+                    },
+                );
+                crate::jobs::Outcome::PartCreated {
+                    path: target,
+                    result,
+                }
+            },
+        );
+    }
+
+    /// The part *Create Part* made: saved, offered in the panel.
+    pub(crate) fn part_created(&mut self, path: PathBuf, result: Result<String, String>) {
+        match result {
+            Ok(note) => {
+                self.status = format!("Made {}: {note}", path.display());
+                self.remember_recent(&path);
+                self.simulation.generative.created = Some(path);
+            }
+            Err(why) => self.status = format!("Could not make the part: {why}"),
+        }
+    }
+
     /// The Generative Design tab was chosen: when the open study is not a generative
     /// study, the model's first one opens, if it has one.
     pub(crate) fn enter_generative(&mut self) {
@@ -1742,6 +1870,15 @@ impl OxydeApp {
                         .map(|o| o.id)
                 });
             }
+        }
+        if command_button(ui, Icon::Part, "Create Part", has_outcome, false)
+            .on_hover_text(
+                "A new part file of the outcome picked: its surface made a solid, joined to the \
+                 preserve bodies, the obstacles cut away",
+            )
+            .clicked()
+        {
+            self.create_part();
         }
         if command_button(ui, Icon::ExportMesh, "Export", has_outcome, false)
             .on_hover_text(
@@ -1923,6 +2060,21 @@ impl OxydeApp {
                         .text(format!("{stage}… {:.0} %", fraction * 100.0)),
                 );
             }
+            if let Some(path) = &self.simulation.generative.created {
+                ui.horizontal_wrapped(|ui| {
+                    let name = path
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+                    ui.label(egui::RichText::new(format!("Made {name}")).small());
+                    if ui
+                        .small_button("Open it")
+                        .on_hover_text("Open the part made from the outcome (this part closes)")
+                        .clicked()
+                    {
+                        action = Some(GenAction::OpenCreated);
+                    }
+                });
+            }
             for e in self
                 .simulation
                 .generative
@@ -2066,6 +2218,12 @@ impl OxydeApp {
             }
             Some(GenAction::Show(on)) => self.simulation.generative.show = on,
             Some(GenAction::Export) => self.export_outcome(),
+            Some(GenAction::CreatePart) => self.create_part(),
+            Some(GenAction::OpenCreated) => {
+                if let Some(path) = self.simulation.generative.created.clone() {
+                    self.guard(crate::app::PendingAction::OpenRecent(path), ui.ctx());
+                }
+            }
             Some(GenAction::OpenStudy) => self.open_study(),
             Some(GenAction::SaveStudy) => {
                 self.save_study(false);
@@ -2078,6 +2236,136 @@ impl OxydeApp {
             None => {}
         }
     }
+}
+
+// ---- Create Part ---------------------------------------------------------------------------
+
+/// What *Create Part* works from: the outcome's surface, copies of the bodies to keep and
+/// to cut (the job's to release), the outcome's material.
+struct PartInput {
+    shape: Shape,
+    preserve: Vec<ShapeHandle>,
+    obstacles: Vec<ShapeHandle>,
+    material: Option<Material>,
+    file_name: String,
+}
+
+/// The part of an outcome, rebuilt on `kernel`, and a note of what was done: the surface
+/// simplified to [`PART_TRIANGLES`], a solid of each piece, fused with the preserve bodies
+/// (left as bodies of their own when the fuse fails), the obstacles cut away (left in when
+/// that fails), written as STEP into an Imported feature, in the outcome's material.
+fn make_outcome_part<K: Kernel>(
+    kernel: &mut K,
+    input: PartInput,
+    say: &dyn Fn(String),
+) -> Result<(Part, String), String> {
+    let PartInput {
+        shape,
+        preserve,
+        obstacles,
+        material,
+        file_name,
+    } = input;
+    let mut made: Vec<ShapeHandle> = Vec::new();
+    let release = |kernel: &mut K, shapes: &[ShapeHandle]| {
+        for s in shapes {
+            kernel.release(*s);
+        }
+    };
+    let result = (|| {
+        say("Simplifying the surface".to_owned());
+        let fewer = decimate(&shape, PART_TRIANGLES);
+        let pieces = solid_pieces(&fewer);
+        if pieces.is_empty() {
+            return Err("the outcome has no closed surface".to_owned());
+        }
+        say(format!(
+            "Making a solid of {} triangles",
+            fewer.triangles.len()
+        ));
+        let mut solids = Vec::new();
+        for p in &pieces {
+            let s = kernel
+                .solid_from_mesh(&p.positions, &p.triangles)
+                .map_err(|e| format!("the surface makes no solid: {e}"))?
+                .shape;
+            made.push(s);
+            solids.push(s);
+        }
+        let mut notes = vec![format!("{} triangles", fewer.triangles.len())];
+        let mut bodies: Vec<ShapeHandle> = solids.clone();
+        if let Some((&first, rest)) = solids.split_first()
+            && (!preserve.is_empty() || !rest.is_empty())
+        {
+            say("Joining the preserve bodies".to_owned());
+            let tools: Vec<ShapeHandle> = rest.iter().chain(&preserve).copied().collect();
+            match kernel.boolean_many(BooleanOp::Fuse, first, &tools) {
+                Ok(r) => {
+                    made.push(r.shape);
+                    bodies = vec![r.shape];
+                    notes.push("joined to the preserve bodies".to_owned());
+                }
+                Err(e) => {
+                    bodies.extend(&preserve);
+                    notes.push(format!("the preserve bodies left apart ({e})"));
+                }
+            }
+        }
+        if let [only] = bodies[..]
+            && !obstacles.is_empty()
+        {
+            say("Cutting the obstacles away".to_owned());
+            match kernel.boolean_many(BooleanOp::Cut, only, &obstacles) {
+                Ok(r) => {
+                    made.push(r.shape);
+                    bodies = vec![r.shape];
+                    notes.push("the obstacles cut away".to_owned());
+                }
+                Err(e) => notes.push(format!("the obstacles not cut ({e})")),
+            }
+        }
+        say("Writing the solid".to_owned());
+        let step = std::env::temp_dir().join(format!(
+            "oxyde-outcome-{}-{}.step",
+            std::process::id(),
+            crate::document::next_revision()
+        ));
+        let materials: Vec<Option<StepMaterial>> = bodies
+            .iter()
+            .map(|_| {
+                material.as_ref().map(|m| StepMaterial {
+                    name: m.name.clone(),
+                    description: String::new(),
+                    density: m.density,
+                })
+            })
+            .collect();
+        kernel
+            .export_step(&bodies, &[], &materials, &step)
+            .map_err(|e| format!("could not write the solid: {e}"))?;
+        let bytes = std::fs::read(&step).map_err(|e| format!("could not read the solid: {e}"));
+        let _ = std::fs::remove_file(&step);
+        Ok((bytes?, notes.join(", ")))
+    })();
+    release(kernel, &made);
+    release(kernel, &preserve);
+    release(kernel, &obstacles);
+    let (bytes, note) = result?;
+    say("Rebuilding the part".to_owned());
+    let mut part = Part::new();
+    part.set_material(material);
+    part.add_feature(oxyde_model::FeatureKind::Import(Import::new(
+        file_name,
+        FileData::new(bytes),
+    )));
+    part.rebuild(kernel);
+    let id = part.timeline().last().map(|e| e.id);
+    if let Some(FeatureStatus::Error(why)) = id.and_then(|id| part.status(id)) {
+        let why = why.clone();
+        part.release(kernel);
+        return Err(why);
+    }
+    Ok((part, note))
 }
 
 // ---- The panel's sections ------------------------------------------------------------------
@@ -2842,6 +3130,16 @@ fn picked_rows(
             .on_hover_text("The obstacles drawn faintly around it");
         if ui.button("Export…").clicked() {
             action = Some(GenAction::Export);
+        }
+        if ui
+            .button("Create Part…")
+            .on_hover_text(
+                "A new part file of the outcome: its surface made a solid, joined to the \
+                 preserve bodies, the obstacles cut away",
+            )
+            .clicked()
+        {
+            action = Some(GenAction::CreatePart);
         }
     });
     action

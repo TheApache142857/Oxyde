@@ -14,12 +14,12 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use oxyde_geom::Point2;
-use oxyde_kernel::{Kernel, Mesh, SurfaceKind};
+use oxyde_kernel::{BooleanOp, Kernel, Mesh, ShapeHandle, SurfaceKind};
 use oxyde_model::{Extrude, ExtrudeOp, FeatureKind, Part, Sketch, SketchPlane, StandardPlane};
 use oxyde_occt::OcctKernel;
 use oxyde_sim::generative::{
-    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, generate,
-    generate_on, surface, voxel_size,
+    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, decimate,
+    generate, generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, Fixture, FixtureKind, Load, LoadKind, SolveOptions, SurfaceMesh};
 use oxyde_sim_gpu::GpuBackend;
@@ -43,6 +43,8 @@ fn body(part: &mut Part, plane: StandardPlane, profile: impl FnOnce(&mut Sketch)
 /// between them. Each solid's surface, its faces labelled by their index in the part's
 /// topology, and each ring's bore (its smaller cylindrical face).
 struct Bracket {
+    kernel: OcctKernel,
+    part: Part,
     solids: Vec<SurfaceMesh>,
     bores: [u32; 2],
 }
@@ -112,7 +114,12 @@ fn bracket() -> Bracket {
                 .expect("a bore");
         }
     }
-    Bracket { solids, bores }
+    Bracket {
+        kernel,
+        part,
+        solids,
+        bores,
+    }
 }
 
 fn study(bracket: &Bracket, density: f64) -> GenerativeStudy {
@@ -230,6 +237,85 @@ fn a_bracket_is_grown_between_its_rings_around_the_post() {
     assert!(joined(&grid, &outcome.density, &loaded, &held));
     let shape = surface(&grid, &outcome.density, 10);
     assert!(!shape.triangles.is_empty() && shape.volume() > 0.0);
+}
+
+/// Create Part's work on an outcome: its surface simplified, a solid made of each piece,
+/// fused with the rings (the preserve bodies), the post (the obstacle) cut away, written as
+/// STEP and read back.
+#[test]
+fn an_outcome_becomes_a_solid_with_the_rings() {
+    let mut bracket = bracket();
+    let mut study = study(&bracket, 0.0);
+    study.max_iterations = 30;
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let outcome = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    let shape = surface(&grid, &outcome.density, 12);
+
+    let start = Instant::now();
+    let fewer = decimate(&shape, 6000);
+    let pieces = solid_pieces(&fewer);
+    eprintln!(
+        "{} triangles to {} in {} piece(s), {:.2} s",
+        shape.triangles.len(),
+        fewer.triangles.len(),
+        pieces.len(),
+        start.elapsed().as_secs_f64()
+    );
+    assert!(!pieces.is_empty() && fewer.triangles.len() <= 6000);
+    let start = Instant::now();
+    let kernel = &mut bracket.kernel;
+    let solids: Vec<ShapeHandle> = pieces
+        .iter()
+        .map(|p| {
+            kernel
+                .solid_from_mesh(&p.positions, &p.triangles)
+                .unwrap()
+                .shape
+        })
+        .collect();
+    let made: f64 = solids.iter().map(|s| kernel.volume(*s).unwrap()).sum();
+    let meshed: f64 = pieces.iter().map(|p| p.volume()).sum();
+    assert!((made - meshed).abs() < 1e-6 * meshed, "{made} {meshed}");
+    eprintln!("solids: {:.2} s", start.elapsed().as_secs_f64());
+
+    let start = Instant::now();
+    let body = bracket.part.body().unwrap();
+    let rings: Vec<ShapeHandle> = body.solids[..2].iter().map(|s| s.shape).collect();
+    let post = body.solids[2].shape;
+    let tools: Vec<ShapeHandle> = solids[1..].iter().chain(&rings).copied().collect();
+    let fused = kernel
+        .boolean_many(BooleanOp::Fuse, solids[0], &tools)
+        .unwrap();
+    let cut = kernel.boolean(BooleanOp::Cut, fused.shape, post).unwrap();
+    eprintln!("fuse and cut: {:.2} s", start.elapsed().as_secs_f64());
+    let rings_volume: f64 = rings.iter().map(|r| kernel.volume(*r).unwrap()).sum();
+    let volume = kernel.volume(cut.shape).unwrap();
+    // The outcome holds the rings, roughly (voxels), and the exact rings add their edges.
+    assert!(
+        volume >= 0.97 * made && volume <= made + rings_volume,
+        "{volume}"
+    );
+    // The loaded ring joined to the held one: one solid.
+    assert_eq!(kernel.topology_counts(cut.shape).unwrap().solids, 1);
+
+    // Written as STEP and read back, as the part's Imported feature keeps it.
+    let path = std::env::temp_dir().join(format!("oxyde-outcome-{}.step", std::process::id()));
+    kernel.export_step(&[cut.shape], &[], &[], &path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let read = kernel.import_step(&bytes).unwrap();
+    let back = kernel.volume(read.shape).unwrap();
+    assert!((back - volume).abs() < 1e-3 * volume, "{back} {volume}");
 }
 
 fn write_obj(path: &str, shape: &oxyde_sim::Shape) -> std::io::Result<()> {

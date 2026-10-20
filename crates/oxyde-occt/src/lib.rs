@@ -249,6 +249,22 @@ impl Kernel for OcctKernel {
         })
     }
 
+    fn solid_from_mesh(
+        &mut self,
+        points: &[[f64; 3]],
+        triangles: &[[u32; 3]],
+    ) -> Result<OpResult, OcctError> {
+        guarded(|| {
+            let points: Vec<f64> = points.iter().flatten().copied().collect();
+            let triangles: Vec<u32> = triangles.iter().flatten().copied().collect();
+            let data = self
+                .session
+                .pin_mut()
+                .solid_from_mesh(&points, &triangles)?;
+            Ok(op_result(data))
+        })
+    }
+
     fn boolean_many(
         &mut self,
         op: BooleanOp,

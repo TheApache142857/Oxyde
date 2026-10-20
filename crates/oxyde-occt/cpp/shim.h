@@ -69,6 +69,8 @@ public:
     OpResultData transform(std::uint64_t shape, rust::Slice<const double> rows);
     OpResultData boolean_op(std::uint8_t kind, std::uint64_t target,
                             rust::Slice<const std::uint64_t> tools);
+    OpResultData solid_from_mesh(rust::Slice<const double> points,
+                                 rust::Slice<const std::uint32_t> triangles);
     OpResultData fillet(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
                         double radius);
     OpResultData chamfer(std::uint64_t shape, rust::Slice<const std::uint32_t> edges,
