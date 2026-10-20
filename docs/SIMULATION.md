@@ -882,3 +882,40 @@ its methods split into outcomes by `GenerativeMethod::outcomes`) and
   outcome with no message or with snapshots, a message on one that did not fail, another
   overhang, snapshots not matching their entry, a grid with no voxel along an axis, other
   units, a density entry missing or not described).
+
+**Built (October 2026): step 3**, the tab (`oxyde-app`, `generative_ui.rs`): the Topology tab
+becomes Generative Design, and topology studies stay in the Simulation tab, where New Study
+makes them.
+
+- **Setting up**: *New Generative Study*; the bodies' roles from the command bar (*Preserve*,
+  *Obstacle*, *Starting Shape* on the bodies of the selected faces, a second click taking the
+  role back) or the panel's list of bodies, each coloured by role in the viewport, as Fusion
+  360 colours them (green, red, yellow); fixtures and loads as in a static study, on preserve
+  bodies; *Objectives and limits* (maximize stiffness, the mass target in kg with what the
+  preserve bodies weigh beside it, the safety factor the outcomes are held against);
+  *Manufacturing* (unrestricted, 2-axis cutting along X, Y or Z, casting along any of the six
+  directions, one way or both from a parting plane; additive is in the file but not
+  generated yet: such an outcome fails, saying so); *Materials* from the library (none: the
+  part's own); *Resolution* (the density slider or a voxel size, with the voxels it makes),
+  the minimum thickness, the iteration limit and symmetry.
+- **Generate** checks the study first (bodies kept, held, loaded, on preserve bodies, a
+  mass target, a way of making it, a material), then lays the grid and grows the outcomes on
+  a thread, on the graphics card when there is one (a preference, on by default), each shown
+  as it is done; *Stop* keeps the one being grown as far as it got (`Outcome::stopped`, a
+  change to the engine: a stop after an iteration returns the design, `Cancelled` before
+  one). A saved study's outcomes are saved beside it, and read back when it opens if neither
+  the model nor the study changed.
+- **Explore**: the outcomes listed (material, method, mass, the estimated factor of safety
+  marked when under the study's), plotted mass across and maximum stress, compliance,
+  displacement or factor of safety up, a click on a point picking one; the one picked drawn
+  in place of the model with the preserve bodies exact over it and the obstacles faint, its
+  numbers, and its iterations on a slider (every tenth, then the end). *Export* writes its
+  surface as STL, OBJ or 3MF.
+- **Tests** (`oxyde-app`): roles (one per body, an obstacle keeping its offset, one starting
+  shape), methods' names and the engine's, every material meeting every method direction,
+  a study refused until it can be generated (a fixture on a body not kept, no mass target, no
+  preserve body, a body gone) with its voxel estimate and the preserve bodies' mass, a study
+  file keeping the settings, and two pads generated through the thread on the CPU: an
+  unrestricted and a 2-axis cutting outcome on target to 10 %, the cut the same down every
+  column, the additive one failed and saying why, a surface and a scene, the outcomes saved
+  and read back the same.

@@ -2526,6 +2526,7 @@ dependencies = [
  "oxyde-occt",
  "oxyde-render",
  "oxyde-sim",
+ "oxyde-sim-gpu",
  "oxyde-sketch",
  "pollster 0.3.0",
  "rfd",

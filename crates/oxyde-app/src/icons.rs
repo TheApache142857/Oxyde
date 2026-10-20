@@ -139,6 +139,14 @@ pub enum Icon {
     TemperaturePlot,
     /// The heat flux plot: a block with arrows through it in plot colours.
     HeatFluxPlot,
+    /// Generative design: two green bosses joined by grown, branching members.
+    Generative,
+    /// Obstacle: a red block material stays out of.
+    Obstacle,
+    /// Starting shape: a yellow block the material starts in.
+    StartingShape,
+    /// Explore: outcomes as dots on a plot, one picked.
+    Explore,
     // View and edit
     ViewFront,
     ViewTop,
@@ -181,6 +189,18 @@ const HOT: Color32 = Color32::from_rgb(220, 45, 35);
 const COOL: Color32 = Color32::from_rgb(40, 125, 215);
 /// Material a topology study keeps.
 const KEEP: Color32 = Color32::from_rgb(25, 150, 150);
+/// Generative design's roles, as Fusion 360 colours them: preserve, obstacle, starting shape.
+const PRESERVE: Color32 = Color32::from_rgb(70, 170, 95);
+const OBSTACLE: [Color32; 3] = [
+    Color32::from_rgb(240, 160, 150),
+    Color32::from_rgb(215, 75, 65),
+    Color32::from_rgb(165, 50, 45),
+];
+const STARTING: [Color32; 3] = [
+    Color32::from_rgb(250, 228, 150),
+    Color32::from_rgb(235, 190, 60),
+    Color32::from_rgb(190, 148, 40),
+];
 const WHITE: Color32 = Color32::WHITE;
 
 /// Draws on the 24-unit grid of one icon.
@@ -1243,6 +1263,45 @@ fn draw(pen: &Pen, icon: Icon) {
                 INK,
             );
         }
+        Generative => {
+            // Members grown from the lower boss to the upper one, branching on the way.
+            let members: [&[(f32, f32)]; 3] = [
+                &[(7.0, 16.0), (10.5, 14.5), (13.5, 11.0), (17.0, 7.5)],
+                &[(5.5, 15.0), (6.5, 10.5), (10.0, 7.0), (16.0, 5.5)],
+                &[(10.5, 14.5), (14.5, 15.0), (18.0, 10.0), (18.5, 8.5)],
+            ];
+            for m in members {
+                pen.line(m, 3.4, INK);
+            }
+            for m in members {
+                pen.line(m, 2.0, BODY);
+            }
+            pen.ring(5.5, 18.0, 3.2, 2.2, PRESERVE);
+            pen.ring(18.5, 6.0, 3.2, 2.2, PRESERVE);
+        }
+        Obstacle => {
+            pen.block(4.0, 10.0, 12.0, 10.0, 5.0, OBSTACLE);
+            // No material: a white bar across.
+            pen.line(&[(6.5, 15.0), (13.5, 15.0)], 2.4, WHITE);
+        }
+        StartingShape => {
+            pen.block(3.0, 9.0, 14.0, 11.0, 5.0, STARTING);
+            // The shape that grows inside it.
+            pen.line(&[(6.0, 17.0), (9.5, 13.0), (14.0, 12.0)], 2.2, INK);
+        }
+        Explore => {
+            pen.line(&[(3.0, 3.0), (3.0, 21.0), (21.0, 21.0)], 1.4, INK);
+            for (x, y, c) in [
+                (7.0, 8.0, SKETCH),
+                (10.0, 13.0, ACCENT),
+                (13.5, 9.5, SKETCH),
+                (17.0, 16.0, ACCENT),
+            ] {
+                pen.circle(x, y, 1.9, c, None);
+            }
+            pen.circle(11.0, 17.0, 2.2, PRESERVE, None);
+            pen.circle(11.0, 17.0, 3.6, Color32::TRANSPARENT, Some((1.3, INK)));
+        }
         Preserve => {
             pen.block(3.0, 11.0, 12.0, 9.0, 5.0, [KEEP, BODY, BODY_SIDE]);
             // A padlock: its shackle, then its body.
@@ -1608,7 +1667,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 97] = {
+pub const ALL: [Icon; 101] = {
     use Icon::*;
     [
         Sketch,
@@ -1692,6 +1751,10 @@ pub const ALL: [Icon; 97] = {
         InternalHeat,
         TemperaturePlot,
         HeatFluxPlot,
+        Generative,
+        Obstacle,
+        StartingShape,
+        Explore,
         ViewFront,
         ViewTop,
         ViewRight,

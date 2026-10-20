@@ -206,6 +206,10 @@ pub struct Outcome {
     pub history: Vec<GenerativeStep>,
     /// The design settled before the iteration limit.
     pub converged: bool,
+    /// The run was stopped (`cancel` set) after an iteration or more: the outcome is the
+    /// design as far as it got, its numbers from the last solve, which may not have
+    /// finished.
+    pub stopped: bool,
     /// kg.
     pub mass: f64,
     /// N·mm.
@@ -582,6 +586,7 @@ pub fn generate_on(
     let mut history: Vec<GenerativeStep> = Vec::new();
     let mut snapshots: Vec<(usize, Vec<u8>)> = Vec::new();
     let mut converged = false;
+    let mut stopped = false;
     let mut at_beta = 0;
     let mut solver_iterations = 0;
     let mut solved_rho: Vec<f64> = Vec::new();
@@ -589,8 +594,13 @@ pub fn generate_on(
     let mut compliance = 0.0;
 
     for iteration in 0..iterations {
+        // Stopped after an iteration or more: the design as far as it got.
         if cancel.load(Ordering::Relaxed) {
-            return Err(GenerativeError::Cancelled);
+            if history.is_empty() {
+                return Err(GenerativeError::Cancelled);
+            }
+            stopped = true;
+            break;
         }
         // Design, filtered, capped along a casting direction, projected.
         let design: Vec<f64> = (0..voxels)
@@ -644,7 +654,7 @@ pub fn generate_on(
                 SOLVE_ITERATIONS,
                 cancel,
                 threads,
-            )?,
+            ),
             Some(backend) => {
                 fine.project(&mut displacement);
                 let mut kept = loads.clone();
@@ -660,8 +670,16 @@ pub fn generate_on(
                     tolerance,
                     SOLVE_ITERATIONS,
                     cancel,
-                )?
+                )
             }
+        };
+        let solved = match solved {
+            Ok(s) => s,
+            Err(GenerativeError::Cancelled) if !history.is_empty() => {
+                stopped = true;
+                break;
+            }
+            Err(e) => return Err(e),
         };
         solver_iterations += solved.iterations;
         let energies = element_energies(dims, &brick, &displacement, &stiffness, threads);
@@ -787,6 +805,7 @@ pub fn generate_on(
         snapshots,
         history,
         converged,
+        stopped,
         mass,
         compliance,
         max_displacement,

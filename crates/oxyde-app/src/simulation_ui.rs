@@ -1,8 +1,8 @@
 //! The Simulation tab: studies of the part or assembly, as SolidWorks Simulation and
 //! Fusion 360 run them (`docs/SIMULATION.md`). The tab starts on *New Study*, which makes
 //! a static, thermal, transient thermal, thermal stress or topology study; a model has any
-//! number of them, one shown at a time (`simulation_studies.rs`). The Topology tab, next
-//! to it, shows the same studies, the topology ones only.
+//! number of them, one shown at a time (`simulation_studies.rs`). Generative studies are
+//! among them too, shown in the Generative Design tab only (`generative_ui.rs`).
 //!
 //! A topology study takes a static study's fixtures, forces and pressures, and *Preserve
 //! Region* faces where material must stay; *Run* takes material away where the loads do
@@ -46,14 +46,14 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use oxyde_assembly::Placement;
 use oxyde_format::results::{Fingerprint, SolverInfo};
-use oxyde_format::simulation::{StudyType, TransientSettings};
+use oxyde_format::simulation::{GenerativeSettings, StudyType, TransientSettings};
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
     FaceMesh, FaceSource, Kernel, Mesh, MeshWatch, ShapeHandle, VolumeMesh, VolumeMeshError,
     VolumeMeshOptions,
 };
-use oxyde_model::{FaceName, Material, Mechanical, Thermal};
+use oxyde_model::{BodyId, FaceName, Material, Mechanical, Thermal};
 use oxyde_occt::OcctKernel;
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
@@ -203,6 +203,8 @@ pub struct SimulationPrefs {
     pub smooth_shape: bool,
     /// The whole model drawn faintly around a topology study's shape.
     pub show_original: bool,
+    /// Generative studies solved on the graphics card when there is one.
+    pub generative_gpu: bool,
 }
 
 impl Default for SimulationPrefs {
@@ -218,6 +220,7 @@ impl Default for SimulationPrefs {
             shape_threshold: 0.5,
             smooth_shape: true,
             show_original: true,
+            generative_gpu: true,
         }
     }
 }
@@ -542,6 +545,9 @@ pub struct Study {
     pub reference_temperature: f64,
     /// A topology study's target mass, member size and iterations.
     pub topology: TopologyGoal,
+    /// A generative study's bodies, target, methods, materials and resolution, as the file
+    /// has them.
+    pub generative: GenerativeSettings,
     pub contacts: Vec<StudyContact>,
     /// mm: how close faces of different bodies must be to be found in contact.
     pub contact_tolerance: f64,
@@ -571,6 +577,7 @@ impl Study {
             transient: TransientSettings::default(),
             reference_temperature: 20.0,
             topology: TopologyGoal::default(),
+            generative: GenerativeSettings::default(),
             contacts: Vec::new(),
             contact_tolerance: 0.1,
             contacts_found: false,
@@ -677,8 +684,10 @@ impl Study {
 
 /// A solid of the model handed to the mesher.
 #[derive(Debug, Clone)]
-struct BodyInfo {
+pub(crate) struct BodyInfo {
     name: String,
+    /// The part's body it is, in a part.
+    pub(crate) id: Option<BodyId>,
     /// Its material group: the material's name, or `part:` and the part's document id.
     key: String,
     material: Option<Material>,
@@ -698,15 +707,15 @@ struct BodySource {
 }
 
 /// The model's surfaces for the mesher, made for one revision of the document.
-struct Surfaces {
-    revision: u64,
-    assembly: bool,
-    solids: Vec<SurfaceMesh>,
+pub(crate) struct Surfaces {
+    pub(crate) revision: u64,
+    pub(crate) assembly: bool,
+    pub(crate) solids: Vec<SurfaceMesh>,
     /// The face each label stands for.
-    faces: Vec<SimFace>,
+    pub(crate) faces: Vec<SimFace>,
     /// The body (index into `bodies`) of each label.
-    face_body: Vec<u32>,
-    bodies: Vec<BodyInfo>,
+    pub(crate) face_body: Vec<u32>,
+    pub(crate) bodies: Vec<BodyInfo>,
     sources: Vec<BodySource>,
     /// mm³, mm² and mm.
     volume: f64,
@@ -714,9 +723,45 @@ struct Surfaces {
     diagonal: f64,
 }
 
+#[cfg(test)]
+impl Surfaces {
+    /// The surfaces of a part's `bodies` as a test makes them: `solids` labelled by index
+    /// into `faces`, `face_body` the body of each.
+    pub(crate) fn for_test(
+        solids: Vec<SurfaceMesh>,
+        faces: Vec<SimFace>,
+        face_body: Vec<u32>,
+        bodies: Vec<(String, Option<BodyId>, Option<Material>)>,
+    ) -> Surfaces {
+        Surfaces {
+            revision: 0,
+            assembly: false,
+            solids,
+            faces,
+            face_body,
+            bodies: bodies
+                .into_iter()
+                .map(|(name, id, material)| BodyInfo {
+                    key: material
+                        .as_ref()
+                        .map_or_else(|| "part:x".to_owned(), |m| m.name.clone()),
+                    name,
+                    id,
+                    material,
+                    path: None,
+                })
+                .collect(),
+            sources: Vec::new(),
+            volume: 0.0,
+            area: 0.0,
+            diagonal: 1.0,
+        }
+    }
+}
+
 impl Surfaces {
     /// The labels of `faces`.
-    fn labels(&self, faces: &[SimFace]) -> Vec<u32> {
+    pub(crate) fn labels(&self, faces: &[SimFace]) -> Vec<u32> {
         self.faces
             .iter()
             .enumerate()
@@ -963,7 +1008,7 @@ pub struct SimulationView {
     pub study: Study,
     /// Where the study is saved, once it is.
     pub(crate) file: Option<StudyFile>,
-    surfaces: Option<Surfaces>,
+    pub(crate) surfaces: Option<Surfaces>,
     /// Why the surfaces could not be made for this revision (assembly or not): not tried
     /// again every frame.
     surfaces_failed: Option<(u64, bool, String)>,
@@ -974,7 +1019,7 @@ pub struct SimulationView {
     shown: Option<PlotKey>,
     legend: Option<Legend>,
     error: Option<String>,
-    prefs_dirty: bool,
+    pub(crate) prefs_dirty: bool,
     /// The item picked in the panel, whose faces are selected.
     pub(crate) selected: Option<usize>,
     /// The contact picked in the panel.
@@ -984,9 +1029,9 @@ pub struct SimulationView {
     /// The model's other studies, in order, without the open one (which sits at `active`
     /// among them).
     pub(crate) others: Vec<crate::simulation_studies::Parked>,
-    /// The study document's generative studies, which this tab neither shows nor changes:
-    /// written back as they were read when the studies are saved.
-    pub(crate) generative_studies: Vec<oxyde_format::simulation::Study>,
+    /// The Generative Design tab's state beside the open study: its outcomes, the
+    /// generation running, what Explore shows.
+    pub(crate) generative: crate::generative_ui::GenView,
     pub(crate) active: usize,
     /// The time of a transient study's results shown, an index into its frames.
     pub(crate) frame: usize,
@@ -1186,31 +1231,24 @@ fn too_many_nodes(nodes: usize, budget_gb: f64, quadratic: bool) -> String {
 // ---- The application side ------------------------------------------------------------------
 
 impl OxydeApp {
-    /// Whether the Simulation tab, or the Topology tab with a topology study open, is
-    /// open and in charge of the viewport.
+    /// Whether the Simulation tab with one of its studies open, or the Generative Design
+    /// tab with a generative study open, is open and in charge of the viewport.
     pub(crate) fn simulation_active(&self) -> bool {
-        let simulation = match self.asm {
-            Some(_) => self.asm_tab == crate::assembly_ui::AsmTab::Simulation,
-            None => self.tab == crate::app::CommandTab::Simulation,
-        };
-        let tab = simulation || (self.topology_tab_open() && self.topology_study_open());
+        let simulation = self.simulation_tab_open();
+        let generative = self.generative_study_open();
+        let tab = (simulation && !generative) || (self.generative_tab_open() && generative);
         tab && self.sketch.is_none()
             && self.section.is_none()
             && self.mesh_export.is_none()
             && !self.busy()
     }
 
-    /// Whether the Topology tab is the one open.
-    pub(crate) fn topology_tab_open(&self) -> bool {
+    /// Whether the Simulation tab is the one open.
+    pub(crate) fn simulation_tab_open(&self) -> bool {
         match self.asm {
-            Some(_) => self.asm_tab == crate::assembly_ui::AsmTab::Topology,
-            None => self.tab == crate::app::CommandTab::Topology,
+            Some(_) => self.asm_tab == crate::assembly_ui::AsmTab::Simulation,
+            None => self.tab == crate::app::CommandTab::Simulation,
         }
-    }
-
-    /// Whether the open study is a topology study.
-    pub(crate) fn topology_study_open(&self) -> bool {
-        self.simulation.started && self.simulation.study.study_type == StudyType::Topology
     }
 
     fn document_key(&self) -> (bool, String) {
@@ -1233,6 +1271,7 @@ impl OxydeApp {
             self.open_saved_studies();
         }
         self.poll_simulation(ctx);
+        self.generative_housekeeping(ctx);
         self.advance_playback(ctx);
         if self.simulation.shown.is_some() && !self.plot_wanted() {
             self.restore_simulation_scene();
@@ -1279,7 +1318,8 @@ impl OxydeApp {
     }
 
     pub(crate) fn restore_simulation_scene(&mut self) {
-        if self.simulation.shown.take().is_some() {
+        let generative = self.simulation.generative.take_shown();
+        if self.simulation.shown.take().is_some() || generative {
             // The usual scene comes back on the next frame.
             self.viewport.pickable = None;
             self.scene_revision = None;
@@ -1416,7 +1456,7 @@ impl OxydeApp {
     }
 
     /// The model's surfaces for the mesher, made again when the document changed.
-    fn ensure_surfaces(&mut self) -> Result<(), String> {
+    pub(crate) fn ensure_surfaces(&mut self) -> Result<(), String> {
         let (revision, assembly) = (self.document_revision(), self.asm.is_some());
         if self
             .simulation
@@ -1523,6 +1563,7 @@ impl OxydeApp {
                         None,
                         BodyInfo {
                             name,
+                            id: Some(solid.id),
                             key: key.clone(),
                             material: part.material().cloned(),
                             path: None,
@@ -1554,6 +1595,7 @@ impl OxydeApp {
                             Some(o.clone()),
                             BodyInfo {
                                 name: asm.occurrence_name(&o),
+                                id: None,
                                 key: key.clone(),
                                 material: loaded.part.material().cloned(),
                                 path: asm.path_at(&o),
@@ -1601,7 +1643,7 @@ impl OxydeApp {
     }
 
     /// The faces selected now, as study faces.
-    fn selected_sim_faces(&self) -> Vec<SimFace> {
+    pub(crate) fn selected_sim_faces(&self) -> Vec<SimFace> {
         match &self.asm {
             Some(asm) => asm
                 .selection
@@ -1648,7 +1690,7 @@ impl OxydeApp {
     }
 
     /// A fixture or load on the selected faces (the command bar's buttons).
-    fn add_study_item(&mut self, kind: ItemKind) {
+    pub(crate) fn add_study_item(&mut self, kind: ItemKind) {
         if !self.simulation.started || !kind.fits(self.simulation.study.study_type) {
             return;
         }
@@ -1665,15 +1707,17 @@ impl OxydeApp {
                     kind.base_name()
                 )
             };
-            // The plot hides, so the model is there to pick on.
+            // The plot (or the outcome) hides, so the model is there to pick on.
             self.simulation.show_plot = false;
+            self.simulation.generative.show = false;
             return;
         }
         let count = faces.len();
         let index = self.simulation.study.add(kind, faces);
         self.simulation.selected = Some(index);
-        // The plot hides, so the model is there to pick on.
+        // The plot (or the outcome) hides, so the model is there to pick on.
         self.simulation.show_plot = false;
+        self.simulation.generative.show = false;
         if let Some(item) = self.simulation.study.items.get(index) {
             self.status = format!("{} on {count} face(s)", item.name);
         }
@@ -2412,7 +2456,7 @@ impl OxydeApp {
     }
 
     /// `scene` in the viewport in place of the model's, until the plot hides.
-    fn show_scene(&mut self, scene: Scene) {
+    pub(crate) fn show_scene(&mut self, scene: Scene) {
         // Looked at, not picked: the faces are the plot's, not the model's.
         self.viewport.pickable = Some((0, 0));
         self.viewport.set_scene(scene, false);
@@ -2891,28 +2935,10 @@ impl OxydeApp {
         if let Some(t) = picked {
             self.new_study(t);
         }
-        if !self.simulation.started {
+        if !self.simulation.started || self.generative_study_open() {
             return;
         }
         self.study_buttons(ui);
-    }
-
-    /// The Topology tab's buttons: New Topology Study, then the open topology study's.
-    pub(crate) fn topology_tab(&mut self, ui: &mut egui::Ui) {
-        use crate::icons::{Icon, command_button};
-        let running = self.simulation.job.is_some();
-        if command_button(ui, Icon::Topology, "New Topology Study", !running, false)
-            .on_hover_text(
-                "A new topology study: the stiffest shape that keeps a share of the model's \
-                 mass under its loads",
-            )
-            .clicked()
-        {
-            self.new_study(StudyType::Topology);
-        }
-        if self.topology_study_open() {
-            self.study_buttons(ui);
-        }
     }
 
     /// The buttons of the open study's type: its fixtures and loads, contacts, Mesh and
@@ -3196,6 +3222,43 @@ impl OxydeApp {
         }
     }
 
+    /// What a fixture's or load's row asked for: its faces selected, its faces replaced by
+    /// the selection, or it deleted. The plot, or the outcome, hides: the model is there to
+    /// pick on.
+    pub(crate) fn study_item_action(&mut self, action: PanelAction) {
+        self.simulation.show_plot = false;
+        self.simulation.generative.show = false;
+        match action {
+            PanelAction::Select(i) => {
+                self.simulation.selected = Some(i);
+                let faces = self
+                    .simulation
+                    .study
+                    .items
+                    .get(i)
+                    .map(|item| item.faces.clone())
+                    .unwrap_or_default();
+                self.select_sim_faces(&faces);
+            }
+            PanelAction::UseSelection(i) => {
+                let faces = self.selected_sim_faces();
+                if faces.is_empty() {
+                    self.status = "Select the faces first".to_owned();
+                } else if let Some(item) = self.simulation.study.items.get_mut(i) {
+                    self.status = format!("{} now on {} face(s)", item.name, faces.len());
+                    item.faces = faces;
+                }
+            }
+            PanelAction::Delete(i) => {
+                if i < self.simulation.study.items.len() {
+                    self.simulation.study.items.remove(i);
+                }
+                self.simulation.selected = None;
+            }
+            _ => {}
+        }
+    }
+
     /// The study, at the top of the left panel while the Simulation tab is open.
     pub(crate) fn simulation_panel(&mut self, ui: &mut egui::Ui) {
         // Made here (not when running) so the panel can show sizes and materials.
@@ -3215,15 +3278,7 @@ impl OxydeApp {
         let element_size = self.simulation_element_size();
         let mut action: Option<PanelAction> = None;
         let max_height = (ui.available_height() * 0.7).max(160.0);
-        if self.topology_tab_open() && !self.topology_study_open() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                self.topology_chooser(ui);
-            });
-            ui.add_space(4.0);
-            return;
-        }
-        if !self.simulation.started {
+        if !self.simulation.started || self.generative_study_open() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.new_study_chooser(ui);
@@ -4005,35 +4060,10 @@ impl OxydeApp {
                 self.simulation.show_plot = false;
             }
             Some(PanelAction::Cancel) => self.cancel_simulation(),
-            Some(PanelAction::Select(i)) => {
-                self.simulation.selected = Some(i);
-                self.simulation.show_plot = false;
-                let faces = self
-                    .simulation
-                    .study
-                    .items
-                    .get(i)
-                    .map(|item| item.faces.clone())
-                    .unwrap_or_default();
-                self.select_sim_faces(&faces);
-            }
-            Some(PanelAction::UseSelection(i)) => {
-                let faces = self.selected_sim_faces();
-                if faces.is_empty() {
-                    self.status = "Select the faces first".to_owned();
-                } else if let Some(item) = self.simulation.study.items.get_mut(i) {
-                    self.status = format!("{} now on {} face(s)", item.name, faces.len());
-                    item.faces = faces;
-                }
-                self.simulation.show_plot = false;
-            }
-            Some(PanelAction::Delete(i)) => {
-                if i < self.simulation.study.items.len() {
-                    self.simulation.study.items.remove(i);
-                }
-                self.simulation.selected = None;
-                self.simulation.show_plot = false;
-            }
+            Some(
+                a
+                @ (PanelAction::Select(_) | PanelAction::UseSelection(_) | PanelAction::Delete(_)),
+            ) => self.study_item_action(a),
             Some(PanelAction::ShowPlot(on)) => self.simulation.show_plot = on,
             Some(PanelAction::Play(on)) => {
                 self.simulation.playing = on.then(Instant::now);
@@ -4090,7 +4120,7 @@ impl OxydeApp {
 
 /// What the panel asks for, done once it is drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum PanelAction {
+pub(crate) enum PanelAction {
     Run,
     Mesh,
     Cancel,
@@ -4177,7 +4207,7 @@ fn contact_row(
 
 /// One fixture or load in the panel: its name (click to select its faces), its value,
 /// its faces.
-fn item_row(
+pub(crate) fn item_row(
     ui: &mut egui::Ui,
     index: usize,
     item: &mut StudyItem,
@@ -4903,7 +4933,7 @@ fn format_number(v: f64) -> String {
     }
 }
 
-fn format_value(v: f64, unit: &str) -> String {
+pub(crate) fn format_value(v: f64, unit: &str) -> String {
     if unit.is_empty() {
         format_number(v)
     } else {
@@ -5687,6 +5717,7 @@ mod tests {
             .clone();
         let body = BodyInfo {
             name: "Bracket".into(),
+            id: None,
             key: steel.name.clone(),
             material: Some(steel.clone()),
             path: None,
@@ -5729,6 +5760,7 @@ mod tests {
             .clone();
         let body = |name: &str, path: &str, material: Option<&Material>| BodyInfo {
             name: name.into(),
+            id: None,
             key: material.map_or_else(|| format!("part:{name}"), |m| m.name.clone()),
             material: material.cloned(),
             path: Some(path.into()),

@@ -7,6 +7,17 @@ release yet; the git history has every detail.
 
 ### Generative design, under way (October 2026)
 
+- **A Generative Design tab in place of the Topology tab.** As in Fusion 360: give the part's
+  bodies their roles (bodies to keep, bodies to stay clear of, a starting shape the material
+  stays inside), each coloured in the viewport; hold and load the bodies to keep as in a
+  static study; set the mass target, the safety factor, the ways of making it (unrestricted,
+  2-axis cutting, casting in a mould pulled along a direction) and the materials to try.
+  *Generate* grows a shape for every material and way of making it, on the graphics card when
+  there is one, each shown as it is done; *Stop* keeps the one being grown as far as it got.
+  *Explore* plots the outcomes' mass against their stress (or stiffness, displacement, safety
+  factor) to compare them, draws the one picked with its iterations on a slider, and *Export*
+  writes it as STL, OBJ or 3MF. The outcomes are saved beside the study and come back with
+  it. Topology studies are still made in the Simulation tab, under New Study.
 - **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
   Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
   clear of, the mass target, safety factor, minimum thickness and resolution, the ways of
@@ -15,8 +26,7 @@ release yet; the git history has every detail.
   results: the grid of voxels and, for each material and way of making it, the shape's
   densities, a few snapshots on the way and its mass, stiffness and estimated stress
   (FORMAT.md §9). A document holding them is written as `format_version` 4, which earlier
-  versions of Oxyde refuse; the others are written as before. Until the tab exists, the
-  Simulation tab keeps a study document's generative studies as they are when it saves it.
+  versions of Oxyde refuse; the others are written as before.
 
 ### Topology optimization (October 2026)
 

@@ -42,8 +42,8 @@ pub enum AsmTab {
     Render,
     /// The assembly's studies, its parts in contact (`simulation_ui`).
     Simulation,
-    /// The topology studies of the assembly (`simulation_ui`).
-    Topology,
+    /// Generative design, which works on parts for now (`generative_ui`).
+    Generative,
 }
 
 /// The mate types offered, in the order shown.
@@ -1333,7 +1333,7 @@ impl OxydeApp {
                 (AsmTab::Evaluate, "Evaluate"),
                 (AsmTab::Render, "Render"),
                 (AsmTab::Simulation, "Simulation"),
-                (AsmTab::Topology, "Topology"),
+                (AsmTab::Generative, "Generative Design"),
             ] {
                 let text = RichText::new(label).size(13.0);
                 let text = if self.asm_tab == tab {
@@ -1343,8 +1343,11 @@ impl OxydeApp {
                 };
                 if ui.selectable_label(self.asm_tab == tab, text).clicked() {
                     self.asm_tab = tab;
-                    if tab == AsmTab::Topology {
-                        self.enter_topology();
+                    if tab == AsmTab::Generative {
+                        self.enter_generative();
+                    }
+                    if tab == AsmTab::Simulation {
+                        self.enter_simulation();
                     }
                 }
             }
@@ -1380,8 +1383,8 @@ impl OxydeApp {
             ui.horizontal(|ui| self.simulation_tab(ui));
             return;
         }
-        if self.asm_tab == AsmTab::Topology {
-            ui.horizontal(|ui| self.topology_tab(ui));
+        if self.asm_tab == AsmTab::Generative {
+            ui.horizontal(|ui| self.generative_tab(ui));
             return;
         }
         // Fix/Float: every selected component, named after the first.
@@ -1556,8 +1559,11 @@ impl OxydeApp {
         if self.asm_tab == AsmTab::Render {
             self.render_panel(ui);
         }
-        if matches!(self.asm_tab, AsmTab::Simulation | AsmTab::Topology) {
+        if self.asm_tab == AsmTab::Simulation {
             self.simulation_panel(ui);
+        }
+        if self.asm_tab == AsmTab::Generative {
+            self.generative_panel(ui);
         }
         self.mate_manager(ui);
         self.refresh_mate_preview();
@@ -2339,6 +2345,7 @@ impl OxydeApp {
     pub(crate) fn assembly_viewport(&mut self, ui: &mut egui::Ui) {
         self.refresh_assembly_scene();
         self.simulation_scene();
+        self.generative_scene();
         let Some(doc) = self.asm.as_ref() else {
             return;
         };

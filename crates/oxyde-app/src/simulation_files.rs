@@ -197,6 +197,11 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
         parting: goal.parting,
     });
     out.topology.one_piece = goal.one_piece;
+    out.generative = study.generative.clone();
+    // A generative study's grid and materials are in its block; it has no contacts.
+    if study.study_type == StudyType::Generative {
+        return out;
+    }
     if study.gravity && study.study_type.takes_gravity() {
         out.loads.push(Load {
             name: "Gravity-1".to_owned(),
@@ -386,6 +391,7 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
     study.thermal_overrides = file.thermal_materials.clone();
     study.transient = file.transient;
     study.reference_temperature = file.reference_temperature;
+    study.generative = file.generative.clone();
     study.recount();
     study
 }
@@ -695,13 +701,6 @@ pub(crate) fn results_path(study_file: &Path, study: &str) -> PathBuf {
     ))
 }
 
-/// A study document's generative studies, then the others: this tab shows only the others.
-fn split_generative(studies: Vec<FileStudy>) -> (Vec<FileStudy>, Vec<FileStudy>) {
-    studies
-        .into_iter()
-        .partition(|s| s.study_type == StudyType::Generative)
-}
-
 // ---- The application side ------------------------------------------------------------------
 
 impl OxydeApp {
@@ -803,7 +802,6 @@ impl OxydeApp {
             .all_studies()
             .iter()
             .map(file_study)
-            .chain(self.simulation.generative_studies.iter().cloned())
             .collect();
         if file.studies.is_empty() {
             self.status = "No study to save: make one with New Study".to_owned();
@@ -855,18 +853,12 @@ impl OxydeApp {
             );
             return;
         }
-        let (generative, studies) = split_generative(file.studies);
-        if studies.is_empty() {
-            self.status = if generative.is_empty() {
-                format!("{} holds no study", path.display())
-            } else {
-                format!("{} holds generative studies only", path.display())
-            };
+        if file.studies.is_empty() {
+            self.status = format!("{} holds no study", path.display());
             return;
         }
-        let count = studies.len();
-        self.set_studies(studies.iter().map(study_of).collect());
-        self.simulation.generative_studies = generative;
+        let count = file.studies.len();
+        self.set_studies(file.studies.iter().map(study_of).collect());
         self.status = if count > 1 {
             format!("Opened {count} studies from {}", path.display())
         } else {
@@ -895,9 +887,7 @@ impl OxydeApp {
         if file.model.document_id != model_id || file.studies.is_empty() {
             return;
         }
-        let (generative, studies) = split_generative(file.studies);
-        self.set_studies(studies.iter().map(study_of).collect());
-        self.simulation.generative_studies = generative;
+        self.set_studies(file.studies.iter().map(study_of).collect());
         self.simulation.file = Some(StudyFile {
             path,
             document_id: file.document_id,
@@ -914,15 +904,34 @@ impl OxydeApp {
         let Some(study_file) = self.simulation.file.clone() else {
             return false;
         };
-        let Some(done) = self.simulation.done.as_ref() else {
-            self.status = "Nothing to save: run the study first".to_owned();
-            return false;
+        let name = self.simulation.study.name.clone();
+        let file = if self.simulation.study.study_type == StudyType::Generative {
+            let generated = self.simulation.generative.generated.as_ref();
+            let Some((g, fingerprint)) = generated
+                .filter(|g| !g.outcomes.is_empty())
+                .and_then(|g| Some((g, g.fingerprint.clone()?)))
+            else {
+                self.status = "Nothing to save: generate the outcomes first".to_owned();
+                return false;
+            };
+            crate::generative_ui::generative_results_file(
+                g,
+                &study_file.document_id,
+                &name,
+                fingerprint,
+            )
+        } else {
+            let Some(done) = self.simulation.done.as_ref() else {
+                self.status = "Nothing to save: run the study first".to_owned();
+                return false;
+            };
+            let (true, Some(fingerprint)) = (done.solved(), &done.fingerprint) else {
+                self.status = "Nothing to save: run the study first".to_owned();
+                return false;
+            };
+            results_file(done, &study_file.document_id, &name, fingerprint.clone())
         };
-        let (true, Some(fingerprint)) = (done.solved(), &done.fingerprint) else {
-            self.status = "Nothing to save: run the study first".to_owned();
-            return false;
-        };
-        let mut path = results_path(&study_file.path, &self.simulation.study.name);
+        let mut path = results_path(&study_file.path, &name);
         if ask {
             let Some(chosen) = rfd::FileDialog::new()
                 .add_filter("Oxyde results", &[oxyde_format::results::RESULTS_EXTENSION])
@@ -936,12 +945,6 @@ impl OxydeApp {
             };
             path = chosen;
         }
-        let file = results_file(
-            done,
-            &study_file.document_id,
-            &self.simulation.study.name,
-            fingerprint.clone(),
-        );
         match oxyde_format::results::save_results(&path, &file) {
             Ok(()) => {
                 self.status = format!("Saved the results to {}", path.display());
@@ -1005,7 +1008,7 @@ impl OxydeApp {
         let changes = file.fingerprint.changes(&now);
         if !changes.is_empty() {
             let what = if changes.iter().any(|c| c == "study") {
-                "the study (fixtures, loads, contacts, mesh or materials)"
+                "the study (its settings, fixtures, loads, contacts, mesh or materials)"
             } else {
                 "the model"
             };
@@ -1013,6 +1016,24 @@ impl OxydeApp {
                 "{} are out of date: {what} changed since they were computed. Run the study again.",
                 path.display()
             );
+            return;
+        }
+        if file.study_type == StudyType::Generative {
+            match crate::generative_ui::generated_from(&file, self.document_revision()) {
+                Some(g) => {
+                    self.restore_simulation_scene();
+                    self.simulation.generative.generated = Some(g);
+                    self.simulation.generative.clear_view();
+                    match self.asm {
+                        Some(_) => self.asm_tab = crate::assembly_ui::AsmTab::Generative,
+                        None => self.tab = crate::app::CommandTab::Generative,
+                    }
+                    self.status = format!("Opened the outcomes {}", path.display());
+                }
+                None => {
+                    self.status = format!("Could not use {}: its grid is not one", path.display())
+                }
+            }
             return;
         }
         let loaded = match mesh_and_results(&file) {

@@ -104,11 +104,15 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   shadows and glass, saved as PNG.
 - **Simulation tab:** static stress, thermal, transient thermal and thermal stress studies, with
   fixtures, loads and contacts between bodies, meshed into tetrahedra by Netgen; stress,
-  displacement, factor of safety and temperature drawn on the model.
-- **Topology tab:** topology optimization, the stiffest shape that keeps a share of the
-  part's mass under its fixtures and loads, with regions to keep, a thinnest member,
-  symmetry planes and a mould's pull direction; the shape is shown as a smooth surface and
+  displacement, factor of safety and temperature drawn on the model. Topology studies: the
+  stiffest shape that keeps a share of the part's mass, with regions to keep, a thinnest
+  member, symmetry planes and a mould's pull direction, shown as a smooth surface and
   exported as STL.
+- **Generative Design tab:** shapes grown between the bodies to keep and the bodies to stay
+  clear of, as Fusion 360 grows them: a mass target, several materials and ways of making it
+  (unrestricted, 2-axis cutting, casting), an outcome for each, on the graphics card when
+  there is one; compared on a plot of mass against stress or stiffness, shown iteration by
+  iteration and exported as STL, OBJ or 3MF.
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,
