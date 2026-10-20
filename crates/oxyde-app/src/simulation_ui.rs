@@ -1714,6 +1714,9 @@ impl OxydeApp {
         }
         let count = faces.len();
         let index = self.simulation.study.add(kind, faces);
+        if self.simulation.study.study_type == StudyType::Generative {
+            crate::generative_ui::join_load_cases(&mut self.simulation.study, index);
+        }
         self.simulation.selected = Some(index);
         // The plot (or the outcome) hides, so the model is there to pick on.
         self.simulation.show_plot = false;
@@ -3251,7 +3254,8 @@ impl OxydeApp {
             }
             PanelAction::Delete(i) => {
                 if i < self.simulation.study.items.len() {
-                    self.simulation.study.items.remove(i);
+                    let gone = self.simulation.study.items.remove(i);
+                    crate::generative_ui::leave_load_cases(&mut self.simulation.study, &gone.name);
                 }
                 self.simulation.selected = None;
             }

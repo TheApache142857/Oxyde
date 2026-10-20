@@ -22,11 +22,15 @@
 //!   ways from a parting plane), so nothing hangs over void the mould could not leave.
 //!   Material a method cannot avoid (behind a preserve voxel, in line with one) is made
 //!   solid, and room it cannot use (in front of an obstacle, in line with one) void.
-//! - [`surface`] cuts the densities into a smooth closed surface.
+//!   *Additive* prints layer by layer along the build direction (`additive`): a voxel can
+//!   only be as dense as the 3 × 3 under it, which keeps overhangs within 45°.
+//! - [`surface`] cuts the densities into a smooth closed surface; [`decimate`] and
+//!   [`solid_pieces`] make it something a modelling kernel takes.
 
 // Indices into the grid's arrays and the design's groups, all sized here from the grid.
 #![allow(clippy::indexing_slicing)]
 
+mod additive;
 mod brick;
 mod decimate;
 mod grid;
@@ -113,6 +117,14 @@ pub struct DesignSpace {
     pub margin: Option<f64>,
 }
 
+/// Fixtures and loads the outcome carries at once: indices into the study's `fixtures` and
+/// `loads`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LoadCase {
+    pub fixtures: Vec<usize>,
+    pub loads: Vec<usize>,
+}
+
 /// What a generative study asks, for one material and one way of making it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerativeStudy {
@@ -120,6 +132,9 @@ pub struct GenerativeStudy {
     /// On faces of the preserve bodies, by label.
     pub fixtures: Vec<Fixture>,
     pub loads: Vec<Load>,
+    /// The load cases, each carried in turn: the stiffest shape for them all, its
+    /// compliance their sum. None: one case of every fixture and load.
+    pub load_cases: Vec<LoadCase>,
     /// kg: the outcome's mass, preserve voxels included.
     pub mass_target: f64,
     /// mm: the thinnest member wanted; `None` for three voxels.
@@ -129,6 +144,20 @@ pub struct GenerativeStudy {
     pub voxel_size: f64,
     /// Planes the outcome is mirrored about.
     pub symmetry: Option<Symmetry>,
+}
+
+impl GenerativeStudy {
+    /// The load cases: [`GenerativeStudy::load_cases`], or one of every fixture and load.
+    pub fn cases(&self) -> Vec<LoadCase> {
+        if self.load_cases.is_empty() {
+            vec![LoadCase {
+                fixtures: (0..self.fixtures.len()).collect(),
+                loads: (0..self.loads.len()).collect(),
+            }]
+        } else {
+            self.load_cases.clone()
+        }
+    }
 }
 
 /// One of the six directions along the axes.
@@ -153,6 +182,9 @@ pub enum Method {
         direction: Direction,
         parting: Option<V3>,
     },
+    /// Printed in layers along `direction`, from a build plate at the grid's end behind it:
+    /// nothing overhangs more than 45° from the direction.
+    Additive { direction: Direction },
 }
 
 impl std::fmt::Display for Method {
@@ -178,6 +210,12 @@ impl std::fmt::Display for Method {
                     ""
                 }
             ),
+            Method::Additive { direction } => write!(
+                f,
+                "additive, printed towards {}{}",
+                if direction.positive { "+" } else { "−" },
+                axis(direction.axis)
+            ),
         }
     }
 }
@@ -185,8 +223,8 @@ impl std::fmt::Display for Method {
 /// One iteration of an outcome.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GenerativeStep {
-    /// N·mm: the compliance of the design solved (the work of the loads; the lower, the
-    /// stiffer).
+    /// N·mm: the compliance of the design solved (the work of the loads, summed over the
+    /// load cases; the lower, the stiffer).
     pub compliance: f64,
     /// kg: its mass.
     pub mass: f64,
@@ -271,6 +309,9 @@ pub enum GenerativeError {
     },
     /// A casting direction crosses a symmetry plane that is not its parting plane.
     PullAcrossSymmetry,
+    /// A build direction crosses a symmetry plane: layers printed one way cannot give a
+    /// mirrored shape.
+    BuildAcrossSymmetry,
     NotConverged {
         iterations: usize,
         residual: f64,
@@ -328,6 +369,10 @@ impl std::fmt::Display for GenerativeError {
                 f,
                 "{method} cannot make this design space: a preserve body and an obstacle are in line along its direction near ({:.1}, {:.1}, {:.1}) mm",
                 at[0], at[1], at[2]
+            ),
+            GenerativeError::BuildAcrossSymmetry => write!(
+                f,
+                "the build direction crosses a symmetry plane, and layers printed one way cannot give a mirrored shape: print along the plane, or take it off"
             ),
             GenerativeError::PullAcrossSymmetry => write!(
                 f,
@@ -546,6 +591,10 @@ pub fn generate_on(
         Method::Casting { direction, parting } => Some(casting_chains(grid, direction, parting)),
         _ => None,
     };
+    let printing = match method {
+        Method::Additive { direction } => Some(additive::Printing::new(grid, direction)),
+        _ => None,
+    };
 
     // kg per voxel: kg/m³ × mm³ × 1e-9.
     let voxel_mass = material.density * h * h * h * 1e-9;
@@ -561,20 +610,31 @@ pub fn generate_on(
     let brick = Brick::new(material.poisson);
     let dims = grid.dims();
     let nodes = dims.node_count();
-    let mut held = vec![NONE; nodes];
-    let mut projectors = Vec::with_capacity(grid.holds.len());
-    for (node, p) in &grid.holds {
-        if let Some(slot) = held.get_mut(*node as usize) {
-            *slot = projectors.len() as u32;
-            projectors.push(*p);
-        }
-    }
-    let mut loads = vec![0.0; 3 * nodes];
-    for (node, f) in &grid.forces {
-        let n = *node as usize;
-        if n < nodes {
-            loads[3 * n..3 * n + 3].copy_from_slice(f);
-        }
+    // Each load case's held nodes, their projectors and its loads.
+    let cases: Vec<CaseSystem> = grid
+        .cases
+        .iter()
+        .map(|case| {
+            let mut held = vec![NONE; nodes];
+            let mut projectors = Vec::with_capacity(case.holds.len());
+            for (node, p) in &case.holds {
+                if let Some(slot) = held.get_mut(*node as usize) {
+                    *slot = projectors.len() as u32;
+                    projectors.push(*p);
+                }
+            }
+            let mut loads = vec![0.0; 3 * nodes];
+            for (node, f) in &case.forces {
+                let n = *node as usize;
+                if n < nodes {
+                    loads[3 * n..3 * n + 3].copy_from_slice(f);
+                }
+            }
+            (held, projectors, loads)
+        })
+        .collect();
+    if cases.is_empty() {
+        return Err(GenerativeError::NoLoads);
     }
 
     // The design starts uniform, at the density whose projection meets the target.
@@ -583,7 +643,7 @@ pub fn generate_on(
     let t = (beta * ETA).tanh();
     let start = (ETA + ((2.0 * share - 1.0) * t).atanh() / beta).clamp(DESIGN_MIN, 1.0);
     let mut x = vec![start; groups];
-    let mut displacement = vec![0.0; 3 * nodes];
+    let mut displacements = vec![vec![0.0; 3 * nodes]; cases.len()];
     let iterations = study.max_iterations.max(1);
     let mut history: Vec<GenerativeStep> = Vec::new();
     let mut snapshots: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -595,7 +655,7 @@ pub fn generate_on(
     let mut solved_field: Vec<f64> = Vec::new();
     let mut compliance = 0.0;
 
-    for iteration in 0..iterations {
+    'iterations: for iteration in 0..iterations {
         // Stopped after an iteration or more: the design as far as it got.
         if cancel.load(Ordering::Relaxed) {
             if history.is_empty() {
@@ -613,9 +673,12 @@ pub fn generate_on(
             })
             .collect();
         let filtered = filter.forward(&design, threads);
-        let (capped, source) = match &chains {
-            Some(chains) => cap(chains, &state, &filtered),
-            None => (filtered, Vec::new()),
+        // Capped along a casting direction, or printed layer by layer.
+        let printed = printing.as_ref().map(|p| p.forward(&filtered, &state));
+        let (capped, source) = match (&chains, &printed) {
+            (Some(chains), _) => cap(chains, &state, &filtered),
+            (None, Some(p)) => (p.printed.clone(), Vec::new()),
+            (None, None) => (filtered.clone(), Vec::new()),
         };
         let rho: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
@@ -633,60 +696,66 @@ pub fn generate_on(
                 State::Void => 0.0,
             })
             .collect();
-        // Void voxels are Laplacians in the solve, a third of a brick's work.
-        let fine = Fine::new(
-            dims,
-            &brick,
-            &stiffness,
-            &held,
-            &projectors,
-            SCALAR_BELOW * modulus * h,
-        );
         let tolerance = options.tolerance.max(if beta < BETA_MAX {
             EARLY_TOLERANCE
         } else {
             SOLVE_TOLERANCE
         });
-        let solved = match backend.as_deref_mut() {
-            None => multigrid::solve(
-                &fine,
-                &loads,
-                &mut displacement,
-                tolerance,
-                SOLVE_ITERATIONS,
-                cancel,
-                threads,
-            ),
-            Some(backend) => {
-                fine.project(&mut displacement);
-                let mut kept = loads.clone();
-                fine.project(&mut kept);
-                let system = System {
-                    fine: &fine,
-                    loads: kept,
-                    threads,
-                };
-                backend.solve(
-                    &system,
-                    &mut displacement,
+        // Each load case solved in turn, its energies and its work added up.
+        let mut energies = vec![0.0; voxels];
+        compliance = 0.0;
+        for ((held, projectors, loads), displacement) in cases.iter().zip(&mut displacements) {
+            // Void voxels are Laplacians in the solve, a third of a brick's work.
+            let fine = Fine::new(
+                dims,
+                &brick,
+                &stiffness,
+                held,
+                projectors,
+                SCALAR_BELOW * modulus * h,
+            );
+            let solved = match backend.as_deref_mut() {
+                None => multigrid::solve(
+                    &fine,
+                    loads,
+                    displacement,
                     tolerance,
                     SOLVE_ITERATIONS,
                     cancel,
-                )
+                    threads,
+                ),
+                Some(backend) => {
+                    fine.project(displacement);
+                    let mut kept = loads.clone();
+                    fine.project(&mut kept);
+                    let system = System {
+                        fine: &fine,
+                        loads: kept,
+                        threads,
+                    };
+                    backend.solve(&system, displacement, tolerance, SOLVE_ITERATIONS, cancel)
+                }
+            };
+            let solved = match solved {
+                Ok(s) => s,
+                Err(GenerativeError::Cancelled) if !history.is_empty() => {
+                    stopped = true;
+                    break 'iterations;
+                }
+                Err(e) => return Err(e),
+            };
+            solver_iterations += solved.iterations;
+            let case = element_energies(dims, &brick, displacement, &stiffness, threads);
+            for (e, c) in energies.iter_mut().zip(&case) {
+                *e += c;
             }
-        };
-        let solved = match solved {
-            Ok(s) => s,
-            Err(GenerativeError::Cancelled) if !history.is_empty() => {
-                stopped = true;
-                break;
-            }
-            Err(e) => return Err(e),
-        };
-        solver_iterations += solved.iterations;
-        let energies = element_energies(dims, &brick, &displacement, &stiffness, threads);
-        // The work of the loads on the displacements solved.
-        compliance = loads.iter().zip(&displacement).map(|(f, u)| f * u).sum();
+            // The work of the loads on the displacements solved.
+            compliance += loads
+                .iter()
+                .zip(displacement.iter())
+                .map(|(f, u)| f * u)
+                .sum::<f64>();
+        }
         let mass_now: f64 = rho.iter().sum::<f64>() * voxel_mass;
 
         // The slopes of the compliance and the mass for the projected densities, carried
@@ -709,6 +778,9 @@ pub fn generate_on(
                     }
                 }
                 s = carried;
+            }
+            if let (Some(printing), Some(p)) = (&printing, &printed) {
+                s = printing.backward(&filtered, &state, p, &s);
             }
             let per_design = filter.backward(&s, threads);
             let mut out = vec![0.0; groups];
@@ -778,7 +850,10 @@ pub fn generate_on(
     let mut max_displacement = 0.0f64;
     let mut max_von_mises = 0.0f64;
     let offsets = dims.corner_offsets();
-    for v in (0..voxels).filter(|&v| material_voxel(v)) {
+    for (v, displacement) in (0..voxels)
+        .filter(|&v| material_voxel(v))
+        .flat_map(|v| displacements.iter().map(move |d| (v, d)))
+    {
         let c = grid.coords(v);
         let base = dims.node(c);
         let mut u = [0.0; DOFS];
@@ -817,6 +892,10 @@ pub fn generate_on(
         filter_radius: radius,
     })
 }
+
+/// A load case as each iteration solves it: per node the index of its projector (or
+/// `NONE`), the projectors, and the loads, three per node.
+type CaseSystem = (Vec<u32>, Vec<[f64; 9]>, Vec<f64>);
 
 /// Densities as the files keep them: 0 to 255.
 fn bytes(rho: &[f64], state: &[State]) -> Vec<u8> {
@@ -1029,6 +1108,11 @@ fn states(
             return Err(GenerativeError::PullAcrossSymmetry);
         }
     }
+    if let (Method::Additive { direction }, Some(s)) = (method, symmetry)
+        && s.planes[direction.axis.min(2)]
+    {
+        return Err(GenerativeError::BuildAcrossSymmetry);
+    }
     if symmetric.contains(&true) {
         for v in 0..state.len() {
             let images = mirror_images(grid, v, symmetric);
@@ -1056,7 +1140,8 @@ fn states(
         at: grid.centre(v),
     };
     match method {
-        Method::Unrestricted => {}
+        // Printing makes any design space: what nothing holds up is printed empty.
+        Method::Unrestricted | Method::Additive { .. } => {}
         Method::Cutting { axis } => {
             for line in lines(grid, axis.min(2)) {
                 let void = line.iter().find(|&&v| state[v] == State::Void);

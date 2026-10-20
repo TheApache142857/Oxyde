@@ -947,3 +947,32 @@ stays on show.
   (0.02 s), a solid of exactly the mesh's volume (1 s), fused with the rings and cut by the
   post in one solid (1.3 s, a debug build with OCCT's release libraries), written as STEP and
   read back the same.
+
+**Built (October 2026): step 5**, additive and load cases.
+
+- **Additive** (`generative/additive.rs`, `Method::Additive`): Langelaar's filter between the
+  density filter and the projection, as the design above has it. From the plate at the
+  grid's end behind the build direction, layer by layer, a voxel's printed density is the
+  smooth minimum (ε 10⁻⁴) of its filtered density and the smooth maximum (P 40, exact at a
+  half) of the printed densities of the 3 × 3 under it; preserve voxels print solid, void
+  ones empty, the first layer stands on the plate. The slopes go back down the layers by the
+  filter's adjoint. A build direction across a symmetry plane is refused
+  (`BuildAcrossSymmetry`): layers printed one way cannot give a mirrored shape. The smooth
+  minimum leaves about a hundredth over an empty layer, which the projection removes. In the
+  app, *Additive* with any of the six directions, the overhang 45° (the file's only value).
+- **Load cases** (`LoadCase`, FORMAT.md §8): each case's fixtures and loads laid on the grid
+  apart (`CaseNodes`); every iteration solves each case in turn with its own held nodes and
+  loads, its displacements kept for the next iteration's start; the energies and the
+  compliances added, so the slopes are those of the cases' summed compliance (Fusion 360
+  weighs its cases alike); the displacement and stress estimates the worst over the cases.
+  The panel lists the cases with their fixtures and loads to tick (*Add a load case* turns
+  the one implicit case into two); a new fixture joins every case, a new load the last one,
+  a deleted item leaves them, and a load in no case is named as not applied.
+- **Tests**: the smooth bounds and their slopes, nothing printed over an empty layer, the
+  filter's adjoint against finite differences; the test bracket printed up +Y with under 1 %
+  of its material unsupported; a build across a symmetry plane refused; two load cases laid
+  apart, their forces adding up per case, the design for both working harder in all than the
+  design for one, a case holding nothing refused; the format's cases round trip and their
+  refusals (names twice, unknown items, a case without a fixture or a load, an item twice);
+  in the app, cases mapped to the engine's items, items joining and leaving them, a printed
+  outcome with nothing hanging.

@@ -264,6 +264,20 @@ pub struct GenerativeSettings {
     /// unique; empty for the part's own material. Copied in, so the study never depends on
     /// a library; without their textures (a study document holds no images).
     pub materials: Vec<Material>,
+    /// The load cases, each carried in turn; empty for one case of every fixture and load.
+    pub load_cases: Vec<LoadCase>,
+}
+
+/// Fixtures and loads a generative study's outcomes carry at once, as Fusion 360's load
+/// cases: the stiffest shape for every case, its compliance their sum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadCase {
+    /// `Load Case 1`…, unique in the study.
+    pub name: String,
+    /// The names of the study's fixtures it holds, at least one.
+    pub fixtures: Vec<String>,
+    /// The names of the study's loads it holds, at least one.
+    pub loads: Vec<String>,
 }
 
 impl Default for GenerativeSettings {
@@ -282,6 +296,7 @@ impl Default for GenerativeSettings {
             symmetry: None,
             methods: vec![GenerativeMethod::Unrestricted],
             materials: Vec::new(),
+            load_cases: Vec::new(),
         }
     }
 }
@@ -849,6 +864,17 @@ struct GenerativeDto {
     methods: Vec<MethodDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     materials: Vec<MaterialDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    load_cases: Vec<LoadCaseDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LoadCaseDto {
+    name: String,
+    #[serde(default)]
+    fixtures: Vec<String>,
+    #[serde(default)]
+    loads: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1501,6 +1527,15 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
                 dto
             })
             .collect(),
+        load_cases: g
+            .load_cases
+            .iter()
+            .map(|c| LoadCaseDto {
+                name: c.name.clone(),
+                fixtures: c.fixtures.clone(),
+                loads: c.loads.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1894,7 +1929,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, None) => TopologySettings::default(),
     };
     let generative = match (study_type, dto.generative) {
-        (StudyType::Generative, Some(g)) => generative_from(g)?,
+        (StudyType::Generative, Some(g)) => generative_from(g, &fixtures, &loads)?,
         (StudyType::Generative, None) => {
             return Err("a generative study has no generative block".to_owned());
         }
@@ -2008,7 +2043,11 @@ fn directions_from(
     Ok(directions)
 }
 
-fn generative_from(dto: GenerativeDto) -> Result<GenerativeSettings, String> {
+fn generative_from(
+    dto: GenerativeDto,
+    fixtures: &[Fixture],
+    loads: &[Load],
+) -> Result<GenerativeSettings, String> {
     // A body has one role at most.
     let mut bodies = BTreeSet::new();
     let mut body = |dto: BodyIdDto| -> Result<BodyId, String> {
@@ -2122,6 +2161,42 @@ fn generative_from(dto: GenerativeDto) -> Result<GenerativeSettings, String> {
         materials.push(material);
     }
 
+    let mut case_names = BTreeSet::new();
+    let mut load_cases = Vec::with_capacity(dto.load_cases.len());
+    for c in dto.load_cases {
+        if c.name.trim().is_empty() {
+            return Err("a load case has no name".to_owned());
+        }
+        if !case_names.insert(c.name.clone()) {
+            return Err(format!("two load cases are named \"{}\"", c.name));
+        }
+        let item = |e: String| format!("{}: {e}", c.name);
+        if c.fixtures.is_empty() || c.loads.is_empty() {
+            return Err(item("a load case needs a fixture and a load".to_owned()));
+        }
+        let check = |names: &[String], known: &[&str], what: &str| -> Result<(), String> {
+            let mut seen = BTreeSet::new();
+            for n in names {
+                if !known.contains(&n.as_str()) {
+                    return Err(format!("\"{n}\" is not one of the study's {what}"));
+                }
+                if !seen.insert(n) {
+                    return Err(format!("\"{n}\" is listed twice"));
+                }
+            }
+            Ok(())
+        };
+        let fixture_names: Vec<&str> = fixtures.iter().map(|f| f.name.as_str()).collect();
+        let load_names: Vec<&str> = loads.iter().map(|l| l.name.as_str()).collect();
+        check(&c.fixtures, &fixture_names, "fixtures").map_err(item)?;
+        check(&c.loads, &load_names, "loads").map_err(item)?;
+        load_cases.push(LoadCase {
+            name: c.name,
+            fixtures: c.fixtures,
+            loads: c.loads,
+        });
+    }
+
     Ok(GenerativeSettings {
         preserve,
         obstacles,
@@ -2142,6 +2217,7 @@ fn generative_from(dto: GenerativeDto) -> Result<GenerativeSettings, String> {
         symmetry: symmetry_from(dto.symmetry)?,
         methods,
         materials,
+        load_cases,
     })
 }
 
@@ -2465,7 +2541,27 @@ mod tests {
                 material("Aluminium 6061-T6", 2700.0, 68900.0),
                 material("Titanium (Ti-6Al-4V)", 4430.0, 113800.0),
             ],
+            load_cases: vec![
+                LoadCase {
+                    name: "Load Case 1".to_owned(),
+                    fixtures: vec!["Fixed-1".to_owned()],
+                    loads: vec!["Force-1".to_owned()],
+                },
+                LoadCase {
+                    name: "Load Case 2".to_owned(),
+                    fixtures: vec!["Fixed-1".to_owned()],
+                    loads: vec!["Force-2".to_owned()],
+                },
+            ],
         };
+        study.loads.push(Load {
+            name: "Force-2".to_owned(),
+            kind: LoadKind::Pressure {
+                faces: vec![StudyFace::part(face(9))],
+                mpa: 0.5,
+            },
+            suppressed: false,
+        });
         file.studies = vec![study, Study::new("Static 1")];
         file
     }
@@ -2590,6 +2686,10 @@ mod tests {
                 { "type": "cutting", "directions": ["-y"] },
                 { "type": "casting", "directions": ["+y", "-x"], "parting": [0.0, 10.0, 0.0] }
             ])
+        );
+        assert_eq!(
+            g["load_cases"][1],
+            serde_json::json!({ "name": "Load Case 2", "fixtures": ["Fixed-1"], "loads": ["Force-2"] })
         );
         let aluminium = &g["materials"][0];
         assert_eq!(aluminium["name"], "Aluminium 6061-T6");
@@ -2783,6 +2883,28 @@ mod tests {
         refused(
             &|v| block(v)["methods"][1]["overhang"] = 30.0.into(),
             "overhang is 30°",
+        );
+
+        // The load cases.
+        refused(
+            &|v| block(v)["load_cases"][1]["name"] = "Load Case 1".into(),
+            "two load cases",
+        );
+        refused(
+            &|v| block(v)["load_cases"][1]["loads"] = serde_json::json!(["Force-9"]),
+            "\"Force-9\" is not one of the study's loads",
+        );
+        refused(
+            &|v| block(v)["load_cases"][0]["fixtures"] = serde_json::json!(["Force-1"]),
+            "not one of the study's fixtures",
+        );
+        refused(
+            &|v| block(v)["load_cases"][0]["loads"] = serde_json::json!([]),
+            "needs a fixture and a load",
+        );
+        refused(
+            &|v| block(v)["load_cases"][0]["loads"] = serde_json::json!(["Force-1", "Force-1"]),
+            "listed twice",
         );
 
         // The materials.

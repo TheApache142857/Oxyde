@@ -8,6 +8,8 @@
 //!   starting shape and it is not in it, else *design*. Inside is the lattice mesher's test
 //!   (`mesher::Surfaces`: crossings counted along lines of voxel centres). A centre well
 //!   inside both a preserve body and an obstacle (by a quarter of a voxel) is refused.
+//! - **Load cases**: each case's fixtures and loads are laid on the nodes apart, the
+//!   study's every fixture and load one case when it gives none.
 //! - **Fixtures and loads** are on faces of the preserve bodies. Each face is sampled every
 //!   half voxel; each sample lands in the voxel holding it, which becomes a preserve voxel
 //!   (a thin preserve body has no voxel centre inside it), or, in an obstacle voxel, in the
@@ -73,12 +75,19 @@ pub struct Grid {
     pub counts: [usize; 3],
     /// Per voxel, x fastest: voxel (i, j, k) is `i + nx (j + ny k)`.
     pub kinds: Vec<Voxel>,
+    /// Each load case's fixtures and loads on the nodes.
+    pub(crate) cases: Vec<CaseNodes>,
+    /// The voxels fixtures and loads act through, in order.
+    pub(crate) anchored: Vec<u32>,
+}
+
+/// A load case on the grid's nodes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct CaseNodes {
     /// Held nodes in order, each with the motions it keeps (`I` less the held directions).
     pub(crate) holds: Vec<(u32, [f64; 9])>,
     /// Loaded nodes in order, each with its force, N.
     pub(crate) forces: Vec<(u32, V3)>,
-    /// The voxels fixtures and loads act through, in order.
-    pub(crate) anchored: Vec<u32>,
 }
 
 impl Grid {
@@ -100,8 +109,7 @@ impl Grid {
             size,
             counts,
             kinds,
-            holds: Vec::new(),
-            forces: Vec::new(),
+            cases: Vec::new(),
             anchored: Vec::new(),
         })
     }
@@ -188,8 +196,7 @@ impl Grid {
             size: h,
             counts,
             kinds: Vec::new(),
-            holds: Vec::new(),
-            forces: Vec::new(),
+            cases: Vec::new(),
             anchored: Vec::new(),
         };
         grid.classify(space, threads, cancel)?;
@@ -366,10 +373,12 @@ impl Grid {
         }
         let spacing = 0.5 * self.size;
         let dims = self.dims();
-        let mut holds: BTreeMap<u32, (bool, Vec<V3>)> = BTreeMap::new();
-        let mut forces: BTreeMap<u32, V3> = BTreeMap::new();
+        // Each fixture's held nodes and each load's forces, apart: the cases mix them.
+        let mut fixture_holds: Vec<BTreeMap<u32, (bool, Vec<V3>)>> = Vec::new();
+        let mut load_forces: Vec<BTreeMap<u32, V3>> = Vec::new();
         let mut anchored: Vec<u32> = Vec::new();
         for fixture in &study.fixtures {
+            let mut holds: BTreeMap<u32, (bool, Vec<V3>)> = BTreeMap::new();
             let fixed = fixture.kind == FixtureKind::Fixed;
             for label in &fixture.labels {
                 for tri in faces.get(label).into_iter().flatten() {
@@ -394,11 +403,13 @@ impl Grid {
                     }
                 }
             }
+            fixture_holds.push(holds);
             if cancel.load(Ordering::Relaxed) {
                 return Err(GenerativeError::Cancelled);
             }
         }
         for load in &study.loads {
+            let mut forces: BTreeMap<u32, V3> = BTreeMap::new();
             let triangles: Vec<&[V3; 3]> = load
                 .labels
                 .iter()
@@ -406,6 +417,7 @@ impl Grid {
                 .collect();
             let area: f64 = triangles.iter().map(|t| triangle_area(t)).sum();
             if !area.is_finite() || area <= 0.0 {
+                load_forces.push(forces);
                 continue;
             }
             for tri in triangles {
@@ -443,46 +455,42 @@ impl Grid {
                     }
                 }
             }
+            load_forces.push(forces);
         }
-        self.holds = holds
-            .into_iter()
-            .map(|(node, (fixed, normals))| {
-                let kept = if fixed {
-                    [0.0; 9]
-                } else {
-                    let mut p = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-                    let mut held: Vec<V3> = Vec::new();
-                    for n in normals {
-                        // What of this normal the directions held so far do not cover.
-                        let rest = held.iter().fold(n, |r, d| sub(r, scale(*d, dot(r, *d))));
-                        if norm(rest) > 0.5
-                            && held.len() < 3
-                            && let Some(d) = normalize(rest)
-                        {
-                            held.push(d);
-                        }
-                    }
-                    for d in &held {
-                        for r in 0..3 {
-                            for c in 0..3 {
-                                p[r * 3 + c] -= d[r] * d[c];
-                            }
-                        }
-                    }
-                    p
-                };
-                (node, kept)
-            })
-            .collect();
-        self.forces = forces.into_iter().filter(|(_, f)| norm(*f) > 0.0).collect();
         anchored.sort_unstable();
         anchored.dedup();
         self.anchored = anchored;
-        if self.holds.is_empty() {
-            return Err(GenerativeError::NotHeld);
-        }
-        if self.forces.is_empty() {
-            return Err(GenerativeError::NoLoads);
+        self.cases = Vec::new();
+        for case in study.cases() {
+            let mut holds: BTreeMap<u32, (bool, Vec<V3>)> = BTreeMap::new();
+            for map in case.fixtures.iter().filter_map(|&f| fixture_holds.get(f)) {
+                for (node, (fixed, normals)) in map {
+                    let entry = holds.entry(*node).or_insert((false, Vec::new()));
+                    entry.0 |= fixed;
+                    entry.1.extend(normals);
+                }
+            }
+            let mut forces: BTreeMap<u32, V3> = BTreeMap::new();
+            for map in case.loads.iter().filter_map(|&l| load_forces.get(l)) {
+                for (node, f) in map {
+                    let sum = forces.entry(*node).or_insert([0.0; 3]);
+                    *sum = add(*sum, *f);
+                }
+            }
+            let nodes = CaseNodes {
+                holds: holds
+                    .into_iter()
+                    .map(|(node, (fixed, normals))| (node, kept_motions(fixed, &normals)))
+                    .collect(),
+                forces: forces.into_iter().filter(|(_, f)| norm(*f) > 0.0).collect(),
+            };
+            if nodes.holds.is_empty() {
+                return Err(GenerativeError::NotHeld);
+            }
+            if nodes.forces.is_empty() {
+                return Err(GenerativeError::NoLoads);
+            }
+            self.cases.push(nodes);
         }
         Ok(())
     }
@@ -520,6 +528,34 @@ impl Grid {
         self.kinds[v] = Voxel::Preserve;
         v
     }
+}
+
+/// The motions a held node keeps: none when a fixture holds it fixed, else the identity
+/// less each roller face's normal (at most three directions, those `normals` add).
+fn kept_motions(fixed: bool, normals: &[V3]) -> [f64; 9] {
+    if fixed {
+        return [0.0; 9];
+    }
+    let mut p = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let mut held: Vec<V3> = Vec::new();
+    for &n in normals {
+        // What of this normal the directions held so far do not cover.
+        let rest = held.iter().fold(n, |r, d| sub(r, scale(*d, dot(r, *d))));
+        if norm(rest) > 0.5
+            && held.len() < 3
+            && let Some(d) = normalize(rest)
+        {
+            held.push(d);
+        }
+    }
+    for d in &held {
+        for r in 0..3 {
+            for c in 0..3 {
+                p[r * 3 + c] -= d[r] * d[c];
+            }
+        }
+    }
+    p
 }
 
 /// The box the grid covers before it is cut into voxels and made symmetric: around the

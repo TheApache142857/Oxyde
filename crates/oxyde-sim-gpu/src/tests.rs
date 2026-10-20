@@ -80,6 +80,7 @@ fn bracket(voxel_size: f64, iterations: usize) -> GenerativeStudy {
             },
             labels: vec![11],
         }],
+        load_cases: Vec::new(),
         mass_target: 0.25 * 60.0 * 20.0 * 10.0 * 7850.0 * 1e-9,
         member_size: None,
         max_iterations: iterations,

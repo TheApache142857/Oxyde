@@ -18,6 +18,11 @@ release yet; the git history has every detail.
   factor) to compare them, draws the one picked with its iterations on a slider, and *Export*
   writes it as STL, OBJ or 3MF. The outcomes are saved beside the study and come back with
   it. Topology studies are still made in the Simulation tab, under New Study.
+- **Additive manufacturing and load cases.** *Additive* grows shapes that print without
+  supports along the build direction picked: nothing overhangs more than 45°. *Load cases*
+  (Design conditions › Add a load case) give the loads a part meets at different times, each
+  with its own fixtures: the outcomes are as stiff as can be for them all. In files:
+  `load_cases` in the study's `generative` block (FORMAT.md §8).
 - **Create Part.** The outcome picked becomes a part file of its own: its surface made a
   solid, joined to the exact preserve bodies, the obstacles cut away, in the outcome's
   material, ready to be refined with features or studied in the Simulation tab. The part

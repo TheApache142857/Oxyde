@@ -41,6 +41,7 @@ fn bracket(voxel_size: f64) -> GenerativeStudy {
             },
             labels: vec![11],
         }],
+        load_cases: Vec::new(),
         // A quarter of the box's volume in steel.
         mass_target: 0.25 * 60.0 * 20.0 * 10.0 * 7850.0 * 1e-9,
         member_size: None,
@@ -125,8 +126,8 @@ fn the_grid_covers_the_box_and_sorts_the_voxels() {
     assert_eq!(count(Voxel::Outside), 0);
     assert_eq!(count(Voxel::Design), 60 * 20 * 10 - 928 - 12 * 20 * 8);
     // Held and loaded nodes: the held face's 21 × 11 corners; the load's forces add up.
-    assert_eq!(grid.holds.len(), 21 * 11);
-    let total = grid
+    assert_eq!(grid.cases[0].holds.len(), 21 * 11);
+    let total = grid.cases[0]
         .forces
         .iter()
         .fold([0.0; 3], |s, (_, f)| crate::math::add(s, *f));
@@ -252,6 +253,148 @@ fn a_study_set_up_wrong_is_refused() {
         &|_| {},
     );
     assert_eq!(refused, Err(GenerativeError::PullAcrossSymmetry));
+    // Printed across a symmetry plane, likewise.
+    let printed = generate(
+        &grid,
+        &study,
+        Method::Additive {
+            direction: Direction {
+                axis: 2,
+                positive: true,
+            },
+        },
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    );
+    assert_eq!(printed, Err(GenerativeError::BuildAcrossSymmetry));
+}
+
+#[test]
+fn load_cases_are_laid_apart_and_carried_together() {
+    // The bracket's down load, and a second case pushing the small pad sideways (+Z).
+    let mut study = bracket(2.0);
+    study.loads.push(Load {
+        kind: LoadKind::Force {
+            total: 600.0,
+            direction: Some([0.0, 0.0, 1.0]),
+        },
+        labels: vec![11],
+    });
+    let down = LoadCase {
+        fixtures: vec![0],
+        loads: vec![0],
+    };
+    let sideways = LoadCase {
+        fixtures: vec![0],
+        loads: vec![1],
+    };
+    study.load_cases = vec![down.clone(), sideways];
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    assert_eq!(grid.cases.len(), 2);
+    let total = |c: usize| {
+        grid.cases[c]
+            .forces
+            .iter()
+            .fold([0.0; 3], |s, (_, f)| crate::math::add(s, *f))
+    };
+    assert!((total(0)[1] + 1000.0).abs() < 1e-9 && total(0)[2].abs() < 1e-9);
+    assert!((total(1)[2] - 600.0).abs() < 1e-9 && total(1)[1].abs() < 1e-9);
+    assert_eq!(grid.cases[0].holds, grid.cases[1].holds);
+    // The design that carries both works harder in all than the one for the down load
+    // alone: its compliance is the two cases' sum.
+    let both = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    study.load_cases = vec![down];
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    assert_eq!(grid.cases.len(), 1);
+    let alone = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    )
+    .unwrap();
+    assert!(both.compliance > alone.compliance);
+    // On target as a single case is on this coarse grid (2 mm voxels): to a few percent.
+    for outcome in [&both, &alone] {
+        assert!(
+            (outcome.mass - study.mass_target).abs() < 0.06 * study.mass_target,
+            "mass {} for {}",
+            outcome.mass,
+            study.mass_target
+        );
+    }
+    // A case that holds nothing is refused.
+    study.load_cases = vec![LoadCase {
+        fixtures: Vec::new(),
+        loads: vec![0],
+    }];
+    assert_eq!(
+        Grid::build(&study, 0, &cancel).unwrap_err(),
+        GenerativeError::NotHeld
+    );
+}
+
+#[test]
+fn a_printed_bracket_holds_itself_up() {
+    // Printed up +Y from a plate at y = 0: the arm reaching out to the loaded pad would
+    // overhang, unrestricted.
+    let study = bracket(1.5);
+    let up = Method::Additive {
+        direction: Direction {
+            axis: 1,
+            positive: true,
+        },
+    };
+    let (grid, outcome) = run(&study, up, 0);
+    assert!(
+        (outcome.mass - study.mass_target).abs() < 0.05 * study.mass_target,
+        "mass {} for {}",
+        outcome.mass,
+        study.mass_target
+    );
+    // Every voxel of the material above the plate stands on one of the nine under it.
+    let n = grid.counts;
+    let (mut material, mut hanging) = (0, 0);
+    for v in 0..grid.voxel_count() {
+        let c = grid.coords(v);
+        if c[1] == 0 || outcome.density[v] < 128 || grid.kinds[v] == Voxel::Preserve {
+            continue;
+        }
+        material += 1;
+        let held = (-1i64..=1).any(|dz| {
+            (-1i64..=1).any(|dx| {
+                let (x, z) = (c[0] as i64 + dx, c[2] as i64 + dz);
+                x >= 0
+                    && z >= 0
+                    && x < n[0] as i64
+                    && z < n[2] as i64
+                    && outcome.density[grid.index([x as usize, c[1] - 1, z as usize])] >= 128
+            })
+        });
+        if !held {
+            hanging += 1;
+        }
+    }
+    assert!(material > 0);
+    assert!(
+        hanging * 100 <= material,
+        "{hanging} of {material} voxels hang"
+    );
 }
 
 #[test]
