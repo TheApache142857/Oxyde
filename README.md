@@ -109,10 +109,13 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   member, symmetry planes and a mould's pull direction, shown as a smooth surface and
   exported as STL.
 - **Generative Design tab:** shapes grown between the bodies to keep and the bodies to stay
-  clear of, as Fusion 360 grows them: a mass target, several materials and ways of making it
-  (unrestricted, 2-axis cutting, casting), an outcome for each, on the graphics card when
-  there is one; compared on a plot of mass against stress or stiffness, shown iteration by
-  iteration and exported as STL, OBJ or 3MF.
+  clear of, in parts and assemblies, as Fusion 360 grows them: the stiffest shape for a mass
+  target or the lightest under a safety factor (and a displacement limit), with load cases,
+  for several materials and ways of making it (unrestricted, additive without supports,
+  2-axis cutting, milling, casting), an outcome for each, on the graphics card when there is
+  one; compared on a plot of mass against stress or stiffness, shown iteration by iteration,
+  exported as STL, OBJ or 3MF, or made a part (*Create Part*: a solid joined to the exact
+  bodies kept).
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,
