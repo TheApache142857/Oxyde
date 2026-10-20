@@ -30,7 +30,7 @@ use oxyde_format::results::{
 };
 use oxyde_format::simulation::{
     AxisDirection, GenerativeMethod, GenerativeObjective, GenerativeObstacle, GenerativeSettings,
-    LoadCase, MeshSize, OutcomeMethod, StudyType, SymmetryPlanes,
+    LoadCase, MeshSize, OutcomeMethod, StudyBody, StudyType, SymmetryPlanes,
 };
 use oxyde_geom::Transform;
 use oxyde_kernel::{BooleanOp, FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
@@ -112,12 +112,12 @@ impl Role {
 }
 
 /// The role `id` has in `g`.
-pub(crate) fn role_of(g: &GenerativeSettings, id: BodyId) -> Role {
-    if g.preserve.contains(&id) {
+pub(crate) fn role_of(g: &GenerativeSettings, id: &StudyBody) -> Role {
+    if g.preserve.contains(id) {
         Role::Preserve
-    } else if g.obstacles.iter().any(|o| o.body == id) {
+    } else if g.obstacles.iter().any(|o| o.body == *id) {
         Role::Obstacle
-    } else if g.starting_shape == Some(id) {
+    } else if g.starting_shape.as_ref() == Some(id) {
         Role::StartingShape
     } else {
         Role::None
@@ -126,13 +126,13 @@ pub(crate) fn role_of(g: &GenerativeSettings, id: BodyId) -> Role {
 
 /// Gives `id` the role `role`, and no other: a body has one role at most. An obstacle
 /// keeps its offset; a new starting shape replaces the one before.
-pub(crate) fn set_role(g: &mut GenerativeSettings, id: BodyId, role: Role) {
-    if role_of(g, id) == role {
+pub(crate) fn set_role(g: &mut GenerativeSettings, id: StudyBody, role: Role) {
+    if role_of(g, &id) == role {
         return;
     }
     g.preserve.retain(|b| *b != id);
     g.obstacles.retain(|o| o.body != id);
-    if g.starting_shape == Some(id) {
+    if g.starting_shape.as_ref() == Some(&id) {
         g.starting_shape = None;
     }
     match role {
@@ -146,18 +146,33 @@ pub(crate) fn set_role(g: &mut GenerativeSettings, id: BodyId, role: Role) {
     }
 }
 
+/// The number of body `id` in `part`, as the timeline orders them (`Body 2`).
+fn body_number(part: &Part, id: BodyId) -> Option<usize> {
+    let mut ids: Vec<BodyId> = part.body()?.solids.iter().map(|s| s.id).collect();
+    ids.sort_by_key(|b| (part.index_of(b.feature), b.index));
+    ids.iter().position(|b| *b == id).map(|i| i + 1)
+}
+
 /// A hash of the roles, to tell when the viewport's colours are out of date.
 fn roles_hash(g: &GenerativeSettings) -> u64 {
     let mut h = DefaultHasher::new();
-    let id = |b: &BodyId| (b.feature.raw(), b.index);
-    g.preserve.iter().map(id).collect::<Vec<_>>().hash(&mut h);
+    g.preserve.hash(&mut h);
     g.obstacles
         .iter()
-        .map(|o| id(&o.body))
+        .map(|o| &o.body)
         .collect::<Vec<_>>()
         .hash(&mut h);
-    g.starting_shape.as_ref().map(id).hash(&mut h);
+    g.starting_shape.hash(&mut h);
     h.finish()
+}
+
+/// The surface of body `b` among `surfaces`, and its index.
+fn solid_of<'a>(surfaces: &'a Surfaces, b: &StudyBody) -> Option<(usize, &'a SurfaceMesh)> {
+    let i = surfaces
+        .bodies
+        .iter()
+        .position(|info| info.study_body().as_ref() == Some(b))?;
+    Some((i, surfaces.solids.get(i)?))
 }
 
 // ---- Methods and materials -----------------------------------------------------------------
@@ -301,30 +316,21 @@ pub(crate) fn outcome_plan(g: &GenerativeSettings, part: Option<&Material>) -> V
 /// The engine's study for `study` on `surfaces` (the part's, made for the document as it
 /// is), with the faces the fixtures and loads are on checked to be preserve bodies'.
 pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<GenerativeStudy, String> {
-    if surfaces.assembly {
-        return Err("Generative design works on a part: open the part".to_owned());
-    }
     let g = &study.generative;
-    let body = |id: BodyId| -> Result<usize, String> {
-        surfaces
-            .bodies
-            .iter()
-            .position(|b| b.id == Some(id))
-            .ok_or_else(|| format!("Body {id} is no longer in the part: give its role again"))
+    let body = |id: &StudyBody| -> Result<usize, String> {
+        solid_of(surfaces, id)
+            .map(|(i, _)| i)
+            .ok_or_else(|| format!("Body {id} is no longer in the model: give its role again"))
     };
     if g.preserve.is_empty() {
         return Err(
             "Nothing to keep: select a face of each body to keep, then Preserve".to_owned(),
         );
     }
-    let preserve: Vec<usize> = g
-        .preserve
-        .iter()
-        .map(|&id| body(id))
-        .collect::<Result<_, _>>()?;
+    let preserve: Vec<usize> = g.preserve.iter().map(body).collect::<Result<_, _>>()?;
     let mut obstacles = Vec::new();
     for o in &g.obstacles {
-        let i = body(o.body)?;
+        let i = body(&o.body)?;
         if let Some(s) = surfaces.solids.get(i) {
             obstacles.push(Obstacle {
                 surface: s.clone(),
@@ -332,7 +338,7 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
             });
         }
     }
-    let starting_shape = match g.starting_shape {
+    let starting_shape = match &g.starting_shape {
         Some(id) => surfaces.solids.get(body(id)?).cloned(),
         None => None,
     };
@@ -505,21 +511,11 @@ pub(crate) fn leave_load_cases(study: &mut Study, name: &str) {
 /// the design space takes, from the preserve bodies and the starting shape alone.
 pub(crate) fn voxel_estimate(study: &Study, surfaces: &Surfaces) -> Option<(f64, usize)> {
     let g = &study.generative;
-    let solid = |id: BodyId| {
-        surfaces
-            .bodies
-            .iter()
-            .position(|b| b.id == Some(id))
-            .and_then(|i| surfaces.solids.get(i))
-    };
+    let solid = |id: &StudyBody| solid_of(surfaces, id).map(|(_, s)| s.clone());
     let space = DesignSpace {
-        preserve: g
-            .preserve
-            .iter()
-            .filter_map(|&id| solid(id).cloned())
-            .collect(),
+        preserve: g.preserve.iter().filter_map(solid).collect(),
         obstacles: Vec::new(),
-        starting_shape: g.starting_shape.and_then(|id| solid(id).cloned()),
+        starting_shape: g.starting_shape.as_ref().and_then(solid),
         margin: g.margin,
     };
     let symmetry = engine_symmetry(g.symmetry);
@@ -542,10 +538,7 @@ pub(crate) fn preserve_mass(study: &Study, surfaces: &Surfaces, density: f64) ->
         .generative
         .preserve
         .iter()
-        .filter_map(|&id| {
-            let i = surfaces.bodies.iter().position(|b| b.id == Some(id))?;
-            surfaces.solids.get(i)
-        })
+        .filter_map(|id| solid_of(surfaces, id).map(|(_, s)| s))
         .map(|s| s.volume().abs())
         .sum();
     volume * 1e-9 * density
@@ -1141,7 +1134,7 @@ impl OxydeApp {
 
     /// Whether the tab works on the open study now: a part's generative study in its tab.
     fn generative_active(&self) -> bool {
-        self.generative_tab_open() && self.generative_study_open() && self.asm.is_none()
+        self.generative_tab_open() && self.generative_study_open()
     }
 
     /// Every frame: the generation's progress, the viewport's colours, the outcomes saved
@@ -1162,6 +1155,7 @@ impl OxydeApp {
         {
             self.simulation.generative.roles_shown = roles;
             self.scene_revision = None;
+            self.asm_scene = None;
             ctx.request_repaint();
         }
         self.load_saved_outcomes();
@@ -1173,24 +1167,67 @@ impl OxydeApp {
         if !self.generative_active() {
             return;
         }
-        let Some(body) = self.shown_body() else {
-            return;
-        };
         let g = &self.simulation.study.generative;
-        let faces = body.topology.faces.len();
-        if materials.len() < faces {
-            materials.resize(faces, RenderMaterial::default());
-        }
-        for (i, m) in materials.iter_mut().enumerate().take(faces) {
-            let role = body
-                .solid_of_face(i as u32)
-                .map_or(Role::None, |s| role_of(g, s.id));
+        let paint = |m: &mut RenderMaterial, role: Role| {
             if let Some(color) = role.color() {
                 *m = RenderMaterial {
                     color: Some(color),
                     ..RenderMaterial::default()
                 };
             }
+        };
+        match &self.asm {
+            None => {
+                let Some(body) = self.shown_body() else {
+                    return;
+                };
+                let faces = body.topology.faces.len();
+                if materials.len() < faces {
+                    materials.resize(faces, RenderMaterial::default());
+                }
+                for (i, m) in materials.iter_mut().enumerate().take(faces) {
+                    let role = body
+                        .solid_of_face(i as u32)
+                        .map_or(Role::None, |s| role_of(g, &StudyBody::part(s.id)));
+                    paint(m, role);
+                }
+            }
+            Some(doc) => {
+                // Each part occurrence's faces, by the scene's ranges.
+                for r in &doc.ranges {
+                    let Some(body) = doc.part_at(&r.owner).and_then(|p| p.part.body()) else {
+                        continue;
+                    };
+                    for (local, index) in r.faces.clone().enumerate() {
+                        let role = body.solid_of_face(local as u32).map_or(Role::None, |s| {
+                            let b = StudyBody::component(r.owner.top, r.owner.path.clone(), s.id);
+                            role_of(g, &b)
+                        });
+                        if let Some(m) = materials.get_mut(index as usize) {
+                            paint(m, role);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the panel and the messages call body `b`: `Body 2`, or in an assembly the
+    /// occurrence's name and the body's number in its part.
+    pub(crate) fn study_body_label(&self, b: &StudyBody) -> String {
+        match (&self.asm, b.component) {
+            (Some(doc), Some(top)) => {
+                let o = crate::assembly::Occurrence {
+                    top,
+                    path: b.path.clone(),
+                };
+                let number = doc
+                    .part_at(&o)
+                    .and_then(|p| body_number(&p.part, b.body))
+                    .map_or_else(String::new, |n| format!(" body {n}"));
+                format!("{}{number}", doc.occurrence_name(&o))
+            }
+            _ => self.body_label(b.body),
         }
     }
 
@@ -1200,11 +1237,18 @@ impl OxydeApp {
         if !self.generative_study_open() || self.generative_running() {
             return;
         }
-        let mut bodies: Vec<BodyId> = self
+        let mut bodies: Vec<StudyBody> = self
             .selected_sim_faces()
             .iter()
-            .filter(|f| f.occurrence.is_none())
-            .filter_map(|f| self.body_of_face(&f.face))
+            .filter_map(|f| match (&f.occurrence, &self.asm) {
+                (None, None) => self.body_of_face(&f.face).map(StudyBody::part),
+                (Some(o), Some(doc)) => {
+                    let body = doc.part_at(o)?.part.body()?;
+                    let id = body.solid_of_face(body.naming.find_face(&f.face)?)?.id;
+                    Some(StudyBody::component(o.top, o.path.clone(), id))
+                }
+                _ => None,
+            })
             .collect();
         bodies.sort();
         bodies.dedup();
@@ -1216,16 +1260,16 @@ impl OxydeApp {
             return;
         }
         let g = &mut self.simulation.study.generative;
-        let all = bodies.iter().all(|&b| role_of(g, b) == role);
+        let all = bodies.iter().all(|b| role_of(g, b) == role);
         let target = if all { Role::None } else { role };
         if target == Role::StartingShape && bodies.len() > 1 {
             self.status = "A study has one starting shape: select a face of one body".to_owned();
             return;
         }
-        for &b in &bodies {
-            set_role(g, b, target);
+        for b in &bodies {
+            set_role(g, b.clone(), target);
         }
-        let names: Vec<String> = bodies.iter().map(|&b| self.body_label(b)).collect();
+        let names: Vec<String> = bodies.iter().map(|b| self.study_body_label(b)).collect();
         self.status = if all {
             format!(
                 "{} no longer {}",
@@ -1506,13 +1550,7 @@ impl OxydeApp {
             return;
         };
         let study = &self.simulation.study.generative;
-        let solid = |id: &BodyId| {
-            surfaces
-                .bodies
-                .iter()
-                .position(|b| b.id == Some(*id))
-                .and_then(|i| surfaces.solids.get(i))
-        };
+        let solid = |id: &StudyBody| solid_of(surfaces, id).map(|(_, s)| s);
         let preserve: Vec<&SurfaceMesh> = study.preserve.iter().filter_map(solid).collect();
         let obstacles: Vec<&SurfaceMesh> = if key.obstacles {
             study
@@ -1691,31 +1729,67 @@ impl OxydeApp {
         };
         let (id, material_name) = (o.id, o.material.clone());
         let g = &self.simulation.study.generative;
+        // A body's shape, and where an assembly places it.
+        let shape_of = |b: &StudyBody| -> Option<(ShapeHandle, Transform)> {
+            match (&self.asm, b.component) {
+                (None, None) => Some((
+                    self.doc.part.body()?.solid(b.body)?.shape,
+                    Transform::IDENTITY,
+                )),
+                (Some(doc), Some(top)) => {
+                    let o = crate::assembly::Occurrence {
+                        top,
+                        path: b.path.clone(),
+                    };
+                    let (_, placement, part) = doc
+                        .leaves(&doc.assembly)
+                        .into_iter()
+                        .find(|(at, _, _)| *at == o)?;
+                    Some((
+                        part.part.body()?.solid(b.body)?.shape,
+                        placement.transform(),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        // The outcome's material: the study's, else the (first preserve body's) part's.
+        let own_material = match (&self.asm, g.preserve.first()) {
+            (Some(doc), Some(b)) => b
+                .component
+                .map(|top| crate::assembly::Occurrence {
+                    top,
+                    path: b.path.clone(),
+                })
+                .and_then(|o| doc.part_at(&o)?.part.material().cloned()),
+            _ => self.doc.part.material().cloned(),
+        };
         let material = g
             .materials
             .iter()
             .find(|m| m.name == material_name)
             .cloned()
-            .or_else(|| self.doc.part.material().cloned());
-        let Some(body) = self.doc.part.body() else {
-            return;
-        };
-        let preserve: Vec<ShapeHandle> = g
-            .preserve
-            .iter()
-            .filter_map(|b| body.solid(*b).map(|s| s.shape))
-            .collect();
-        let obstacles: Vec<ShapeHandle> = g
+            .or(own_material);
+        let preserve: Vec<(ShapeHandle, Transform)> =
+            g.preserve.iter().filter_map(shape_of).collect();
+        let obstacles: Vec<(ShapeHandle, Transform)> = g
             .obstacles
             .iter()
-            .filter_map(|o| body.solid(o.body).map(|s| s.shape))
+            .filter_map(|o| shape_of(&o.body))
             .collect();
-        let stem = self.doc.display_name();
+        let stem = match &self.asm {
+            Some(doc) => doc.display_name(),
+            None => self.doc.display_name(),
+        };
         let name = format!("{stem} {} outcome {id}", self.simulation.study.name);
         let mut dialog = rfd::FileDialog::new()
             .add_filter("Oxyde part", &[oxyde_format::PART_EXTENSION])
             .set_file_name(format!("{name}.{}", oxyde_format::PART_EXTENSION));
-        if let Some(dir) = self.doc.path.as_deref().and_then(std::path::Path::parent) {
+        let folder = match &self.asm {
+            Some(doc) => doc.path.clone(),
+            None => self.doc.path.clone(),
+        };
+        if let Some(dir) = folder.as_deref().and_then(std::path::Path::parent) {
             dialog = dialog.set_directory(dir);
         }
         let Some(mut path) = dialog.save_file() else {
@@ -1726,10 +1800,10 @@ impl OxydeApp {
         }
         // Copies of the bodies to keep and to cut, so the job works on shapes of its own
         // while the part stays on show.
-        let copy = |kernel: &mut oxyde_occt::OcctKernel, shapes: &[ShapeHandle]| {
+        let copy = |kernel: &mut oxyde_occt::OcctKernel, shapes: &[(ShapeHandle, Transform)]| {
             shapes
                 .iter()
-                .filter_map(|s| kernel.transform(*s, &Transform::IDENTITY).ok())
+                .filter_map(|(s, at)| kernel.transform(*s, at).ok())
                 .map(|r| r.shape)
                 .collect::<Vec<_>>()
         };
@@ -1781,8 +1855,12 @@ impl OxydeApp {
     pub(crate) fn part_created(&mut self, path: PathBuf, result: Result<String, String>) {
         match result {
             Ok(note) => {
-                self.status = format!("Made {}: {note}", path.display());
                 self.remember_recent(&path);
+                // In an assembly, the part goes in where it was grown: at the origin, fixed.
+                if self.asm.is_some() {
+                    self.insert_part(&path, Some(oxyde_assembly::Placement::IDENTITY));
+                }
+                self.status = format!("Made {}: {note}", path.display());
                 self.simulation.generative.created = Some(path);
             }
             Err(why) => self.status = format!("Could not make the part: {why}"),
@@ -1809,13 +1887,6 @@ impl OxydeApp {
     /// Explore and Export.
     pub(crate) fn generative_tab(&mut self, ui: &mut egui::Ui) {
         use crate::icons::{Icon, command_button};
-        if self.asm.is_some() {
-            ui.label(
-                egui::RichText::new("Generative design works on a part: open one of the parts")
-                    .weak(),
-            );
-            return;
-        }
         let running = self.study_running();
         if command_button(
             ui,
@@ -1836,7 +1907,11 @@ impl OxydeApp {
             return;
         }
         let has_faces = !self.selected_sim_faces().is_empty();
-        let enabled = !running && self.doc.part.body().is_some();
+        let enabled = !running
+            && match &self.asm {
+                Some(doc) => !doc.leaves(&doc.assembly).is_empty(),
+                None => self.doc.part.body().is_some(),
+            };
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -1989,10 +2064,6 @@ impl OxydeApp {
             .weak(),
         );
         ui.add_space(4.0);
-        if self.asm.is_some() {
-            ui.label(egui::RichText::new("Open a part to set up a generative study.").weak());
-            return;
-        }
         let running = self.study_running();
         if ui
             .add_enabled(!running, egui::Button::new("New Generative Study"))
@@ -2023,7 +2094,7 @@ impl OxydeApp {
     /// The tab's panel: the study, its roles, conditions, objectives, manufacturing,
     /// materials and resolution, and its outcomes.
     pub(crate) fn generative_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.generative_study_open() || self.asm.is_some() {
+        if !self.generative_study_open() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 self.generative_chooser(ui);
@@ -2033,15 +2104,18 @@ impl OxydeApp {
         }
         let surface_error = self.ensure_surfaces().err();
         // What the sections show, gathered before the study is borrowed to edit.
-        let bodies: Vec<(BodyId, String)> = self
+        let bodies: Vec<(StudyBody, String)> = self
             .simulation
             .surfaces
             .as_ref()
             .map(|s| {
                 s.bodies
                     .iter()
-                    .filter_map(|b| b.id)
-                    .map(|id| (id, self.body_label(id)))
+                    .filter_map(|b| b.study_body())
+                    .map(|b| {
+                        let label = self.study_body_label(&b);
+                        (b, label)
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -2469,16 +2543,16 @@ fn weak(ui: &mut egui::Ui, text: &str) {
 fn design_space_rows(
     ui: &mut egui::Ui,
     g: &mut GenerativeSettings,
-    bodies: &[(BodyId, String)],
+    bodies: &[(StudyBody, String)],
 ) -> bool {
     let mut changed = false;
     if bodies.is_empty() {
         weak(ui, "The part has no body yet");
         return false;
     }
-    for (id, name) in bodies {
+    for (row, (id, name)) in bodies.iter().enumerate() {
         ui.horizontal(|ui| {
-            let role = role_of(g, *id);
+            let role = role_of(g, id);
             if let Some(c) = role.color() {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -2489,7 +2563,7 @@ fn design_space_rows(
             }
             ui.label(name);
             let mut chosen = role;
-            egui::ComboBox::from_id_salt(("generative_role", id.feature.raw(), id.index))
+            egui::ComboBox::from_id_salt(("generative_role", row))
                 .selected_text(role.label())
                 .width(110.0)
                 .show_ui(ui, |ui| {
@@ -2499,7 +2573,7 @@ fn design_space_rows(
                     }
                 });
             if chosen != role {
-                set_role(g, *id, chosen);
+                set_role(g, id.clone(), chosen);
                 changed = true;
             }
             if let Some(o) = g.obstacles.iter_mut().find(|o| o.body == *id) {
@@ -3532,8 +3606,8 @@ mod tests {
     use super::*;
     use oxyde_model::FeatureId;
 
-    fn body(feature: u32) -> BodyId {
-        BodyId::new(FeatureId::from_raw(feature), 0)
+    fn body(feature: u32) -> StudyBody {
+        StudyBody::part(BodyId::new(FeatureId::from_raw(feature), 0))
     }
 
     #[test]
@@ -3541,8 +3615,8 @@ mod tests {
         let mut g = GenerativeSettings::default();
         set_role(&mut g, body(2), Role::Preserve);
         set_role(&mut g, body(3), Role::Obstacle);
-        assert_eq!(role_of(&g, body(2)), Role::Preserve);
-        assert_eq!(role_of(&g, body(3)), Role::Obstacle);
+        assert_eq!(role_of(&g, &body(2)), Role::Preserve);
+        assert_eq!(role_of(&g, &body(3)), Role::Obstacle);
         g.obstacles[0].offset = 2.0;
         // The same role again keeps the offset.
         set_role(&mut g, body(3), Role::Obstacle);
@@ -3552,7 +3626,7 @@ mod tests {
         assert_eq!(g.starting_shape, Some(body(2)));
         // A new starting shape replaces the one before.
         set_role(&mut g, body(4), Role::StartingShape);
-        assert_eq!(role_of(&g, body(2)), Role::None);
+        assert_eq!(role_of(&g, &body(2)), Role::None);
         set_role(&mut g, body(3), Role::None);
         assert!(g.obstacles.is_empty());
         let before = roles_hash(&g);
@@ -3688,8 +3762,8 @@ mod tests {
             (0..12).map(pad_face).collect(),
             (0..12).map(|l| l / 6).collect(),
             vec![
-                ("Body 1".to_owned(), Some(body(2)), Some(steel())),
-                ("Body 2".to_owned(), Some(body(3)), Some(steel())),
+                ("Body 1".to_owned(), Some(body(2).body), Some(steel())),
+                ("Body 2".to_owned(), Some(body(3).body), Some(steel())),
             ],
         );
         let mut study = Study::of_type(StudyType::Generative, "Generative 1");
@@ -3938,6 +4012,60 @@ mod tests {
         assert!(o.max_von_mises <= 1.1 * 125.0, "{} MPa", o.max_von_mises);
         let full = (40.0 * 16.0 * 8.0) * 7850e-9;
         assert!(o.mass < full, "{} kg", o.mass);
+    }
+
+    #[test]
+    fn in_an_assembly_bodies_are_named_by_their_occurrence() {
+        // The two pads as components 1 and 2 of an assembly (the second inside a
+        // sub-assembly, component 4 of 2).
+        let (mut surfaces, _) = two_pads();
+        let occurrences = [
+            crate::assembly::Occurrence::top(oxyde_assembly::ComponentId(1)),
+            crate::assembly::Occurrence {
+                top: oxyde_assembly::ComponentId(2),
+                path: vec![oxyde_assembly::ComponentId(4)],
+            },
+        ];
+        surfaces.assembly = true;
+        for (b, o) in surfaces.bodies.iter_mut().zip(&occurrences) {
+            b.occurrence = Some(o.clone());
+        }
+        for (f, b) in surfaces.faces.iter_mut().zip(&surfaces.face_body) {
+            f.occurrence = Some(occurrences[*b as usize].clone());
+        }
+        let bodies: Vec<StudyBody> = surfaces
+            .bodies
+            .iter()
+            .filter_map(|b| b.study_body())
+            .collect();
+        assert_eq!(
+            bodies[1],
+            StudyBody::component(
+                oxyde_assembly::ComponentId(2),
+                vec![oxyde_assembly::ComponentId(4)],
+                body(3).body
+            )
+        );
+        let mut study = Study::of_type(StudyType::Generative, "Generative 1");
+        study.add(ItemKind::Fixed, vec![surfaces.faces[0].clone()]);
+        study.add(
+            ItemKind::Force {
+                newtons: -500.0,
+                direction: crate::simulation_ui::LoadDirection::Y,
+            },
+            vec![surfaces.faces[7].clone()],
+        );
+        let g = &mut study.generative;
+        for b in &bodies {
+            set_role(g, b.clone(), Role::Preserve);
+        }
+        g.mass_target = 0.03;
+        g.resolution = MeshSize::ElementSize(2.0);
+        // A part's body name finds nothing in the assembly.
+        assert!(engine_study(&study, &surfaces).is_ok());
+        study.generative.preserve[0] = body(2);
+        let why = engine_study(&study, &surfaces).unwrap_err();
+        assert!(why.contains("no longer in the model"), "{why}");
     }
 
     #[test]

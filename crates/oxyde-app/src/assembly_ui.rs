@@ -606,11 +606,17 @@ impl OxydeApp {
             return;
         };
         for path in paths {
-            self.insert_part(&path);
+            self.insert_part(&path, None);
         }
     }
 
-    fn insert_part(&mut self, path: &Path) {
+    /// Inserts the part or assembly file at `path`: at `placement`, fixed, or in a free
+    /// spot to be mated.
+    pub(crate) fn insert_part(
+        &mut self,
+        path: &Path,
+        placement: Option<oxyde_assembly::Placement>,
+    ) {
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
@@ -622,7 +628,8 @@ impl OxydeApp {
             self.status = format!("Could not insert: {e}");
             return;
         }
-        let placement = doc.free_spot(doc.file_bounds(path));
+        let fixed_at = placement;
+        let placement = placement.unwrap_or_else(|| doc.free_spot(doc.file_bounds(path)));
         let document_id = doc
             .docs
             .get(path)
@@ -638,6 +645,11 @@ impl OxydeApp {
         let id = doc
             .assembly
             .add_component(&stem, stored, document_id, placement);
+        if fixed_at.is_some()
+            && let Some(c) = doc.assembly.component_mut(id)
+        {
+            c.fixed = true;
+        }
         doc.load_parts(&mut self.kernel);
         doc.solve();
         doc.selection = vec![AsmSelected::Component(id)];
@@ -2817,6 +2829,7 @@ impl OxydeApp {
         };
         let mut mesh = doc.scene_mesh(&assembly);
         let (mut materials, textures) = self.assembly_materials(&assembly);
+        self.tint_generative_roles(&mut materials);
         self.add_context(&mut mesh, &mut materials);
         let own = self.own_mesh_counts(&mesh);
         let before = (mesh.faces.len() as u32, mesh.edges.len() as u32);

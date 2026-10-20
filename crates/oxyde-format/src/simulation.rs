@@ -234,12 +234,12 @@ pub struct PreservedRegion {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerativeSettings {
     /// Bodies kept as they are; at least one. Fixtures and loads are on their faces.
-    pub preserve: Vec<BodyId>,
+    pub preserve: Vec<StudyBody>,
     /// Bodies no material may go into.
     pub obstacles: Vec<GenerativeObstacle>,
     /// A body the material starts in and stays inside; `None` for the box around the
     /// preserve bodies, grown by [`GenerativeSettings::margin`].
-    pub starting_shape: Option<BodyId>,
+    pub starting_shape: Option<StudyBody>,
     /// mm the box around the preserve bodies is grown by on every side, without a starting
     /// shape; `None` for a tenth of the box's largest side.
     pub margin: Option<f64>,
@@ -306,10 +306,54 @@ impl Default for GenerativeSettings {
     }
 }
 
-/// A body a generative study's material stays out of.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GenerativeObstacle {
+/// A body of the studied model: of the part, or of a part in the assembly, named as faces
+/// are ([`StudyFace`]).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StudyBody {
+    /// The assembly's component holding it; `None` in a part study.
+    pub component: Option<ComponentId>,
+    /// Inside a sub-assembly: its component ids down to the part.
+    pub path: Vec<ComponentId>,
     pub body: BodyId,
+}
+
+impl StudyBody {
+    /// A body of the studied part.
+    pub fn part(body: BodyId) -> Self {
+        Self {
+            component: None,
+            path: Vec::new(),
+            body,
+        }
+    }
+
+    /// A body of a part in the studied assembly.
+    pub fn component(component: ComponentId, path: Vec<ComponentId>, body: BodyId) -> Self {
+        Self {
+            component: Some(component),
+            path,
+            body,
+        }
+    }
+}
+
+impl std::fmt::Display for StudyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(c) = self.component {
+            write!(f, "component {}", c.0)?;
+            for p in &self.path {
+                write!(f, "/{}", p.0)?;
+            }
+            write!(f, " ")?;
+        }
+        write!(f, "{}", self.body)
+    }
+}
+
+/// A body a generative study's material stays out of.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerativeObstacle {
+    pub body: StudyBody,
     /// mm it is grown by on every side; 0 for none.
     pub offset: f64,
 }
@@ -866,11 +910,11 @@ struct StudyDto {
 struct GenerativeDto {
     /// At least one.
     #[serde(default)]
-    preserve: Vec<BodyIdDto>,
+    preserve: Vec<StudyBodyDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     obstacles: Vec<ObstacleDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    starting_shape: Option<BodyIdDto>,
+    starting_shape: Option<StudyBodyDto>,
     /// mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     margin: Option<f64>,
@@ -911,9 +955,31 @@ struct LoadCaseDto {
     loads: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// A body, written as a face's component and path are: only in assemblies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StudyBodyDto {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    component: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path: Vec<u32>,
+    feature: u32,
+    #[serde(default)]
+    index: u32,
+}
+
+fn study_body_dto(b: &StudyBody) -> StudyBodyDto {
+    let id: BodyIdDto = body_dto(&b.body);
+    StudyBodyDto {
+        component: b.component.map(|c| c.0),
+        path: b.path.iter().map(|c| c.0).collect(),
+        feature: id.feature,
+        index: id.index,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct ObstacleDto {
-    body: BodyIdDto,
+    body: StudyBodyDto,
     /// mm.
     #[serde(default, skip_serializing_if = "is_zero")]
     offset: f64,
@@ -1516,16 +1582,16 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
     // A study document holds no images: its materials go without their textures.
     let no_textures = TextureTable::default();
     GenerativeDto {
-        preserve: g.preserve.iter().map(body_dto).collect(),
+        preserve: g.preserve.iter().map(study_body_dto).collect(),
         obstacles: g
             .obstacles
             .iter()
             .map(|o| ObstacleDto {
-                body: body_dto(&o.body),
+                body: study_body_dto(&o.body),
                 offset: o.offset,
             })
             .collect(),
-        starting_shape: g.starting_shape.as_ref().map(body_dto),
+        starting_shape: g.starting_shape.as_ref().map(study_body_dto),
         margin: g.margin,
         objective: match g.objective {
             GenerativeObjective::MaxStiffness => ObjectiveDto::MaxStiffness,
@@ -1699,9 +1765,6 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
 
     // A generative study's grid and materials are in its block; it has no contacts.
     if study_type == StudyType::Generative {
-        if kind == ModelKind::Assembly {
-            return Err("an assembly has a generative study".to_owned());
-        }
         if !dto.contacts.is_empty() {
             return Err("a generative study has contacts".to_owned());
         }
@@ -1982,7 +2045,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, None) => TopologySettings::default(),
     };
     let generative = match (study_type, dto.generative) {
-        (StudyType::Generative, Some(g)) => generative_from(g, &fixtures, &loads)?,
+        (StudyType::Generative, Some(g)) => generative_from(g, kind, &fixtures, &loads)?,
         (StudyType::Generative, None) => {
             return Err("a generative study has no generative block".to_owned());
         }
@@ -2098,17 +2161,38 @@ fn directions_from(
 
 fn generative_from(
     dto: GenerativeDto,
+    kind: ModelKind,
     fixtures: &[Fixture],
     loads: &[Load],
 ) -> Result<GenerativeSettings, String> {
-    // A body has one role at most.
+    // A body has one role at most, and names a component exactly in an assembly.
     let mut bodies = BTreeSet::new();
-    let mut body = |dto: BodyIdDto| -> Result<BodyId, String> {
-        let id = body_from(dto);
-        if bodies.insert(id) {
-            Ok(id)
+    let mut body = |dto: StudyBodyDto| -> Result<StudyBody, String> {
+        match (kind, dto.component) {
+            (ModelKind::Part, Some(_)) => {
+                return Err("a body of a part names a component".to_owned());
+            }
+            (ModelKind::Assembly, None) => {
+                return Err("a body of an assembly names no component".to_owned());
+            }
+            (_, None) if !dto.path.is_empty() => {
+                return Err("a body has a component path but no component".to_owned());
+            }
+            (_, Some(0)) => return Err("a body names component 0".to_owned()),
+            _ => {}
+        }
+        let b = StudyBody {
+            component: dto.component.map(ComponentId),
+            path: dto.path.into_iter().map(ComponentId).collect(),
+            body: body_from(BodyIdDto {
+                feature: dto.feature,
+                index: dto.index,
+            }),
+        };
+        if bodies.insert(b.clone()) {
+            Ok(b)
         } else {
-            Err(format!("the body {id} is listed twice"))
+            Err(format!("the body {b} is listed twice"))
         }
     };
     if dto.preserve.is_empty() {
@@ -2548,7 +2632,8 @@ mod tests {
             path: "bracket.oxyprt".to_owned(),
             document_id: "66666666-6666-6666-6666-666666666666".to_owned(),
         });
-        let body = |feature, index| BodyId::new(FeatureId::from_raw(feature), index);
+        let body =
+            |feature, index| StudyBody::part(BodyId::new(FeatureId::from_raw(feature), index));
         let material = |name: &str, density, modulus| Material {
             name: name.to_owned(),
             category: "Metal".to_owned(),
@@ -2723,6 +2808,39 @@ mod tests {
                 },
             ]
         );
+        // In an assembly, its bodies name their components.
+        let mut assembly = generative_sample();
+        assembly.model.kind = ModelKind::Assembly;
+        assembly.studies.truncate(1);
+        let s = &mut assembly.studies[0];
+        let on = |f: &mut StudyFace| f.component = Some(ComponentId(2));
+        s.fixtures
+            .iter_mut()
+            .flat_map(|f| f.faces.iter_mut())
+            .for_each(on);
+        for l in &mut s.loads {
+            if let LoadKind::Force { faces, .. } | LoadKind::Pressure { faces, .. } = &mut l.kind {
+                faces.iter_mut().for_each(on);
+            }
+        }
+        let g = &mut s.generative;
+        let place = |b: &mut StudyBody| {
+            b.component = Some(ComponentId(2));
+            b.path = vec![ComponentId(5)];
+        };
+        g.preserve.iter_mut().for_each(place);
+        g.obstacles.iter_mut().for_each(|o| place(&mut o.body));
+        g.starting_shape.iter_mut().for_each(place);
+        assert_eq!(
+            read_simulation(Cursor::new(bytes(&assembly))).unwrap(),
+            assembly
+        );
+        let v = json(&assembly);
+        assert_eq!(
+            v["studies"][0]["generative"]["preserve"][0],
+            serde_json::json!({ "component": 2, "path": [5], "feature": 3, "index": 0 })
+        );
+
         // Minimizing mass: no target needed, a displacement limit taken.
         let mut light = generative_sample();
         let g = &mut light.studies[0].generative;
@@ -2866,15 +2984,22 @@ mod tests {
             },
             "no generative block",
         );
+        // In an assembly, bodies name their components as faces do.
         refused(
             &|v| {
                 v["model"]["kind"] = "assembly".into();
                 v["studies"].as_array_mut().unwrap().truncate(1);
                 for item in ["fixtures", "loads"] {
-                    study(v)[item][0]["faces"][0]["component"] = 1.into();
+                    for i in 0..study(v)[item].as_array().unwrap().len() {
+                        study(v)[item][i]["faces"][0]["component"] = 1.into();
+                    }
                 }
             },
-            "an assembly has a generative study",
+            "a body of an assembly names no component",
+        );
+        refused(
+            &|v| block(v)["preserve"][0]["component"] = 2.into(),
+            "a body of a part names a component",
         );
         refused(
             &|v| {
@@ -2916,6 +3041,10 @@ mod tests {
         refused(
             &|v| block(v)["starting_shape"] = serde_json::json!({ "feature": 9, "index": 1 }),
             "the body F9.1 is listed twice",
+        );
+        refused(
+            &|v| block(v)["preserve"][0]["path"] = serde_json::json!([3]),
+            "a component path but no component",
         );
         refused(
             &|v| block(v)["obstacles"][0]["offset"] = (-1.0).into(),

@@ -1007,6 +1007,13 @@ stays on show.
 - **The app**: *Maximize stiffness* or *Minimize mass* (the mass target only for the first,
   a displacement limit for the second), *Milling* from any of the six sides with a tool
   diameter.
+- **Assemblies**: a generative study of an assembly takes its parts' bodies, each named by
+  its component and path as faces are (`StudyBody`, FORMAT.md §8), so a body of one part can
+  be kept and another's be an obstacle; the roles are coloured on the assembly's scene and
+  set from the selection there. *Create Part* copies the preserve bodies and obstacles where
+  the assembly places them, and inserts the part it makes at the origin, fixed, where the
+  outcome was grown. The assembly's own bodies and mates take no part: the outcome is a new
+  part among them.
 - **Tests**: MMA on Svanberg's test problem (to his optimum, 2·10⁻³) and on a linear
   objective under a convex constraint; the bracket's limits met (stress, displacement), the
   heavier design for the tighter limit, a material without strength refused; a milled

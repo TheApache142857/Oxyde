@@ -29,6 +29,10 @@ release yet; the git history has every detail.
   takes a mass target. *Milling* grows shapes a 3-axis mill reaches from the side picked,
   no pocket narrower than the tool. In files: `objective: "min_mass"`, `displacement_limit`
   and the `milling` method (FORMAT.md §8).
+- **Generative design in assemblies.** A generative study of an assembly takes the bodies
+  of its parts: keep the brackets' mounting bosses, stay clear of the motor next to them, and
+  the outcome grows between them; *Create Part* inserts the part made where it was grown,
+  fixed. In files: bodies named with their component, as faces are (FORMAT.md §8).
 - **Create Part.** The outcome picked becomes a part file of its own: its surface made a
   solid, joined to the exact preserve bodies, the obstacles cut away, in the outcome's
   material, ready to be refined with features or studied in the Simulation tab. The part

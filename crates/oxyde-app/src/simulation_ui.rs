@@ -686,13 +686,26 @@ impl Study {
 #[derive(Debug, Clone)]
 pub(crate) struct BodyInfo {
     name: String,
-    /// The part's body it is, in a part.
+    /// The part's body it is.
     pub(crate) id: Option<BodyId>,
+    /// The part occurrence holding it, in an assembly.
+    pub(crate) occurrence: Option<Occurrence>,
     /// Its material group: the material's name, or `part:` and the part's document id.
     key: String,
     material: Option<Material>,
     /// The part file it comes from (an assembly's part), to give it another material.
     path: Option<std::path::PathBuf>,
+}
+
+impl BodyInfo {
+    /// The body as a study names it.
+    pub(crate) fn study_body(&self) -> Option<oxyde_format::simulation::StudyBody> {
+        let id = self.id?;
+        Some(match &self.occurrence {
+            Some(o) => oxyde_format::simulation::StudyBody::component(o.top, o.path.clone(), id),
+            None => oxyde_format::simulation::StudyBody::part(id),
+        })
+    }
 }
 
 /// Where a solid of the model is, for a volume mesher that works on the shape itself.
@@ -747,6 +760,7 @@ impl Surfaces {
                         .map_or_else(|| "part:x".to_owned(), |m| m.name.clone()),
                     name,
                     id,
+                    occurrence: None,
                     material,
                     path: None,
                 })
@@ -1564,6 +1578,7 @@ impl OxydeApp {
                         BodyInfo {
                             name,
                             id: Some(solid.id),
+                            occurrence: None,
                             key: key.clone(),
                             material: part.material().cloned(),
                             path: None,
@@ -1595,7 +1610,8 @@ impl OxydeApp {
                             Some(o.clone()),
                             BodyInfo {
                                 name: asm.occurrence_name(&o),
-                                id: None,
+                                id: Some(solid.id),
+                                occurrence: Some(o.clone()),
                                 key: key.clone(),
                                 material: loaded.part.material().cloned(),
                                 path: asm.path_at(&o),
@@ -5722,6 +5738,7 @@ mod tests {
         let body = BodyInfo {
             name: "Bracket".into(),
             id: None,
+            occurrence: None,
             key: steel.name.clone(),
             material: Some(steel.clone()),
             path: None,
@@ -5765,6 +5782,7 @@ mod tests {
         let body = |name: &str, path: &str, material: Option<&Material>| BodyInfo {
             name: name.into(),
             id: None,
+            occurrence: None,
             key: material.map_or_else(|| format!("part:{name}"), |m| m.name.clone()),
             material: material.cloned(),
             path: Some(path.into()),
