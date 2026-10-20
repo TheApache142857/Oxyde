@@ -28,7 +28,8 @@ fn bracket(voxel_size: f64) -> GenerativeStudy {
             ],
             obstacles: Vec::new(),
             starting_shape: None,
-            margin: Some(0.0),
+            margin: [Some(0.0); 3],
+            ..DesignSpace::default()
         },
         fixtures: vec![Fixture {
             kind: FixtureKind::Fixed,
@@ -675,7 +676,7 @@ fn an_exact_surface_meets_the_bodies_on_their_faces() {
         preserve: vec![box_surface(keep_lo, keep_hi)],
         obstacles: Vec::new(),
         starting_shape: Some(box_surface(start_lo, start_hi)),
-        margin: None,
+        ..DesignSpace::default()
     };
     let plain = surface(&grid, &density, 10);
     let (exact, held) = exact_surface(&grid, &density, 10, &space);
@@ -722,4 +723,280 @@ fn an_exact_surface_meets_the_bodies_on_their_faces() {
     }
     assert_eq!(highest(&fewer, 1), 6.7);
     assert!(inside(&fewer));
+}
+
+/// A plate along X and Y, `lo[2]` to `hi[2]` thick, with a square hole `hole_lo` to
+/// `hole_hi` (in X and Y) through it. Its faces are labelled `10 × body +`: 0 to 3 its
+/// sides (−X, +X, −Y, +Y), 4 to 7 the hole's (at its −X, +X, −Y, +Y side), 8 its bottom
+/// and 9 its top.
+fn holed_plate(body: u32, lo: V3, hi: V3, hole_lo: [f64; 2], hole_hi: [f64; 2]) -> SurfaceMesh {
+    let mut s = SurfaceMesh::default();
+    let mut quad = |corners: [V3; 4], outward: V3, label: u32| {
+        let base = s.positions.len() as u32;
+        s.positions.extend(corners);
+        let normal = crate::math::cross(
+            crate::math::sub(corners[1], corners[0]),
+            crate::math::sub(corners[2], corners[0]),
+        );
+        let (a, b, c, d) = (base, base + 1, base + 2, base + 3);
+        if crate::math::dot(normal, outward) > 0.0 {
+            s.triangles.extend([[a, b, c], [a, c, d]]);
+        } else {
+            s.triangles.extend([[a, c, b], [a, d, c]]);
+        }
+        s.labels.extend([10 * body + label; 2]);
+    };
+    // A wall at x = `x` from y0 to y1, or at y = `y` from x0 to x1, the plate's thickness.
+    let (z0, z1) = (lo[2], hi[2]);
+    let x_wall = |x: f64, y0: f64, y1: f64| [[x, y0, z0], [x, y1, z0], [x, y1, z1], [x, y0, z1]];
+    let y_wall = |y: f64, x0: f64, x1: f64| [[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]];
+    quad(x_wall(lo[0], lo[1], hi[1]), [-1.0, 0.0, 0.0], 0);
+    quad(x_wall(hi[0], lo[1], hi[1]), [1.0, 0.0, 0.0], 1);
+    quad(y_wall(lo[1], lo[0], hi[0]), [0.0, -1.0, 0.0], 2);
+    quad(y_wall(hi[1], lo[0], hi[0]), [0.0, 1.0, 0.0], 3);
+    // The hole's walls face into it.
+    quad(
+        x_wall(hole_lo[0], hole_lo[1], hole_hi[1]),
+        [1.0, 0.0, 0.0],
+        4,
+    );
+    quad(
+        x_wall(hole_hi[0], hole_lo[1], hole_hi[1]),
+        [-1.0, 0.0, 0.0],
+        5,
+    );
+    quad(
+        y_wall(hole_lo[1], hole_lo[0], hole_hi[0]),
+        [0.0, 1.0, 0.0],
+        6,
+    );
+    quad(
+        y_wall(hole_hi[1], hole_lo[0], hole_hi[0]),
+        [0.0, -1.0, 0.0],
+        7,
+    );
+    // Bottom and top, around the hole in four pieces.
+    let xs = [lo[0], hole_lo[0], hole_hi[0], hi[0]];
+    let ys = [lo[1], hole_lo[1], hole_hi[1], hi[1]];
+    let pieces = [(0, 0, 1, 3), (2, 0, 3, 3), (1, 0, 2, 1), (1, 2, 2, 3)];
+    for (z, outward, label) in [(z0, -1.0, 8), (z1, 1.0, 9)] {
+        for (i0, j0, i1, j1) in pieces {
+            let (x0, x1, y0, y1) = (xs[i0], xs[i1], ys[j0], ys[j1]);
+            quad(
+                [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]],
+                [0.0, 0.0, outward],
+                label,
+            );
+        }
+    }
+    s
+}
+
+/// The plate 40 × 10 mm and 4 thick, the hole 4 mm square near its −X end: one body, no
+/// role. Kept: 1.5 mm around the hole, held there; 2 mm under its +X end, loaded 200 N down
+/// there. The room 2 mm along X and Y, none along Z: the outcome stays as thick as the
+/// plate. 1 mm voxels.
+fn one_plate() -> GenerativeStudy {
+    let mut study = bracket(1.0);
+    study.space = DesignSpace {
+        regions: vec![
+            PreserveRegion {
+                body: 0,
+                labels: vec![4, 5, 6, 7],
+                depth: 1.5,
+            },
+            PreserveRegion {
+                body: 0,
+                labels: vec![1],
+                depth: 2.0,
+            },
+        ],
+        region_bodies: vec![holed_plate(
+            0,
+            [0.0, 0.0, 0.0],
+            [40.0, 10.0, 4.0],
+            [4.0, 3.0],
+            [8.0, 7.0],
+        )],
+        margin: [Some(2.0), Some(2.0), Some(0.0)],
+        ..DesignSpace::default()
+    };
+    study.fixtures[0].labels = vec![4, 5, 6, 7];
+    study.loads[0].labels = vec![1];
+    study.loads[0].kind = LoadKind::Force {
+        total: 200.0,
+        direction: Some([0.0, -1.0, 0.0]),
+    };
+    // A third of the plate's volume in steel.
+    study.mass_target = (40.0 * 10.0 * 4.0 - 16.0 * 4.0) / 3.0 * 7850.0 * 1e-9;
+    study
+}
+
+#[test]
+fn a_region_keeps_its_faces_to_a_depth_and_its_hole_clear() {
+    let study = one_plate();
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    // The box: the plate grown by 2 mm along X and Y, by nothing along Z.
+    assert_eq!(grid.counts, [44, 14, 4]);
+    assert_eq!(grid.origin, [-2.0, -2.0, 0.0]);
+    let kind_at = |x: f64, y: f64, z: f64| grid.kinds[grid.index(grid.voxel_at([x, y, z]))];
+    // Within 1.5 mm of the hole's faces, inside the plate: kept; further: design.
+    assert_eq!(kind_at(3.5, 5.5, 1.5), Voxel::Preserve);
+    assert_eq!(kind_at(8.5, 5.5, 1.5), Voxel::Preserve);
+    assert_eq!(kind_at(5.5, 2.5, 1.5), Voxel::Preserve);
+    assert_eq!(kind_at(1.5, 5.5, 1.5), Voxel::Design);
+    assert_eq!(kind_at(20.5, 5.5, 1.5), Voxel::Design);
+    // Within 2 mm of the +X end: kept.
+    assert_eq!(kind_at(38.5, 5.5, 1.5), Voxel::Preserve);
+    assert_eq!(kind_at(37.5, 5.5, 2.5), Voxel::Design);
+    // Out of the plate, around it: design.
+    assert_eq!(kind_at(-1.5, 5.5, 1.5), Voxel::Design);
+    assert_eq!(kind_at(20.5, 11.5, 1.5), Voxel::Design);
+    // The hole is kept clear, every voxel of it, though the fixture is on its faces.
+    let hole = voxels_in(&grid, [4.0, 3.0, 0.0], [8.0, 7.0, 4.0]);
+    assert_eq!(hole.len(), 64);
+    assert!(hole.iter().all(|&v| grid.kinds[v] == Voxel::Obstacle));
+    let count = |k: Voxel| grid.kinds.iter().filter(|x| **x == k).count();
+    assert_eq!(count(Voxel::Obstacle), 64);
+    assert_eq!(count(Voxel::Outside), 0);
+    assert!(!grid.cases[0].holds.is_empty() && !grid.cases[0].forces.is_empty());
+
+    // With room along Z, what is above and below the hole is design: only the hole itself
+    // is enclosed.
+    let mut taller = one_plate();
+    taller.space.margin[2] = Some(2.0);
+    let grid = Grid::build(&taller, 0, &cancel).unwrap();
+    let kind_at = |x: f64, y: f64, z: f64| grid.kinds[grid.index(grid.voxel_at([x, y, z]))];
+    assert_eq!(kind_at(5.5, 5.5, 1.5), Voxel::Obstacle);
+    assert_eq!(kind_at(5.5, 5.5, 4.5), Voxel::Design);
+    assert_eq!(kind_at(5.5, 5.5, -0.5), Voxel::Design);
+
+    // The plate as the starting shape: the hole is out of it, the rest as before.
+    let mut inside = one_plate();
+    inside.space.starting_shape = inside.space.region_bodies.first().cloned();
+    let grid = Grid::build(&inside, 0, &cancel).unwrap();
+    assert_eq!(grid.counts, [40, 10, 4]);
+    let kind_at = |x: f64, y: f64, z: f64| grid.kinds[grid.index(grid.voxel_at([x, y, z]))];
+    assert_eq!(kind_at(5.5, 5.5, 1.5), Voxel::Outside);
+    assert_eq!(kind_at(3.5, 5.5, 1.5), Voxel::Preserve);
+    assert_eq!(kind_at(20.5, 5.5, 1.5), Voxel::Design);
+
+    // A load on a face of the plate that no region keeps is refused; so is an obstacle
+    // well into the material a region keeps.
+    let mut loose = one_plate();
+    loose.loads[0].labels = vec![3];
+    assert_eq!(
+        Grid::build(&loose, 0, &cancel),
+        Err(GenerativeError::FaceNotOnPreserve { label: 3 })
+    );
+    let mut over = one_plate();
+    over.space.obstacles.push(Obstacle {
+        surface: block(5, [37.0, 3.0, 1.0], [39.0, 7.0, 3.0]),
+        offset: 0.0,
+    });
+    assert_eq!(
+        Grid::build(&over, 0, &cancel),
+        Err(GenerativeError::ObstacleOverRegion {
+            obstacle: 0,
+            region: 1
+        })
+    );
+    // Nothing kept: refused.
+    let mut none = one_plate();
+    none.space.regions.clear();
+    assert_eq!(
+        Grid::build(&none, 0, &cancel),
+        Err(GenerativeError::NoPreserve)
+    );
+}
+
+#[test]
+fn only_holes_with_something_in_them_are_kept_clear() {
+    // A preserve frame (a plate with a big hole), held at its −X side, loaded at its +X
+    // side: the room inside the frame is design, as a wheel's inside its rim is.
+    let cancel = AtomicBool::new(false);
+    let mut study = bracket(1.0);
+    study.space = DesignSpace {
+        preserve: vec![holed_plate(
+            0,
+            [0.0, 0.0, 0.0],
+            [30.0, 30.0, 4.0],
+            [5.0, 5.0],
+            [25.0, 25.0],
+        )],
+        margin: [Some(0.0), Some(0.0), Some(2.0)],
+        ..DesignSpace::default()
+    };
+    study.fixtures[0].labels = vec![0];
+    study.loads[0].labels = vec![1];
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let inside = voxels_in(&grid, [5.0, 5.0, 0.0], [25.0, 25.0, 4.0]);
+    assert_eq!(inside.len(), 20 * 20 * 4);
+    assert!(inside.iter().all(|&v| grid.kinds[v] == Voxel::Design));
+    // Held by its hole's faces (a shaft in it): kept clear.
+    study.fixtures[0].labels = vec![4, 5, 6, 7];
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    assert!(inside.iter().all(|&v| grid.kinds[v] == Voxel::Obstacle));
+}
+
+#[test]
+fn a_single_body_is_redesigned_around_its_kept_regions() {
+    let study = one_plate();
+    let (grid, outcome) = run(&study, Method::Unrestricted, 0);
+    assert!(
+        (outcome.mass - study.mass_target).abs() < 0.02 * study.mass_target,
+        "mass {} for {}",
+        outcome.mass,
+        study.mass_target
+    );
+    // The ring around the hole is joined to the loaded end, by the voxels' faces or edges:
+    // the plate is four voxels thick and its members two, the diagonal ones in steps.
+    let ring = voxels_in(&grid, [2.5, 1.5, 0.0], [4.0, 8.5, 4.0]);
+    let end = voxels_in(&grid, [38.0, 0.0, 0.0], [40.0, 10.0, 4.0]);
+    let solid = |v: usize| outcome.density[v] >= 128;
+    let mut seen: Vec<bool> = (0..grid.voxel_count()).map(|v| end.contains(&v)).collect();
+    let mut queue: VecDeque<usize> = end.iter().copied().filter(|&v| solid(v)).collect();
+    let mut joined = false;
+    while let Some(v) = queue.pop_front() {
+        if ring.contains(&v) {
+            joined = true;
+            break;
+        }
+        let c = grid.coords(v).map(|x| x as i64);
+        for d in 0..27 {
+            let step = [d % 3, (d / 3) % 3, d / 9].map(|s| s as i64 - 1);
+            if step.iter().filter(|s| **s != 0).count() > 2 {
+                continue;
+            }
+            let at: [i64; 3] = std::array::from_fn(|a| c[a] + step[a]);
+            if (0..3).any(|a| at[a] < 0 || at[a] >= grid.counts[a] as i64) {
+                continue;
+            }
+            let w = grid.index(at.map(|x| x as usize));
+            if !seen[w] && solid(w) {
+                seen[w] = true;
+                queue.push_back(w);
+            }
+        }
+    }
+    assert!(joined);
+    for v in voxels_in(&grid, [4.0, 3.0, 0.0], [8.0, 7.0, 4.0]) {
+        assert_eq!(outcome.density[v], 0);
+    }
+    // Made a part, its surface meets the hole's faces where they are, and nothing of it is
+    // in the hole.
+    let (shape, held) = exact_surface(&grid, &outcome.density, 10, &study.space);
+    assert!(is_closed(&shape));
+    let on_hole = shape
+        .positions
+        .iter()
+        .zip(&held)
+        .filter(|(p, h)| **h && (p[0] == 4.0 || p[0] == 8.0 || p[1] == 3.0 || p[1] == 7.0))
+        .count();
+    assert!(on_hole > 10, "{on_hole}");
+    let in_hole = shape.positions.iter().filter(|p| {
+        p[0] > 4.01 && p[0] < 7.99 && p[1] > 3.01 && p[1] < 6.99 && p[2] > 0.01 && p[2] < 3.99
+    });
+    assert_eq!(in_hole.count(), 0);
 }

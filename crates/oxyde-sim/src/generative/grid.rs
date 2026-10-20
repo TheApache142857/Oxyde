@@ -1,19 +1,30 @@
 //! The design space as a grid of cubic voxels, and the fixtures and loads on its nodes.
 //!
-//! - **The box**: around the preserve bodies (and the starting shape), grown by the margin
-//!   when there is no starting shape, and made symmetric about each symmetry plane, which
-//!   then falls between two layers of voxels: the mirror image of a voxel is a voxel.
-//! - **Each voxel** is decided by its centre: *preserve* inside a preserve body, else
-//!   *obstacle* inside an obstacle or within its offset, else *outside* when there is a
-//!   starting shape and it is not in it, else *design*. Inside is the lattice mesher's test
+//! - **The box**: around the preserve bodies, the bodies of the preserve regions (and the
+//!   starting shape), grown by the margin along each axis when there is no starting shape,
+//!   and made symmetric about each symmetry plane, which then falls between two layers of
+//!   voxels: the mirror image of a voxel is a voxel.
+//! - **Each voxel** is decided by its centre: *preserve* inside a preserve body, or inside
+//!   a region's body within the region's depth of its faces (at least a voxel's edge, so
+//!   every line of centres crossing a face keeps one inside); else *obstacle* inside an
+//!   obstacle or within its offset, or in a hole kept clear; else *outside* when there is a
+//!   starting shape and it is not in it; else *design*. Inside is the lattice mesher's test
 //!   (`mesher::Surfaces`: crossings counted along lines of voxel centres). A centre well
-//!   inside both a preserve body and an obstacle (by a quarter of a voxel) is refused.
+//!   inside both a preserve body (or the material a region keeps) and an obstacle, by a
+//!   quarter of a voxel, is refused.
+//! - **Holes kept clear**: the faces of the regions, the fixtures and the loads have
+//!   something in them when they wrap around a hole (a pin, a bolt, a bearing), so a centre
+//!   that would be design is in a hole when, along two of the three axes and both ways, the
+//!   first surface met is one of those faces, of the same body, entered from outside it.
+//!   Not every hole of a preserve body: a wheel's rim encloses the room for its spokes as
+//!   a boss does its bolt hole.
 //! - **Load cases**: each case's fixtures and loads are laid on the nodes apart, the
 //!   study's every fixture and load one case when it gives none.
-//! - **Fixtures and loads** are on faces of the preserve bodies. Each face is sampled every
-//!   half voxel; each sample lands in the voxel holding it, which becomes a preserve voxel
-//!   (a thin preserve body has no voxel centre inside it), or, in an obstacle voxel, in the
-//!   nearest preserve voxel around. A fixture holds the corner of that voxel nearest its
+//! - **Fixtures and loads** are on faces of the preserve bodies or of the regions. Each face
+//!   is sampled every half voxel; each sample lands in the voxel holding it, which becomes a
+//!   preserve voxel (a thin preserve body has no voxel centre inside it), or, in a voxel
+//!   never material (an obstacle, a hole, out of the starting shape), in the nearest
+//!   preserve voxel around. A fixture holds the corner of that voxel nearest its
 //!   sample (all three directions, or a roller's normal); a load spreads its sample's share
 //!   (by area) over the voxel's corners by trilinear weights.
 
@@ -139,7 +150,7 @@ impl Grid {
     }
 
     /// The voxel holding `p`, the nearest one when it is outside the grid.
-    fn voxel_at(&self, p: V3) -> [usize; 3] {
+    pub(crate) fn voxel_at(&self, p: V3) -> [usize; 3] {
         std::array::from_fn(|a| {
             let t = ((p[a] - self.origin[a]) / self.size).floor();
             if t.is_finite() && t > 0.0 {
@@ -157,13 +168,38 @@ impl Grid {
         threads: usize,
         cancel: &AtomicBool,
     ) -> Result<Grid, GenerativeError> {
-        let space = &study.space;
-        let h = study.voxel_size;
+        let mut grid = Grid::lay(
+            &study.space,
+            study.symmetry.as_ref(),
+            study.voxel_size,
+            &study.hole_faces(),
+            threads,
+            cancel,
+        )?;
+        grid.anchor(study, cancel)?;
+        if !grid.kinds.contains(&Voxel::Design) {
+            return Err(GenerativeError::NoDesignSpace);
+        }
+        Ok(grid)
+    }
+
+    /// The design space alone on a grid of voxels of `h` mm, every voxel decided but no
+    /// fixture or load laid: what [`Grid::build`] starts from, and enough to see how a
+    /// study's space is shared out before it is complete. `holes` are the faces whose holes
+    /// are kept clear ([`GenerativeStudy::hole_faces`]), sorted.
+    pub fn lay(
+        space: &DesignSpace,
+        symmetry: Option<&Symmetry>,
+        h: f64,
+        holes: &[u32],
+        threads: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Grid, GenerativeError> {
         if !(h.is_finite() && h > 0.0) {
             return Err(GenerativeError::BadVoxelSize);
         }
-        let symmetry = study.symmetry.filter(|s| s.planes.contains(&true));
-        let (lo, hi) = design_box(space, symmetry.as_ref()).ok_or(GenerativeError::NoPreserve)?;
+        let symmetry = symmetry.filter(|s| s.planes.contains(&true));
+        let (lo, hi) = design_box(space, symmetry).ok_or(GenerativeError::NoPreserve)?;
         let mut origin = [0.0; 3];
         let mut counts = [0usize; 3];
         for a in 0..3 {
@@ -199,18 +235,15 @@ impl Grid {
             cases: Vec::new(),
             anchored: Vec::new(),
         };
-        grid.classify(space, threads, cancel)?;
-        grid.anchor(study, cancel)?;
-        if !grid.kinds.contains(&Voxel::Design) {
-            return Err(GenerativeError::NoDesignSpace);
-        }
+        grid.classify(space, holes, threads, cancel)?;
         Ok(grid)
     }
 
-    /// Decides every voxel by its centre.
+    /// Decides every voxel by its centre, `holes` the faces whose holes are kept clear.
     fn classify(
         &mut self,
         space: &DesignSpace,
+        holes: &[u32],
         threads: usize,
         cancel: &AtomicBool,
     ) -> Result<(), GenerativeError> {
@@ -218,20 +251,26 @@ impl Grid {
         const OBSTACLE: u8 = 2;
         const OFFSET: u8 = 4;
         const OUTSIDE: u8 = 8;
+        /// Kept by a region.
+        const KEPT: u8 = 16;
+        const HOLE: u8 = 32;
         let preserve = Surfaces::new(&space.preserve);
-        let obstacle_surfaces: Vec<_> = space.obstacles.iter().map(|o| o.surface.clone()).collect();
-        let obstacles = Surfaces::new(&obstacle_surfaces);
+        let obstacles = Surfaces::new(space.obstacles.iter().map(|o| &o.surface));
         let start = space
             .starting_shape
             .as_ref()
             .map(|s| Surfaces::new(std::slice::from_ref(s)));
         let (nx, h) = (self.counts[0], self.size);
+        let regions = kept_faces(space, h);
+        // Solid `b` of these is region body `b`.
+        let carriers = (!regions.is_empty()).then(|| Surfaces::new(&space.region_bodies));
         // A line from a point must reach past every surface for its crossings to pair up.
         let top: V3 = std::array::from_fn(|a| self.origin[a] + self.counts[a] as f64 * h);
         let every = space
             .preserve
             .iter()
-            .chain(obstacle_surfaces.iter())
+            .chain(&space.region_bodies)
+            .chain(space.obstacles.iter().map(|o| &o.surface))
             .chain(space.starting_shape.iter())
             .flat_map(|s| s.positions.iter().copied())
             .chain([self.origin, top]);
@@ -247,24 +286,29 @@ impl Grid {
                 let v0 = (first + m) * nx;
                 let start_point = grid.centre(v0);
                 let step = [h, 0.0, 0.0];
-                let inside = |s: &Surfaces, hits: &mut Vec<Hit>| -> Vec<bool> {
-                    match s.along_line(start_point, step, nx, hits) {
-                        Some(states) => states.iter().map(|&s| s != NONE).collect(),
-                        None => (0..nx)
-                            .map(|i| {
-                                let p = add(start_point, scale(step, i as f64));
-                                s.containing(p, reach, hits) != NONE
-                            })
-                            .collect(),
-                    }
+                let at = |i: usize| add(start_point, scale(step, i as f64));
+                // Per centre, the lowest-numbered solid holding it.
+                let containing = |s: &Surfaces, hits: &mut Vec<Hit>| -> Vec<u32> {
+                    s.along_line(start_point, step, nx, hits)
+                        .unwrap_or_else(|| {
+                            (0..nx).map(|i| s.containing(at(i), reach, hits)).collect()
+                        })
                 };
-                let p = inside(&preserve, &mut hits);
-                let o = inside(&obstacles, &mut hits);
-                let st = start.as_ref().map(|s| inside(s, &mut hits));
+                let p = containing(&preserve, &mut hits);
+                let o = containing(&obstacles, &mut hits);
+                let st = start.as_ref().map(|s| containing(s, &mut hits));
+                let c = carriers.as_ref().map(|s| containing(s, &mut hits));
                 for (i, f) in line.iter_mut().enumerate() {
-                    *f = u8::from(p[i]) * PRESERVE
-                        + u8::from(o[i]) * OBSTACLE
-                        + u8::from(st.as_ref().is_some_and(|s| !s[i])) * OUTSIDE;
+                    let kept = c.as_ref().is_some_and(|c| {
+                        c[i] != NONE
+                            && regions
+                                .iter()
+                                .any(|r| r.body == c[i] as usize && r.keeps(at(i)))
+                    });
+                    *f = u8::from(p[i] != NONE) * PRESERVE
+                        + u8::from(o[i] != NONE) * OBSTACLE
+                        + u8::from(st.as_ref().is_some_and(|s| s[i] == NONE)) * OUTSIDE
+                        + u8::from(kept) * KEPT;
                 }
             }
         });
@@ -293,7 +337,7 @@ impl Grid {
                     }
                     for (i, f) in line.iter_mut().enumerate() {
                         let x = c[0] + i as f64 * h;
-                        if x < lo[0] || x > hi[0] || *f & (OBSTACLE | PRESERVE) != 0 {
+                        if x < lo[0] || x > hi[0] || *f & (OBSTACLE | PRESERVE | KEPT) != 0 {
                             continue;
                         }
                         if bvh
@@ -306,10 +350,10 @@ impl Grid {
                 }
             });
         }
-        // A centre well inside a preserve body and an obstacle both.
+        // A centre well inside a preserve body (or a region's material) and an obstacle both.
         let mut hits = Vec::new();
         for (v, &f) in flags.iter().enumerate() {
-            if f & (PRESERVE | OBSTACLE) != (PRESERVE | OBSTACLE) {
+            if f & OBSTACLE == 0 || f & (PRESERVE | KEPT) == 0 {
                 continue;
             }
             let c = self.centre(v);
@@ -318,19 +362,45 @@ impl Grid {
                     .nearest(c)
                     .is_some_and(|(_, d2)| d2 >= (0.25 * h) * (0.25 * h))
             };
-            if deep(&preserve) && deep(&obstacles) {
+            if !deep(&obstacles) {
+                continue;
+            }
+            let obstacle = obstacles.containing(c, reach, &mut hits) as usize;
+            if f & PRESERVE != 0 && deep(&preserve) {
                 return Err(GenerativeError::ObstacleOverPreserve {
-                    obstacle: obstacles.containing(c, reach, &mut hits) as usize,
+                    obstacle,
                     preserve: preserve.containing(c, reach, &mut hits) as usize,
                 });
+            }
+            if f & KEPT != 0
+                && let Some(r) = regions.iter().find(|r| r.keeps(c))
+            {
+                return Err(GenerativeError::ObstacleOverRegion {
+                    obstacle,
+                    region: r.index,
+                });
+            }
+        }
+        if !holes.is_empty() {
+            let open: Vec<bool> = flags.iter().map(|&f| f == 0).collect();
+            for (f, hole) in flags
+                .iter_mut()
+                .zip(self.holes(space, holes, &open, threads))
+            {
+                if hole {
+                    *f |= HOLE;
+                }
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(GenerativeError::Cancelled);
             }
         }
         self.kinds = flags
             .iter()
             .map(|&f| {
-                if f & PRESERVE != 0 {
+                if f & (PRESERVE | KEPT) != 0 {
                     Voxel::Preserve
-                } else if f & (OBSTACLE | OFFSET) != 0 {
+                } else if f & (OBSTACLE | OFFSET | HOLE) != 0 {
                     Voxel::Obstacle
                 } else if f & OUTSIDE != 0 {
                     Voxel::Outside
@@ -342,13 +412,142 @@ impl Grid {
         Ok(())
     }
 
+    /// Per voxel, whether its centre is in a hole kept clear: along two of the three axes,
+    /// both ways, the first surface it meets (of the preserve bodies and the regions'
+    /// bodies) is one of the faces `holes` (sorted), of one same body, met from outside it.
+    /// Only the voxels `open` says are looked at. Each line of centres along an axis is cut
+    /// once, within the box of those faces: no hole reaches out of it.
+    fn holes(
+        &self,
+        space: &DesignSpace,
+        holes: &[u32],
+        open: &[bool],
+        threads: usize,
+    ) -> Vec<bool> {
+        let total = self.voxel_count();
+        let bodies = || space.preserve.iter().chain(&space.region_bodies);
+        let walls = Surfaces::new(bodies());
+        let is_hole = |label: u32| holes.binary_search(&label).is_ok();
+        let face_points = bodies().flat_map(|s| {
+            s.triangles
+                .iter()
+                .zip(&s.labels)
+                .filter(|(_, l)| is_hole(**l))
+                .flat_map(|(t, _)| t.iter().filter_map(|&i| s.positions.get(i as usize)))
+                .copied()
+        });
+        let Some((lo, hi)) = bounds(face_points) else {
+            return vec![false; total];
+        };
+        let (n, h) = (self.counts, self.size);
+        // The voxel index along axis `a` of coordinate `x`, kept on the grid.
+        let index = |a: usize, x: f64| -> usize {
+            let t = ((x - self.origin[a]) / h - 0.5).round();
+            if t.is_finite() && t > 0.0 {
+                (t as usize).min(n[a] - 1)
+            } else {
+                0
+            }
+        };
+        // Per axis, per voxel: the body that encloses it along the axis, `NONE` for none.
+        let mut enclosing: Vec<Vec<u32>> = Vec::with_capacity(3);
+        for axis in 0..3 {
+            let (a1, a2) = ((axis + 1) % 3, (axis + 2) % 3);
+            let len = n[axis];
+            let (first_k, last_k) = (index(axis, lo[axis]), index(axis, hi[axis]));
+            // Line `i + n[a1] j` runs along the axis at (i, j) across it; its voxels, in order.
+            let mut per_line = vec![NONE; n[a1] * n[a2] * len];
+            par_fill(&mut per_line, len, threads, 4, |first, part| {
+                let mut hits: Vec<Hit> = Vec::new();
+                let mut crossings: Vec<(f64, u32, u32, bool)> = Vec::new();
+                for (m, out) in part.chunks_exact_mut(len).enumerate() {
+                    let line = first + m;
+                    let mut c = [0usize; 3];
+                    c[a1] = line % n[a1];
+                    c[a2] = line / n[a1];
+                    let base = self.centre(self.index(c));
+                    if base[a1] < lo[a1]
+                        || base[a1] > hi[a1]
+                        || base[a2] < lo[a2]
+                        || base[a2] > hi[a2]
+                    {
+                        continue;
+                    }
+                    // From a voxel before the faces' box to one after, in voxel steps.
+                    let from = first_k as f64 - 1.0;
+                    let to = last_k as f64 + 1.0;
+                    let point = |k: f64| {
+                        let mut p = base;
+                        p[axis] = self.origin[axis] + (k + 0.5) * h;
+                        p
+                    };
+                    walls.bvh.segment_hits(point(from), point(to), &mut hits);
+                    crossings.clear();
+                    crossings.extend(hits.iter().filter_map(|hit| {
+                        let (solid, label) = walls.solid_and_label(hit.triangle)?;
+                        Some((from + hit.t * (to - from), solid, label, hit.leaving))
+                    }));
+                    crossings.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    // A line through an edge between triangles crosses each: once.
+                    crossings.dedup_by(|b, a| (b.0 - a.0).abs() < 1e-7 && a.1 == b.1 && a.3 == b.3);
+                    let mut next = 0;
+                    let along = out.iter_mut().enumerate().take(last_k + 1).skip(first_k);
+                    for (k, slot) in along {
+                        while next < crossings.len() && crossings[next].0 <= k as f64 {
+                            next += 1;
+                        }
+                        let (Some(before), Some(after)) = (
+                            next.checked_sub(1).map(|i| crossings[i]),
+                            crossings.get(next),
+                        ) else {
+                            continue;
+                        };
+                        // Leaving a body behind, entering the same one ahead: outside it,
+                        // between two of its hole faces.
+                        if before.3
+                            && !after.3
+                            && before.1 == after.1
+                            && is_hole(before.2)
+                            && is_hole(after.2)
+                        {
+                            *slot = before.1;
+                        }
+                    }
+                }
+            });
+            // Back into voxel order.
+            let mut by_voxel = vec![NONE; total];
+            for (line, out) in per_line.chunks_exact(len).enumerate() {
+                let mut c = [0usize; 3];
+                c[a1] = line % n[a1];
+                c[a2] = line / n[a1];
+                for (k, &body) in out.iter().enumerate() {
+                    if body != NONE {
+                        c[axis] = k;
+                        by_voxel[self.index(c)] = body;
+                    }
+                }
+            }
+            enclosing.push(by_voxel);
+        }
+        (0..total)
+            .map(|v| {
+                let e = [enclosing[0][v], enclosing[1][v], enclosing[2][v]];
+                open[v]
+                    && ((e[0] != NONE && (e[0] == e[1] || e[0] == e[2]))
+                        || (e[1] != NONE && e[1] == e[2]))
+            })
+            .collect()
+    }
+
     /// The fixtures and loads, from samples of their faces.
     fn anchor(
         &mut self,
         study: &GenerativeStudy,
         cancel: &AtomicBool,
     ) -> Result<(), GenerativeError> {
-        // Every face named, by label: the triangles of the preserve bodies it is.
+        // Every face named, by label: the triangles of the preserve bodies or the regions
+        // it is.
         let mut faces: BTreeMap<u32, Vec<[V3; 3]>> = BTreeMap::new();
         let wanted: Vec<u32> = study
             .fixtures
@@ -357,9 +556,19 @@ impl Grid {
             .chain(study.loads.iter().flat_map(|l| l.labels.iter()))
             .copied()
             .collect();
-        for mesh in &study.space.preserve {
+        let space = &study.space;
+        // Each region body once, with the faces its regions keep.
+        let mut kept: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for r in &space.regions {
+            kept.entry(r.body).or_default().extend(&r.labels);
+        }
+        let sources = space.preserve.iter().map(|m| (m, None)).chain(
+            kept.iter()
+                .filter_map(|(b, labels)| Some((space.region_bodies.get(*b)?, Some(labels)))),
+        );
+        for (mesh, only) in sources {
             for (t, &label) in mesh.triangles.iter().zip(&mesh.labels) {
-                if !wanted.contains(&label) {
+                if !wanted.contains(&label) || only.is_some_and(|o| !o.contains(&label)) {
                     continue;
                 }
                 let p = |i: u32| mesh.positions.get(i as usize).copied();
@@ -496,12 +705,13 @@ impl Grid {
     }
 
     /// The voxel a sample of a fixture's or a load's face at `p` acts through: the one
-    /// holding it, made a preserve voxel, or, when that is an obstacle, the nearest preserve
-    /// voxel around it.
+    /// holding it, made a preserve voxel, or, when that is never material (in an obstacle,
+    /// a hole kept clear, out of the starting shape), the nearest preserve voxel around it:
+    /// a hole's face then leaves the hole clear.
     fn anchor_voxel(&mut self, p: V3) -> usize {
         let c = self.voxel_at(p);
         let v = self.index(c);
-        if self.kinds[v] == Voxel::Obstacle {
+        if matches!(self.kinds[v], Voxel::Obstacle | Voxel::Outside) {
             let mut best: Option<(f64, usize)> = None;
             for dz in -1i64..=1 {
                 for dy in -1i64..=1 {
@@ -559,29 +769,31 @@ fn kept_motions(fixed: bool, normals: &[V3]) -> [f64; 9] {
 }
 
 /// The box the grid covers before it is cut into voxels and made symmetric: around the
-/// preserve bodies and the starting shape, grown by the margin when there is no starting
-/// shape, then grown to be symmetric about each plane of `symmetry`. `None` without any
-/// preserve body.
+/// preserve bodies, the regions' bodies and the starting shape, grown by the margin along
+/// each axis when there is no starting shape, then grown to be symmetric about each plane
+/// of `symmetry`. `None` when nothing is kept.
 pub fn design_box(space: &DesignSpace, symmetry: Option<&Symmetry>) -> Option<(V3, V3)> {
+    if !space.keeps_anything() {
+        return None;
+    }
     let points = space
         .preserve
         .iter()
+        .chain(&space.region_bodies)
+        .chain(space.starting_shape.iter())
         .flat_map(|s| s.positions.iter())
-        .chain(space.starting_shape.iter().flat_map(|s| s.positions.iter()))
         .copied()
         .filter(|p| p.iter().all(|x| x.is_finite()));
     let (mut lo, mut hi) = bounds(points)?;
-    if space.preserve.iter().all(|s| s.triangles.is_empty()) {
-        return None;
-    }
     if space.starting_shape.is_none() {
         let largest = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max);
-        let margin = space
-            .margin
-            .filter(|m| m.is_finite() && *m >= 0.0)
-            .unwrap_or(0.1 * largest);
-        lo = sub(lo, [margin; 3]);
-        hi = add(hi, [margin; 3]);
+        for a in 0..3 {
+            let margin = space.margin[a]
+                .filter(|m| m.is_finite() && *m >= 0.0)
+                .unwrap_or(0.1 * largest);
+            lo[a] -= margin;
+            hi[a] += margin;
+        }
     }
     if let Some(s) = symmetry {
         for a in 0..3 {
@@ -628,6 +840,67 @@ pub(super) fn triangles_of(s: &crate::mesher::SurfaceMesh) -> Vec<[V3; 3]> {
         .filter_map(|t| {
             let p = |i: u32| s.positions.get(i as usize).copied();
             Some([p(t[0])?, p(t[1])?, p(t[2])?])
+        })
+        .collect()
+}
+
+/// A region's faces, ready to measure from.
+struct KeptFaces {
+    /// Its index among the design space's regions.
+    index: usize,
+    /// Its body, an index into the design space's region bodies.
+    body: usize,
+    faces: Bvh,
+    /// The faces' box grown by the depth: nothing further is kept.
+    lo: V3,
+    hi: V3,
+    /// mm: the region's depth, a voxel's edge at least.
+    depth: f64,
+}
+
+impl KeptFaces {
+    /// Whether `p` is within the depth of the faces (inside the body is not asked).
+    fn keeps(&self, p: V3) -> bool {
+        (0..3).all(|a| p[a] >= self.lo[a] && p[a] <= self.hi[a])
+            && self
+                .faces
+                .nearest(p)
+                .is_some_and(|(_, d2)| d2 <= self.depth * self.depth)
+    }
+}
+
+/// The regions of `space` with faces on their bodies, on voxels of `h` mm: a region is kept
+/// at least a voxel deep, so every line of centres crossing one of its faces keeps the
+/// first centre inside.
+fn kept_faces(space: &DesignSpace, h: f64) -> Vec<KeptFaces> {
+    space
+        .regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| {
+            let body = space.region_bodies.get(r.body)?;
+            let p = |i: u32| body.positions.get(i as usize).copied();
+            let triangles: Vec<[V3; 3]> = body
+                .triangles
+                .iter()
+                .zip(&body.labels)
+                .filter(|(_, l)| r.labels.contains(l))
+                .filter_map(|(t, _)| Some([p(t[0])?, p(t[1])?, p(t[2])?]))
+                .collect();
+            let (lo, hi) = bounds(triangles.iter().flatten().copied())?;
+            let depth = if r.depth.is_finite() {
+                r.depth.max(h)
+            } else {
+                h
+            };
+            Some(KeptFaces {
+                index,
+                body: r.body,
+                faces: Bvh::new(triangles),
+                lo: sub(lo, [depth; 3]),
+                hi: add(hi, [depth; 3]),
+                depth,
+            })
         })
         .collect()
 }

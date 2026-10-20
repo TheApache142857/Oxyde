@@ -1052,3 +1052,76 @@ stays on show.
   bracket with no undercut seen from the tool and the tool's radius in the filter; the
   format's objective, limit and milling round trips and refusals; through the app, a milled
   pair of pads minimized in mass under its stress limit.
+
+**A single body, set up in a few clicks (October 2026).** On a part that is one body (the
+Front Upper Arm of the RC car bench: an A-arm imported from STEP, a plate joined to it), the
+only role it could take was *Preserve*, and the outcomes were lumps added to the arm. Set up
+as Fusion 360 expects in a scratch harness instead (preserve bodies cut from the arm round
+its pivot eyes and its outer boss, pins in the three holes as obstacles, a block for the
+chassis mount, a starting slab as tall as the arm), the same arm gave organic A-frames, at
+80 % of its mass 3.1 times as stiff. The tab now sets that up from the arm itself.
+
+**Decided (October 2026, the owner):** preserved regions in the generative block as topology
+studies have them, a margin per axis (a number or `[x, y, z]` with `null` for the default),
+both in `format_version` 4 (FORMAT.md §8); holes kept clear only where a region, a fixture or
+a load is on their faces.
+
+- **Preserve regions** (`PreserveRegion`, `DesignSpace::regions` and `region_bodies`): faces
+  and a depth, as a topology study's. A voxel is kept when its centre is inside the body the
+  faces are on and within the depth of them, the depth at least a voxel's edge so that every
+  line of centres crossing a face keeps the first one inside (at half a voxel, a face at 45°
+  left lines with none). The body may have any role or none: the starting shape, so the arm
+  is redesigned inside itself, or none, so the box around it (grown by the margin) is the
+  design space, as the harness's slab was. Fixtures and loads may be on the regions' faces;
+  the box takes in the regions' whole bodies, not only the material kept, so that a margin
+  of 0 along an axis keeps the outcome within the part. An obstacle well into the material a
+  region keeps is refused as one in a preserve body is (`ObstacleOverRegion`). Region voxels
+  are preserve voxels in the files: nothing changes in `.oxyres`.
+- **Holes kept clear**: a voxel that would be design is in a hole when, along two of the
+  three axes and both ways, the first surface met (of the preserve bodies and the regions'
+  bodies) is a face of a region, a fixture or a load, of one same body, met from outside it:
+  it becomes an obstacle voxel, as if a pin were there. Each line of centres along an axis is
+  cut once against those bodies, within the box of the faces counted (no hole reaches out of
+  it). Two axes, not three: a through hole is open along its own. Only the hole itself: a pin
+  that runs on past it (the hinge pin through both eyes and the chassis mount between them)
+  is still an obstacle to model. Not every hole of a preserve body: a wheel's rim encloses the
+  room for its spokes as a boss does its bolt hole, and nothing on the voxels tells them
+  apart; a fixture or a load on a hole's faces says something sits in it, a region on them
+  that the hole is the user's. A sample of a fixture's or a load's face that lands in a hole
+  (or out of the starting shape) acts through the preserve voxel beside it, as one in an
+  obstacle did, rather than making the hole's voxel material. Applied with a starting shape
+  too: a slab over a part does not fill its holes.
+- **A margin per axis** (`DesignSpace::margin: [Option<f64>; 3]`): the room beyond the bodies
+  along X, Y and Z, both ways, each a tenth of the box's largest side when not given. The
+  panel's *Margin* has a box per axis; ticked, it starts at 0.
+- **Warnings before Generate** (`setup_warnings`), one line each above the panel's sections:
+  every body kept with no starting shape (the outcome can only add material round them; the
+  message says to make the part the starting shape and keep its holes with *Preserve
+  Region*); the kept material half the design space or more; no material, or one no outcome
+  can be made of; voxels too coarse for a region's depth or a preserve body's thickness
+  (twice its volume over its area, a plate's thickness, a cube's third: fewer than two voxels
+  across a region, under one across a body). The shares come from a census (`census`): the
+  design space laid on its voxels, or on coarser ones when those would be more than fifty
+  thousand (`Grid::lay`, the grid without fixtures or loads), worked out again only when
+  what it depends on changes; it also gives the least an outcome weighs once regions keep
+  material (their voxels', the mass target's hint saying *about*).
+- **The tab**: *Preserve Region* in the command bar (the faces selected, a depth in the panel,
+  0 by default as in topology studies), the regions listed under *Design space* with their
+  depth and drawn in the preserve bodies' green; the *Preserve* role has an icon of its own
+  (a green block, as the obstacle's is red and the starting shape's yellow).
+- **Tests**: in `oxyde-sim`, a plate 40 mm long with a square hole near one end, one body of
+  no role, kept 1.5 mm round its hole (held there) and 2 mm under its far end (loaded):
+  the box the plate grown by 2 mm along X and Y and not at all along Z, the voxels kept
+  within the depths and inside the plate only, the hole's 64 voxels clear although the
+  fixture is on its faces, what is above and below the hole design once there is room
+  there, the plate as starting shape leaving the hole out, a load on a face nothing keeps and
+  an obstacle in a region refused, nothing kept refused; a preserve frame's inside left
+  design, cleared once its hole's faces are held; the plate grown to its mass target, the
+  ring joined to the loaded end, the hole empty, and its exact surface on the hole's faces
+  with nothing in it. In `oxyde-format`, regions and margins round trip (one number for three
+  alike, `[null, 0, null]`), a study kept by regions alone, the refusals (nothing kept, a
+  region named as a fixture, a negative depth, a face of the wrong kind, a negative margin, a
+  margin array not of three). In `oxyde-app`, the plate set up from regions (two regions on
+  one body, the regions not fixtures or loads, the voxels kept, a fixture on a face nothing
+  keeps, a region on an obstacle and nothing kept refused, the census and the least mass),
+  each warning, and a study file keeping the regions and the margin.

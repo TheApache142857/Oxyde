@@ -128,7 +128,7 @@ fn study(bracket: &Bracket, density: f64) -> GenerativeStudy {
             offset: 1.0,
         }],
         starting_shape: None,
-        margin: None,
+        ..DesignSpace::default()
     };
     let voxel_size = voxel_size(&space, None, density).expect("a voxel size");
     GenerativeStudy {
@@ -383,7 +383,7 @@ fn an_outcome_cut_from_its_starting_shape_meets_its_faces() {
             preserve: surfaces[..2].to_vec(),
             obstacles: Vec::new(),
             starting_shape: Some(surfaces[2].clone()),
-            margin: None,
+            ..DesignSpace::default()
         },
         fixtures: vec![Fixture {
             kind: FixtureKind::Fixed,

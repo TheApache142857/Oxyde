@@ -109,7 +109,9 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   member, symmetry planes and a mould's pull direction, shown as a smooth surface and
   exported as STL.
 - **Generative Design tab:** shapes grown between the bodies to keep and the bodies to stay
-  clear of, in parts and assemblies, as Fusion 360 grows them: the stiffest shape for a mass
+  clear of, in parts and assemblies, as Fusion 360 grows them, or a single body redesigned
+  from the faces to keep (its holes kept clear, the room limited along each axis), with
+  warnings before a setup that would disappoint: the stiffest shape for a mass
   target or the lightest under a safety factor (and a displacement limit), with load cases,
   for several materials and ways of making it (unrestricted, additive without supports,
   2-axis cutting, milling, casting), an outcome for each, on the graphics card when there is
