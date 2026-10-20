@@ -41,6 +41,9 @@ const SPECTRUM_RATIO: f64 = 30.0;
 const SPECTRUM_MARGIN: f64 = 1.1;
 const COARSE_MARGIN: f64 = 1.2;
 const POWER_STEPS: usize = 20;
+/// A run of an output and the index of its first record, for the task that takes it.
+type Slot<'a, T> = Mutex<Option<(usize, &'a mut [T])>>;
+
 /// Calls `f(first, part)` on `out` cut into up to `threads` runs of whole records of
 /// `width` values, `first` the index of a run's first record, each run `least` records at
 /// least so the threads pay for themselves. Each record must depend on its index only, so
@@ -59,10 +62,20 @@ pub(crate) fn par_fill<T: Send>(
         return;
     }
     let per = records.div_ceil(threads);
-    std::thread::scope(|s| {
-        let f = &f;
-        for (t, part) in out.chunks_mut(per * width).enumerate() {
-            s.spawn(move || f(t * per, part));
+    // Each task takes its own run of `out`, handed over through its slot.
+    let slots: Vec<Slot<'_, T>> = out
+        .chunks_mut(per * width)
+        .enumerate()
+        .map(|(t, part)| Mutex::new(Some((t * per, part))))
+        .collect();
+    crate::pool::run(slots.len(), &|t| {
+        let taken = slots.get(t).and_then(|s| {
+            s.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        });
+        if let Some((first, part)) = taken {
+            f(first, part);
         }
     });
 }
@@ -143,54 +156,123 @@ impl Dims {
 /// A level's operator, as the cycle and the next level's Galerkin product see it.
 pub(crate) trait Operator: Sync {
     fn dims(&self) -> Dims;
-    /// `y = A x`; rows of nodes no element touches are the identity.
-    fn apply(&self, x: &[f64], y: &mut [f64], threads: usize);
+    /// `out`, node by node: `finish(node, the node's rows of A x, out's value there)`, in
+    /// the same pass over the nodes as the product's sums (rows of nodes no element touches
+    /// are the identity's).
+    fn product(&self, x: &[f64], out: &mut [f64], threads: usize, finish: &Finish<'_>);
+    /// `y = A x`.
+    fn apply(&self, x: &[f64], y: &mut [f64], threads: usize) {
+        self.product(x, y, threads, &|_, ax, _| ax);
+    }
     /// Whether cell `e` has a matrix.
     fn active(&self, e: usize) -> bool;
+    /// Whether cell `e`'s matrix is `S ⊗ I`, the same 8 × 8 matrix for each direction.
+    fn is_scalar(&self, e: usize) -> bool;
     /// Cell `e`'s matrix as the operator sums it, into `out`.
     fn element(&self, e: usize, out: &mut [f64; SIZE]);
+    /// Cell `e`'s `S`, when it is scalar.
+    fn scalar(&self, e: usize) -> Option<[f64; 64]>;
     /// Node `n`'s diagonal block, `None` when no element touches it.
     fn block(&self, n: usize) -> Option<[f64; 9]>;
 }
 
-/// The cells' products, kept from one product to the next so their memory is not asked of
-/// the system each time.
+/// What a product does at each node with its rows of `A x` and the output's value there.
+pub(crate) type Finish<'a> = dyn Fn(usize, [f64; 3], [f64; 3]) -> [f64; 3] + Sync + 'a;
+
+/// The full cells' products, kept from one product to the next so their memory is not
+/// asked of the system each time.
 type Scratch = Mutex<Vec<f64>>;
 
-/// `y`, node by node: the products of the cells around each node (`products`, 24 values per
-/// cell of `slot`, `NONE` for the cells without), summed in the order of its corners, then
-/// `finish(node, sum)`.
+/// What a cell is in a level's product.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// No element.
+    None,
+    /// A full 24 × 24 matrix: its product is worked out once into a buffer.
+    Full,
+    /// `S ⊗ I`: its rows are worked out at each node as they are needed, a third of the
+    /// work and no buffer to write and read back.
+    Scalar,
+}
+
+/// `y`, node by node: each cell around a node gives its rows for that node (`term(cell, the
+/// node's corner in it, the cell's first node)`, `None` for a cell without an element),
+/// summed in the order of the node's corners, then `finish(node, sum, y's value there)`.
 fn gather(
     dims: Dims,
-    slot: &[u32],
-    products: &[f64],
     y: &mut [f64],
     threads: usize,
-    finish: impl Fn(usize, [f64; 3]) -> [f64; 3] + Sync,
+    term: impl Fn(usize, usize, usize) -> Option<[f64; 3]> + Sync,
+    finish: impl Fn(usize, [f64; 3], [f64; 3]) -> [f64; 3] + Sync,
 ) {
     let cells = dims.cells;
+    let offsets = dims.corner_offsets();
+    let nodes = dims.nodes();
     par_fill(y, 3, threads, 4096, |first, part| {
+        // The coordinates go along with the nodes, rather than out of a division each.
+        let mut c = dims.node_coords(first);
         for (m, out) in part.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let n = first + m;
-            let c = dims.node_coords(n);
+            if m > 0 {
+                c[0] += 1;
+                if c[0] == nodes[0] {
+                    c[0] = 0;
+                    c[1] += 1;
+                    if c[1] == nodes[1] {
+                        c[1] = 0;
+                        c[2] += 1;
+                    }
+                }
+            }
             let mut sum = [0.0; 3];
-            for a in 0..8 {
+            for (a, offset) in offsets.iter().enumerate() {
                 let k = corner(a);
                 if (0..3).any(|d| c[d] < k[d] || c[d] - k[d] >= cells[d]) {
                     continue;
                 }
-                let s = slot[dims.cell([c[0] - k[0], c[1] - k[1], c[2] - k[2]])];
-                if s == NONE {
-                    continue;
-                }
-                let at = DOFS * s as usize + 3 * a;
-                for (r, v) in sum.iter_mut().enumerate() {
-                    *v += products[at + r];
+                let e = dims.cell([c[0] - k[0], c[1] - k[1], c[2] - k[2]]);
+                if let Some(v) = term(e, a, n - offset) {
+                    for r in 0..3 {
+                        sum[r] += v[r];
+                    }
                 }
             }
-            out.copy_from_slice(&finish(n, sum));
+            *out = finish(n, sum, *out);
         }
     });
+}
+
+/// Corner `a`'s rows of `scale S ⊗ I` times `x`, for the cell whose first node is `base`.
+fn scalar_rows<T: Copy + Into<f64>>(
+    s: &[T],
+    scale: f64,
+    a: usize,
+    base: usize,
+    offsets: &[usize; 8],
+    x: &[f64],
+) -> [f64; 3] {
+    let mut out = [0.0; 3];
+    for (b, offset) in offsets.iter().enumerate() {
+        let w = scale * s[8 * a + b].into();
+        let nb = 3 * (base + offset);
+        for r in 0..3 {
+            out[r] += w * x[nb + r];
+        }
+    }
+    out
+}
+
+/// `S ⊗ I` as a 24 × 24 matrix.
+fn expand<T: Copy + Into<f64>>(s: &[T], scale: f64, out: &mut [f64; SIZE]) {
+    out.fill(0.0);
+    for a in 0..8 {
+        for b in 0..8 {
+            let v = scale * s[8 * a + b].into();
+            for r in 0..3 {
+                out[(3 * a + r) * DOFS + 3 * b + r] = v;
+            }
+        }
+    }
 }
 
 /// `w = s K u` for a symmetric `k`, as a sum of its columns (its rows): the rows' sums run
@@ -205,7 +287,9 @@ fn product<T: Copy + Into<f64>>(k: &[T], s: f64, u: &[f64; DOFS], w: &mut [f64])
     }
 }
 
-/// The finest level: each voxel a brick scaled by its stiffness, held nodes projected.
+/// The finest level: each voxel with material a brick scaled by its stiffness, each void
+/// one (under `scalar_below`, and with no held corner) the brick's Laplacian scaled the same
+/// way; held nodes projected.
 pub(crate) struct Fine<'a> {
     dims: Dims,
     brick: &'a Brick,
@@ -215,8 +299,8 @@ pub(crate) struct Fine<'a> {
     held: &'a [u32],
     /// The motions each held node keeps, `I` less its held directions, row-major.
     projectors: &'a [[f64; 9]],
-    /// The cells with material in order, and each cell's place among them (`NONE` for
-    /// those without).
+    kind: Vec<Kind>,
+    /// The bricks in order, and each cell's place among them (`NONE` for the others).
     bricks: Vec<u32>,
     slot: Vec<u32>,
     /// Per node: whether a cell with material touches it.
@@ -225,24 +309,33 @@ pub(crate) struct Fine<'a> {
 }
 
 impl<'a> Fine<'a> {
-    /// The level for voxels of `stiffness` (N/mm).
+    /// The level for voxels of `stiffness` (N/mm), those under `scalar_below` void.
     pub(crate) fn new(
         dims: Dims,
         brick: &'a Brick,
         stiffness: &'a [f64],
         held: &'a [u32],
         projectors: &'a [[f64; 9]],
+        scalar_below: f64,
     ) -> Fine<'a> {
+        let mut kind = vec![Kind::None; dims.cell_count()];
         let mut bricks = Vec::new();
         let mut slot = vec![NONE; dims.cell_count()];
         for (e, s) in stiffness.iter().enumerate() {
-            if *s > 0.0 {
+            if *s <= 0.0 {
+                continue;
+            }
+            let held_corner = || dims.cell_nodes(e).iter().any(|&n| held[n] != NONE);
+            if *s < scalar_below && !held_corner() {
+                kind[e] = Kind::Scalar;
+            } else {
+                kind[e] = Kind::Full;
                 slot[e] = bricks.len() as u32;
                 bricks.push(e as u32);
             }
         }
         let active = (0..dims.node_count())
-            .map(|n| dims.cells_around(n).any(|(e, _)| slot[e] != NONE))
+            .map(|n| dims.cells_around(n).any(|(e, _)| kind[e] != Kind::None))
             .collect();
         Fine {
             dims,
@@ -250,6 +343,7 @@ impl<'a> Fine<'a> {
             stiffness,
             held,
             projectors,
+            kind,
             bricks,
             slot,
             active,
@@ -323,7 +417,7 @@ impl Operator for Fine<'_> {
         self.dims
     }
 
-    fn apply(&self, x: &[f64], y: &mut [f64], threads: usize) {
+    fn product(&self, x: &[f64], out: &mut [f64], threads: usize, finish: &Finish<'_>) {
         let dims = self.dims;
         let offsets = dims.corner_offsets();
         let mut products = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -344,7 +438,24 @@ impl Operator for Fine<'_> {
                 product(&self.brick.k, self.stiffness[e], &u, w);
             }
         });
-        gather(dims, &self.slot, &products, y, threads, |n, sum| {
+        let products = &products;
+        let term = |e: usize, a: usize, base: usize| match self.kind[e] {
+            Kind::None => None,
+            Kind::Full => {
+                let at = DOFS * self.slot[e] as usize + 3 * a;
+                Some([products[at], products[at + 1], products[at + 2]])
+            }
+            // No held corner, so nothing to project.
+            Kind::Scalar => Some(scalar_rows(
+                &self.brick.laplacian,
+                self.stiffness[e],
+                a,
+                base,
+                &offsets,
+                x,
+            )),
+        };
+        let rows = |n: usize, sum: [f64; 3]| -> [f64; 3] {
             let xn = [x[3 * n], x[3 * n + 1], x[3 * n + 2]];
             if !self.active[n] {
                 return xn;
@@ -358,17 +469,37 @@ impl Operator for Fine<'_> {
                     std::array::from_fn(|r| kept[r] + d * (xn[r] - px[r]))
                 }
             }
+        };
+        gather(dims, out, threads, term, |n, sum, old| {
+            finish(n, rows(n, sum), old)
         });
     }
 
     fn active(&self, e: usize) -> bool {
-        self.stiffness[e] > 0.0
+        self.kind[e] != Kind::None
+    }
+
+    fn is_scalar(&self, e: usize) -> bool {
+        self.kind[e] == Kind::Scalar
     }
 
     fn element(&self, e: usize, out: &mut [f64; SIZE]) {
         let s = self.stiffness[e];
-        for (o, k) in out.iter_mut().zip(&self.brick.k) {
-            *o = s * k;
+        match self.kind[e] {
+            Kind::None => {
+                out.fill(0.0);
+                return;
+            }
+            Kind::Scalar => {
+                // No held corner: nothing more to do.
+                expand(&self.brick.laplacian, s, out);
+                return;
+            }
+            Kind::Full => {
+                for (o, k) in out.iter_mut().zip(&self.brick.k) {
+                    *o = s * k;
+                }
+            }
         }
         let nodes = self.dims.cell_nodes(e);
         for (a, &na) in nodes.iter().enumerate() {
@@ -400,7 +531,7 @@ impl Operator for Fine<'_> {
             let count = self
                 .dims
                 .cells_around(na)
-                .filter(|&(c, _)| self.stiffness[c] > 0.0)
+                .filter(|&(c, _)| self.kind[c] != Kind::None)
                 .count()
                 .max(1);
             let d = self.held_stiffness(na) / count as f64;
@@ -413,19 +544,31 @@ impl Operator for Fine<'_> {
         }
     }
 
+    fn scalar(&self, e: usize) -> Option<[f64; 64]> {
+        let s = self.stiffness[e];
+        (self.kind[e] == Kind::Scalar).then(|| self.brick.laplacian.map(|v| s * v))
+    }
+
     fn block(&self, n: usize) -> Option<[f64; 9]> {
         if !self.active[n] {
             return None;
         }
         let mut block = [0.0; 9];
         for (e, a) in self.dims.cells_around(n) {
-            if self.slot[e] == NONE {
-                continue;
-            }
             let s = self.stiffness[e];
-            for r in 0..3 {
-                for c in 0..3 {
-                    block[r * 3 + c] += s * self.brick.k[(3 * a + r) * DOFS + 3 * a + c];
+            match self.kind[e] {
+                Kind::None => {}
+                Kind::Full => {
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            block[r * 3 + c] += s * self.brick.k[(3 * a + r) * DOFS + 3 * a + c];
+                        }
+                    }
+                }
+                Kind::Scalar => {
+                    for r in 0..3 {
+                        block[r * 4] += s * self.brick.laplacian[9 * a];
+                    }
                 }
             }
         }
@@ -434,14 +577,16 @@ impl Operator for Fine<'_> {
     }
 }
 
-/// A coarse level: a matrix per cell, in single precision.
+/// A coarse level: per cell a full matrix or a scalar one, in single precision.
 struct Stored {
     dims: Dims,
-    /// Per cell, the index of its matrix, or `NONE`.
-    slot: Vec<u32>,
-    /// The cell of each matrix.
-    cells: Vec<u32>,
+    kind: Vec<Kind>,
+    /// Per cell, the index of its matrix among the full or the scalar ones.
+    index: Vec<u32>,
+    /// The cell of each full matrix.
+    full: Vec<u32>,
     matrices: Vec<f32>,
+    scalars: Vec<f32>,
     /// Per node: whether a cell with a matrix touches it.
     active: Vec<bool>,
     scratch: Scratch,
@@ -452,16 +597,16 @@ impl Operator for Stored {
         self.dims
     }
 
-    fn apply(&self, x: &[f64], y: &mut [f64], threads: usize) {
+    fn product(&self, x: &[f64], out: &mut [f64], threads: usize, finish: &Finish<'_>) {
         let dims = self.dims;
         let offsets = dims.corner_offsets();
         let mut products = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        products.resize(DOFS * self.cells.len(), 0.0);
+        products.resize(DOFS * self.full.len(), 0.0);
         par_fill(&mut products, DOFS, threads, 512, |first, part| {
             let mut u = [0.0; DOFS];
             for (m, w) in part.as_chunks_mut::<DOFS>().0.iter_mut().enumerate() {
                 let slot = first + m;
-                let base = dims.node(dims.cell_coords(self.cells[slot] as usize));
+                let base = dims.node(dims.cell_coords(self.full[slot] as usize));
                 for (b, offset) in offsets.iter().enumerate() {
                     let nb = base + offset;
                     u[3 * b..3 * b + 3].copy_from_slice(&x[3 * nb..3 * nb + 3]);
@@ -469,29 +614,60 @@ impl Operator for Stored {
                 product(&self.matrices[slot * SIZE..(slot + 1) * SIZE], 1.0, &u, w);
             }
         });
-        gather(dims, &self.slot, &products, y, threads, |n, sum| {
-            if self.active[n] {
+        let products = &products;
+        let term = |e: usize, a: usize, base: usize| {
+            let i = self.index[e] as usize;
+            match self.kind[e] {
+                Kind::None => None,
+                Kind::Full => {
+                    let at = DOFS * i + 3 * a;
+                    Some([products[at], products[at + 1], products[at + 2]])
+                }
+                Kind::Scalar => Some(scalar_rows(
+                    &self.scalars[64 * i..64 * (i + 1)],
+                    1.0,
+                    a,
+                    base,
+                    &offsets,
+                    x,
+                )),
+            }
+        };
+        gather(dims, out, threads, term, |n, sum, old| {
+            let rows = if self.active[n] {
                 sum
             } else {
                 [x[3 * n], x[3 * n + 1], x[3 * n + 2]]
-            }
+            };
+            finish(n, rows, old)
         });
     }
 
     fn active(&self, e: usize) -> bool {
-        self.slot[e] != NONE
+        self.kind[e] != Kind::None
+    }
+
+    fn is_scalar(&self, e: usize) -> bool {
+        self.kind[e] == Kind::Scalar
     }
 
     fn element(&self, e: usize, out: &mut [f64; SIZE]) {
-        let slot = self.slot[e];
-        if slot == NONE {
-            out.fill(0.0);
-            return;
+        let i = self.index[e] as usize;
+        match self.kind[e] {
+            Kind::None => out.fill(0.0),
+            Kind::Full => {
+                for (o, v) in out.iter_mut().zip(&self.matrices[i * SIZE..(i + 1) * SIZE]) {
+                    *o = f64::from(*v);
+                }
+            }
+            Kind::Scalar => expand(&self.scalars[64 * i..64 * (i + 1)], 1.0, out),
         }
-        let k = &self.matrices[slot as usize * SIZE..(slot as usize + 1) * SIZE];
-        for (o, v) in out.iter_mut().zip(k) {
-            *o = f64::from(*v);
-        }
+    }
+
+    fn scalar(&self, e: usize) -> Option<[f64; 64]> {
+        let i = self.index[e] as usize;
+        (self.kind[e] == Kind::Scalar)
+            .then(|| std::array::from_fn(|k| f64::from(self.scalars[64 * i + k])))
     }
 
     fn block(&self, n: usize) -> Option<[f64; 9]> {
@@ -500,14 +676,22 @@ impl Operator for Stored {
         }
         let mut block = [0.0; 9];
         for (e, a) in self.dims.cells_around(n) {
-            let slot = self.slot[e];
-            if slot == NONE {
-                continue;
-            }
-            let k = &self.matrices[slot as usize * SIZE..(slot as usize + 1) * SIZE];
-            for r in 0..3 {
-                for c in 0..3 {
-                    block[r * 3 + c] += f64::from(k[(3 * a + r) * DOFS + 3 * a + c]);
+            let i = self.index[e] as usize;
+            match self.kind[e] {
+                Kind::None => {}
+                Kind::Full => {
+                    let k = &self.matrices[i * SIZE..(i + 1) * SIZE];
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            block[r * 3 + c] += f64::from(k[(3 * a + r) * DOFS + 3 * a + c]);
+                        }
+                    }
+                }
+                Kind::Scalar => {
+                    let d = f64::from(self.scalars[64 * i + 9 * a]);
+                    for r in 0..3 {
+                        block[r * 4] += d;
+                    }
                 }
             }
         }
@@ -527,7 +711,22 @@ fn axis_weight(factor: usize, child: usize, fine: usize, coarse: usize) -> f64 {
     }
 }
 
-/// The next level down: `Pᵀ A P`, coarse cell by coarse cell.
+/// `W[a][A]`: coarse corner `A`'s weight at the fine corner `a` of child `child`.
+fn weights(factor: [usize; 3], child: [usize; 3]) -> [[f64; 8]; 8] {
+    std::array::from_fn(|a| {
+        let fa = corner(a);
+        std::array::from_fn(|big| {
+            let ca = corner(big);
+            (0..3)
+                .map(|x| axis_weight(factor[x], child[x], fa[x], ca[x]))
+                .product()
+        })
+    })
+}
+
+/// The next level down: `Pᵀ A P`, coarse cell by coarse cell. A coarse cell over nothing but
+/// scalar cells is scalar too (`Wᵀ (S ⊗ I) W = (Wᵀ S W) ⊗ I`, `W` the same for each
+/// direction), so void stays cheap all the way down.
 fn galerkin(op: &dyn Operator, factor: [usize; 3], threads: usize) -> Stored {
     let fine = op.dims();
     let dims = Dims {
@@ -546,36 +745,45 @@ fn galerkin(op: &dyn Operator, factor: [usize; 3], threads: usize) -> Stored {
                 .then(|| (fine.cell(at), k))
         })
     };
-    let mut slot = vec![NONE; dims.cell_count()];
-    let mut cells: Vec<usize> = Vec::new();
-    for (e, s) in slot.iter_mut().enumerate() {
-        if children(e).any(|(f, _)| op.active(f)) {
-            *s = cells.len() as u32;
-            cells.push(e);
+    let mut kind = vec![Kind::None; dims.cell_count()];
+    let mut index = vec![NONE; dims.cell_count()];
+    let mut full: Vec<usize> = Vec::new();
+    let mut scalar: Vec<usize> = Vec::new();
+    for e in 0..dims.cell_count() {
+        let mut any = false;
+        let mut all_scalar = true;
+        for (f, _) in children(e) {
+            if op.active(f) {
+                any = true;
+                all_scalar &= op.is_scalar(f);
+            }
+        }
+        if !any {
+            continue;
+        }
+        if all_scalar {
+            kind[e] = Kind::Scalar;
+            index[e] = scalar.len() as u32;
+            scalar.push(e);
+        } else {
+            kind[e] = Kind::Full;
+            index[e] = full.len() as u32;
+            full.push(e);
         }
     }
-    let mut matrices = vec![0.0f32; cells.len() * SIZE];
+    let mut matrices = vec![0.0f32; full.len() * SIZE];
     par_fill(&mut matrices, SIZE, threads, 16, |first, part| {
         let mut k = [0.0; SIZE];
         let mut t = [0.0; SIZE];
         let mut sum = [0.0; SIZE];
         for (m, out) in part.as_chunks_mut::<SIZE>().0.iter_mut().enumerate() {
             sum.fill(0.0);
-            for (f, child) in children(cells[first + m]) {
+            for (f, child) in children(full[first + m]) {
                 if !op.active(f) {
                     continue;
                 }
                 op.element(f, &mut k);
-                // W[a][A]: coarse corner A's weight at fine corner a.
-                let w: [[f64; 8]; 8] = std::array::from_fn(|a| {
-                    let fa = corner(a);
-                    std::array::from_fn(|big| {
-                        let ca = corner(big);
-                        (0..3)
-                            .map(|x| axis_weight(factor[x], child[x], fa[x], ca[x]))
-                            .product()
-                    })
-                });
+                let w = weights(factor, child);
                 // T = K W, then Wᵀ T.
                 t.fill(0.0);
                 for row in 0..DOFS {
@@ -608,21 +816,53 @@ fn galerkin(op: &dyn Operator, factor: [usize; 3], threads: usize) -> Stored {
             }
             for i in 0..DOFS {
                 for j in 0..DOFS {
-                    let v = 0.5 * (sum[i * DOFS + j] + sum[j * DOFS + i]);
-                    out[i * DOFS + j] = v as f32;
+                    out[i * DOFS + j] = (0.5 * (sum[i * DOFS + j] + sum[j * DOFS + i])) as f32;
+                }
+            }
+        }
+    });
+    let mut scalars = vec![0.0f32; scalar.len() * 64];
+    par_fill(&mut scalars, 64, threads, 256, |first, part| {
+        for (m, out) in part.as_chunks_mut::<64>().0.iter_mut().enumerate() {
+            let mut sum = [0.0; 64];
+            for (f, child) in children(scalar[first + m]) {
+                let Some(s) = op.scalar(f) else {
+                    continue;
+                };
+                let w = weights(factor, child);
+                // Wᵀ S W.
+                for big in 0..8 {
+                    for small in 0..8 {
+                        let mut v = 0.0;
+                        for a in 0..8 {
+                            if w[a][big] == 0.0 {
+                                continue;
+                            }
+                            let sw: f64 = (0..8).map(|b| s[8 * a + b] * w[b][small]).sum();
+                            v += w[a][big] * sw;
+                        }
+                        sum[8 * big + small] += v;
+                    }
+                }
+            }
+            for i in 0..8 {
+                for j in 0..8 {
+                    out[8 * i + j] = (0.5 * (sum[8 * i + j] + sum[8 * j + i])) as f32;
                 }
             }
         }
     });
     let mut active = vec![false; dims.node_count()];
     for (n, a) in active.iter_mut().enumerate() {
-        *a = dims.cells_around(n).any(|(e, _)| slot[e] != NONE);
+        *a = dims.cells_around(n).any(|(e, _)| kind[e] != Kind::None);
     }
     Stored {
         dims,
-        slot,
-        cells: cells.iter().map(|&e| e as u32).collect(),
+        kind,
+        index,
+        full: full.iter().map(|&e| e as u32).collect(),
         matrices,
+        scalars,
         active,
         scratch: Mutex::new(Vec::new()),
     }
@@ -781,15 +1021,15 @@ fn top_of_spectrum(op: &dyn Operator, dinv: &[[f64; 9]], threads: usize) -> f64 
     lambda.max(1.0)
 }
 
-/// Chebyshev smoothing of `A x = b`, from zero when `zero`.
-#[allow(clippy::too_many_arguments)]
+/// Chebyshev smoothing of `A x = b`, from zero when `zero`. Each step is one product whose
+/// pass over the nodes also forms the correction, `d = c₁ d + c₂ D⁻¹ (b − A x)`, then
+/// `x += d`.
 fn smooth(
     op: &dyn Operator,
     s: &Smoothing,
     b: &[f64],
     x: &mut [f64],
     zero: bool,
-    r: &mut [f64],
     d: &mut [f64],
     threads: usize,
 ) {
@@ -800,14 +1040,6 @@ fn smooth(
     let sigma = theta / delta;
     let mut rho = 1.0 / sigma;
     for step in 0..DEGREE {
-        if step == 0 && zero {
-            r.copy_from_slice(b);
-        } else {
-            op.apply(x, r, threads);
-            for (r, b) in r.iter_mut().zip(b) {
-                *r = b - *r;
-            }
-        }
         let (c1, c2) = if step == 0 {
             (0.0, 1.0 / theta)
         } else {
@@ -816,14 +1048,24 @@ fn smooth(
             rho = next;
             c
         };
-        apply_dinv(&s.dinv, r, d, c1, c2, threads);
         if step == 0 && zero {
+            // x is zero: the residual is b, and x becomes the correction.
+            apply_dinv(&s.dinv, b, d, 0.0, c2, threads);
             x.copy_from_slice(d);
-        } else {
-            for (x, d) in x.iter_mut().zip(d.iter()) {
-                *x += d;
-            }
+            continue;
         }
+        let dinv = &s.dinv;
+        op.product(x, d, threads, &|n, ax, old| {
+            let r = [b[3 * n] - ax[0], b[3 * n + 1] - ax[1], b[3 * n + 2] - ax[2]];
+            let v = mat3(&dinv[n], r);
+            std::array::from_fn(|k| c1 * old[k] + c2 * v[k])
+        });
+        let d = &*d;
+        par_fill(x, 1, threads, 65536, |first, part| {
+            for (m, v) in part.iter_mut().enumerate() {
+                *v += d[first + m];
+            }
+        });
     }
 }
 
@@ -1027,11 +1269,10 @@ fn cycle(
     };
     let op: &dyn Operator = if l == 0 { fine } else { &coarse[l - 1] };
     let next = &coarse[l];
-    smooth(op, s, b, x, true, &mut w.r, &mut w.d, threads);
-    op.apply(x, &mut w.r, threads);
-    for (r, b) in w.r.iter_mut().zip(b) {
-        *r = b - *r;
-    }
+    smooth(op, s, b, x, true, &mut w.d, threads);
+    op.product(x, &mut w.r, threads, &|n, ax, _| {
+        [b[3 * n] - ax[0], b[3 * n + 1] - ax[1], b[3 * n + 2] - ax[2]]
+    });
     restrict(op.dims(), next.dims, factor, &w.r, &mut w.coarse_b, threads);
     w.coarse_x.fill(0.0);
     cycle(
@@ -1047,7 +1288,7 @@ fn cycle(
         threads,
     );
     prolong_add(op.dims(), next.dims, factor, &w.coarse_x, x, threads);
-    smooth(op, s, b, x, false, &mut w.r, &mut w.d, threads);
+    smooth(op, s, b, x, false, &mut w.d, threads);
 }
 
 /// Values per block of a dot product: each block summed on its own, the blocks in order,
@@ -1223,7 +1464,7 @@ mod tests {
         let target = dims.node([2, 1, 1]);
         held[target] = 1;
         let projectors = [[0.0; 9], roller];
-        let fine = Fine::new(dims, &brick, &s, &held, &projectors);
+        let fine = Fine::new(dims, &brick, &s, &held, &projectors, 1e-6);
         let a = assembled(&fine);
         let n = dims.node_count() * 3;
         // From the elements.
@@ -1275,7 +1516,7 @@ mod tests {
         // Small enough to factor: the same answer as a dense solve.
         let (dims, s, held, b) = beam([6, 2, 2], |_| 1.0);
         let projectors = [[0.0; 9]];
-        let fine = Fine::new(dims, &brick, &s, &held, &projectors);
+        let fine = Fine::new(dims, &brick, &s, &held, &projectors, 0.0);
         let mut x = vec![0.0; b.len()];
         solve(&fine, &b, &mut x, 1e-10, 200, &cancel, 1).unwrap();
         let a = assembled(&fine);
@@ -1305,7 +1546,7 @@ mod tests {
                 1.0
             }
         });
-        let fine = Fine::new(dims, &brick, &s, &held, &projectors);
+        let fine = Fine::new(dims, &brick, &s, &held, &projectors, 1e-5);
         let mut one = vec![0.0; b.len()];
         let solved = solve(&fine, &b, &mut one, 1e-8, 400, &cancel, 1).unwrap();
         assert!(solved.iterations < 80, "{solved:?}");

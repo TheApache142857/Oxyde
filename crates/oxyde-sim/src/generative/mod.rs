@@ -49,6 +49,11 @@ use multigrid::{Dims, Fine, par_fill};
 const VOID_STIFFNESS: f64 = 1e-6;
 /// SIMP's penalty: stiffness goes as the projected density to this power.
 const PENALTY: f64 = 3.0;
+/// Voxels whose stiffness is under this share of the material's (a projected density under
+/// about 2 %: void) are, in the solve, the brick's Laplacian scaled as the brick would be:
+/// as weak, as free to move as a whole, a third of the work. Their slopes are still the
+/// brick's, so material can grow back into them.
+const SCALAR_BELOW: f64 = 1e-5;
 /// The projection's threshold, and its sharpness at the end; it starts at 1 and doubles
 /// when the design settles, or after `BETA_STEP_AFTER` iterations at one sharpness (which
 /// brings it to the end within 125 iterations).
@@ -60,19 +65,26 @@ const DESIGN_MIN: f64 = 1e-3;
 /// The most a design density moves in one iteration, and from a sharpness of 8 on.
 const MOVE_LIMIT: f64 = 0.2;
 const LATE_MOVE_LIMIT: f64 = 0.1;
-/// Settled, at the last sharpness: no design density moves by more than this, or, the
+/// Settled, at the last sharpness: no design density moves by more than this; or, the
 /// densities going back and forth at the move limit as optimality criteria do once the
-/// shape is crisp, the compliance has changed by less than `STEADY_COMPLIANCE` over the
-/// last `STEADY_OVER` iterations with the mass on target to `STEADY_MASS`.
+/// shape is crisp, the compliance has stayed within `STEADY_COMPLIANCE` over the last
+/// `STEADY_OVER` iterations with the mass on target to `STEADY_MASS`; or the last stage has
+/// run as long as the others. At the last sharpness the compliance jitters by a few tenths
+/// of a percent and the mass by about one: a tighter test was met or missed by chance.
 const SETTLED_CHANGE: f64 = 0.01;
-const STEADY_COMPLIANCE: f64 = 1e-3;
+const STEADY_COMPLIANCE: f64 = 5e-3;
 const STEADY_OVER: usize = 10;
 const STEADY_MASS: f64 = 0.01;
 /// The densities are kept every this many iterations, for the slider through them.
 pub const SNAPSHOT_EVERY: usize = 10;
 /// The iterations' solves stop at this residual, a fraction of the loads (as topology
-/// studies' do), and give up after this many conjugate gradient iterations.
+/// studies' do), and give up after this many conjugate gradient iterations. Before the
+/// projection is at its sharpest, a tenth as tight is enough: the design changes far more
+/// from one iteration to the next than that error moves it (on the test bracket, a fifth
+/// fewer conjugate gradient iterations and the same compliance in the end), and the
+/// sharpest stage, which settles on the compliance staying put, gets the tight one.
 const SOLVE_TOLERANCE: f64 = 1e-5;
+const EARLY_TOLERANCE: f64 = 1e-4;
 const SOLVE_ITERATIONS: usize = 2000;
 const NONE: u32 = u32::MAX;
 
@@ -463,12 +475,24 @@ pub fn generate(
                 State::Void => 0.0,
             })
             .collect();
-        let fine = Fine::new(dims, &brick, &stiffness, &held, &projectors);
+        // Void voxels are Laplacians in the solve, a third of a brick's work.
+        let fine = Fine::new(
+            dims,
+            &brick,
+            &stiffness,
+            &held,
+            &projectors,
+            SCALAR_BELOW * modulus * h,
+        );
         let solved = multigrid::solve(
             &fine,
             &loads,
             &mut displacement,
-            options.tolerance.max(SOLVE_TOLERANCE),
+            options.tolerance.max(if beta < BETA_MAX {
+                EARLY_TOLERANCE
+            } else {
+                SOLVE_TOLERANCE
+            }),
             SOLVE_ITERATIONS,
             cancel,
             threads,
@@ -550,7 +574,8 @@ pub fn generate(
             });
             hi - lo <= STEADY_COMPLIANCE * hi && (mass_now - target).abs() <= STEADY_MASS * target
         };
-        if (beta >= BETA_MAX && change < SETTLED_CHANGE) || steady {
+        let last_stage_done = beta >= BETA_MAX && at_beta >= BETA_STEP_AFTER;
+        if (beta >= BETA_MAX && change < SETTLED_CHANGE) || steady || last_stage_done {
             converged = true;
             break;
         }

@@ -31,6 +31,10 @@ pub(crate) struct Brick {
     /// assembly of bricks has a larger one for its own block diagonal, which bounds the
     /// smoother's interval on the finest level without power iterations.
     pub spread: f64,
+    /// The cube's Laplacian (`∫ ∇Nₐ · ∇N_b`), 8 × 8, scaled to `k`'s diagonal: what a void
+    /// voxel is in the solve, the same for each direction. A third of a brick's work, and,
+    /// like a brick, it leaves translations free: it holds nothing to the ground.
+    pub laplacian: [f64; 64],
 }
 
 impl Brick {
@@ -65,11 +69,13 @@ impl Brick {
             }
         }
         let spread = spread(&k);
+        let laplacian = laplacian(k[0]);
         Brick {
             k,
             b: strains([0.5; 3]),
             d,
             spread,
+            laplacian,
         }
     }
 
@@ -92,6 +98,40 @@ fn elasticity(poisson: f64) -> [f64; 36] {
         d[(r + 3) * 6 + r + 3] = mu;
     }
     d
+}
+
+/// The unit cube's Laplacian, its diagonal scaled to `diagonal`.
+fn laplacian(diagonal: f64) -> [f64; 64] {
+    let g = 0.5 / 3f64.sqrt();
+    let mut l = [0.0; 64];
+    for p in 0..8 {
+        let at = corner(p).map(|c| if c == 0 { 0.5 - g } else { 0.5 + g });
+        let grads = gradients(at);
+        for a in 0..8 {
+            for b in 0..8 {
+                let v: f64 = (0..3).map(|d| grads[a][d] * grads[b][d]).sum();
+                l[a * 8 + b] += v / 8.0;
+            }
+        }
+    }
+    let scale = diagonal / l[0];
+    l.map(|v| v * scale)
+}
+
+/// The shape functions' gradients on the unit cube at `at`, by corner.
+fn gradients(at: [f64; 3]) -> [[f64; 3]; 8] {
+    std::array::from_fn(|a| {
+        let c = corner(a);
+        let f = |axis: usize| {
+            if c[axis] == 0 {
+                1.0 - at[axis]
+            } else {
+                at[axis]
+            }
+        };
+        let s = |axis: usize| if c[axis] == 0 { -1.0 } else { 1.0 };
+        [s(0) * f(1) * f(2), f(0) * s(1) * f(2), f(0) * f(1) * s(2)]
+    })
 }
 
 /// The strain–displacement matrix of the unit cube at `at` (in it, 0 to 1 along each axis).
@@ -247,6 +287,29 @@ mod tests {
             assert!((brick.k[i * DOFS + i] - brick.diagonal()).abs() < 1e-12);
         }
         assert!(brick.spread > 1.0 && brick.spread < 8.0, "{}", brick.spread);
+    }
+
+    #[test]
+    fn the_laplacian_leaves_translations_free_and_matches_the_diagonal() {
+        let brick = Brick::new(0.3);
+        let l = &brick.laplacian;
+        for a in 0..8 {
+            let row: f64 = (0..8).map(|b| l[a * 8 + b]).sum();
+            assert!(row.abs() < 1e-12, "row {a} sums to {row}");
+            assert!((l[a * 8 + a] - brick.diagonal()).abs() < 1e-12);
+            for b in 0..8 {
+                assert!((l[a * 8 + b] - l[b * 8 + a]).abs() < 1e-12);
+            }
+        }
+        // A linear field costs what its gradient says: ∫ |∇u|² = |g|² over the cube.
+        let g = [0.3, -0.2, 0.5];
+        let u: [f64; 8] = std::array::from_fn(|a| (0..3).map(|d| g[d] * corner(a)[d] as f64).sum());
+        let energy: f64 = (0..8)
+            .map(|a| u[a] * (0..8).map(|b| l[a * 8 + b] * u[b]).sum::<f64>())
+            .sum();
+        let scale = brick.diagonal() / (1.0 / 3.0);
+        let expected = scale * g.iter().map(|x| x * x).sum::<f64>();
+        assert!((energy - expected).abs() < 1e-12, "{energy} {expected}");
     }
 
     #[test]

@@ -641,20 +641,29 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   node in the order of its corners, so the sums are the same on any number of threads.
   Gathered node by node instead, each node working out its own rows of the eight bricks
   around it, a product took twice as long. Memory goes as a few numbers per voxel, not as a
-  matrix's nonzeros. Void voxels stay bricks, at a millionth of the stiffness. Making them
-  springs at their corners (their bricks' diagonals) instead, to skip their products, was
-  tried: springs hold to the ground, a void continuum does not, and with two hundred
-  thousand of them the optimizer spread specks of material through the box near the
-  loaded ring to lean on them, a load path to nowhere as stiff as the bracket itself, at
-  twice the mass target.
-- **The solve:** conjugate gradients to a residual of 10⁻⁵ of the loads, preconditioned by
+  matrix's nonzeros. A void voxel (its stiffness under 10⁻⁵ of the material's, a projected
+  density under about 2 %, and no held corner) is the brick's Laplacian instead
+  (`∫ ∇Nₐ · ∇N_b`, the same for each direction), scaled to the brick's diagonal and to the
+  voxel's stiffness: as weak, as free to move as a whole, a third of the work, its rows
+  worked out at each node as they are needed instead of written to the buffer and read
+  back. Its slope is still the brick's, so material grows back into it from the shape's
+  surface; the test bracket's compliance came out the same to 0.2 %. Springs at the void
+  voxels' corners (their bricks' diagonals) were tried first: springs hold to the ground, a
+  void continuum does not, and with two hundred thousand of them the optimizer spread
+  specks of material through the box near the loaded ring to lean on them, a load path to
+  nowhere as stiff as the bracket itself, at twice the mass target.
+- **The solve:** conjugate gradients to a residual of 10⁻⁵ of the loads (10⁻⁴ before the
+  last sharpness, when the design moves far more from one iteration to the next than that
+  error does: a fifth fewer conjugate gradient iterations, the same compliance in the end;
+  10⁻⁴ throughout left the last stage too noisy to settle), preconditioned by
   geometric multigrid on the grid's own levels, each halving the one above along every axis
   with two voxels or more, down to a couple of hundred nodes factored densely; each
   optimization iteration starts from the last displacements. The coarse levels are Galerkin
   products, exact for nested trilinear grids: each coarse cell's 24 × 24 matrix is its eight
   children's seen through the interpolation, worked out one coarse cell at a time and kept in
-  single precision (it only preconditions). They carry the fixtures down with no special
-  case; averaged moduli were not tried. Fixtures project: a held node keeps only the motions its fixtures allow (`P`),
+  single precision (it only preconditions); a coarse cell over nothing but void voxels is a
+  scalar one too, `(Wᵀ S W) ⊗ I`, exactly, so void stays cheap all the way down. They carry
+  the fixtures down with no special case; averaged moduli were not tried. Fixtures project: a held node keeps only the motions its fixtures allow (`P`),
   the operator is `P K P + d (I − P)`, `d` the node's own stiffness (so the coarse levels
   see the held directions at the right scale), and conjugate gradients stay in the allowed
   motions. Smoothing is Chebyshev's on block Jacobi, degree 2, the finest level's interval
@@ -662,7 +671,19 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   brick), the coarse levels' found by 20 power iterations from a pseudo-random start, with
   a fifth to spare. From a smooth start, a mode held to a few nodes can be missed: with
   coarse cells over void left out (tried with the springs above), one was, the smoother
-  amplified it, and conjugate gradients went from about 40 iterations to hundreds.
+  amplified it, and conjugate gradients went from about 40 iterations to hundreds. Each
+  smoothing step is one product whose pass over the nodes also forms the correction
+  `c₁ d + c₂ D⁻¹ (b − A x)`, and the cycle's residual comes out of a product the same way.
+- **Threads:** the parallel steps run on a pool of worker threads started once
+  (`oxyde_sim::pool`, one per core but the caller's, asleep between steps). Started afresh
+  for each step, sixteen threads cost some forty microseconds each, more than the step's
+  work: a step over 300 000 values took 690 µs on fresh threads, 150 µs on one thread and
+  55 µs on the pool, and a solve makes some thirty steps per conjugate gradient iteration.
+  Moving to the pool halved the time of an iteration. Handing the workers a borrowed
+  closure is the crate's one `unsafe` block, sound because a step returns only once every
+  task it handed out is done (the owner chose this over adding `rayon`, October 2026).
+  The pool also runs a step started from inside a task serially, so it never waits on
+  itself, and resumes a task's panic on the caller.
 - **Fixtures and loads** act through samples of their faces every half voxel. Each sample
   lands in the voxel holding it, made a preserve voxel (a thin preserve body has no voxel
   centre in it), or, in an obstacle voxel, in the nearest preserve voxel around. A fixture
@@ -677,10 +698,13 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   0.1 from `β` 8; design densities kept over 0.001 so that any can come back), the mass
   target met by the projected densities, linearised at each iteration: it is met once the
   design settles. The design starts uniform at the density whose projection weighs the
-  target. Settled, at `β` 32: no design density moving by 0.01, or, as the densities go back
-  and forth at the move limit once the shape is crisp, the compliance steady to 0.1 % over
-  ten iterations with the mass on target to 1 %. The projection is also what §8's shapes
-  pulled in the plane of bending lack.
+  target. Settled, at `β` 32: no design density moving by 0.01; or, as the densities go back
+  and forth at the move limit once the shape is crisp, the compliance steady to 0.5 % over
+  ten iterations with the mass on target to 1 %; or the last stage run as long as the
+  others (at the last sharpness the compliance jitters by a few tenths of a percent and the
+  mass by about one, and a test to 0.1 % was met or missed by chance: a run that met it
+  after 144 iterations, rounded a little differently, went on past 200). The projection is
+  also what §8's shapes pulled in the plane of bending lack.
 - **Manufacturing on the grid:** symmetry ties each voxel's design to its mirror images (one
   value, the slopes summed); 2-axis cutting keeps one value per column along the direction;
   casting caps each voxel at the one behind it along the direction (§8's pull, the
@@ -745,8 +769,9 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   body, an obstacle in a preserve body, nothing held, too many voxels, a target out of
   reach, 2-axis cutting with a preserve body and an obstacle in line, a one-way pull across
   a symmetry plane); a bracket of two pads grown to its mass target to 2 %, stiffer than it
-  started, its pads joined, its preserve voxels solid, its surface closed and holding the
-  volume its mass says to 15 % (a grey design would not); the same outcome on one thread
+  started, its pads joined, its preserve voxels solid, its voxels over half holding the
+  material its mass says to 5 % (a grey design would not), its surface closed and holding
+  most of them; the same outcome on one thread
   and on eight; symmetry exact to the byte, 2-axis cutting the same all along each column,
   casting never denser in front (one way and both ways); surfaces closed, holding a block's
   volume. In `oxyde-tests` (`generative.rs`), a bracket modelled through OpenCASCADE as
@@ -757,14 +782,26 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
 
   | Resolution | Voxels | An iteration | Conjugate gradient iterations a solve | Outcome |
   |---|---|---|---|---|
-  | 0 | 21 840 of 2.27 mm | 0.7 s | 50 | 150 iterations in 103 s |
-  | 0.5 (default) | 211 120 of 1.06 mm | 5.4 s | 80 | settled after 148 iterations, 13 min |
+  | 0 | 21 840 of 2.27 mm | 0.28 s (0.69 s at first) | 46 | settled after 145 iterations, 41 s (103 s) |
+  | 0.5 (default) | 211 120 of 1.06 mm | 1.84 s (5.4 s at first) | 56 | settled after 142 iterations, 4.4 min (13 min) |
 
   The mass stays on target throughout, and the shapes are what generative design gives: on
   the bracket at 0.5, a curved web from the held ring sweeping round to the loaded one,
-  ribbed, open where the post passes. The solves take about 25 conjugate gradient
-  iterations at first and more as the shape sharpens and solid stands next to void. Void
-  voxels cost as much as solid ones, most of the box by the end: leaving them out of the
-  solve without grounding them (a weak operator that leaves translations free, unlike the
-  springs) is what would pay most, then cheaper coarse levels (node stencils instead of a
-  matrix per cell).
+  ribbed, open where the post passes. Three times as fast as step 1 left it, by the thread
+  pool, void voxels as Laplacians, the looser tolerance before the last stage and the
+  fused smoothing (each measured above), the designs the same to a percent (298.0 N·mm at
+  0.5 against 300.8). The solves take about 25 conjugate gradient iterations at first and
+  more as the shape sharpens and solid stands next to void: a lower contrast (void at 10⁻⁴
+  of the material's stiffness instead of 10⁻⁶) saved only a twentieth of them and made the
+  bracket 6 % more flexible.
+
+**Decided (October 2026, the owner): a GPU solver**, as a step of its own after the CPU
+work above: a new crate, `oxyde-sim-gpu`, depending on `oxyde-sim` and on the `wgpu` that
+`eframe` already brings, with the products, multigrid and the vector operations in WGSL
+compute shaders. Every voxel being the same element, the product parallelises perfectly,
+and the CPU is held back by memory traffic (four threads did nearly as well as sixteen),
+where a graphics card has ten to twenty times the bandwidth. WGSL has no double precision
+on most cards, so the GPU works in single precision, which suits the preconditioner, with
+the conjugate gradients built to reach the same residual; sums ordered by hand so that a
+run repeats exactly. The CPU solver stays: the fallback where no usable GPU is found, and
+the reference the GPU's results are tested against.

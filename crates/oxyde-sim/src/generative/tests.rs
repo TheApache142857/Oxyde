@@ -285,17 +285,23 @@ fn a_bracket_grows_a_crisp_load_path_at_its_mass_target() {
         }
     }
 
-    // Its surface is closed and holds the material the mass says: the design is solid or
-    // void, not grey (grey material weighs without being inside). Members two or three
-    // voxels thick lose their edges to the cut's bevels, about a tenth here.
-    let shape = surface(&grid, &outcome.density, 8);
-    assert!(is_closed(&shape));
+    // Solid or void, not grey: the voxels over half hold the material the mass says (grey
+    // material would weigh without being over half, or be over half without weighing).
+    let solid = outcome.density.iter().filter(|&&d| d >= 128).count() as f64 * grid.size.powi(3);
     let material = outcome.mass / (STEEL.density * 1e-9);
     assert!(
-        (shape.volume() - material).abs() < 0.15 * material,
+        (solid - material).abs() < 0.05 * material,
+        "{solid} {material}"
+    );
+    // Its surface is closed and holds most of them: members two or three voxels thick lose
+    // their edges to the cut's bevels.
+    let shape = surface(&grid, &outcome.density, 8);
+    assert!(is_closed(&shape));
+    assert!(
+        shape.volume() < solid && shape.volume() > 0.75 * solid,
         "{} {}",
         shape.volume(),
-        material
+        solid
     );
 }
 

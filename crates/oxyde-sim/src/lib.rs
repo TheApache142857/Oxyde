@@ -63,6 +63,7 @@ mod math;
 pub mod mesh;
 pub mod mesher;
 pub mod plot;
+mod pool;
 pub mod solve;
 pub mod thermal;
 pub mod topology;
