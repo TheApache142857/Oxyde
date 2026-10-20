@@ -23,7 +23,7 @@ use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
     FixtureKind as FileFixtureKind, ForceDirection, Load, LoadKind as FileLoadKind, MeshQuality,
     MeshSettings, MeshSize, Mesher, ModelKind, PreservedRegion, PullDirection, SimulationFile,
-    StudiedModel, Study as FileStudy, StudyFace, SymmetryPlanes,
+    StudiedModel, Study as FileStudy, StudyFace, StudyType, SymmetryPlanes,
 };
 use oxyde_format::{AssemblyFile, PartFile};
 use oxyde_sim::{
@@ -545,6 +545,8 @@ pub(crate) fn results_file(
                 removed_mass: j.removed_mass,
             }),
         }),
+        // This tab solves no generative study.
+        generative: None,
     }
 }
 
@@ -693,6 +695,13 @@ pub(crate) fn results_path(study_file: &Path, study: &str) -> PathBuf {
     ))
 }
 
+/// A study document's generative studies, then the others: this tab shows only the others.
+fn split_generative(studies: Vec<FileStudy>) -> (Vec<FileStudy>, Vec<FileStudy>) {
+    studies
+        .into_iter()
+        .partition(|s| s.study_type == StudyType::Generative)
+}
+
 // ---- The application side ------------------------------------------------------------------
 
 impl OxydeApp {
@@ -794,6 +803,7 @@ impl OxydeApp {
             .all_studies()
             .iter()
             .map(file_study)
+            .chain(self.simulation.generative_studies.iter().cloned())
             .collect();
         if file.studies.is_empty() {
             self.status = "No study to save: make one with New Study".to_owned();
@@ -845,12 +855,18 @@ impl OxydeApp {
             );
             return;
         }
-        if file.studies.is_empty() {
-            self.status = format!("{} holds no study", path.display());
+        let (generative, studies) = split_generative(file.studies);
+        if studies.is_empty() {
+            self.status = if generative.is_empty() {
+                format!("{} holds no study", path.display())
+            } else {
+                format!("{} holds generative studies only", path.display())
+            };
             return;
         }
-        let count = file.studies.len();
-        self.set_studies(file.studies.iter().map(study_of).collect());
+        let count = studies.len();
+        self.set_studies(studies.iter().map(study_of).collect());
+        self.simulation.generative_studies = generative;
         self.status = if count > 1 {
             format!("Opened {count} studies from {}", path.display())
         } else {
@@ -879,7 +895,9 @@ impl OxydeApp {
         if file.model.document_id != model_id || file.studies.is_empty() {
             return;
         }
-        self.set_studies(file.studies.iter().map(study_of).collect());
+        let (generative, studies) = split_generative(file.studies);
+        self.set_studies(studies.iter().map(study_of).collect());
+        self.simulation.generative_studies = generative;
         self.simulation.file = Some(StudyFile {
             path,
             document_id: file.document_id,

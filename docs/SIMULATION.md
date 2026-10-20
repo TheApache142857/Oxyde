@@ -850,3 +850,35 @@ application.
   0.03 s, the solve on the card 0.15 to 0.19 s (some 3.5 ms a conjugate gradient iteration)
   and the optimization's own steps on the CPU 0.09 s: the Galerkin products and the element
   energies on the card are what would pay next.
+
+**Built (October 2026): step 2**, the files: `oxyde_format::simulation` reads and writes
+the `generative` study (`StudyType::Generative`, `Study::generative`: `GenerativeSettings`,
+its methods split into outcomes by `GenerativeMethod::outcomes`) and
+`oxyde_format::results` its results (`ResultsFile::generative`: the `VoxelGrid` and each
+`GenerativeOutcome` with its densities and snapshots), as FORMAT.md §8–§9 have them, as
+`format_version` 4; documents without a generative study are written as before.
+
+- **What the draft left open**, settled here and written into FORMAT.md: a study's materials
+  go without their textures (a study document holds no images; a texture written by hand is
+  ignored); an additive method's `overhang` may be left out, and another value than 45 is
+  refused; a cutting method's `+y` and `-y` are one direction, so not both; only a failed
+  outcome has a `message`, and it has no `snapshots`; `mesh/` entries in generative results
+  are ignored.
+- **The application** has no generative study to make yet. Until the tab (step 3), the
+  Simulation tab sets a document's generative studies aside when it opens it, as they were
+  read, writes them back when it saves the document, and keeps its own studies' names clear
+  of theirs; it solves none.
+- **Tests** in `oxyde-format`: a part's study document with a generative study using every
+  setting, and one with the defaults, round trip, its JSON as FORMAT.md shows it, version 4;
+  each refusal (a generative block in another type, or missing; a generative study in an
+  assembly, with contacts, mesh settings, material overrides or gravity; no preserve body, a
+  body listed twice, a negative offset or margin; a mass target, safety factor or member size
+  not positive; iterations out of range; a resolution with both sizes; no method, a method
+  twice, a method with no direction or one twice, `+y` and `-y` cutting, another overhang;
+  materials named twice, without a density or usable mechanical properties); textures
+  dropped. Results with three outcomes (one with snapshots, one without, a failed one)
+  round trip, the entries and JSON as documented, version 4 with `mass` in kg; inconsistent
+  ones are not written, and inconsistent entries are refused (a voxel kind of 4, a failed
+  outcome with no message or with snapshots, a message on one that did not fail, another
+  overhang, snapshots not matching their entry, a grid with no voxel along an axis, other
+  units, a density entry missing or not described).

@@ -984,6 +984,9 @@ pub struct SimulationView {
     /// The model's other studies, in order, without the open one (which sits at `active`
     /// among them).
     pub(crate) others: Vec<crate::simulation_studies::Parked>,
+    /// The study document's generative studies, which this tab neither shows nor changes:
+    /// written back as they were read when the studies are saved.
+    pub(crate) generative_studies: Vec<oxyde_format::simulation::Study>,
     pub(crate) active: usize,
     /// The time of a transient study's results shown, an index into its frames.
     pub(crate) frame: usize,
@@ -1914,6 +1917,9 @@ impl OxydeApp {
                 },
                 materials: elastic()?,
             },
+            StudyType::Generative => {
+                return Err("A generative study is not solved in the Simulation tab".to_owned());
+            }
         })
     }
 

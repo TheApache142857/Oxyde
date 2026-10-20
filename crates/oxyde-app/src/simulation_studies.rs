@@ -67,6 +67,7 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::TransientThermal => "Transient",
         StudyType::ThermalStress => "Thermal Stress",
         StudyType::Topology => "Topology",
+        StudyType::Generative => "Generative",
     }
 }
 
@@ -173,6 +174,12 @@ impl OxydeApp {
             .study_list()
             .into_iter()
             .map(|(n, _)| n)
+            .chain(
+                self.simulation
+                    .generative_studies
+                    .iter()
+                    .map(|s| s.name.clone()),
+            )
             .collect();
         let name = unique_name(base_name(t), &taken);
         self.restore_simulation_scene();
@@ -200,6 +207,8 @@ impl OxydeApp {
                     "select faces, add fixtures and temperatures or heat, then Run".to_owned(),
                 StudyType::Topology =>
                     "select faces, add fixtures, loads and regions to keep, then Run".to_owned(),
+                StudyType::Generative =>
+                    "pick the bodies to keep, add fixtures and loads, then Generate".to_owned(),
             }
         );
     }
@@ -261,15 +270,14 @@ impl OxydeApp {
             .simulation
             .others
             .iter()
-            .find(|p| same_file(&p.study.name, name))
+            .map(|p| &p.study.name)
+            .chain(self.simulation.generative_studies.iter().map(|s| &s.name))
+            .find(|other| same_file(other, name))
         {
-            return Err(if other.study.name == name {
+            return Err(if other == name {
                 format!("Another study is called {name}")
             } else {
-                format!(
-                    "{name} would share its results file with {}: choose another name",
-                    other.study.name
-                )
+                format!("{name} would share its results file with {other}: choose another name")
             });
         }
         self.simulation.study.name = name.to_owned();
@@ -328,7 +336,9 @@ impl OxydeApp {
                             StudyType::Thermal => crate::icons::Icon::TemperaturePlot,
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
-                            StudyType::Topology => crate::icons::Icon::Topology,
+                            StudyType::Topology | StudyType::Generative => {
+                                crate::icons::Icon::Topology
+                            }
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {

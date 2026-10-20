@@ -5,6 +5,19 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Generative design, under way (October 2026)
+
+- **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
+  Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
+  clear of, the mass target, safety factor, minimum thickness and resolution, the ways of
+  making the shapes (unrestricted, additive, 2-axis cutting, casting, each along chosen
+  directions) and the materials to try (`type` `generative`, FORMAT.md §8), and their
+  results: the grid of voxels and, for each material and way of making it, the shape's
+  densities, a few snapshots on the way and its mass, stiffness and estimated stress
+  (FORMAT.md §9). A document holding them is written as `format_version` 4, which earlier
+  versions of Oxyde refuse; the others are written as before. Until the tab exists, the
+  Simulation tab keeps a study document's generative studies as they are when it saves it.
+
 ### Topology optimization (October 2026)
 
 - **A Topology tab, and topology studies.** *Topology* is a new study type in the

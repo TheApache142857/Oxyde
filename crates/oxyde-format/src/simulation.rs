@@ -1,8 +1,9 @@
 //! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it (forces
 //! and pressures, or heat), how its bodies touch, how it is meshed and which mechanical and
 //! thermal properties the study uses instead of the materials' own. A document holds any
-//! number of studies of five types: static, thermal, transient thermal, thermal stress and
-//! topology (the lightest shape that carries a static study's loads).
+//! number of studies of six types: static, thermal, transient thermal, thermal stress,
+//! topology (the lightest shape that carries a static study's loads) and generative design
+//! (shapes grown between bodies to keep, for several materials and ways of making them).
 //!
 //! A study document refers to the model it studies (a part or an assembly file, by relative
 //! path and document id) and to its faces by persistent name, never by index, so a study
@@ -17,12 +18,15 @@ use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::Path;
 
 use oxyde_assembly::ComponentId;
-use oxyde_model::{FaceName, Mechanical, Thermal};
+use oxyde_model::{BodyId, FaceName, Material, Mechanical, Thermal};
 use serde::{Deserialize, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::schema::{FaceRefDto, MechanicalDto, ThermalDto, face_dto, face_from};
+use crate::schema::{
+    BodyIdDto, FaceRefDto, MaterialDto, MechanicalDto, TextureTable, ThermalDto, body_dto,
+    body_from, face_dto, face_from, material_dto, material_from,
+};
 use crate::{
     DocumentKind, FORMAT_VERSION, FormatError, MANIFEST, SIMULATION_FORMAT_VERSION, expect_kind,
     from_json, manifest_version, new_document_id, read_entry, read_manifest, to_json, write_file,
@@ -117,6 +121,10 @@ pub enum StudyType {
     /// Topology optimization: the stiffest shape that keeps a share of the model's mass
     /// under fixtures, forces and pressures ([`Study::topology`]).
     Topology,
+    /// Generative design: shapes grown between bodies to keep and bodies to stay clear of,
+    /// for several materials and ways of making them ([`Study::generative`]). Only a part
+    /// has them.
+    Generative,
 }
 
 impl StudyType {
@@ -124,18 +132,21 @@ impl StudyType {
     pub fn is_structural(self) -> bool {
         matches!(
             self,
-            StudyType::Static | StudyType::ThermalStress | StudyType::Topology
+            StudyType::Static
+                | StudyType::ThermalStress
+                | StudyType::Topology
+                | StudyType::Generative
         )
     }
 
-    /// Whether it takes gravity: a topology study does not, its weight changing with the
-    /// shape.
+    /// Whether it takes gravity: topology and generative studies do not, their weight
+    /// changing with the shape.
     pub fn takes_gravity(self) -> bool {
         matches!(self, StudyType::Static | StudyType::ThermalStress)
     }
 
-    /// Whether its results are displacements and stresses (a topology study's are
-    /// densities).
+    /// Whether its results are displacements and stresses (topology and generative
+    /// studies' are densities).
     pub fn has_stresses(self) -> bool {
         matches!(self, StudyType::Static | StudyType::ThermalStress)
     }
@@ -183,8 +194,8 @@ impl Default for TopologySettings {
     }
 }
 
-/// Planes a topology study's shape is mirrored about: through `point`, parallel to the
-/// standard planes.
+/// Planes a topology or generative study's shape is mirrored about: through `point`,
+/// parallel to the standard planes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SymmetryPlanes {
     /// Parallel to the Right plane (normal to X), the Top plane (Y) and the Front plane
@@ -215,6 +226,216 @@ pub struct PreservedRegion {
     /// mm, 0 for the elements on the faces only.
     pub depth: f64,
     pub suppressed: bool,
+}
+
+/// What a generative study grows, as Fusion 360 has it: shapes between the bodies to keep and
+/// those to stay clear of, as stiff as can be for a mass, for each material and each way of
+/// making them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerativeSettings {
+    /// Bodies kept as they are; at least one. Fixtures and loads are on their faces.
+    pub preserve: Vec<BodyId>,
+    /// Bodies no material may go into.
+    pub obstacles: Vec<GenerativeObstacle>,
+    /// A body the material starts in and stays inside; `None` for the box around the
+    /// preserve bodies, grown by [`GenerativeSettings::margin`].
+    pub starting_shape: Option<BodyId>,
+    /// mm the box around the preserve bodies is grown by on every side, without a starting
+    /// shape; `None` for a tenth of the box's largest side.
+    pub margin: Option<f64>,
+    pub objective: GenerativeObjective,
+    /// kg: every outcome's mass, preserve bodies included, whatever its material; positive
+    /// (0 in a new study until it is set).
+    pub mass_target: f64,
+    /// What each outcome's estimated factor of safety is held against.
+    pub safety_factor: f64,
+    /// mm: the minimum thickness; `None` for three voxels.
+    pub member_size: Option<f64>,
+    /// Iterations at most, for each outcome.
+    pub iterations: u32,
+    /// The voxels' size, as a mesh's elements': from coarse (0) to fine (1) relative to the
+    /// design space, or an edge in mm.
+    pub resolution: MeshSize,
+    /// Planes the shapes are mirrored about; `None` for none.
+    pub symmetry: Option<SymmetryPlanes>,
+    /// The ways of making the shapes; at least one, no kind twice.
+    pub methods: Vec<GenerativeMethod>,
+    /// The materials to generate for, each with a density and mechanical properties, names
+    /// unique; empty for the part's own material. Copied in, so the study never depends on
+    /// a library; without their textures (a study document holds no images).
+    pub materials: Vec<Material>,
+}
+
+impl Default for GenerativeSettings {
+    fn default() -> Self {
+        Self {
+            preserve: Vec::new(),
+            obstacles: Vec::new(),
+            starting_shape: None,
+            margin: None,
+            objective: GenerativeObjective::MaxStiffness,
+            mass_target: 0.0,
+            safety_factor: 2.0,
+            member_size: None,
+            iterations: 150,
+            resolution: MeshSize::Automatic { density: 0.5 },
+            symmetry: None,
+            methods: vec![GenerativeMethod::Unrestricted],
+            materials: Vec::new(),
+        }
+    }
+}
+
+/// A body a generative study's material stays out of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenerativeObstacle {
+    pub body: BodyId,
+    /// mm it is grown by on every side; 0 for none.
+    pub offset: f64,
+}
+
+/// What a generative study looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenerativeObjective {
+    /// The stiffest shape for the mass target.
+    #[default]
+    MaxStiffness,
+}
+
+/// One of the six directions along the world axes (Y up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AxisDirection {
+    #[serde(rename = "+x")]
+    PlusX,
+    #[serde(rename = "-x")]
+    MinusX,
+    #[serde(rename = "+y")]
+    PlusY,
+    #[serde(rename = "-y")]
+    MinusY,
+    #[serde(rename = "+z")]
+    PlusZ,
+    #[serde(rename = "-z")]
+    MinusZ,
+}
+
+impl AxisDirection {
+    /// The direction along axis `axis` (0 for X, 1 for Y, 2 for Z; Z beyond), one way.
+    pub fn new(axis: usize, positive: bool) -> Self {
+        match (axis, positive) {
+            (0, true) => AxisDirection::PlusX,
+            (0, false) => AxisDirection::MinusX,
+            (1, true) => AxisDirection::PlusY,
+            (1, false) => AxisDirection::MinusY,
+            (_, true) => AxisDirection::PlusZ,
+            (_, false) => AxisDirection::MinusZ,
+        }
+    }
+
+    /// 0 for X, 1 for Y, 2 for Z.
+    pub fn axis(self) -> usize {
+        match self {
+            AxisDirection::PlusX | AxisDirection::MinusX => 0,
+            AxisDirection::PlusY | AxisDirection::MinusY => 1,
+            AxisDirection::PlusZ | AxisDirection::MinusZ => 2,
+        }
+    }
+
+    /// Whether it goes the way of its axis.
+    pub fn is_positive(self) -> bool {
+        matches!(
+            self,
+            AxisDirection::PlusX | AxisDirection::PlusY | AxisDirection::PlusZ
+        )
+    }
+
+    /// As the file writes it: `+x`, `-y`…
+    pub fn name(self) -> &'static str {
+        match self {
+            AxisDirection::PlusX => "+x",
+            AxisDirection::MinusX => "-x",
+            AxisDirection::PlusY => "+y",
+            AxisDirection::MinusY => "-y",
+            AxisDirection::PlusZ => "+z",
+            AxisDirection::MinusZ => "-z",
+        }
+    }
+}
+
+/// A way of making a generative study's shapes, along one or more directions: each direction
+/// is an outcome of its own ([`GenerativeMethod::outcomes`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenerativeMethod {
+    /// No constraint.
+    Unrestricted,
+    /// Printed in layers along each direction, nothing overhanging more than 45° from it
+    /// (the only overhang for now).
+    Additive { directions: Vec<AxisDirection> },
+    /// 2-axis cutting: the shape the same all along each direction, whose sign does not
+    /// count.
+    Cutting { directions: Vec<AxisDirection> },
+    /// Cast in a mould pulled off along each direction, one way, or both ways from the plane
+    /// across it through `parting` (mm).
+    Casting {
+        directions: Vec<AxisDirection>,
+        parting: Option<[f64; 3]>,
+    },
+}
+
+impl GenerativeMethod {
+    /// Its name in the file: `unrestricted`, `additive`, `cutting` or `casting`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            GenerativeMethod::Unrestricted => "unrestricted",
+            GenerativeMethod::Additive { .. } => "additive",
+            GenerativeMethod::Cutting { .. } => "cutting",
+            GenerativeMethod::Casting { .. } => "casting",
+        }
+    }
+
+    /// The method of each outcome it makes, one per direction, in order.
+    pub fn outcomes(&self) -> Vec<OutcomeMethod> {
+        match self {
+            GenerativeMethod::Unrestricted => vec![OutcomeMethod::Unrestricted],
+            GenerativeMethod::Additive { directions } => directions
+                .iter()
+                .map(|&direction| OutcomeMethod::Additive { direction })
+                .collect(),
+            GenerativeMethod::Cutting { directions } => directions
+                .iter()
+                .map(|&direction| OutcomeMethod::Cutting { direction })
+                .collect(),
+            GenerativeMethod::Casting {
+                directions,
+                parting,
+            } => directions
+                .iter()
+                .map(|&direction| OutcomeMethod::Casting {
+                    direction,
+                    parting: *parting,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// How one outcome of a generative study is made: a [`GenerativeMethod`] with one direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutcomeMethod {
+    Unrestricted,
+    /// Printed in layers along `direction`, nothing overhanging more than 45° from it.
+    Additive {
+        direction: AxisDirection,
+    },
+    /// The shape the same all along `direction`.
+    Cutting {
+        direction: AxisDirection,
+    },
+    /// A mould pulled off along `direction`, or both ways from `parting` (mm).
+    Casting {
+        direction: AxisDirection,
+        parting: Option<[f64; 3]>,
+    },
 }
 
 /// How a transient thermal study marches in time.
@@ -261,6 +482,9 @@ pub struct Study {
     /// A topology study's target, member size and preserved regions; ignored by the other
     /// types.
     pub topology: TopologySettings,
+    /// A generative study's bodies, target, methods and materials; ignored by the other
+    /// types.
+    pub generative: GenerativeSettings,
 }
 
 impl Study {
@@ -283,6 +507,7 @@ impl Study {
             transient: TransientSettings::default(),
             reference_temperature: 20.0,
             topology: TopologySettings::default(),
+            generative: GenerativeSettings::default(),
         }
     }
 }
@@ -461,12 +686,13 @@ pub fn simulation_version(file: &SimulationFile) -> u32 {
 }
 
 /// The first `format_version` that has studies (and results) of type `t`: 1 static, 2 the
-/// thermal ones, 3 topology.
+/// thermal ones, 3 topology, 4 generative.
 pub(crate) fn type_version(t: StudyType) -> u32 {
     match t {
         StudyType::Static => FORMAT_VERSION,
         StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress => 2,
-        StudyType::Topology => SIMULATION_FORMAT_VERSION,
+        StudyType::Topology => 3,
+        StudyType::Generative => SIMULATION_FORMAT_VERSION,
     }
 }
 
@@ -570,8 +796,9 @@ struct StudyDto {
     loads: Vec<LoadDto>,
     #[serde(default)]
     contacts: Vec<ContactDto>,
-    #[serde(default)]
-    mesh: MeshDto,
+    /// Absent: the defaults. Never in a generative study, whose grid is in its block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh: Option<MeshDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     materials: BTreeMap<String, MechanicalDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -585,6 +812,108 @@ struct StudyDto {
     /// Only in a topology study.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topology: Option<TopologyDto>,
+    /// Only in a generative study, and required there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generative: Option<GenerativeDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct GenerativeDto {
+    /// At least one.
+    #[serde(default)]
+    preserve: Vec<BodyIdDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    obstacles: Vec<ObstacleDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    starting_shape: Option<BodyIdDto>,
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    margin: Option<f64>,
+    #[serde(default)]
+    objective: ObjectiveDto,
+    /// kg.
+    mass_target: f64,
+    #[serde(default = "default_safety_factor")]
+    safety_factor: f64,
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    member_size: Option<f64>,
+    #[serde(default = "default_generative_iterations")]
+    iterations: u32,
+    #[serde(default)]
+    resolution: ResolutionDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    symmetry: Option<SymmetryDto>,
+    /// At least one.
+    #[serde(default)]
+    methods: Vec<MethodDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    materials: Vec<MaterialDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct ObstacleDto {
+    body: BodyIdDto,
+    /// mm.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    offset: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ObjectiveDto {
+    #[default]
+    MaxStiffness,
+}
+
+/// The voxels' size: as `mesh`'s, a density or an element size, not both.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+struct ResolutionDto {
+    /// 0 to 1; 0.5 when both are absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    density: Option<f64>,
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    element_size: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MethodDto {
+    Unrestricted,
+    Additive {
+        #[serde(default)]
+        directions: Vec<AxisDirection>,
+        /// Degrees; 45, the only value for now.
+        #[serde(default = "default_overhang")]
+        overhang: f64,
+    },
+    Cutting {
+        #[serde(default)]
+        directions: Vec<AxisDirection>,
+    },
+    Casting {
+        #[serde(default)]
+        directions: Vec<AxisDirection>,
+        /// mm.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parting: Option<[f64; 3]>,
+    },
+}
+
+/// Degrees: what an additive method's overhang is, the only value for now.
+pub(crate) const ADDITIVE_OVERHANG: f64 = 45.0;
+
+fn default_overhang() -> f64 {
+    ADDITIVE_OVERHANG
+}
+
+fn default_safety_factor() -> f64 {
+    GenerativeSettings::default().safety_factor
+}
+
+fn default_generative_iterations() -> u32 {
+    GenerativeSettings::default().iterations
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -667,6 +996,7 @@ pub(crate) enum StudyTypeDto {
     TransientThermal,
     ThermalStress,
     Topology,
+    Generative,
 }
 
 impl StudyTypeDto {
@@ -677,6 +1007,7 @@ impl StudyTypeDto {
             StudyType::TransientThermal => StudyTypeDto::TransientThermal,
             StudyType::ThermalStress => StudyTypeDto::ThermalStress,
             StudyType::Topology => StudyTypeDto::Topology,
+            StudyType::Generative => StudyTypeDto::Generative,
         }
     }
 
@@ -687,6 +1018,7 @@ impl StudyTypeDto {
             StudyTypeDto::TransientThermal => StudyType::TransientThermal,
             StudyTypeDto::ThermalStress => StudyType::ThermalStress,
             StudyTypeDto::Topology => StudyType::Topology,
+            StudyTypeDto::Generative => StudyType::Generative,
         }
     }
 
@@ -1008,24 +1340,21 @@ fn study_dto(study: &Study) -> StudyDto {
                 suppressed: c.suppressed,
             })
             .collect(),
-        mesh: MeshDto {
-            mesher: match study.mesh.mesher {
-                Mesher::Netgen => MesherDto::Netgen,
-                Mesher::Lattice => MesherDto::Lattice,
-            },
-            quality: match study.mesh.quality {
-                MeshQuality::High => QualityDto::High,
-                MeshQuality::Draft => QualityDto::Draft,
-            },
-            density: match study.mesh.size {
-                MeshSize::Automatic { density } => Some(density),
-                MeshSize::ElementSize(_) => None,
-            },
-            element_size: match study.mesh.size {
-                MeshSize::Automatic { .. } => None,
-                MeshSize::ElementSize(size) => Some(size),
-            },
-        },
+        mesh: (study.study_type != StudyType::Generative).then(|| {
+            let (density, element_size) = size_dto(study.mesh.size);
+            MeshDto {
+                mesher: match study.mesh.mesher {
+                    Mesher::Netgen => MesherDto::Netgen,
+                    Mesher::Lattice => MesherDto::Lattice,
+                },
+                quality: match study.mesh.quality {
+                    MeshQuality::High => QualityDto::High,
+                    MeshQuality::Draft => QualityDto::Draft,
+                },
+                density,
+                element_size,
+            }
+        }),
         materials: study
             .materials
             .iter()
@@ -1078,18 +1407,7 @@ fn study_dto(study: &Study) -> StudyDto {
                         suppressed: p.suppressed,
                     })
                     .collect(),
-                symmetry: t
-                    .symmetry
-                    .filter(|s| s.planes.contains(&true))
-                    .map(|s| SymmetryDto {
-                        planes: STANDARD_PLANES
-                            .iter()
-                            .zip(s.planes)
-                            .filter(|(_, on)| *on)
-                            .map(|(p, _)| *p)
-                            .collect(),
-                        point: s.point,
-                    }),
+                symmetry: symmetry_dto(t.symmetry),
                 pull: t.pull.map(|p| PullDto {
                     direction: p.direction,
                     parting: p.parting,
@@ -1097,6 +1415,92 @@ fn study_dto(study: &Study) -> StudyDto {
                 one_piece: t.one_piece,
             }
         }),
+        generative: (study.study_type == StudyType::Generative)
+            .then(|| generative_dto(&study.generative)),
+    }
+}
+
+/// A mesh's or a grid's size: a density or an element size.
+fn size_dto(size: MeshSize) -> (Option<f64>, Option<f64>) {
+    match size {
+        MeshSize::Automatic { density } => (Some(density), None),
+        MeshSize::ElementSize(size) => (None, Some(size)),
+    }
+}
+
+/// Planes without one on are none.
+fn symmetry_dto(symmetry: Option<SymmetryPlanes>) -> Option<SymmetryDto> {
+    symmetry
+        .filter(|s| s.planes.contains(&true))
+        .map(|s| SymmetryDto {
+            planes: STANDARD_PLANES
+                .iter()
+                .zip(s.planes)
+                .filter(|(_, on)| *on)
+                .map(|(p, _)| *p)
+                .collect(),
+            point: s.point,
+        })
+}
+
+fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
+    let (density, element_size) = size_dto(g.resolution);
+    // A study document holds no images: its materials go without their textures.
+    let no_textures = TextureTable::default();
+    GenerativeDto {
+        preserve: g.preserve.iter().map(body_dto).collect(),
+        obstacles: g
+            .obstacles
+            .iter()
+            .map(|o| ObstacleDto {
+                body: body_dto(&o.body),
+                offset: o.offset,
+            })
+            .collect(),
+        starting_shape: g.starting_shape.as_ref().map(body_dto),
+        margin: g.margin,
+        objective: match g.objective {
+            GenerativeObjective::MaxStiffness => ObjectiveDto::MaxStiffness,
+        },
+        mass_target: g.mass_target,
+        safety_factor: g.safety_factor,
+        member_size: g.member_size,
+        iterations: g.iterations,
+        resolution: ResolutionDto {
+            density,
+            element_size,
+        },
+        symmetry: symmetry_dto(g.symmetry),
+        methods: g
+            .methods
+            .iter()
+            .map(|m| match m {
+                GenerativeMethod::Unrestricted => MethodDto::Unrestricted,
+                GenerativeMethod::Additive { directions } => MethodDto::Additive {
+                    directions: directions.clone(),
+                    overhang: ADDITIVE_OVERHANG,
+                },
+                GenerativeMethod::Cutting { directions } => MethodDto::Cutting {
+                    directions: directions.clone(),
+                },
+                GenerativeMethod::Casting {
+                    directions,
+                    parting,
+                } => MethodDto::Casting {
+                    directions: directions.clone(),
+                    parting: *parting,
+                },
+            })
+            .collect(),
+        materials: g
+            .materials
+            .iter()
+            .map(|m| {
+                let mut dto = material_dto(m, &no_textures);
+                dto.appearance.texture = None;
+                dto
+            })
+            .collect(),
     }
 }
 
@@ -1205,6 +1609,21 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         }
     };
 
+    // A generative study's grid and materials are in its block; it has no contacts.
+    if study_type == StudyType::Generative {
+        if kind == ModelKind::Assembly {
+            return Err("an assembly has a generative study".to_owned());
+        }
+        if !dto.contacts.is_empty() {
+            return Err("a generative study has contacts".to_owned());
+        }
+        if dto.mesh.is_some() {
+            return Err("a generative study has mesh settings".to_owned());
+        }
+        if !dto.materials.is_empty() || !dto.thermal_materials.is_empty() {
+            return Err("a generative study has material overrides".to_owned());
+        }
+    }
     if !study_type.is_structural() && !dto.fixtures.is_empty() {
         return Err("a thermal study has fixtures".to_owned());
     }
@@ -1308,7 +1727,11 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             ));
         }
         if matches!(load_kind, LoadKind::Gravity { .. }) && !study_type.takes_gravity() {
-            return Err(item("a topology study has gravity".to_owned()));
+            return Err(item(if study_type == StudyType::Generative {
+                "a generative study has gravity".to_owned()
+            } else {
+                "a topology study has gravity".to_owned()
+            }));
         }
         loads.push(Load {
             name: l.name,
@@ -1356,25 +1779,8 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         });
     }
 
-    let size = match (dto.mesh.density, dto.mesh.element_size) {
-        (Some(_), Some(_)) => {
-            return Err("the mesh has both a density and an element size".to_owned());
-        }
-        (density, None) => {
-            let density = finite(density.unwrap_or(0.5), "the mesh density")?;
-            if !(0.0..=1.0).contains(&density) {
-                return Err("the mesh density is not between 0 and 1".to_owned());
-            }
-            MeshSize::Automatic { density }
-        }
-        (None, Some(size)) => {
-            let size = finite(size, "the element size")?;
-            if size <= 0.0 {
-                return Err("the element size is not positive".to_owned());
-            }
-            MeshSize::ElementSize(size)
-        }
-    };
+    let mesh = dto.mesh.unwrap_or_default();
+    let size = size_from(mesh.density, mesh.element_size, "the mesh")?;
 
     let mut materials = BTreeMap::new();
     for (group, p) in dto.materials {
@@ -1437,16 +1843,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             if !(target_mass > 0.0 && target_mass < 1.0) {
                 return Err("the target mass is not between 0 and 1".to_owned());
             }
-            let member_size = match t.member_size {
-                Some(size) => {
-                    let size = finite(size, "the member size")?;
-                    if size <= 0.0 {
-                        return Err("the member size is not positive".to_owned());
-                    }
-                    Some(size)
-                }
-                None => None,
-            };
+            let member_size = positive_size(t.member_size, "the member size")?;
             if !(1..=10_000).contains(&t.iterations) {
                 return Err("the iterations are not from 1 to 10 000".to_owned());
             }
@@ -1465,18 +1862,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
                     name: p.name,
                 });
             }
-            let symmetry = match t.symmetry {
-                Some(s) => {
-                    if s.planes.is_empty() {
-                        return Err("the symmetry has no plane".to_owned());
-                    }
-                    Some(SymmetryPlanes {
-                        planes: STANDARD_PLANES.map(|p| s.planes.contains(&p)),
-                        point: finite_vector(s.point, "the symmetry point")?,
-                    })
-                }
-                None => None,
-            };
+            let symmetry = symmetry_from(t.symmetry)?;
             let pull = match t.pull {
                 Some(p) => {
                     let direction = finite_vector(p.direction, "the pull direction")?;
@@ -1507,6 +1893,14 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, Some(_)) => return Err("only a topology study has a target mass".to_owned()),
         (_, None) => TopologySettings::default(),
     };
+    let generative = match (study_type, dto.generative) {
+        (StudyType::Generative, Some(g)) => generative_from(g)?,
+        (StudyType::Generative, None) => {
+            return Err("a generative study has no generative block".to_owned());
+        }
+        (_, Some(_)) => return Err("only a generative study has a generative block".to_owned()),
+        (_, None) => GenerativeSettings::default(),
+    };
 
     Ok(Study {
         name: dto.name,
@@ -1515,11 +1909,11 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         loads,
         contacts,
         mesh: MeshSettings {
-            mesher: match dto.mesh.mesher {
+            mesher: match mesh.mesher {
                 MesherDto::Netgen => Mesher::Netgen,
                 MesherDto::Lattice => Mesher::Lattice,
             },
-            quality: match dto.mesh.quality {
+            quality: match mesh.quality {
                 QualityDto::High => MeshQuality::High,
                 QualityDto::Draft => MeshQuality::Draft,
             },
@@ -1530,6 +1924,224 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         transient,
         reference_temperature,
         topology,
+        generative,
+    })
+}
+
+/// A mesh's or a grid's size (`what`: `the mesh`, `the resolution`): a density from 0 to 1
+/// (0.5 when neither is given) or a positive element size, not both.
+fn size_from(
+    density: Option<f64>,
+    element_size: Option<f64>,
+    what: &str,
+) -> Result<MeshSize, String> {
+    match (density, element_size) {
+        (Some(_), Some(_)) => Err(format!("{what} has both a density and an element size")),
+        (density, None) => {
+            let density = finite(density.unwrap_or(0.5), &format!("{what}'s density"))?;
+            if !(0.0..=1.0).contains(&density) {
+                return Err(format!("{what}'s density is not between 0 and 1"));
+            }
+            Ok(MeshSize::Automatic { density })
+        }
+        (None, Some(size)) => {
+            let size = finite(size, &format!("{what}'s element size"))?;
+            if size <= 0.0 {
+                return Err(format!("{what}'s element size is not positive"));
+            }
+            Ok(MeshSize::ElementSize(size))
+        }
+    }
+}
+
+fn symmetry_from(dto: Option<SymmetryDto>) -> Result<Option<SymmetryPlanes>, String> {
+    let Some(s) = dto else {
+        return Ok(None);
+    };
+    if s.planes.is_empty() {
+        return Err("the symmetry has no plane".to_owned());
+    }
+    Ok(Some(SymmetryPlanes {
+        planes: STANDARD_PLANES.map(|p| s.planes.contains(&p)),
+        point: finite_vector(s.point, "the symmetry point")?,
+    }))
+}
+
+/// A positive size in mm, or none.
+fn positive_size(value: Option<f64>, what: &str) -> Result<Option<f64>, String> {
+    match value {
+        Some(v) => {
+            let v = finite(v, what)?;
+            if v <= 0.0 {
+                return Err(format!("{what} is not positive"));
+            }
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The directions of a method that has some: at least one, none twice; a cutting method's
+/// sign does not count, so `+y` and `-y` are the same direction there.
+fn directions_from(
+    directions: Vec<AxisDirection>,
+    method: &str,
+    signed: bool,
+) -> Result<Vec<AxisDirection>, String> {
+    if directions.is_empty() {
+        return Err(format!("the {method} method has no direction"));
+    }
+    let mut seen = BTreeSet::new();
+    for d in &directions {
+        let key = if signed {
+            *d
+        } else {
+            AxisDirection::new(d.axis(), true)
+        };
+        if !seen.insert(key) {
+            return Err(format!(
+                "the {method} method has the direction {} twice",
+                d.name()
+            ));
+        }
+    }
+    Ok(directions)
+}
+
+fn generative_from(dto: GenerativeDto) -> Result<GenerativeSettings, String> {
+    // A body has one role at most.
+    let mut bodies = BTreeSet::new();
+    let mut body = |dto: BodyIdDto| -> Result<BodyId, String> {
+        let id = body_from(dto);
+        if bodies.insert(id) {
+            Ok(id)
+        } else {
+            Err(format!("the body {id} is listed twice"))
+        }
+    };
+    if dto.preserve.is_empty() {
+        return Err("the generative study has no body to preserve".to_owned());
+    }
+    let preserve = dto
+        .preserve
+        .into_iter()
+        .map(&mut body)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut obstacles = Vec::with_capacity(dto.obstacles.len());
+    for o in dto.obstacles {
+        let offset = finite(o.offset, "an obstacle's offset")?;
+        if offset < 0.0 {
+            return Err("an obstacle's offset is negative".to_owned());
+        }
+        obstacles.push(GenerativeObstacle {
+            body: body(o.body)?,
+            offset,
+        });
+    }
+    let starting_shape = dto.starting_shape.map(&mut body).transpose()?;
+    let margin = match dto.margin {
+        Some(m) => {
+            let m = finite(m, "the margin")?;
+            if m < 0.0 {
+                return Err("the margin is negative".to_owned());
+            }
+            Some(m)
+        }
+        None => None,
+    };
+    let mass_target = finite(dto.mass_target, "the mass target")?;
+    if mass_target <= 0.0 {
+        return Err("the mass target is not positive".to_owned());
+    }
+    let safety_factor = finite(dto.safety_factor, "the safety factor")?;
+    if safety_factor <= 0.0 {
+        return Err("the safety factor is not positive".to_owned());
+    }
+    if !(1..=10_000).contains(&dto.iterations) {
+        return Err("the iterations are not from 1 to 10 000".to_owned());
+    }
+
+    if dto.methods.is_empty() {
+        return Err("the generative study has no manufacturing method".to_owned());
+    }
+    let mut kinds = BTreeSet::new();
+    let mut methods = Vec::with_capacity(dto.methods.len());
+    for m in dto.methods {
+        let method = match m {
+            MethodDto::Unrestricted => GenerativeMethod::Unrestricted,
+            MethodDto::Additive {
+                directions,
+                overhang,
+            } => {
+                if overhang != ADDITIVE_OVERHANG {
+                    return Err(format!(
+                        "the additive method's overhang is {overhang}°, not {ADDITIVE_OVERHANG}°"
+                    ));
+                }
+                GenerativeMethod::Additive {
+                    directions: directions_from(directions, "additive", true)?,
+                }
+            }
+            MethodDto::Cutting { directions } => GenerativeMethod::Cutting {
+                directions: directions_from(directions, "cutting", false)?,
+            },
+            MethodDto::Casting {
+                directions,
+                parting,
+            } => GenerativeMethod::Casting {
+                directions: directions_from(directions, "casting", true)?,
+                parting: parting
+                    .map(|p| finite_vector(p, "the parting point"))
+                    .transpose()?,
+            },
+        };
+        if !kinds.insert(method.name()) {
+            return Err(format!("two methods are {}", method.name()));
+        }
+        methods.push(method);
+    }
+
+    let mut names = BTreeSet::new();
+    let mut materials = Vec::with_capacity(dto.materials.len());
+    for mut m in dto.materials {
+        // A study document holds no images.
+        m.appearance.texture = None;
+        let material = material_from(m, &Default::default())?;
+        if !names.insert(material.name.clone()) {
+            return Err(format!("two materials are named \"{}\"", material.name));
+        }
+        if material.density <= 0.0 {
+            return Err(format!("the material \"{}\" has no density", material.name));
+        }
+        if material.mechanical.is_none() {
+            return Err(format!(
+                "the material \"{}\" has no mechanical properties",
+                material.name
+            ));
+        }
+        materials.push(material);
+    }
+
+    Ok(GenerativeSettings {
+        preserve,
+        obstacles,
+        starting_shape,
+        margin,
+        objective: match dto.objective {
+            ObjectiveDto::MaxStiffness => GenerativeObjective::MaxStiffness,
+        },
+        mass_target,
+        safety_factor,
+        member_size: positive_size(dto.member_size, "the member size")?,
+        iterations: dto.iterations,
+        resolution: size_from(
+            dto.resolution.density,
+            dto.resolution.element_size,
+            "the resolution",
+        )?,
+        symmetry: symmetry_from(dto.symmetry)?,
+        methods,
+        materials,
     })
 }
 
@@ -1774,10 +2386,472 @@ mod tests {
         file
     }
 
+    /// A part's study document with a generative study using every setting, and a static
+    /// study.
+    fn generative_sample() -> SimulationFile {
+        let mut file = SimulationFile::new(StudiedModel {
+            kind: ModelKind::Part,
+            path: "bracket.oxyprt".to_owned(),
+            document_id: "66666666-6666-6666-6666-666666666666".to_owned(),
+        });
+        let body = |feature, index| BodyId::new(FeatureId::from_raw(feature), index);
+        let material = |name: &str, density, modulus| Material {
+            name: name.to_owned(),
+            category: "Metal".to_owned(),
+            appearance: oxyde_model::Appearance {
+                color: [200, 203, 208],
+                transparency: 0.0,
+                texture: None,
+            },
+            density,
+            source: oxyde_model::MaterialSource::Library,
+            mechanical: Some(Mechanical::new(modulus, 0.33, 275.0, 310.0)),
+            thermal: None,
+        };
+        let mut study = Study::of_type("Generative 1", StudyType::Generative);
+        study.fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: vec![StudyFace::part(face(3))],
+            suppressed: false,
+        });
+        study.loads.push(Load {
+            name: "Force-1".to_owned(),
+            kind: LoadKind::Force {
+                faces: vec![StudyFace::part(face(9))],
+                newtons: 800.0,
+                direction: ForceDirection::Vector([0.0, -1.0, 0.0]),
+            },
+            suppressed: false,
+        });
+        study.generative = GenerativeSettings {
+            preserve: vec![body(3, 0), body(9, 1)],
+            obstacles: vec![
+                GenerativeObstacle {
+                    body: body(12, 0),
+                    offset: 1.5,
+                },
+                GenerativeObstacle {
+                    body: body(13, 0),
+                    offset: 0.0,
+                },
+            ],
+            starting_shape: Some(body(15, 0)),
+            margin: Some(4.0),
+            objective: GenerativeObjective::MaxStiffness,
+            mass_target: 0.25,
+            safety_factor: 2.5,
+            member_size: Some(4.0),
+            iterations: 120,
+            resolution: MeshSize::ElementSize(0.8),
+            symmetry: Some(SymmetryPlanes {
+                planes: [true, false, false],
+                point: [0.0, 0.0, 0.0],
+            }),
+            methods: vec![
+                GenerativeMethod::Unrestricted,
+                GenerativeMethod::Additive {
+                    directions: vec![AxisDirection::PlusZ, AxisDirection::PlusY],
+                },
+                GenerativeMethod::Cutting {
+                    directions: vec![AxisDirection::MinusY],
+                },
+                GenerativeMethod::Casting {
+                    directions: vec![AxisDirection::PlusY, AxisDirection::MinusX],
+                    parting: Some([0.0, 10.0, 0.0]),
+                },
+            ],
+            materials: vec![
+                material("Aluminium 6061-T6", 2700.0, 68900.0),
+                material("Titanium (Ti-6Al-4V)", 4430.0, 113800.0),
+            ],
+        };
+        file.studies = vec![study, Study::new("Static 1")];
+        file
+    }
+
     fn bytes(file: &SimulationFile) -> Vec<u8> {
         write_simulation(Cursor::new(Vec::new()), file)
             .unwrap()
             .into_inner()
+    }
+
+    #[test]
+    fn generative_studies_round_trip() {
+        let file = generative_sample();
+        assert_eq!(read_simulation(Cursor::new(bytes(&file))).unwrap(), file);
+        assert_eq!(simulation_version(&file), 4);
+
+        // The defaults, with the bodies and the target a study cannot do without.
+        let mut plain = generative_sample();
+        let g = &mut plain.studies[0].generative;
+        *g = GenerativeSettings {
+            preserve: g.preserve.clone(),
+            mass_target: 1.5,
+            ..GenerativeSettings::default()
+        };
+        assert_eq!(read_simulation(Cursor::new(bytes(&plain))).unwrap(), plain);
+        let v = json(&plain);
+        let g = &v["studies"][0]["generative"];
+        // serde_json's maps are sorted.
+        assert_eq!(
+            g.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "iterations",
+                "mass_target",
+                "methods",
+                "objective",
+                "preserve",
+                "resolution",
+                "safety_factor"
+            ]
+        );
+        assert_eq!(
+            g["methods"],
+            serde_json::json!([{ "type": "unrestricted" }])
+        );
+        assert_eq!(g["resolution"], serde_json::json!({ "density": 0.5 }));
+
+        // The splitting of methods into outcomes, one per direction.
+        let methods = &file.studies[0].generative.methods;
+        assert_eq!(
+            methods
+                .iter()
+                .flat_map(GenerativeMethod::outcomes)
+                .collect::<Vec<_>>(),
+            [
+                OutcomeMethod::Unrestricted,
+                OutcomeMethod::Additive {
+                    direction: AxisDirection::PlusZ
+                },
+                OutcomeMethod::Additive {
+                    direction: AxisDirection::PlusY
+                },
+                OutcomeMethod::Cutting {
+                    direction: AxisDirection::MinusY
+                },
+                OutcomeMethod::Casting {
+                    direction: AxisDirection::PlusY,
+                    parting: Some([0.0, 10.0, 0.0])
+                },
+                OutcomeMethod::Casting {
+                    direction: AxisDirection::MinusX,
+                    parting: Some([0.0, 10.0, 0.0])
+                },
+            ]
+        );
+        for d in [
+            AxisDirection::MinusX,
+            AxisDirection::PlusY,
+            AxisDirection::MinusZ,
+        ] {
+            assert_eq!(AxisDirection::new(d.axis(), d.is_positive()), d);
+        }
+    }
+
+    #[test]
+    fn the_generative_json_is_as_documented() {
+        let v = json(&generative_sample());
+        let study = &v["studies"][0];
+        assert_eq!(study["type"], "generative");
+        // No mesh, contacts or overrides: the grid and the materials are in the block.
+        assert!(study.get("mesh").is_none() && study.get("materials").is_none());
+        assert!(v["studies"][1].get("mesh").is_some());
+        assert!(v["studies"][1].get("generative").is_none());
+        let g = &study["generative"];
+        assert_eq!(
+            g["preserve"],
+            serde_json::json!([{ "feature": 3, "index": 0 }, { "feature": 9, "index": 1 }])
+        );
+        assert_eq!(
+            g["obstacles"],
+            serde_json::json!([
+                { "body": { "feature": 12, "index": 0 }, "offset": 1.5 },
+                { "body": { "feature": 13, "index": 0 } }
+            ])
+        );
+        assert_eq!(g["starting_shape"]["feature"], 15);
+        assert_eq!(g["margin"], 4.0);
+        assert_eq!(g["objective"], "max_stiffness");
+        assert_eq!(g["mass_target"], 0.25);
+        assert_eq!(g["safety_factor"], 2.5);
+        assert_eq!(g["member_size"], 4.0);
+        assert_eq!(g["iterations"], 120);
+        assert_eq!(g["resolution"], serde_json::json!({ "element_size": 0.8 }));
+        assert_eq!(
+            g["symmetry"],
+            serde_json::json!({ "planes": ["right"], "point": [0.0, 0.0, 0.0] })
+        );
+        assert_eq!(
+            g["methods"],
+            serde_json::json!([
+                { "type": "unrestricted" },
+                { "type": "additive", "directions": ["+z", "+y"], "overhang": 45.0 },
+                { "type": "cutting", "directions": ["-y"] },
+                { "type": "casting", "directions": ["+y", "-x"], "parting": [0.0, 10.0, 0.0] }
+            ])
+        );
+        let aluminium = &g["materials"][0];
+        assert_eq!(aluminium["name"], "Aluminium 6061-T6");
+        assert_eq!(aluminium["density"], 2700.0);
+        assert_eq!(
+            aluminium["appearance"]["color"],
+            serde_json::json!([200, 203, 208])
+        );
+        assert_eq!(aluminium["mechanical"]["elastic_modulus"], 68900.0);
+        assert_eq!(g["materials"][1]["name"], "Titanium (Ti-6Al-4V)");
+    }
+
+    #[test]
+    fn a_generative_studys_materials_go_without_their_textures() {
+        let plain = generative_sample();
+        let mut file = plain.clone();
+        let texture = oxyde_model::Texture {
+            data: oxyde_model::FileData::new(vec![1, 2, 3]),
+            file_name: "brushed.png".to_owned(),
+            scale: 20.0,
+        };
+        file.studies[0].generative.materials[0].appearance.texture = Some(texture);
+        let v = json(&file);
+        assert!(
+            v["studies"][0]["generative"]["materials"][0]["appearance"]
+                .get("texture")
+                .is_none()
+        );
+        let read = read_simulation(Cursor::new(bytes(&file))).unwrap();
+        assert_eq!(read, plain);
+        // One written by hand has its texture ignored, not refused.
+        let with = edited(&bytes(&plain), SIMULATION, |s| {
+            s.replacen(
+                "\"color\": [",
+                "\"texture\": { \"file\": \"textures/1.png\", \"scale\": 5 }, \"color\": [",
+                1,
+            )
+        });
+        assert_eq!(read_simulation(Cursor::new(with)).unwrap(), read);
+    }
+
+    #[test]
+    fn inconsistent_generative_studies_are_refused() {
+        let good = bytes(&generative_sample());
+        let refused = |edit: &dyn Fn(&mut serde_json::Value), why: &str| {
+            let bytes = edited(&good, SIMULATION, |s| {
+                let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+                edit(&mut v);
+                serde_json::to_string(&v).unwrap()
+            });
+            match read_simulation(Cursor::new(bytes)) {
+                Err(FormatError::InvalidSimulation(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected an invalid study ({why}), got {other:?}"),
+            }
+        };
+        fn study(v: &mut serde_json::Value) -> &mut serde_json::Value {
+            &mut v["studies"][0]
+        }
+        fn block(v: &mut serde_json::Value) -> &mut serde_json::Value {
+            &mut v["studies"][0]["generative"]
+        }
+
+        // What the type takes.
+        refused(
+            &|v| {
+                let g = study(v)["generative"].clone();
+                v["studies"][1]["generative"] = g;
+            },
+            "only a generative study has a generative block",
+        );
+        refused(
+            &|v| {
+                study(v).as_object_mut().unwrap().remove("generative");
+            },
+            "no generative block",
+        );
+        refused(
+            &|v| {
+                v["model"]["kind"] = "assembly".into();
+                v["studies"].as_array_mut().unwrap().truncate(1);
+                for item in ["fixtures", "loads"] {
+                    study(v)[item][0]["faces"][0]["component"] = 1.into();
+                }
+            },
+            "an assembly has a generative study",
+        );
+        refused(
+            &|v| {
+                study(v)["contacts"] =
+                    serde_json::json!([{ "name": "Contact-1", "type": "bonded" }]);
+            },
+            "has contacts",
+        );
+        refused(
+            &|v| study(v)["mesh"] = serde_json::json!({ "density": 0.5 }),
+            "mesh settings",
+        );
+        refused(
+            &|v| {
+                study(v)["materials"] = serde_json::json!({
+                    "Steel": { "elastic_modulus": 200000, "poisson_ratio": 0.3 }
+                });
+            },
+            "material overrides",
+        );
+        refused(
+            &|v| {
+                study(v)["loads"][0] = serde_json::json!({
+                    "name": "Gravity-1", "type": "gravity", "acceleration": [0, -9.81, 0]
+                });
+            },
+            "a generative study has gravity",
+        );
+        refused(
+            &|v| study(v)["topology"] = serde_json::json!({ "target_mass": 0.5 }),
+            "only a topology study",
+        );
+
+        // The bodies.
+        refused(
+            &|v| block(v)["preserve"] = serde_json::json!([]),
+            "no body to preserve",
+        );
+        refused(
+            &|v| block(v)["starting_shape"] = serde_json::json!({ "feature": 9, "index": 1 }),
+            "the body F9.1 is listed twice",
+        );
+        refused(
+            &|v| block(v)["obstacles"][0]["offset"] = (-1.0).into(),
+            "offset is negative",
+        );
+        refused(
+            &|v| block(v)["margin"] = (-1.0).into(),
+            "margin is negative",
+        );
+
+        // The numbers.
+        refused(
+            &|v| block(v)["mass_target"] = 0.0.into(),
+            "mass target is not positive",
+        );
+        refused(
+            &|v| block(v)["safety_factor"] = 0.0.into(),
+            "safety factor is not positive",
+        );
+        refused(
+            &|v| block(v)["member_size"] = (-4.0).into(),
+            "member size is not positive",
+        );
+        refused(&|v| block(v)["iterations"] = 0.into(), "iterations");
+        refused(
+            &|v| block(v)["resolution"] = serde_json::json!({ "density": 0.5, "element_size": 1 }),
+            "the resolution has both",
+        );
+        refused(
+            &|v| block(v)["resolution"] = serde_json::json!({ "density": 1.5 }),
+            "the resolution's density is not between 0 and 1",
+        );
+        refused(
+            &|v| block(v)["symmetry"]["planes"] = serde_json::json!([]),
+            "no plane",
+        );
+
+        // The methods.
+        refused(
+            &|v| block(v)["methods"] = serde_json::json!([]),
+            "no manufacturing method",
+        );
+        refused(
+            &|v| {
+                block(v)["methods"] = serde_json::json!([
+                    { "type": "cutting", "directions": ["+x"] },
+                    { "type": "cutting", "directions": ["+y"] }
+                ]);
+            },
+            "two methods are cutting",
+        );
+        refused(
+            &|v| block(v)["methods"][1]["directions"] = serde_json::json!([]),
+            "the additive method has no direction",
+        );
+        refused(
+            &|v| block(v)["methods"][1]["directions"] = serde_json::json!(["+z", "+z"]),
+            "the direction +z twice",
+        );
+        // A cutting direction's sign does not count; an additive one's does.
+        refused(
+            &|v| block(v)["methods"][2]["directions"] = serde_json::json!(["-y", "+y"]),
+            "the cutting method has the direction +y twice",
+        );
+        refused(
+            &|v| block(v)["methods"][1]["overhang"] = 30.0.into(),
+            "overhang is 30°",
+        );
+
+        // The materials.
+        refused(
+            &|v| block(v)["materials"][1]["name"] = "Aluminium 6061-T6".into(),
+            "two materials",
+        );
+        refused(
+            &|v| block(v)["materials"][1]["density"] = 0.0.into(),
+            "has no density",
+        );
+        refused(
+            &|v| {
+                block(v)["materials"][1]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("mechanical");
+            },
+            "no mechanical properties",
+        );
+        // A mechanical block no solver could use counts as none.
+        refused(
+            &|v| block(v)["materials"][1]["mechanical"]["poisson_ratio"] = 0.7.into(),
+            "no mechanical properties",
+        );
+
+        // What is not a number, a direction or an objective is not JSON of a study.
+        for edit in [
+            (|v: &mut serde_json::Value| block(v)["objective"] = "min_mass".into())
+                as fn(&mut serde_json::Value),
+            |v| block(v)["methods"][2]["directions"] = serde_json::json!(["y"]),
+            |v| {
+                block(v).as_object_mut().unwrap().remove("mass_target");
+            },
+        ] {
+            let bytes = edited(&good, SIMULATION, |s| {
+                let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+                edit(&mut v);
+                serde_json::to_string(&v).unwrap()
+            });
+            assert!(matches!(
+                read_simulation(Cursor::new(bytes)),
+                Err(FormatError::Json { .. })
+            ));
+        }
+
+        // Hand-written: the defaults, and the overhang may be left out.
+        let read = read_simulation(Cursor::new(edited(&good, SIMULATION, |s| {
+            let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+            let g = block(&mut v).as_object_mut().unwrap();
+            for key in ["safety_factor", "iterations", "resolution", "objective"] {
+                g.remove(key);
+            }
+            g["methods"][1].as_object_mut().unwrap().remove("overhang");
+            serde_json::to_string(&v).unwrap()
+        })))
+        .unwrap();
+        let g = &read.studies[0].generative;
+        let defaults = GenerativeSettings::default();
+        assert_eq!(
+            (g.safety_factor, g.iterations, g.resolution, g.objective),
+            (
+                defaults.safety_factor,
+                defaults.iterations,
+                defaults.resolution,
+                defaults.objective
+            )
+        );
+        assert_eq!(g.methods, generative_sample().studies[0].generative.methods);
     }
 
     fn json(file: &SimulationFile) -> serde_json::Value {
@@ -1923,6 +2997,7 @@ mod tests {
 
     #[test]
     fn documents_are_written_with_the_oldest_version_that_holds_them() {
+        assert_eq!(simulation_version(&generative_sample()), 4);
         let mut file = sample();
         assert_eq!(simulation_version(&file), 3);
         file.studies.truncate(4);
@@ -1969,7 +3044,7 @@ mod tests {
         let good = bytes(&sample());
         let newer = edited(&good, MANIFEST, |m| {
             m.replace(
-                &format!("\"format_version\": {SIMULATION_FORMAT_VERSION}"),
+                &format!("\"format_version\": {}", simulation_version(&sample())),
                 &format!("\"format_version\": {}", SIMULATION_FORMAT_VERSION + 1),
             )
         });
