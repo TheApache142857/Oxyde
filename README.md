@@ -167,7 +167,8 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-assembly` | Assemblies: components, mates and the 3D mate solver, bill of materials |
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking; the Render tab's path tracer |
-| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, topology optimization, result plots; depends on no other crate |
+| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, topology optimization, generative design on a grid of voxels, result plots; depends on no other crate |
+| `oxyde-sim-gpu` | Generative design's solve on a graphics card: WGSL compute shaders through `wgpu`, the CPU's solve as fallback and reference |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-tests` | End-to-end tests: the model driving OpenCASCADE |

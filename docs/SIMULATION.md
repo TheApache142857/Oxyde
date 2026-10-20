@@ -805,3 +805,48 @@ on most cards, so the GPU works in single precision, which suits the preconditio
 the conjugate gradients built to reach the same residual; sums ordered by hand so that a
 run repeats exactly. The CPU solver stays: the fallback where no usable GPU is found, and
 the reference the GPU's results are tested against.
+
+**Built (October 2026): the GPU solver**, `oxyde-sim-gpu`, the solve only, not yet in the
+application.
+
+- **The seam**: `oxyde_sim::generative::Backend` solves an optimization iteration's system;
+  `generate_on` takes one (`generate` is the CPU's, `CpuBackend` the same as a backend). A
+  backend sees the system through `System`: each voxel's stiffness and kind (brick,
+  Laplacian or nothing), the brick and its Laplacian, the held nodes' projectors and
+  stiffness, the nodes no voxel touches, the loads, and `System::plan`, the multigrid
+  hierarchy the CPU would use in plain arrays (`Plan`: per coarse level each cell's full or
+  scalar matrix, the nodes' block Jacobi inverses, the smoothing interval, the coarsening;
+  the coarsest level inverted), coarsened here to 64 nodes so its inverse is small.
+- **On the card** (WGSL through the `wgpu` `eframe` brings, with the same features, so no
+  crate is added; Vulkan on Windows), the whole solve: the conjugate gradients in double
+  precision (their fine product gathered node by node as on the CPU, vectors, dot products in
+  two passes summed in a fixed order, the scalars kept on the card) and the multigrid cycle
+  that preconditions them in single (the fine level's products and Chebyshev smoothing,
+  each step's correction formed in the product's pass, the coarse levels' products from
+  their cells' matrices, restriction, prolongation, the coarsest level by its inverse). The
+  residual is read back every eight iterations. The plan is still built on the CPU and
+  uploaded each iteration.
+- **Single precision for the conjugate gradients failed.** A node's rows of `K u` sum terms
+  near a million newtons down to loads of tens, a cancellation single precision cannot
+  follow far: on the test bracket its displacements were a few tenths of a percent from
+  the CPU's while its recursive residual reported 10⁻⁷, and on the OpenCASCADE bracket at
+  67 000 voxels (preserve rings eight thousand times as stiff as the grey design, fixed
+  bores) its solves stalled. Refining in double precision on the CPU (the true residual
+  there, a correction on the card) did not save it: each correction's own recursive residual
+  drifted the same way, and the true one went up. Double precision for the conjugate
+  gradients, single for the preconditioner, is what GPU codes for topology optimization do;
+  a card without double precision in its shaders (`SHADER_F64`; Apple's) is refused, and the
+  CPU solves there.
+- **Tests** (`oxyde-sim-gpu`, on the card when there is one, skipped with a note when there
+  is none, failing when a card refuses the solver): every system of twelve iterations solved
+  on the card and on the CPU from the same start, on three grids (one level; several; a post
+  across the bracket), the displacements the same to 10⁻⁵ of the largest (they come out to
+  10⁻⁸); a whole outcome on the card with the CPU's compliance to 2 % and its shape but for
+  under 2 % of the voxels; the same outcome twice on one card.
+- **Timings** (`generative_timings` with `OXYDE_GENERATIVE_GPU`, the bracket of the CPU
+  timings, an RTX 3080): at 0.5, settled after 138 iterations in 58 s (0.42 s an iteration,
+  4.4 times the CPU's 1.84 s; 298.5 N·mm, the CPU's 298.0), the same conjugate gradient
+  iterations a solve. Of an iteration's 0.42 s, the plan takes 0.12 s on the CPU, the upload
+  0.03 s, the solve on the card 0.15 to 0.19 s (some 3.5 ms a conjugate gradient iteration)
+  and the optimization's own steps on the CPU 0.09 s: the Galerkin products and the element
+  energies on the card are what would pay next.

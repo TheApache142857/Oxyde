@@ -5,8 +5,9 @@
 //! An ignored test times the same bracket at a resolution:
 //! `cargo test -p oxyde-tests --test generative -- --ignored --nocapture`, with
 //! `OXYDE_GENERATIVE_DENSITY` (the resolution, 0 coarse to 1 fine; 0.5 by default),
-//! `OXYDE_GENERATIVE_ITERATIONS` (30 by default), `OXYDE_GENERATIVE_THREADS` and
-//! `OXYDE_GENERATIVE_OBJ` (a file to write the outcome's smoothed surface to).
+//! `OXYDE_GENERATIVE_ITERATIONS` (30 by default), `OXYDE_GENERATIVE_THREADS`,
+//! `OXYDE_GENERATIVE_GPU` (solve on the graphics card) and `OXYDE_GENERATIVE_OBJ` (a file to
+//! write the outcome's smoothed surface to).
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -17,10 +18,11 @@ use oxyde_kernel::{Kernel, Mesh, SurfaceKind};
 use oxyde_model::{Extrude, ExtrudeOp, FeatureKind, Part, Sketch, SketchPlane, StandardPlane};
 use oxyde_occt::OcctKernel;
 use oxyde_sim::generative::{
-    DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, generate, surface,
-    voxel_size,
+    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, generate,
+    generate_on, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, Fixture, FixtureKind, Load, LoadKind, SolveOptions, SurfaceMesh};
+use oxyde_sim_gpu::GpuBackend;
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 
@@ -285,12 +287,18 @@ fn generative_timings() {
         threads,
         ..SolveOptions::default()
     };
-    let outcome: Outcome = generate(
+    let mut card = env("OXYDE_GENERATIVE_GPU").map(|_| GpuBackend::new().unwrap());
+    if let Some(card) = &card {
+        eprintln!("on {}", card.name());
+    }
+    let backend = card.as_mut().map(|c| c as &mut dyn Backend);
+    let outcome: Outcome = generate_on(
         &grid,
         &study,
         Method::Unrestricted,
         &STEEL,
         &options,
+        backend,
         &cancel,
         &progress,
     )

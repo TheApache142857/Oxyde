@@ -33,6 +33,7 @@ mod multigrid;
 mod surface;
 
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
+pub use multigrid::{Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved};
 pub use surface::surface;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -339,6 +340,133 @@ impl std::fmt::Display for GenerativeError {
     }
 }
 
+/// What a cell is in a [`System`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellKind {
+    /// No element: no material at all.
+    None,
+    /// The brick scaled by the voxel's stiffness.
+    Brick,
+    /// The brick's Laplacian, the same for each direction, scaled the same way: a void
+    /// voxel.
+    Laplacian,
+}
+
+/// The system an optimization iteration solves, `K u = f`, as a [`Backend`] sees it: each
+/// voxel's brick (or, void, its Laplacian) scaled by its stiffness, assembled over the
+/// grid's nodes (node `(i, j, k)` is `i + (nx + 1) (j + (ny + 1) k)`, three unknowns each);
+/// a held node keeping only the motions its fixtures allow, `P K P + d (I − P)`, `P` its
+/// projector and `d` [`System::held_stiffness`]; a node no voxel touches left out (its rows
+/// the identity, its value 0).
+pub struct System<'a> {
+    fine: &'a Fine<'a>,
+    loads: Vec<f64>,
+    threads: usize,
+}
+
+impl System<'_> {
+    /// Voxels along X, Y and Z.
+    pub fn cells(&self) -> [usize; 3] {
+        self.fine.dims().cells
+    }
+
+    /// N/mm per voxel: what its brick or Laplacian is scaled by.
+    pub fn stiffness(&self) -> &[f64] {
+        self.fine.stiffness()
+    }
+
+    pub fn kind(&self, cell: usize) -> CellKind {
+        match self.fine.scalar_cell(cell) {
+            None => CellKind::None,
+            Some(false) => CellKind::Brick,
+            Some(true) => CellKind::Laplacian,
+        }
+    }
+
+    /// The brick for a unit stiffness, 24 × 24, row-major, unknowns corner by corner (corner
+    /// `a` at `(a & 1, (a >> 1) & 1, (a >> 2) & 1)`), x y z each.
+    pub fn brick(&self) -> &[f64; brick::SIZE] {
+        &self.fine.brick().k
+    }
+
+    /// Its Laplacian for a unit stiffness, 8 × 8, by corner.
+    pub fn laplacian(&self) -> &[f64; 64] {
+        &self.fine.brick().laplacian
+    }
+
+    /// Per node: the index of its projector, or `u32::MAX` when it is free.
+    pub fn held(&self) -> &[u32] {
+        self.fine.held()
+    }
+
+    /// The motions each held node keeps, `I` less its held directions, row-major.
+    pub fn projectors(&self) -> &[[f64; 9]] {
+        self.fine.projectors()
+    }
+
+    /// The stiffness of node `node`'s held directions.
+    pub fn held_stiffness(&self, node: usize) -> f64 {
+        self.fine.held_stiffness(node)
+    }
+
+    /// Per node: whether a voxel with an element touches it.
+    pub fn active(&self) -> &[bool] {
+        self.fine.active_nodes()
+    }
+
+    /// The loads, N, three per node, already kept to the allowed motions.
+    pub fn loads(&self) -> &[f64] {
+        &self.loads
+    }
+
+    /// The multigrid hierarchy the CPU would use, coarsened until a level has at most
+    /// `coarsest_nodes` nodes, in plain arrays.
+    pub fn plan(&self, coarsest_nodes: usize) -> Result<Plan, GenerativeError> {
+        multigrid::plan(self.fine, coarsest_nodes, self.threads)
+    }
+}
+
+/// Solves optimization iterations' systems in place of the CPU's multigrid: a GPU's.
+pub trait Backend {
+    /// Solves `system` from `x` (the last solve's displacements, kept to the allowed
+    /// motions) to a residual of `tolerance` times the loads, in at most `max_iterations`
+    /// conjugate gradient iterations.
+    fn solve(
+        &mut self,
+        system: &System<'_>,
+        x: &mut [f64],
+        tolerance: f64,
+        max_iterations: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Solved, GenerativeError>;
+}
+
+/// The CPU's own multigrid as a [`Backend`]: the reference other backends are tested
+/// against.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuBackend;
+
+impl Backend for CpuBackend {
+    fn solve(
+        &mut self,
+        system: &System<'_>,
+        x: &mut [f64],
+        tolerance: f64,
+        max_iterations: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Solved, GenerativeError> {
+        multigrid::solve(
+            system.fine,
+            &system.loads,
+            x,
+            tolerance,
+            max_iterations,
+            cancel,
+            system.threads,
+        )
+    }
+}
+
 /// What a voxel is to the optimization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -359,6 +487,24 @@ pub fn generate(
     method: Method,
     material: &Elastic,
     options: &SolveOptions,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f64),
+) -> Result<Outcome, GenerativeError> {
+    generate_on(
+        grid, study, method, material, options, None, cancel, progress,
+    )
+}
+
+/// [`generate`], each iteration's system solved by `backend` (a GPU's) instead of the CPU's
+/// multigrid when there is one.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_on(
+    grid: &Grid,
+    study: &GenerativeStudy,
+    method: Method,
+    material: &Elastic,
+    options: &SolveOptions,
+    mut backend: Option<&mut dyn Backend>,
     cancel: &AtomicBool,
     progress: &dyn Fn(f64),
 ) -> Result<Outcome, GenerativeError> {
@@ -484,19 +630,39 @@ pub fn generate(
             &projectors,
             SCALAR_BELOW * modulus * h,
         );
-        let solved = multigrid::solve(
-            &fine,
-            &loads,
-            &mut displacement,
-            options.tolerance.max(if beta < BETA_MAX {
-                EARLY_TOLERANCE
-            } else {
-                SOLVE_TOLERANCE
-            }),
-            SOLVE_ITERATIONS,
-            cancel,
-            threads,
-        )?;
+        let tolerance = options.tolerance.max(if beta < BETA_MAX {
+            EARLY_TOLERANCE
+        } else {
+            SOLVE_TOLERANCE
+        });
+        let solved = match backend.as_deref_mut() {
+            None => multigrid::solve(
+                &fine,
+                &loads,
+                &mut displacement,
+                tolerance,
+                SOLVE_ITERATIONS,
+                cancel,
+                threads,
+            )?,
+            Some(backend) => {
+                fine.project(&mut displacement);
+                let mut kept = loads.clone();
+                fine.project(&mut kept);
+                let system = System {
+                    fine: &fine,
+                    loads: kept,
+                    threads,
+                };
+                backend.solve(
+                    &system,
+                    &mut displacement,
+                    tolerance,
+                    SOLVE_ITERATIONS,
+                    cancel,
+                )?
+            }
+        };
         solver_iterations += solved.iterations;
         let energies = element_energies(dims, &brick, &displacement, &stiffness, threads);
         // The work of the loads on the displacements solved.

@@ -1,0 +1,12 @@
+[package]
+name = "oxyde-sim-gpu"
+description = "Generative design's solver on a graphics card: oxyde-sim's multigrid conjugate gradients as WGSL compute shaders, through wgpu."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxyde-sim = { workspace = true }
+wgpu = { workspace = true }

@@ -35,8 +35,10 @@ const NONE: u32 = u32::MAX;
 /// A level of at most this many nodes is factored and solved directly.
 const COARSEST_NODES: usize = 220;
 /// Chebyshev smoothing: degree, and how far under the top of the spectrum it damps.
-const DEGREE: usize = 2;
-const SPECTRUM_RATIO: f64 = 30.0;
+pub const SMOOTHING_DEGREE: usize = 2;
+const DEGREE: usize = SMOOTHING_DEGREE;
+/// How far under the top of the spectrum the smoothing interval reaches: `upper / this`.
+pub const SPECTRUM_RATIO: f64 = 30.0;
 /// Over the finest level's bound (the brick's own), and over the coarse levels' estimate.
 const SPECTRUM_MARGIN: f64 = 1.1;
 const COARSE_MARGIN: f64 = 1.2;
@@ -351,6 +353,39 @@ impl<'a> Fine<'a> {
         }
     }
 
+    pub(crate) fn dims(&self) -> Dims {
+        self.dims
+    }
+
+    pub(crate) fn stiffness(&self) -> &[f64] {
+        self.stiffness
+    }
+
+    /// Whether cell `e` is a brick (`Some(false)`), a Laplacian (`Some(true)`) or nothing.
+    pub(crate) fn scalar_cell(&self, e: usize) -> Option<bool> {
+        match self.kind[e] {
+            Kind::None => None,
+            Kind::Full => Some(false),
+            Kind::Scalar => Some(true),
+        }
+    }
+
+    pub(crate) fn brick(&self) -> &Brick {
+        self.brick
+    }
+
+    pub(crate) fn held(&self) -> &[u32] {
+        self.held
+    }
+
+    pub(crate) fn projectors(&self) -> &[[f64; 9]] {
+        self.projectors
+    }
+
+    pub(crate) fn active_nodes(&self) -> &[bool] {
+        &self.active
+    }
+
     fn projector(&self, n: usize) -> Option<&[f64; 9]> {
         let p = self.held[n];
         (p != NONE)
@@ -359,7 +394,7 @@ impl<'a> Fine<'a> {
     }
 
     /// The stiffness given to node `n`'s held directions: its own diagonal.
-    fn held_stiffness(&self, n: usize) -> f64 {
+    pub(crate) fn held_stiffness(&self, n: usize) -> f64 {
         let sum: f64 = self
             .dims
             .cells_around(n)
@@ -1118,6 +1153,31 @@ impl Dense {
         ))
     }
 
+    /// The matrix's inverse, row-major, worked out column by column.
+    fn inverse(&self) -> Vec<f64> {
+        let n = self.n;
+        let mut out = vec![0.0; n * n];
+        let mut e = vec![0.0; n];
+        let mut col = vec![0.0; n];
+        for j in 0..n {
+            e.fill(0.0);
+            e[j] = 1.0;
+            self.solve(&e, &mut col);
+            for i in 0..n {
+                out[i * n + j] = col[i];
+            }
+        }
+        // Exactly symmetric, as the matrix is.
+        for i in 0..n {
+            for j in 0..i {
+                let m = 0.5 * (out[i * n + j] + out[j * n + i]);
+                out[i * n + j] = m;
+                out[j * n + i] = m;
+            }
+        }
+        out
+    }
+
     fn solve(&self, b: &[f64], x: &mut [f64]) {
         let (n, l) = (self.n, &self.l);
         for i in 0..n {
@@ -1181,7 +1241,11 @@ struct Hierarchy {
 }
 
 impl Hierarchy {
-    fn new(fine: &Fine, threads: usize) -> Result<Hierarchy, GenerativeError> {
+    fn new(
+        fine: &Fine,
+        coarsest_nodes: usize,
+        threads: usize,
+    ) -> Result<Hierarchy, GenerativeError> {
         let mut coarse: Vec<Stored> = Vec::new();
         let mut smoothing: Vec<Smoothing> = Vec::new();
         let mut factors: Vec<[usize; 3]> = Vec::new();
@@ -1191,7 +1255,7 @@ impl Hierarchy {
                 None => fine,
             };
             let dims = op.dims();
-            if dims.node_count() <= COARSEST_NODES || dims.cells == [1, 1, 1] {
+            if dims.node_count() <= coarsest_nodes || dims.cells == [1, 1, 1] {
                 break;
             }
             let dinv = diagonal_inverses(op);
@@ -1320,9 +1384,107 @@ fn axpy(y: &mut [f64], c: f64, x: &[f64], threads: usize) {
     });
 }
 
+/// A solve's multigrid hierarchy in plain arrays, for a backend that runs the cycle
+/// elsewhere: the levels the CPU's own solve would use, coarsened down to a size given, and
+/// the coarsest one inverted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Plan {
+    /// From the finest (whose operator is the system itself: no matrices here) to the
+    /// coarsest.
+    pub levels: Vec<PlanLevel>,
+    /// The coarsest level's matrix inverted, row-major, three rows per node.
+    pub coarsest_inverse: Vec<f64>,
+}
+
+/// A level of a [`Plan`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlanLevel {
+    /// Cells along each axis.
+    pub cells: [usize; 3],
+    /// Per cell (empty on the finest level): `u32::MAX` for none, the index of its full
+    /// matrix, or, with [`PlanLevel::SCALAR`] set, the index of its scalar one.
+    pub cell: Vec<u32>,
+    /// 24 × 24 per full cell, row-major, unknowns corner by corner (x fastest), x y z each.
+    pub matrices: Vec<f32>,
+    /// 8 × 8 per scalar cell: its matrix is this one for each direction.
+    pub scalars: Vec<f32>,
+    /// Per node (empty on the finest level): whether a cell with a matrix touches it.
+    pub active: Vec<bool>,
+    /// Per node: the inverse of its 3 × 3 diagonal block, for block Jacobi (empty on the
+    /// coarsest level).
+    pub dinv: Vec<[f64; 9]>,
+    /// The top of the smoothing interval: Chebyshev of degree [`SMOOTHING_DEGREE`] over
+    /// `upper / SPECTRUM_RATIO` to `upper` (0 on the coarsest level).
+    pub upper: f64,
+    /// To the next level: 2 along the axes halved, 1 along the others.
+    pub factor: [usize; 3],
+}
+
+impl PlanLevel {
+    pub const SCALAR: u32 = 1 << 31;
+}
+
+/// The plan of `fine`'s solve, coarsened until a level has at most `coarsest_nodes` nodes.
+pub(crate) fn plan(
+    fine: &Fine,
+    coarsest_nodes: usize,
+    threads: usize,
+) -> Result<Plan, GenerativeError> {
+    let hierarchy = Hierarchy::new(fine, coarsest_nodes, threads)?;
+    let mut levels = Vec::with_capacity(hierarchy.coarse.len() + 1);
+    for l in 0..=hierarchy.coarse.len() {
+        let (cells, cell, matrices, scalars, active) = if l == 0 {
+            (
+                fine.dims.cells,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let c = &hierarchy.coarse[l - 1];
+            let cell = c
+                .kind
+                .iter()
+                .zip(&c.index)
+                .map(|(k, i)| match k {
+                    Kind::None => NONE,
+                    Kind::Full => *i,
+                    Kind::Scalar => *i | PlanLevel::SCALAR,
+                })
+                .collect();
+            (
+                c.dims.cells,
+                cell,
+                c.matrices.clone(),
+                c.scalars.clone(),
+                c.active.clone(),
+            )
+        };
+        let (dinv, upper) = hierarchy
+            .smoothing
+            .get(l)
+            .map_or((Vec::new(), 0.0), |s| (s.dinv.clone(), s.upper));
+        levels.push(PlanLevel {
+            cells,
+            cell,
+            matrices,
+            scalars,
+            active,
+            dinv,
+            upper,
+            factor: hierarchy.factors.get(l).copied().unwrap_or([1; 3]),
+        });
+    }
+    Ok(Plan {
+        levels,
+        coarsest_inverse: hierarchy.coarsest.inverse(),
+    })
+}
+
 /// How a solve went.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Solved {
+pub struct Solved {
     pub iterations: usize,
     /// The residual reached, a fraction of the loads.
     pub residual: f64,
@@ -1341,7 +1503,7 @@ pub(crate) fn solve(
     threads: usize,
 ) -> Result<Solved, GenerativeError> {
     let n = fine.dims.node_count() * 3;
-    let mut hierarchy = Hierarchy::new(fine, threads)?;
+    let mut hierarchy = Hierarchy::new(fine, COARSEST_NODES, threads)?;
     fine.project(x);
     let mut loads = b.to_vec();
     fine.project(&mut loads);
