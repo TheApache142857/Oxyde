@@ -23,6 +23,12 @@ release yet; the git history has every detail.
   (Design conditions › Add a load case) give the loads a part meets at different times, each
   with its own fixtures: the outcomes are as stiff as can be for them all. In files:
   `load_cases` in the study's `generative` block (FORMAT.md §8).
+- **Minimize mass, a displacement limit, milling.** *Minimize mass* (Objectives) finds the
+  lightest shape whose stress stays under the material's strength over the safety factor,
+  and whose displacement stays under a limit when one is set; *Maximize stiffness* still
+  takes a mass target. *Milling* grows shapes a 3-axis mill reaches from the side picked,
+  no pocket narrower than the tool. In files: `objective: "min_mass"`, `displacement_limit`
+  and the `milling` method (FORMAT.md §8).
 - **Create Part.** The outcome picked becomes a part file of its own: its surface made a
   solid, joined to the exact preserve bodies, the obstacles cut away, in the outcome's
   material, ready to be refined with features or studied in the Simulation tab. The part

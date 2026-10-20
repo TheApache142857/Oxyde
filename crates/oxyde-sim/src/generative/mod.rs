@@ -7,6 +7,12 @@
 //! - **The elements** are the voxels themselves, eight-node bricks all alike, solved by
 //!   conjugate gradients preconditioned by geometric multigrid, the finest level never
 //!   assembled (`multigrid`): that is what lets the grid be fine.
+//! - **Minimize mass** ([`Objective::MinMass`]) keeps the estimated von Mises stress under
+//!   the material's strength over the safety factor (and the displacement under a limit):
+//!   the stresses at the voxels' centres relaxed by the density (`ρ^½ σ`, so void voxels
+//!   carry none) and gathered by a p-norm (p = 8) scaled to the largest, its slopes by an
+//!   adjoint solve per load case, and the design moved by the method of moving asymptotes
+//!   (`mma`) towards the least mass that keeps them.
 //! - **The optimization** is SIMP as in [`crate::topology`]: a design density per voxel (or
 //!   per group of voxels the manufacturing ties together), averaged over a sphere (the
 //!   density filter: no member thinner than the minimum thickness), then pushed towards
@@ -34,6 +40,7 @@ mod additive;
 mod brick;
 mod decimate;
 mod grid;
+mod mma;
 mod multigrid;
 mod surface;
 
@@ -82,6 +89,16 @@ const SETTLED_CHANGE: f64 = 0.01;
 const STEADY_COMPLIANCE: f64 = 5e-3;
 const STEADY_OVER: usize = 10;
 const STEADY_MASS: f64 = 0.01;
+/// Minimize mass's stress measure: the relaxation exponent (`ρ^q σ`) and the p-norm's.
+const STRESS_RELAXATION: f64 = 0.5;
+const NORM_POWER: i32 = 8;
+/// How far the p-norm's scaling to the largest value moves each iteration (Le et al. 2010).
+const NORMALIZATION_DAMPING: f64 = 0.5;
+/// MMA's move limit, and from a sharpness of 8 on.
+const MMA_MOVE: f64 = 0.1;
+const LATE_MMA_MOVE: f64 = 0.05;
+/// A limit counts as met within this share of it.
+const LIMIT_TOLERANCE: f64 = 0.01;
 /// The densities are kept every this many iterations, for the slider through them.
 pub const SNAPSHOT_EVERY: usize = 10;
 /// The iterations' solves stop at this residual, a fraction of the loads (as topology
@@ -125,6 +142,21 @@ pub struct LoadCase {
     pub loads: Vec<usize>,
 }
 
+/// What a generative study looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Objective {
+    /// The stiffest shape weighing [`GenerativeStudy::mass_target`].
+    #[default]
+    MaxStiffness,
+    /// The lightest shape whose estimated von Mises stress stays under the material's
+    /// strength over `safety_factor` and, when there is a `displacement_limit` (mm), whose
+    /// displacement stays under it.
+    MinMass {
+        safety_factor: f64,
+        displacement_limit: Option<f64>,
+    },
+}
+
 /// What a generative study asks, for one material and one way of making it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerativeStudy {
@@ -135,7 +167,8 @@ pub struct GenerativeStudy {
     /// The load cases, each carried in turn: the stiffest shape for them all, its
     /// compliance their sum. None: one case of every fixture and load.
     pub load_cases: Vec<LoadCase>,
-    /// kg: the outcome's mass, preserve voxels included.
+    pub objective: Objective,
+    /// kg: the outcome's mass, preserve voxels included ([`Objective::MaxStiffness`]).
     pub mass_target: f64,
     /// mm: the thinnest member wanted; `None` for three voxels.
     pub member_size: Option<f64>,
@@ -185,6 +218,26 @@ pub enum Method {
     /// Printed in layers along `direction`, from a build plate at the grid's end behind it:
     /// nothing overhangs more than 45° from the direction.
     Additive { direction: Direction },
+    /// 3-axis milled from the side `direction` points to: the tool reaches every face from
+    /// there, so the shape has no undercut seen from it (a one-way pull towards the tool),
+    /// and no pocket or gap is narrower than `tool_diameter` (mm; the density filter's
+    /// radius at least half of it).
+    Milling {
+        direction: Direction,
+        tool_diameter: Option<f64>,
+    },
+}
+
+impl Method {
+    /// The one-way pull a method makes the shape keep, with its parting point: casting's
+    /// own, or milling's, towards the tool.
+    fn pull(self) -> Option<(Direction, Option<V3>)> {
+        match self {
+            Method::Casting { direction, parting } => Some((direction, parting)),
+            Method::Milling { direction, .. } => Some((direction, None)),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Method {
@@ -213,6 +266,12 @@ impl std::fmt::Display for Method {
             Method::Additive { direction } => write!(
                 f,
                 "additive, printed towards {}{}",
+                if direction.positive { "+" } else { "−" },
+                axis(direction.axis)
+            ),
+            Method::Milling { direction, .. } => write!(
+                f,
+                "3-axis milling from {}{}",
                 if direction.positive { "+" } else { "−" },
                 axis(direction.axis)
             ),
@@ -301,6 +360,9 @@ pub enum GenerativeError {
     },
     /// The material has no usable modulus, Poisson's ratio or density.
     BadMaterial,
+    /// Minimize mass needs the material's strength (yield, else tensile), and a positive
+    /// safety factor and displacement limit.
+    NoStrength,
     /// The method cannot make the design space: a preserve body and an obstacle in line
     /// along its direction, the one behind the other, at `at` (mm).
     NotMakeable {
@@ -365,6 +427,10 @@ impl std::fmt::Display for GenerativeError {
             GenerativeError::BadMaterial => {
                 write!(f, "the material has no usable stiffness or density")
             }
+            GenerativeError::NoStrength => write!(
+                f,
+                "minimize mass needs the material's yield or tensile strength, and a positive safety factor"
+            ),
             GenerativeError::NotMakeable { method, at } => write!(
                 f,
                 "{method} cannot make this design space: a preserve body and an obstacle are in line along its direction near ({:.1}, {:.1}, {:.1}) mm",
@@ -376,7 +442,7 @@ impl std::fmt::Display for GenerativeError {
             ),
             GenerativeError::PullAcrossSymmetry => write!(
                 f,
-                "the casting direction crosses a symmetry plane, and a mould pulled one way cannot give a mirrored shape: pull both ways from that plane, or take it off"
+                "the casting or milling direction crosses a symmetry plane, and a shape made from one side cannot be mirrored across it: pull both ways from that plane, or take it off"
             ),
             GenerativeError::NotConverged {
                 iterations,
@@ -576,21 +642,29 @@ pub fn generate_on(
     let state = states(grid, method, study.symmetry.as_ref(), symmetric)?;
     let (group, groups) = groups(grid, method, &state, symmetric);
 
+    // A milling tool's radius too: no pocket narrower than the tool.
+    let tool = match method {
+        Method::Milling {
+            tool_diameter: Some(d),
+            ..
+        } if d.is_finite() && d > 0.0 => 0.5 * d,
+        _ => 0.0,
+    };
     let radius = study
         .member_size
         .filter(|d| d.is_finite() && *d > 0.0)
         .map_or(1.5 * h, |d| 0.5 * d)
-        .max(1.5 * h);
+        .max(1.5 * h)
+        .max(tool);
     // 2-axis cutting filters across the cut only, so whole columns stay alike.
     let flat = match method {
         Method::Cutting { axis } => Some(axis.min(2)),
         _ => None,
     };
     let filter = Filter::new(grid, &state, radius, flat, threads);
-    let chains = match method {
-        Method::Casting { direction, parting } => Some(casting_chains(grid, direction, parting)),
-        _ => None,
-    };
+    let chains = method
+        .pull()
+        .map(|(direction, parting)| casting_chains(grid, direction, parting));
     let printing = match method {
         Method::Additive { direction } => Some(additive::Printing::new(grid, direction)),
         _ => None,
@@ -603,9 +677,28 @@ pub fn generate_on(
     let min = solid as f64 * voxel_mass;
     let max = (solid + free) as f64 * voxel_mass;
     let target = study.mass_target;
-    if !(target > min && target < max) {
-        return Err(GenerativeError::BadTarget { min, max });
-    }
+    // Minimize mass: the stress the material may take, and the displacement limit.
+    let limits = match study.objective {
+        Objective::MaxStiffness => {
+            if !(target > min && target < max) {
+                return Err(GenerativeError::BadTarget { min, max });
+            }
+            None
+        }
+        Objective::MinMass {
+            safety_factor,
+            displacement_limit,
+        } => {
+            let stress = material.yield_strength / safety_factor;
+            let displacement = displacement_limit.filter(|d| d.is_finite() && *d > 0.0);
+            if !(stress.is_finite() && stress > 0.0)
+                || displacement_limit.is_some() && displacement.is_none()
+            {
+                return Err(GenerativeError::NoStrength);
+            }
+            Some((stress, displacement))
+        }
+    };
 
     let brick = Brick::new(material.poisson);
     let dims = grid.dims();
@@ -637,12 +730,24 @@ pub fn generate_on(
         return Err(GenerativeError::NoLoads);
     }
 
-    // The design starts uniform, at the density whose projection meets the target.
+    // The design starts uniform: at the density whose projection meets the target, or solid
+    // (where the stresses are least) to minimize mass.
     let mut beta = 1.0;
-    let share = (target - min) / (max - min);
-    let t = (beta * ETA).tanh();
-    let start = (ETA + ((2.0 * share - 1.0) * t).atanh() / beta).clamp(DESIGN_MIN, 1.0);
+    let start = match limits {
+        None => {
+            let share = (target - min) / (max - min);
+            let t = (beta * ETA).tanh();
+            (ETA + ((2.0 * share - 1.0) * t).atanh() / beta).clamp(DESIGN_MIN, 1.0)
+        }
+        Some(_) => 1.0,
+    };
     let mut x = vec![start; groups];
+    let mut mma = mma::Mma::default();
+    // The adjoint solutions, kept to start the next ones from: per constraint, per case.
+    let mut adjoints = vec![vec![vec![0.0; 3 * nodes]; cases.len()]; 2];
+    let mut stress_scale = 1.0;
+    let mut displacement_scale = 1.0;
+    let mut feasible = true;
     let mut displacements = vec![vec![0.0; 3 * nodes]; cases.len()];
     let iterations = study.max_iterations.max(1);
     let mut history: Vec<GenerativeStep> = Vec::new();
@@ -791,22 +896,127 @@ pub fn generate_on(
             }
             out
         };
-        let dc = back(&|v| {
-            -PENALTY
-                * rho[v].powf(PENALTY - 1.0)
-                * (1.0 - VOID_STIFFNESS)
-                * modulus
-                * h
-                * energies[v]
-        });
         let dm = back(&|_| voxel_mass);
-        let budget = target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
-        let limit = if beta >= 8.0 {
-            LATE_MOVE_LIMIT
-        } else {
-            MOVE_LIMIT
+        let next = match limits {
+            None => {
+                let dc = back(&|v| {
+                    -PENALTY
+                        * rho[v].powf(PENALTY - 1.0)
+                        * (1.0 - VOID_STIFFNESS)
+                        * modulus
+                        * h
+                        * energies[v]
+                });
+                let budget = target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
+                let limit = if beta >= 8.0 {
+                    LATE_MOVE_LIMIT
+                } else {
+                    MOVE_LIMIT
+                };
+                optimality_update(&x, &dc, &dm, budget, limit)
+            }
+            Some((allowed_stress, allowed_displacement)) => {
+                let element = ElementContext {
+                    dims,
+                    brick: &brick,
+                    rho: &rho,
+                    state: &state,
+                    anchored: &grid.anchored,
+                    modulus,
+                    h,
+                };
+                // dK/dρ for each free voxel, per unit of λᵀ k u.
+                let stiffness_slope = |v: usize| {
+                    PENALTY * rho[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * modulus * h
+                };
+                let mut values = Vec::new();
+                let mut slopes = Vec::new();
+                // The stress, gathered over every case.
+                let stress = element.stress_norm(&displacements);
+                if stress.norm > 0.0 {
+                    let scale = stress.largest / stress.norm;
+                    stress_scale = NORMALIZATION_DAMPING * scale
+                        + (1.0 - NORMALIZATION_DAMPING) * stress_scale;
+                }
+                values.push(stress_scale * stress.norm / allowed_stress - 1.0);
+                let mut per_voxel = element.stress_slopes(&stress);
+                // The displacement, likewise, when it is limited.
+                let displacement =
+                    allowed_displacement.map(|_| element.displacement_norm(&displacements));
+                if let Some(d) = &displacement
+                    && d.norm > 0.0
+                {
+                    let scale = d.largest / d.norm;
+                    displacement_scale = NORMALIZATION_DAMPING * scale
+                        + (1.0 - NORMALIZATION_DAMPING) * displacement_scale;
+                }
+                let mut displacement_voxel = displacement
+                    .as_ref()
+                    .map(|d| element.displacement_slopes(d, &displacements))
+                    .unwrap_or_default();
+                // The adjoint part: one solve per case and measure.
+                for (c, ((held, projectors, _), u)) in cases.iter().zip(&displacements).enumerate()
+                {
+                    let fine = Fine::new(
+                        dims,
+                        &brick,
+                        &stiffness,
+                        held,
+                        projectors,
+                        SCALAR_BELOW * modulus * h,
+                    );
+                    let mut measures: Vec<(usize, Vec<f64>)> =
+                        vec![(0, element.stress_rhs(&stress, c, u))];
+                    if let Some(d) = &displacement {
+                        measures.push((1, element.displacement_rhs(d, u)));
+                    }
+                    for (k, rhs) in measures {
+                        let lambda = &mut adjoints[k][c];
+                        let solved = solve_system(
+                            &fine,
+                            &rhs,
+                            lambda,
+                            tolerance,
+                            backend.as_deref_mut(),
+                            cancel,
+                            threads,
+                        );
+                        match solved {
+                            Ok(s) => solver_iterations += s.iterations,
+                            Err(GenerativeError::Cancelled) if !history.is_empty() => {
+                                stopped = true;
+                                break 'iterations;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        let products =
+                            element_products(dims, &brick, lambda, u, &stiffness, threads);
+                        let target = if k == 0 {
+                            &mut per_voxel
+                        } else {
+                            &mut displacement_voxel
+                        };
+                        for v in 0..voxels {
+                            if state[v] == State::Free {
+                                target[v] -= products[v] * stiffness_slope(v);
+                            }
+                        }
+                    }
+                }
+                let stress_factor = stress_scale / allowed_stress;
+                slopes.push(back(&|v| stress_factor * per_voxel[v]));
+                if let (Some(d), Some(allowed)) = (&displacement, allowed_displacement) {
+                    values.push(displacement_scale * d.norm / allowed - 1.0);
+                    let factor = displacement_scale / allowed;
+                    slopes.push(back(&|v| factor * displacement_voxel[v]));
+                }
+                feasible = values.iter().all(|g| *g <= LIMIT_TOLERANCE);
+                // Mass as a share of the whole design space's.
+                let df0: Vec<f64> = dm.iter().map(|m| m / max).collect();
+                let limit = if beta >= 8.0 { LATE_MMA_MOVE } else { MMA_MOVE };
+                mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &values, &slopes)
+            }
         };
-        let next = optimality_update(&x, &dc, &dm, budget, limit);
         let change = x
             .iter()
             .zip(&next)
@@ -827,13 +1037,25 @@ pub fn generate_on(
         progress((iteration + 1) as f64 / iterations as f64);
         let steady = beta >= BETA_MAX && at_beta >= STEADY_OVER && {
             let recent = &history[history.len() - STEADY_OVER..];
-            let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
-                (lo.min(s.compliance), hi.max(s.compliance))
-            });
-            hi - lo <= STEADY_COMPLIANCE * hi && (mass_now - target).abs() <= STEADY_MASS * target
+            match limits {
+                None => {
+                    let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
+                        (lo.min(s.compliance), hi.max(s.compliance))
+                    });
+                    hi - lo <= STEADY_COMPLIANCE * hi
+                        && (mass_now - target).abs() <= STEADY_MASS * target
+                }
+                // The mass steady, the limits met.
+                Some(_) => {
+                    let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
+                        (lo.min(s.mass), hi.max(s.mass))
+                    });
+                    feasible && hi - lo <= STEADY_MASS * hi
+                }
+            }
         };
         let last_stage_done = beta >= BETA_MAX && at_beta >= BETA_STEP_AFTER;
-        if (beta >= BETA_MAX && change < SETTLED_CHANGE) || steady || last_stage_done {
+        if (beta >= BETA_MAX && change < SETTLED_CHANGE && feasible) || steady || last_stage_done {
             converged = true;
             break;
         }
@@ -891,6 +1113,319 @@ pub fn generate_on(
         solver_iterations,
         filter_radius: radius,
     })
+}
+
+/// `fine u = rhs` solved from `x`, on `backend` when there is one.
+fn solve_system(
+    fine: &Fine<'_>,
+    rhs: &[f64],
+    x: &mut [f64],
+    tolerance: f64,
+    backend: Option<&mut (dyn Backend + '_)>,
+    cancel: &AtomicBool,
+    threads: usize,
+) -> Result<Solved, GenerativeError> {
+    match backend {
+        None => multigrid::solve(fine, rhs, x, tolerance, SOLVE_ITERATIONS, cancel, threads),
+        Some(backend) => {
+            fine.project(x);
+            let mut kept = rhs.to_vec();
+            fine.project(&mut kept);
+            let system = System {
+                fine,
+                loads: kept,
+                threads,
+            };
+            backend.solve(&system, x, tolerance, SOLVE_ITERATIONS, cancel)
+        }
+    }
+}
+
+/// A p-norm over voxels or nodes and every load case: its value, the largest value the
+/// outcome reports (the stress in its material, the displacement at its corners), which it
+/// is scaled to, and what each term is, per case.
+struct Gathered {
+    norm: f64,
+    largest: f64,
+    /// Per case, per voxel (stress) or node (displacement): the value measured.
+    values: Vec<Vec<f64>>,
+}
+
+/// What the stress and displacement measures need of the design.
+struct ElementContext<'a> {
+    dims: Dims,
+    brick: &'a Brick,
+    rho: &'a [f64],
+    state: &'a [State],
+    /// The voxels fixtures and loads act through, where stress is singular: left out.
+    anchored: &'a [u32],
+    modulus: f64,
+    h: f64,
+}
+
+impl ElementContext<'_> {
+    /// Whether voxel `v`'s stress counts: material at all, and no fixture or load through
+    /// it.
+    fn counts(&self, v: usize) -> bool {
+        self.state[v] != State::Void
+            && self.rho[v] > 0.0
+            && self.anchored.binary_search(&(v as u32)).is_err()
+    }
+
+    /// The displacements of voxel `v`'s corners in `u`.
+    fn corners(&self, v: usize, u: &[f64]) -> [f64; DOFS] {
+        let base = self.dims.node(self.dims.cell_coords(v));
+        let mut out = [0.0; DOFS];
+        for (a, off) in self.dims.corner_offsets().iter().enumerate() {
+            let n = base + off;
+            out[3 * a..3 * a + 3].copy_from_slice(&u[3 * n..3 * n + 3]);
+        }
+        out
+    }
+
+    /// The solid material's stress at the centre of voxel `v`, MPa.
+    fn stress(&self, v: usize, u: &[f64]) -> [f64; 6] {
+        let ue = self.corners(v, u);
+        let b = &self.brick.b;
+        let strain: [f64; 6] = std::array::from_fn(|r| {
+            (0..DOFS).map(|k| b[r * DOFS + k] * ue[k]).sum::<f64>() / self.h
+        });
+        std::array::from_fn(|r| {
+            self.modulus
+                * (0..6)
+                    .map(|k| self.brick.d[r * 6 + k] * strain[k])
+                    .sum::<f64>()
+        })
+    }
+
+    /// The relaxed stresses `ρ^q σ_vm` gathered by their p-norm over every case.
+    fn stress_norm(&self, displacements: &[Vec<f64>]) -> Gathered {
+        let voxels = self.rho.len();
+        let mut sum = 0.0;
+        let mut largest = 0.0f64;
+        let mut values = Vec::with_capacity(displacements.len());
+        for u in displacements {
+            let mut vm = vec![0.0; voxels];
+            for (v, out) in vm.iter_mut().enumerate() {
+                if !self.counts(v) {
+                    continue;
+                }
+                *out = von_mises(&self.stress(v, u));
+                let relaxed = self.rho[v].powf(STRESS_RELAXATION) * *out;
+                sum += relaxed.powi(NORM_POWER);
+                // Scaled to the largest stress the outcome reports: in its material.
+                if self.rho[v] >= 0.5 {
+                    largest = largest.max(*out);
+                }
+            }
+            values.push(vm);
+        }
+        Gathered {
+            norm: sum.powf(1.0 / f64::from(NORM_POWER)),
+            largest,
+            values,
+        }
+    }
+
+    /// The p-norm's explicit slopes for each voxel's density.
+    fn stress_slopes(&self, g: &Gathered) -> Vec<f64> {
+        let p = f64::from(NORM_POWER);
+        let voxels = self.rho.len();
+        let mut out = vec![0.0; voxels];
+        if g.norm <= 0.0 {
+            return out;
+        }
+        let outer = g.norm.powf(1.0 - p);
+        for (v, o) in out.iter_mut().enumerate() {
+            if self.state[v] != State::Free || !self.counts(v) {
+                continue;
+            }
+            let vm_p: f64 = g.values.iter().map(|vm| vm[v].powi(NORM_POWER)).sum();
+            *o = outer * STRESS_RELAXATION * self.rho[v].powf(STRESS_RELAXATION * p - 1.0) * vm_p;
+        }
+        out
+    }
+
+    /// The p-norm's slopes for case `case`'s displacements: the adjoint's right-hand side.
+    fn stress_rhs(&self, g: &Gathered, case: usize, u: &[f64]) -> Vec<f64> {
+        let p = f64::from(NORM_POWER);
+        let mut rhs = vec![0.0; u.len()];
+        let Some(vm) = g.values.get(case) else {
+            return rhs;
+        };
+        if g.norm <= 0.0 {
+            return rhs;
+        }
+        let outer = g.norm.powf(1.0 - p);
+        let b = &self.brick.b;
+        let base_offsets = self.dims.corner_offsets();
+        for (v, &vm_v) in vm.iter().enumerate() {
+            if vm_v <= 0.0 || !self.counts(v) {
+                continue;
+            }
+            let rho_q = self.rho[v].powf(STRESS_RELAXATION);
+            let weight = outer * (rho_q * vm_v).powi(NORM_POWER - 1) * rho_q;
+            let sigma = self.stress(v, u);
+            // d σ_vm / d σ, then through D and B to the corners.
+            let dvm: [f64; 6] = [
+                (2.0 * sigma[0] - sigma[1] - sigma[2]) / (2.0 * vm_v),
+                (2.0 * sigma[1] - sigma[0] - sigma[2]) / (2.0 * vm_v),
+                (2.0 * sigma[2] - sigma[0] - sigma[1]) / (2.0 * vm_v),
+                3.0 * sigma[3] / vm_v,
+                3.0 * sigma[4] / vm_v,
+                3.0 * sigma[5] / vm_v,
+            ];
+            let dstrain: [f64; 6] = std::array::from_fn(|k| {
+                self.modulus
+                    * (0..6)
+                        .map(|r| self.brick.d[r * 6 + k] * dvm[r])
+                        .sum::<f64>()
+            });
+            let base = self.dims.node(self.dims.cell_coords(v));
+            for (a, off) in base_offsets.iter().enumerate() {
+                let n = base + off;
+                for x in 0..3 {
+                    let k = 3 * a + x;
+                    let du: f64 =
+                        (0..6).map(|r| b[r * DOFS + k] * dstrain[r]).sum::<f64>() / self.h;
+                    rhs[3 * n + x] += weight * du;
+                }
+            }
+        }
+        rhs
+    }
+
+    /// Each node's weight: the mean density of the eight voxels around it.
+    fn node_weights(&self) -> Vec<f64> {
+        let mut w = vec![0.0; self.dims.node_count()];
+        let offsets = self.dims.corner_offsets();
+        for (v, r) in self.rho.iter().enumerate() {
+            if *r <= 0.0 {
+                continue;
+            }
+            let base = self.dims.node(self.dims.cell_coords(v));
+            for off in &offsets {
+                w[base + off] += r / 8.0;
+            }
+        }
+        w
+    }
+
+    /// The displacements, weighted by the material around each node, gathered by their
+    /// p-norm over every case.
+    fn displacement_norm(&self, displacements: &[Vec<f64>]) -> Gathered {
+        let p = f64::from(NORM_POWER);
+        let weights = self.node_weights();
+        let mut sum = 0.0;
+        let mut largest = 0.0f64;
+        for u in displacements {
+            for (n, w) in weights.iter().enumerate() {
+                if *w <= 0.0 {
+                    continue;
+                }
+                let d = (u[3 * n].powi(2) + u[3 * n + 1].powi(2) + u[3 * n + 2].powi(2)).sqrt();
+                sum += w * d.powi(NORM_POWER);
+                // Scaled to the largest displacement the outcome reports: at its material's
+                // corners (half a voxel of material around the node, or more).
+                if *w >= 1.0 / 16.0 {
+                    largest = largest.max(d);
+                }
+            }
+        }
+        Gathered {
+            norm: sum.powf(1.0 / p),
+            largest,
+            values: vec![weights],
+        }
+    }
+
+    /// Its explicit slopes for each voxel's density, through the weights of its corners.
+    fn displacement_slopes(&self, g: &Gathered, displacements: &[Vec<f64>]) -> Vec<f64> {
+        let p = f64::from(NORM_POWER);
+        let mut out = vec![0.0; self.rho.len()];
+        if g.norm <= 0.0 {
+            return out;
+        }
+        let outer = g.norm.powf(1.0 - p) / p;
+        let offsets = self.dims.corner_offsets();
+        for (v, o) in out.iter_mut().enumerate() {
+            if self.state[v] != State::Free {
+                continue;
+            }
+            let base = self.dims.node(self.dims.cell_coords(v));
+            let mut sum = 0.0;
+            for u in displacements {
+                for off in &offsets {
+                    let n = base + off;
+                    let d2 = u[3 * n].powi(2) + u[3 * n + 1].powi(2) + u[3 * n + 2].powi(2);
+                    sum += d2.powf(0.5 * p);
+                }
+            }
+            *o = outer * sum / 8.0;
+        }
+        out
+    }
+
+    /// The displacement p-norm's slopes for one case's displacements.
+    fn displacement_rhs(&self, g: &Gathered, u: &[f64]) -> Vec<f64> {
+        let p = f64::from(NORM_POWER);
+        let mut rhs = vec![0.0; u.len()];
+        let Some(weights) = g.values.first() else {
+            return rhs;
+        };
+        if g.norm <= 0.0 {
+            return rhs;
+        }
+        let outer = g.norm.powf(1.0 - p);
+        for (n, w) in weights.iter().enumerate() {
+            if *w <= 0.0 {
+                continue;
+            }
+            let d2 = u[3 * n].powi(2) + u[3 * n + 1].powi(2) + u[3 * n + 2].powi(2);
+            let factor = outer * w * d2.powf(0.5 * (p - 2.0));
+            for x in 0..3 {
+                rhs[3 * n + x] = factor * u[3 * n + x];
+            }
+        }
+        rhs
+    }
+}
+
+/// `aₑᵀ K bₑ` of each voxel with an element, for a unit modulus and edge (the brick's own).
+fn element_products(
+    dims: Dims,
+    brick: &Brick,
+    a: &[f64],
+    b: &[f64],
+    stiffness: &[f64],
+    threads: usize,
+) -> Vec<f64> {
+    let offsets = dims.corner_offsets();
+    let mut out = vec![0.0; dims.cell_count()];
+    par_fill(&mut out, 1, threads, 2048, |first, part| {
+        let mut ae = [0.0; DOFS];
+        let mut be = [0.0; DOFS];
+        for (m, o) in part.iter_mut().enumerate() {
+            let e = first + m;
+            if stiffness[e] <= 0.0 {
+                continue;
+            }
+            let base = dims.node(dims.cell_coords(e));
+            for (k, off) in offsets.iter().enumerate() {
+                let n = base + off;
+                ae[3 * k..3 * k + 3].copy_from_slice(&a[3 * n..3 * n + 3]);
+                be[3 * k..3 * k + 3].copy_from_slice(&b[3 * n..3 * n + 3]);
+            }
+            let mut kb = [0.0; DOFS];
+            for (row, &bj) in brick.k.as_chunks::<DOFS>().0.iter().zip(&be) {
+                for (o, kv) in kb.iter_mut().zip(row) {
+                    *o += kv * bj;
+                }
+            }
+            *o = kb.iter().zip(&ae).map(|(x, y)| x * y).sum();
+        }
+    });
+    out
 }
 
 /// A load case as each iteration solves it: per node the index of its projector (or
@@ -1101,7 +1636,7 @@ fn states(
             Voxel::Obstacle | Voxel::Outside => State::Void,
         })
         .collect();
-    if let (Method::Casting { direction, parting }, Some(s)) = (method, symmetry) {
+    if let (Some((direction, parting)), Some(s)) = (method.pull(), symmetry) {
         // A pull along a plane keeps the mirror; across one only from it both ways.
         let a = direction.axis.min(2);
         if s.planes[a] && !parting.is_some_and(|p| (p[a] - s.point[a]).abs() < 1e-6) {
@@ -1142,6 +1677,9 @@ fn states(
     match method {
         // Printing makes any design space: what nothing holds up is printed empty.
         Method::Unrestricted | Method::Additive { .. } => {}
+        Method::Milling { direction, .. } => {
+            one_way(grid, direction, None, &mut state).map_err(not_makeable)?
+        }
         Method::Cutting { axis } => {
             for line in lines(grid, axis.min(2)) {
                 let void = line.iter().find(|&&v| state[v] == State::Void);
@@ -1160,30 +1698,41 @@ fn states(
             }
         }
         Method::Casting { direction, parting } => {
-            for chain in casting_chains(grid, direction, parting) {
-                // In front of a void, void; behind a solid, solid; a solid in front of a
-                // void is an undercut.
-                let mut void = false;
-                for &v in &chain {
-                    match state[v] {
-                        State::Void => void = true,
-                        State::Solid if void => return Err(not_makeable(v)),
-                        State::Free if void => state[v] = State::Void,
-                        _ => {}
-                    }
-                }
-                let mut solid = false;
-                for &v in chain.iter().rev() {
-                    match state[v] {
-                        State::Solid => solid = true,
-                        State::Free if solid => state[v] = State::Solid,
-                        _ => {}
-                    }
-                }
-            }
+            one_way(grid, direction, parting, &mut state).map_err(not_makeable)?;
         }
     }
     Ok(state)
+}
+
+/// The states a one-way pull along `direction` (both ways from `parting`) leaves: in front
+/// of a void, void; behind a solid, solid. A solid in front of a void is an undercut: that
+/// voxel is the error.
+fn one_way(
+    grid: &Grid,
+    direction: Direction,
+    parting: Option<V3>,
+    state: &mut [State],
+) -> Result<(), usize> {
+    for chain in casting_chains(grid, direction, parting) {
+        let mut void = false;
+        for &v in &chain {
+            match state[v] {
+                State::Void => void = true,
+                State::Solid if void => return Err(v),
+                State::Free if void => state[v] = State::Void,
+                _ => {}
+            }
+        }
+        let mut solid = false;
+        for &v in chain.iter().rev() {
+            match state[v] {
+                State::Solid => solid = true,
+                State::Free if solid => state[v] = State::Solid,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Each free voxel's design group (mirror images, and with 2-axis cutting whole columns,

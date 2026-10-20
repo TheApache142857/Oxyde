@@ -759,6 +759,13 @@ fn generative_dto(g: &GenerativeResults) -> GenerativeDto {
                     OutcomeMethod::Casting { direction, parting } => {
                         OutcomeMethodDto::Casting { direction, parting }
                     }
+                    OutcomeMethod::Milling {
+                        direction,
+                        tool_diameter,
+                    } => OutcomeMethodDto::Milling {
+                        direction,
+                        tool_diameter,
+                    },
                 },
                 status: match o.status {
                     OutcomeStatus::Converged => OutcomeStatusDto::Converged,
@@ -1088,6 +1095,13 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
                     OutcomeMethodDto::Casting { direction, parting } => {
                         OutcomeMethod::Casting { direction, parting }
                     }
+                    OutcomeMethodDto::Milling {
+                        direction,
+                        tool_diameter,
+                    } => OutcomeMethod::Milling {
+                        direction,
+                        tool_diameter,
+                    },
                 },
                 status,
                 iterations: o.iterations,
@@ -1520,6 +1534,12 @@ enum OutcomeMethodDto {
         /// mm.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parting: Option<[f64; 3]>,
+    },
+    Milling {
+        direction: AxisDirection,
+        /// mm.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_diameter: Option<f64>,
     },
 }
 

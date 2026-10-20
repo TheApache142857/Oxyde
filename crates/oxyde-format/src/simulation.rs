@@ -244,11 +244,15 @@ pub struct GenerativeSettings {
     /// shape; `None` for a tenth of the box's largest side.
     pub margin: Option<f64>,
     pub objective: GenerativeObjective,
-    /// kg: every outcome's mass, preserve bodies included, whatever its material; positive
-    /// (0 in a new study until it is set).
+    /// kg: every outcome's mass, preserve bodies included, whatever its material, when
+    /// maximizing stiffness; positive (0 in a new study until it is set, and while
+    /// minimizing mass, which does not need it).
     pub mass_target: f64,
-    /// What each outcome's estimated factor of safety is held against.
+    /// What each outcome's estimated factor of safety is held against: its stress kept
+    /// under the material's strength over it when minimizing mass.
     pub safety_factor: f64,
+    /// mm: the most an outcome may move when minimizing mass; `None` for no limit.
+    pub displacement_limit: Option<f64>,
     /// mm: the minimum thickness; `None` for three voxels.
     pub member_size: Option<f64>,
     /// Iterations at most, for each outcome.
@@ -290,6 +294,7 @@ impl Default for GenerativeSettings {
             objective: GenerativeObjective::MaxStiffness,
             mass_target: 0.0,
             safety_factor: 2.0,
+            displacement_limit: None,
             member_size: None,
             iterations: 150,
             resolution: MeshSize::Automatic { density: 0.5 },
@@ -315,6 +320,9 @@ pub enum GenerativeObjective {
     /// The stiffest shape for the mass target.
     #[default]
     MaxStiffness,
+    /// The lightest shape that keeps its stress under the material's strength over the
+    /// safety factor, and its displacement under the limit when there is one.
+    MinMass,
 }
 
 /// One of the six directions along the world axes (Y up).
@@ -395,16 +403,23 @@ pub enum GenerativeMethod {
         directions: Vec<AxisDirection>,
         parting: Option<[f64; 3]>,
     },
+    /// 3-axis milled from each direction's side (one outcome each): no undercut seen from
+    /// the tool, no pocket narrower than `tool_diameter` (mm) when given.
+    Milling {
+        directions: Vec<AxisDirection>,
+        tool_diameter: Option<f64>,
+    },
 }
 
 impl GenerativeMethod {
-    /// Its name in the file: `unrestricted`, `additive`, `cutting` or `casting`.
+    /// Its name in the file: `unrestricted`, `additive`, `cutting`, `casting` or `milling`.
     pub fn name(&self) -> &'static str {
         match self {
             GenerativeMethod::Unrestricted => "unrestricted",
             GenerativeMethod::Additive { .. } => "additive",
             GenerativeMethod::Cutting { .. } => "cutting",
             GenerativeMethod::Casting { .. } => "casting",
+            GenerativeMethod::Milling { .. } => "milling",
         }
     }
 
@@ -430,6 +445,16 @@ impl GenerativeMethod {
                     parting: *parting,
                 })
                 .collect(),
+            GenerativeMethod::Milling {
+                directions,
+                tool_diameter,
+            } => directions
+                .iter()
+                .map(|&direction| OutcomeMethod::Milling {
+                    direction,
+                    tool_diameter: *tool_diameter,
+                })
+                .collect(),
         }
     }
 }
@@ -450,6 +475,11 @@ pub enum OutcomeMethod {
     Casting {
         direction: AxisDirection,
         parting: Option<[f64; 3]>,
+    },
+    /// Milled from the side `direction` points to, with a tool of `tool_diameter` (mm).
+    Milling {
+        direction: AxisDirection,
+        tool_diameter: Option<f64>,
     },
 }
 
@@ -846,10 +876,14 @@ struct GenerativeDto {
     margin: Option<f64>,
     #[serde(default)]
     objective: ObjectiveDto,
-    /// kg.
-    mass_target: f64,
+    /// kg; required when maximizing stiffness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mass_target: Option<f64>,
     #[serde(default = "default_safety_factor")]
     safety_factor: f64,
+    /// mm; only when minimizing mass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    displacement_limit: Option<f64>,
     /// mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     member_size: Option<f64>,
@@ -890,6 +924,7 @@ struct ObstacleDto {
 enum ObjectiveDto {
     #[default]
     MaxStiffness,
+    MinMass,
 }
 
 /// The voxels' size: as `mesh`'s, a density or an element size, not both.
@@ -924,6 +959,13 @@ enum MethodDto {
         /// mm.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parting: Option<[f64; 3]>,
+    },
+    Milling {
+        #[serde(default)]
+        directions: Vec<AxisDirection>,
+        /// mm.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_diameter: Option<f64>,
     },
 }
 
@@ -1487,9 +1529,13 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
         margin: g.margin,
         objective: match g.objective {
             GenerativeObjective::MaxStiffness => ObjectiveDto::MaxStiffness,
+            GenerativeObjective::MinMass => ObjectiveDto::MinMass,
         },
-        mass_target: g.mass_target,
+        // Minimizing mass needs no target: one is kept only when set.
+        mass_target: (g.objective == GenerativeObjective::MaxStiffness || g.mass_target > 0.0)
+            .then_some(g.mass_target),
         safety_factor: g.safety_factor,
+        displacement_limit: g.displacement_limit,
         member_size: g.member_size,
         iterations: g.iterations,
         resolution: ResolutionDto {
@@ -1515,6 +1561,13 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
                 } => MethodDto::Casting {
                     directions: directions.clone(),
                     parting: *parting,
+                },
+                GenerativeMethod::Milling {
+                    directions,
+                    tool_diameter,
+                } => MethodDto::Milling {
+                    directions: directions.clone(),
+                    tool_diameter: *tool_diameter,
                 },
             })
             .collect(),
@@ -2088,10 +2141,29 @@ fn generative_from(
         }
         None => None,
     };
-    let mass_target = finite(dto.mass_target, "the mass target")?;
-    if mass_target <= 0.0 {
-        return Err("the mass target is not positive".to_owned());
-    }
+    let objective = match dto.objective {
+        ObjectiveDto::MaxStiffness => GenerativeObjective::MaxStiffness,
+        ObjectiveDto::MinMass => GenerativeObjective::MinMass,
+    };
+    let mass_target = match (objective, dto.mass_target) {
+        (GenerativeObjective::MaxStiffness, None) => {
+            return Err("maximizing stiffness needs a mass target".to_owned());
+        }
+        (_, Some(m)) => {
+            let m = finite(m, "the mass target")?;
+            if m <= 0.0 {
+                return Err("the mass target is not positive".to_owned());
+            }
+            m
+        }
+        (GenerativeObjective::MinMass, None) => 0.0,
+    };
+    let displacement_limit = match (objective, dto.displacement_limit) {
+        (GenerativeObjective::MaxStiffness, Some(_)) => {
+            return Err("only minimizing mass takes a displacement limit".to_owned());
+        }
+        (_, limit) => positive_size(limit, "the displacement limit")?,
+    };
     let safety_factor = finite(dto.safety_factor, "the safety factor")?;
     if safety_factor <= 0.0 {
         return Err("the safety factor is not positive".to_owned());
@@ -2123,6 +2195,13 @@ fn generative_from(
             }
             MethodDto::Cutting { directions } => GenerativeMethod::Cutting {
                 directions: directions_from(directions, "cutting", false)?,
+            },
+            MethodDto::Milling {
+                directions,
+                tool_diameter,
+            } => GenerativeMethod::Milling {
+                directions: directions_from(directions, "milling", true)?,
+                tool_diameter: positive_size(tool_diameter, "the tool diameter")?,
             },
             MethodDto::Casting {
                 directions,
@@ -2202,11 +2281,10 @@ fn generative_from(
         obstacles,
         starting_shape,
         margin,
-        objective: match dto.objective {
-            ObjectiveDto::MaxStiffness => GenerativeObjective::MaxStiffness,
-        },
+        objective,
         mass_target,
         safety_factor,
+        displacement_limit,
         member_size: positive_size(dto.member_size, "the member size")?,
         iterations: dto.iterations,
         resolution: size_from(
@@ -2517,6 +2595,7 @@ mod tests {
             objective: GenerativeObjective::MaxStiffness,
             mass_target: 0.25,
             safety_factor: 2.5,
+            displacement_limit: None,
             member_size: Some(4.0),
             iterations: 120,
             resolution: MeshSize::ElementSize(0.8),
@@ -2535,6 +2614,10 @@ mod tests {
                 GenerativeMethod::Casting {
                     directions: vec![AxisDirection::PlusY, AxisDirection::MinusX],
                     parting: Some([0.0, 10.0, 0.0]),
+                },
+                GenerativeMethod::Milling {
+                    directions: vec![AxisDirection::PlusZ],
+                    tool_diameter: Some(6.0),
                 },
             ],
             materials: vec![
@@ -2634,8 +2717,24 @@ mod tests {
                     direction: AxisDirection::MinusX,
                     parting: Some([0.0, 10.0, 0.0])
                 },
+                OutcomeMethod::Milling {
+                    direction: AxisDirection::PlusZ,
+                    tool_diameter: Some(6.0)
+                },
             ]
         );
+        // Minimizing mass: no target needed, a displacement limit taken.
+        let mut light = generative_sample();
+        let g = &mut light.studies[0].generative;
+        g.objective = GenerativeObjective::MinMass;
+        g.mass_target = 0.0;
+        g.displacement_limit = Some(0.2);
+        assert_eq!(read_simulation(Cursor::new(bytes(&light))).unwrap(), light);
+        let v = json(&light);
+        let g = &v["studies"][0]["generative"];
+        assert_eq!(g["objective"], "min_mass");
+        assert!(g.get("mass_target").is_none());
+        assert_eq!(g["displacement_limit"], 0.2);
         for d in [
             AxisDirection::MinusX,
             AxisDirection::PlusY,
@@ -2684,7 +2783,8 @@ mod tests {
                 { "type": "unrestricted" },
                 { "type": "additive", "directions": ["+z", "+y"], "overhang": 45.0 },
                 { "type": "cutting", "directions": ["-y"] },
-                { "type": "casting", "directions": ["+y", "-x"], "parting": [0.0, 10.0, 0.0] }
+                { "type": "casting", "directions": ["+y", "-x"], "parting": [0.0, 10.0, 0.0] },
+                { "type": "milling", "directions": ["+z"], "tool_diameter": 6.0 }
             ])
         );
         assert_eq!(
@@ -2931,14 +3031,38 @@ mod tests {
             "no mechanical properties",
         );
 
-        // What is not a number, a direction or an objective is not JSON of a study.
-        for edit in [
-            (|v: &mut serde_json::Value| block(v)["objective"] = "min_mass".into())
-                as fn(&mut serde_json::Value),
-            |v| block(v)["methods"][2]["directions"] = serde_json::json!(["y"]),
-            |v| {
+        // The objectives' limits.
+        refused(
+            &|v| {
                 block(v).as_object_mut().unwrap().remove("mass_target");
             },
+            "needs a mass target",
+        );
+        refused(
+            &|v| block(v)["displacement_limit"] = 0.5.into(),
+            "only minimizing mass takes a displacement limit",
+        );
+        refused(
+            &|v| {
+                block(v)["objective"] = "min_mass".into();
+                block(v)["displacement_limit"] = (-1.0).into();
+            },
+            "displacement limit is not positive",
+        );
+        refused(
+            &|v| block(v)["methods"][4]["tool_diameter"] = 0.0.into(),
+            "tool diameter is not positive",
+        );
+        refused(
+            &|v| block(v)["methods"][4]["directions"] = serde_json::json!([]),
+            "the milling method has no direction",
+        );
+
+        // What is not a number, a direction or an objective is not JSON of a study.
+        for edit in [
+            (|v: &mut serde_json::Value| block(v)["objective"] = "max_strength".into())
+                as fn(&mut serde_json::Value),
+            |v| block(v)["methods"][2]["directions"] = serde_json::json!(["y"]),
         ] {
             let bytes = edited(&good, SIMULATION, |s| {
                 let mut v: serde_json::Value = serde_json::from_str(s).unwrap();

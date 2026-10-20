@@ -29,8 +29,8 @@ use oxyde_format::results::{
     NodalFields, OutcomeStatus, ResultMesh, ResultsFile, SolverInfo, Summary, VoxelGrid, VoxelKind,
 };
 use oxyde_format::simulation::{
-    AxisDirection, GenerativeMethod, GenerativeObstacle, GenerativeSettings, LoadCase, MeshSize,
-    OutcomeMethod, StudyType, SymmetryPlanes,
+    AxisDirection, GenerativeMethod, GenerativeObjective, GenerativeObstacle, GenerativeSettings,
+    LoadCase, MeshSize, OutcomeMethod, StudyType, SymmetryPlanes,
 };
 use oxyde_geom::Transform;
 use oxyde_kernel::{BooleanOp, FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
@@ -38,7 +38,7 @@ use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical,
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, DesignSpace, Direction, GenerativeError, GenerativeStudy, Grid, MAX_VOXELS, Method,
-    Obstacle, Voxel, decimate, generate_on, solid_pieces, surface, voxel_size,
+    Objective, Obstacle, Voxel, decimate, generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -197,6 +197,9 @@ pub(crate) fn method_label(m: &OutcomeMethod) -> String {
             direction,
             parting: Some(_),
         } => format!("Casting ±{}", axis_label(direction.axis())),
+        OutcomeMethod::Milling { direction, .. } => {
+            format!("Milling from {}", direction_label(*direction))
+        }
     }
 }
 
@@ -219,6 +222,16 @@ pub(crate) fn engine_method(m: &OutcomeMethod) -> Result<Method, String> {
                 axis: direction.axis(),
                 positive: direction.is_positive(),
             },
+        }),
+        OutcomeMethod::Milling {
+            direction,
+            tool_diameter,
+        } => Ok(Method::Milling {
+            direction: Direction {
+                axis: direction.axis(),
+                positive: direction.is_positive(),
+            },
+            tool_diameter,
         }),
     }
 }
@@ -422,9 +435,18 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         }
         load_cases.push(case);
     }
-    if !(g.mass_target.is_finite() && g.mass_target > 0.0) {
-        return Err("Set the mass target (Objectives) first".to_owned());
-    }
+    let objective = match g.objective {
+        GenerativeObjective::MaxStiffness => {
+            if !(g.mass_target.is_finite() && g.mass_target > 0.0) {
+                return Err("Set the mass target (Objectives) first".to_owned());
+            }
+            Objective::MaxStiffness
+        }
+        GenerativeObjective::MinMass => Objective::MinMass {
+            safety_factor: g.safety_factor,
+            displacement_limit: g.displacement_limit,
+        },
+    };
     let symmetry = engine_symmetry(g.symmetry);
     let voxel_size = match g.resolution {
         MeshSize::ElementSize(h) => Some(h),
@@ -437,6 +459,7 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         fixtures,
         loads,
         load_cases,
+        objective,
         mass_target: g.mass_target,
         member_size: g.member_size,
         max_iterations: g.iterations.max(1) as usize,
@@ -2656,26 +2679,48 @@ fn objective_rows(
     preserve_masses: &[(String, f64)],
 ) -> bool {
     let mut changed = false;
-    ui.label("Maximize stiffness")
-        .on_hover_text("The stiffest shape that weighs the mass target");
+    ui.horizontal(|ui| {
+        changed |= ui
+            .radio_value(
+                &mut g.objective,
+                GenerativeObjective::MaxStiffness,
+                "Maximize stiffness",
+            )
+            .on_hover_text("The stiffest shape that weighs the mass target")
+            .changed();
+        changed |= ui
+            .radio_value(
+                &mut g.objective,
+                GenerativeObjective::MinMass,
+                "Minimize mass",
+            )
+            .on_hover_text(
+                "The lightest shape that keeps its stress under the material's strength over \
+                 the safety factor (and its displacement under the limit)",
+            )
+            .changed();
+    });
+    let stiffest = g.objective == GenerativeObjective::MaxStiffness;
     egui::Grid::new("generative_objectives")
         .num_columns(2)
         .spacing([10.0, 4.0])
         .show(ui, |ui| {
-            ui.label("Mass target");
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut g.mass_target)
-                        .range(0.0..=100_000.0)
-                        .speed(0.001)
-                        .max_decimals(4)
-                        .suffix(" kg"),
-                )
-                .on_hover_text(
-                    "What every outcome weighs, the preserve bodies included, whatever its material",
-                )
-                .changed();
-            ui.end_row();
+            if stiffest {
+                ui.label("Mass target");
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(&mut g.mass_target)
+                            .range(0.0..=100_000.0)
+                            .speed(0.001)
+                            .max_decimals(4)
+                            .suffix(" kg"),
+                    )
+                    .on_hover_text(
+                        "What every outcome weighs, the preserve bodies included, whatever its material",
+                    )
+                    .changed();
+                ui.end_row();
+            }
             ui.label("Safety factor");
             changed |= ui
                 .add(
@@ -2684,23 +2729,59 @@ fn objective_rows(
                         .speed(0.05)
                         .max_decimals(2),
                 )
-                .on_hover_text(
-                    "Outcomes whose estimated factor of safety is under it are marked in Explore",
-                )
+                .on_hover_text(if stiffest {
+                    "Outcomes whose estimated factor of safety is under it are marked in Explore"
+                } else {
+                    "The stress is kept under the material's strength divided by it"
+                })
                 .changed();
             ui.end_row();
+            if !stiffest {
+                ui.label("Displacement limit");
+                ui.horizontal(|ui| {
+                    let mut on = g.displacement_limit.is_some();
+                    if ui
+                        .checkbox(&mut on, "")
+                        .on_hover_text("The most the outcome may move under its loads")
+                        .changed()
+                    {
+                        g.displacement_limit = on.then_some(0.5);
+                        changed = true;
+                    }
+                    if let Some(d) = g.displacement_limit.as_mut() {
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(d)
+                                    .range(0.0001..=1000.0)
+                                    .speed(0.005)
+                                    .max_decimals(4)
+                                    .suffix(" mm"),
+                            )
+                            .changed();
+                    }
+                });
+                ui.end_row();
+            }
         });
-    for (name, mass) in preserve_masses {
+    if stiffest {
+        for (name, mass) in preserve_masses {
+            weak(
+                ui,
+                &format!(
+                    "The preserve bodies weigh {} in {name}: the target must be more",
+                    format_value(*mass, "kg")
+                ),
+            );
+        }
+        if g.mass_target <= 0.0 {
+            weak(ui, "Set the mass target to generate");
+        }
+    } else {
         weak(
             ui,
-            &format!(
-                "The preserve bodies weigh {} in {name}: the target must be more",
-                format_value(*mass, "kg")
-            ),
+            "Each material's yield strength (else its tensile strength) over the safety \
+             factor is the stress allowed",
         );
-    }
-    if g.mass_target <= 0.0 {
-        weak(ui, "Set the mass target to generate");
     }
     changed
 }
@@ -2883,6 +2964,74 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
         });
         if directions.is_empty() {
             weak(ui, "Pick a direction, or untick it");
+        }
+    }
+    let mut milling = has(g, "milling");
+    if ui
+        .checkbox(&mut milling, "Milling")
+        .on_hover_text(
+            "3-axis milled from the side picked: the tool reaches every face from there, and \
+             no pocket is narrower than the tool",
+        )
+        .changed()
+    {
+        toggle(
+            g,
+            "milling",
+            milling,
+            GenerativeMethod::Milling {
+                directions: vec![AxisDirection::PlusY],
+                tool_diameter: Some(6.0),
+            },
+        );
+        changed = true;
+    }
+    if let Some(GenerativeMethod::Milling {
+        directions,
+        tool_diameter,
+    }) = g.methods.iter_mut().find(|m| m.name() == "milling")
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(18.0);
+            ui.label(egui::RichText::new("From").small());
+            for axis in 0..3 {
+                for positive in [true, false] {
+                    let d = AxisDirection::new(axis, positive);
+                    let mut on = directions.contains(&d);
+                    if ui.toggle_value(&mut on, direction_label(d)).changed() {
+                        directions.retain(|x| *x != d);
+                        if on {
+                            directions.push(d);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(18.0);
+            let mut set = tool_diameter.is_some();
+            if ui
+                .checkbox(&mut set, "Tool diameter")
+                .on_hover_text("No pocket or gap narrower than the tool")
+                .changed()
+            {
+                *tool_diameter = set.then_some(6.0);
+                changed = true;
+            }
+            if let Some(d) = tool_diameter.as_mut() {
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(d)
+                            .range(0.01..=1000.0)
+                            .speed(0.1)
+                            .suffix(" mm"),
+                    )
+                    .changed();
+            }
+        });
+        if directions.is_empty() {
+            weak(ui, "Pick a side, or untick it");
         }
     }
     let count: usize = g.methods.iter().map(|m| m.outcomes().len()).sum();
@@ -3744,6 +3893,51 @@ mod tests {
         leave_load_cases(&mut study, "Force-2");
         let why = engine_study(&study, &surfaces).unwrap_err();
         assert!(why.contains("Load Case 2"), "{why}");
+    }
+
+    #[test]
+    fn minimizing_mass_needs_no_target_and_keeps_the_stress_down() {
+        let (surfaces, mut study) = two_pads();
+        let g = &mut study.generative;
+        g.objective = GenerativeObjective::MinMass;
+        g.mass_target = 0.0;
+        g.safety_factor = 2.0;
+        g.methods = vec![GenerativeMethod::Milling {
+            directions: vec![AxisDirection::PlusZ],
+            tool_diameter: Some(4.0),
+        }];
+        let engine = engine_study(&study, &surfaces).unwrap();
+        assert_eq!(
+            engine.objective,
+            Objective::MinMass {
+                safety_factor: 2.0,
+                displacement_limit: None
+            }
+        );
+        let plan = outcome_plan(&study.generative, None);
+        assert_eq!(method_label(&plan[0].method), "Milling from +Z");
+        let shared = Mutex::new(GenShared::default());
+        let cancel = AtomicBool::new(false);
+        generation_thread(
+            GenInput {
+                study: engine,
+                plan,
+                gpu: false,
+            },
+            &shared,
+            &cancel,
+        );
+        let shared = shared.into_inner().unwrap();
+        let o = &shared.outcomes[0];
+        assert!(
+            !matches!(o.status, OutcomeStatus::Failed(_)),
+            "{:?}",
+            o.status
+        );
+        // Steel's 250 MPa over 2, with what a coarse grid's estimate allows.
+        assert!(o.max_von_mises <= 1.1 * 125.0, "{} MPa", o.max_von_mises);
+        let full = (40.0 * 16.0 * 8.0) * 7850e-9;
+        assert!(o.mass < full, "{} kg", o.mass);
     }
 
     #[test]

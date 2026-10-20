@@ -976,3 +976,40 @@ stays on show.
   refusals (names twice, unknown items, a case without a fixture or a load, an item twice);
   in the app, cases mapped to the engine's items, items joining and leaving them, a printed
   outcome with nothing hanging.
+
+**Built (October 2026): step 6**, minimize mass, a displacement limit and milling.
+
+- **Minimize mass** (`Objective::MinMass`): the lightest design whose stress stays under the
+  material's strength over the safety factor. The stress at each voxel's centre for the solid
+  material (the brick's `D B u`), relaxed by the density (`ρ^½ σ_vm`, so void voxels carry
+  none, the qp relaxation) and gathered over every voxel of material and every load case by
+  a p-norm (p 8), the voxels the fixtures and loads act through left out (singular there);
+  the norm scaled to the largest stress in the material, the scale damped by half each
+  iteration (Le et al., 2010), so the limit holds on the stress the outcome reports. Its
+  slopes: the explicit part through the relaxation, and an adjoint solve per load case
+  (`K λ = ∂σ_PN/∂u`, on the same multigrid, warm-started from the last iteration's), `−λᵀ
+  (∂K/∂ρ) u` per voxel. The design starts solid and moves by MMA (`mma.rs`, Svanberg's
+  method of moving asymptotes and his primal-dual subproblem solver; move limit 0.1, 0.05
+  from a sharpness of 8), the mass (as a share of the design space's) its objective, under
+  the same projection continuation. Settled when the mass is steady to 1 % over ten
+  iterations with the limits met, or after the last stage. A material without a strength
+  is refused (`NoStrength`).
+- **A displacement limit**: the displacements at the nodes weighted by the density around
+  them, gathered the same way, scaled to the largest at the material's corners, its own
+  adjoint solve per case.
+- **Milling** (`Method::Milling`): 3-axis milled from one side per outcome, which is a
+  one-way pull towards the tool (no undercut seen from it, as casting's), with the density
+  filter's radius at least the tool's (no pocket narrower).
+- **Results** on the test bracket at 2 mm voxels, steel at a safety factor of 2 (125 MPa):
+  37 % of the design space's mass, 122 MPa; with a 0.08 mm displacement limit, heavier, and
+  0.080 mm; at a factor of 4 (62.5 MPa, more than the full design space meets) the design
+  stays full and says so in its stress.
+- **The app**: *Maximize stiffness* or *Minimize mass* (the mass target only for the first,
+  a displacement limit for the second), *Milling* from any of the six sides with a tool
+  diameter.
+- **Tests**: MMA on Svanberg's test problem (to his optimum, 2·10⁻³) and on a linear
+  objective under a convex constraint; the bracket's limits met (stress, displacement), the
+  heavier design for the tighter limit, a material without strength refused; a milled
+  bracket with no undercut seen from the tool and the tool's radius in the filter; the
+  format's objective, limit and milling round trips and refusals; through the app, a milled
+  pair of pads minimized in mass under its stress limit.

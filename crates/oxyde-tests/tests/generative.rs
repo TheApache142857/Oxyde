@@ -147,6 +147,7 @@ fn study(bracket: &Bracket, density: f64) -> GenerativeStudy {
             labels: vec![bracket.bores[1]],
         }],
         load_cases: Vec::new(),
+        objective: Default::default(),
         mass_target: 0.12,
         member_size: None,
         max_iterations: 40,

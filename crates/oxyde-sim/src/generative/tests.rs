@@ -43,6 +43,7 @@ fn bracket(voxel_size: f64) -> GenerativeStudy {
         }],
         load_cases: Vec::new(),
         // A quarter of the box's volume in steel.
+        objective: Default::default(),
         mass_target: 0.25 * 60.0 * 20.0 * 10.0 * 7850.0 * 1e-9,
         member_size: None,
         max_iterations: 150,
@@ -347,6 +348,79 @@ fn load_cases_are_laid_apart_and_carried_together() {
         Grid::build(&study, 0, &cancel).unwrap_err(),
         GenerativeError::NotHeld
     );
+}
+
+#[test]
+fn the_lightest_bracket_keeps_its_stress_under_the_limit() {
+    // Steel (250 MPa yield) at a safety factor of 2: 125 MPa allowed.
+    let mut study = bracket(2.0);
+    let limit = |safety_factor, displacement_limit| Objective::MinMass {
+        safety_factor,
+        displacement_limit,
+    };
+    study.objective = limit(2.0, None);
+    let (grid, light) = run(&study, Method::Unrestricted, 0);
+    let space = grid.kinds.iter().filter(|k| **k != Voxel::Obstacle).count() as f64;
+    let full = space * 8.0 * 7850e-9;
+    assert!(
+        light.max_von_mises <= 1.05 * 125.0,
+        "{} MPa",
+        light.max_von_mises
+    );
+    assert!(light.mass < 0.5 * full, "{} kg of {full}", light.mass);
+    // A displacement limit tighter than the stress gives: heavier, and under it.
+    study.objective = limit(2.0, Some(0.08));
+    let (_, stiff) = run(&study, Method::Unrestricted, 0);
+    assert!(light.max_displacement > 0.1);
+    assert!(
+        stiff.max_displacement <= 1.05 * 0.08,
+        "{} mm",
+        stiff.max_displacement
+    );
+    assert!(stiff.max_von_mises <= 1.05 * 125.0);
+    assert!(stiff.mass > light.mass);
+    // A safety factor of 4 (62.5 MPa) is more than even the full design space meets: the
+    // design stays full, and its stress says so.
+    study.objective = limit(4.0, None);
+    let (_, heavy) = run(&study, Method::Unrestricted, 0);
+    assert!(heavy.mass > 0.95 * full && heavy.max_von_mises > 62.5);
+    // Without a strength there is nothing to keep the stress under.
+    let cancel = AtomicBool::new(false);
+    let weak = Elastic::new(200_000.0, 0.3, 0.0, 7850.0);
+    let refused = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &weak,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    );
+    assert_eq!(refused, Err(GenerativeError::NoStrength));
+}
+
+#[test]
+fn a_milled_bracket_has_no_undercut_seen_from_the_tool() {
+    // Milled from +Z with a 6 mm tool: no voxel denser than the one under it.
+    let study = bracket(2.0);
+    let milled = Method::Milling {
+        direction: Direction {
+            axis: 2,
+            positive: true,
+        },
+        tool_diameter: Some(6.0),
+    };
+    let (grid, outcome) = run(&study, milled, 0);
+    for v in 0..grid.voxel_count() {
+        let c = grid.coords(v);
+        if c[2] > 0 {
+            let below = grid.index([c[0], c[1], c[2] - 1]);
+            assert!(outcome.density[v] <= outcome.density[below], "{c:?}");
+        }
+    }
+    // The tool's radius widens the filter past the default 1.5 voxels.
+    assert!((outcome.filter_radius - 3.0).abs() < 1e-12);
+    assert!((outcome.mass - study.mass_target).abs() < 0.06 * study.mass_target);
 }
 
 #[test]
