@@ -10,26 +10,109 @@
 //! shared by the triangles on either side. The threshold, 127.5, is no byte, so no centre
 //! lies on the surface and no triangle is flat. Taubin's smoothing then takes the voxels'
 //! steps away.
+//!
+//! For *Create Part*, [`exact_surface`] puts the crossings where the design space's bodies
+//! meet the material on those bodies' faces instead, and leaves them there while it smooths.
 
 // Indices into the lattice, sized here.
 #![allow(clippy::indexing_slicing)]
 
 use std::collections::HashMap;
 
-use super::grid::Grid;
+use super::DesignSpace;
+use super::grid::{Grid, Voxel, triangles_of};
+use crate::bvh::{Bvh, Hit};
 use crate::math::{V3, add, cross, dot, lerp, scale, sub};
 use crate::mesh::kuhn_tets;
-use crate::topology::{Shape, smooth};
+use crate::mesher::SurfaceMesh;
+use crate::topology::{Shape, smooth_holding};
 
 /// Half of a byte's range: a voxel is in the material from 128 up.
 const THRESHOLD: f64 = 127.5;
+/// A crossing put on an exact body stays this share of its edge from the lattice points,
+/// so no two crossings around a point meet and no triangle is flat.
+const MIN_SHARE: f64 = 0.02;
 
 /// The surface of `density` (one byte per voxel of `grid`, as [`super::Outcome`] has it),
 /// smoothed by `smoothing` rounds of Taubin's smoothing. Empty when the densities do not
 /// fit the grid.
 pub fn surface(grid: &Grid, density: &[u8], smoothing: usize) -> Shape {
+    cut(grid, density, smoothing, &mut |_, _, _, _| None).0
+}
+
+/// [`surface`], meeting the design space's bodies on their faces: where a lattice edge runs
+/// from the material out of a preserve body into empty design space, out of the starting
+/// shape, or into an obstacle, the surface crosses it where that body's surface does (as
+/// its triangles have it), not where the densities say, and keeps that point through the
+/// smoothing. Its faces there lie on the bodies' faces (their tessellations', to a fiftieth
+/// of the edge), so *Create Part* makes the part's solid of it alone: no boolean with the
+/// exact bodies, which OpenCASCADE takes minutes over, or fails, on a fine outcome whose
+/// faces lie a hair from theirs. An obstacle's offset keeps the material from its surface,
+/// and is no surface to meet: there, the densities place the crossing. With it, per point,
+/// whether it is on a body's face, for [`super::decimate_holding`] to leave it there; the
+/// points next to those take only the smoothing's shrinking steps, which keep them on their
+/// side of a flat face.
+pub fn exact_surface(
+    grid: &Grid,
+    density: &[u8],
+    smoothing: usize,
+    space: &DesignSpace,
+) -> (Shape, Vec<bool>) {
+    let tree = |meshes: &mut dyn Iterator<Item = &SurfaceMesh>| -> Option<Bvh> {
+        let triangles: Vec<[V3; 3]> = meshes.flat_map(triangles_of).collect();
+        (!triangles.is_empty()).then(|| Bvh::new(triangles))
+    };
+    let preserve = tree(&mut space.preserve.iter());
+    let start = tree(&mut space.starting_shape.iter());
+    let obstacles = tree(&mut space.obstacles.iter().map(|o| &o.surface));
+    let n = grid.counts;
+    let size = n.map(|c| c + 2);
+    // A lattice point's voxel; `None` past the grid's sides.
+    let kind = |at: usize| -> Option<Voxel> {
+        let c = [
+            at % size[0],
+            (at / size[0]) % size[1],
+            at / (size[0] * size[1]),
+        ];
+        (0..3)
+            .all(|a| (1..=n[a]).contains(&c[a]))
+            .then(|| grid.kinds[grid.index(c.map(|x| x - 1))])
+    };
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut exact = |inside: usize, outside: usize, p: V3, q: V3| -> Option<f64> {
+        // Out of a preserve body first: its faces may lie on the starting shape's.
+        let through = [
+            (kind(inside) == Some(Voxel::Preserve))
+                .then_some(preserve.as_ref())
+                .flatten(),
+            match kind(outside) {
+                None | Some(Voxel::Outside) => start.as_ref(),
+                Some(Voxel::Obstacle) => obstacles.as_ref(),
+                _ => None,
+            },
+        ];
+        through.into_iter().flatten().find_map(|bodies| {
+            bodies.segment_hits(p, q, &mut hits);
+            hits.iter()
+                .map(|h| h.t)
+                .filter(|t| (0.0..=1.0).contains(t))
+                .min_by(f64::total_cmp)
+        })
+    };
+    cut(grid, density, smoothing, &mut exact)
+}
+
+/// The surface of `density`, its crossings put where `exact` says (the share of the edge
+/// from the lattice point in the material, given the two points and their places) or, when
+/// it says nothing, where the densities are half; and per point, whether `exact` put it.
+fn cut(
+    grid: &Grid,
+    density: &[u8],
+    smoothing: usize,
+    exact: &mut dyn FnMut(usize, usize, V3, V3) -> Option<f64>,
+) -> (Shape, Vec<bool>) {
     if density.len() != grid.voxel_count() {
-        return Shape::default();
+        return (Shape::default(), Vec::new());
     }
     let n = grid.counts;
     // The lattice: lattice point (i, j, k) is voxel (i − 1, j − 1, k − 1), the points
@@ -57,7 +140,9 @@ pub fn surface(grid: &Grid, density: &[u8], smoothing: usize) -> Shape {
     let mut cut = Cutter {
         value: &value,
         position: &position,
+        exact,
         out: Shape::default(),
+        fixed: Vec::new(),
         points: HashMap::new(),
     };
     for k in 0..size[2] - 1 {
@@ -100,19 +185,21 @@ pub fn surface(grid: &Grid, density: &[u8], smoothing: usize) -> Shape {
             }
         }
     }
-    let mut out = cut.out;
+    let (mut out, fixed) = (cut.out, cut.fixed);
     if smoothing > 0 {
-        let fixed = vec![false; out.positions.len()];
-        smooth(&mut out, &fixed, smoothing);
+        smooth_holding(&mut out, &fixed, smoothing);
     }
-    out
+    (out, fixed)
 }
 
 /// The surface being cut: one point per lattice edge crossed.
 struct Cutter<'a> {
     value: &'a [u8],
     position: &'a dyn Fn(usize) -> V3,
+    exact: &'a mut dyn FnMut(usize, usize, V3, V3) -> Option<f64>,
     out: Shape,
+    /// Per point: put on an exact body, so the smoothing leaves it.
+    fixed: Vec<bool>,
     points: HashMap<(usize, usize), u32>,
 }
 
@@ -124,9 +211,21 @@ impl Cutter<'_> {
         }
         // The ends are on either side of the threshold, so they differ.
         let (va, vb) = (f64::from(self.value[key.0]), f64::from(self.value[key.1]));
-        let t = ((THRESHOLD - va) / (vb - va)).clamp(0.0, 1.0);
-        let p = lerp((self.position)(key.0), (self.position)(key.1), t);
+        let (pa, pb) = ((self.position)(key.0), (self.position)(key.1));
+        let (inside, outside, pi, po) = if va > THRESHOLD {
+            (key.0, key.1, pa, pb)
+        } else {
+            (key.1, key.0, pb, pa)
+        };
+        let (p, fixed) = match (self.exact)(inside, outside, pi, po) {
+            Some(t) => (lerp(pi, po, t.clamp(MIN_SHARE, 1.0 - MIN_SHARE)), true),
+            None => {
+                let t = ((THRESHOLD - va) / (vb - va)).clamp(0.0, 1.0);
+                (lerp(pa, pb, t), false)
+            }
+        };
         self.out.positions.push(p);
+        self.fixed.push(fixed);
         let id = (self.out.positions.len() - 1) as u32;
         self.points.insert(key, id);
         id

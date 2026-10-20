@@ -34,9 +34,11 @@ release yet; the git history has every detail.
   the outcome grows between them; *Create Part* inserts the part made where it was grown,
   fixed. In files: bodies named with their component, as faces are (FORMAT.md §8).
 - **Create Part.** The outcome picked becomes a part file of its own: its surface made a
-  solid, joined to the exact preserve bodies, the obstacles cut away, in the outcome's
-  material, ready to be refined with features or studied in the Simulation tab. The part
-  being studied stays open; the panel offers to open the new one.
+  solid that meets the bodies kept, the starting shape and the bodies to stay clear of on
+  their faces (flat faces exactly, round ones as their tessellation does), in seconds even
+  for a fine outcome, in the outcome's material, ready to be refined with features or
+  studied in the Simulation tab. The part being studied stays open; the panel offers to open
+  the new one.
 - **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
   Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
   clear of, the mass target, safety factor, minimum thickness and resolution, the ways of

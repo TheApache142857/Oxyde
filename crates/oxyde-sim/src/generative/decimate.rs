@@ -8,8 +8,9 @@
 //! collapsed first, its point placed where the merged quadric is least, until the surface
 //! has the triangles asked for. A collapse is skipped when it would make the surface other
 //! than a closed manifold (the two ends sharing more neighbours than the edge's two
-//! triangles give them, an end of three triangles only) or turn a triangle over. Ties go to
-//! the lower indices, so the result is the same on every run.
+//! triangles give them, an end of three triangles only), turn a triangle over or leave one
+//! so thin the kernel would skip it. Ties go to the lower indices, so the result is the same
+//! on every run.
 
 // Indices into the mesh's arrays, all sized here from the shape.
 #![allow(clippy::indexing_slicing)]
@@ -22,11 +23,52 @@ use crate::topology::Shape;
 
 /// A collapse turns no triangle further than this cosine from where it faced.
 const MIN_TURN_COSINE: f64 = 0.2;
+/// Added to a collapse's cost per mm² of its edge's length squared: among the collapses
+/// that cost nothing (on a flat face, every one), the shortest edges go first, spreading
+/// them over the face. Taken by the lowest numbers instead, they piled the face's points
+/// onto a few, whose fans of thin triangles refused collapse after collapse: a plate's
+/// outcome (70 000 triangles to 6 000) took 10 s, under half a second with this.
+const LENGTH_COST: f64 = 1e-9;
+/// Nor leaves one thinner than this ([`thickness`]). A kernel making a solid of the
+/// triangles skips the flattest as degenerate (OpenCASCADE's when two edges are parallel
+/// to a sine of 1e-7), which leaves a hole in the shell; this keeps every angle's sine over
+/// a thousandth, far from that.
+const MIN_THICKNESS: f64 = 1e-3;
+
+/// How far a triangle is from flat: twice its area over its longest edge squared, which
+/// no angle's sine is under (an equilateral triangle's is 0.87, a flat one's 0).
+fn thickness(p: [V3; 3]) -> f64 {
+    let n = norm(cross(sub(p[1], p[0]), sub(p[2], p[0])));
+    let longest = [(0, 1), (1, 2), (2, 0)]
+        .iter()
+        .map(|&(i, j)| {
+            let e = sub(p[j], p[i]);
+            dot(e, e)
+        })
+        .fold(0.0, f64::max);
+    if longest > 0.0 { n / longest } else { 0.0 }
+}
 
 /// `shape` with at most `target` triangles (as few as collapses can make when they cannot
 /// reach it), closed and manifold as it was. Each triangle keeps its label.
 pub fn decimate(shape: &Shape, target: usize) -> Shape {
+    decimate_holding(shape, &[], target, f64::INFINITY)
+}
+
+/// [`decimate`], the points `held` (per point of `shape`; none past its end) never moving:
+/// a collapse onto one leaves the merged point where it is, so points on an exact body's
+/// face ([`super::exact_surface`]) stay on it and a flat face stays flat. And no collapse
+/// moves the surface further than `tolerance` (mm: the merged point's distance from the
+/// planes of the triangles it stands for, their root mean square weighted by area): when
+/// the collapses within it cannot reach `target`, it stops short of it rather than wear
+/// the shape away (gone through to the last collapse, the servo arm's screw hole ended a
+/// skewed pentagon, two of its points merged into the counterbore's floor).
+pub fn decimate_holding(shape: &Shape, held: &[bool], target: usize, tolerance: f64) -> Shape {
     let mut m = Mesh::new(shape);
+    for (h, &given) in m.held.iter_mut().zip(held) {
+        *h = given;
+    }
+    m.tolerance = tolerance;
     if m.live_faces <= target {
         return shape.clone();
     }
@@ -233,6 +275,12 @@ struct Mesh {
     /// Bumped whenever the point moves or its faces change.
     stamp: Vec<u32>,
     dead: Vec<bool>,
+    /// Points that stay where they are.
+    held: Vec<bool>,
+    /// Per point, the areas its quadric is weighted by, summed.
+    weights: Vec<f64>,
+    /// mm: the furthest a collapse may move the surface.
+    tolerance: f64,
 }
 
 impl Mesh {
@@ -240,6 +288,7 @@ impl Mesh {
         let n = shape.positions.len();
         let mut around = vec![Vec::new(); n];
         let mut quadrics = vec![[0.0; 10]; n];
+        let mut weights = vec![0.0; n];
         let mut faces = Vec::with_capacity(shape.triangles.len());
         let mut labels = Vec::with_capacity(shape.triangles.len());
         let given = shape
@@ -266,6 +315,7 @@ impl Mesh {
                 let plane = plane_quadric(unit, -dot(unit, p), 0.5 * area2);
                 for &i in t {
                     quadrics[i as usize] = quadric_sum(&quadrics[i as usize], &plane);
+                    weights[i as usize] += 0.5 * area2;
                 }
             }
         }
@@ -280,6 +330,9 @@ impl Mesh {
             around,
             stamp: vec![0; n],
             dead: vec![false; n],
+            held: vec![false; n],
+            weights,
+            tolerance: f64::INFINITY,
         }
     }
 
@@ -312,7 +365,8 @@ impl Mesh {
     }
 
     /// The collapse of edge `a b` (`a < b`), costed, its point where the merged quadric is
-    /// least (else the better of the ends and the middle).
+    /// least (else the better of the ends and the middle), or at a held end; none when it
+    /// would move the surface further than the tolerance.
     fn candidate(&self, a: usize, b: usize) -> Option<Candidate> {
         if a == b || self.dead[a] || self.dead[b] {
             return None;
@@ -323,15 +377,23 @@ impl Mesh {
         let length = norm(sub(pb, pa));
         // A minimum far off the edge (a nearly flat neighbourhood) is no better a place.
         let optimum = quadric_minimum(&q).filter(|v| norm(sub(*v, middle)) <= length);
-        let at = match optimum {
-            Some(v) => v,
-            None => [pa, pb, middle]
+        let better = |x: &V3, y: &V3| quadric_error(&q, *x).total_cmp(&quadric_error(&q, *y));
+        let at = match (self.held[a], self.held[b], optimum) {
+            (true, true, _) => [pa, pb].into_iter().min_by(better).unwrap_or(pa),
+            (true, false, _) => pa,
+            (false, true, _) => pb,
+            (false, false, Some(v)) => v,
+            (false, false, None) => [pa, pb, middle]
                 .into_iter()
-                .min_by(|x, y| quadric_error(&q, *x).total_cmp(&quadric_error(&q, *y)))
+                .min_by(better)
                 .unwrap_or(middle),
         };
+        let error = quadric_error(&q, at).max(0.0);
+        if error > self.tolerance * self.tolerance * (self.weights[a] + self.weights[b]) {
+            return None;
+        }
         Some(Candidate {
-            cost: quadric_error(&q, at).max(0.0),
+            cost: error + LENGTH_COST * length * length,
             a: a as u32,
             b: b as u32,
             stamp_a: self.stamp[a],
@@ -365,7 +427,8 @@ impl Mesh {
         if common != across || na.len() <= 3 || nb.len() <= 3 {
             return false;
         }
-        // No triangle turned over or flattened.
+        // No triangle turned over, flattened or left a sliver (but one that was thinner
+        // still, which it may stay).
         for &v in &[a, b] {
             for &f in &self.around[v] {
                 if shared.contains(&f) {
@@ -385,6 +448,7 @@ impl Mesh {
                 let (l0, l1) = (norm(n0), norm(n1));
                 if l1 <= 1e-12 * l0.max(f64::MIN_POSITIVE)
                     || dot(n0, n1) < MIN_TURN_COSINE * l0 * l1
+                    || thickness(after) < MIN_THICKNESS.min(thickness(before))
                 {
                     return false;
                 }
@@ -408,6 +472,8 @@ impl Mesh {
         }
         self.positions[a] = at;
         self.quadrics[a] = quadric_sum(&self.quadrics[a], &self.quadrics[b]);
+        self.held[a] |= self.held[b];
+        self.weights[a] += self.weights[b];
         self.dead[b] = true;
         // Its edges are costed again; the others' costs did not change.
         self.stamp[a] += 1;
@@ -577,6 +643,88 @@ mod tests {
         assert!(fewer.triangles.len() <= s.triangles.len() / 4);
         let ratio = fewer.volume() / s.volume();
         assert!((ratio - 1.0).abs() < 0.05, "{ratio}");
+    }
+
+    #[test]
+    fn a_tolerance_keeps_the_shape_where_the_target_would_wear_it() {
+        use crate::generative::{Grid, Voxel, surface};
+        // A plate with a hole through it cut from voxels, unsmoothed: every point on a
+        // plane, so collapses within a face cost nothing and across an edge a lot.
+        let counts = [24, 12, 8];
+        let grid = Grid::from_parts(
+            [0.0; 3],
+            0.5,
+            counts,
+            vec![Voxel::Design; counts.iter().product()],
+        )
+        .unwrap();
+        let density: Vec<u8> = (0..grid.voxel_count())
+            .map(|v| {
+                let c = grid.centre(v);
+                let plate = (1.0..11.0).contains(&c[0])
+                    && (1.0..5.0).contains(&c[1])
+                    && (1.0..3.0).contains(&c[2]);
+                let hole = (c[0] - 6.0).hypot(c[1] - 3.0) < 1.2;
+                if plate && !hole { 255 } else { 0 }
+            })
+            .collect();
+        let s = surface(&grid, &density, 0);
+        let volume = s.volume();
+        // Within a hundredth of a millimetre: the faces simplified, the shape kept.
+        let kept = decimate_holding(&s, &[], 40, 0.01);
+        assert!(closed_manifold(&kept));
+        assert!(kept.triangles.len() < s.triangles.len() / 4);
+        assert!((kept.volume() - volume).abs() < 1e-9 * volume);
+        // With none, on to the target: worn.
+        let worn = decimate(&s, 40);
+        assert!(worn.triangles.len() < kept.triangles.len());
+        let change = (worn.volume() - volume).abs() / volume;
+        assert!(change > 1e-3, "{change}");
+    }
+
+    /// The thinnest triangle's twice area over its longest edge squared.
+    fn thinnest(s: &Shape) -> f64 {
+        s.triangles
+            .iter()
+            .map(|t| thickness(t.map(|i| s.positions[i as usize])))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Flat faces and straight creases, collapsed far: no triangle left as thin as a
+    /// kernel would skip (the servo arm's outcome lost faces in OpenCASCADE that way).
+    #[test]
+    fn a_flat_sided_surface_is_simplified_without_slivers() {
+        use crate::generative::{Grid, Voxel, surface};
+        let counts = [30, 30, 8];
+        let grid = Grid::from_parts(
+            [0.0; 3],
+            0.5,
+            counts,
+            vec![Voxel::Design; counts.iter().product()],
+        )
+        .unwrap();
+        // An L-shaped plate: before slivers were refused, a quarter of its triangles left one
+        // at 1.4e-4.
+        let density: Vec<u8> = (0..grid.voxel_count())
+            .map(|v| {
+                let c = grid.centre(v);
+                let plate = (1.0..14.0).contains(&c[0])
+                    && (1.0..14.0).contains(&c[1])
+                    && (1.0..3.0).contains(&c[2]);
+                let notch = c[0] > 5.0 && c[1] > 5.0;
+                if plate && !notch { 255 } else { 0 }
+            })
+            .collect();
+        let s = surface(&grid, &density, 12);
+        assert!(thinnest(&s) >= MIN_THICKNESS);
+        for k in [2, 4, 8, 16, 32] {
+            let target = s.triangles.len() / k;
+            let fewer = decimate(&s, target);
+            assert!(closed_manifold(&fewer));
+            assert!(fewer.triangles.len() <= target);
+            let thin = thinnest(&fewer);
+            assert!(thin >= MIN_THICKNESS, "{target}: {thin:e}");
+        }
     }
 
     #[test]

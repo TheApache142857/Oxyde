@@ -114,8 +114,8 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   for several materials and ways of making it (unrestricted, additive without supports,
   2-axis cutting, milling, casting), an outcome for each, on the graphics card when there is
   one; compared on a plot of mass against stress or stiffness, shown iteration by iteration,
-  exported as STL, OBJ or 3MF, or made a part (*Create Part*: a solid joined to the exact
-  bodies kept).
+  exported as STL, OBJ or 3MF, or made a part (*Create Part*: a solid meeting the bodies
+  kept on their faces).
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,

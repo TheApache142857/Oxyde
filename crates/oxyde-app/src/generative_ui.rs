@@ -32,13 +32,13 @@ use oxyde_format::simulation::{
     AxisDirection, GenerativeMethod, GenerativeObjective, GenerativeObstacle, GenerativeSettings,
     LoadCase, MeshSize, OutcomeMethod, StudyBody, StudyType, SymmetryPlanes,
 };
-use oxyde_geom::Transform;
-use oxyde_kernel::{BooleanOp, FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
+use oxyde_kernel::{FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
 use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical, Part};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, DesignSpace, Direction, GenerativeError, GenerativeStudy, Grid, MAX_VOXELS, Method,
-    Objective, Obstacle, Voxel, decimate, generate_on, solid_pieces, surface, voxel_size,
+    Objective, Obstacle, Voxel, decimate_holding, exact_surface, generate_on, solid_pieces,
+    surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -55,8 +55,11 @@ const GHOST_OPACITY: f32 = 0.22;
 /// Rounds of Taubin's smoothing an outcome's surface is drawn and exported with.
 pub(crate) const SMOOTHING: usize = 12;
 /// The triangles an outcome's surface is simplified to for *Create Part*: one face each,
-/// as many as the kernel fuses with the preserve bodies in a few seconds.
+/// as many as the kernel makes a solid of in a few seconds.
 const PART_TRIANGLES: usize = 8000;
+/// Nor further than this share of a voxel from where it was: where that keeps more
+/// triangles, the part has more.
+const PART_TOLERANCE: f64 = 0.25;
 
 // ---- Roles ---------------------------------------------------------------------------------
 
@@ -313,10 +316,11 @@ pub(crate) fn outcome_plan(g: &GenerativeSettings, part: Option<&Material>) -> V
 
 // ---- The engine's study --------------------------------------------------------------------
 
-/// The engine's study for `study` on `surfaces` (the part's, made for the document as it
-/// is), with the faces the fixtures and loads are on checked to be preserve bodies'.
-pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<GenerativeStudy, String> {
-    let g = &study.generative;
+/// The design space of `g` on `surfaces`, and the preserve bodies' indices into them.
+fn design_space(
+    g: &GenerativeSettings,
+    surfaces: &Surfaces,
+) -> Result<(DesignSpace, Vec<usize>), String> {
     let body = |id: &StudyBody| -> Result<usize, String> {
         solid_of(surfaces, id)
             .map(|(i, _)| i)
@@ -351,6 +355,14 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         starting_shape,
         margin: g.margin,
     };
+    Ok((space, preserve))
+}
+
+/// The engine's study for `study` on `surfaces` (the part's, made for the document as it
+/// is), with the faces the fixtures and loads are on checked to be preserve bodies'.
+pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<GenerativeStudy, String> {
+    let g = &study.generative;
+    let (space, preserve) = design_space(g, surfaces)?;
 
     let mut fixtures = Vec::new();
     let mut loads = Vec::new();
@@ -1710,49 +1722,40 @@ impl OxydeApp {
     }
 
     /// Create Part: the picked outcome as a new part file, made off the UI thread (its
-    /// surface simplified, a solid made of each piece, fused with copies of the preserve
-    /// bodies, the obstacles cut away, written as STEP into the new part's Imported feature,
-    /// in the outcome's material). The open part stays open; the panel offers the new one.
+    /// surface cut to meet the preserve bodies, the starting shape and the obstacles on
+    /// their faces, simplified, a solid made of each piece, written as STEP into the new
+    /// part's Imported feature, in the outcome's material). The open part stays open; the
+    /// panel offers the new one.
     pub(crate) fn create_part(&mut self) {
-        let Some(shape) = self.outcome_shape() else {
-            self.status = "Create Part: pick an outcome first".to_owned();
-            return;
-        };
+        // The bodies' surfaces as the outcome was grown on them, to meet them exactly; the
+        // densities' own surface when they cannot be had.
+        let surfaces = self
+            .ensure_surfaces()
+            .ok()
+            .and(self.simulation.surfaces.as_ref());
+        let space = surfaces.and_then(|s| design_space(&self.simulation.study.generative, s).ok());
         let view = &self.simulation.generative;
-        let Some(o) = view
+        let Some((generated, o)) = view
             .generated
             .as_ref()
             .zip(view.picked)
-            .and_then(|(g, id)| g.outcome(id))
+            .and_then(|(g, id)| Some((g, g.outcome(id)?)))
         else {
+            self.status = "Create Part: pick an outcome first".to_owned();
             return;
         };
         let (id, material_name) = (o.id, o.material.clone());
-        let g = &self.simulation.study.generative;
-        // A body's shape, and where an assembly places it.
-        let shape_of = |b: &StudyBody| -> Option<(ShapeHandle, Transform)> {
-            match (&self.asm, b.component) {
-                (None, None) => Some((
-                    self.doc.part.body()?.solid(b.body)?.shape,
-                    Transform::IDENTITY,
-                )),
-                (Some(doc), Some(top)) => {
-                    let o = crate::assembly::Occurrence {
-                        top,
-                        path: b.path.clone(),
-                    };
-                    let (_, placement, part) = doc
-                        .leaves(&doc.assembly)
-                        .into_iter()
-                        .find(|(at, _, _)| *at == o)?;
-                    Some((
-                        part.part.body()?.solid(b.body)?.shape,
-                        placement.transform(),
-                    ))
-                }
-                _ => None,
-            }
+        // The densities shown: the iteration picked on the slider, else the last.
+        let density = densities(o, view.snapshot);
+        let (shape, held) = match &space {
+            Some((space, _)) => exact_surface(&generated.grid, density, SMOOTHING, space),
+            None => (surface(&generated.grid, density, SMOOTHING), Vec::new()),
         };
+        if shape.triangles.is_empty() {
+            self.status = "The outcome has no material to make a part of".to_owned();
+            return;
+        }
+        let g = &self.simulation.study.generative;
         // The outcome's material: the study's, else the (first preserve body's) part's.
         let own_material = match (&self.asm, g.preserve.first()) {
             (Some(doc), Some(b)) => b
@@ -1770,13 +1773,6 @@ impl OxydeApp {
             .find(|m| m.name == material_name)
             .cloned()
             .or(own_material);
-        let preserve: Vec<(ShapeHandle, Transform)> =
-            g.preserve.iter().filter_map(shape_of).collect();
-        let obstacles: Vec<(ShapeHandle, Transform)> = g
-            .obstacles
-            .iter()
-            .filter_map(|o| shape_of(&o.body))
-            .collect();
         let stem = match &self.asm {
             Some(doc) => doc.display_name(),
             None => self.doc.display_name(),
@@ -1798,21 +1794,10 @@ impl OxydeApp {
         if !crate::assembly_ui::has_extension(&path, oxyde_format::PART_EXTENSION) {
             path.set_extension(oxyde_format::PART_EXTENSION);
         }
-        // Copies of the bodies to keep and to cut, so the job works on shapes of its own
-        // while the part stays on show.
-        let copy = |kernel: &mut oxyde_occt::OcctKernel, shapes: &[(ShapeHandle, Transform)]| {
-            shapes
-                .iter()
-                .filter_map(|(s, at)| kernel.transform(*s, at).ok())
-                .map(|r| r.shape)
-                .collect::<Vec<_>>()
-        };
-        let preserve = copy(&mut self.kernel, &preserve);
-        let obstacles = copy(&mut self.kernel, &obstacles);
         let input = PartInput {
             shape,
-            preserve,
-            obstacles,
+            held,
+            tolerance: PART_TOLERANCE * generated.grid.size,
             material,
             file_name: format!("{name}.step"),
         };
@@ -2029,8 +2014,8 @@ impl OxydeApp {
         }
         if command_button(ui, Icon::Part, "Create Part", has_outcome, false)
             .on_hover_text(
-                "A new part file of the outcome picked: its surface made a solid, joined to the \
-                 preserve bodies, the obstacles cut away",
+                "A new part file of the outcome picked: its surface made a solid, meeting the \
+                 bodies kept, the starting shape and the bodies to stay clear of on their faces",
             )
             .clicked()
         {
@@ -2405,20 +2390,24 @@ impl OxydeApp {
 
 // ---- Create Part ---------------------------------------------------------------------------
 
-/// What *Create Part* works from: the outcome's surface, copies of the bodies to keep and
-/// to cut (the job's to release), the outcome's material.
+/// What *Create Part* works from: the outcome's surface (from [`exact_surface`], on the
+/// bodies' faces where it meets them) and material.
 struct PartInput {
     shape: Shape,
-    preserve: Vec<ShapeHandle>,
-    obstacles: Vec<ShapeHandle>,
+    /// Per point of `shape`, whether it is on a body's face, where simplifying leaves it.
+    held: Vec<bool>,
+    /// mm: the furthest simplifying may move the surface.
+    tolerance: f64,
     material: Option<Material>,
     file_name: String,
 }
 
 /// The part of an outcome, rebuilt on `kernel`, and a note of what was done: the surface
-/// simplified to [`PART_TRIANGLES`], a solid of each piece, fused with the preserve bodies
-/// (left as bodies of their own when the fuse fails), the obstacles cut away (left in when
-/// that fails), written as STEP into an Imported feature, in the outcome's material.
+/// simplified to [`PART_TRIANGLES`], a solid of each piece, written as STEP into an
+/// Imported feature, in the outcome's material. No boolean joins the exact preserve bodies
+/// or cuts the obstacles: the surface already meets them on their faces, and OpenCASCADE
+/// takes minutes over a boolean between a fine outcome's thousands of faces and those, or
+/// fails.
 fn make_outcome_part<K: Kernel>(
     kernel: &mut K,
     input: PartInput,
@@ -2426,8 +2415,8 @@ fn make_outcome_part<K: Kernel>(
 ) -> Result<(Part, String), String> {
     let PartInput {
         shape,
-        preserve,
-        obstacles,
+        held,
+        tolerance,
         material,
         file_name,
     } = input;
@@ -2439,7 +2428,7 @@ fn make_outcome_part<K: Kernel>(
     };
     let result = (|| {
         say("Simplifying the surface".to_owned());
-        let fewer = decimate(&shape, PART_TRIANGLES);
+        let fewer = decimate_holding(&shape, &held, PART_TRIANGLES, tolerance);
         let pieces = solid_pieces(&fewer);
         if pieces.is_empty() {
             return Err("the outcome has no closed surface".to_owned());
@@ -2458,37 +2447,10 @@ fn make_outcome_part<K: Kernel>(
             solids.push(s);
         }
         let mut notes = vec![format!("{} triangles", fewer.triangles.len())];
-        let mut bodies: Vec<ShapeHandle> = solids.clone();
-        if let Some((&first, rest)) = solids.split_first()
-            && (!preserve.is_empty() || !rest.is_empty())
-        {
-            say("Joining the preserve bodies".to_owned());
-            let tools: Vec<ShapeHandle> = rest.iter().chain(&preserve).copied().collect();
-            match kernel.boolean_many(BooleanOp::Fuse, first, &tools) {
-                Ok(r) => {
-                    made.push(r.shape);
-                    bodies = vec![r.shape];
-                    notes.push("joined to the preserve bodies".to_owned());
-                }
-                Err(e) => {
-                    bodies.extend(&preserve);
-                    notes.push(format!("the preserve bodies left apart ({e})"));
-                }
-            }
+        if solids.len() > 1 {
+            notes.push(format!("{} bodies", solids.len()));
         }
-        if let [only] = bodies[..]
-            && !obstacles.is_empty()
-        {
-            say("Cutting the obstacles away".to_owned());
-            match kernel.boolean_many(BooleanOp::Cut, only, &obstacles) {
-                Ok(r) => {
-                    made.push(r.shape);
-                    bodies = vec![r.shape];
-                    notes.push("the obstacles cut away".to_owned());
-                }
-                Err(e) => notes.push(format!("the obstacles not cut ({e})")),
-            }
-        }
+        let bodies = solids;
         say("Writing the solid".to_owned());
         let step = std::env::temp_dir().join(format!(
             "oxyde-outcome-{}-{}.step",
@@ -2513,8 +2475,6 @@ fn make_outcome_part<K: Kernel>(
         Ok((bytes?, notes.join(", ")))
     })();
     release(kernel, &made);
-    release(kernel, &preserve);
-    release(kernel, &obstacles);
     let (bytes, note) = result?;
     say("Rebuilding the part".to_owned());
     let mut part = Part::new();
@@ -3590,8 +3550,8 @@ fn picked_rows(
         if ui
             .button("Create Part…")
             .on_hover_text(
-                "A new part file of the outcome: its surface made a solid, joined to the \
-                 preserve bodies, the obstacles cut away",
+                "A new part file of the outcome: its surface made a solid, meeting the bodies \
+                 kept, the starting shape and the bodies to stay clear of on their faces",
             )
             .clicked()
         {

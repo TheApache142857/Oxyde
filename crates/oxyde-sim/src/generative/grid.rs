@@ -621,7 +621,8 @@ fn bounds(points: impl Iterator<Item = V3>) -> Option<(V3, V3)> {
     out
 }
 
-fn triangles_of(s: &crate::mesher::SurfaceMesh) -> Vec<[V3; 3]> {
+/// A surface's triangles, by their corners.
+pub(super) fn triangles_of(s: &crate::mesher::SurfaceMesh) -> Vec<[V3; 3]> {
     s.triangles
         .iter()
         .filter_map(|t| {

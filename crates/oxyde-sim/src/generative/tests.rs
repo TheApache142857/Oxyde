@@ -646,3 +646,80 @@ fn surfaces_are_closed_and_hold_the_material() {
     assert!(surface(&grid, &[0u8; 1000], 4).triangles.is_empty());
     assert!(surface(&grid, &[0u8; 10], 4).triangles.is_empty());
 }
+
+#[test]
+fn an_exact_surface_meets_the_bodies_on_their_faces() {
+    // 1 mm voxels; the starting shape a box from 0.3 to 8.7 along X and 0.3 to 6.7 across,
+    // its faces between the voxels' centres; a preserve box at its −X end to x = 3.4; a bar
+    // of material from the preserve box to x = 6, empty design space beyond.
+    let (start_lo, start_hi) = ([0.3; 3], [8.7, 6.7, 6.7]);
+    let (keep_lo, keep_hi) = ([0.3; 3], [3.4, 6.7, 6.7]);
+    let counts = [10, 8, 8];
+    let blank = Grid::from_parts([0.0; 3], 1.0, counts, vec![Voxel::Design; 640]).unwrap();
+    let within = |c: V3, lo: V3, hi: V3| (0..3).all(|a| c[a] > lo[a] && c[a] < hi[a]);
+    let mut kinds = vec![Voxel::Design; 640];
+    let mut density = vec![0u8; 640];
+    for v in 0..640 {
+        let c = blank.centre(v);
+        if within(c, keep_lo, keep_hi) {
+            kinds[v] = Voxel::Preserve;
+            density[v] = 255;
+        } else if !within(c, start_lo, start_hi) {
+            kinds[v] = Voxel::Outside;
+        } else if c[0] < 6.0 && (2.0..6.0).contains(&c[1]) && (2.0..6.0).contains(&c[2]) {
+            density[v] = 255;
+        }
+    }
+    let grid = Grid::from_parts([0.0; 3], 1.0, counts, kinds).unwrap();
+    let space = DesignSpace {
+        preserve: vec![box_surface(keep_lo, keep_hi)],
+        obstacles: Vec::new(),
+        starting_shape: Some(box_surface(start_lo, start_hi)),
+        margin: None,
+    };
+    let plain = surface(&grid, &density, 10);
+    let (exact, held) = exact_surface(&grid, &density, 10, &space);
+    assert!(is_closed(&exact));
+    assert_eq!(held.len(), exact.positions.len());
+    let lowest = |s: &crate::topology::Shape, a: usize| {
+        s.positions
+            .iter()
+            .map(|p| p[a])
+            .fold(f64::INFINITY, f64::min)
+    };
+    let highest = |s: &crate::topology::Shape, a: usize| {
+        s.positions
+            .iter()
+            .map(|p| p[a])
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    // Cut by the densities, the outcome stops midway between centres, at 0; cut exactly, it
+    // is as big as the boxes, through the smoothing.
+    assert!(lowest(&plain, 0).abs() < 0.1, "{}", lowest(&plain, 0));
+    for a in 0..3 {
+        assert_eq!(lowest(&exact, a), 0.3);
+    }
+    assert_eq!(highest(&exact, 1), 6.7);
+    assert_eq!(highest(&exact, 2), 6.7);
+    // The preserve box's face to the empty space beside the bar is met where it is; the
+    // bar's free end, by the densities.
+    let on = |x: f64| exact.positions.iter().filter(|p| p[0] == x).count();
+    assert!(on(3.4) > 10, "{}", on(3.4));
+    assert!(highest(&exact, 0) < 6.5);
+    // Nothing of it is out of the starting shape.
+    let inside = |s: &crate::topology::Shape| {
+        s.positions
+            .iter()
+            .all(|p| (0..3).all(|a| p[a] >= start_lo[a] && p[a] <= start_hi[a]))
+    };
+    assert!(inside(&exact));
+    // Simplified, holding the points on the faces: still on them, still inside.
+    let fewer = decimate_holding(&exact, &held, exact.triangles.len() / 8, f64::INFINITY);
+    assert!(is_closed(&fewer));
+    assert!(fewer.triangles.len() <= exact.triangles.len() / 8);
+    for a in 0..3 {
+        assert_eq!(lowest(&fewer, a), 0.3);
+    }
+    assert_eq!(highest(&fewer, 1), 6.7);
+    assert!(inside(&fewer));
+}

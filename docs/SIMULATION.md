@@ -732,12 +732,12 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   bracket's surface held half its material. The threshold, 127.5, is no byte, so no
   triangle is flat. Then Taubin's smoothing, every point free. The preserve bodies are drawn
   exact over it.
-- **Create Part:** the surface decimated (quadric edge collapse) to as many triangles as the
+- **Create Part:** the surface cut to meet the preserve bodies, the starting shape and the
+  obstacles on their faces, decimated (quadric edge collapse) to as many triangles as the
   kernel handles well, sewn into a solid by a new `Kernel` operation (a solid from a closed
-  triangle mesh, ARCHITECTURE.md §4), fused with the exact preserve bodies, the obstacles cut
-  away, and written as STEP into a new part's *Imported* feature, kept as an imported STEP
-  file is: no change to `.oxyprt`. If the fuse fails, the outcome and the preserve bodies
-  stay separate bodies of the part.
+  triangle mesh, ARCHITECTURE.md §4), and written as STEP into a new part's *Imported*
+  feature, kept as an imported STEP file is: no change to `.oxyprt`. No boolean with the
+  exact bodies (step 4 below says why).
 
 **Order of the work**, each step a commit with its tests and documents:
 
@@ -924,29 +924,61 @@ makes them.
 (asked for, next to the model by default), made on a job with a worker kernel while the part
 stays on show.
 
-- **The surface simplified** (`oxyde_sim::generative::decimate`): quadric edge collapse
-  (Garland and Heckbert) down to 8 000 triangles, each collapse kept only when the surface
-  stays a closed manifold (the ends sharing no neighbour but the edge's two triangles give
-  them, no end left with three triangles) and turns no triangle over; ties to the lower
-  indices, so it repeats exactly. Then split into its closed pieces (`solid_pieces`), specks
-  under a thousandth of the largest left out.
+- **The surface meeting the bodies on their faces**
+  (`oxyde_sim::generative::exact_surface`): where a lattice edge runs from the material out
+  of a preserve body into empty design space, out of the starting shape (or past the grid's
+  side, which is out of it) or into an obstacle, the crossing goes where that body's surface
+  crosses the edge (the first hit of the segment on its triangles, through a bounding volume
+  hierarchy), kept a fiftieth of the edge from its ends so that no two crossings meet, and
+  is held through the smoothing; the points next to a held one take only its shrinking
+  steps, which keep them on their side of a flat face (the growing step pushed some a few
+  hundredths of a voxel through it). An obstacle's offset is no surface: there the densities
+  place it. Marching tetrahedra makes a closed surface that does not cross itself wherever
+  the crossings lie on their edges, so this changes where the surface is, never what it is.
+- **The surface simplified** (`oxyde_sim::generative::decimate_holding`): quadric edge
+  collapse (Garland and Heckbert) down to 8 000 triangles, each collapse kept only when the
+  surface stays a closed manifold (the ends sharing no neighbour but the edge's two
+  triangles give them, no end left with three triangles), turns no triangle over and leaves
+  none a sliver (twice its area over its longest edge squared, which no angle's sine is
+  under, kept over a thousandth: OCCT skips a triangle whose edges are parallel to a sine of
+  1e-7, which opens the shell; the servo arm's outcomes at 0.15 mm lost four triangles that
+  way); a collapse onto a held point leaves the merged point there, so the faces met stay
+  where they are and flat; among collapses of equal cost (a flat face's all cost nothing),
+  the shortest edge first (a plate's 70 000 triangles took 10 s to bring to 6 000 when the
+  lowest numbers went first, piling the face onto a few points; under half a second so); and
+  none moving the surface more than a quarter of a voxel from where it was (the merged
+  point's distance from the planes of the triangles it stands for, their root mean square
+  weighted by area), so that where the target cannot be reached within that, the part keeps
+  more triangles rather than worn features (gone through to the last collapse, the servo
+  arm's screw hole ended a skewed pentagon); ties to the lower indices, so it repeats
+  exactly. Then split into its closed pieces (`solid_pieces`), specks under a thousandth of
+  the largest left out.
 - **A solid of each piece** by a new `Kernel` operation, `solid_from_mesh` (ARCHITECTURE.md
   §4): OCCT's `BRepBuilderAPI_MakeShapeOnMesh` makes one planar face per triangle with shared
   edges, which come back loose and are gathered into a shell, checked closed, made a solid,
   turned outward and checked valid.
-- **Fused with the preserve bodies, the obstacles cut away**: copies of the exact bodies
-  (made on the UI thread, so the job works on shapes of its own) in one fuse and one cut. A
-  fuse that fails leaves the preserve bodies as bodies of their own; a cut that fails leaves
-  the obstacles' room in; the status says which. The result goes to STEP, with the outcome's
-  material, into the Imported feature of a new part in that material, kept as an imported
-  STEP file is: no change to `.oxyprt`. The panel then offers to open it.
+- **No boolean**: the solids go to STEP as they are, with the outcome's material, into the
+  Imported feature of a new part in that material, kept as an imported STEP file is: no
+  change to `.oxyprt`. The panel then offers to open it. The first *Create Part* fused the
+  solid with copies of the exact preserve bodies and cut the obstacles away; at 0.15 mm on
+  the servo arm (its preserve bodies cut from it, the arm the starting shape) the surface
+  cut by the densities lay a few hundredths from the bodies' faces, and OCCT's fuse ran for
+  16 minutes and left 142 slivers; grown a voxel past the arm and trimmed to it, the trim
+  ran for 20 minutes and lost the outcome. Between a solid of ten thousand faces and the
+  arm's, its spline's 73 among them, OCCT's booleans are no tool. Met on their faces
+  instead, the bodies' flat faces are exact and their round ones as close as their
+  tessellation (0.02 mm), and the part takes seconds: the servo arm's 514 000 triangles to
+  13 700 and a solid in 5 s.
 - **Tests**: in `oxyde-sim`, a sphere of 20 480 triangles brought to 2 000 stays a closed
   manifold on the sphere to 0.1 mm with its volume to 1 %, the same on every run; an outcome's
   surface brought to a quarter likewise; pieces found, the largest first, specks left out. In
   `oxyde-tests`, the OpenCASCADE bracket's outcome: its 15 000 triangles brought to 6 000
-  (0.02 s), a solid of exactly the mesh's volume (1 s), fused with the rings and cut by the
-  post in one solid (1.3 s, a debug build with OCCT's release libraries), written as STEP and
-  read back the same.
+  (0.02 s), a solid of exactly the mesh's volume (1 s, a debug build with OCCT's release
+  libraries), the rings' flat faces met exactly, written as STEP and read back the same.
+  Later: an L-shaped plate's surface decimated far leaves no sliver; boxes met on their
+  faces, through the smoothing and the simplifying; and two rings in a plate as thick, bored
+  where they are (the servo arm's case), make one solid exactly as thick as the plate and
+  within it (1.3 s).
 
 **Built (October 2026): step 5**, additive and load cases.
 

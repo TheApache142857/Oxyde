@@ -1521,6 +1521,17 @@ impl Cutter<'_> {
 /// Taubin's λ|μ smoothing: a shrinking Laplacian step, then a growing one, `rounds` times,
 /// over the points not `fixed`.
 pub(crate) fn smooth(shape: &mut Shape, fixed: &[bool], rounds: usize) {
+    taubin(shape, fixed, rounds, false);
+}
+
+/// [`smooth`], the points next to a fixed one taking the shrinking steps only: each stays
+/// among its neighbours, so where the fixed points lie on a flat face, it stays on its side
+/// of the face (the growing step pushed some a few hundredths of a voxel through it).
+pub(crate) fn smooth_holding(shape: &mut Shape, fixed: &[bool], rounds: usize) {
+    taubin(shape, fixed, rounds, true);
+}
+
+fn taubin(shape: &mut Shape, fixed: &[bool], rounds: usize, hold_next: bool) {
     let n = shape.positions.len();
     let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); n];
     for t in &shape.triangles {
@@ -1534,12 +1545,16 @@ pub(crate) fn smooth(shape: &mut Shape, fixed: &[bool], rounds: usize) {
         list.sort_unstable();
         list.dedup();
     }
+    let is_fixed = |i: usize| fixed.get(i).copied().unwrap_or(false);
+    let next_to_fixed: Vec<bool> = (0..n)
+        .map(|i| hold_next && neighbours[i].iter().any(|&j| is_fixed(j as usize)))
+        .collect();
     let step = |positions: &mut Vec<V3>, factor: f64| {
         let next: Vec<V3> = (0..n)
             .map(|i| {
                 let p = positions[i];
                 let list = &neighbours[i];
-                if fixed[i] || list.is_empty() {
+                if is_fixed(i) || list.is_empty() || factor < 0.0 && next_to_fixed[i] {
                     return p;
                 }
                 let mean = scale(

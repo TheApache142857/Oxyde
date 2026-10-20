@@ -44,10 +44,10 @@ mod mma;
 mod multigrid;
 mod surface;
 
-pub use decimate::{decimate, solid_pieces};
+pub use decimate::{decimate, decimate_holding, solid_pieces};
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
 pub use multigrid::{Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved};
-pub use surface::surface;
+pub use surface::{exact_surface, surface};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
