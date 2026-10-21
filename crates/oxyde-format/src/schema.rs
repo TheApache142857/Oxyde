@@ -632,14 +632,14 @@ pub(crate) enum CombineOpDto {
     Intersect,
 }
 
-fn body_dto(id: &BodyId) -> BodyIdDto {
+pub(crate) fn body_dto(id: &BodyId) -> BodyIdDto {
     BodyIdDto {
         feature: id.feature.raw(),
         index: id.index,
     }
 }
 
-fn body_from(dto: BodyIdDto) -> BodyId {
+pub(crate) fn body_from(dto: BodyIdDto) -> BodyId {
     BodyId::new(FeatureId::from_raw(dto.feature), dto.index)
 }
 

@@ -5,6 +5,182 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Frequency studies (October 2026)
+
+- **Frequency studies in the Simulation tab.** *New Study › Frequency*, as in SolidWorks:
+  hold the model with fixtures (and tie its bodies with contacts), say how many modes to
+  find (5 by default, up to 50) and *Run* finds its lowest natural frequencies and the shape
+  it vibrates in at each. The panel lists every mode with its frequency in hertz and the
+  share of the model's mass it moves along X, Y and Z, with their totals; clicking a mode
+  draws its shape on the model, coloured by how far each point moves, under a legend such
+  as *Mode 2: 143.2 Hz*. Frequency studies take no loads, and every body needs a density
+  (the panel warns where one is missing). The modes are saved with the study and come
+  back when it opens.
+- **Files:** the `.oxysim` holds frequency studies (`type` `frequency`, with a `frequency`
+  block holding the number of modes, FORMAT.md §8) and the `.oxyres` their results: each
+  mode's frequency and mass participation, the model's mass, and the mode shapes in
+  `fields/mode_shapes.bin` (FORMAT.md §9). A document holding one is written as
+  `format_version` 4, as one holding a generative study is; builds of Oxyde from before
+  frequency studies refuse it, and the other documents are written as before.
+
+### Generative design, under way (October 2026)
+
+- **A Generative Design tab in place of the Topology tab.** As in Fusion 360: give the part's
+  bodies their roles (bodies to keep, bodies to stay clear of, a starting shape the material
+  stays inside), each coloured in the viewport; hold and load the bodies to keep as in a
+  static study; set the mass target, the safety factor, the ways of making it (unrestricted,
+  2-axis cutting, casting in a mould pulled along a direction) and the materials to try.
+  *Generate* grows a shape for every material and way of making it, on the graphics card when
+  there is one, each shown as it is done; *Stop* keeps the one being grown as far as it got.
+  *Explore* plots the outcomes' mass against their stress (or stiffness, displacement, safety
+  factor) to compare them, draws the one picked with its iterations on a slider, and *Export*
+  writes it as STL, OBJ or 3MF. The outcomes are saved beside the study and come back with
+  it. Topology studies are still made in the Simulation tab, under New Study.
+- **Additive manufacturing and load cases.** *Additive* grows shapes that print without
+  supports along the build direction picked: nothing overhangs more than 45°, in any
+  direction. *Load cases* (Design conditions › Add a load case) give the loads a part meets
+  at different times, each with its own fixtures: the outcomes are as stiff as can be for
+  them all. In files: `load_cases` in the study's `generative` block (FORMAT.md §8).
+- **Minimize mass, a displacement limit, milling.** *Minimize mass* (Objectives) finds the
+  lightest shape whose stress stays under the material's strength over the safety factor,
+  and whose displacement stays under a limit when one is set; *Maximize stiffness* still
+  takes a mass target. *Milling* grows shapes a 3-axis mill reaches from the side picked,
+  pockets narrower than the tool kept out where the shape allows. In files:
+  `objective: "min_mass"`, `displacement_limit` and the `milling` method (FORMAT.md §8).
+- **Overhangs within 45° in every direction.** Additive outcomes could lean up to about
+  55° from the build direction where a wall ran along a diagonal between the axes: each
+  layer was allowed to rest on a diagonal neighbour. Now nothing overhangs more than 45° in
+  any direction (walls leaning along a diagonal come out a little steeper than needed), so
+  the outcomes print without supports as promised. Additive outcomes generated again
+  differ from earlier ones.
+- **How grey an outcome is.** Explore shows each outcome's *grayness*: how much of it is
+  neither solid nor void. A few percent is the thin band where the shape ends; more is
+  marked, as parts of the shape did not settle crisp there. An outcome that stops changing
+  while still grey is no longer called settled and runs on to the end. In files: each
+  outcome's `grayness` (FORMAT.md §9).
+- **Gravity and remote masses.** *Gravity* weighs the shape as it grows (9.81 m/s² down, or
+  so many g for a shock, along any direction), and *Remote Mass* hangs a component on the
+  faces of a body kept: its mass at its centre of mass, which gravity weighs and whose
+  weight reaches the faces as a force and a moment, as Fusion 360's point mass does (a
+  1.35 kg instrument under 10 g, as NASA's bracket carries). Each is a load the load cases
+  pick, so a case can be a shock along X and another the weight alone. Weighted outcomes
+  are the stiffest for their mass target at most: a lighter one may be stiffer when the
+  material weighs. In files: `gravity` in generative studies and the new `remote_mass`
+  load (FORMAT.md §8).
+- **Milling from several sides.** *Milling* can make one outcome milled from all the sides
+  picked (*All sides in one outcome*), the part turned over between setups, as Autodesk's
+  machinery example mills from +Y and −Y: every spot is reached from one side or another,
+  so the shape can have hollows on both faces. Off, it is an outcome per side as before.
+  In files: `combined` on the `milling` method, and a milled outcome's `directions`
+  (FORMAT.md §8–§9).
+- **Minimum thickness and the tool's width are aims.** The panel and the documents now say
+  what they are: the density filter keeps bars and walls from coming out thinner than the
+  minimum thickness, and pockets narrower than a milling tool, wherever the shape allows,
+  but does not rule them out. Check the part made.
+- **Generative design in assemblies.** A generative study of an assembly takes the bodies
+  of its parts: keep the brackets' mounting bosses, stay clear of the motor next to them, and
+  the outcome grows between them; *Create Part* inserts the part made where it was grown,
+  fixed. In files: bodies named with their component, as faces are (FORMAT.md §8).
+- **A single body, redesigned in a few clicks.** A part that is one body no longer has to be
+  cut into bodies to keep: select faces to keep (its holes, its mounting faces), *Preserve
+  Region*, and give a depth; the material within that depth inside the body is kept, and the
+  body can be the starting shape (to redesign it inside itself) or have no role (to grow
+  around it). Fixtures and loads go on those faces. Holes whose faces are kept, held,
+  loaded or carry a remote mass stay empty, as if a pin were in them, without modelling one.
+  *Margin* now takes a value per axis: 0 along Y keeps the outcome within the part's own
+  height. Before
+  *Generate*, the panel warns of a setup that would disappoint: every body kept (the outcome
+  can only add lumps), most of the design space kept, no material, voxels too coarse for
+  what is kept. In files: `preserved` and a `margin` per axis in the `generative` block
+  (FORMAT.md §8).
+- **Create Part.** The outcome picked becomes a part file of its own: its surface made a
+  solid that meets the bodies kept, the starting shape and the bodies to stay clear of on
+  their faces (flat faces exactly, round ones as their tessellation does), in seconds even
+  for a fine outcome, in the outcome's material, ready to be studied in the Simulation tab.
+  Where it meets a flat face, that is one flat face of the new part, to select, sketch on
+  or mate to, rather than hundreds of triangles; elsewhere it stays faceted, and features
+  cut into it are slow at that many faces. The part being studied stays open; the panel
+  offers to open the new one.
+- **A minimum frequency.** *Minimum frequency* (Objectives), with either objective, keeps
+  each outcome's lowest natural frequency, held as the first load case holds it, at or
+  above the hertz set, as Fusion 360's frequency limit does: above what will shake the part,
+  a motor's speed or a launch's vibration. Explore shows each outcome's lowest frequency,
+  marked when it falls short, and the part *Create Part* makes is checked for it too. A
+  limit makes outcomes take longer, as their natural frequencies are found at every
+  iteration (on the graphics card, with the rest of the solve, when one is used), and the
+  stiffest outcome for its target may then weigh less. In files:
+  `min_frequency` in generative studies and each outcome's `frequency` (FORMAT.md §8–§9).
+- **The part made is checked.** Once *Create Part* has made the part, the panel checks it
+  as a static study would: the part filled with tetrahedra, the faces of the bodies kept
+  found on it, every load case solved on it. Its mass, compliance, largest displacement,
+  largest stress and lowest factor of safety then stand beside the outcome's estimates,
+  which come from voxels whose corners gather stress. A bar shows the check going, and
+  *Stop* ends it (the part stays). The panel warns when the check's mesh lost some of the
+  part's thinnest members. With a minimum frequency, the part's lowest natural frequency
+  is found too. Nothing of the check is saved: it is made again with the part.
+- **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
+  Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
+  clear of, the mass target, safety factor, minimum thickness and resolution, the ways of
+  making the shapes (unrestricted, additive, 2-axis cutting, casting, each along chosen
+  directions) and the materials to try (`type` `generative`, FORMAT.md §8), and their
+  results: the grid of voxels and, for each material and way of making it, the shape's
+  densities, a few snapshots on the way and its mass, stiffness and estimated stress
+  (FORMAT.md §9). A document holding them is written as `format_version` 4, which earlier
+  versions of Oxyde refuse; the others are written as before.
+
+### Topology optimization (October 2026)
+
+- **A Topology tab, and topology studies.** *Topology* is a new study type in the
+  Simulation tab's New Study, as SolidWorks has its topology study and Fusion 360 its shape
+  optimization, and it has a tab of its own next to Simulation, which shows the topology
+  studies only. Hold and load the part as in a static study (Fixed Geometry, Roller/Slider,
+  Force, Pressure), say how much of its mass to keep (half by default), and *Run* takes
+  material away where the loads need it least until that much is left: the stiffest shape
+  for that mass. The viewport shows the shape that remains as a smooth surface, the whole
+  part faint around it; a *Threshold* slider makes it thinner or thicker, and *Export STL*
+  writes it out, to print it or to model a part over it. The panel says how much of the
+  mass is kept and what that costs in stiffness ("1.9 times as flexible as the whole
+  part"). Parts of several bodies and assemblies are optimized with their contacts.
+- **Material that stays.** The faces of fixtures and loads keep their material; *Preserve
+  Region* keeps that of other faces (mounting faces, bolt holes), as deep under them as set
+  in the panel. *Thinnest member* keeps bars and walls from coming out thinner than wanted;
+  by default they can be as thin as the mesh allows, about three elements.
+- **Symmetry and a pull direction**, the manufacturing controls of SolidWorks' topology
+  study and Fusion 360's shape optimization, in the Target section. *Symmetry* mirrors the
+  shape across the Right, Top or Front plane (any of them, or planes parallel to them at a
+  position typed) whatever the loads, the kept regions too. *Pull direction* (±X, ±Y, ±Z)
+  gives a shape a mould pulled off that way can release: going along it the shape never
+  widens, so it has no undercut; *Both ways* is a two-part mould, the shape narrowing away
+  from a parting plane on each side. A plane the part is not symmetric about is refused,
+  and so is a pull one way across a symmetry plane. Pulled across the way the part bends
+  (through a plate's thickness, as most castings are) the shape is as crisp as without;
+  pulled in that plane (a beam loaded down and pulled up) it comes out grey, neither solid
+  nor void, until a later version sharpens the densities.
+- **Keep it in one piece.** Material nothing loads can come out floating: a preserved
+  ring around a hole the loads do not reach, held or not, ends up on its own, as it would in
+  SolidWorks or Fusion 360's shape optimization. *Keep it in one piece* (in the Target
+  section, on for new studies) joins every piece holding a fixture, a load or a preserved
+  region to the rest by a bar as thick as the thinnest member, where it adds least material,
+  and takes away loose bits holding none of them; the panel says how much was added. Without
+  it, or at another threshold, the panel says when the shape is in pieces and which
+  fixtures, loads and preserved regions are on the pieces the loads do not reach. In files:
+  `one_piece` in the study's `topology`, and `joining` in the results (FORMAT.md §8–§9).
+- **How it works:** each element of the mesh gets a density, its stiffness going as the
+  cube of it, the densities averaged over a small sphere so no member is thinner than it,
+  and moved by optimality criteria, one static solve per iteration (60 at most by default,
+  fewer once the shape settles). Gravity is not taken: the weight would change with the
+  shape. New topology studies mesh with four-node elements (*Draft*): the shape comes from
+  the elements' densities, which they give as well as ten-node ones with a seventh of the
+  unknowns, so every iteration is several times quicker (on a servo arm meshed at 0.3 mm,
+  5 s instead of about 100); the Mesh section says so when a topology study is set to
+  ten-node elements.
+- **Files:** topology studies are saved in the `.oxysim` with their target, member size,
+  iterations, preserved regions, symmetry planes and pull direction, and their results in
+  the `.oxyres`: each element's density and every iteration's compliance and mass (`type`
+  `topology`, `fields/density.bin`; FORMAT.md §8–§9). A document holding a topology study
+  is written as `format_version` 3, which earlier versions of Oxyde refuse; the others are
+  written as before.
+
 ### Planes at an angle, through edges and through points (unreleased, October 2026)
 
 - **The Plane command builds planes the way SolidWorks' does.** Its panel has a first, a

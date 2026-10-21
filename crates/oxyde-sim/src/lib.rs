@@ -15,6 +15,16 @@
 //!   heat flows and fluxes, convection, radiation, heat made inside bodies), on the same
 //!   meshes and contacts, solved with the same multigrid; their temperatures expand the
 //!   model in a thermal stress study ([`solve::ThermalStrain`]).
+//! - [`modal`] finds the lowest natural frequencies and mode shapes of the model held by its
+//!   fixtures (a frequency study): the static study's stiffness, a consistent mass, and the
+//!   smallest eigenpairs by LOBPCG (`eigen`) preconditioned by the same multigrid.
+//! - [`topology`] optimizes a static study's shape: the stiffest one that keeps a given
+//!   share of the mass (SIMP densities, a density filter, optimality criteria), and cuts
+//!   it out of the mesh as a closed surface.
+//! - [`generative`] grows shapes between bodies to keep and bodies to stay clear of
+//!   (generative design, as Fusion 360 has it), on a grid of voxels solved by geometric
+//!   multigrid, for a material and a way of making them, and cuts them out as smooth
+//!   closed surfaces.
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
 //! - [`material`] holds the elastic properties, and a guess of them from a material's
@@ -50,13 +60,18 @@
 mod amg;
 mod bvh;
 pub mod contact;
+mod eigen;
+pub mod generative;
 pub mod material;
 mod math;
 pub mod mesh;
 pub mod mesher;
+pub mod modal;
 pub mod plot;
+mod pool;
 pub mod solve;
 pub mod thermal;
+pub mod topology;
 
 pub use contact::{
     Contact, ContactCandidate, ContactKind, ContactResult, ContactSolve, detect_contacts,
@@ -65,6 +80,7 @@ pub use material::{Elastic, ThermalProps};
 pub use math::V3;
 pub use mesh::{Facet, TetMesh};
 pub use mesher::{MeshError, MeshOptions, MeshReport, SurfaceMesh, mesh_solids};
+pub use modal::{FrequencyResults, FrequencyStudy, MAX_MODES, Mode, solve_frequencies};
 pub use plot::{Band, Quantity, bands, mesh_edges, rainbow};
 pub use solve::{
     Fixture, FixtureKind, Load, LoadKind, Results, SolveError, SolveOptions, Study, Summary,
@@ -73,6 +89,10 @@ pub use solve::{
 pub use thermal::{
     Frame, InternalHeat, KELVIN, ThermalError, ThermalLoad, ThermalLoadKind, ThermalMaterial,
     ThermalResults, ThermalStudy, ThermalSummary, Transient, solve_thermal,
+};
+pub use topology::{
+    Joining, Piece, Preserve, Pull, Shape, Symmetry, TopologyError, TopologyResults, TopologyStep,
+    TopologyStudy, optimize, pieces, shape,
 };
 
 /// A label on no face: a boundary facet the mesher could not tie to a model face.

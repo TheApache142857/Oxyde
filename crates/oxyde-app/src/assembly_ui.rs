@@ -40,8 +40,10 @@ pub enum AsmTab {
     Evaluate,
     /// The assembly drawn by the path tracer (`render_ui`).
     Render,
-    /// A linear static study of the assembly, its parts bonded (`simulation_ui`).
+    /// The assembly's studies, its parts in contact (`simulation_ui`).
     Simulation,
+    /// Generative design, which works on parts for now (`generative_ui`).
+    Generative,
 }
 
 /// The mate types offered, in the order shown.
@@ -604,11 +606,17 @@ impl OxydeApp {
             return;
         };
         for path in paths {
-            self.insert_part(&path);
+            self.insert_part(&path, None);
         }
     }
 
-    fn insert_part(&mut self, path: &Path) {
+    /// Inserts the part or assembly file at `path`: at `placement`, fixed, or in a free
+    /// spot to be mated.
+    pub(crate) fn insert_part(
+        &mut self,
+        path: &Path,
+        placement: Option<oxyde_assembly::Placement>,
+    ) {
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
@@ -620,7 +628,8 @@ impl OxydeApp {
             self.status = format!("Could not insert: {e}");
             return;
         }
-        let placement = doc.free_spot(doc.file_bounds(path));
+        let fixed_at = placement;
+        let placement = placement.unwrap_or_else(|| doc.free_spot(doc.file_bounds(path)));
         let document_id = doc
             .docs
             .get(path)
@@ -636,6 +645,11 @@ impl OxydeApp {
         let id = doc
             .assembly
             .add_component(&stem, stored, document_id, placement);
+        if fixed_at.is_some()
+            && let Some(c) = doc.assembly.component_mut(id)
+        {
+            c.fixed = true;
+        }
         doc.load_parts(&mut self.kernel);
         doc.solve();
         doc.selection = vec![AsmSelected::Component(id)];
@@ -1331,6 +1345,7 @@ impl OxydeApp {
                 (AsmTab::Evaluate, "Evaluate"),
                 (AsmTab::Render, "Render"),
                 (AsmTab::Simulation, "Simulation"),
+                (AsmTab::Generative, "Generative Design"),
             ] {
                 let text = RichText::new(label).size(13.0);
                 let text = if self.asm_tab == tab {
@@ -1340,6 +1355,12 @@ impl OxydeApp {
                 };
                 if ui.selectable_label(self.asm_tab == tab, text).clicked() {
                     self.asm_tab = tab;
+                    if tab == AsmTab::Generative {
+                        self.enter_generative();
+                    }
+                    if tab == AsmTab::Simulation {
+                        self.enter_simulation();
+                    }
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1372,6 +1393,10 @@ impl OxydeApp {
         }
         if self.asm_tab == AsmTab::Simulation {
             ui.horizontal(|ui| self.simulation_tab(ui));
+            return;
+        }
+        if self.asm_tab == AsmTab::Generative {
+            ui.horizontal(|ui| self.generative_tab(ui));
             return;
         }
         // Fix/Float: every selected component, named after the first.
@@ -1548,6 +1573,9 @@ impl OxydeApp {
         }
         if self.asm_tab == AsmTab::Simulation {
             self.simulation_panel(ui);
+        }
+        if self.asm_tab == AsmTab::Generative {
+            self.generative_panel(ui);
         }
         self.mate_manager(ui);
         self.refresh_mate_preview();
@@ -2329,6 +2357,7 @@ impl OxydeApp {
     pub(crate) fn assembly_viewport(&mut self, ui: &mut egui::Ui) {
         self.refresh_assembly_scene();
         self.simulation_scene();
+        self.generative_scene();
         let Some(doc) = self.asm.as_ref() else {
             return;
         };
@@ -2800,6 +2829,7 @@ impl OxydeApp {
         };
         let mut mesh = doc.scene_mesh(&assembly);
         let (mut materials, textures) = self.assembly_materials(&assembly);
+        self.tint_generative_roles(&mut materials);
         self.add_context(&mut mesh, &mut materials);
         let own = self.own_mesh_counts(&mesh);
         let before = (mesh.faces.len() as u32, mesh.edges.len() as u32);

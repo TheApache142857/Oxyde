@@ -4,8 +4,10 @@
 //! saved next to a model as `<model>.oxysim` open with it.
 //!
 //! A study document names its part or assembly by relative path and document id, and holds
-//! the fixtures, loads, contacts, mesh settings and material overrides by persistent face
-//! name. A results document holds the mesh and the nodal fields, tied to the study by its
+//! the fixtures, loads, contacts, mesh settings and material overrides (and a topology
+//! study's target and preserved regions, a frequency study's number of modes) by persistent
+//! face name. A results document holds the mesh and the nodal fields (a frequency study's
+//! mode shapes, a topology study's element densities), tied to the study by its
 //! document id and to the model by a fingerprint (a hash of every part and assembly file's
 //! definition and of the study itself), so results of an earlier model are told apart when
 //! they are opened. After *Run*, the results of a saved study are written next to it.
@@ -14,23 +16,28 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use oxyde_format::results::{
-    DocumentHash, Elements, Extreme, Fingerprint, NodalFields, ResultBody, ResultFacet, ResultMesh,
-    ResultsFile, SolverInfo, TemperatureFrame, ThermalFields,
+    DocumentHash, Elements, Extreme, Fingerprint, FrequencyFields, ModeShape, NodalFields,
+    ResultBody, ResultFacet, ResultMesh, ResultsFile, SolverInfo, TemperatureFrame, ThermalFields,
+    TopologyFields, TopologyIteration, TopologyJoining,
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
-    FixtureKind as FileFixtureKind, ForceDirection, Load, LoadKind as FileLoadKind, MeshQuality,
-    MeshSettings, MeshSize, Mesher, ModelKind, SimulationFile, StudiedModel, Study as FileStudy,
-    StudyFace,
+    FixtureKind as FileFixtureKind, ForceDirection, GenerativeSettings, Load,
+    LoadKind as FileLoadKind, MeshQuality, MeshSettings, MeshSize, Mesher, ModelKind,
+    PreservedRegion, PullDirection, SimulationFile, StudiedModel, Study as FileStudy, StudyFace,
+    StudyType, SymmetryPlanes,
 };
 use oxyde_format::{AssemblyFile, PartFile};
-use oxyde_sim::{ContactKind, Facet, Frame, Results, TetMesh, ThermalResults};
+use oxyde_sim::{
+    ContactKind, Facet, Frame, FrequencyResults, Joining, Mode, Results, TetMesh, ThermalResults,
+    TopologyResults, TopologyStep,
+};
 
 use crate::app::OxydeApp;
 use crate::assembly::{Loaded, Occurrence};
 use crate::simulation_ui::{
     Done, ElementQuality, ItemKind, LoadDirection, MesherChoice, SimFace, Study, StudyContact,
-    StudyItem, StudyMesh,
+    StudyItem, StudyMesh, TopologyGoal,
 };
 
 /// Where the open study is saved, and its document id.
@@ -171,9 +178,50 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
                     watts: *watts,
                 },
             )),
+            ItemKind::Preserve { depth } => out.topology.preserved.push(PreservedRegion {
+                name: item.name.clone(),
+                faces: on,
+                depth: *depth,
+                suppressed: false,
+            }),
+            ItemKind::Gravity { acceleration } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::Gravity {
+                    acceleration: *acceleration,
+                },
+            )),
+            ItemKind::RemoteMass { kg, point } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::RemoteMass {
+                    faces: on,
+                    kg: *kg,
+                    point: *point,
+                },
+            )),
         }
     }
-    if study.gravity && study.study_type.is_structural() {
+    out.topology.target_mass = study.topology.target_mass;
+    out.topology.member_size = study.topology.member_size;
+    out.topology.iterations = study.topology.iterations;
+    let goal = &study.topology;
+    out.topology.symmetry = goal.symmetry.contains(&true).then_some(SymmetryPlanes {
+        planes: goal.symmetry,
+        point: goal.symmetry_point,
+    });
+    out.topology.pull = goal.pull.map(|direction| PullDirection {
+        direction,
+        parting: goal.parting,
+    });
+    out.topology.one_piece = goal.one_piece;
+    out.generative = study.generative.clone();
+    out.frequency.modes = study.modes;
+    // A generative study's grid, materials and preserved regions are in its block; it has
+    // no contacts.
+    if study.study_type == StudyType::Generative {
+        out.generative.preserved = std::mem::take(&mut out.topology.preserved);
+        return out;
+    }
+    if study.gravity && study.study_type.takes_gravity() {
         out.loads.push(Load {
             name: "Gravity-1".to_owned(),
             kind: FileLoadKind::Gravity {
@@ -224,7 +272,8 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
 }
 
 /// The study a `.oxysim` holds, as the panel edits it. Suppressed items are left out (the
-/// panel has no switch for them yet); a gravity load other than −Y becomes −Y.
+/// panel has no switch for them yet); a static study's gravity load other than −Y becomes
+/// −Y (a generative study's gravity is an item of its own, as it is).
 pub(crate) fn study_of(file: &FileStudy) -> Study {
     let mut study = Study::of_type(file.study_type, &file.name);
     let faces = |faces: &[StudyFace]| faces.iter().map(sim_face).collect::<Vec<_>>();
@@ -260,7 +309,31 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
                 kind: ItemKind::Pressure { mpa: *mpa },
                 faces: faces(f),
             }),
-            FileLoadKind::Gravity { .. } => study.gravity = true,
+            FileLoadKind::Gravity { acceleration } => {
+                if file.study_type == StudyType::Generative {
+                    study.items.push(StudyItem {
+                        name: l.name.clone(),
+                        kind: ItemKind::Gravity {
+                            acceleration: *acceleration,
+                        },
+                        faces: Vec::new(),
+                    });
+                } else {
+                    study.gravity = true;
+                }
+            }
+            FileLoadKind::RemoteMass {
+                faces: f,
+                kg,
+                point,
+            } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::RemoteMass {
+                    kg: *kg,
+                    point: *point,
+                },
+                faces: faces(f),
+            }),
             FileLoadKind::Temperature { faces: f, celsius } => study.items.push(StudyItem {
                 name: l.name.clone(),
                 kind: ItemKind::Temperature { celsius: *celsius },
@@ -307,6 +380,29 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
             }),
         }
     }
+    // A topology study's preserved regions, or a generative study's: the study's items.
+    let preserved = file
+        .topology
+        .preserved
+        .iter()
+        .chain(&file.generative.preserved);
+    for p in preserved.filter(|p| !p.suppressed) {
+        study.items.push(StudyItem {
+            name: p.name.clone(),
+            kind: ItemKind::Preserve { depth: p.depth },
+            faces: faces(&p.faces),
+        });
+    }
+    study.topology = TopologyGoal {
+        target_mass: file.topology.target_mass,
+        member_size: file.topology.member_size,
+        iterations: file.topology.iterations,
+        symmetry: file.topology.symmetry.map_or([false; 3], |s| s.planes),
+        symmetry_point: file.topology.symmetry.map_or([0.0; 3], |s| s.point),
+        pull: file.topology.pull.map(|p| p.direction),
+        parting: file.topology.pull.and_then(|p| p.parting),
+        one_piece: file.topology.one_piece,
+    };
     for c in file.contacts.iter().filter(|c| !c.suppressed) {
         if let ContactDetection::Automatic { tolerance } = c.detection {
             study.contact_tolerance = tolerance;
@@ -345,6 +441,12 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
     study.thermal_overrides = file.thermal_materials.clone();
     study.transient = file.transient;
     study.reference_temperature = file.reference_temperature;
+    // Its preserved regions are items, as a topology study's are.
+    study.generative = GenerativeSettings {
+        preserved: Vec::new(),
+        ..file.generative.clone()
+    };
+    study.modes = file.frequency.modes;
     study.recount();
     study
 }
@@ -398,12 +500,15 @@ pub(crate) fn results_file(
     let thermal_summary = done.thermal.as_ref().map(ThermalResults::summary);
     let extreme = |(value, node): (f64, u32)| Extreme { value, node };
     let iterations = done.results.as_ref().map_or(0, |r| r.iterations)
-        + done.thermal.as_ref().map_or(0, |t| t.iterations);
+        + done.thermal.as_ref().map_or(0, |t| t.iterations)
+        + done.topology.as_ref().map_or(0, |t| t.solver_iterations)
+        + done.frequency.as_ref().map_or(0, |f| f.iterations);
     let residual = done
         .results
         .as_ref()
         .map(|r| r.residual)
         .or_else(|| done.thermal.as_ref().map(|t| t.residual))
+        .or_else(|| done.frequency.as_ref().map(|f| f.residual))
         .unwrap_or(0.0);
     ResultsFile {
         document_id: oxyde_format::new_document_id(),
@@ -422,7 +527,14 @@ pub(crate) fn results_file(
         solver: SolverInfo {
             program: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
             mesher: done.mesher.to_owned(),
-            method: "pcg+amg".to_owned(),
+            method: if done.topology.is_some() {
+                "simp+oc, pcg+amg"
+            } else if done.frequency.is_some() {
+                "lobpcg+amg"
+            } else {
+                "pcg+amg"
+            }
+            .to_owned(),
             iterations: iterations as u64,
             residual,
             seconds: done.mesh_seconds + done.solve_seconds,
@@ -454,16 +566,32 @@ pub(crate) fn results_file(
                 })
                 .collect(),
         },
-        fields: match &done.results {
-            Some(results) => NodalFields {
+        fields: match (&done.results, &done.frequency) {
+            (Some(results), _) => NodalFields {
                 displacement: results.displacement.clone(),
                 stress: results.stress.clone(),
                 von_mises: results.von_mises.clone(),
                 yield_strength: results.yield_strength.clone(),
                 contact_pressure: (!results.contact_pressure.is_empty())
                     .then(|| results.contact_pressure.clone()),
+                frequency: None,
             },
-            None => NodalFields::default(),
+            (None, Some(f)) => NodalFields {
+                frequency: Some(FrequencyFields {
+                    mass: f.mass,
+                    modes: f
+                        .modes
+                        .iter()
+                        .map(|m| ModeShape {
+                            frequency: m.frequency,
+                            participation: m.participation,
+                            shape: m.shape.clone(),
+                        })
+                        .collect(),
+                }),
+                ..NodalFields::default()
+            },
+            (None, None) => NodalFields::default(),
         },
         thermal: done.thermal.as_ref().map(|t| ThermalFields {
             temperature: t.temperature.clone(),
@@ -477,6 +605,29 @@ pub(crate) fn results_file(
                 })
                 .collect(),
         }),
+        topology: done.topology.as_ref().map(|t| TopologyFields {
+            density: t.density.clone(),
+            initial_compliance: t.initial_compliance,
+            converged: t.converged,
+            filter_radius: t.filter_radius,
+            history: t
+                .history
+                .iter()
+                .map(|s| TopologyIteration {
+                    compliance: s.compliance,
+                    mass_fraction: s.mass_fraction,
+                    change: s.change,
+                })
+                .collect(),
+            joining: t.joining.map(|j| TopologyJoining {
+                joined: j.joined as u32,
+                added_mass: j.added_mass,
+                removed: j.removed as u32,
+                removed_mass: j.removed_mass,
+            }),
+        }),
+        // This tab solves no generative study.
+        generative: None,
     }
 }
 
@@ -485,6 +636,8 @@ pub(crate) struct LoadedResults {
     pub mesh: TetMesh,
     pub results: Option<Results>,
     pub thermal: Option<ThermalResults>,
+    pub topology: Option<TopologyResults>,
+    pub frequency: Option<FrequencyResults>,
 }
 
 /// The mesh and results a `.oxyres` holds, or why they cannot be used.
@@ -519,7 +672,7 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
     mesh.validate()?;
     let f = &file.fields;
     let n = mesh.nodes.len();
-    let results = if file.study_type.is_structural() {
+    let results = if file.study_type.has_stresses() {
         if [
             f.displacement.len(),
             f.stress.len(),
@@ -566,10 +719,64 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
         }),
         None => None,
     };
+    let topology = match &file.topology {
+        Some(t) if t.density.len() != mesh.tets.len() => {
+            return Err("its densities do not match its mesh".to_owned());
+        }
+        Some(t) => Some(TopologyResults {
+            density: t.density.clone(),
+            initial_compliance: t.initial_compliance,
+            history: t
+                .history
+                .iter()
+                .map(|s| TopologyStep {
+                    compliance: s.compliance,
+                    mass_fraction: s.mass_fraction,
+                    change: s.change,
+                })
+                .collect(),
+            converged: t.converged,
+            solver_iterations: file.solver.iterations as usize,
+            filter_radius: t.filter_radius,
+            joining: t.joining.map(|j| Joining {
+                joined: j.joined as usize,
+                added_mass: j.added_mass,
+                removed: j.removed as usize,
+                removed_mass: j.removed_mass,
+            }),
+        }),
+        None => None,
+    };
+    let frequency = match &f.frequency {
+        Some(modes) if modes.modes.iter().any(|m| m.shape.len() != n) => {
+            return Err("its mode shapes do not match its mesh".to_owned());
+        }
+        Some(modes) => Some(FrequencyResults {
+            modes: modes
+                .modes
+                .iter()
+                .map(|m| {
+                    let omega = 2.0 * std::f64::consts::PI * m.frequency;
+                    Mode {
+                        frequency: m.frequency,
+                        eigenvalue: omega * omega,
+                        shape: m.shape.clone(),
+                        participation: m.participation,
+                    }
+                })
+                .collect(),
+            mass: modes.mass,
+            iterations: file.solver.iterations as usize,
+            residual: file.solver.residual,
+        }),
+        None => None,
+    };
     Ok(LoadedResults {
         mesh,
         results,
         thermal,
+        topology,
+        frequency,
     })
 }
 
@@ -798,15 +1005,34 @@ impl OxydeApp {
         let Some(study_file) = self.simulation.file.clone() else {
             return false;
         };
-        let Some(done) = self.simulation.done.as_ref() else {
-            self.status = "Nothing to save: run the study first".to_owned();
-            return false;
+        let name = self.simulation.study.name.clone();
+        let file = if self.simulation.study.study_type == StudyType::Generative {
+            let generated = self.simulation.generative.generated.as_ref();
+            let Some((g, fingerprint)) = generated
+                .filter(|g| !g.outcomes.is_empty())
+                .and_then(|g| Some((g, g.fingerprint.clone()?)))
+            else {
+                self.status = "Nothing to save: generate the outcomes first".to_owned();
+                return false;
+            };
+            crate::generative_ui::generative_results_file(
+                g,
+                &study_file.document_id,
+                &name,
+                fingerprint,
+            )
+        } else {
+            let Some(done) = self.simulation.done.as_ref() else {
+                self.status = "Nothing to save: run the study first".to_owned();
+                return false;
+            };
+            let (true, Some(fingerprint)) = (done.solved(), &done.fingerprint) else {
+                self.status = "Nothing to save: run the study first".to_owned();
+                return false;
+            };
+            results_file(done, &study_file.document_id, &name, fingerprint.clone())
         };
-        let (true, Some(fingerprint)) = (done.solved(), &done.fingerprint) else {
-            self.status = "Nothing to save: run the study first".to_owned();
-            return false;
-        };
-        let mut path = results_path(&study_file.path, &self.simulation.study.name);
+        let mut path = results_path(&study_file.path, &name);
         if ask {
             let Some(chosen) = rfd::FileDialog::new()
                 .add_filter("Oxyde results", &[oxyde_format::results::RESULTS_EXTENSION])
@@ -820,12 +1046,6 @@ impl OxydeApp {
             };
             path = chosen;
         }
-        let file = results_file(
-            done,
-            &study_file.document_id,
-            &self.simulation.study.name,
-            fingerprint.clone(),
-        );
         match oxyde_format::results::save_results(&path, &file) {
             Ok(()) => {
                 self.status = format!("Saved the results to {}", path.display());
@@ -889,7 +1109,7 @@ impl OxydeApp {
         let changes = file.fingerprint.changes(&now);
         if !changes.is_empty() {
             let what = if changes.iter().any(|c| c == "study") {
-                "the study (fixtures, loads, contacts, mesh or materials)"
+                "the study (its settings, fixtures, loads, contacts, mesh or materials)"
             } else {
                 "the model"
             };
@@ -897,6 +1117,24 @@ impl OxydeApp {
                 "{} are out of date: {what} changed since they were computed. Run the study again.",
                 path.display()
             );
+            return;
+        }
+        if file.study_type == StudyType::Generative {
+            match crate::generative_ui::generated_from(&file, self.document_revision()) {
+                Some(g) => {
+                    self.restore_simulation_scene();
+                    self.simulation.generative.generated = Some(g);
+                    self.simulation.generative.clear_view();
+                    match self.asm {
+                        Some(_) => self.asm_tab = crate::assembly_ui::AsmTab::Generative,
+                        None => self.tab = crate::app::CommandTab::Generative,
+                    }
+                    self.status = format!("Opened the outcomes {}", path.display());
+                }
+                None => {
+                    self.status = format!("Could not use {}: its grid is not one", path.display())
+                }
+            }
             return;
         }
         let loaded = match mesh_and_results(&file) {
@@ -918,6 +1156,8 @@ impl OxydeApp {
             file.study_type,
             loaded.results,
             loaded.thermal,
+            loaded.topology,
+            loaded.frequency,
             faces,
             bodies,
             file.fingerprint,
@@ -1011,6 +1251,139 @@ mod tests {
         study.study_type = StudyType::ThermalStress;
         let file = file_study(&study);
         assert_eq!((file.fixtures.len(), file.loads.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_topology_study_and_its_results_survive_their_files() {
+        let mut study = Study::of_type(StudyType::Topology, "Topology 1");
+        study.add(ItemKind::Fixed, vec![face(2)]);
+        study.add(
+            ItemKind::Force {
+                newtons: -500.0,
+                direction: LoadDirection::Y,
+            },
+            vec![face(3)],
+        );
+        study.add(ItemKind::Preserve { depth: 2.5 }, vec![face(4), face(5)]);
+        study.topology = TopologyGoal {
+            target_mass: 0.35,
+            member_size: Some(6.0),
+            iterations: 90,
+            symmetry: [false, true, false],
+            symmetry_point: [0.0, 12.5, 0.0],
+            pull: Some([0.0, -1.0, 0.0]),
+            parting: Some([0.0, 12.5, 0.0]),
+            one_piece: false,
+        };
+        // Gravity is not written for a topology study: readers would refuse it.
+        study.gravity = true;
+        let file = file_study(&study);
+        assert!(file.loads.iter().all(|l| l.name != "Gravity-1"));
+        assert_eq!(file.topology.preserved.len(), 1);
+        assert_eq!(file.topology.target_mass, 0.35);
+        let mut back = study_of(&file);
+        back.made.clear();
+        study.made.clear();
+        study.gravity = false;
+        assert_eq!(back, study);
+
+        // The densities and the iterations, through a results file and back.
+        let mut mesh = TetMesh::structured_box([0.0; 3], [2.0, 1.0, 1.0], [2, 1, 1]);
+        mesh.make_quadratic();
+        // Its facets on no face of a model: the results have no label table.
+        for f in &mut mesh.facets {
+            f.label = oxyde_sim::NO_LABEL;
+        }
+        let elements = mesh.tets.len();
+        let topology = TopologyResults {
+            density: (0..elements).map(|e| e as f64 / elements as f64).collect(),
+            initial_compliance: 3.0,
+            history: vec![TopologyStep {
+                compliance: 7.5,
+                mass_fraction: 0.35,
+                change: 0.004,
+            }],
+            converged: true,
+            solver_iterations: 120,
+            filter_radius: 0.75,
+            joining: Some(Joining {
+                joined: 1,
+                added_mass: 0.0125,
+                removed: 0,
+                removed_mass: 0.0,
+            }),
+        };
+        let done = Done::for_test(mesh, StudyType::Topology, Some(topology.clone()));
+        let file = results_file(&done, "sim", "Topology 1", Fingerprint::default());
+        let bytes = oxyde_format::results::write_results(std::io::Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let read = oxyde_format::results::read_results(std::io::Cursor::new(bytes)).unwrap();
+        let loaded = mesh_and_results(&read).unwrap();
+        assert!(loaded.results.is_none() && loaded.thermal.is_none());
+        assert_eq!(loaded.topology, Some(topology));
+    }
+
+    #[test]
+    fn a_frequency_study_and_its_modes_survive_their_files() {
+        let mut study = Study::of_type(StudyType::Frequency, "Frequency 1");
+        study.add(ItemKind::Fixed, vec![face(2)]);
+        // A load is not written: a frequency study takes none.
+        study.add(ItemKind::Pressure { mpa: 1.0 }, vec![face(3)]);
+        study.gravity = true;
+        study.modes = 7;
+        let file = file_study(&study);
+        assert_eq!((file.fixtures.len(), file.loads.len()), (1, 0));
+        assert_eq!(file.frequency.modes, 7);
+        let back = study_of(&file);
+        assert_eq!(back.modes, 7);
+        assert_eq!(back.items.len(), 1);
+
+        let mut mesh = TetMesh::structured_box([0.0; 3], [2.0, 1.0, 1.0], [2, 1, 1]);
+        for f in &mut mesh.facets {
+            f.label = oxyde_sim::NO_LABEL;
+        }
+        let n = mesh.nodes.len();
+        let mode = |hz: f64, d: usize| {
+            let omega = 2.0 * std::f64::consts::PI * hz;
+            Mode {
+                frequency: hz,
+                eigenvalue: omega * omega,
+                shape: (0..n)
+                    .map(|i| {
+                        let mut u = [0.0; 3];
+                        u[d] = i as f64 / (n - 1) as f64;
+                        u
+                    })
+                    .collect(),
+                participation: [0.0, 0.25, 0.5],
+            }
+        };
+        let frequency = FrequencyResults {
+            modes: vec![mode(120.0, 2), mode(250.0, 1)],
+            mass: 0.125,
+            iterations: 30,
+            residual: 1e-7,
+        };
+        let mut done = Done::for_test(mesh, StudyType::Frequency, None);
+        done.frequency = Some(frequency.clone());
+        let file = results_file(&done, "sim", "Frequency 1", Fingerprint::default());
+        let bytes = oxyde_format::results::write_results(std::io::Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let read = oxyde_format::results::read_results(std::io::Cursor::new(bytes)).unwrap();
+        let loaded = mesh_and_results(&read).unwrap();
+        assert!(loaded.results.is_none() && loaded.topology.is_none());
+        let back = loaded.frequency.unwrap();
+        assert_eq!(back.modes.len(), 2);
+        for (b, m) in back.modes.iter().zip(&frequency.modes) {
+            assert_eq!(
+                (b.frequency, b.participation, &b.shape),
+                (m.frequency, m.participation, &m.shape)
+            );
+            assert!((b.eigenvalue / m.eigenvalue - 1.0).abs() < 1e-12);
+        }
+        assert_eq!((back.mass, back.iterations), (0.125, 30));
     }
 
     #[test]

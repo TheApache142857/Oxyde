@@ -1,8 +1,11 @@
 //! The Simulation tab's studies, as Fusion 360 keeps them: the tab opens on *New Study*,
-//! which makes a static stress, thermal, transient thermal or thermal stress study, and a
-//! model has as many as wanted, each with its own fixtures, loads, contacts, mesh settings,
-//! material overrides and results. One is open at a time; the panel's list switches
-//! between them, and *Save* writes them all to the model's `.oxysim`.
+//! which makes a static stress, frequency, thermal, transient thermal, thermal stress or
+//! topology study, and a model has as many as wanted, each with its own fixtures, loads, contacts,
+//! mesh settings, material overrides and results. One is open at a time; the panel's list
+//! switches between them, and *Save* writes them all to the model's `.oxysim`. Generative
+//! studies are among them, listed and made in the Generative Design tab only
+//! (`generative_ui.rs`), which opens one when it is chosen; the Simulation tab lists the
+//! others.
 //!
 //! The open study lives where the rest of the tab expects it (`SimulationView::study`,
 //! `done`); the others wait in `SimulationView::others`, in order, with their results.
@@ -11,22 +14,43 @@ use eframe::egui;
 use oxyde_format::simulation::StudyType;
 
 use crate::app::OxydeApp;
+use crate::generative_ui::Generated;
 use crate::simulation_ui::{Done, Study};
 
 /// A study not open now, with what the tab keeps of it.
 pub(crate) struct Parked {
     pub study: Study,
     pub done: Option<Done>,
+    /// A generative study's outcomes.
+    pub generated: Option<Generated>,
     pub selected: Option<usize>,
     pub selected_contact: Option<usize>,
 }
 
+impl Parked {
+    /// `study`, without results.
+    pub(crate) fn new(study: Study) -> Self {
+        Self {
+            study,
+            done: None,
+            generated: None,
+            selected: None,
+            selected_contact: None,
+        }
+    }
+}
+
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 6] = [
     (
         StudyType::Static,
         "Static Stress",
         "Stresses, displacements and the factor of safety under fixtures, forces, pressures and gravity",
+    ),
+    (
+        StudyType::Frequency,
+        "Frequency",
+        "The natural frequencies and mode shapes: how the model vibrates, held by its fixtures",
     ),
     (
         StudyType::Thermal,
@@ -43,10 +67,18 @@ pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
         "Thermal Stress",
         "The steady temperatures, then the stresses of the expansion they cause, with fixtures and loads",
     ),
+    (
+        StudyType::Topology,
+        "Topology",
+        "The stiffest shape that keeps a share of the mass under fixtures and loads: material kept where the loads need it, taken away elsewhere",
+    ),
 ];
 
 /// What the panel and the menus call a study type.
 pub(crate) fn type_label(t: StudyType) -> &'static str {
+    if t == StudyType::Generative {
+        return "Generative Design";
+    }
     STUDY_TYPES
         .iter()
         .find(|(k, _, _)| *k == t)
@@ -60,6 +92,9 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::Thermal => "Thermal",
         StudyType::TransientThermal => "Transient",
         StudyType::ThermalStress => "Thermal Stress",
+        StudyType::Topology => "Topology",
+        StudyType::Generative => "Generative",
+        StudyType::Frequency => "Frequency",
     }
 }
 
@@ -126,9 +161,12 @@ impl crate::simulation_ui::SimulationView {
             return None;
         }
         self.started = false;
+        let generated = self.generative.generated.take();
+        self.generative.clear_view();
         Some(Parked {
             study: std::mem::take(&mut self.study),
             done: self.done.take(),
+            generated,
             selected: self.selected.take(),
             selected_contact: self.selected_contact.take(),
         })
@@ -138,6 +176,8 @@ impl crate::simulation_ui::SimulationView {
     fn open(&mut self, p: Parked, index: usize) {
         self.study = p.study;
         self.done = p.done;
+        self.generative.generated = p.generated;
+        self.generative.clear_view();
         self.selected = p.selected;
         self.selected_contact = p.selected_contact;
         self.active = index;
@@ -149,15 +189,21 @@ impl crate::simulation_ui::SimulationView {
             .and_then(|d| d.thermal.as_ref())
             .map_or(0, |t| t.frames.len().saturating_sub(1));
         self.playing = None;
+        self.mode = 0;
         // The model comes back to set up the study; its results show when asked for.
         self.show_plot = false;
     }
 }
 
 impl OxydeApp {
+    /// Whether a study is being solved or generated: the studies stay as they are.
+    pub(crate) fn study_running(&self) -> bool {
+        self.simulation.job.is_some() || self.simulation.generative.job.is_some()
+    }
+
     /// A new study of type `t`, open, after the others.
     pub(crate) fn new_study(&mut self, t: StudyType) {
-        if self.simulation.job.is_some() {
+        if self.study_running() {
             self.status = "Wait for the study to finish, or cancel it".to_owned();
             return;
         }
@@ -174,15 +220,8 @@ impl OxydeApp {
             self.simulation.others.insert(at, open);
         }
         let index = self.simulation.others.len();
-        self.simulation.open(
-            Parked {
-                study: Study::of_type(t, &name),
-                done: None,
-                selected: None,
-                selected_contact: None,
-            },
-            index,
-        );
+        self.simulation
+            .open(Parked::new(Study::of_type(t, &name)), index);
         self.status = format!(
             "{name}: {}",
             match t {
@@ -191,6 +230,11 @@ impl OxydeApp {
                     "select faces, add temperatures, heat and cooling, then Run".to_owned(),
                 StudyType::ThermalStress =>
                     "select faces, add fixtures and temperatures or heat, then Run".to_owned(),
+                StudyType::Topology =>
+                    "select faces, add fixtures, loads and regions to keep, then Run".to_owned(),
+                StudyType::Generative =>
+                    "pick the bodies to keep, add fixtures and loads, then Generate".to_owned(),
+                StudyType::Frequency => "select faces, add fixtures, then Run".to_owned(),
             }
         );
     }
@@ -200,7 +244,7 @@ impl OxydeApp {
         if !self.simulation.started || index == self.simulation.active {
             return;
         }
-        if self.simulation.job.is_some() {
+        if self.study_running() {
             self.status = "Wait for the study to finish, or cancel it".to_owned();
             return;
         }
@@ -221,7 +265,7 @@ impl OxydeApp {
 
     /// Deletes the open study; the next one opens, or the tab goes back to New Study.
     pub(crate) fn delete_study(&mut self) {
-        if self.simulation.job.is_some() {
+        if self.study_running() {
             self.status = "Wait for the study to finish, or cancel it".to_owned();
             return;
         }
@@ -252,15 +296,13 @@ impl OxydeApp {
             .simulation
             .others
             .iter()
-            .find(|p| same_file(&p.study.name, name))
+            .map(|p| &p.study.name)
+            .find(|other| same_file(other, name))
         {
-            return Err(if other.study.name == name {
+            return Err(if other == name {
                 format!("Another study is called {name}")
             } else {
-                format!(
-                    "{name} would share its results file with {}: choose another name",
-                    other.study.name
-                )
+                format!("{name} would share its results file with {other}: choose another name")
             });
         }
         self.simulation.study.name = name.to_owned();
@@ -276,29 +318,14 @@ impl OxydeApp {
         self.simulation.others.clear();
         let mut studies = studies.into_iter();
         if let Some(first) = studies.next() {
-            self.simulation.others = studies
-                .map(|study| Parked {
-                    study,
-                    done: None,
-                    selected: None,
-                    selected_contact: None,
-                })
-                .collect();
-            self.simulation.open(
-                Parked {
-                    study: first,
-                    done: None,
-                    selected: None,
-                    selected_contact: None,
-                },
-                0,
-            );
+            self.simulation.others = studies.map(Parked::new).collect();
+            self.simulation.open(Parked::new(first), 0);
         } else {
             self.simulation.active = 0;
         }
     }
 
-    /// The panel's top while no study is open: the four types to start one, as Fusion 360's
+    /// The panel's top while no study is open: the types to start one, as Fusion 360's
     /// New Study dialog offers them, and Open for a study saved before.
     pub(crate) fn new_study_chooser(&mut self, ui: &mut egui::Ui) {
         ui.strong("New Study");
@@ -316,9 +343,13 @@ impl OxydeApp {
                     ui.horizontal(|ui| {
                         let icon = match t {
                             StudyType::Static => crate::icons::Icon::Stress,
+                            StudyType::Frequency => crate::icons::Icon::Displacement,
                             StudyType::Thermal => crate::icons::Icon::TemperaturePlot,
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
+                            StudyType::Topology | StudyType::Generative => {
+                                crate::icons::Icon::Topology
+                            }
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {
@@ -339,6 +370,13 @@ impl OxydeApp {
                 picked = Some(t);
             }
         }
+        // The model's other studies, when a generative one is open (in its own tab).
+        let mut open = None;
+        for (i, (name, t)) in self.simulation.study_list().iter().enumerate() {
+            if *t != StudyType::Generative && ui.link(name).clicked() {
+                open = Some(i);
+            }
+        }
         ui.add_space(4.0);
         if ui
             .small_button("Open…")
@@ -349,14 +387,34 @@ impl OxydeApp {
         }
         if let Some(t) = picked {
             self.new_study(t);
+        } else if let Some(i) = open {
+            self.switch_study(i);
+        }
+    }
+
+    /// The Simulation tab was chosen: when a generative study is open, the model's first
+    /// other study opens, if it has one.
+    pub(crate) fn enter_simulation(&mut self) {
+        if !self.generative_study_open() || self.study_running() {
+            return;
+        }
+        let first = self
+            .simulation
+            .study_list()
+            .iter()
+            .position(|(_, t)| *t != StudyType::Generative);
+        if let Some(i) = first {
+            self.switch_study(i);
         }
     }
 
     /// The open study's line at the top of the panel: its name and type, the list of the
-    /// model's studies, New Study, Rename and Delete.
+    /// model's studies (the generative ones in the Generative Design tab, the others in
+    /// the Simulation tab), New Study, Rename and Delete.
     pub(crate) fn study_bar(&mut self, ui: &mut egui::Ui) {
         let list = self.simulation.study_list();
-        let running = self.simulation.job.is_some();
+        let generative_only = self.generative_tab_open();
+        let running = self.study_running();
         let mut switch_to = None;
         let mut new_type = None;
         let mut delete = false;
@@ -372,6 +430,9 @@ impl OxydeApp {
                     .width((ui.available_width() - 80.0).max(120.0))
                     .show_ui(ui, |ui| {
                         for (i, (name, t)) in list.iter().enumerate() {
+                            if generative_only != (*t == StudyType::Generative) {
+                                continue;
+                            }
                             let text = format!("{name} — {}", type_label(*t));
                             if ui
                                 .selectable_label(i == self.simulation.active, text)
@@ -383,11 +444,21 @@ impl OxydeApp {
                     })
                     .response
                     .on_hover_text("The model's studies: pick one to open it");
-                ui.menu_button("New", |ui| {
-                    new_type = new_study_menu(ui);
-                })
-                .response
-                .on_hover_text("A new study of this model");
+                if generative_only {
+                    if ui
+                        .button("New")
+                        .on_hover_text("A new generative study of this part")
+                        .clicked()
+                    {
+                        new_type = Some(StudyType::Generative);
+                    }
+                } else {
+                    ui.menu_button("New", |ui| {
+                        new_type = new_study_menu(ui);
+                    })
+                    .response
+                    .on_hover_text("A new study of this model");
+                }
             });
         });
         ui.horizontal(|ui| match self.simulation.renaming.as_mut() {
@@ -442,6 +513,11 @@ mod tests {
         assert_eq!(unique_name("Static", &taken), "Static 2");
         assert_eq!(unique_name("Thermal", &taken), "Thermal 1");
         assert_eq!(type_label(StudyType::TransientThermal), "Transient Thermal");
+        assert_eq!(type_label(StudyType::Frequency), "Frequency");
+        assert_eq!(
+            unique_name(base_name(StudyType::Frequency), &taken),
+            "Frequency 1"
+        );
         assert_eq!(base_name(StudyType::ThermalStress), "Thermal Stress");
         // Names one file name apart are the same study's results.
         let taken = vec!["static 1".to_owned()];
@@ -454,12 +530,7 @@ mod tests {
         let mut view = crate::simulation_ui::SimulationView::default();
         let mut parked: Vec<Parked> = names
             .iter()
-            .map(|n| Parked {
-                study: Study::of_type(StudyType::Thermal, n),
-                done: None,
-                selected: None,
-                selected_contact: None,
-            })
+            .map(|n| Parked::new(Study::of_type(StudyType::Thermal, n)))
             .collect();
         let first = parked.remove(0);
         view.others = parked;
