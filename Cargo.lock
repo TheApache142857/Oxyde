@@ -2519,6 +2519,7 @@ dependencies = [
  "eframe",
  "image",
  "oxyde-assembly",
+ "oxyde-flow",
  "oxyde-format",
  "oxyde-geom",
  "oxyde-kernel",
@@ -2559,6 +2560,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "oxyde-flow"
+version = "0.0.8"
 
 [[package]]
 name = "oxyde-format"

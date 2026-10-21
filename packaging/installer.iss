@@ -3,6 +3,16 @@
 ; Installs for the current user only (no administrator rights), into
 ; %LOCALAPPDATA%\Programs\Oxyde, with a Start menu entry, and opens .oxyprt and .oxyasm
 ; files (and the older .oxy) with Oxyde.
+; Flow studies run OpenFOAM, a separate program (GPL-3.0, OpenCFD Ltd): the task "openfoam"
+; downloads OpenCFD's own Windows installer from openfoam.com, checks it, and runs it after
+; Oxyde is installed. OpenFOAM is never inside this installer (docs/CFD.md).
+
+; The OpenFOAM the flow studies are written for (oxyde-flow), pinned so that every install
+; gets the same version; its installer's size is 203 083 004 bytes.
+#define OpenFoamVersion "v2606"
+#define OpenFoamFile "OpenFOAM-v2606-windows-mingw.exe"
+#define OpenFoamUrl "https://dl.openfoam.com/source/v2606/OpenFOAM-v2606-windows-mingw.exe"
+#define OpenFoamSha256 "020321d58b42e1d2ad0b616cdde17f92503608edd902388fb8c73e94e9cb1e25"
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -36,6 +46,7 @@ ChangesAssociations=yes
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "associate"; Description: "Open .oxyprt and .oxyasm files with Oxyde"; GroupDescription: "Files:"
+Name: "openfoam"; Description: "Download and install OpenFOAM {#OpenFoamVersion} from openfoam.com, for flow studies (203 MB; a separate program, GPL)"; GroupDescription: "Flow simulation:"; Flags: unchecked
 
 [InstallDelete]
 ; the last version's DLLs: one it had and this one has not would stay
@@ -65,4 +76,42 @@ Root: HKCU; Subkey: "Software\Classes\.oxyprt"; ValueType: string; ValueData: "O
 Root: HKCU; Subkey: "Software\Classes\.oxyasm"; ValueType: string; ValueData: "Oxyde.Assembly"; Flags: uninsdeletevalue; Tasks: associate
 
 [Run]
+; OpenFOAM's own installer, when it was downloaded; it asks for what it needs (shellexec
+; lets it raise its rights).
+Filename: "{tmp}\{#OpenFoamFile}"; StatusMsg: "Installing OpenFOAM {#OpenFoamVersion} (its own installer)..."; Flags: shellexec waituntilterminated skipifdoesntexist; Tasks: openfoam
 Filename: "{app}\Oxyde.exe"; Description: "{cm:LaunchProgram,Oxyde}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+var
+  OpenFoamDownload: TDownloadWizardPage;
+
+procedure InitializeWizard;
+begin
+  OpenFoamDownload := CreateDownloadPage(SetupMessage(msgWizardPreparing), 'Downloading OpenFOAM {#OpenFoamVersion} from openfoam.com', nil);
+end;
+
+// On Ready's Next, with the task picked: OpenFOAM's installer downloaded into {tmp} and
+// checked. A failed download does not stop Oxyde's install; Preferences > Simulation
+// says where to get OpenFOAM later.
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (CurPageID = wpReady) and WizardIsTaskSelected('openfoam') then
+  begin
+    OpenFoamDownload.Clear;
+    OpenFoamDownload.Add('{#OpenFoamUrl}', '{#OpenFoamFile}', '{#OpenFoamSha256}');
+    OpenFoamDownload.Show;
+    try
+      try
+        OpenFoamDownload.Download;
+      except
+        if not OpenFoamDownload.AbortedByUser then
+          SuppressibleMsgBox('OpenFOAM could not be downloaded: ' + GetExceptionMessage + #13#10#13#10 +
+            'Oxyde installs without it. Flow studies need it: get OpenFOAM {#OpenFoamVersion} from https://www.openfoam.com/download later.',
+            mbInformation, MB_OK, IDOK);
+      end;
+    finally
+      OpenFoamDownload.Hide;
+    end;
+  end;
+end;

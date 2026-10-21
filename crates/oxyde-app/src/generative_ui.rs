@@ -1039,6 +1039,7 @@ pub(crate) fn generative_results_file(
         fields: NodalFields::default(),
         thermal: None,
         topology: None,
+        flow: None,
         generative: Some(GenerativeResults {
             grid: voxel_grid(&generated.grid),
             outcomes: generated.outcomes.clone(),

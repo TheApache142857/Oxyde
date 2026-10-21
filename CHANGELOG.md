@@ -5,6 +5,55 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Cooling studies: heat carried away by a flow (unreleased, October 2026)
+
+- **New Study › Cooling** computes the temperatures of a model cooled by air or water
+  flowing through or around it, the heat conducted through its bodies with their
+  materials' conductivities (conjugate heat transfer), as SolidWorks Flow Simulation's
+  *heat conduction in solids*. It takes everything a flow study does, and in the panel's
+  **Heat** section the temperature the fluid comes in at, its specific heat, conductivity and
+  expansion (set with the fluid), and **gravity**, for natural convection: warmer fluid rises.
+  Bodies touching one another pass heat across the faces they share.
+- **Heat ▾** puts *Internal Heat* in the bodies of the selected faces (a chip's power),
+  lets *Heat Power* or *Heat Flux* in through faces, holds faces at a *Temperature*, or
+  cools faces outside the fluid by *Convection*. **Goals** add the hottest temperature of
+  the bodies, the mean temperature of faces and the heat leaving through faces.
+- **Results**: the goals, a temperature cut plot through the fluid and the bodies, the
+  temperature on the model's faces, and the flow's plots. A run stops once its residuals
+  meet the target or, since a plume never quite stops moving, once the bodies' hottest
+  temperature has settled.
+- **Files**: cooling studies and their results are `format_version` 6 (FORMAT.md §8–§9);
+  documents without one are written as before.
+
+### Flow studies: CFD with OpenFOAM (unreleased, October 2026)
+
+- **New Study › Flow** computes the steady flow of a liquid or a gas through the model
+  (*internal*: a valve, a manifold, a duct, its openings closed by lids) or around it
+  (*external*: a body in a stream), as SolidWorks Flow Simulation does. The panel sets the
+  fluid (water, air, or any density and viscosity), laminar or turbulent flow (the k-ω SST
+  model), an external flow's free stream, a mesh level from 1 (coarse) to 7 (fine), the
+  most iterations and the residual it has converged at.
+- **On faces**: *Inlet* (a velocity, a volume flow in L/min or a mass flow), *Static
+  Pressure* (an opening where the fluid goes out), *Ideal Wall* (no friction: also a plane
+  of symmetry); faces in none are walls. **Goals** measure a force (pressure and friction),
+  a volume or mass flow, or a mean pressure on faces. They are drawn on the model while the
+  study is set up.
+- **Run** meshes the fluid and solves it with **OpenFOAM** (openfoam.com's v2606), a
+  separate program installed apart: the residuals are plotted in the panel as it goes,
+  Cancel stops it. An internal flow whose cavity is open (a lid missing) is stopped after
+  meshing, with what to do.
+- **Results**: the goals' values, how the run converged, and in the viewport a cut plot
+  (the velocity or the pressure on a plane through the fluid, square to X, Y or Z, moved
+  with a slider, the model faint around it) or the pressure on the faces the fluid wets,
+  in colour bands with a legend and the largest value marked.
+- **Files**: flow studies are saved in the `.oxysim` (as `format_version` 5; documents
+  without one are written exactly as before), their results in the `.oxyres` with the
+  OpenFOAM case folder beside them (`<study file>-<study>.openfoam`, which ParaView opens):
+  FORMAT.md §8–§9.
+- **Preferences › Simulation** says where OpenFOAM is (otherwise found in its usual places),
+  how many processes it runs on, and where to get it. The Windows installer offers to
+  download OpenFOAM and install it.
+
 ### Frequency studies (October 2026)
 
 - **Frequency studies in the Simulation tab.** *New Study › Frequency*, as in SolidWorks:

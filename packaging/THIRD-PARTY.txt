@@ -32,6 +32,13 @@ volume mesher of the Simulation tab, when the build includes it
 The libraries OpenCASCADE uses, when present beside it (for example FreeType, TBB, zlib),
 are under their own licences, found with their sources.
 
+OpenFOAM is not shipped with Oxyde. Flow studies run OpenFOAM (OpenCFD Ltd, GNU General
+Public License v3) as a separate program, installed apart: Oxyde writes OpenFOAM cases,
+starts OpenFOAM's programs and reads the files they write; it does not link to OpenFOAM or
+include any of its code. The Windows installer can download OpenCFD's own OpenFOAM
+installer from https://www.openfoam.com and run it, which installs OpenFOAM under its own
+licence. https://www.openfoam.com/documentation/licencing
+
 Oxyde's Rust dependencies (egui, wgpu, serde, zip and others) are MIT or Apache-2.0
 licensed; `cargo about` or `cargo license` lists them from the source tree.
 

@@ -36,6 +36,10 @@
 //! typed properties are preferences (`simulation` in `preferences.json`). Where studies
 //! belong in the files is the owner's call (`docs/SIMULATION.md` §5).
 //!
+//! A flow study (`flow_ui.rs`, `docs/CFD.md`) takes inlets, static pressures, ideal walls
+//! and goals on faces instead, and runs OpenFOAM on its own thread; its plots are the
+//! pressure on the model's wetted faces and cut planes through the fluid.
+//!
 //! The mesh is Netgen's when the kernel has it (`Kernel::volume_mesh`, run on a worker
 //! kernel over copies of the solids), else the lattice mesher's. Each solid is meshed on
 //! its own and contacts tie them, as in Fusion 360: found automatically between faces of
@@ -51,7 +55,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use oxyde_assembly::Placement;
 use oxyde_format::results::{Fingerprint, SolverInfo};
-use oxyde_format::simulation::{GenerativeSettings, StudyType, TransientSettings};
+use oxyde_format::simulation::{
+    CoolingSettings, FlowGoalKind, FlowSettings, GenerativeSettings, StudyType, TransientSettings,
+};
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
@@ -104,10 +110,20 @@ pub enum PlotChoice {
     Shape,
     /// A frequency study's mode: how far each point moves in it, relative to the most.
     ModeShape,
+    /// Pa, a flow study's static pressure on the model's faces the fluid wets.
+    FlowSurfacePressure,
+    /// m/s, a flow study's speed on a plane through the fluid.
+    FlowCutVelocity,
+    /// Pa, a flow study's static pressure on a plane through the fluid.
+    FlowCutPressure,
+    /// °C, a cooling study's temperature on a plane through the fluid and the solids.
+    CoolingCutTemperature,
+    /// °C, a cooling study's temperature on the model's faces.
+    CoolingSurfaceTemperature,
 }
 
 impl PlotChoice {
-    pub(crate) const ALL: [PlotChoice; 9] = [
+    pub(crate) const ALL: [PlotChoice; 14] = [
         PlotChoice::Temperature,
         PlotChoice::HeatFlux,
         PlotChoice::VonMises,
@@ -117,6 +133,11 @@ impl PlotChoice {
         PlotChoice::ContactPressure,
         PlotChoice::Shape,
         PlotChoice::ModeShape,
+        PlotChoice::CoolingCutTemperature,
+        PlotChoice::CoolingSurfaceTemperature,
+        PlotChoice::FlowCutVelocity,
+        PlotChoice::FlowCutPressure,
+        PlotChoice::FlowSurfacePressure,
     ];
 
     /// Whether it plots a thermal study's results.
@@ -124,11 +145,42 @@ impl PlotChoice {
         matches!(self, PlotChoice::Temperature | PlotChoice::HeatFlux)
     }
 
+    /// Whether it plots a flow or cooling study's results.
+    pub(crate) fn is_flow(self) -> bool {
+        matches!(
+            self,
+            PlotChoice::FlowSurfacePressure
+                | PlotChoice::FlowCutVelocity
+                | PlotChoice::FlowCutPressure
+                | PlotChoice::CoolingCutTemperature
+                | PlotChoice::CoolingSurfaceTemperature
+        )
+    }
+
+    /// Whether it plots a cooling study's temperatures.
+    pub(crate) fn is_cooling(self) -> bool {
+        matches!(
+            self,
+            PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature
+        )
+    }
+
+    /// Whether it cuts a plane through the fluid.
+    pub(crate) fn is_cut(self) -> bool {
+        matches!(
+            self,
+            PlotChoice::FlowCutVelocity
+                | PlotChoice::FlowCutPressure
+                | PlotChoice::CoolingCutTemperature
+        )
+    }
+
     /// Whether a study of `t` has it.
     pub(crate) fn fits(self, t: StudyType) -> bool {
         match self {
             PlotChoice::Shape => t == StudyType::Topology,
             PlotChoice::ModeShape => t == StudyType::Frequency,
+            p if p.is_flow() => t.is_flow() && (t.is_cooling() || !p.is_cooling()),
             p if p.is_thermal() => t.is_thermal(),
             _ => t.has_stresses(),
         }
@@ -144,7 +196,12 @@ impl PlotChoice {
             | PlotChoice::Temperature
             | PlotChoice::HeatFlux
             | PlotChoice::Shape
-            | PlotChoice::ModeShape => None,
+            | PlotChoice::ModeShape
+            | PlotChoice::FlowSurfacePressure
+            | PlotChoice::FlowCutVelocity
+            | PlotChoice::FlowCutPressure
+            | PlotChoice::CoolingCutTemperature
+            | PlotChoice::CoolingSurfaceTemperature => None,
         }
     }
 
@@ -155,17 +212,25 @@ impl PlotChoice {
             PlotChoice::HeatFlux => "Heat flux",
             PlotChoice::Shape => "Shape",
             PlotChoice::ModeShape => "Mode shape",
+            PlotChoice::FlowSurfacePressure => "Surface pressure",
+            PlotChoice::FlowCutVelocity => "Velocity (cut plot)",
+            PlotChoice::FlowCutPressure => "Pressure (cut plot)",
+            PlotChoice::CoolingCutTemperature => "Temperature (cut plot)",
+            PlotChoice::CoolingSurfaceTemperature => "Surface temperature",
             other => other.quantity().map_or("", Quantity::label),
         }
     }
 
-    fn unit(self) -> &'static str {
+    pub(crate) fn unit(self) -> &'static str {
         match self {
             PlotChoice::ContactPressure => "MPa",
             PlotChoice::Temperature => "°C",
             PlotChoice::HeatFlux => "W/m²",
             // A mode's size is arbitrary: its shape is relative to its largest motion.
             PlotChoice::Shape | PlotChoice::ModeShape => "",
+            PlotChoice::FlowSurfacePressure | PlotChoice::FlowCutPressure => "Pa",
+            PlotChoice::FlowCutVelocity => "m/s",
+            PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature => "°C",
             other => other.quantity().map_or("", Quantity::unit),
         }
     }
@@ -217,6 +282,45 @@ pub struct SimulationPrefs {
     pub show_original: bool,
     /// Generative studies solved on the graphics card when there is one.
     pub generative_gpu: bool,
+    /// The OpenFOAM installation flow studies run with (Preferences › Simulation); empty:
+    /// the newest found in the usual places.
+    pub openfoam_dir: String,
+    /// Processes a flow study's solver runs on; 0: one per core when OpenFOAM's MPI is
+    /// installed, else one.
+    pub flow_processes: u32,
+    /// The axis a cut plot's plane is square to.
+    pub cut_axis: CutAxis,
+    /// Where the plane is along the fluid, 0 to 1.
+    pub cut_position: f64,
+}
+
+/// The axis a cut plot's plane is square to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl CutAxis {
+    pub(crate) const ALL: [CutAxis; 3] = [CutAxis::X, CutAxis::Y, CutAxis::Z];
+
+    pub(crate) fn index(self) -> usize {
+        match self {
+            CutAxis::X => 0,
+            CutAxis::Y => 1,
+            CutAxis::Z => 2,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            CutAxis::X => "Square to X",
+            CutAxis::Y => "Square to Y",
+            CutAxis::Z => "Square to Z",
+        }
+    }
 }
 
 impl Default for SimulationPrefs {
@@ -233,6 +337,10 @@ impl Default for SimulationPrefs {
             smooth_shape: true,
             show_original: true,
             generative_gpu: true,
+            openfoam_dir: String::new(),
+            flow_processes: 0,
+            cut_axis: CutAxis::Z,
+            cut_position: 0.5,
         }
     }
 }
@@ -360,10 +468,30 @@ pub enum ItemKind {
         kg: f64,
         point: [f64; 3],
     },
+    /// A flow's inlet: fluid coming in normal to the faces, m/s.
+    InletVelocity {
+        speed: f64,
+    },
+    /// A flow's inlet: m³/s through the faces, shared by area.
+    InletVolumeFlow {
+        rate: f64,
+    },
+    /// A flow's inlet: kg/s through the faces, shared by area.
+    InletMassFlow {
+        rate: f64,
+    },
+    /// An opening at a static pressure, Pa (gauge), where the fluid goes out.
+    StaticPressure {
+        pascals: f64,
+    },
+    /// A wall the fluid slips along without friction.
+    IdealWall,
+    /// What a flow study measures on the faces.
+    Goal(FlowGoalKind),
 }
 
 /// The names items are numbered after, as SolidWorks names them.
-pub(crate) const ITEM_BASES: [&str; 14] = [
+pub(crate) const ITEM_BASES: [&str; 26] = [
     "Fixed",
     "Roller/Slider",
     "Force",
@@ -378,6 +506,18 @@ pub(crate) const ITEM_BASES: [&str; 14] = [
     "Gravity",
     "Remote Mass",
     "Contact",
+    "Inlet Velocity",
+    "Inlet Volume Flow",
+    "Inlet Mass Flow",
+    "Static Pressure",
+    "Ideal Wall",
+    "Force Goal",
+    "Volume Flow Goal",
+    "Mass Flow Goal",
+    "Pressure Goal",
+    "Max Temperature Goal",
+    "Mean Temperature Goal",
+    "Heat Flow Goal",
 ];
 
 impl ItemKind {
@@ -398,6 +538,29 @@ impl ItemKind {
         )
     }
 
+    /// Whether it is a flow study's condition or goal.
+    pub(crate) fn is_flow(&self) -> bool {
+        matches!(
+            self,
+            ItemKind::InletVelocity { .. }
+                | ItemKind::InletVolumeFlow { .. }
+                | ItemKind::InletMassFlow { .. }
+                | ItemKind::StaticPressure { .. }
+                | ItemKind::IdealWall
+                | ItemKind::Goal(_)
+        )
+    }
+
+    /// Whether it is a flow study's goal.
+    pub(crate) fn is_goal(&self) -> bool {
+        matches!(self, ItemKind::Goal(_))
+    }
+
+    /// Whether it is a goal only a cooling study measures: a temperature or heat.
+    pub(crate) fn is_thermal_goal(&self) -> bool {
+        matches!(self, ItemKind::Goal(kind) if kind.is_thermal())
+    }
+
     pub(crate) fn base_name(&self) -> &'static str {
         match self {
             ItemKind::Fixed => "Fixed",
@@ -413,17 +576,33 @@ impl ItemKind {
             ItemKind::Preserve { .. } => "Preserve",
             ItemKind::Gravity { .. } => "Gravity",
             ItemKind::RemoteMass { .. } => "Remote Mass",
+            ItemKind::InletVelocity { .. } => "Inlet Velocity",
+            ItemKind::InletVolumeFlow { .. } => "Inlet Volume Flow",
+            ItemKind::InletMassFlow { .. } => "Inlet Mass Flow",
+            ItemKind::StaticPressure { .. } => "Static Pressure",
+            ItemKind::IdealWall => "Ideal Wall",
+            ItemKind::Goal(FlowGoalKind::Force) => "Force Goal",
+            ItemKind::Goal(FlowGoalKind::VolumeFlow) => "Volume Flow Goal",
+            ItemKind::Goal(FlowGoalKind::MassFlow) => "Mass Flow Goal",
+            ItemKind::Goal(FlowGoalKind::MeanPressure) => "Pressure Goal",
+            ItemKind::Goal(FlowGoalKind::MaxTemperature) => "Max Temperature Goal",
+            ItemKind::Goal(FlowGoalKind::MeanTemperature) => "Mean Temperature Goal",
+            ItemKind::Goal(FlowGoalKind::HeatFlow) => "Heat Flow Goal",
         }
     }
 
-    /// Whether a study of `t` takes it.
+    /// Whether a study of `t` takes it. A cooling study takes a flow's conditions and goals,
+    /// its own goals of temperature and heat, and the thermal loads but radiation.
     pub(crate) fn fits(&self, t: StudyType) -> bool {
         match self {
             ItemKind::Preserve { .. } => {
                 matches!(t, StudyType::Topology | StudyType::Generative)
             }
             ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. } => t == StudyType::Generative,
-            k if k.is_thermal() => t.is_thermal(),
+            k if k.is_flow() => t.is_flow() && (t.is_cooling() || !k.is_thermal_goal()),
+            k if k.is_thermal() => {
+                t.is_thermal() || (t.is_cooling() && !matches!(k, ItemKind::Radiation { .. }))
+            }
             k if k.is_fixture() => t.takes_fixtures(),
             _ => t.is_structural(),
         }
@@ -588,6 +767,10 @@ pub struct Study {
     /// The contacts were looked for: *Run* does not look again by itself.
     pub contacts_found: bool,
     pub mesh: StudyMesh,
+    /// A flow study's fluid, flow and solver settings.
+    pub flow: FlowSettings,
+    /// A cooling study's fluid temperature, thermal properties and gravity.
+    pub cooling: CoolingSettings,
     /// Items made so far of each kind, for their names.
     pub(crate) made: BTreeMap<&'static str, u32>,
 }
@@ -627,6 +810,8 @@ impl Study {
                 },
                 ..StudyMesh::default()
             },
+            flow: FlowSettings::default(),
+            cooling: CoolingSettings::default(),
             made: BTreeMap::new(),
         }
     }
@@ -768,7 +953,37 @@ pub(crate) struct Surfaces {
     /// mm³, mm² and mm.
     volume: f64,
     area: f64,
-    diagonal: f64,
+    pub(crate) diagonal: f64,
+}
+
+#[cfg(test)]
+impl Surfaces {
+    /// The surfaces of `solids` whose labels stand for `faces`, for tests: a body each
+    /// (`Body 0`…, material group `test:0`…), without a material.
+    pub(crate) fn of_solids(solids: Vec<SurfaceMesh>, faces: Vec<SimFace>) -> Self {
+        let bodies = (0..solids.len())
+            .map(|i| BodyInfo {
+                name: format!("Body {i}"),
+                id: None,
+                occurrence: None,
+                key: format!("test:{i}"),
+                material: None,
+                path: None,
+            })
+            .collect();
+        Self {
+            revision: 0,
+            assembly: false,
+            solids,
+            faces,
+            face_body: Vec::new(),
+            bodies,
+            sources: Vec::new(),
+            volume: 0.0,
+            area: 0.0,
+            diagonal: 1.0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -809,6 +1024,30 @@ impl Surfaces {
 }
 
 impl Surfaces {
+    /// Each solid's name, thermal conductivity (W/(m·K)) and density (kg/m³; 1000 where its
+    /// material gives none, which a steady state never uses), in the order of `solids`; or
+    /// which body has no conductivity.
+    pub(crate) fn conductivities(&self, study: &Study) -> Result<Vec<(String, f64, f64)>, String> {
+        self.bodies
+            .iter()
+            .map(|body| match thermal_material_of(study, body) {
+                Some(t) if t.conductivity.is_finite() && t.conductivity > 0.0 => Ok((
+                    body.name.clone(),
+                    t.conductivity,
+                    if t.density.is_finite() && t.density > 0.0 {
+                        t.density
+                    } else {
+                        1000.0
+                    },
+                )),
+                _ => Err(format!(
+                    "{} has no known thermal conductivity: apply a material or type it in Material",
+                    body.name
+                )),
+            })
+            .collect()
+    }
+
     /// The labels of `faces`.
     pub(crate) fn labels(&self, faces: &[SimFace]) -> Vec<u32> {
         self.faces
@@ -864,45 +1103,49 @@ pub(crate) enum RunMode {
     Run,
 }
 
-struct Outcome {
-    mesh: TetMesh,
-    report: MeshReport,
-    results: Option<Results>,
-    thermal: Option<ThermalResults>,
-    topology: Option<TopologyResults>,
-    frequency: Option<FrequencyResults>,
-    mesh_seconds: f64,
-    solve_seconds: f64,
+pub(crate) struct Outcome {
+    pub(crate) mesh: TetMesh,
+    pub(crate) report: MeshReport,
+    pub(crate) results: Option<Results>,
+    pub(crate) thermal: Option<ThermalResults>,
+    pub(crate) topology: Option<TopologyResults>,
+    pub(crate) frequency: Option<FrequencyResults>,
+    pub(crate) mesh_seconds: f64,
+    pub(crate) solve_seconds: f64,
     /// Faces found facing each other, when contacts were looked for.
-    candidates: Option<Vec<ContactCandidate>>,
-    /// `netgen` or `lattice`.
-    mesher: &'static str,
+    pub(crate) candidates: Option<Vec<ContactCandidate>>,
+    /// `netgen`, `lattice` or `openfoam`.
+    pub(crate) mesher: &'static str,
     /// Why Netgen was asked for and not used.
-    note: Option<String>,
+    pub(crate) note: Option<String>,
+    /// A flow study's run.
+    pub(crate) flow: Option<crate::flow_ui::FlowDone>,
 }
 
 #[derive(Default)]
-struct Shared {
-    stage: &'static str,
-    fraction: f64,
-    outcome: Option<Result<Outcome, String>>,
+pub(crate) struct Shared {
+    pub(crate) stage: &'static str,
+    pub(crate) fraction: f64,
+    pub(crate) outcome: Option<Result<Outcome, String>>,
+    /// A flow study's residuals so far, one record per iteration.
+    pub(crate) residuals: Vec<Vec<(String, f64)>>,
 }
 
 pub(crate) struct SimJob {
-    cancel: Arc<AtomicBool>,
-    shared: Arc<Mutex<Shared>>,
-    revision: u64,
-    assembly: bool,
-    started: Instant,
-    diagonal: f64,
-    mode: RunMode,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) shared: Arc<Mutex<Shared>>,
+    pub(crate) revision: u64,
+    pub(crate) assembly: bool,
+    pub(crate) started: Instant,
+    pub(crate) diagonal: f64,
+    pub(crate) mode: RunMode,
     /// The face of each label and the name and material group of each body, as the run
     /// was made.
-    faces: Vec<SimFace>,
-    bodies: Vec<(String, String)>,
+    pub(crate) faces: Vec<SimFace>,
+    pub(crate) bodies: Vec<(String, String)>,
     /// The model and study as they were run, for the results file.
-    fingerprint: Option<Fingerprint>,
-    study_type: StudyType,
+    pub(crate) fingerprint: Option<Fingerprint>,
+    pub(crate) study_type: StudyType,
 }
 
 impl Drop for SimJob {
@@ -915,26 +1158,26 @@ impl Drop for SimJob {
 /// A mesh, and the results when the study was solved.
 pub(crate) struct Done {
     /// Tells one run's plot from the next.
-    id: u64,
-    revision: u64,
-    assembly: bool,
+    pub(crate) id: u64,
+    pub(crate) revision: u64,
+    pub(crate) assembly: bool,
     pub(crate) mesh: TetMesh,
-    report: MeshReport,
+    pub(crate) report: MeshReport,
     /// What was solved: the study's type then.
     pub(crate) study_type: StudyType,
     /// Displacements and stresses (a static or thermal stress study).
     pub(crate) results: Option<Results>,
-    summary: Option<Summary>,
+    pub(crate) summary: Option<Summary>,
     /// Temperatures and heat flux (a thermal, transient or thermal stress study).
     pub(crate) thermal: Option<ThermalResults>,
-    thermal_summary: Option<ThermalSummary>,
+    pub(crate) thermal_summary: Option<ThermalSummary>,
     /// The densities of a topology study.
     pub(crate) topology: Option<TopologyResults>,
     /// The modes of a frequency study.
     pub(crate) frequency: Option<FrequencyResults>,
     pub(crate) mesh_seconds: f64,
     pub(crate) solve_seconds: f64,
-    diagonal: f64,
+    pub(crate) diagonal: f64,
     /// `netgen` or `lattice`.
     pub(crate) mesher: &'static str,
     /// The face each label of the mesh stands for.
@@ -943,6 +1186,8 @@ pub(crate) struct Done {
     pub(crate) bodies: Vec<(String, String)>,
     /// The model and study as they were solved.
     pub(crate) fingerprint: Option<Fingerprint>,
+    /// A flow study's run: its record, and the fields read from its case.
+    pub(crate) flow: Option<crate::flow_ui::FlowDone>,
 }
 
 impl Done {
@@ -952,6 +1197,7 @@ impl Done {
             || self.thermal.is_some()
             || self.topology.is_some()
             || self.frequency.is_some()
+            || self.flow.is_some()
     }
 
     /// Whether it can draw `plot`.
@@ -959,6 +1205,11 @@ impl Done {
         match plot {
             PlotChoice::Shape => self.topology.is_some(),
             PlotChoice::ModeShape => self.frequency.is_some(),
+            p if p.is_flow() => self.flow.as_ref().is_some_and(|f| {
+                f.fields
+                    .as_ref()
+                    .is_some_and(|r| !p.is_cooling() || r.temperature.is_some())
+            }),
             p if p.is_thermal() => self.thermal.is_some(),
             _ => self.results.is_some(),
         }
@@ -1021,6 +1272,7 @@ impl Done {
             thermal_summary: None,
             topology,
             frequency: None,
+            flow: None,
             mesh_seconds: 0.0,
             solve_seconds: 0.0,
             diagonal: 1.0,
@@ -1034,31 +1286,33 @@ impl Done {
 
 /// What the viewport shows: anything else, and the plot is made again.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct PlotKey {
-    id: u64,
-    plot: Option<PlotChoice>,
-    scale: f64,
-    bands: u32,
-    show_mesh: bool,
+pub(crate) struct PlotKey {
+    pub(crate) id: u64,
+    pub(crate) plot: Option<PlotChoice>,
+    pub(crate) scale: f64,
+    pub(crate) bands: u32,
+    pub(crate) show_mesh: bool,
     /// The transient study's time shown.
-    frame: Option<usize>,
+    pub(crate) frame: Option<usize>,
+    /// A flow's cut plane: its axis and where it is, 0 to 1.
+    pub(crate) cut: Option<(CutAxis, f64)>,
     /// A topology study's shape: the density it is cut at, smoothed, the model around it.
-    threshold: f64,
-    smooth: bool,
-    ghost: bool,
+    pub(crate) threshold: f64,
+    pub(crate) smooth: bool,
+    pub(crate) ghost: bool,
 }
 
 /// The legend of the plot shown.
 #[derive(Debug, Clone, PartialEq)]
-struct Legend {
-    title: String,
-    unit: &'static str,
-    range: (f64, f64),
-    bands: u32,
-    reversed: bool,
-    scale: f64,
+pub(crate) struct Legend {
+    pub(crate) title: String,
+    pub(crate) unit: &'static str,
+    pub(crate) range: (f64, f64),
+    pub(crate) bands: u32,
+    pub(crate) reversed: bool,
+    pub(crate) scale: f64,
     /// The node marked (deformed position) and its label.
-    marker: Option<([f64; 3], String)>,
+    pub(crate) marker: Option<([f64; 3], String)>,
 }
 
 /// The Simulation tab's state.
@@ -1077,9 +1331,9 @@ pub struct SimulationView {
     pub(crate) done: Option<Done>,
     /// The plot (or the mesh) is shown over the model; off while setting up.
     pub(crate) show_plot: bool,
-    shown: Option<PlotKey>,
-    legend: Option<Legend>,
-    error: Option<String>,
+    pub(crate) shown: Option<PlotKey>,
+    pub(crate) legend: Option<Legend>,
+    pub(crate) error: Option<String>,
     pub(crate) prefs_dirty: bool,
     /// The item picked in the panel, whose faces are selected.
     pub(crate) selected: Option<usize>,
@@ -1441,6 +1695,9 @@ impl OxydeApp {
                 if let Some(f) = &o.frequency {
                     self.status = frequency_summary(f, seconds);
                 }
+                if let Some(f) = &o.flow {
+                    self.status = crate::flow_ui::flow_status(f, seconds);
+                }
                 if let Some(note) = &o.note {
                     self.status =
                         format!("{} ({note}; meshed with the lattice mesher)", self.status);
@@ -1460,7 +1717,8 @@ impl OxydeApp {
                 let solved = o.results.is_some()
                     || o.thermal.is_some()
                     || o.topology.is_some()
-                    || o.frequency.is_some();
+                    || o.frequency.is_some()
+                    || o.flow.is_some();
                 // Contacts Run found and bonded itself are now in the study it solved: the
                 // fingerprint says so, unless the model changed meanwhile (then the
                 // results are stale and are not saved).
@@ -1497,6 +1755,7 @@ impl OxydeApp {
                         .collect(),
                     bodies: job.bodies.clone(),
                     fingerprint,
+                    flow: o.flow,
                 });
                 self.simulation.error = None;
                 self.simulation.show_plot = true;
@@ -1900,6 +2159,12 @@ impl OxydeApp {
                 }),
                 // Generative studies' alone, which the Generative Design tab solves.
                 ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. } => {}
+                ItemKind::InletVelocity { .. }
+                | ItemKind::InletVolumeFlow { .. }
+                | ItemKind::InletMassFlow { .. }
+                | ItemKind::StaticPressure { .. }
+                | ItemKind::IdealWall
+                | ItemKind::Goal(_) => {}
             }
         }
         if !mesh_only {
@@ -2061,6 +2326,12 @@ impl OxydeApp {
             StudyType::Generative => {
                 return Err("A generative study is not solved in the Simulation tab".to_owned());
             }
+            // Flow and cooling studies run OpenFOAM (`flow_ui.rs`), never these solvers.
+            StudyType::Flow | StudyType::Cooling => {
+                return Err(
+                    "A flow study is solved by OpenFOAM, not meshed into tetrahedra".to_owned(),
+                );
+            }
         })
     }
 
@@ -2068,6 +2339,12 @@ impl OxydeApp {
     /// thread.
     pub(crate) fn run_simulation(&mut self, mode: RunMode) {
         self.simulation.error = None;
+        if self.simulation.study.study_type.is_flow() {
+            if mode == RunMode::Run {
+                self.run_flow();
+            }
+            return;
+        }
         if let Err(e) = self.ensure_surfaces() {
             self.simulation.error = Some(e);
             return;
@@ -2298,6 +2575,7 @@ impl OxydeApp {
             faces,
             bodies,
             fingerprint: Some(fingerprint),
+            flow: None,
         });
         self.simulation.error = None;
         self.simulation.show_plot = true;
@@ -2342,7 +2620,7 @@ impl OxydeApp {
         }
     }
 
-    fn cancel_simulation(&mut self) {
+    pub(crate) fn cancel_simulation(&mut self) {
         if self.simulation.job.take().is_some() {
             self.status = "Study cancelled".to_owned();
         }
@@ -2352,6 +2630,15 @@ impl OxydeApp {
     /// again when the result or the plot settings changed.
     pub(crate) fn simulation_scene(&mut self) {
         if !self.plot_wanted() {
+            return;
+        }
+        if self
+            .simulation
+            .done
+            .as_ref()
+            .is_some_and(|d| d.flow.is_some())
+        {
+            self.flow_scene();
             return;
         }
         let prefs = self.prefs.simulation.clone();
@@ -2391,6 +2678,7 @@ impl OxydeApp {
                 bands: 0,
                 show_mesh: false,
                 frame: None,
+                cut: None,
                 threshold: prefs.shape_threshold.clamp(0.01, 0.99),
                 smooth: prefs.smooth_shape,
                 ghost: prefs.show_original,
@@ -2433,6 +2721,7 @@ impl OxydeApp {
             threshold: 0.0,
             smooth: false,
             ghost: false,
+            cut: None,
         };
         if self.simulation.shown == Some(key) {
             return;
@@ -2734,6 +3023,8 @@ impl OxydeApp {
         let hot_color = egui::Color32::from_rgb(215, 45, 35);
         let cool_color = egui::Color32::from_rgb(40, 125, 215);
         let keep_color = egui::Color32::from_rgb(25, 150, 150);
+        let flow_color = egui::Color32::from_rgb(25, 140, 230);
+        let goal_color = egui::Color32::from_rgb(232, 145, 40);
         if !self.simulation.started {
             return;
         }
@@ -2870,6 +3161,60 @@ impl OxydeApp {
                     }
                     // No faces: never reached.
                     ItemKind::Gravity { .. } => {}
+                    ItemKind::InletVelocity { .. }
+                    | ItemKind::InletVolumeFlow { .. }
+                    | ItemKind::InletMassFlow { .. } => {
+                        // The fluid coming in: arrows along the face's normal, which points
+                        // out of the lid into the fluid.
+                        let stroke = egui::Stroke::new(width, flow_color);
+                        match normal.and_then(|n| screen_dir(c, n, 26.0)) {
+                            Some(v) => {
+                                let side = egui::vec2(-v.y, v.x) * 0.5;
+                                for offset in [-1.0f32, 0.0, 1.0] {
+                                    let t = tip + side * offset;
+                                    paint_arrow(painter, t - v, t, stroke);
+                                }
+                            }
+                            None => {
+                                painter.circle_filled(tip, 4.0, flow_color);
+                            }
+                        }
+                    }
+                    ItemKind::StaticPressure { .. } => {
+                        // The fluid going out: arrows leaving the face, out of the fluid.
+                        let stroke = egui::Stroke::new(width, flow_color);
+                        match normal.and_then(|n| screen_dir(c, n, 26.0)) {
+                            Some(v) => {
+                                let side = egui::vec2(-v.y, v.x) * 0.5;
+                                for offset in [-1.0f32, 0.0, 1.0] {
+                                    let t = tip + side * offset;
+                                    paint_arrow(painter, t, t - v, stroke);
+                                }
+                            }
+                            None => {
+                                painter.circle_stroke(tip, 6.0, stroke);
+                            }
+                        }
+                    }
+                    ItemKind::IdealWall => {
+                        let stroke = egui::Stroke::new(width, flow_color);
+                        painter.circle_stroke(tip, 6.0, stroke);
+                        painter.line_segment(
+                            [tip - egui::vec2(9.0, 0.0), tip + egui::vec2(9.0, 0.0)],
+                            stroke,
+                        );
+                    }
+                    ItemKind::Goal(_) => {
+                        // A flag on the face.
+                        let stroke = egui::Stroke::new(width, goal_color);
+                        let top = tip - egui::vec2(0.0, 20.0);
+                        painter.line_segment([tip, top], stroke);
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![top, top + egui::vec2(11.0, 3.5), top + egui::vec2(0.0, 7.0)],
+                            goal_color,
+                            egui::Stroke::NONE,
+                        ));
+                    }
                 }
             }
         }
@@ -3014,7 +3359,9 @@ impl OxydeApp {
                 fraction * 100.0
             )
         } else if s.done.is_none() {
-            if s.study.study_type == StudyType::Topology {
+            if s.study.study_type.is_flow() {
+                crate::flow_ui::setup_hint(&s.study).to_owned()
+            } else if s.study.study_type == StudyType::Topology {
                 "Select faces, add fixtures, loads and regions to keep, then Run".to_owned()
             } else if s.study.study_type == StudyType::Frequency {
                 "Select faces, add fixtures, then Run".to_owned()
@@ -3041,7 +3388,7 @@ impl OxydeApp {
         );
     }
 
-    fn show_plot(&mut self, plot: Option<PlotChoice>) {
+    pub(crate) fn show_plot(&mut self, plot: Option<PlotChoice>) {
         if let Some(plot) = plot
             && self.prefs.simulation.plot != plot
         {
@@ -3095,6 +3442,10 @@ impl OxydeApp {
         let study_type = self.simulation.study.study_type;
         let has_faces = !self.selected_sim_faces().is_empty();
         let enabled = has_model && !running;
+        if study_type.is_flow() {
+            self.flow_tab(ui, has_model, running, has_faces);
+            return;
+        }
         let item_button = |app: &mut OxydeApp,
                            ui: &mut egui::Ui,
                            icon: Icon,
@@ -3509,6 +3860,37 @@ impl OxydeApp {
                         .small()
                         .color(egui::Color32::from_rgb(210, 60, 60)),
                 );
+            }
+            if study_type.is_flow() {
+                if study_type.is_cooling() {
+                    // The bodies conduct heat: their materials' conductivities, or typed in.
+                    let study = &mut self.simulation.study;
+                    let unknown = groups.iter().any(|g| g.thermal.is_none());
+                    egui::CollapsingHeader::new("Material")
+                        .default_open(unknown)
+                        .show(ui, |ui| {
+                            if groups.is_empty() {
+                                ui.label(egui::RichText::new("Nothing to study yet").weak());
+                            }
+                            for (i, g) in groups.iter().enumerate() {
+                                if let Some(a) = material_rows(
+                                    ui,
+                                    study_type,
+                                    &mut study.overrides,
+                                    &mut study.thermal_overrides,
+                                    g,
+                                    i,
+                                    &material_names,
+                                ) {
+                                    action = Some(a);
+                                }
+                            }
+                        });
+                }
+                if let Some(a) = self.flow_panel(ui, max_height) {
+                    action = Some(a);
+                }
+                return;
             }
             let p = &mut self.prefs.simulation;
             egui::ScrollArea::vertical()
@@ -4714,6 +5096,85 @@ pub(crate) fn item_row(
                 }
             });
         }
+        ItemKind::InletVelocity { speed } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(speed)
+                            .range(0.0..=1e4)
+                            .speed(0.01)
+                            .max_decimals(4)
+                            .suffix(" m/s"),
+                    )
+                    .on_hover_text(
+                        "The fluid comes in through the faces at this speed, square to them",
+                    )
+                    .changed();
+            });
+        }
+        ItemKind::InletVolumeFlow { rate } => {
+            // Typed in litres a minute, kept in m³/s.
+            let mut litres = *rate * 60_000.0;
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut litres)
+                            .range(0.0..=1e9)
+                            .speed(0.1)
+                            .max_decimals(4)
+                            .suffix(" L/min"),
+                    )
+                    .on_hover_text(
+                        "The volume coming in through the faces, shared between them by area (1 m³/h = 16.67 L/min)",
+                    )
+                    .changed()
+                {
+                    *rate = litres / 60_000.0;
+                    changed = true;
+                }
+            });
+        }
+        ItemKind::InletMassFlow { rate } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(rate)
+                            .range(0.0..=1e6)
+                            .speed(0.001)
+                            .max_decimals(6)
+                            .suffix(" kg/s"),
+                    )
+                    .on_hover_text(
+                        "The mass coming in through the faces, shared between them by area",
+                    )
+                    .changed();
+            });
+        }
+        ItemKind::StaticPressure { pascals } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(egui::DragValue::new(pascals).speed(1.0).suffix(" Pa"))
+                    .on_hover_text(
+                        "The static pressure at the opening, above the surroundings' (0 is atmospheric); the fluid goes out through it",
+                    )
+                    .changed();
+            });
+        }
+        ItemKind::IdealWall => {}
+        ItemKind::Goal(kind) => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(crate::flow_ui::goal_hint(*kind))
+                        .small()
+                        .weak(),
+                );
+            });
+        }
     }
     if changed {
         action.get_or_insert(PanelAction::Edited);
@@ -5011,8 +5472,10 @@ fn material_rows(
     let mut action = None;
     let source = g.effective.map(|(_, s)| s);
     let thermal_source = g.thermal.map(|(_, s)| s);
+    // A cooling study's bodies conduct heat as a thermal study's do.
+    let thermal = study_type.is_thermal() || study_type.is_cooling();
     let typed = (study_type.takes_fixtures() && source == Some(PropsSource::Study))
-        || (study_type.is_thermal() && thermal_source == Some(PropsSource::Study));
+        || (thermal && thermal_source == Some(PropsSource::Study));
     ui.horizontal(|ui| {
         let parts = if g.bodies.len() > 1 {
             format!("{} bodies: {}", g.bodies.len(), g.bodies.join(", "))
@@ -5068,7 +5531,7 @@ fn material_rows(
             }
         }
     });
-    if study_type.is_thermal() {
+    if thermal {
         thermal_material_rows(ui, study_type, thermal_overrides, g);
     }
     if !study_type.takes_fixtures() {
@@ -5220,7 +5683,12 @@ fn thermal_material_rows(
     }
 }
 
-fn paint_arrow(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, stroke: egui::Stroke) {
+pub(crate) fn paint_arrow(
+    painter: &egui::Painter,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    stroke: egui::Stroke,
+) {
     let d = to - from;
     if d.length() < 1e-3 {
         return;
@@ -5238,7 +5706,7 @@ fn paint_arrow(painter: &egui::Painter, from: egui::Pos2, to: egui::Pos2, stroke
 }
 
 /// A number with about four significant figures, without trailing noise.
-fn format_number(v: f64) -> String {
+pub(crate) fn format_number(v: f64) -> String {
     if !v.is_finite() {
         return "∞".to_owned();
     }
@@ -5519,6 +5987,7 @@ fn study_thread(
             candidates,
             mesher,
             note,
+            flow: None,
         });
     }
     report_progress("Solving", span);
@@ -5655,6 +6124,7 @@ fn study_thread(
         candidates,
         mesher,
         note,
+        flow: None,
     })
 }
 

@@ -41,6 +41,7 @@ const FORBIDDEN: &[(&str, &[&str])] = &[
             "oxyde-tests",
         ],
     ),
+    ("oxyde-flow", &["*"]),
     ("oxyde-app", &[]),
     ("oxyde-cli", &["oxyde-app"]),
     ("oxyde-mcp", &["oxyde-app"]),

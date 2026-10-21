@@ -11,6 +11,10 @@
 //! document id and to the model by a fingerprint (a hash of every part and assembly file's
 //! definition and of the study itself), so results of an earlier model are told apart when
 //! they are opened. After *Run*, the results of a saved study are written next to it.
+//!
+//! A flow study's results are a record of its OpenFOAM run instead (goals, residuals), and
+//! its case folder is kept beside them, `<study file>-<study>.openfoam`, which holds the
+//! mesh and the fields the plots are drawn from (`flow_ui.rs`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,10 +26,10 @@ use oxyde_format::results::{
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
-    FixtureKind as FileFixtureKind, ForceDirection, GenerativeSettings, Load,
-    LoadKind as FileLoadKind, MeshQuality, MeshSettings, MeshSize, Mesher, ModelKind,
-    PreservedRegion, PullDirection, SimulationFile, StudiedModel, Study as FileStudy, StudyFace,
-    StudyType, SymmetryPlanes,
+    FixtureKind as FileFixtureKind, FlowCondition, FlowConditionKind, FlowGoal, ForceDirection,
+    GenerativeSettings, Load, LoadKind as FileLoadKind, MeshQuality, MeshSettings, MeshSize,
+    Mesher, ModelKind, PreservedRegion, PullDirection, SimulationFile, StudiedModel,
+    Study as FileStudy, StudyFace, StudyType, SymmetryPlanes,
 };
 use oxyde_format::{AssemblyFile, PartFile};
 use oxyde_sim::{
@@ -198,6 +202,35 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
                     point: *point,
                 },
             )),
+            ItemKind::InletVelocity { speed } => out.conditions.push(condition(
+                &item.name,
+                FlowConditionKind::InletVelocity { speed: *speed },
+                on,
+            )),
+            ItemKind::InletVolumeFlow { rate } => out.conditions.push(condition(
+                &item.name,
+                FlowConditionKind::InletVolumeFlow { rate: *rate },
+                on,
+            )),
+            ItemKind::InletMassFlow { rate } => out.conditions.push(condition(
+                &item.name,
+                FlowConditionKind::InletMassFlow { rate: *rate },
+                on,
+            )),
+            ItemKind::StaticPressure { pascals } => out.conditions.push(condition(
+                &item.name,
+                FlowConditionKind::StaticPressure { pressure: *pascals },
+                on,
+            )),
+            ItemKind::IdealWall => {
+                out.conditions
+                    .push(condition(&item.name, FlowConditionKind::IdealWall, on))
+            }
+            ItemKind::Goal(kind) => out.goals.push(FlowGoal {
+                name: item.name.clone(),
+                kind: *kind,
+                faces: on,
+            }),
         }
     }
     out.topology.target_mass = study.topology.target_mass;
@@ -268,7 +301,18 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
     out.thermal_materials = study.thermal_overrides.clone();
     out.transient = study.transient;
     out.reference_temperature = study.reference_temperature;
+    out.flow = study.flow.clone();
+    out.cooling = study.cooling;
     out
+}
+
+fn condition(name: &str, kind: FlowConditionKind, faces: Vec<StudyFace>) -> FlowCondition {
+    FlowCondition {
+        name: name.to_owned(),
+        kind,
+        faces,
+        suppressed: false,
+    }
 }
 
 /// The study a `.oxysim` holds, as the panel edits it. Suppressed items are left out (the
@@ -447,6 +491,30 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
         ..file.generative.clone()
     };
     study.modes = file.frequency.modes;
+    for c in file.conditions.iter().filter(|c| !c.suppressed) {
+        study.items.push(StudyItem {
+            name: c.name.clone(),
+            kind: match c.kind {
+                FlowConditionKind::InletVelocity { speed } => ItemKind::InletVelocity { speed },
+                FlowConditionKind::InletVolumeFlow { rate } => ItemKind::InletVolumeFlow { rate },
+                FlowConditionKind::InletMassFlow { rate } => ItemKind::InletMassFlow { rate },
+                FlowConditionKind::StaticPressure { pressure } => {
+                    ItemKind::StaticPressure { pascals: pressure }
+                }
+                FlowConditionKind::IdealWall => ItemKind::IdealWall,
+            },
+            faces: faces(&c.faces),
+        });
+    }
+    for g in &file.goals {
+        study.items.push(StudyItem {
+            name: g.name.clone(),
+            kind: ItemKind::Goal(g.kind),
+            faces: faces(&g.faces),
+        });
+    }
+    study.flow = file.flow.clone();
+    study.cooling = file.cooling;
     study.recount();
     study
 }
@@ -499,16 +567,27 @@ pub(crate) fn results_file(
     let summary = done.results.as_ref().map(Results::summary);
     let thermal_summary = done.thermal.as_ref().map(ThermalResults::summary);
     let extreme = |(value, node): (f64, u32)| Extreme { value, node };
+    let flow = done.flow.as_ref().map(|f| &f.run);
     let iterations = done.results.as_ref().map_or(0, |r| r.iterations)
         + done.thermal.as_ref().map_or(0, |t| t.iterations)
         + done.topology.as_ref().map_or(0, |t| t.solver_iterations)
-        + done.frequency.as_ref().map_or(0, |f| f.iterations);
+        + done.frequency.as_ref().map_or(0, |f| f.iterations)
+        + flow.map_or(0, |f| f.iterations as usize);
     let residual = done
         .results
         .as_ref()
         .map(|r| r.residual)
         .or_else(|| done.thermal.as_ref().map(|t| t.residual))
         .or_else(|| done.frequency.as_ref().map(|f| f.residual))
+        .or_else(|| {
+            // A flow's largest residual at its last iteration.
+            flow.and_then(|f| f.residuals.last()).map(|row| {
+                row.iter()
+                    .copied()
+                    .filter(|r| r.is_finite())
+                    .fold(0.0, f64::max)
+            })
+        })
         .unwrap_or(0.0);
     ResultsFile {
         document_id: oxyde_format::new_document_id(),
@@ -527,14 +606,13 @@ pub(crate) fn results_file(
         solver: SolverInfo {
             program: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
             mesher: done.mesher.to_owned(),
-            method: if done.topology.is_some() {
-                "simp+oc, pcg+amg"
-            } else if done.frequency.is_some() {
-                "lobpcg+amg"
-            } else {
-                "pcg+amg"
-            }
-            .to_owned(),
+            method: match (&done.flow, done.study_type) {
+                (Some(_), StudyType::Cooling) => "chtMultiRegionSimpleFoam".to_owned(),
+                (Some(_), _) => "simpleFoam".to_owned(),
+                (None, _) if done.topology.is_some() => "simp+oc, pcg+amg".to_owned(),
+                (None, _) if done.frequency.is_some() => "lobpcg+amg".to_owned(),
+                (None, _) => "pcg+amg".to_owned(),
+            },
             iterations: iterations as u64,
             residual,
             seconds: done.mesh_seconds + done.solve_seconds,
@@ -628,6 +706,7 @@ pub(crate) fn results_file(
         }),
         // This tab solves no generative study.
         generative: None,
+        flow: flow.cloned(),
     }
 }
 
@@ -1005,8 +1084,13 @@ impl OxydeApp {
         let Some(study_file) = self.simulation.file.clone() else {
             return false;
         };
+        // A flow study's case goes beside its study file, as its results do.
+        if let Err(e) = self.keep_flow_case(&study_file.path) {
+            self.status = e;
+            return false;
+        }
         let name = self.simulation.study.name.clone();
-        let file = if self.simulation.study.study_type == StudyType::Generative {
+        let mut file = if self.simulation.study.study_type == StudyType::Generative {
             let generated = self.simulation.generative.generated.as_ref();
             let Some((g, fingerprint)) = generated
                 .filter(|g| !g.outcomes.is_empty())
@@ -1045,6 +1129,12 @@ impl OxydeApp {
                 return false;
             };
             path = chosen;
+        }
+        // A flow's case, named relative to where its results go.
+        let flow = self.simulation.done.as_ref().and_then(|d| d.flow.as_ref());
+        if let (Some(run), Some(flow)) = (file.flow.as_mut(), flow) {
+            let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            run.case = relative_path(&folder, &flow.case_dir);
         }
         match oxyde_format::results::save_results(&path, &file) {
             Ok(()) => {
@@ -1137,6 +1227,30 @@ impl OxydeApp {
             }
             return;
         }
+        let faces: BTreeMap<u32, SimFace> =
+            file.labels.iter().map(|(k, f)| (*k, sim_face(f))).collect();
+        if let Some(run) = file.flow.clone() {
+            // A flow's fields are in its case folder, beside the results.
+            let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let case_dir = folder.join(&run.case);
+            self.show_loaded_flow(run, case_dir.clone(), faces, file.fingerprint, &file.solver);
+            self.status = if self
+                .simulation
+                .done
+                .as_ref()
+                .and_then(|d| d.flow.as_ref())
+                .is_some_and(|f| f.fields.is_some())
+            {
+                format!("Opened the results {}", path.display())
+            } else {
+                format!(
+                    "Opened the results {}, without plots: their OpenFOAM case {} is not there",
+                    path.display(),
+                    case_dir.display()
+                )
+            };
+            return;
+        }
         let loaded = match mesh_and_results(&file) {
             Ok(r) => r,
             Err(e) => {
@@ -1144,8 +1258,6 @@ impl OxydeApp {
                 return;
             }
         };
-        let faces: BTreeMap<u32, SimFace> =
-            file.labels.iter().map(|(k, f)| (*k, sim_face(f))).collect();
         let bodies = file
             .bodies
             .iter()
@@ -1384,6 +1496,103 @@ mod tests {
             assert!((b.eigenvalue / m.eigenvalue - 1.0).abs() < 1e-12);
         }
         assert_eq!((back.mass, back.iterations), (0.125, 30));
+    }
+
+    #[test]
+    fn a_flow_study_survives_its_file() {
+        use oxyde_format::simulation::{FlowAnalysis, FlowGoalKind, FlowTurbulence, Fluid};
+        let mut study = Study::of_type(StudyType::Flow, "Flow 1");
+        for (k, kind) in [
+            ItemKind::InletVelocity { speed: 2.0 },
+            ItemKind::InletVolumeFlow { rate: 1e-4 },
+            ItemKind::InletMassFlow { rate: 0.2 },
+            ItemKind::StaticPressure { pascals: -50.0 },
+            ItemKind::IdealWall,
+            ItemKind::Goal(FlowGoalKind::Force),
+            ItemKind::Goal(FlowGoalKind::MeanPressure),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            study.items.push(StudyItem {
+                name: format!("{}-1", kind.base_name()),
+                kind,
+                faces: vec![face(k as u32 + 2)],
+            });
+        }
+        study.flow.analysis = FlowAnalysis::External {
+            velocity: [0.0, 0.0, -3.0],
+        };
+        study.flow.fluid = Fluid::air();
+        study.flow.turbulence = FlowTurbulence::Turbulent {
+            intensity: 0.03,
+            length: 2.0,
+        };
+        study.flow.mesh_level = 5;
+        let file = file_study(&study);
+        assert_eq!((file.conditions.len(), file.goals.len()), (5, 2));
+        let mut back = study_of(&file);
+        back.made.clear();
+        study.made.clear();
+        // Conditions come back first, then goals: the order the panel lists them in.
+        assert_eq!(back, study);
+        // A thermal study's file holds none of a flow study's items.
+        let mut thermal = study.clone();
+        thermal.study_type = StudyType::Thermal;
+        let file = file_study(&thermal);
+        assert!(file.conditions.is_empty() && file.goals.is_empty());
+    }
+
+    #[test]
+    fn a_cooling_study_survives_its_file() {
+        use oxyde_format::simulation::{CoolingSettings, FlowGoalKind};
+        let mut study = Study::of_type(StudyType::Cooling, "Cooling 1");
+        for (k, kind) in [
+            ItemKind::InletVelocity { speed: 0.5 },
+            ItemKind::StaticPressure { pascals: 0.0 },
+            ItemKind::InternalHeat { watts: 12.0 },
+            ItemKind::Convection {
+                coefficient: 10.0,
+                ambient: 25.0,
+            },
+            ItemKind::Goal(FlowGoalKind::MaxTemperature),
+            ItemKind::Goal(FlowGoalKind::HeatFlow),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            study.items.push(StudyItem {
+                name: format!("{}-1", kind.base_name()),
+                kind,
+                faces: vec![face(k as u32 + 2)],
+            });
+        }
+        study.cooling = CoolingSettings {
+            temperature: 35.0,
+            gravity: Some([0.0, -9.81, 0.0]),
+            ..CoolingSettings::air()
+        };
+        let file = file_study(&study);
+        assert_eq!(
+            (file.conditions.len(), file.loads.len(), file.goals.len()),
+            (2, 2, 2)
+        );
+        assert_eq!(file.cooling, study.cooling);
+        let mut back = study_of(&file);
+        back.made.clear();
+        study.made.clear();
+        // Conditions, then loads, then goals: their order in the file.
+        let order = |s: &Study| -> Vec<String> { s.items.iter().map(|i| i.name.clone()).collect() };
+        assert_eq!(order(&back).len(), 6);
+        back.items.sort_by(|a, b| a.name.cmp(&b.name));
+        study.items.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(back, study);
+        // A flow study takes neither the heat nor the thermal goals.
+        let mut flow = study.clone();
+        flow.study_type = StudyType::Flow;
+        let file = file_study(&flow);
+        assert!(file.loads.is_empty());
+        assert_eq!(file.goals.len(), 0);
     }
 
     #[test]

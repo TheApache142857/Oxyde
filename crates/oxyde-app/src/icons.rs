@@ -149,6 +149,22 @@ pub enum Icon {
     StartingShape,
     /// Explore: outcomes as dots on a plot, one picked.
     Explore,
+    /// A flow study: streamlines bending round a body.
+    FlowStudy,
+    /// A cooling study: a heat sink's fins, warm at the base, in a blue stream.
+    CoolingStudy,
+    /// An inlet: blue arrows into a lid.
+    Inlet,
+    /// A static pressure opening, where the fluid goes out: blue arrows leaving a lid.
+    Outlet,
+    /// An ideal wall: a wall the fluid slips along.
+    IdealWall,
+    /// A goal: a flag on a face, what a flow study measures.
+    Goal,
+    /// A cut plot: a plane through the fluid in plot colours.
+    CutPlot,
+    /// A surface plot: a body's faces in plot colours, with flow lines past it.
+    SurfacePlot,
     // View and edit
     ViewFront,
     ViewTop,
@@ -1453,6 +1469,140 @@ fn draw(pen: &Pen, icon: Icon) {
                 pen.arrow((1.0, y), (21.0, y), 1.5, *color);
             }
         }
+        CoolingStudy => {
+            // A heat sink: a warm base and three fins, air flowing between them.
+            pen.poly(
+                &[(4.0, 16.0), (20.0, 16.0), (20.0, 20.0), (4.0, 20.0)],
+                HOT,
+                INK,
+            );
+            for x in [5.0, 10.5, 16.0] {
+                pen.poly(
+                    &[(x, 6.0), (x + 3.0, 6.0), (x + 3.0, 16.0), (x, 16.0)],
+                    BODY,
+                    INK,
+                );
+            }
+            pen.arrow((1.0, 4.0), (23.0, 4.0), 1.5, COOL);
+            pen.line(&[(8.0, 11.0), (10.5, 11.0)], 1.5, COOL);
+            pen.line(&[(13.5, 11.0), (16.0, 11.0)], 1.5, COOL);
+        }
+        FlowStudy => {
+            // A body, and three streamlines bending round it.
+            pen.poly(
+                &[(9.0, 9.0), (15.0, 9.0), (15.0, 15.0), (9.0, 15.0)],
+                BODY,
+                INK,
+            );
+            pen.line(
+                &[
+                    (2.0, 6.0),
+                    (7.0, 6.0),
+                    (12.0, 4.5),
+                    (17.0, 6.0),
+                    (22.0, 6.0),
+                ],
+                1.5,
+                COOL,
+            );
+            pen.line(&[(2.0, 12.0), (7.0, 12.0)], 1.5, COOL);
+            pen.line(&[(17.0, 12.0), (22.0, 12.0)], 1.5, COOL);
+            pen.line(
+                &[
+                    (2.0, 18.0),
+                    (7.0, 18.0),
+                    (12.0, 19.5),
+                    (17.0, 18.0),
+                    (22.0, 18.0),
+                ],
+                1.5,
+                COOL,
+            );
+            pen.head((22.0, 6.0), 1.0, 0.0, 3.0, COOL);
+            pen.head((22.0, 18.0), 1.0, 0.0, 3.0, COOL);
+        }
+        Inlet => {
+            // A lid, and the fluid coming in through it.
+            pen.poly(
+                &[(14.0, 3.0), (18.0, 3.0), (18.0, 21.0), (14.0, 21.0)],
+                BODY_TOP,
+                INK,
+            );
+            for y in [7.0, 12.0, 17.0] {
+                pen.arrow((2.0, y), (13.0, y), 1.6, COOL);
+            }
+        }
+        Outlet => {
+            // A lid, and the fluid going out past it.
+            pen.poly(
+                &[(6.0, 3.0), (10.0, 3.0), (10.0, 21.0), (6.0, 21.0)],
+                BODY_TOP,
+                INK,
+            );
+            for y in [7.0, 12.0, 17.0] {
+                pen.arrow((11.0, y), (22.0, y), 1.6, COOL);
+            }
+        }
+        IdealWall => {
+            // A hatched wall, and the fluid gliding along it.
+            pen.line(&[(3.0, 16.0), (21.0, 16.0)], 1.8, INK);
+            for x in [5.0, 9.0, 13.0, 17.0, 21.0] {
+                pen.line(&[(x, 16.0), (x - 3.0, 20.0)], 1.0, INK);
+            }
+            pen.arrow((3.0, 12.0), (21.0, 12.0), 1.6, COOL);
+            pen.arrow((6.0, 7.0), (18.0, 7.0), 1.4, COOL);
+        }
+        Goal => {
+            // A flag planted on a face.
+            pen.solid(3.0, 15.0, 14.0, 6.0, 3.0);
+            pen.line(&[(11.0, 15.0), (11.0, 2.0)], 1.6, INK);
+            pen.poly(&[(11.0, 2.5), (20.0, 5.0), (11.0, 8.0)], ACCENT, INK);
+        }
+        CutPlot => {
+            // A plane through the fluid, banded cold to hot.
+            let bands = [
+                Color32::from_rgb(0, 60, 255),
+                Color32::from_rgb(0, 200, 255),
+                Color32::from_rgb(40, 220, 60),
+                Color32::from_rgb(250, 220, 0),
+                Color32::from_rgb(240, 40, 20),
+            ];
+            for (k, color) in bands.iter().enumerate() {
+                let x = 4.0 + 3.2 * k as f32;
+                let skew = 4.0;
+                pen.fill(
+                    &[
+                        (x + skew, 5.0),
+                        (x + 3.2 + skew, 5.0),
+                        (x + 3.2, 19.0),
+                        (x, 19.0),
+                    ],
+                    *color,
+                );
+            }
+            pen.closed(
+                &[(8.0, 5.0), (24.0, 5.0), (20.0, 19.0), (4.0, 19.0)],
+                1.0,
+                INK,
+            );
+            pen.arrow((1.0, 12.0), (7.0, 12.0), 1.3, COOL);
+        }
+        SurfacePlot => {
+            // A body's faces in plot colours, and the fluid going past.
+            pen.block(
+                5.0,
+                10.0,
+                11.0,
+                10.0,
+                4.0,
+                [
+                    Color32::from_rgb(250, 220, 0),
+                    Color32::from_rgb(240, 40, 20),
+                    Color32::from_rgb(0, 200, 255),
+                ],
+            );
+            pen.arrow((1.0, 5.0), (12.0, 5.0), 1.4, COOL);
+        }
         Configurations => {
             // A small table: three rows, the middle one marked as the active configuration.
             pen.poly(
@@ -1687,7 +1837,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 102] = {
+pub const ALL: [Icon; 110] = {
     use Icon::*;
     [
         Sketch,
@@ -1776,6 +1926,14 @@ pub const ALL: [Icon; 102] = {
         Obstacle,
         StartingShape,
         Explore,
+        FlowStudy,
+        CoolingStudy,
+        Inlet,
+        Outlet,
+        IdealWall,
+        Goal,
+        CutPlot,
+        SurfacePlot,
         ViewFront,
         ViewTop,
         ViewRight,

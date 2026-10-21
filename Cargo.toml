@@ -21,6 +21,7 @@ oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
 oxyde-sim = { path = "crates/oxyde-sim" }
 oxyde-sim-gpu = { path = "crates/oxyde-sim-gpu" }
+oxyde-flow = { path = "crates/oxyde-flow" }
 
 clap = { version = "4.6", features = ["derive"] }
 cxx = "1.0"

@@ -1052,6 +1052,10 @@ pub(crate) struct Solved {
     contact_solve: ContactSolve,
 }
 
+/// An element's blocks for [`Prepared::assemble`]: called with the element and a sink taking
+/// two of its nodes (local numbers) and their 3 × 3 block in global directions.
+type ElementBlocks<'a> = dyn Fn(usize, &mut dyn FnMut(usize, usize, &M3)) + Sync + 'a;
+
 impl Prepared {
     /// Checks the problem (the mesh, the materials, the fixtures holding every piece, the
     /// loads) and prepares it.
@@ -1188,7 +1192,7 @@ impl Prepared {
     fn assemble(
         &self,
         mesh: &TetMesh,
-        element: &(dyn Fn(usize, &mut dyn FnMut(usize, usize, &M3)) + Sync),
+        element: &ElementBlocks<'_>,
         held_diagonal: f64,
     ) -> BlockMatrix {
         let constraints = &self.constraints;

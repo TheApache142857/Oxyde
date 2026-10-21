@@ -1,8 +1,11 @@
 //! Simulation results (`.oxyres`): the mesh a study was solved on and the fields computed
 //! at its nodes (displacements and stresses, temperatures and heat flux, a frequency study's
 //! mode shapes) or, for a topology study, its elements' densities; for a generative study,
-//! a grid of voxels and the densities of each outcome on it. They are kept apart from the study (`.oxysim`) so
-//! studies stay small and diff cleanly while results can be thrown away and computed again.
+//! a grid of voxels and the densities of each outcome on it. They are kept apart from the
+//! study (`.oxysim`) so studies stay small and diff cleanly while results can be thrown away
+//! and computed again. A flow study's results are a record of its OpenFOAM run instead: the
+//! case folder kept beside them, which holds the mesh and fields, the goals' values and the
+//! residuals of every iteration ([`FlowRun`]).
 //!
 //! `results.json` says which study the results belong to, a fingerprint of the model they
 //! were computed from (so stale results are detected when reopened), a summary, and
@@ -20,8 +23,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::simulation::{
-    ADDITIVE_OVERHANG, AxisDirection, AxisSides, OutcomeMethod, Study, StudyFace, StudyFaceDto,
-    StudyType, StudyTypeDto, study_face_dto, study_face_from, type_version,
+    ADDITIVE_OVERHANG, AxisDirection, AxisSides, FlowGoalKind, GoalKindDto, OutcomeMethod, Study,
+    StudyFace, StudyFaceDto, StudyType, StudyTypeDto, study_face_dto, study_face_from,
+    study_version,
 };
 use crate::{
     AssemblyFile, DocumentKind, FormatError, MANIFEST, PartFile, assembly_json, expect_kind,
@@ -56,6 +60,7 @@ const VOXELS: &str = "grid/voxels.bin";
 /// Under `outcomes/<id>/`.
 const OUTCOME_DENSITY: &str = "density.bin";
 const SNAPSHOTS: &str = "snapshots.bin";
+const RESIDUALS: &str = "flow/residuals.bin";
 
 /// A results document as stored on disk.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +91,54 @@ pub struct ResultsFile {
     /// The grid of voxels and the shapes grown on it: a generative study's, which has no
     /// mesh, bodies or labels.
     pub generative: Option<GenerativeResults>,
+    /// A flow study's run; its mesh above is empty.
+    pub flow: Option<FlowRun>,
+}
+
+/// A flow study's results: where its OpenFOAM case is, how the run went, the goals' values
+/// and the residuals. The mesh and the fields stay in the case, read from there to plot them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FlowRun {
+    /// The OpenFOAM case folder, relative to the results document's folder, with `/`
+    /// separators.
+    pub case: String,
+    /// The case's time folder holding the last fields.
+    pub time: String,
+    /// The OpenFOAM version that solved it: `v2606`.
+    pub openfoam: String,
+    /// The fluid mesh's cells.
+    pub cells: u64,
+    pub iterations: u32,
+    /// The residuals fell under the study's target before the most iterations allowed.
+    pub converged: bool,
+    pub goals: Vec<GoalResult>,
+    /// The equations whose residuals are recorded (`Ux`, `p`, `k`…).
+    pub residual_fields: Vec<String>,
+    /// Each iteration's initial residuals, one per field of `residual_fields`, NaN where a
+    /// field was not solved.
+    pub residuals: Vec<Vec<f64>>,
+}
+
+/// A flow goal's value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GoalResult {
+    pub name: String,
+    pub kind: FlowGoalKind,
+    pub value: GoalOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GoalOutcome {
+    /// A volume flow (m³/s), a mass flow (kg/s) or a mean pressure (Pa).
+    Value(f64),
+    /// A force, N: the total, and its pressure and friction parts.
+    Force {
+        total: [f64; 3],
+        pressure: [f64; 3],
+        viscous: [f64; 3],
+    },
+    /// Not measured, and why.
+    Missing(String),
 }
 
 /// What the results were computed from, to tell whether they still hold.
@@ -677,9 +730,18 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             }
         }
     }
+    if let Some(flow) = &file.flow {
+        entries.push(entry(
+            RESIDUALS,
+            Dtype::F64,
+            flow.residual_fields.len() as u32,
+            flow.residuals.len(),
+            f64s(flow.residuals.iter().flatten()),
+        ));
+    }
 
     // The oldest version that has results of this type, as for studies.
-    let version = type_version(file.study_type);
+    let version = study_version(file.study_type);
     let model = ResultsDto {
         simulation: file.simulation_id.clone(),
         study: file.study.clone(),
@@ -720,6 +782,7 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
                 })
                 .collect(),
         }),
+        flow: file.flow.as_ref().map(flow_run_dto),
     };
 
     let manifest = manifest_version(DocumentKind::SimulationResults, &file.document_id, version);
@@ -1258,6 +1321,27 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
         None
     };
 
+    let flow = match (study_type.is_flow(), dto.flow) {
+        (true, Some(f)) => {
+            let width = f.residual_fields.len();
+            let residuals = match array(RESIDUALS, Dtype::F64, &[width as u32])? {
+                Some((bytes, _)) => read_f64s(&bytes)
+                    .chunks(width.max(1))
+                    .map(<[f64]>::to_vec)
+                    .collect(),
+                None => Vec::new(),
+            };
+            Some(flow_run_from(f, residuals).map_err(invalid)?)
+        }
+        (true, None) => return Err(invalid("flow results have no flow run".to_owned())),
+        (false, Some(_)) => {
+            return Err(invalid(
+                "only a flow study's results have a flow run".to_owned(),
+            ));
+        }
+        (false, None) => None,
+    };
+
     let mut labels = BTreeMap::new();
     for l in dto.labels {
         let face = study_face_from(l.face, None)
@@ -1292,6 +1376,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
         thermal,
         topology,
         generative,
+        flow,
     };
     validate(&file).map_err(invalid)?;
     Ok(file)
@@ -1512,6 +1597,45 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
     if !file.solver.residual.is_finite() || !file.solver.seconds.is_finite() {
         return Err("the solver's residual or time is not a finite number".to_owned());
     }
+    match (&file.flow, file.study_type.is_flow()) {
+        (Some(flow), true) => {
+            let width = flow.residual_fields.len();
+            if width == 0 && !flow.residuals.is_empty() {
+                return Err("residuals are recorded for no field".to_owned());
+            }
+            if flow.residuals.iter().any(|r| r.len() != width) {
+                return Err(format!(
+                    "an iteration's residuals are not the {width} of the fields named"
+                ));
+            }
+            for goal in &flow.goals {
+                let finite = match &goal.value {
+                    GoalOutcome::Value(v) => v.is_finite(),
+                    GoalOutcome::Force {
+                        total,
+                        pressure,
+                        viscous,
+                    } => total
+                        .iter()
+                        .chain(pressure)
+                        .chain(viscous)
+                        .all(|x| x.is_finite()),
+                    GoalOutcome::Missing(_) => true,
+                };
+                if !finite {
+                    return Err(format!("goal {} is not a finite number", goal.name));
+                }
+                if matches!(goal.value, GoalOutcome::Force { .. })
+                    != (goal.kind == FlowGoalKind::Force)
+                {
+                    return Err(format!("goal {} has a value of another kind", goal.name));
+                }
+            }
+        }
+        (None, false) => {}
+        (Some(_), false) => return Err("only a flow study's results have a flow run".to_owned()),
+        (None, true) => return Err("flow results have no flow run".to_owned()),
+    }
     Ok(())
 }
 
@@ -1634,6 +1758,9 @@ struct ResultsDto {
     /// A frequency study's modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     frequency: Option<FrequencyDto>,
+    /// A flow study's run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flow: Option<FlowRunDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1761,6 +1888,119 @@ struct TopologyDto {
     history: Vec<TopologyIteration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     joining: Option<TopologyJoining>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FlowRunDto {
+    case: String,
+    time: String,
+    #[serde(default)]
+    openfoam: String,
+    cells: u64,
+    iterations: u32,
+    converged: bool,
+    #[serde(default)]
+    residual_fields: Vec<String>,
+    #[serde(default)]
+    goals: Vec<GoalResultDto>,
+}
+
+/// A goal's value: `value` (a flow or a mean pressure), or `force` with its
+/// `pressure_force` and `viscous_force` parts, or `missing` and why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct GoalResultDto {
+    name: String,
+    #[serde(rename = "type")]
+    kind: GoalKindDto,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    force: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pressure_force: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    viscous_force: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing: Option<String>,
+}
+
+fn flow_run_dto(flow: &FlowRun) -> FlowRunDto {
+    FlowRunDto {
+        case: flow.case.clone(),
+        time: flow.time.clone(),
+        openfoam: flow.openfoam.clone(),
+        cells: flow.cells,
+        iterations: flow.iterations,
+        converged: flow.converged,
+        residual_fields: flow.residual_fields.clone(),
+        goals: flow
+            .goals
+            .iter()
+            .map(|g| {
+                let mut dto = GoalResultDto {
+                    name: g.name.clone(),
+                    kind: GoalKindDto::of(g.kind),
+                    value: None,
+                    force: None,
+                    pressure_force: None,
+                    viscous_force: None,
+                    missing: None,
+                };
+                match &g.value {
+                    GoalOutcome::Value(v) => dto.value = Some(*v),
+                    GoalOutcome::Force {
+                        total,
+                        pressure,
+                        viscous,
+                    } => {
+                        dto.force = Some(*total);
+                        dto.pressure_force = Some(*pressure);
+                        dto.viscous_force = Some(*viscous);
+                    }
+                    GoalOutcome::Missing(why) => dto.missing = Some(why.clone()),
+                }
+                dto
+            })
+            .collect(),
+    }
+}
+
+fn flow_run_from(dto: FlowRunDto, residuals: Vec<Vec<f64>>) -> Result<FlowRun, String> {
+    let mut goals = Vec::with_capacity(dto.goals.len());
+    for g in dto.goals {
+        let value = match (
+            g.missing,
+            g.force,
+            g.pressure_force,
+            g.viscous_force,
+            g.value,
+        ) {
+            (Some(why), ..) => GoalOutcome::Missing(why),
+            (None, Some(total), Some(pressure), Some(viscous), None) => GoalOutcome::Force {
+                total,
+                pressure,
+                viscous,
+            },
+            (None, None, None, None, Some(v)) => GoalOutcome::Value(v),
+            _ => return Err(format!("goal {} has no value it can be read by", g.name)),
+        };
+        goals.push(GoalResult {
+            name: g.name,
+            kind: g.kind.kind(),
+            value,
+        });
+    }
+    Ok(FlowRun {
+        case: dto.case,
+        time: dto.time,
+        openfoam: dto.openfoam,
+        cells: dto.cells,
+        iterations: dto.iterations,
+        converged: dto.converged,
+        goals,
+        residual_fields: dto.residual_fields,
+        residuals,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2020,6 +2260,7 @@ mod tests {
             thermal: None,
             topology: None,
             generative: None,
+            flow: None,
         }
     }
 
@@ -2624,6 +2865,146 @@ mod tests {
         assert_eq!(read, file);
     }
 
+    /// A flow study's results: no mesh of their own, a run with goals and residuals.
+    fn flow_sample() -> ResultsFile {
+        let mut file = sample();
+        file.study = "Flow 1".to_owned();
+        file.study_type = StudyType::Flow;
+        file.summary = Summary::default();
+        file.bodies.clear();
+        file.mesh = ResultMesh::default();
+        file.fields = NodalFields::default();
+        file.solver.mesher = "snappyHexMesh".to_owned();
+        file.flow = Some(FlowRun {
+            case: "bracket-Flow 1.openfoam".to_owned(),
+            time: "245".to_owned(),
+            openfoam: "v2606".to_owned(),
+            cells: 41_696,
+            iterations: 3,
+            converged: true,
+            goals: vec![
+                GoalResult {
+                    name: "Force Goal-1".to_owned(),
+                    kind: FlowGoalKind::Force,
+                    value: GoalOutcome::Force {
+                        total: [2.0, 0.0, -1e-6],
+                        pressure: [1.5, 0.0, 0.0],
+                        viscous: [0.5, 0.0, -1e-6],
+                    },
+                },
+                GoalResult {
+                    name: "Flow Goal-1".to_owned(),
+                    kind: FlowGoalKind::VolumeFlow,
+                    value: GoalOutcome::Value(-1.5e-7),
+                },
+                GoalResult {
+                    name: "Pressure Goal-1".to_owned(),
+                    kind: FlowGoalKind::MeanPressure,
+                    value: GoalOutcome::Missing("the mesh has none of its faces".to_owned()),
+                },
+            ],
+            residual_fields: vec!["Ux".to_owned(), "Uy".to_owned(), "p".to_owned()],
+            residuals: vec![
+                vec![1.0, 1.0, 1.0],
+                vec![0.1, f64::NAN, 0.3],
+                vec![1e-5, 2e-5, 9e-6],
+            ],
+        });
+        file
+    }
+
+    /// Equal but for NaN, which is never equal to itself.
+    fn same_flow(a: &ResultsFile, b: &ResultsFile) -> bool {
+        let strip = |f: &ResultsFile| {
+            let mut f = f.clone();
+            if let Some(flow) = f.flow.as_mut() {
+                for r in flow.residuals.iter_mut().flatten() {
+                    if r.is_nan() {
+                        *r = -1.0;
+                    }
+                }
+            }
+            f
+        };
+        strip(a) == strip(b)
+    }
+
+    #[test]
+    fn flow_results_round_trip() {
+        let file = flow_sample();
+        let written = bytes(&file);
+        let read = read_results(Cursor::new(&written)).unwrap();
+        assert!(same_flow(&read, &file), "{read:?}");
+        assert!(read.flow.as_ref().unwrap().residuals[1][1].is_nan());
+        let mut archive = ZipArchive::new(Cursor::new(&written)).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert_eq!(json["type"], "flow");
+        let flow = &json["flow"];
+        assert_eq!(flow["case"], "bracket-Flow 1.openfoam");
+        assert_eq!(flow["time"], "245");
+        assert_eq!(flow["cells"], 41_696);
+        assert_eq!(
+            flow["residual_fields"],
+            serde_json::json!(["Ux", "Uy", "p"])
+        );
+        assert_eq!(flow["goals"][0]["type"], "force");
+        assert_eq!(
+            flow["goals"][0]["force"],
+            serde_json::json!([2.0, 0.0, -1e-6])
+        );
+        assert_eq!(flow["goals"][0]["viscous_force"][0], 0.5);
+        assert_eq!(flow["goals"][1]["value"], -1.5e-7);
+        assert!(flow["goals"][1].get("force").is_none());
+        assert_eq!(
+            flow["goals"][2]["missing"],
+            "the mesh has none of its faces"
+        );
+        let residuals = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == RESIDUALS)
+            .unwrap();
+        assert_eq!(
+            (&residuals["count"], &residuals["components"]),
+            (&3.into(), &3.into())
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 5);
+    }
+
+    #[test]
+    fn inconsistent_flow_results_are_not_written() {
+        let refused =
+            |file: ResultsFile, why: &str| match write_results(Cursor::new(Vec::new()), &file) {
+                Err(FormatError::InvalidResults(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected invalid results ({why}), got {other:?}"),
+            };
+        let mut no_run = flow_sample();
+        no_run.flow = None;
+        refused(no_run, "no flow run");
+        let mut stray = sample();
+        stray.flow = flow_sample().flow;
+        refused(stray, "only a flow study");
+        let mut ragged = flow_sample();
+        if let Some(f) = ragged.flow.as_mut() {
+            f.residuals[1].pop();
+        }
+        refused(ragged, "residuals are not the 3");
+        let mut infinite = flow_sample();
+        if let Some(f) = infinite.flow.as_mut() {
+            f.goals[1].value = GoalOutcome::Value(f64::INFINITY);
+        }
+        refused(infinite, "not a finite number");
+        let mut mixed = flow_sample();
+        if let Some(f) = mixed.flow.as_mut() {
+            f.goals[0].value = GoalOutcome::Value(1.0);
+        }
+        refused(mixed, "another kind");
+    }
+
     /// The sample as a transient thermal study's results: temperatures only.
     fn transient_sample() -> ResultsFile {
         let mut file = sample();
@@ -2978,6 +3359,39 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded.unwrap(), file);
         assert_eq!(kind.unwrap().0, DocumentKind::SimulationResults);
+    }
+
+    #[test]
+    fn studies_of_the_other_types_hash_as_before_flow_studies() {
+        // Their results' fingerprints hold the study's hash: it must not change when a
+        // version adds study types, or saved results would all read as out of date. The
+        // values were computed by the code before flow studies were added.
+        use crate::simulation::{Fixture, FixtureKind, Load, LoadKind};
+        let face = StudyFace::part(FaceName::end_cap(FeatureId::from_raw(2)));
+        let mut s = Study::new("Static 1");
+        s.fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: vec![face.clone()],
+            suppressed: false,
+        });
+        let mut t = Study::of_type("Thermal 1", StudyType::Thermal);
+        t.loads.push(Load {
+            name: "Temperature-1".to_owned(),
+            kind: LoadKind::Temperature {
+                faces: vec![face],
+                celsius: 80.0,
+            },
+            suppressed: false,
+        });
+        assert_eq!(
+            study_hash(&s).unwrap(),
+            "fnv1a128:ec30593d579337ff293f91a6885c6545"
+        );
+        assert_eq!(
+            study_hash(&t).unwrap(),
+            "fnv1a128:3a9b0c2ce48e7c6e0cab93e7f62bf1a3"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! The Simulation tab's studies, as Fusion 360 keeps them: the tab opens on *New Study*,
-//! which makes a static stress, frequency, thermal, transient thermal, thermal stress or
-//! topology study, and a model has as many as wanted, each with its own fixtures, loads, contacts,
-//! mesh settings, material overrides and results. One is open at a time; the panel's list
-//! switches between them, and *Save* writes them all to the model's `.oxysim`. Generative
-//! studies are among them, listed and made in the Generative Design tab only
-//! (`generative_ui.rs`), which opens one when it is chosen; the Simulation tab lists the
+//! which makes a static stress, frequency, thermal, transient thermal, thermal stress,
+//! topology, flow or cooling study, and a model has as many as wanted, each with its own
+//! fixtures, loads, contacts, mesh settings, material overrides and results. One is open at a
+//! time; the panel's list switches between them, and *Save* writes them all to the model's
+//! `.oxysim`. Generative studies are among them, listed and made in the Generative Design tab
+//! only (`generative_ui.rs`), which opens one when it is chosen; the Simulation tab lists the
 //! others.
 //!
 //! The open study lives where the rest of the tab expects it (`SimulationView::study`,
@@ -41,7 +41,7 @@ impl Parked {
 }
 
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 6] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 8] = [
     (
         StudyType::Static,
         "Static Stress",
@@ -72,6 +72,16 @@ pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 6] = [
         "Topology",
         "The stiffest shape that keeps a share of the mass under fixtures and loads: material kept where the loads need it, taken away elsewhere",
     ),
+    (
+        StudyType::Flow,
+        "Flow",
+        "A liquid or a gas through or around the model: velocities, pressures, forces and flow rates, solved by OpenFOAM",
+    ),
+    (
+        StudyType::Cooling,
+        "Cooling",
+        "Air or water carrying heat away from the model, the heat conducted through its bodies: temperatures and heat flows, solved by OpenFOAM",
+    ),
 ];
 
 /// What the panel and the menus call a study type.
@@ -95,6 +105,8 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::Topology => "Topology",
         StudyType::Generative => "Generative",
         StudyType::Frequency => "Frequency",
+        StudyType::Flow => "Flow",
+        StudyType::Cooling => "Cooling",
     }
 }
 
@@ -235,6 +247,8 @@ impl OxydeApp {
                 StudyType::Generative =>
                     "pick the bodies to keep, add fixtures and loads, then Generate".to_owned(),
                 StudyType::Frequency => "select faces, add fixtures, then Run".to_owned(),
+                StudyType::Flow => "set the fluid in the panel; select the inner faces of the lids, add an inlet and a static pressure, then Run".to_owned(),
+                StudyType::Cooling => "set the fluid in the panel; add Internal Heat where heat is made, and an inlet and a static pressure or a stream, then Run".to_owned(),
             }
         );
     }
@@ -350,6 +364,8 @@ impl OxydeApp {
                             StudyType::Topology | StudyType::Generative => {
                                 crate::icons::Icon::Topology
                             }
+                            StudyType::Flow => crate::icons::Icon::FlowStudy,
+                            StudyType::Cooling => crate::icons::Icon::CoolingStudy,
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {
