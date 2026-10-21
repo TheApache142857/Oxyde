@@ -1,6 +1,6 @@
 //! The Simulation tab's studies, as Fusion 360 keeps them: the tab opens on *New Study*,
-//! which makes a static stress, thermal, transient thermal, thermal stress or topology
-//! study, and a model has as many as wanted, each with its own fixtures, loads, contacts,
+//! which makes a static stress, frequency, thermal, transient thermal, thermal stress or
+//! topology study, and a model has as many as wanted, each with its own fixtures, loads, contacts,
 //! mesh settings, material overrides and results. One is open at a time; the panel's list
 //! switches between them, and *Save* writes them all to the model's `.oxysim`. Generative
 //! studies are among them, listed and made in the Generative Design tab only
@@ -41,11 +41,16 @@ impl Parked {
 }
 
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 5] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 6] = [
     (
         StudyType::Static,
         "Static Stress",
         "Stresses, displacements and the factor of safety under fixtures, forces, pressures and gravity",
+    ),
+    (
+        StudyType::Frequency,
+        "Frequency",
+        "The natural frequencies and mode shapes: how the model vibrates, held by its fixtures",
     ),
     (
         StudyType::Thermal,
@@ -89,6 +94,7 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::ThermalStress => "Thermal Stress",
         StudyType::Topology => "Topology",
         StudyType::Generative => "Generative",
+        StudyType::Frequency => "Frequency",
     }
 }
 
@@ -183,6 +189,7 @@ impl crate::simulation_ui::SimulationView {
             .and_then(|d| d.thermal.as_ref())
             .map_or(0, |t| t.frames.len().saturating_sub(1));
         self.playing = None;
+        self.mode = 0;
         // The model comes back to set up the study; its results show when asked for.
         self.show_plot = false;
     }
@@ -227,6 +234,7 @@ impl OxydeApp {
                     "select faces, add fixtures, loads and regions to keep, then Run".to_owned(),
                 StudyType::Generative =>
                     "pick the bodies to keep, add fixtures and loads, then Generate".to_owned(),
+                StudyType::Frequency => "select faces, add fixtures, then Run".to_owned(),
             }
         );
     }
@@ -317,7 +325,7 @@ impl OxydeApp {
         }
     }
 
-    /// The panel's top while no study is open: the four types to start one, as Fusion 360's
+    /// The panel's top while no study is open: the types to start one, as Fusion 360's
     /// New Study dialog offers them, and Open for a study saved before.
     pub(crate) fn new_study_chooser(&mut self, ui: &mut egui::Ui) {
         ui.strong("New Study");
@@ -335,6 +343,7 @@ impl OxydeApp {
                     ui.horizontal(|ui| {
                         let icon = match t {
                             StudyType::Static => crate::icons::Icon::Stress,
+                            StudyType::Frequency => crate::icons::Icon::Displacement,
                             StudyType::Thermal => crate::icons::Icon::TemperaturePlot,
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
@@ -504,6 +513,11 @@ mod tests {
         assert_eq!(unique_name("Static", &taken), "Static 2");
         assert_eq!(unique_name("Thermal", &taken), "Thermal 1");
         assert_eq!(type_label(StudyType::TransientThermal), "Transient Thermal");
+        assert_eq!(type_label(StudyType::Frequency), "Frequency");
+        assert_eq!(
+            unique_name(base_name(StudyType::Frequency), &taken),
+            "Frequency 1"
+        );
         assert_eq!(base_name(StudyType::ThermalStress), "Thermal Stress");
         // Names one file name apart are the same study's results.
         let taken = vec!["static 1".to_owned()];

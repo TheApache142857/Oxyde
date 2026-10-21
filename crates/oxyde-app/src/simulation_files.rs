@@ -5,8 +5,9 @@
 //!
 //! A study document names its part or assembly by relative path and document id, and holds
 //! the fixtures, loads, contacts, mesh settings and material overrides (and a topology
-//! study's target and preserved regions) by persistent face name. A results document holds
-//! the mesh and the nodal fields (a topology study's element densities), tied to the study by its
+//! study's target and preserved regions, a frequency study's number of modes) by persistent
+//! face name. A results document holds the mesh and the nodal fields (a frequency study's
+//! mode shapes, a topology study's element densities), tied to the study by its
 //! document id and to the model by a fingerprint (a hash of every part and assembly file's
 //! definition and of the study itself), so results of an earlier model are told apart when
 //! they are opened. After *Run*, the results of a saved study are written next to it.
@@ -15,9 +16,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use oxyde_format::results::{
-    DocumentHash, Elements, Extreme, Fingerprint, NodalFields, ResultBody, ResultFacet, ResultMesh,
-    ResultsFile, SolverInfo, TemperatureFrame, ThermalFields, TopologyFields, TopologyIteration,
-    TopologyJoining,
+    DocumentHash, Elements, Extreme, Fingerprint, FrequencyFields, ModeShape, NodalFields,
+    ResultBody, ResultFacet, ResultMesh, ResultsFile, SolverInfo, TemperatureFrame, ThermalFields,
+    TopologyFields, TopologyIteration, TopologyJoining,
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
@@ -27,8 +28,8 @@ use oxyde_format::simulation::{
 };
 use oxyde_format::{AssemblyFile, PartFile};
 use oxyde_sim::{
-    ContactKind, Facet, Frame, Joining, Results, TetMesh, ThermalResults, TopologyResults,
-    TopologyStep,
+    ContactKind, Facet, Frame, FrequencyResults, Joining, Mode, Results, TetMesh, ThermalResults,
+    TopologyResults, TopologyStep,
 };
 
 use crate::app::OxydeApp;
@@ -212,6 +213,7 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
     });
     out.topology.one_piece = goal.one_piece;
     out.generative = study.generative.clone();
+    out.frequency.modes = study.modes;
     // A generative study's grid and materials are in its block; it has no contacts.
     if study.study_type == StudyType::Generative {
         return out;
@@ -431,6 +433,7 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
     study.transient = file.transient;
     study.reference_temperature = file.reference_temperature;
     study.generative = file.generative.clone();
+    study.modes = file.frequency.modes;
     study.recount();
     study
 }
@@ -485,12 +488,14 @@ pub(crate) fn results_file(
     let extreme = |(value, node): (f64, u32)| Extreme { value, node };
     let iterations = done.results.as_ref().map_or(0, |r| r.iterations)
         + done.thermal.as_ref().map_or(0, |t| t.iterations)
-        + done.topology.as_ref().map_or(0, |t| t.solver_iterations);
+        + done.topology.as_ref().map_or(0, |t| t.solver_iterations)
+        + done.frequency.as_ref().map_or(0, |f| f.iterations);
     let residual = done
         .results
         .as_ref()
         .map(|r| r.residual)
         .or_else(|| done.thermal.as_ref().map(|t| t.residual))
+        .or_else(|| done.frequency.as_ref().map(|f| f.residual))
         .unwrap_or(0.0);
     ResultsFile {
         document_id: oxyde_format::new_document_id(),
@@ -511,6 +516,8 @@ pub(crate) fn results_file(
             mesher: done.mesher.to_owned(),
             method: if done.topology.is_some() {
                 "simp+oc, pcg+amg"
+            } else if done.frequency.is_some() {
+                "lobpcg+amg"
             } else {
                 "pcg+amg"
             }
@@ -546,16 +553,32 @@ pub(crate) fn results_file(
                 })
                 .collect(),
         },
-        fields: match &done.results {
-            Some(results) => NodalFields {
+        fields: match (&done.results, &done.frequency) {
+            (Some(results), _) => NodalFields {
                 displacement: results.displacement.clone(),
                 stress: results.stress.clone(),
                 von_mises: results.von_mises.clone(),
                 yield_strength: results.yield_strength.clone(),
                 contact_pressure: (!results.contact_pressure.is_empty())
                     .then(|| results.contact_pressure.clone()),
+                frequency: None,
             },
-            None => NodalFields::default(),
+            (None, Some(f)) => NodalFields {
+                frequency: Some(FrequencyFields {
+                    mass: f.mass,
+                    modes: f
+                        .modes
+                        .iter()
+                        .map(|m| ModeShape {
+                            frequency: m.frequency,
+                            participation: m.participation,
+                            shape: m.shape.clone(),
+                        })
+                        .collect(),
+                }),
+                ..NodalFields::default()
+            },
+            (None, None) => NodalFields::default(),
         },
         thermal: done.thermal.as_ref().map(|t| ThermalFields {
             temperature: t.temperature.clone(),
@@ -601,6 +624,7 @@ pub(crate) struct LoadedResults {
     pub results: Option<Results>,
     pub thermal: Option<ThermalResults>,
     pub topology: Option<TopologyResults>,
+    pub frequency: Option<FrequencyResults>,
 }
 
 /// The mesh and results a `.oxyres` holds, or why they cannot be used.
@@ -710,11 +734,36 @@ pub(crate) fn mesh_and_results(file: &ResultsFile) -> Result<LoadedResults, Stri
         }),
         None => None,
     };
+    let frequency = match &f.frequency {
+        Some(modes) if modes.modes.iter().any(|m| m.shape.len() != n) => {
+            return Err("its mode shapes do not match its mesh".to_owned());
+        }
+        Some(modes) => Some(FrequencyResults {
+            modes: modes
+                .modes
+                .iter()
+                .map(|m| {
+                    let omega = 2.0 * std::f64::consts::PI * m.frequency;
+                    Mode {
+                        frequency: m.frequency,
+                        eigenvalue: omega * omega,
+                        shape: m.shape.clone(),
+                        participation: m.participation,
+                    }
+                })
+                .collect(),
+            mass: modes.mass,
+            iterations: file.solver.iterations as usize,
+            residual: file.solver.residual,
+        }),
+        None => None,
+    };
     Ok(LoadedResults {
         mesh,
         results,
         thermal,
         topology,
+        frequency,
     })
 }
 
@@ -1095,6 +1144,7 @@ impl OxydeApp {
             loaded.results,
             loaded.thermal,
             loaded.topology,
+            loaded.frequency,
             faces,
             bodies,
             file.fingerprint,
@@ -1259,6 +1309,68 @@ mod tests {
         let loaded = mesh_and_results(&read).unwrap();
         assert!(loaded.results.is_none() && loaded.thermal.is_none());
         assert_eq!(loaded.topology, Some(topology));
+    }
+
+    #[test]
+    fn a_frequency_study_and_its_modes_survive_their_files() {
+        let mut study = Study::of_type(StudyType::Frequency, "Frequency 1");
+        study.add(ItemKind::Fixed, vec![face(2)]);
+        // A load is not written: a frequency study takes none.
+        study.add(ItemKind::Pressure { mpa: 1.0 }, vec![face(3)]);
+        study.gravity = true;
+        study.modes = 7;
+        let file = file_study(&study);
+        assert_eq!((file.fixtures.len(), file.loads.len()), (1, 0));
+        assert_eq!(file.frequency.modes, 7);
+        let back = study_of(&file);
+        assert_eq!(back.modes, 7);
+        assert_eq!(back.items.len(), 1);
+
+        let mut mesh = TetMesh::structured_box([0.0; 3], [2.0, 1.0, 1.0], [2, 1, 1]);
+        for f in &mut mesh.facets {
+            f.label = oxyde_sim::NO_LABEL;
+        }
+        let n = mesh.nodes.len();
+        let mode = |hz: f64, d: usize| {
+            let omega = 2.0 * std::f64::consts::PI * hz;
+            Mode {
+                frequency: hz,
+                eigenvalue: omega * omega,
+                shape: (0..n)
+                    .map(|i| {
+                        let mut u = [0.0; 3];
+                        u[d] = i as f64 / (n - 1) as f64;
+                        u
+                    })
+                    .collect(),
+                participation: [0.0, 0.25, 0.5],
+            }
+        };
+        let frequency = FrequencyResults {
+            modes: vec![mode(120.0, 2), mode(250.0, 1)],
+            mass: 0.125,
+            iterations: 30,
+            residual: 1e-7,
+        };
+        let mut done = Done::for_test(mesh, StudyType::Frequency, None);
+        done.frequency = Some(frequency.clone());
+        let file = results_file(&done, "sim", "Frequency 1", Fingerprint::default());
+        let bytes = oxyde_format::results::write_results(std::io::Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let read = oxyde_format::results::read_results(std::io::Cursor::new(bytes)).unwrap();
+        let loaded = mesh_and_results(&read).unwrap();
+        assert!(loaded.results.is_none() && loaded.topology.is_none());
+        let back = loaded.frequency.unwrap();
+        assert_eq!(back.modes.len(), 2);
+        for (b, m) in back.modes.iter().zip(&frequency.modes) {
+            assert_eq!(
+                (b.frequency, b.participation, &b.shape),
+                (m.frequency, m.participation, &m.shape)
+            );
+            assert!((b.eigenvalue / m.eigenvalue - 1.0).abs() < 1e-12);
+        }
+        assert_eq!((back.mass, back.iterations), (0.125, 30));
     }
 
     #[test]

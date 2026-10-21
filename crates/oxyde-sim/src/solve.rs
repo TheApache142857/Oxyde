@@ -357,11 +357,68 @@ fn element_stiffness(
     }
 }
 
+/// Adds the element's consistent mass between each pair of its nodes, through
+/// `add(a, b, m)` with local node numbers and `m` the scalar mass (the same for each
+/// direction), `mass` being the element's own. The exact integrals of the shape functions'
+/// products: `mass / 20 × (1 + δ)` between the corners of a four-node element; for a ten-node
+/// one, `mass / 420` times 6 on a corner's own diagonal, 1 between two corners, −4 between a
+/// corner and an edge node on an edge through it, −6 with one on another edge, 32 on an
+/// edge node's own diagonal, 16 between the edge nodes of two edges sharing a corner and 8
+/// between those of opposite edges. Each row sums to the share of the weight
+/// [`load_vector`] gives the node.
+fn element_mass(quadratic: bool, mass: f64, mut add: impl FnMut(usize, usize, f64)) {
+    if !quadratic {
+        for a in 0..4 {
+            for b in 0..4 {
+                add(a, b, mass / 20.0 * if a == b { 2.0 } else { 1.0 });
+            }
+        }
+        return;
+    }
+    // Corners 0 to 3, then the edge nodes in `EDGES` order.
+    for a in 0..10 {
+        for b in 0..10 {
+            let weight = match (a < 4, b < 4) {
+                (true, true) => {
+                    if a == b {
+                        6.0
+                    } else {
+                        1.0
+                    }
+                }
+                (true, false) | (false, true) => {
+                    let (corner, (i, j)) = if a < 4 {
+                        (a, EDGES[b - 4])
+                    } else {
+                        (b, EDGES[a - 4])
+                    };
+                    if corner == i || corner == j {
+                        -4.0
+                    } else {
+                        -6.0
+                    }
+                }
+                (false, false) => {
+                    let ((i, j), (k, l)) = (EDGES[a - 4], EDGES[b - 4]);
+                    if a == b {
+                        32.0
+                    } else if i == k || i == l || j == k || j == l {
+                        16.0
+                    } else {
+                        8.0
+                    }
+                }
+            };
+            add(a, b, mass * weight / 420.0);
+        }
+    }
+}
+
 // ---- The matrix ---------------------------------------------------------------------------
 
 /// A symmetric matrix in 3 × 3 blocks, row by row.
 #[derive(Clone)]
-struct BlockMatrix {
+pub(crate) struct BlockMatrix {
     row_start: Vec<usize>,
     columns: Vec<u32>,
     blocks: Vec<M3>,
@@ -1002,6 +1059,21 @@ impl Prepared {
         problem: &Problem,
         preconditioner: Preconditioner,
     ) -> Result<Prepared, SolveError> {
+        Self::prepare(problem, preconditioner, true)
+    }
+
+    /// As [`Prepared::new`] for a problem that takes no loads, a frequency study's
+    /// ([`crate::modal`]): the mesh, the materials and the fixtures checked, multigrid's
+    /// rigid motions ready.
+    pub(crate) fn unloaded(problem: &Problem) -> Result<Prepared, SolveError> {
+        Self::prepare(problem, Preconditioner::Multigrid, false)
+    }
+
+    fn prepare(
+        problem: &Problem,
+        preconditioner: Preconditioner,
+        loaded: bool,
+    ) -> Result<Prepared, SolveError> {
         let Problem {
             mesh,
             materials,
@@ -1037,7 +1109,7 @@ impl Prepared {
             add_thermal_load(mesh, materials, strain, &mut force);
         }
         let load_size = force.iter().map(|f| dot(*f, *f)).sum::<f64>().sqrt();
-        if !(load_size > 0.0 && load_size.is_finite()) {
+        if loaded && !(load_size > 0.0 && load_size.is_finite()) {
             return Err(SolveError::NoLoads);
         }
         let geometries = (0..mesh.tets.len())
@@ -1062,39 +1134,65 @@ impl Prepared {
         })
     }
 
-    /// The displacements, with element `e`'s stiffness multiplied by `scale[e]` (by 1
-    /// without `scale`), starting from `start` (global directions) when it is given: the
-    /// last solve's displacements make a close start for the next of a series.
-    pub(crate) fn solve(
-        &self,
-        problem: &Problem,
-        scale: Option<&[f64]>,
-        start: Option<&[V3]>,
-        cancel: &AtomicBool,
-        progress: &dyn Fn(f64),
-    ) -> Result<Solved, SolveError> {
+    /// The stiffness matrix, element `e`'s multiplied by `scale[e]` (by 1 without `scale`),
+    /// in the nodes' frames, the held directions' rows and columns out (1 on their
+    /// diagonal). Contacts' ties are not in it.
+    pub(crate) fn stiffness(&self, problem: &Problem, scale: Option<&[f64]>) -> BlockMatrix {
         let Problem {
-            mesh,
-            materials,
-            study,
-            options,
-            ..
+            mesh, materials, ..
         } = *problem;
-        if scale.is_some_and(|s| {
-            s.len() != mesh.tets.len() || s.iter().any(|k| !(k.is_finite() && *k > 0.0))
-        }) {
-            return Err(SolveError::Invalid(
-                "its elements' stiffness factors do not match its elements".to_owned(),
-            ));
-        }
         let quadratic = self.quadratic;
-        let n = mesh.nodes.len();
-        let constraints = &self.constraints;
-        let ties = &self.pairing.ties;
-        let threads = self.threads;
-        let ranges = &self.ranges;
+        let geometries = &self.geometries;
+        self.assemble(
+            mesh,
+            &|e, sink| {
+                let material = &materials[mesh.bodies[e] as usize];
+                let k = scale.map_or(1.0, |s| s[e]);
+                element_stiffness(&geometries[e], quadratic, material, |a, b, block| {
+                    sink(a, b, &block.map(|v| k * v));
+                });
+            },
+            1.0,
+        )
+    }
 
-        // ---- The matrix, row ranges on threads.
+    /// The consistent mass matrix, tonnes (millimetres and newtons make the tonne the unit
+    /// of mass: densities in kg/m³ times 10⁻¹²), in the nodes' frames, the held directions
+    /// without mass (0 on their diagonal too), so a frequency study never finds their modes.
+    pub(crate) fn mass(&self, problem: &Problem) -> BlockMatrix {
+        let Problem {
+            mesh, materials, ..
+        } = *problem;
+        let quadratic = self.quadratic;
+        let geometries = &self.geometries;
+        self.assemble(
+            mesh,
+            &|e, sink| {
+                let density = materials
+                    .get(mesh.bodies[e] as usize)
+                    .map_or(0.0, |m| m.density);
+                let mass = density * 1e-12 * geometries[e].volume;
+                element_mass(quadratic, mass, |a, b, m| {
+                    sink(a, b, &[m, 0.0, 0.0, 0.0, m, 0.0, 0.0, 0.0, m]);
+                });
+            },
+            0.0,
+        )
+    }
+
+    /// A matrix of the pattern's shape: every element's blocks from `element` (called with
+    /// the element and a sink taking two of its nodes, as local numbers, and their 3 × 3
+    /// block in global directions), assembled on threads by ranges of rows, then turned
+    /// into each node's frame with the held directions out: their rows and columns zero,
+    /// `held_diagonal` on the diagonal.
+    fn assemble(
+        &self,
+        mesh: &TetMesh,
+        element: &(dyn Fn(usize, &mut dyn FnMut(usize, usize, &M3)) + Sync),
+        held_diagonal: f64,
+    ) -> BlockMatrix {
+        let constraints = &self.constraints;
+        let ranges = &self.ranges;
         let mut matrix = self.pattern.clone();
         {
             let BlockMatrix {
@@ -1103,7 +1201,6 @@ impl Prepared {
                 blocks,
             } = &mut matrix;
             let (row_start, columns) = (&*row_start, &*columns);
-            let geometries = &self.geometries;
             std::thread::scope(|s| {
                 let mut rest: &mut [M3] = blocks;
                 let mut taken = 0usize;
@@ -1120,26 +1217,19 @@ impl Prepared {
                             if !nodes.iter().any(|&i| (r0..r1).contains(&(i as usize))) {
                                 continue;
                             }
-                            let material = &materials[mesh.bodies[e] as usize];
-                            let k = scale.map_or(1.0, |s| s[e]);
-                            element_stiffness(
-                                &geometries[e],
-                                quadratic,
-                                material,
-                                |a, b, block| {
-                                    let (row, col) = (nodes[a] as usize, nodes[b]);
-                                    if !(r0..r1).contains(&row) {
-                                        return;
+                            element(e, &mut |a, b, block| {
+                                let (row, col) = (nodes[a] as usize, nodes[b]);
+                                if !(r0..r1).contains(&row) {
+                                    return;
+                                }
+                                let span = row_start[row]..row_start[row + 1];
+                                if let Ok(j) = columns[span.clone()].binary_search(&col) {
+                                    let slot = &mut mine[span.start + j - b0];
+                                    for (s, v) in slot.iter_mut().zip(block) {
+                                        *s += v;
                                     }
-                                    let span = row_start[row]..row_start[row + 1];
-                                    if let Ok(j) = columns[span.clone()].binary_search(&col) {
-                                        let slot = &mut mine[span.start + j - b0];
-                                        for (s, v) in slot.iter_mut().zip(block) {
-                                            *s += k * v;
-                                        }
-                                    }
-                                },
-                            );
+                                }
+                            });
                         }
                         // Into each node's frame, and the held directions out.
                         for row in r0..r1 {
@@ -1157,8 +1247,11 @@ impl Prepared {
                                     for i in 0..3 {
                                         for j in 0..3 {
                                             if hr & (1 << i) != 0 || hc & (1 << j) != 0 {
-                                                block[i * 3 + j] =
-                                                    if row == col && i == j { 1.0 } else { 0.0 };
+                                                block[i * 3 + j] = if row == col && i == j {
+                                                    held_diagonal
+                                                } else {
+                                                    0.0
+                                                };
                                             }
                                         }
                                     }
@@ -1169,6 +1262,90 @@ impl Prepared {
                 }
             });
         }
+        matrix
+    }
+
+    /// `matrix`'s contacts' ties added as a static solve starts them, all closed: the
+    /// stiffness a frequency study vibrates with.
+    pub(crate) fn add_closed_ties(&self, matrix: &mut BlockMatrix) {
+        let ties = &self.pairing.ties;
+        let multipliers = Multipliers::new(ties);
+        for (tie, _) in ties.iter().zip(&multipliers.active).filter(|(_, on)| **on) {
+            matrix.add_tie(&self.constraints, tie, 1.0);
+        }
+    }
+
+    /// `y = matrix x`, three values per node in the nodes' frames, on the solve's threads.
+    pub(crate) fn multiply(&self, matrix: &BlockMatrix, x: &[f64], y: &mut [f64]) {
+        multiply(
+            matrix,
+            &self.ranges,
+            x.as_chunks::<3>().0,
+            y.as_chunks_mut::<3>().0,
+        );
+    }
+
+    /// `v` (three values per node, in the nodes' frames) with its held directions zeroed.
+    pub(crate) fn project_held(&self, v: &mut [f64]) {
+        for (i, x) in v.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let held = self.constraints.held.get(i).copied().unwrap_or(0);
+            for (k, c) in x.iter_mut().enumerate() {
+                if held & (1 << k) != 0 {
+                    *c = 0.0;
+                }
+            }
+        }
+    }
+
+    /// Displacements in the nodes' frames (three values per node) in global directions.
+    pub(crate) fn global(&self, x: &[f64]) -> Vec<V3> {
+        out_of_frames(&self.constraints, x.as_chunks::<3>().0)
+    }
+
+    /// A preconditioner for `matrix`, `z ≈ matrix⁻¹ r`: one multigrid cycle on the rigid
+    /// motions, or block-Jacobi when the hierarchy cannot be built.
+    pub(crate) fn cycle<'a>(&self, matrix: &'a BlockMatrix) -> Cycle<'a> {
+        let multigrid = self.modes.as_deref().and_then(|modes| {
+            Multigrid::new(matrix.view(), modes, crate::amg::RIGID_MODES, self.threads).ok()
+        });
+        let jacobi = match multigrid {
+            Some(_) => Vec::new(),
+            None => diagonal_inverses(matrix),
+        };
+        Cycle { multigrid, jacobi }
+    }
+
+    /// The displacements, with element `e`'s stiffness multiplied by `scale[e]` (by 1
+    /// without `scale`), starting from `start` (global directions) when it is given: the
+    /// last solve's displacements make a close start for the next of a series.
+    pub(crate) fn solve(
+        &self,
+        problem: &Problem,
+        scale: Option<&[f64]>,
+        start: Option<&[V3]>,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(f64),
+    ) -> Result<Solved, SolveError> {
+        let Problem {
+            mesh,
+            study,
+            options,
+            ..
+        } = *problem;
+        if scale.is_some_and(|s| {
+            s.len() != mesh.tets.len() || s.iter().any(|k| !(k.is_finite() && *k > 0.0))
+        }) {
+            return Err(SolveError::Invalid(
+                "its elements' stiffness factors do not match its elements".to_owned(),
+            ));
+        }
+        let n = mesh.nodes.len();
+        let constraints = &self.constraints;
+        let ties = &self.pairing.ties;
+        let threads = self.threads;
+        let ranges = &self.ranges;
+
+        let mut matrix = self.stiffness(problem, scale);
         // The contacts' penalties, for the ties that start closed (all of them).
         let mut multipliers = Multipliers::new(ties);
         let mut in_matrix = multipliers.active.clone();
@@ -1542,17 +1719,7 @@ impl<'a> Linear<'a> {
             }
         }
         let matrix = self.matrix;
-        let jacobi = self.jacobi.get_or_insert_with(|| {
-            (0..matrix.rows())
-                .map(|row| {
-                    let span = matrix.row_start[row]..matrix.row_start[row + 1];
-                    match matrix.columns[span.clone()].binary_search(&(row as u32)) {
-                        Ok(k) => inverse(&matrix.blocks[span.start + k]).unwrap_or(IDENTITY),
-                        Err(_) => IDENTITY,
-                    }
-                })
-                .collect()
-        });
+        let jacobi = self.jacobi.get_or_insert_with(|| diagonal_inverses(matrix));
         let mut precondition = |r: &[V3], z: &mut [V3]| {
             for ((z, r), d) in z.iter_mut().zip(r).zip(jacobi.iter()) {
                 *z = mat_vec(d, *r);
@@ -1573,6 +1740,46 @@ impl<'a> Linear<'a> {
                     residual,
                 });
                 (spent + iterations, residual)
+            }
+        }
+    }
+}
+
+/// The inverse of each row's diagonal block, the identity where it has none or it is
+/// singular: block-Jacobi's preconditioner.
+fn diagonal_inverses(matrix: &BlockMatrix) -> Vec<M3> {
+    (0..matrix.rows())
+        .map(|row| {
+            let span = matrix.row_start[row]..matrix.row_start[row + 1];
+            match matrix.columns[span.clone()].binary_search(&(row as u32)) {
+                Ok(k) => inverse(&matrix.blocks[span.start + k]).unwrap_or(IDENTITY),
+                Err(_) => IDENTITY,
+            }
+        })
+        .collect()
+}
+
+/// `z ≈ A⁻¹ r` for a matrix of a solve ([`Prepared::cycle`]): one multigrid cycle, or
+/// block-Jacobi where the hierarchy could not be built.
+pub(crate) struct Cycle<'a> {
+    multigrid: Option<Multigrid<'a>>,
+    jacobi: Vec<M3>,
+}
+
+impl Cycle<'_> {
+    /// `z ≈ A⁻¹ r`, three values per node in the nodes' frames.
+    pub(crate) fn apply(&mut self, r: &[f64], z: &mut [f64]) {
+        match &mut self.multigrid {
+            Some(multigrid) => multigrid.apply(r, z),
+            None => {
+                let rows = z
+                    .as_chunks_mut::<3>()
+                    .0
+                    .iter_mut()
+                    .zip(r.as_chunks::<3>().0);
+                for ((z, r), d) in rows.zip(&self.jacobi) {
+                    *z = mat_vec(d, *r);
+                }
             }
         }
     }

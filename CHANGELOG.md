@@ -5,6 +5,24 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Frequency studies (October 2026)
+
+- **Frequency studies in the Simulation tab.** *New Study › Frequency*, as in SolidWorks:
+  hold the model with fixtures (and tie its bodies with contacts), say how many modes to
+  find (5 by default, up to 50) and *Run* finds its lowest natural frequencies and the shape
+  it vibrates in at each. The panel lists every mode with its frequency in hertz and the
+  share of the model's mass it moves along X, Y and Z, with their totals; clicking a mode
+  draws its shape on the model, coloured by how far each point moves, under a legend such
+  as *Mode 2: 143.2 Hz*. Frequency studies take no loads, and every body needs a density
+  (the panel warns where one is missing). The modes are saved with the study and come
+  back when it opens.
+- **Files:** the `.oxysim` holds frequency studies (`type` `frequency`, with a `frequency`
+  block holding the number of modes, FORMAT.md §8) and the `.oxyres` their results: each
+  mode's frequency and mass participation, the model's mass, and the mode shapes in
+  `fields/mode_shapes.bin` (FORMAT.md §9). A document holding one is written as
+  `format_version` 4, as one holding a generative study is; builds of Oxyde from before
+  frequency studies refuse it, and the other documents are written as before.
+
 ### Generative design, under way (October 2026)
 
 - **A Generative Design tab in place of the Topology tab.** As in Fusion 360: give the part's

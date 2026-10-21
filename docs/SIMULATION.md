@@ -358,7 +358,8 @@ is still open:
   for curved parts. A Netgen cantilever is tested against beam theory
   (`oxyde-tests/tests/simulation.rs`).
 
-Still to do, in the order of §3: probing, a report, mesh controls, frequency and buckling studies.
+Still to do, in the order of §3: probing, a report, mesh controls, buckling studies
+(frequency studies are built, §10).
 
 ## 7. Studies and thermal studies
 
@@ -1203,3 +1204,102 @@ and Gasso; "always validate", Schnitger, Cadalyst 2018).
   within a factor of three of the outcome's (still a little grey after 30 iterations).
 - **Not yet:** the check's stresses drawn on the part in Explore, and the check rerun on a
   part edited after it was made (a static study of the part in the Simulation tab does it).
+
+## 10. Frequency studies
+
+**Decided (October 2026, the owner):** a frequency study in the Simulation tab, as SolidWorks
+has its frequency study and Fusion 360 its modal frequencies study: the lowest natural
+frequencies of the model held by its fixtures, and the shape it vibrates in at each. It is a
+study type, `frequency`, offered by *New Study* after *Static Stress*, saved in the `.oxysim`
+with its number of modes and its modes in the `.oxyres` (FORMAT.md §8–§9, `format_version`
+4). The eigensolver is written to be shared: generative design's frequency limit finds its
+grid's modes with it.
+
+**What the user sets up**, as in SolidWorks:
+
+- **Fixtures** (*Fixed Geometry*, *Roller/Slider*) on faces, as in a static study, and
+  **contacts** between bodies, found by *Run* or made by hand. No loads: a linear study's
+  frequencies do not depend on them (SolidWorks uses loads only to stiffen the model by
+  their in-plane stresses, which is not done here). A model, or a piece of it, held nowhere
+  is refused, as in a static study. SolidWorks finds such a model's rigid motions as modes
+  near 0 Hz; here the preconditioner, multigrid on the stiffness, needs
+  a stiffness that holds the model, so free models wait for a shift (`K + σM`).
+- **Options:** the number of modes, the lowest first, 1 to 50 (5, SolidWorks' default).
+- **Mesh and materials** as in a static study. Every body needs a density, which only an
+  applied material gives (as for gravity in a static study); *Run* names a body without one,
+  and the panel's material rows warn of it.
+
+*Run* meshes the model as for any study and solves on the study's thread, with progress and
+*Cancel*. The panel lists each mode's number, its frequency in hertz and its mass
+participation along X, Y and Z (a percentage of the model's mass), with their totals, as
+SolidWorks' *List Resonant Frequencies* and *Mass Participation* do; picking a mode plots its
+shape (*Mode Shape*): the boundary displaced by the mode and coloured by the length of its
+displacement, under the legend `Mode 2: 143.2 Hz`. A mode's size is arbitrary (its largest
+displacement is 1), so the *Automatic* deformation scale draws that largest displacement at a
+twentieth of the model's diagonal, and *True scale* at 1 mm.
+
+**How it works** (`oxyde_sim::modal` and `oxyde_sim::eigen`, pure Rust, no new dependency):
+
+- **The problem** is `K φ = ω² M φ`, each frequency `f = ω / 2π`. `K` is the static study's
+  stiffness, made by the same code (`solve::Prepared::stiffness`, taken out of the static
+  solve, which is unchanged): the same elements, fixtures in the nodes' frames, a held
+  direction an identity row. Contacts add their ties as a static solve starts them, all
+  closed (`Prepared::add_closed_ties`): a separation, sliding or rough contact holds as it
+  does at rest, since one that opened would make the problem nonlinear.
+- **The mass is consistent:** the exact integrals of the elements' shape functions' products
+  (`solve::element_mass`), `ρV/20 (1 + δ)` between the corners of a four-node element and
+  `ρV/420` times 6, 1, −4, −6, 32, 16 and 8 between the nodes of a ten-node one. A lumped mass
+  is no option on ten-node elements, whose corners' shares of the weight are negative (−1/20
+  each, 1/5 for each edge node, as the gravity load has them), and with a consistent mass the
+  frequencies come from above as the mesh is refined, as stiffnesses do. Held directions
+  have no mass and every vector is kept out of them (`Prepared::project_held`), so their
+  modes never show. Millimetres and newtons make the tonne the unit of mass (`ρ` in kg/m³
+  times 10⁻¹²), and `ω²` comes out in s⁻².
+- **The eigensolver** (`eigen.rs`) is LOBPCG (Knyazev, 2001): a block of approximate modes,
+  their preconditioned residuals and the last step's directions, made M-orthonormal
+  together by modified Gram–Schmidt run twice, a vector that depends on the others dropped
+  (the basis selection of Hetmaniuk and Lehoucq, 2006: the Cholesky factorization of the
+  block's Gram matrix, the textbook way, fails as the modes converge), then the small
+  eigenproblem on that basis solved by cyclic Jacobi rotations. The block holds a few guard
+  modes beyond those asked for (a quarter as many, 2 to 8), which speed the last ones up. A
+  mode is converged when `‖K φ − ω² M φ‖` is under 10⁻⁶ of `‖K φ‖ + ω² ‖M φ‖`, its frequency
+  then exact to far better than a millionth; it is no longer expanded (soft locking) but
+  stays in the Rayleigh–Ritz. The preconditioner is the static solve's multigrid on `K`
+  (`Prepared::cycle`, block-Jacobi when the hierarchy cannot be built): an approximation of
+  `K⁻¹`, which brings the lowest modes out first. An iteration costs a product by `K` and one
+  by `M` and a multigrid cycle per mode not yet converged. The operators are closures on
+  flat vectors, so generative design's matrix-free bricks can be handed in as a mesh's
+  assembled matrices are. Deterministic: a fixed pseudo-random start and every sum in a
+  fixed order, so a run repeats exactly.
+- **Why LOBPCG.** Lanczos with a shift and invert, what most commercial solvers use, needs a
+  direct factorization of `K`, which Oxyde does not have (faer, §5.4, is still an open
+  question); subspace iteration converges more slowly for the same work. LOBPCG needs only
+  products and a preconditioner, and the multigrid that solves a static study in a couple
+  of dozen iterations is already there.
+- **The results:** each mode's frequency; its shape, scaled so that the largest
+  displacement is 1, since only the shape means anything; and its effective mass along each
+  axis as a share of the model's mass, `(φᵀ M r)²` for `φ` with `φᵀ M φ = 1`, `r` every node
+  moving one along the axis, the supports included, as a shaking base moves them. `M r` is
+  each node's share of the weight, the rows of the consistent mass summed, so it comes from
+  the elements' masses with no product.
+
+**Tests:**
+
+- **The eigensolver** (`eigen.rs`): cyclic Jacobi diagonalises a symmetric matrix; a
+  diagonal pencil's five smallest values; a string of 60 nodes held at both ends, with an
+  identity mass (`2 − 2 cos θ`) and a consistent one (`6 (1 − cos θ) / (2 + cos θ)`), to
+  10⁻⁸; an eigenvalue repeated three times found three times, a held unknown never moving;
+  a warm start from a stiffer problem's modes converging in fewer iterations, and a run
+  repeating exactly; a cancelled solve saying so.
+- **Frequency studies** (`modal.rs`): a 200 × 20 × 10 mm steel cantilever of ten-node
+  elements, its first two modes bending across the thin and the wide side within 4 % of
+  Euler–Bernoulli (203.9 and 407.7 Hz), each shape's largest displacement 1, the first
+  moving its tip along Z with about 61 % of the mass, the model's mass exact and a second
+  run the same; four-node elements' modes orthogonal through the mass; a massless body, a
+  free model and a cancelled solve refused.
+- **Files and the app:** the `frequency` study and its block round trip, a frequency study
+  with loads or with 0 or 51 modes refused, the block in another type refused, five modes
+  when it is absent (`oxyde-format`); the results' modes round trip, frequencies that go
+  down, shapes of the wrong length, no modes, modes in another type's results and modes
+  numbered out of order refused; through the app's files, a frequency study and its modes
+  back from their `.oxysim` and `.oxyres`.

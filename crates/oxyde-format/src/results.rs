@@ -1,7 +1,7 @@
 //! Simulation results (`.oxyres`): the mesh a study was solved on and the fields computed
-//! at its nodes (displacements and stresses, temperatures and heat flux) or, for a topology
-//! study, its elements' densities; for a generative study, a grid of voxels and the
-//! densities of each outcome on it. They are kept apart from the study (`.oxysim`) so
+//! at its nodes (displacements and stresses, temperatures and heat flux, a frequency study's
+//! mode shapes) or, for a topology study, its elements' densities; for a generative study,
+//! a grid of voxels and the densities of each outcome on it. They are kept apart from the study (`.oxysim`) so
 //! studies stay small and diff cleanly while results can be thrown away and computed again.
 //!
 //! `results.json` says which study the results belong to, a fingerprint of the model they
@@ -51,6 +51,7 @@ const TEMPERATURE: &str = "fields/temperature.bin";
 const HEAT_FLUX: &str = "fields/heat_flux.bin";
 const TEMPERATURE_HISTORY: &str = "fields/temperature_history.bin";
 const DENSITY: &str = "fields/density.bin";
+const MODE_SHAPES: &str = "fields/mode_shapes.bin";
 const VOXELS: &str = "grid/voxels.bin";
 /// Under `outcomes/<id>/`.
 const OUTCOME_DENSITY: &str = "density.bin";
@@ -315,6 +316,28 @@ pub struct NodalFields {
     pub yield_strength: Vec<f64>,
     /// MPa, normal pressure between bodies in contact; absent without contacts.
     pub contact_pressure: Option<Vec<f64>>,
+    /// A frequency study's modes: their frequencies and their shapes at the nodes.
+    pub frequency: Option<FrequencyFields>,
+}
+
+/// A frequency study's results: its modes, the lowest first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FrequencyFields {
+    /// kg: the model's mass, which the participation is a share of.
+    pub mass: f64,
+    pub modes: Vec<ModeShape>,
+}
+
+/// A natural mode of vibration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModeShape {
+    /// Hz.
+    pub frequency: f64,
+    /// The mode's effective mass along X, Y and Z, as a share of the model's mass.
+    pub participation: [f64; 3],
+    /// Each node's displacement in the mode, the largest of length 1: a mode's size is
+    /// arbitrary, only its shape means anything.
+    pub shape: Vec<[f64; 3]>,
 }
 
 /// The temperatures and heat flux at the mesh's nodes.
@@ -599,6 +622,15 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             f64s(p.iter()),
         ));
     }
+    if let Some(f) = &fields.frequency {
+        entries.push(entry(
+            MODE_SHAPES,
+            Dtype::F64,
+            3 * mesh.nodes.len() as u32,
+            f.modes.len(),
+            f64s(f.modes.iter().flat_map(|m| m.shape.iter().flatten())),
+        ));
+    }
     if let Some(t) = &file.topology {
         entries.push(entry(
             DENSITY,
@@ -672,6 +704,19 @@ pub fn write_results<W: Write + Seek>(writer: W, file: &ResultsFile) -> Result<W
             joining: t.joining,
         }),
         generative: file.generative.as_ref().map(generative_dto),
+        frequency: fields.frequency.as_ref().map(|f| FrequencyDto {
+            mass: f.mass,
+            modes: f
+                .modes
+                .iter()
+                .enumerate()
+                .map(|(k, m)| ModeDto {
+                    mode: k as u32 + 1,
+                    frequency: m.frequency,
+                    participation: m.participation,
+                })
+                .collect(),
+        }),
     };
 
     let manifest = manifest_version(DocumentKind::SimulationResults, &file.document_id, version);
@@ -966,6 +1011,46 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
     } else {
         None
     };
+    let frequency = if study_type == StudyType::Frequency {
+        let f = dto.frequency.as_ref().ok_or_else(|| {
+            invalid("a frequency study's results have no frequency block".to_owned())
+        })?;
+        let width = 3 * mesh.nodes.len() as u32;
+        let values = read_f64s(
+            &array(MODE_SHAPES, Dtype::F64, &[width])?
+                .ok_or_else(|| missing(MODE_SHAPES))?
+                .0,
+        );
+        let records: Vec<&[f64]> = values.chunks(width.max(1) as usize).collect();
+        if records.len() != f.modes.len() {
+            return Err(invalid(format!(
+                "{} mode shapes for {} modes",
+                records.len(),
+                f.modes.len()
+            )));
+        }
+        let mut modes = Vec::with_capacity(f.modes.len());
+        for (k, (m, shape)) in f.modes.iter().zip(records).enumerate() {
+            if m.mode as usize != k + 1 {
+                return Err(invalid(format!(
+                    "mode {} is where mode {} should be: the modes are not numbered in order",
+                    m.mode,
+                    k + 1
+                )));
+            }
+            modes.push(ModeShape {
+                frequency: m.frequency,
+                participation: m.participation,
+                shape: fixed(shape),
+            });
+        }
+        Some(FrequencyFields {
+            mass: f.mass,
+            modes,
+        })
+    } else {
+        None
+    };
     let topology = if study_type == StudyType::Topology {
         let density = read_f64s(
             &array(DENSITY, Dtype::F64, &[1])?
@@ -1197,6 +1282,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             von_mises,
             yield_strength,
             contact_pressure,
+            frequency,
         },
         thermal,
         topology,
@@ -1284,6 +1370,37 @@ fn validate(file: &ResultsFile) -> Result<(), String> {
         (None, false) => {}
         (Some(_), false) => return Err("static results have temperatures".to_owned()),
         (None, true) => return Err("thermal results have no temperatures".to_owned()),
+    }
+    match (&fields.frequency, file.study_type == StudyType::Frequency) {
+        (Some(f), true) => {
+            if f.modes.is_empty() {
+                return Err("a frequency study's results have no mode".to_owned());
+            }
+            if !(f.mass.is_finite() && f.mass >= 0.0) {
+                return Err("the model's mass is not a finite number".to_owned());
+            }
+            let mut last = 0.0;
+            for (k, m) in f.modes.iter().enumerate() {
+                if m.shape.len() != nodes {
+                    return Err(format!(
+                        "mode {} has {} displacements for {nodes} nodes",
+                        k + 1,
+                        m.shape.len()
+                    ));
+                }
+                if !(m.frequency.is_finite() && m.frequency >= last) {
+                    return Err("the modes' frequencies do not go up".to_owned());
+                }
+                last = m.frequency;
+                let numbers = m.participation.iter().chain(m.shape.iter().flatten());
+                if numbers.into_iter().any(|v| !v.is_finite()) {
+                    return Err(format!("mode {} has a number that is not finite", k + 1));
+                }
+            }
+        }
+        (None, false) => {}
+        (Some(_), false) => return Err("these results have modes".to_owned()),
+        (None, true) => return Err("frequency results have no modes".to_owned()),
     }
     match (&file.topology, file.study_type == StudyType::Topology) {
         (Some(t), true) => {
@@ -1506,6 +1623,26 @@ struct ResultsDto {
     /// A generative study's grid and outcomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generative: Option<GenerativeDto>,
+    /// A frequency study's modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frequency: Option<FrequencyDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FrequencyDto {
+    /// kg.
+    mass: f64,
+    modes: Vec<ModeDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct ModeDto {
+    /// From 1, in order.
+    mode: u32,
+    /// Hz.
+    frequency: f64,
+    /// Shares of the model's mass, along X, Y and Z.
+    participation: [f64; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1867,6 +2004,7 @@ mod tests {
                 von_mises: (0..n).map(|i| 10.0 * i as f64).collect(),
                 yield_strength: vec![275.0; n],
                 contact_pressure: Some(vec![0.0, 0.5, 0.5, 0.5, 0.0]),
+                frequency: None,
             },
             thermal: None,
             topology: None,
@@ -1980,6 +2118,106 @@ mod tests {
         let mut stressed = sample();
         stressed.topology = topology_sample().topology;
         refused(stressed, "have densities");
+    }
+
+    /// The sample as a frequency study's results: two modes, no stresses.
+    fn frequency_sample() -> ResultsFile {
+        let mut file = sample();
+        file.study = "Frequency 1".to_owned();
+        file.study_type = StudyType::Frequency;
+        file.summary = Summary::default();
+        let n = file.mesh.nodes.len();
+        let shape = |k: f64| (0..n).map(|i| [0.0, k * i as f64 / 4.0, 0.0]).collect();
+        file.fields = NodalFields {
+            frequency: Some(FrequencyFields {
+                mass: 0.75,
+                modes: vec![
+                    ModeShape {
+                        frequency: 203.5,
+                        participation: [0.0, 0.0, 0.61],
+                        shape: shape(1.0),
+                    },
+                    ModeShape {
+                        frequency: 407.25,
+                        participation: [0.0, 0.6, 0.0],
+                        shape: shape(-1.0),
+                    },
+                ],
+            }),
+            ..NodalFields::default()
+        };
+        file
+    }
+
+    #[test]
+    fn frequency_results_round_trip() {
+        let file = frequency_sample();
+        let written = bytes(&file);
+        assert_eq!(read_results(Cursor::new(&written)).unwrap(), file);
+        let mut archive = ZipArchive::new(Cursor::new(&written)).unwrap();
+        let names: Vec<String> = archive.file_names().map(str::to_owned).collect();
+        assert!(names.iter().all(|n| n != STRESS && n != DISPLACEMENT));
+        assert!(names.iter().any(|n| n == MODE_SHAPES) && names.iter().any(|n| n == NODES));
+        let json: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, RESULTS).unwrap()).unwrap();
+        assert_eq!(json["type"], "frequency");
+        assert_eq!(json["frequency"]["mass"], 0.75);
+        assert_eq!(json["frequency"]["modes"][1]["mode"], 2);
+        assert_eq!(json["frequency"]["modes"][1]["frequency"], 407.25);
+        assert_eq!(
+            json["frequency"]["modes"][0]["participation"],
+            serde_json::json!([0.0, 0.0, 0.61])
+        );
+        let shapes = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == MODE_SHAPES)
+            .unwrap();
+        assert_eq!(
+            (&shapes["count"], &shapes["components"]),
+            (&2.into(), &15.into())
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 4);
+    }
+
+    #[test]
+    fn inconsistent_frequency_results_are_not_written() {
+        let refused =
+            |file: ResultsFile, why: &str| match write_results(Cursor::new(Vec::new()), &file) {
+                Err(FormatError::InvalidResults(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected invalid results ({why}), got {other:?}"),
+            };
+        let mut down = frequency_sample();
+        down.fields.frequency.as_mut().unwrap().modes.swap(0, 1);
+        refused(down, "do not go up");
+        let mut short = frequency_sample();
+        short.fields.frequency.as_mut().unwrap().modes[1]
+            .shape
+            .pop();
+        refused(short, "4 displacements for 5 nodes");
+        let mut none = frequency_sample();
+        none.fields.frequency.as_mut().unwrap().modes.clear();
+        refused(none, "no mode");
+        let mut missing = frequency_sample();
+        missing.fields.frequency = None;
+        refused(missing, "no modes");
+        let mut stressed = sample();
+        stressed.fields.frequency = frequency_sample().fields.frequency;
+        refused(stressed, "have modes");
+        // Read back, the modes must be numbered in order.
+        let written = bytes(&frequency_sample());
+        let renumbered = edited(
+            &written,
+            RESULTS,
+            text_edit(|s| s.replacen("\"mode\": 2", "\"mode\": 3", 1)),
+        );
+        assert!(matches!(
+            read_results(Cursor::new(renumbered)),
+            Err(FormatError::InvalidResults(e)) if e.contains("not numbered in order")
+        ));
     }
 
     /// A generative study's results on a grid of 3 × 2 × 1 voxels: an outcome with two

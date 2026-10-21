@@ -1,9 +1,10 @@
 //! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it (forces
 //! and pressures, or heat), how its bodies touch, how it is meshed and which mechanical and
 //! thermal properties the study uses instead of the materials' own. A document holds any
-//! number of studies of six types: static, thermal, transient thermal, thermal stress,
-//! topology (the lightest shape that carries a static study's loads) and generative design
-//! (shapes grown between bodies to keep, for several materials and ways of making them).
+//! number of studies of seven types: static, frequency (the natural frequencies and mode
+//! shapes), thermal, transient thermal, thermal stress, topology (the lightest shape that
+//! carries a static study's loads) and generative design (shapes grown between bodies to
+//! keep, for several materials and ways of making them).
 //!
 //! A study document refers to the model it studies (a part or an assembly file, by relative
 //! path and document id) and to its faces by persistent name, never by index, so a study
@@ -125,6 +126,9 @@ pub enum StudyType {
     /// for several materials and ways of making them ([`Study::generative`]). Only a part
     /// has them.
     Generative,
+    /// The lowest natural frequencies and mode shapes of the model held by its fixtures
+    /// ([`Study::frequency`]): fixtures and contacts, no loads.
+    Frequency,
 }
 
 impl StudyType {
@@ -137,6 +141,12 @@ impl StudyType {
                 | StudyType::Topology
                 | StudyType::Generative
         )
+    }
+
+    /// Whether it takes fixtures and the materials' elastic properties: the structural
+    /// types, and frequency studies, which take no loads.
+    pub fn takes_fixtures(self) -> bool {
+        self.is_structural() || self == StudyType::Frequency
     }
 
     /// Whether it takes gravity: a topology study does not, its weight changing with the
@@ -194,6 +204,23 @@ impl Default for TopologySettings {
             pull: None,
             one_piece: false,
         }
+    }
+}
+
+/// The most modes a frequency study may ask for.
+pub const MAX_MODES: u32 = 50;
+
+/// What a frequency study looks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrequencySettings {
+    /// The natural frequencies wanted, the lowest first: 1 to [`MAX_MODES`].
+    pub modes: u32,
+}
+
+impl Default for FrequencySettings {
+    fn default() -> Self {
+        // SolidWorks' default.
+        Self { modes: 5 }
     }
 }
 
@@ -627,6 +654,8 @@ pub struct Study {
     /// A generative study's bodies, target, methods and materials; ignored by the other
     /// types.
     pub generative: GenerativeSettings,
+    /// A frequency study's number of modes; ignored by the other types.
+    pub frequency: FrequencySettings,
 }
 
 impl Study {
@@ -650,6 +679,7 @@ impl Study {
             reference_temperature: 20.0,
             topology: TopologySettings::default(),
             generative: GenerativeSettings::default(),
+            frequency: FrequencySettings::default(),
         }
     }
 }
@@ -839,13 +869,13 @@ pub fn simulation_version(file: &SimulationFile) -> u32 {
 }
 
 /// The first `format_version` that has studies (and results) of type `t`: 1 static, 2 the
-/// thermal ones, 3 topology, 4 generative.
+/// thermal ones, 3 topology, 4 generative and frequency.
 pub(crate) fn type_version(t: StudyType) -> u32 {
     match t {
         StudyType::Static => FORMAT_VERSION,
         StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress => 2,
         StudyType::Topology => 3,
-        StudyType::Generative => SIMULATION_FORMAT_VERSION,
+        StudyType::Generative | StudyType::Frequency => SIMULATION_FORMAT_VERSION,
     }
 }
 
@@ -968,6 +998,19 @@ struct StudyDto {
     /// Only in a generative study, and required there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generative: Option<GenerativeDto>,
+    /// Only in a frequency study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frequency: Option<FrequencyDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct FrequencyDto {
+    #[serde(default = "default_modes")]
+    modes: u32,
+}
+
+fn default_modes() -> u32 {
+    FrequencySettings::default().modes
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1198,6 +1241,7 @@ pub(crate) enum StudyTypeDto {
     ThermalStress,
     Topology,
     Generative,
+    Frequency,
 }
 
 impl StudyTypeDto {
@@ -1209,6 +1253,7 @@ impl StudyTypeDto {
             StudyType::ThermalStress => StudyTypeDto::ThermalStress,
             StudyType::Topology => StudyTypeDto::Topology,
             StudyType::Generative => StudyTypeDto::Generative,
+            StudyType::Frequency => StudyTypeDto::Frequency,
         }
     }
 
@@ -1220,6 +1265,7 @@ impl StudyTypeDto {
             StudyTypeDto::ThermalStress => StudyType::ThermalStress,
             StudyTypeDto::Topology => StudyType::Topology,
             StudyTypeDto::Generative => StudyType::Generative,
+            StudyTypeDto::Frequency => StudyType::Frequency,
         }
     }
 
@@ -1630,6 +1676,9 @@ fn study_dto(study: &Study) -> StudyDto {
         }),
         generative: (study.study_type == StudyType::Generative)
             .then(|| generative_dto(&study.generative)),
+        frequency: (study.study_type == StudyType::Frequency).then_some(FrequencyDto {
+            modes: study.frequency.modes,
+        }),
     }
 }
 
@@ -1856,8 +1905,12 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             return Err("a generative study has material overrides".to_owned());
         }
     }
-    if !study_type.is_structural() && !dto.fixtures.is_empty() {
+    if !study_type.takes_fixtures() && !dto.fixtures.is_empty() {
         return Err("a thermal study has fixtures".to_owned());
+    }
+    // A frequency study's model vibrates freely, held by its fixtures alone.
+    if study_type == StudyType::Frequency && !dto.loads.is_empty() {
+        return Err("a frequency study has loads".to_owned());
     }
     let mut fixtures = Vec::with_capacity(dto.fixtures.len());
     for f in dto.fixtures {
@@ -2143,6 +2196,16 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, Some(_)) => return Err("only a generative study has a generative block".to_owned()),
         (_, None) => GenerativeSettings::default(),
     };
+    let frequency = match (study_type, dto.frequency) {
+        (StudyType::Frequency, Some(f)) => {
+            if !(1..=MAX_MODES).contains(&f.modes) {
+                return Err(format!("the modes are not from 1 to {MAX_MODES}"));
+            }
+            FrequencySettings { modes: f.modes }
+        }
+        (_, Some(_)) => return Err("only a frequency study has a frequency block".to_owned()),
+        (_, None) => FrequencySettings::default(),
+    };
 
     Ok(Study {
         name: dto.name,
@@ -2167,6 +2230,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         reference_temperature,
         topology,
         generative,
+        frequency,
     })
 }
 
@@ -3721,6 +3785,78 @@ mod tests {
             )),
             Err(FormatError::Json { .. })
         ));
+    }
+
+    #[test]
+    fn frequency_studies_round_trip_and_take_no_loads() {
+        let mut part = SimulationFile::new(StudiedModel {
+            kind: ModelKind::Part,
+            path: "bracket.oxyprt".to_owned(),
+            document_id: "55555555-5555-5555-5555-555555555555".to_owned(),
+        });
+        let mut study = Study::of_type("Frequency 1", StudyType::Frequency);
+        study.fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: vec![StudyFace::part(face(2))],
+            suppressed: false,
+        });
+        study.frequency.modes = 8;
+        study.mesh.quality = MeshQuality::Draft;
+        part.studies.push(study);
+        assert_eq!(read_simulation(Cursor::new(bytes(&part))).unwrap(), part);
+        assert_eq!(simulation_version(&part), 4);
+        let v = json(&part);
+        let study = &v["studies"][0];
+        assert_eq!(study["type"], "frequency");
+        assert_eq!(study["frequency"], serde_json::json!({ "modes": 8 }));
+        assert_eq!(study["mesh"]["quality"], "draft");
+        assert!(study.get("generative").is_none() && study.get("topology").is_none());
+
+        let good = bytes(&part);
+        let refused = |edit: &dyn Fn(&str) -> String, why: &str| match read_simulation(Cursor::new(
+            edited(&good, SIMULATION, edit),
+        )) {
+            Err(FormatError::InvalidSimulation(e)) => assert!(e.contains(why), "{e}"),
+            other => panic!("expected an invalid study ({why}), got {other:?}"),
+        };
+        let edit = |change: fn(&mut serde_json::Value)| {
+            move |s: &str| {
+                let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+                change(&mut v["studies"][0]);
+                serde_json::to_string(&v).unwrap()
+            }
+        };
+        refused(
+            &edit(|s| {
+                s["loads"] = serde_json::json!([{
+                    "name": "Gravity-1", "type": "gravity", "acceleration": [0.0, -9.81, 0.0]
+                }])
+            }),
+            "a frequency study has loads",
+        );
+        refused(
+            &edit(|s| s["frequency"]["modes"] = serde_json::json!(0)),
+            "the modes are not from 1 to 50",
+        );
+        refused(
+            &edit(|s| s["frequency"]["modes"] = serde_json::json!(51)),
+            "the modes are not from 1 to 50",
+        );
+        refused(
+            &edit(|s| s["type"] = serde_json::json!("static")),
+            "only a frequency study has a frequency block",
+        );
+        // Without its block, a frequency study asks for SolidWorks' five modes.
+        let plain = read_simulation(Cursor::new(edited(
+            &good,
+            SIMULATION,
+            edit(|s| {
+                s.as_object_mut().unwrap().remove("frequency");
+            }),
+        )))
+        .unwrap();
+        assert_eq!(plain.studies[0].frequency.modes, 5);
     }
 
     #[test]

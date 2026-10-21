@@ -15,6 +15,9 @@
 //!   heat flows and fluxes, convection, radiation, heat made inside bodies), on the same
 //!   meshes and contacts, solved with the same multigrid; their temperatures expand the
 //!   model in a thermal stress study ([`solve::ThermalStrain`]).
+//! - [`modal`] finds the lowest natural frequencies and mode shapes of the model held by its
+//!   fixtures (a frequency study): the static study's stiffness, a consistent mass, and the
+//!   smallest eigenpairs by LOBPCG (`eigen`) preconditioned by the same multigrid.
 //! - [`topology`] optimizes a static study's shape: the stiffest one that keeps a given
 //!   share of the mass (SIMP densities, a density filter, optimality criteria), and cuts
 //!   it out of the mesh as a closed surface.
@@ -57,11 +60,13 @@
 mod amg;
 mod bvh;
 pub mod contact;
+mod eigen;
 pub mod generative;
 pub mod material;
 mod math;
 pub mod mesh;
 pub mod mesher;
+pub mod modal;
 pub mod plot;
 mod pool;
 pub mod solve;
@@ -75,6 +80,7 @@ pub use material::{Elastic, ThermalProps};
 pub use math::V3;
 pub use mesh::{Facet, TetMesh};
 pub use mesher::{MeshError, MeshOptions, MeshReport, SurfaceMesh, mesh_solids};
+pub use modal::{FrequencyResults, FrequencyStudy, MAX_MODES, Mode, solve_frequencies};
 pub use plot::{Band, Quantity, bands, mesh_edges, rainbow};
 pub use solve::{
     Fixture, FixtureKind, Load, LoadKind, Results, SolveError, SolveOptions, Study, Summary,
