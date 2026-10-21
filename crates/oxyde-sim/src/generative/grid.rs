@@ -431,6 +431,19 @@ impl Grid {
                 load_forces.push(forces);
                 continue;
             }
+            // A force off the faces reaches them through a link, as a remote mass's
+            // weight does.
+            if let LoadKind::Remote { force, point } = load.kind {
+                for (node, b) in self.link(&triangles, point, spacing, &mut anchored) {
+                    let f: V3 = std::array::from_fn(|i| {
+                        (0..3).map(|j| b[j * 3 + i] * force[j]).sum::<f64>()
+                    });
+                    let sum = forces.entry(node).or_insert([0.0; 3]);
+                    *sum = add(*sum, f);
+                }
+                load_forces.push(forces);
+                continue;
+            }
             for tri in triangles {
                 let Some(normal) = normalize(cross(sub(tri[1], tri[0]), sub(tri[2], tri[0])))
                 else {
@@ -443,6 +456,8 @@ impl Grid {
                         None => scale(normal, -total / area),
                     },
                     LoadKind::Pressure { value } => scale(normal, -value),
+                    // Carried through its link above.
+                    LoadKind::Remote { .. } => continue,
                 };
                 for (p, a) in samples(tri, spacing) {
                     let v = self.anchor_voxel(p);

@@ -96,10 +96,11 @@ pub enum Outcome {
         fresh: Option<String>,
     },
     /// A part made from a generative outcome and saved to `path`: what was done (or why it
-    /// could not be made).
+    /// could not be made), and the surfaces it was made of, to check it on.
     PartCreated {
         path: PathBuf,
         result: Result<String, String>,
+        pieces: Vec<oxyde_sim::Shape>,
     },
     /// A STEP assembly read, and the files it would become.
     StepPlanned {
@@ -480,7 +481,11 @@ impl OxydeApp {
                 file_name,
                 fresh,
             } => self.part_imported(part, &file_name, fresh),
-            Outcome::PartCreated { path, result } => self.part_created(path, result),
+            Outcome::PartCreated {
+                path,
+                result,
+                pieces,
+            } => self.part_created(path, result, pieces),
             Outcome::StepPlanned { plan, path, source } => match plan {
                 Ok(plan) => self.write_step_plan(&plan, &path, &source),
                 Err(e) => self.status = format!("Could not import {source}: {e}"),

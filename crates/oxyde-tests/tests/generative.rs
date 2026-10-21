@@ -18,7 +18,7 @@ use oxyde_kernel::{Kernel, Mesh, ShapeHandle, SurfaceKind};
 use oxyde_model::{Extrude, ExtrudeOp, FeatureKind, Part, Sketch, SketchPlane, StandardPlane};
 use oxyde_occt::OcctKernel;
 use oxyde_sim::generative::{
-    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel,
+    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, check_part,
     decimate_holding, exact_surface, generate, generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, Fixture, FixtureKind, Load, LoadKind, SolveOptions, SurfaceMesh};
@@ -456,6 +456,23 @@ fn an_outcome_cut_from_its_starting_shape_meets_its_faces() {
         (volume / target - 1.0).abs() < 0.15,
         "{volume} mm³ for {target}"
     );
+
+    // Checked as Create Part checks it: the bores found on the part where it meets them, the
+    // load carried on a mesh of its own. Its mass is the solid's, and its stiffness near the
+    // outcome's, whose voxels were still a little grey after 30 iterations.
+    let start = Instant::now();
+    let check = check_part(&study, &pieces, &STEEL, &cancel, &|_, _| {}).unwrap();
+    eprintln!(
+        "checked on {} nodes in {:.2} s: {check:?}",
+        check.nodes,
+        start.elapsed().as_secs_f64()
+    );
+    assert!(check.volume_kept > 0.9, "{check:?}");
+    let mass = STEEL.density * 1e-9 * volume;
+    assert!((check.mass / mass - 1.0).abs() < 0.1, "{check:?}");
+    let stiffer = outcome.compliance / check.compliance;
+    assert!((1.0 / 3.0..3.0).contains(&stiffer), "{stiffer}: {check:?}");
+    assert!(check.max_von_mises > 0.0 && check.min_factor_of_safety.is_some());
 }
 
 fn write_obj(path: &str, shape: &oxyde_sim::Shape) -> std::io::Result<()> {

@@ -1166,3 +1166,40 @@ SPIE 2022) and Fusion 360 offers as gravity and point masses.
   50 g and its own weight joins its pads at or under its mass target, and minimizing its
   mass keeps the stress under the limit; the tab's mapping to the engine, the cases and
   the file round trip.
+
+**Built (October 2026): step 10**, the part made checked, as every source on generative
+design says to (NASA's brackets held more than twice their predicted load once tested,
+McClelland, SPIE 2022; Autodesk's machinery example closes with a static study, Crocetti
+and Gasso; "always validate", Schnitger, Cadalyst 2018).
+
+- **The check** (`generative::check_part`, on its own thread once *Create Part* has saved
+  the part, with a bar and *Stop* in the panel): the simplified surface's pieces, the very
+  triangles the part's solid is made of, each triangle labelled with the preserve body's
+  face it lies on (its corners within a twentieth of a voxel of the bodies' faces, where
+  `exact_surface` held them, its centre within three tenths, for a chord across a curved
+  face, and its normal within about 45° of the face's), filled with ten-node tetrahedra by
+  the lattice mesher (§2) at a voxel's size, larger where that would pass 400 000 nodes,
+  and each load case solved by the static solver: the case's fixtures and loads on those
+  faces, its accelerations as gravity, its remote masses' weight as remote forces.
+- **Remote forces** (`LoadKind::Remote`, a force at a point off the faces): the static
+  solver's form of the remote mass's link, each node of the faces taking its share of the
+  force by area and of the moment the offset makes by its distance from their centre
+  (`wᵢ/W F + wᵢ θ × rᵢ`, `θ = J⁻¹ M`), as RBE3 does; the generative grid carries one through
+  `Grid::link`. Not offered in the Simulation tab yet.
+- **What it gives**, beside the outcome's estimates in Explore: the part's mass, its
+  compliance summed over the cases, its largest displacement, its largest von Mises stress
+  but at the nodes of the faces the case's fixtures and loads act on (singular there; the
+  outcome leaves out the voxels they act through likewise) and the factor of safety over it.
+  Where the mesh lost more than 2 % of the part's volume (members thinner than an element),
+  the panel says the part checked is weaker than the one made. A fixture, load or remote
+  mass whose faces are not on the part (material grown over a bore no obstacle kept clear)
+  is named instead. Nothing is saved: the check is the part's, made again with it.
+- **Tests:** a remote force's nodal forces sum to it, with its moment about the faces'
+  centre and none about its point, on linear and quadratic elements; a bar kept whole and
+  made a part, checked: its stress, displacement, compliance and mass as theory gives them
+  (no Poisson's ratio, so the fixed end does not hold it); the same part moved off the
+  bar's faces refused, naming the fixture; through OpenCASCADE, the plate with two bored
+  rings made a part and checked: the bores found, its mass the solid's, its compliance
+  within a factor of three of the outcome's (still a little grey after 30 iterations).
+- **Not yet:** the check's stresses drawn on the part in Explore, and the check rerun on a
+  part edited after it was made (a static study of the part in the Simulation tab does it).

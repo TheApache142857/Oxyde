@@ -71,6 +71,13 @@ release yet; the git history has every detail.
   or mate to, rather than hundreds of triangles; elsewhere it stays faceted, and features
   cut into it are slow at that many faces. The part being studied stays open; the panel
   offers to open the new one.
+- **The part made is checked.** Once *Create Part* has made the part, the panel checks it
+  as a static study would: the part filled with tetrahedra, the faces of the bodies kept
+  found on it, every load case solved on it. Its mass, compliance, largest displacement,
+  largest stress and lowest factor of safety then stand beside the outcome's estimates,
+  which come from voxels whose corners gather stress. A bar shows the check going, and
+  *Stop* ends it (the part stays). The panel warns when the check's mesh lost some of the
+  part's thinnest members. Nothing of the check is saved: it is made again with the part.
 - **Files:** the `.oxysim` and `.oxyres` formats hold generative design studies, as
   Fusion 360 has them, for the Generative Design tab to come: the bodies to keep and to stay
   clear of, the mass target, safety factor, minimum thickness and resolution, the ways of

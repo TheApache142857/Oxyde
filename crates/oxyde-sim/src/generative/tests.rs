@@ -982,3 +982,89 @@ fn an_exact_surface_meets_the_bodies_on_their_faces() {
     assert_eq!(highest(&fewer, 1), 6.7);
     assert!(inside(&fewer));
 }
+
+/// A bar 100 × 10 × 10 mm kept whole (its own preserve body), fixed on its −X face, pulled
+/// 10 kN along +X on its +X face; and the part made of it, the same box, its faces
+/// unlabelled as an outcome's surface comes.
+fn bar_part() -> (GenerativeStudy, crate::topology::Shape) {
+    let (lo, hi) = ([0.0; 3], [100.0, 10.0, 10.0]);
+    let study = GenerativeStudy {
+        space: DesignSpace {
+            preserve: vec![block(0, lo, hi)],
+            obstacles: Vec::new(),
+            starting_shape: None,
+            margin: Some(0.0),
+        },
+        fixtures: vec![Fixture {
+            kind: FixtureKind::Fixed,
+            labels: vec![0],
+        }],
+        loads: vec![Load {
+            kind: LoadKind::Force {
+                total: 10_000.0,
+                direction: Some([1.0, 0.0, 0.0]),
+            },
+            labels: vec![1],
+        }],
+        gravity: Vec::new(),
+        remote_masses: Vec::new(),
+        load_cases: Vec::new(),
+        objective: Default::default(),
+        mass_target: 1.0,
+        member_size: None,
+        max_iterations: 1,
+        voxel_size: 2.0,
+        symmetry: None,
+    };
+    let surface = box_surface(lo, hi);
+    let part = crate::topology::Shape {
+        labels: vec![crate::NO_LABEL; surface.triangles.len()],
+        positions: surface.positions,
+        triangles: surface.triangles,
+    };
+    (study, part)
+}
+
+#[test]
+fn a_part_is_checked_on_its_own_mesh() {
+    let (study, part) = bar_part();
+    // No Poisson's ratio: the fixed end does not hold the bar from narrowing, so the stress
+    // is P/A = 100 MPa throughout.
+    let material = Elastic::new(200_000.0, 0.0, 250.0, 7850.0);
+    let cancel = AtomicBool::new(false);
+    let check = check_part(&study, &[part], &material, &cancel, &|_, _| {}).unwrap();
+    // The end moves PL/EA = 0.05 mm, the load's work is 500 N·mm, and 10 cm³ of steel
+    // weighs 78.5 g. The mesher bevels the box's edges a little, which takes some volume
+    // and gathers a little stress where the bevels are held.
+    let near = |value: f64, expected: f64, share: f64| (value - expected).abs() <= share * expected;
+    assert!(near(check.max_displacement, 0.05, 0.06), "{check:?}");
+    assert!(near(check.compliance, 500.0, 0.06), "{check:?}");
+    assert!(near(check.mass, 0.0785, 0.05), "{check:?}");
+    assert!((90.0..=150.0).contains(&check.max_von_mises), "{check:?}");
+    let fos = check.min_factor_of_safety.unwrap();
+    assert!((fos - 250.0 / check.max_von_mises).abs() < 1e-12);
+    assert!(
+        check.volume_kept > 0.95 && check.volume_kept <= 1.0 + 1e-9,
+        "{check:?}"
+    );
+    assert!(check.element_size >= study.voxel_size);
+    assert!(check.nodes > 0 && check.elements > 0);
+}
+
+#[test]
+fn a_part_off_the_kept_faces_is_not_checked() {
+    let (study, mut part) = bar_part();
+    // Moved 1 mm across: none of its faces lie on the bar's.
+    for p in &mut part.positions {
+        p[1] += 1.0;
+    }
+    let cancel = AtomicBool::new(false);
+    let error = check_part(&study, &[part], &STEEL, &cancel, &|_, _| {}).unwrap_err();
+    assert_eq!(
+        error,
+        CheckError::NotOnPart {
+            what: Missing::Fixture,
+            index: 0
+        }
+    );
+}

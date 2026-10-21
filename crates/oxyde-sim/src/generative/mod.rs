@@ -46,18 +46,23 @@
 //!   does not count as settled.
 //! - [`surface`] cuts the densities into a smooth closed surface; [`decimate`] and
 //!   [`solid_pieces`] make it something a modelling kernel takes.
+//! - [`check_part`] checks the part made of an outcome: its surface meshed with
+//!   tetrahedra, each load case solved on it by the static solver, for numbers the voxels
+//!   only estimate.
 
 // Indices into the grid's arrays and the design's groups, all sized here from the grid.
 #![allow(clippy::indexing_slicing)]
 
 mod additive;
 mod brick;
+mod check;
 mod decimate;
 mod grid;
 mod mma;
 mod multigrid;
 mod surface;
 
+pub use check::{CheckError, Missing, PartCheck, check_part};
 pub use decimate::{decimate, decimate_holding, solid_pieces};
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
 pub use multigrid::{Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved};

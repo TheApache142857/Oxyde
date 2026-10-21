@@ -115,7 +115,8 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   2-axis cutting, milling, casting), an outcome for each, on the graphics card when there is
   one; compared on a plot of mass against stress or stiffness, shown iteration by iteration,
   exported as STL, OBJ or 3MF, or made a part (*Create Part*: a solid meeting the bodies
-  kept on their faces).
+  kept on their faces, then checked on a mesh of its own against every load case).
+  Gravity and remote masses weigh the shapes; milling can reach from several sides.
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,

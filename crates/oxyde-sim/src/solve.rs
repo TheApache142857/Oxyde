@@ -61,6 +61,11 @@ pub enum LoadKind {
     Force { total: f64, direction: Option<V3> },
     /// MPa, normal to the faces, pushing into them when positive.
     Pressure { value: f64 },
+    /// A force in newtons acting at `point`, off the faces (a component's weight at its
+    /// centre of mass), carried to them as a distributing link (RBE3) carries it: spread
+    /// over them by area, with the moment its offset makes spread in proportion to each
+    /// node's distance from their centre. It stiffens nothing.
+    Remote { force: V3, point: V3 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1749,7 +1754,7 @@ fn add_thermal_load(
 }
 
 /// The nodal forces of the loads and the weight, N, in global directions.
-fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> {
+pub(crate) fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> {
     let n = mesh.nodes.len();
     let mut f = vec![[0.0; 3]; n];
     let quadratic = mesh.is_quadratic();
@@ -1761,6 +1766,10 @@ fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> 
             .collect();
         let area: f64 = facets.iter().map(|f| norm(mesh.facet_area_normal(f))).sum();
         if facets.is_empty() || area <= 0.0 {
+            continue;
+        }
+        if let LoadKind::Remote { force, point } = load.kind {
+            remote_force(mesh, &facets, force, point, &mut f);
             continue;
         }
         for facet in facets {
@@ -1776,6 +1785,8 @@ fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> 
                     None => scale(normal, -total / area),
                 },
                 LoadKind::Pressure { value } => scale(normal, -value),
+                // Carried above.
+                LoadKind::Remote { .. } => continue,
             };
             let share = scale(traction, a / 3.0);
             let nodes = match mesh.facet_edge_nodes(facet) {
@@ -1809,6 +1820,61 @@ fn load_vector(mesh: &TetMesh, materials: &[Elastic], study: &Study) -> Vec<V3> 
         }
     }
     f
+}
+
+/// `force` at `point` carried to the nodes of `facets` as a distributing link (RBE3): node
+/// `i`, of weight `wᵢ` (its share of the facets' area, as a uniform traction gives it) at
+/// `rᵢ` from the weights' centre, takes `wᵢ / W F + wᵢ θ × rᵢ`, `θ = J⁻¹ M` with `M` the
+/// moment of the force about the centre and `J = Σ wᵢ (|rᵢ|² I − rᵢ rᵢᵀ)`. The nodal forces
+/// add up to the force, and their moments about the centre to its moment. Nodes in a line
+/// (`J` singular) take the force alone.
+fn remote_force(mesh: &TetMesh, facets: &[&crate::Facet], force: V3, point: V3, f: &mut [V3]) {
+    let quadratic = mesh.is_quadratic();
+    // By node, in order: the sums below do not depend on a hash's order.
+    let mut weights: BTreeMap<u32, f64> = BTreeMap::new();
+    for facet in facets {
+        let a = norm(mesh.facet_area_normal(facet));
+        let nodes = match mesh.facet_edge_nodes(facet) {
+            Some(mids) if quadratic => mids,
+            _ => mesh.facet_corners(facet),
+        };
+        for i in nodes {
+            *weights.entry(i).or_insert(0.0) += a / 3.0;
+        }
+    }
+    let total: f64 = weights.values().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return;
+    }
+    let at = |i: u32| mesh.nodes[i as usize];
+    let centre = scale(
+        weights
+            .iter()
+            .fold([0.0; 3], |c, (&i, &w)| add(c, scale(at(i), w))),
+        1.0 / total,
+    );
+    let mut j = [0.0; 9];
+    for (&i, &w) in &weights {
+        let r = sub(at(i), centre);
+        let rr = dot(r, r);
+        let block: [f64; 9] = std::array::from_fn(|k| {
+            let (a, b) = (k / 3, k % 3);
+            let diagonal = if a == b { rr } else { 0.0 };
+            w * (diagonal - r[a] * r[b])
+        });
+        for (s, b) in j.iter_mut().zip(block) {
+            *s += b;
+        }
+    }
+    let moment = cross(sub(point, centre), force);
+    let theta = inverse(&j).map(|inv| mat_vec(&inv, moment));
+    for (&i, &w) in &weights {
+        let mut share = scale(force, w / total);
+        if let Some(theta) = theta {
+            share = add(share, scale(cross(theta, sub(at(i), centre)), w));
+        }
+        f[i as usize] = add(f[i as usize], share);
+    }
 }
 
 #[cfg(test)]
@@ -1889,6 +1955,50 @@ mod tests {
         let fos = s.min_factor_of_safety.unwrap().0;
         assert!((fos - 2.5).abs() < 1e-4);
         assert!((r.first_principal()[corner] - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_remote_force_reaches_the_face_with_its_moment() {
+        // 100 N down (−Y) 50 mm beyond the +X end of a bar, on that end: the end's nodes
+        // take the 100 N and the 5 N·m its offset makes about the end's centre, and no
+        // moment about the point.
+        for quadratic in [false, true] {
+            let mut mesh = TetMesh::structured_box([0.0; 3], [100.0, 10.0, 10.0], [4, 3, 3]);
+            if quadratic {
+                mesh.make_quadratic();
+            }
+            let point = [150.0, 5.0, 5.0];
+            let force = [0.0, -100.0, 0.0];
+            let study = Study {
+                loads: vec![Load {
+                    kind: LoadKind::Remote { force, point },
+                    labels: vec![1],
+                }],
+                ..Study::default()
+            };
+            let f = load_vector(&mesh, &[STEEL], &study);
+            let total = f.iter().fold([0.0; 3], |s, &x| add(s, x));
+            let about = |p: V3| {
+                f.iter()
+                    .zip(&mesh.nodes)
+                    .fold([0.0; 3], |m, (&x, &at)| add(m, cross(sub(at, p), x)))
+            };
+            assert!(
+                total.iter().zip(&force).all(|(a, b)| (a - b).abs() < 1e-9),
+                "{total:?}"
+            );
+            let at_point = about(point);
+            assert!(norm(at_point) < 1e-6, "{at_point:?}");
+            // About the end's centre: (50, 0, 0) × (0, −100, 0) = −5000 N·mm about Z.
+            let at_end = about([100.0, 5.0, 5.0]);
+            assert!((at_end[2] + 5000.0).abs() < 1e-6, "{at_end:?}");
+            // Only the end's nodes are loaded.
+            for (x, at) in f.iter().zip(&mesh.nodes) {
+                if norm(*x) > 0.0 {
+                    assert!((at[0] - 100.0).abs() < 1e-9, "{at:?}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -36,9 +36,10 @@ use oxyde_kernel::{FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
 use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical, Part};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
-    Backend, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError, GenerativeStudy, Grid,
-    MAX_VOXELS, Method, Objective, Obstacle, RemoteMass, Sides, Voxel, decimate_holding,
-    exact_surface, generate_on, solid_pieces, surface, voxel_size,
+    Backend, CheckError, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError,
+    GenerativeStudy, Grid, MAX_VOXELS, Method, Objective, Obstacle, PartCheck, RemoteMass, Sides,
+    Voxel, check_part, decimate_holding, exact_surface, generate_on, solid_pieces, surface,
+    voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -996,6 +997,56 @@ impl Drop for GenJob {
     }
 }
 
+/// What the check of a part made of an outcome takes: the generation and the outcome it was
+/// made of, the study as the engine takes it and the outcome's material (or why either
+/// cannot be had).
+struct CheckInput {
+    generation: u64,
+    outcome: u32,
+    study: Result<GenerativeStudy, String>,
+    elastic: Result<Elastic, String>,
+}
+
+/// What the check's thread has done so far, read by the tab every frame.
+#[derive(Default)]
+struct CheckShared {
+    stage: String,
+    fraction: f64,
+    finished: Option<Result<PartCheck, String>>,
+}
+
+/// The check of a part made of an outcome, running on its thread.
+pub(crate) struct CheckJob {
+    cancel: Arc<AtomicBool>,
+    shared: Arc<Mutex<CheckShared>>,
+    generation: u64,
+    outcome: u32,
+}
+
+impl Drop for CheckJob {
+    /// The thread notices at its next check and ends; nothing waits for it.
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl CheckJob {
+    /// Where it is: what it does and the fraction done.
+    fn progress(&self) -> (String, f64) {
+        match self.shared.lock() {
+            Ok(s) => (s.stage.clone(), s.fraction),
+            Err(_) => (String::new(), 0.0),
+        }
+    }
+}
+
+/// The check of the part made of an outcome: its numbers, or why it could not be checked.
+pub(crate) struct Checked {
+    generation: u64,
+    outcome: u32,
+    result: Result<PartCheck, String>,
+}
+
 impl GenJob {
     /// Where it is: a line and the fraction done.
     pub(crate) fn progress(&self) -> (String, f64) {
@@ -1184,6 +1235,12 @@ pub(crate) struct GenView {
     estimate: Option<(u64, Option<(f64, usize)>)>,
     /// The part file *Create Part* made last, to open.
     pub(crate) created: Option<PathBuf>,
+    /// What the check of the part being made takes, set aside while *Create Part* makes it.
+    pending_check: Option<CheckInput>,
+    /// The check of the part made last, running.
+    check: Option<CheckJob>,
+    /// Its numbers, or why the part could not be checked.
+    checked: Option<Checked>,
 }
 
 impl GenView {
@@ -1213,6 +1270,8 @@ enum GenAction {
     CreatePart,
     /// Open the part *Create Part* made.
     OpenCreated,
+    /// Stop checking the part made.
+    StopCheck,
     OpenStudy,
     SaveStudy,
     OpenResults,
@@ -1246,6 +1305,7 @@ impl OxydeApp {
     /// with the study read when it opens.
     pub(crate) fn generative_housekeeping(&mut self, ctx: &egui::Context) {
         self.poll_generation(ctx);
+        self.poll_part_check(ctx);
         if self.simulation.generative.shown.is_some() && !self.outcome_wanted() {
             self.restore_simulation_scene();
             ctx.request_repaint();
@@ -1874,7 +1934,7 @@ impl OxydeApp {
     /// surface cut to meet the preserve bodies, the starting shape and the obstacles on
     /// their faces, simplified, a solid made of each piece, written as STEP into the new
     /// part's Imported feature, in the outcome's material). The open part stays open; the
-    /// panel offers the new one.
+    /// panel offers the new one, and checks it (`start_part_check`).
     pub(crate) fn create_part(&mut self) {
         // The bodies' surfaces as the outcome was grown on them, to meet them exactly; the
         // densities' own surface when they cannot be had.
@@ -1883,6 +1943,11 @@ impl OxydeApp {
             .ok()
             .and(self.simulation.surfaces.as_ref());
         let space = surfaces.and_then(|s| design_space(&self.simulation.study.generative, s).ok());
+        // The study as the check of the part takes it.
+        let engine = match surfaces {
+            Some(s) => engine_study(&self.simulation.study, s),
+            None => Err("the model's faces could not be had".to_owned()),
+        };
         let view = &self.simulation.generative;
         let Some((generated, o)) = view
             .generated
@@ -1893,7 +1958,7 @@ impl OxydeApp {
             self.status = "Create Part: pick an outcome first".to_owned();
             return;
         };
-        let (id, material_name) = (o.id, o.material.clone());
+        let (id, material_name, generation) = (o.id, o.material.clone(), generated.id);
         // The densities shown: the iteration picked on the slider, else the last.
         let density = densities(o, view.snapshot);
         let (shape, held) = match &space {
@@ -1943,6 +2008,9 @@ impl OxydeApp {
         if !crate::assembly_ui::has_extension(&path, oxyde_format::PART_EXTENSION) {
             path.set_extension(oxyde_format::PART_EXTENSION);
         }
+        let elastic = material
+            .as_ref()
+            .map_or_else(|| Err("the outcome has no material".to_owned()), elastic_of);
         let input = PartInput {
             shape,
             held,
@@ -1950,13 +2018,22 @@ impl OxydeApp {
             material,
             file_name: format!("{name}.step"),
         };
-        self.simulation.generative.created = None;
+        let view = &mut self.simulation.generative;
+        view.created = None;
+        view.check = None;
+        view.checked = None;
+        view.pending_check = Some(CheckInput {
+            generation,
+            outcome: id,
+            study: engine,
+            elastic,
+        });
         let target = path.clone();
         self.start_job(
             &format!("Making a part of outcome {id}"),
             move |kernel, progress| {
                 let result = make_outcome_part(kernel, input, &|what| progress.say(what)).and_then(
-                    |(part, note)| {
+                    |(part, note, pieces)| {
                         progress.say("Saving the part");
                         let file = oxyde_format::PartFile {
                             document_id: oxyde_format::new_document_id(),
@@ -1970,23 +2047,34 @@ impl OxydeApp {
                             },
                         };
                         let saved = oxyde_format::save_part(&target, &file)
-                            .map(|()| note)
+                            .map(|()| (note, pieces))
                             .map_err(|e| format!("could not save {}: {e}", target.display()));
                         let mut part = part;
                         part.release(kernel);
                         saved
                     },
                 );
+                let (result, pieces) = match result {
+                    Ok((note, pieces)) => (Ok(note), pieces),
+                    Err(why) => (Err(why), Vec::new()),
+                };
                 crate::jobs::Outcome::PartCreated {
                     path: target,
                     result,
+                    pieces,
                 }
             },
         );
     }
 
-    /// The part *Create Part* made: saved, offered in the panel.
-    pub(crate) fn part_created(&mut self, path: PathBuf, result: Result<String, String>) {
+    /// The part *Create Part* made: saved, offered in the panel, and checked from `pieces`,
+    /// its surfaces.
+    pub(crate) fn part_created(
+        &mut self,
+        path: PathBuf,
+        result: Result<String, String>,
+        pieces: Vec<Shape>,
+    ) {
         match result {
             Ok(note) => {
                 self.remember_recent(&path);
@@ -1996,9 +2084,118 @@ impl OxydeApp {
                 }
                 self.status = format!("Made {}: {note}", path.display());
                 self.simulation.generative.created = Some(path);
+                self.start_part_check(pieces);
             }
-            Err(why) => self.status = format!("Could not make the part: {why}"),
+            Err(why) => {
+                self.simulation.generative.pending_check = None;
+                self.status = format!("Could not make the part: {why}");
+            }
         }
+    }
+
+    /// The part just made, checked on its thread: its surfaces meshed with tetrahedra and
+    /// each load case of the study solved on them (`check_part`), for the panel to set
+    /// beside the outcome's estimates. Nothing of it is saved.
+    fn start_part_check(&mut self, pieces: Vec<Shape>) {
+        let view = &mut self.simulation.generative;
+        let Some(CheckInput {
+            generation,
+            outcome,
+            study,
+            elastic,
+        }) = view.pending_check.take()
+        else {
+            return;
+        };
+        let (study, elastic) = match (study, elastic) {
+            (Ok(study), Ok(elastic)) => (study, elastic),
+            (Err(why), _) | (_, Err(why)) => {
+                view.checked = Some(Checked {
+                    generation,
+                    outcome,
+                    result: Err(why),
+                });
+                return;
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(CheckShared::default()));
+        let (thread_cancel, thread_shared) = (cancel.clone(), shared.clone());
+        let spawned = std::thread::Builder::new()
+            .name("part check".to_owned())
+            .spawn(move || {
+                let say = |stage: &str, fraction: f64| {
+                    if let Ok(mut s) = thread_shared.lock() {
+                        if s.stage != stage {
+                            s.stage = stage.to_owned();
+                        }
+                        s.fraction = fraction;
+                    }
+                };
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    check_part(&study, &pieces, &elastic, &thread_cancel, &say)
+                }));
+                let result = match caught {
+                    Ok(Ok(check)) => Ok(check),
+                    Ok(Err(CheckError::Cancelled)) => Err("stopped".to_owned()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("the check stopped on an internal error".to_owned()),
+                };
+                if let Ok(mut s) = thread_shared.lock() {
+                    s.finished = Some(result);
+                }
+            });
+        match spawned {
+            Ok(_) => {
+                view.check = Some(CheckJob {
+                    cancel,
+                    shared,
+                    generation,
+                    outcome,
+                });
+            }
+            Err(e) => {
+                view.checked = Some(Checked {
+                    generation,
+                    outcome,
+                    result: Err(format!("the check could not start: {e}")),
+                });
+            }
+        }
+    }
+
+    /// Every frame: the check of the part made, when it ends.
+    fn poll_part_check(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.simulation.generative.check.as_ref() else {
+            return;
+        };
+        let finished = match job.shared.lock() {
+            Ok(mut s) => s.finished.take(),
+            Err(_) => Some(Err("the check's thread stopped".to_owned())),
+        };
+        let Some(result) = finished else {
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return;
+        };
+        let (generation, outcome) = (job.generation, job.outcome);
+        self.status = match &result {
+            Ok(c) => format!(
+                "Checked the part of outcome {outcome} on {} nodes: max von Mises {}, max \
+                 displacement {}",
+                c.nodes,
+                format_value(c.max_von_mises, "MPa"),
+                format_value(c.max_displacement, "mm")
+            ),
+            Err(why) => format!("The part of outcome {outcome} was not checked: {why}"),
+        };
+        let view = &mut self.simulation.generative;
+        view.check = None;
+        view.checked = Some(Checked {
+            generation,
+            outcome,
+            result,
+        });
+        ctx.request_repaint();
     }
 
     /// The Generative Design tab was chosen: when the open study is not a generative
@@ -2507,10 +2704,27 @@ impl OxydeApp {
                                     action = Some(a);
                                 }
                                 let picked = view.picked.and_then(|id| g.outcome(id));
+                                // The check of the part made of this outcome, running or done.
+                                let this = |generation: u64, outcome: u32| {
+                                    generation == g.id && view.picked == Some(outcome)
+                                };
+                                let part = PartRows {
+                                    checking: view
+                                        .check
+                                        .as_ref()
+                                        .filter(|c| this(c.generation, c.outcome))
+                                        .map(CheckJob::progress),
+                                    checked: view
+                                        .checked
+                                        .as_ref()
+                                        .filter(|c| this(c.generation, c.outcome))
+                                        .map(|c| &c.result),
+                                };
                                 if let Some(o) = picked
                                     && let Some(a) = picked_rows(
                                         ui,
                                         o,
+                                        &part,
                                         &mut view.snapshot,
                                         &mut view.show,
                                         &mut view.show_obstacles,
@@ -2545,6 +2759,11 @@ impl OxydeApp {
                     self.guard(crate::app::PendingAction::OpenRecent(path), ui.ctx());
                 }
             }
+            Some(GenAction::StopCheck) => {
+                if let Some(job) = &self.simulation.generative.check {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            }
             Some(GenAction::OpenStudy) => self.open_study(),
             Some(GenAction::SaveStudy) => {
                 self.save_study(false);
@@ -2573,17 +2792,17 @@ struct PartInput {
     file_name: String,
 }
 
-/// The part of an outcome, rebuilt on `kernel`, and a note of what was done: the surface
-/// simplified to [`PART_TRIANGLES`], a solid of each piece, written as STEP into an
-/// Imported feature, in the outcome's material. No boolean joins the exact preserve bodies
-/// or cuts the obstacles: the surface already meets them on their faces, and OpenCASCADE
-/// takes minutes over a boolean between a fine outcome's thousands of faces and those, or
-/// fails.
+/// The part of an outcome, rebuilt on `kernel`, a note of what was done and the simplified
+/// surface's pieces (for the check): the surface simplified to [`PART_TRIANGLES`], a solid
+/// of each piece, written as STEP into an Imported feature, in the outcome's material. No
+/// boolean joins the exact preserve bodies or cuts the obstacles: the surface already meets
+/// them on their faces, and OpenCASCADE takes minutes over a boolean between a fine
+/// outcome's thousands of faces and those, or fails.
 fn make_outcome_part<K: Kernel>(
     kernel: &mut K,
     input: PartInput,
     say: &dyn Fn(String),
-) -> Result<(Part, String), String> {
+) -> Result<(Part, String, Vec<Shape>), String> {
     let PartInput {
         shape,
         held,
@@ -2643,10 +2862,10 @@ fn make_outcome_part<K: Kernel>(
             .map_err(|e| format!("could not write the solid: {e}"))?;
         let bytes = std::fs::read(&step).map_err(|e| format!("could not read the solid: {e}"));
         let _ = std::fs::remove_file(&step);
-        Ok((bytes?, notes.join(", ")))
+        Ok((bytes?, notes.join(", "), pieces))
     })();
     release(kernel, &made);
-    let (bytes, note) = result?;
+    let (bytes, note, pieces) = result?;
     say("Rebuilding the part".to_owned());
     let mut part = Part::new();
     part.set_material(material);
@@ -2661,7 +2880,7 @@ fn make_outcome_part<K: Kernel>(
         part.release(kernel);
         return Err(why);
     }
-    Ok((part, note))
+    Ok((part, note, pieces))
 }
 
 // ---- The panel's sections ------------------------------------------------------------------
@@ -3653,10 +3872,19 @@ fn scatter(
         .flatten()
 }
 
-/// The picked outcome: its numbers, its iterations on a slider, show and export.
+/// The check of the part made of the picked outcome, for its rows: what it is doing and the
+/// fraction done while it runs, then its numbers or why there are none.
+struct PartRows<'a> {
+    checking: Option<(String, f64)>,
+    checked: Option<&'a Result<PartCheck, String>>,
+}
+
+/// The picked outcome: its numbers (beside its part's, once that is checked), its
+/// iterations on a slider, show and export.
 fn picked_rows(
     ui: &mut egui::Ui,
     o: &GenerativeOutcome,
+    part: &PartRows<'_>,
     snapshot: &mut Option<usize>,
     show: &mut bool,
     show_obstacles: &mut bool,
@@ -3677,32 +3905,64 @@ fn picked_rows(
         OutcomeStatus::Failed(why) => why.clone(),
     };
     weak(ui, &format!("{status}, {:.0} s", o.seconds));
+    let checked = part.checked.and_then(|r| r.as_ref().ok());
+    let short = |f: f64| {
+        let text = egui::RichText::new(format!("{f:.2}"));
+        if f < safety_factor {
+            text.color(egui::Color32::from_rgb(210, 140, 30))
+        } else {
+            text
+        }
+    };
     egui::Grid::new("generative_picked")
-        .num_columns(2)
+        .num_columns(if checked.is_some() { 3 } else { 2 })
         .spacing([10.0, 2.0])
         .show(ui, |ui| {
+            // The part's column: its numbers, which the check made on its own mesh.
+            let cell = |ui: &mut egui::Ui, value: Option<String>| {
+                if checked.is_some() {
+                    ui.label(value.unwrap_or_default());
+                }
+            };
+            if checked.is_some() {
+                ui.label("");
+                ui.label(egui::RichText::new("Outcome").small().weak())
+                    .on_hover_text("Estimated on the voxels the outcome was grown on");
+                ui.label(egui::RichText::new("Part").small().weak())
+                    .on_hover_text(
+                        "The part made of it, meshed with tetrahedra and solved for each load \
+                         case: its own numbers, the voxels' steps and corners gone",
+                    );
+                ui.end_row();
+            }
             ui.label("Mass");
             ui.label(format_value(o.mass, "kg"));
+            cell(ui, checked.map(|c| format_value(c.mass, "kg")));
             ui.end_row();
             ui.label("Compliance");
             ui.label(format_value(o.compliance, "N·mm"))
                 .on_hover_text("The work of the loads: the lower, the stiffer");
+            cell(ui, checked.map(|c| format_value(c.compliance, "N·mm")));
             ui.end_row();
             ui.label("Max displacement");
             ui.label(format_value(o.max_displacement, "mm"));
+            cell(ui, checked.map(|c| format_value(c.max_displacement, "mm")));
             ui.end_row();
             ui.label("Max von Mises");
             ui.label(format_value(o.max_von_mises, "MPa"))
-                .on_hover_text("Estimated at the voxels' centres: a static study of the part made from it gives the exact one");
+                .on_hover_text(
+                    "Estimated at the voxels' centres: Create Part checks the part made of it",
+                );
+            cell(ui, checked.map(|c| format_value(c.max_von_mises, "MPa")));
             ui.end_row();
-            if let Some(f) = o.min_factor_of_safety {
+            let part_safety = checked.and_then(|c| c.min_factor_of_safety);
+            if o.min_factor_of_safety.is_some() || part_safety.is_some() {
                 ui.label("Min factor of safety");
-                let text = egui::RichText::new(format!("{f:.2}"));
-                ui.label(if f < safety_factor {
-                    text.color(egui::Color32::from_rgb(210, 140, 30))
-                } else {
-                    text
-                });
+                let none = || egui::RichText::new("—");
+                ui.label(o.min_factor_of_safety.map_or_else(none, short));
+                if checked.is_some() {
+                    ui.label(part_safety.map_or_else(none, short));
+                }
                 ui.end_row();
             }
             if let Some(g) = o.grayness {
@@ -3724,6 +3984,47 @@ fn picked_rows(
                 ui.end_row();
             }
         });
+    match (&part.checking, part.checked) {
+        (Some((stage, fraction)), _) => {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(*fraction as f32)
+                        .desired_width(180.0)
+                        .text(format!("Checking the part: {stage}")),
+                );
+                if ui
+                    .small_button("Stop")
+                    .on_hover_text("Stop checking the part made (the part stays)")
+                    .clicked()
+                {
+                    action = Some(GenAction::StopCheck);
+                }
+            });
+        }
+        (None, Some(Ok(c))) => {
+            weak(
+                ui,
+                &format!(
+                    "Part checked on {} nodes, elements of {}",
+                    c.nodes,
+                    format_value(c.element_size, "mm")
+                ),
+            );
+            if c.volume_kept < 0.98 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "The check's mesh lost {:.0} % of the part's volume (members thinner \
+                         than its elements): the part checked is weaker than the part made",
+                        100.0 * (1.0 - c.volume_kept)
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(210, 140, 30)),
+                );
+            }
+        }
+        (None, Some(Err(why))) => weak(ui, &format!("The part made was not checked: {why}")),
+        (None, None) => {}
+    }
     if !o.snapshots.is_empty() {
         // The iterations kept, then the end.
         let last = o.snapshots.len();
