@@ -41,6 +41,8 @@ fn bracket(voxel_size: f64) -> GenerativeStudy {
             },
             labels: vec![11],
         }],
+        gravity: Vec::new(),
+        remote_masses: Vec::new(),
         load_cases: Vec::new(),
         // A quarter of the box's volume in steel.
         objective: Default::default(),
@@ -286,10 +288,12 @@ fn load_cases_are_laid_apart_and_carried_together() {
     let down = LoadCase {
         fixtures: vec![0],
         loads: vec![0],
+        ..LoadCase::default()
     };
     let sideways = LoadCase {
         fixtures: vec![0],
         loads: vec![1],
+        ..LoadCase::default()
     };
     study.load_cases = vec![down.clone(), sideways];
     let cancel = AtomicBool::new(false);
@@ -343,10 +347,131 @@ fn load_cases_are_laid_apart_and_carried_together() {
     study.load_cases = vec![LoadCase {
         fixtures: Vec::new(),
         loads: vec![0],
+        ..LoadCase::default()
     }];
     assert_eq!(
         Grid::build(&study, 0, &cancel).unwrap_err(),
         GenerativeError::NotHeld
+    );
+}
+
+#[test]
+fn a_remote_mass_weighs_on_its_faces_as_a_force_at_its_point() {
+    // 2 kg carried by the small pad's +X face (x = 60), its centre 10 mm beyond it, under
+    // 10 g down: the nodes take 196.2 N down in all, and no moment about the mass's point
+    // (the force acts there), so a moment about the face's centre.
+    let mut study = bracket(1.0);
+    study.loads.clear();
+    study.gravity = vec![[0.0, -98.1, 0.0]];
+    let point = [70.0, 10.0, 5.0];
+    study.remote_masses = vec![RemoteMass {
+        mass: 2.0,
+        point,
+        labels: vec![11],
+    }];
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let case = &grid.cases[0];
+    assert_eq!(case.acceleration, [0.0, -98.1, 0.0]);
+    let dims = grid.dims();
+    let at = |n: u32| {
+        let c = dims.node_coords(n as usize);
+        std::array::from_fn::<f64, 3, _>(|a| grid.origin[a] + c[a] as f64 * grid.size)
+    };
+    let (mut total, mut moment) = ([0.0; 3], [0.0; 3]);
+    for (n, f) in &case.forces {
+        total = crate::math::add(total, *f);
+        let r = crate::math::sub(at(*n), point);
+        moment = crate::math::add(moment, crate::math::cross(r, *f));
+    }
+    assert!(
+        (total[1] + 196.2).abs() < 1e-9 && total[0].abs() < 1e-9 && total[2].abs() < 1e-9,
+        "{total:?}"
+    );
+    let size = crate::math::norm(moment);
+    assert!(size < 1e-8 * 196.2 * 10.0, "{moment:?}");
+    // About the face's centre (60, 10, 5) the weight turns it: 10 mm × 196.2 N about Z.
+    let mut turn = [0.0; 3];
+    for (n, f) in &case.forces {
+        let r = crate::math::sub(at(*n), [60.0, 10.0, 5.0]);
+        turn = crate::math::add(turn, crate::math::cross(r, *f));
+    }
+    assert!((turn[2] + 1962.0).abs() < 1e-6, "{turn:?}");
+
+    // Nothing but weight, and no remote mass: still loaded.
+    study.remote_masses.clear();
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    assert!(grid.cases[0].forces.is_empty());
+    // A remote mass with no mass is refused.
+    study.remote_masses = vec![RemoteMass {
+        mass: 0.0,
+        point,
+        labels: vec![11],
+    }];
+    assert_eq!(
+        Grid::build(&study, 0, &cancel),
+        Err(GenerativeError::BadRemoteMass { index: 0 })
+    );
+}
+
+#[test]
+fn weight_goes_to_the_corners_and_fades_under_the_knee() {
+    let dims = Dims { cells: [2, 1, 1] };
+    let mut forces = vec![0.0; 3 * dims.node_count()];
+    add_weight(dims, &[1.0, 3.0], [0.0, -9.81, 0.0], &mut forces);
+    let total: f64 = forces.iter().skip(1).step_by(3).sum();
+    assert!((total + 4.0 * 9.81).abs() < 1e-12);
+    // A field the same at every corner works as its value against the acceleration.
+    let field: Vec<f64> = (0..dims.node_count())
+        .flat_map(|_| [0.5, -2.0, 1.0])
+        .collect();
+    let work = corner_work(dims, &field, [0.0, -9.81, 0.0]);
+    assert!(work.iter().all(|w| (w - 19.62).abs() < 1e-12), "{work:?}");
+    // The weight's share: the density above the knee, its cube scaled to meet it below.
+    assert_eq!(weight_share(0.5), (0.5, 1.0));
+    let (below, _) = weight_share(WEIGHT_KNEE - 1e-12);
+    assert!((below - WEIGHT_KNEE).abs() < 1e-10);
+    let (tiny, _) = weight_share(0.01);
+    assert!((tiny - 1e-4).abs() < 1e-15);
+    let h = 1e-7;
+    let (_, slope) = weight_share(0.05);
+    let fd = (weight_share(0.05 + h).0 - weight_share(0.05 - h).0) / (2.0 * h);
+    assert!((slope - fd).abs() < 1e-6);
+}
+
+#[test]
+fn a_bracket_carries_its_own_weight_and_a_remote_mass() {
+    // No force: the bracket holds 1 kg off the small pad's +X face and its own weight,
+    // under 50 g down. The stiffest bracket of the target mass still joins the pads.
+    let mut study = bracket(2.0);
+    study.loads.clear();
+    study.gravity = vec![[0.0, -490.5, 0.0]];
+    study.remote_masses = vec![RemoteMass {
+        mass: 1.0,
+        point: [66.0, 10.0, 5.0],
+        labels: vec![11],
+    }];
+    let (grid, outcome) = run(&study, Method::Unrestricted, 0);
+    assert!(outcome.compliance > 0.0);
+    assert!(
+        outcome.mass <= 1.06 * study.mass_target,
+        "mass {} for {}",
+        outcome.mass,
+        study.mass_target
+    );
+    let loaded = voxels_in(&grid, [56.0, 6.0, 3.0], [60.0, 14.0, 7.0]);
+    let held = voxels_in(&grid, [0.0, 0.0, 0.0], [4.0, 20.0, 10.0]);
+    assert!(load_path(&grid, &outcome.density, &loaded, &held));
+    // Minimizing mass under the same weight keeps the stress under the limit.
+    study.objective = Objective::MinMass {
+        safety_factor: 2.0,
+        displacement_limit: None,
+    };
+    let (_, light) = run(&study, Method::Unrestricted, 0);
+    assert!(
+        light.max_von_mises <= 1.05 * 125.0,
+        "{} MPa",
+        light.max_von_mises
     );
 }
 

@@ -1125,3 +1125,44 @@ University) mills the outcome it keeps from +Y and −Y.
   both or neither refused; the panel's label and the engine's method.
 - **Not yet**: the tool's length and its holder, which need the closing of the shape by the
   tool's own (a cutter of a radius over a length, then the head): their own step.
+
+**Built (October 2026): step 9**, gravity and remote masses, the loads NASA's Evolved
+Structures puts first (a 1.35 kg instrument under 10 g down and 3 g across, McClelland,
+SPIE 2022) and Fusion 360 offers as gravity and point masses.
+
+- **Gravity** (`GenerativeStudy::gravity`, picked by the load cases as loads are): each
+  case's accelerations summed weigh the material, each voxel's weight an eighth at each
+  corner (`add_weight`), recomputed every iteration from the projected densities. Below a
+  projected density of 0.1 a voxel weighs as the cube of its density scaled to meet the
+  density there (`weight_share`), as its stiffness goes: near-void material weighing as
+  its density would outrun the stiffness carrying it and sag the grey regions under their
+  own weight (the parasitic effect, Bruyneel and Duysinx 2005). The mass the target counts
+  is the density's own, so outcomes weigh what they say.
+- **Slopes:** the compliance `fᵀu` with loads that depend on the design gains `2 uᵀ ∂f/∂ρ`
+  (`corner_work`: the displacements at a voxel's corners against the acceleration); the
+  stress and displacement limits' adjoints gain `λᵀ ∂f/∂ρ`. With weight the compliance's
+  slope is positive where material loads more than it stiffens, which optimality criteria
+  cannot take: a weighted *Maximize stiffness* moves by MMA instead, the compliance scaled to
+  the first one its objective and the mass target its limit, so the stiffest design may
+  weigh less than the target; weightless studies keep optimality criteria and their
+  outcomes as before.
+- **Remote masses** (`RemoteMass`: kg, a point, faces of preserve bodies), the distributing
+  link of NASTRAN's RBE3: the point moves as its faces' samples on average, their mean
+  translation and their mean turn about their centroid weighted by area, `u_p = Σ Bᵢ uᵢ`,
+  `Bᵢ = wᵢ/W I − wᵢ [d]ₓ J⁻¹ [rᵢ]ₓ` (`d` from the centroid to the point, `rᵢ` from the
+  centroid to the sample, `J = Σ wᵢ (|rᵢ|² I − rᵢ rᵢᵀ)`), spread over the samples' voxel
+  corners by trilinear weights (`Grid::link`); its weight `F = m a` under the case's
+  acceleration reaches the nodes as `Bᵀ F`, a force and a moment, design-independent so
+  laid once on the grid. It stiffens nothing (a rigid link would, and needs constraints
+  the projected solve does not have). Its samples' voxels are anchored, kept out of the
+  stress estimate like a load's.
+- **The tab:** *Gravity* (no faces; 1 g down, set in the panel as an acceleration vector,
+  its size shown in g) and *Remote Mass* (on the selected faces, 1 kg at their centre until
+  set) join every load case; a study whose remote masses no gravity weighs is refused,
+  naming them.
+- **Tests:** a remote mass's nodal forces sum to its weight with no moment about its point
+  and the right one about its faces' centre; a study of weight alone is loaded; a massless
+  remote mass refused; the weight's share and the corner work; a bracket holding 1 kg at
+  50 g and its own weight joins its pads at or under its mass target, and minimizing its
+  mass keeps the stress under the limit; the tab's mapping to the engine, the cases and
+  the file round trip.

@@ -182,6 +182,20 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
                 depth: *depth,
                 suppressed: false,
             }),
+            ItemKind::Gravity { acceleration } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::Gravity {
+                    acceleration: *acceleration,
+                },
+            )),
+            ItemKind::RemoteMass { kg, point } => out.loads.push(load(
+                &item.name,
+                FileLoadKind::RemoteMass {
+                    faces: on,
+                    kg: *kg,
+                    point: *point,
+                },
+            )),
         }
     }
     out.topology.target_mass = study.topology.target_mass;
@@ -253,7 +267,8 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
 }
 
 /// The study a `.oxysim` holds, as the panel edits it. Suppressed items are left out (the
-/// panel has no switch for them yet); a gravity load other than −Y becomes −Y.
+/// panel has no switch for them yet); a static study's gravity load other than −Y becomes
+/// −Y (a generative study's gravity is an item of its own, as it is).
 pub(crate) fn study_of(file: &FileStudy) -> Study {
     let mut study = Study::of_type(file.study_type, &file.name);
     let faces = |faces: &[StudyFace]| faces.iter().map(sim_face).collect::<Vec<_>>();
@@ -289,7 +304,31 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
                 kind: ItemKind::Pressure { mpa: *mpa },
                 faces: faces(f),
             }),
-            FileLoadKind::Gravity { .. } => study.gravity = true,
+            FileLoadKind::Gravity { acceleration } => {
+                if file.study_type == StudyType::Generative {
+                    study.items.push(StudyItem {
+                        name: l.name.clone(),
+                        kind: ItemKind::Gravity {
+                            acceleration: *acceleration,
+                        },
+                        faces: Vec::new(),
+                    });
+                } else {
+                    study.gravity = true;
+                }
+            }
+            FileLoadKind::RemoteMass {
+                faces: f,
+                kg,
+                point,
+            } => study.items.push(StudyItem {
+                name: l.name.clone(),
+                kind: ItemKind::RemoteMass {
+                    kg: *kg,
+                    point: *point,
+                },
+                faces: faces(f),
+            }),
             FileLoadKind::Temperature { faces: f, celsius } => study.items.push(StudyItem {
                 name: l.name.clone(),
                 kind: ItemKind::Temperature { celsius: *celsius },

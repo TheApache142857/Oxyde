@@ -139,10 +139,13 @@ impl StudyType {
         )
     }
 
-    /// Whether it takes gravity: topology and generative studies do not, their weight
-    /// changing with the shape.
+    /// Whether it takes gravity: a topology study does not, its weight changing with the
+    /// shape; a generative study weighs its shape as it grows.
     pub fn takes_gravity(self) -> bool {
-        matches!(self, StudyType::Static | StudyType::ThermalStress)
+        matches!(
+            self,
+            StudyType::Static | StudyType::ThermalStress | StudyType::Generative
+        )
     }
 
     /// Whether its results are displacements and stresses (topology and generative
@@ -691,6 +694,14 @@ pub enum LoadKind {
     Pressure { faces: Vec<StudyFace>, mpa: f64 },
     /// The model's weight: an acceleration in m/s² in world coordinates (Y up).
     Gravity { acceleration: [f64; 3] },
+    /// A component carried by the faces (a generative study's preserve faces), of `kg`,
+    /// its centre of mass at `point` (mm): the study's accelerations weigh it, and its
+    /// weight reaches the faces as a force and a moment.
+    RemoteMass {
+        faces: Vec<StudyFace>,
+        kg: f64,
+        point: [f64; 3],
+    },
     /// The faces held at a temperature, °C.
     Temperature { faces: Vec<StudyFace>, celsius: f64 },
     /// A total heat flow into the faces, W, shared by area; negative takes heat out.
@@ -720,7 +731,10 @@ impl LoadKind {
     pub fn is_thermal(&self) -> bool {
         !matches!(
             self,
-            LoadKind::Force { .. } | LoadKind::Pressure { .. } | LoadKind::Gravity { .. }
+            LoadKind::Force { .. }
+                | LoadKind::Pressure { .. }
+                | LoadKind::Gravity { .. }
+                | LoadKind::RemoteMass { .. }
         )
     }
 }
@@ -1273,6 +1287,13 @@ enum LoadKindDto {
     },
     /// m/s².
     Gravity { acceleration: [f64; 3] },
+    /// kg, at a point in mm.
+    RemoteMass {
+        #[serde(default)]
+        faces: Vec<StudyFaceDto>,
+        mass: f64,
+        point: [f64; 3],
+    },
     /// °C.
     Temperature {
         #[serde(default)]
@@ -1465,6 +1486,11 @@ fn study_dto(study: &Study) -> StudyDto {
                     },
                     LoadKind::Gravity { acceleration } => LoadKindDto::Gravity {
                         acceleration: *acceleration,
+                    },
+                    LoadKind::RemoteMass { faces, kg, point } => LoadKindDto::RemoteMass {
+                        faces: faces_dto(faces),
+                        mass: *kg,
+                        point: *point,
                     },
                     LoadKind::Temperature { faces, celsius } => LoadKindDto::Temperature {
                         faces: faces_dto(faces),
@@ -1877,6 +1903,17 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             LoadKindDto::Gravity { acceleration } => LoadKind::Gravity {
                 acceleration: finite_vector(acceleration, "the acceleration").map_err(item)?,
             },
+            LoadKindDto::RemoteMass { faces, mass, point } => {
+                let kg = finite(mass, "the mass").map_err(item)?;
+                if kg <= 0.0 {
+                    return Err(item("the mass is not positive".to_owned()));
+                }
+                LoadKind::RemoteMass {
+                    faces: faces_from(faces, kind).map_err(item)?,
+                    kg,
+                    point: finite_vector(point, "the mass's point").map_err(item)?,
+                }
+            }
             LoadKindDto::Temperature { faces, temperature } => LoadKind::Temperature {
                 faces: faces_from(faces, kind).map_err(item)?,
                 celsius: celsius(temperature, "the temperature").map_err(item)?,
@@ -1933,11 +1970,10 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             ));
         }
         if matches!(load_kind, LoadKind::Gravity { .. }) && !study_type.takes_gravity() {
-            return Err(item(if study_type == StudyType::Generative {
-                "a generative study has gravity".to_owned()
-            } else {
-                "a topology study has gravity".to_owned()
-            }));
+            return Err(item("a topology study has gravity".to_owned()));
+        }
+        if matches!(load_kind, LoadKind::RemoteMass { .. }) && study_type != StudyType::Generative {
+            return Err(item("only a generative study has remote masses".to_owned()));
         }
         loads.push(Load {
             name: l.name,
@@ -2788,6 +2824,28 @@ mod tests {
             },
             suppressed: false,
         });
+        // 10 g down, and a 1.35 kg instrument on the loaded face, as NASA's bracket carries.
+        study.loads.push(Load {
+            name: "Remote Mass-1".to_owned(),
+            kind: LoadKind::RemoteMass {
+                faces: vec![StudyFace::part(face(9))],
+                kg: 1.35,
+                point: [40.0, 25.0, 0.0],
+            },
+            suppressed: false,
+        });
+        study.loads.push(Load {
+            name: "Gravity-1".to_owned(),
+            kind: LoadKind::Gravity {
+                acceleration: [0.0, -98.1, 0.0],
+            },
+            suppressed: false,
+        });
+        study.generative.load_cases.push(LoadCase {
+            name: "Load Case 3".to_owned(),
+            fixtures: vec!["Fixed-1".to_owned()],
+            loads: vec!["Gravity-1".to_owned(), "Remote Mass-1".to_owned()],
+        });
         file.studies = vec![study, Study::new("Static 1")];
         file
     }
@@ -2905,7 +2963,10 @@ mod tests {
             .flat_map(|f| f.faces.iter_mut())
             .for_each(on);
         for l in &mut s.loads {
-            if let LoadKind::Force { faces, .. } | LoadKind::Pressure { faces, .. } = &mut l.kind {
+            if let LoadKind::Force { faces, .. }
+            | LoadKind::Pressure { faces, .. }
+            | LoadKind::RemoteMass { faces, .. } = &mut l.kind
+            {
                 faces.iter_mut().for_each(on);
             }
         }
@@ -2995,6 +3056,17 @@ mod tests {
             g["load_cases"][1],
             serde_json::json!({ "name": "Load Case 2", "fixtures": ["Fixed-1"], "loads": ["Force-2"] })
         );
+        let remote = &study["loads"][2];
+        assert_eq!(
+            (&remote["name"], &remote["type"], &remote["mass"]),
+            (&"Remote Mass-1".into(), &"remote_mass".into(), &1.35.into())
+        );
+        assert_eq!(remote["point"], serde_json::json!([40.0, 25.0, 0.0]));
+        assert_eq!(remote["faces"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            study["loads"][3],
+            serde_json::json!({ "name": "Gravity-1", "type": "gravity", "acceleration": [0.0, -98.1, 0.0] })
+        );
         let aluminium = &g["materials"][0];
         assert_eq!(aluminium["name"], "Aluminium 6061-T6");
         assert_eq!(aluminium["density"], 2700.0);
@@ -3077,7 +3149,10 @@ mod tests {
                 v["studies"].as_array_mut().unwrap().truncate(1);
                 for item in ["fixtures", "loads"] {
                     for i in 0..study(v)[item].as_array().unwrap().len() {
-                        study(v)[item][i]["faces"][0]["component"] = 1.into();
+                        // Gravity has no faces.
+                        if study(v)[item][i].get("faces").is_some() {
+                            study(v)[item][i]["faces"][0]["component"] = 1.into();
+                        }
                     }
                 }
             },
@@ -3108,11 +3183,17 @@ mod tests {
         );
         refused(
             &|v| {
-                study(v)["loads"][0] = serde_json::json!({
-                    "name": "Gravity-1", "type": "gravity", "acceleration": [0, -9.81, 0]
-                });
+                study(v)["loads"][2]["mass"] = 0.into();
             },
-            "a generative study has gravity",
+            "Remote Mass-1: the mass is not positive",
+        );
+        refused(
+            &|v| {
+                v["studies"][1]["loads"] = serde_json::json!([{
+                    "name": "Remote Mass-1", "type": "remote_mass", "mass": 1.0, "point": [0, 0, 0]
+                }]);
+            },
+            "only a generative study has remote masses",
         );
         refused(
             &|v| study(v)["topology"] = serde_json::json!({ "target_mass": 0.5 }),

@@ -40,6 +40,15 @@ release yet; the git history has every detail.
   marked, as parts of the shape did not settle crisp there. An outcome that stops changing
   while still grey is no longer called settled and runs on to the end. In files: each
   outcome's `grayness` (FORMAT.md §9).
+- **Gravity and remote masses.** *Gravity* weighs the shape as it grows (9.81 m/s² down, or
+  so many g for a shock, along any direction), and *Remote Mass* hangs a component on the
+  faces of a body kept: its mass at its centre of mass, which gravity weighs and whose
+  weight reaches the faces as a force and a moment, as Fusion 360's point mass does (a
+  1.35 kg instrument under 10 g, as NASA's bracket carries). Each is a load the load cases
+  pick, so a case can be a shock along X and another the weight alone. Weighted outcomes
+  are the stiffest for their mass target at most: a lighter one may be stiffer when the
+  material weighs. In files: `gravity` in generative studies and the new `remote_mass`
+  load (FORMAT.md §8).
 - **Milling from several sides.** *Milling* can make one outcome milled from all the sides
   picked (*All sides in one outcome*), the part turned over between setups, as Autodesk's
   machinery example mills from +Y and −Y: every spot is reached from one side or another,

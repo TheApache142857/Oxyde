@@ -16,6 +16,12 @@
 //!   nearest preserve voxel around. A fixture holds the corner of that voxel nearest its
 //!   sample (all three directions, or a roller's normal); a load spreads its sample's share
 //!   (by area) over the voxel's corners by trilinear weights.
+//! - **Remote masses** are linked to their faces' samples as a distributing link (RBE3) is:
+//!   the mass moves as the samples' mean translation and their mean turn about their
+//!   centroid, weighted by area, carried to its point; its weight under a case's
+//!   acceleration reaches each sample as that link's transpose gives it, a force and a
+//!   moment about the centroid spread over the faces, then the voxel's corners by trilinear
+//!   weights as a load's.
 
 // Indices into the grid's arrays, sized here from its counts.
 #![allow(clippy::indexing_slicing)]
@@ -23,6 +29,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::brick::invert3;
 use super::multigrid::{Dims, par_fill};
 use super::{DesignSpace, GenerativeError, GenerativeStudy};
 use crate::bvh::{Bvh, Hit};
@@ -86,8 +93,11 @@ pub struct Grid {
 pub(crate) struct CaseNodes {
     /// Held nodes in order, each with the motions it keeps (`I` less the held directions).
     pub(crate) holds: Vec<(u32, [f64; 9])>,
-    /// Loaded nodes in order, each with its force, N.
+    /// Loaded nodes in order, each with its force, N: the forces and pressures, and the
+    /// remote masses' weight under `acceleration`.
     pub(crate) forces: Vec<(u32, V3)>,
+    /// m/s²: the case's accelerations summed, which weigh the material too; zero for none.
+    pub(crate) acceleration: V3,
 }
 
 impl Grid {
@@ -355,6 +365,7 @@ impl Grid {
             .iter()
             .flat_map(|f| f.labels.iter())
             .chain(study.loads.iter().flat_map(|l| l.labels.iter()))
+            .chain(study.remote_masses.iter().flat_map(|r| r.labels.iter()))
             .copied()
             .collect();
         for mesh in &study.space.preserve {
@@ -457,6 +468,23 @@ impl Grid {
             }
             load_forces.push(forces);
         }
+        // Each remote mass's link to the nodes.
+        let mut links: Vec<BTreeMap<u32, [f64; 9]>> = Vec::new();
+        for (index, remote) in study.remote_masses.iter().enumerate() {
+            let triangles: Vec<&[V3; 3]> = remote
+                .labels
+                .iter()
+                .flat_map(|l| faces.get(l).into_iter().flatten())
+                .collect();
+            let usable = remote.mass.is_finite()
+                && remote.mass > 0.0
+                && remote.point.iter().all(|x| x.is_finite())
+                && !triangles.is_empty();
+            if !usable {
+                return Err(GenerativeError::BadRemoteMass { index });
+            }
+            links.push(self.link(&triangles, remote.point, spacing, &mut anchored));
+        }
         anchored.sort_unstable();
         anchored.dedup();
         self.anchored = anchored;
@@ -477,22 +505,120 @@ impl Grid {
                     *sum = add(*sum, *f);
                 }
             }
+            // m/s²: the case's accelerations, summed.
+            let acceleration = case
+                .gravity
+                .iter()
+                .filter_map(|&g| study.gravity.get(g))
+                .filter(|a| a.iter().all(|x| x.is_finite()))
+                .fold([0.0; 3], |sum, a| add(sum, *a));
+            // The remote masses' weight, kg × m/s² = N, through their links.
+            for &r in &case.remote_masses {
+                let (Some(remote), Some(link)) = (study.remote_masses.get(r), links.get(r)) else {
+                    continue;
+                };
+                let weight = scale(acceleration, remote.mass);
+                for (node, b) in link {
+                    let f: V3 = std::array::from_fn(|i| {
+                        (0..3).map(|j| b[j * 3 + i] * weight[j]).sum::<f64>()
+                    });
+                    let sum = forces.entry(*node).or_insert([0.0; 3]);
+                    *sum = add(*sum, f);
+                }
+            }
             let nodes = CaseNodes {
                 holds: holds
                     .into_iter()
                     .map(|(node, (fixed, normals))| (node, kept_motions(fixed, &normals)))
                     .collect(),
                 forces: forces.into_iter().filter(|(_, f)| norm(*f) > 0.0).collect(),
+                acceleration,
             };
             if nodes.holds.is_empty() {
                 return Err(GenerativeError::NotHeld);
             }
-            if nodes.forces.is_empty() {
+            if nodes.forces.is_empty() && norm(acceleration) == 0.0 {
                 return Err(GenerativeError::NoLoads);
             }
             self.cases.push(nodes);
         }
         Ok(())
+    }
+
+    /// The link of a remote mass at `point` to the nodes through the samples of its faces'
+    /// `triangles`, every `spacing`: per node the block `B` with which the point moves as
+    /// `Σ B u`, its force `F` reaching the node as `Bᵀ F`. Each sample `i` (area `wᵢ`, at
+    /// `rᵢ` from the samples' centroid, `W` their area) gives `wᵢ / W I − wᵢ [d]ₓ J⁻¹ [rᵢ]ₓ`,
+    /// `d` the point less the centroid and `J = Σ wᵢ (|rᵢ|² I − rᵢ rᵢᵀ)`, spread over its
+    /// voxel's corners by trilinear weights; samples in a line (J singular) carry the
+    /// force alone, no moment.
+    fn link(
+        &mut self,
+        triangles: &[&[V3; 3]],
+        point: V3,
+        spacing: f64,
+        anchored: &mut Vec<u32>,
+    ) -> BTreeMap<u32, [f64; 9]> {
+        let dims = self.dims();
+        let mut points: Vec<(V3, f64, usize)> = Vec::new();
+        for tri in triangles {
+            for (p, a) in samples(tri, spacing) {
+                let v = self.anchor_voxel(p);
+                anchored.push(v as u32);
+                points.push((p, a, v));
+            }
+        }
+        let area: f64 = points.iter().map(|(_, a, _)| a).sum();
+        let mut out: BTreeMap<u32, [f64; 9]> = BTreeMap::new();
+        if !(area.is_finite() && area > 0.0) {
+            return out;
+        }
+        let centroid = scale(
+            points
+                .iter()
+                .fold([0.0; 3], |sum, (p, a, _)| add(sum, scale(*p, *a))),
+            1.0 / area,
+        );
+        let mut j = [0.0; 9];
+        for (p, a, _) in &points {
+            let r = sub(*p, centroid);
+            let rr = dot(r, r);
+            for row in 0..3 {
+                for col in 0..3 {
+                    let identity = if row == col { rr } else { 0.0 };
+                    j[row * 3 + col] += a * (identity - r[row] * r[col]);
+                }
+            }
+        }
+        let turn = invert3(&j).unwrap_or([0.0; 9]);
+        // [d]ₓ J⁻¹, the same for every sample.
+        let lever = mul3(&skew(sub(point, centroid)), &turn);
+        for (p, a, v) in points {
+            let moment = mul3(&lever, &skew(sub(p, centroid)));
+            let block: [f64; 9] = std::array::from_fn(|k| {
+                let identity = if k % 4 == 0 { a / area } else { 0.0 };
+                identity - a * moment[k]
+            });
+            let c = self.coords(v);
+            let t: [f64; 3] = std::array::from_fn(|x| {
+                ((p[x] - (self.origin[x] + c[x] as f64 * self.size)) / self.size).clamp(0.0, 1.0)
+            });
+            for corner in 0..8 {
+                let k = super::brick::corner(corner);
+                let w: f64 = (0..3)
+                    .map(|x| if k[x] == 1 { t[x] } else { 1.0 - t[x] })
+                    .product();
+                if w == 0.0 {
+                    continue;
+                }
+                let node = dims.node([c[0] + k[0], c[1] + k[1], c[2] + k[2]]) as u32;
+                let sum = out.entry(node).or_insert([0.0; 9]);
+                for (s, b) in sum.iter_mut().zip(&block) {
+                    *s += w * b;
+                }
+            }
+        }
+        out
     }
 
     /// The voxel a sample of a fixture's or a load's face at `p` acts through: the one
@@ -528,6 +654,19 @@ impl Grid {
         self.kinds[v] = Voxel::Preserve;
         v
     }
+}
+
+/// The cross product with `a` as a matrix: `[a]ₓ b = a × b`, row-major.
+fn skew(a: V3) -> [f64; 9] {
+    [0.0, -a[2], a[1], a[2], 0.0, -a[0], -a[1], a[0], 0.0]
+}
+
+/// `a b`, 3 × 3, row-major.
+fn mul3(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+    std::array::from_fn(|k| {
+        let (row, col) = (k / 3, k % 3);
+        (0..3).map(|i| a[row * 3 + i] * b[i * 3 + col]).sum()
+    })
 }
 
 /// The motions a held node keeps: none when a fixture holds it fixed, else the identity

@@ -111,6 +111,13 @@ const STEADY_OVER: usize = 10;
 const STEADY_MASS: f64 = 0.01;
 /// Minimize mass's stress measure: the relaxation exponent (`ρ^q σ`) and the p-norm's.
 const STRESS_RELAXATION: f64 = 0.5;
+/// Under this projected density a voxel's weight goes as the cube of it, as its stiffness
+/// does, above it as the density itself (value-continuous there): near-void material
+/// weighs next to nothing, or its weight would outrun the stiffness carrying it and grey
+/// regions sag under their own weight, the parasitic effect of self-weight in SIMP
+/// (Bruyneel and Duysinx, 2005). The mass the target and the outcome count is the
+/// density's own.
+const WEIGHT_KNEE: f64 = 0.1;
 const NORM_POWER: i32 = 8;
 /// How far the p-norm's scaling to the largest value moves each iteration (Le et al. 2010).
 const NORMALIZATION_DAMPING: f64 = 0.5;
@@ -154,12 +161,31 @@ pub struct DesignSpace {
     pub margin: Option<f64>,
 }
 
-/// Fixtures and loads the outcome carries at once: indices into the study's `fixtures` and
-/// `loads`.
+/// Fixtures and loads the outcome carries at once: indices into the study's `fixtures`,
+/// `loads`, `gravity` and `remote_masses`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct LoadCase {
     pub fixtures: Vec<usize>,
     pub loads: Vec<usize>,
+    /// The accelerations it carries: their sum weighs the material and the case's remote
+    /// masses.
+    pub gravity: Vec<usize>,
+    /// The remote masses the case's accelerations act on.
+    pub remote_masses: Vec<usize>,
+}
+
+/// A component carried by faces of the preserve bodies (Fusion 360's point mass, the
+/// instrument a bracket holds): under a load case's acceleration its weight reaches the
+/// faces as a force and a moment spread over them by area, as a distributing link (RBE3)
+/// carries it, the faces moving on average as the mass does. It stiffens nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteMass {
+    /// kg.
+    pub mass: f64,
+    /// mm: its centre of mass.
+    pub point: V3,
+    /// The faces it is carried by, by label.
+    pub labels: Vec<u32>,
 }
 
 /// What a generative study looks for.
@@ -184,8 +210,13 @@ pub struct GenerativeStudy {
     /// On faces of the preserve bodies, by label.
     pub fixtures: Vec<Fixture>,
     pub loads: Vec<Load>,
+    /// Accelerations, m/s² (gravity, 9.81 down; a shock of so many g): a load case's sum
+    /// weighs the material and the case's remote masses.
+    pub gravity: Vec<V3>,
+    pub remote_masses: Vec<RemoteMass>,
     /// The load cases, each carried in turn: the stiffest shape for them all, its
-    /// compliance their sum. None: one case of every fixture and load.
+    /// compliance their sum. None: one case of every fixture, load, acceleration and
+    /// remote mass.
     pub load_cases: Vec<LoadCase>,
     pub objective: Objective,
     /// kg: the outcome's mass, preserve voxels included ([`Objective::MaxStiffness`]).
@@ -207,6 +238,8 @@ impl GenerativeStudy {
             vec![LoadCase {
                 fixtures: (0..self.fixtures.len()).collect(),
                 loads: (0..self.loads.len()).collect(),
+                gravity: (0..self.gravity.len()).collect(),
+                remote_masses: (0..self.remote_masses.len()).collect(),
             }]
         } else {
             self.load_cases.clone()
@@ -447,6 +480,11 @@ pub enum GenerativeError {
     NotHeld,
     /// The loads act on nothing.
     NoLoads,
+    /// A remote mass (its index) has no positive mass, no point or no face of a preserve
+    /// body.
+    BadRemoteMass {
+        index: usize,
+    },
     /// The mass target is not between the preserve voxels' mass and the whole design
     /// space's, kg.
     BadTarget {
@@ -512,7 +550,12 @@ impl std::fmt::Display for GenerativeError {
             ),
             GenerativeError::NoLoads => write!(
                 f,
-                "no load acts on the design: add a force or a pressure on a preserve body"
+                "no load acts on the design: add a force or a pressure on a preserve body, or gravity"
+            ),
+            GenerativeError::BadRemoteMass { index } => write!(
+                f,
+                "remote mass {} needs a positive mass, a point and faces of a preserve body",
+                index + 1
             ),
             GenerativeError::BadTarget { min, max } => write!(
                 f,
@@ -806,7 +849,7 @@ pub fn generate_on(
     let brick = Brick::new(material.poisson);
     let dims = grid.dims();
     let nodes = dims.node_count();
-    // Each load case's held nodes, their projectors and its loads.
+    // Each load case's held nodes, their projectors, its loads and its acceleration.
     let cases: Vec<CaseSystem> = grid
         .cases
         .iter()
@@ -826,12 +869,19 @@ pub fn generate_on(
                     loads[3 * n..3 * n + 3].copy_from_slice(f);
                 }
             }
-            (held, projectors, loads)
+            CaseSystem {
+                held,
+                projectors,
+                loads,
+                acceleration: case.acceleration,
+            }
         })
         .collect();
     if cases.is_empty() {
         return Err(GenerativeError::NoLoads);
     }
+    // The material weighs in some case: its loads change with the design.
+    let weighted = cases.iter().any(|c| c.acceleration != [0.0; 3]);
 
     // The design starts uniform: at the density whose projection meets the target, or solid
     // (where the stresses are least) to minimize mass.
@@ -862,6 +912,8 @@ pub fn generate_on(
     let mut solved_rho: Vec<f64> = Vec::new();
     let mut solved_field: Vec<f64> = Vec::new();
     let mut compliance = 0.0;
+    // N·mm: the first compliance, what weighted stiffness studies scale theirs to.
+    let mut first_compliance: Option<f64> = None;
 
     'iterations: for iteration in 0..iterations {
         // Stopped after an iteration or more: the design as far as it got.
@@ -912,17 +964,41 @@ pub fn generate_on(
         } else {
             SOLVE_TOLERANCE
         });
+        // kg: each voxel's weight as the loads see it, when the material weighs.
+        let weights: Vec<f64> = if weighted {
+            (0..voxels)
+                .map(|v| match state[v] {
+                    State::Free => voxel_mass * weight_share(rho[v]).0,
+                    State::Solid => voxel_mass,
+                    State::Void => 0.0,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Each case's loads with the material's weight under its acceleration.
+        let totals: Vec<Option<Vec<f64>>> = cases
+            .iter()
+            .map(|case| {
+                (case.acceleration != [0.0; 3]).then(|| {
+                    let mut f = case.loads.clone();
+                    add_weight(dims, &weights, case.acceleration, &mut f);
+                    f
+                })
+            })
+            .collect();
         // Each load case solved in turn, its energies and its work added up.
         let mut energies = vec![0.0; voxels];
         compliance = 0.0;
-        for ((held, projectors, loads), displacement) in cases.iter().zip(&mut displacements) {
+        for ((case, total), displacement) in cases.iter().zip(&totals).zip(&mut displacements) {
+            let loads: &[f64] = total.as_deref().unwrap_or(&case.loads);
             // Void voxels are Laplacians in the solve, a third of a brick's work.
             let fine = Fine::new(
                 dims,
                 &brick,
                 &stiffness,
-                held,
-                projectors,
+                &case.held,
+                &case.projectors,
                 SCALAR_BELOW * modulus * h,
             );
             let solved = match backend.as_deref_mut() {
@@ -937,7 +1013,7 @@ pub fn generate_on(
                 ),
                 Some(backend) => {
                     fine.project(displacement);
-                    let mut kept = loads.clone();
+                    let mut kept = loads.to_vec();
                     fine.project(&mut kept);
                     let system = System {
                         fine: &fine,
@@ -1003,23 +1079,54 @@ pub fn generate_on(
             out
         };
         let dm = back(&|_| voxel_mass);
+        // dK/dρ for each free voxel, per unit of uᵀ k u.
+        let stiffness_slope =
+            |v: usize| PENALTY * rho[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * modulus * h;
+        // kg: what each free voxel's weight gains per unit of projected density.
+        let weight_slope = |v: usize| voxel_mass * weight_share(rho[v]).1;
         let next = match limits {
             None => {
-                let dc = back(&|v| {
-                    -PENALTY
-                        * rho[v].powf(PENALTY - 1.0)
-                        * (1.0 - VOID_STIFFNESS)
-                        * modulus
-                        * h
-                        * energies[v]
-                });
-                let budget = target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
-                let limit = if beta >= 8.0 {
-                    LATE_MOVE_LIMIT
+                // The compliance's slope: the stiffness's, and where the material weighs,
+                // its weight's, twice (it loads and it is what moves).
+                let mut per_voxel: Vec<f64> = (0..voxels)
+                    .map(|v| -stiffness_slope(v) * energies[v])
+                    .collect();
+                for (case, u) in cases.iter().zip(&displacements) {
+                    if case.acceleration == [0.0; 3] {
+                        continue;
+                    }
+                    let work = corner_work(dims, u, case.acceleration);
+                    for v in 0..voxels {
+                        if state[v] == State::Free {
+                            per_voxel[v] += 2.0 * weight_slope(v) * work[v];
+                        }
+                    }
+                }
+                let dc = back(&|v| per_voxel[v]);
+                if weighted {
+                    // Weight turns the compliance's slope positive where material loads
+                    // more than it stiffens, and optimality criteria assume it never does:
+                    // the method of moving asymptotes moves the design, the compliance
+                    // scaled to the first one its objective, the mass target its limit
+                    // (the stiffest design may weigh less than it).
+                    let reference =
+                        *first_compliance.get_or_insert(compliance.max(f64::MIN_POSITIVE));
+                    let df0: Vec<f64> = dc.iter().map(|d| d / reference).collect();
+                    let value = mass_now / target - 1.0;
+                    feasible = value <= LIMIT_TOLERANCE;
+                    let slope: Vec<f64> = dm.iter().map(|m| m / target).collect();
+                    let limit = if beta >= 8.0 { LATE_MMA_MOVE } else { MMA_MOVE };
+                    mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &[value], &[slope])
                 } else {
-                    MOVE_LIMIT
-                };
-                optimality_update(&x, &dc, &dm, budget, limit)
+                    let budget =
+                        target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
+                    let limit = if beta >= 8.0 {
+                        LATE_MOVE_LIMIT
+                    } else {
+                        MOVE_LIMIT
+                    };
+                    optimality_update(&x, &dc, &dm, budget, limit)
+                }
             }
             Some((allowed_stress, allowed_displacement)) => {
                 let element = ElementContext {
@@ -1030,10 +1137,6 @@ pub fn generate_on(
                     anchored: &grid.anchored,
                     modulus,
                     h,
-                };
-                // dK/dρ for each free voxel, per unit of λᵀ k u.
-                let stiffness_slope = |v: usize| {
-                    PENALTY * rho[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * modulus * h
                 };
                 let mut values = Vec::new();
                 let mut slopes = Vec::new();
@@ -1061,14 +1164,13 @@ pub fn generate_on(
                     .map(|d| element.displacement_slopes(d, &displacements))
                     .unwrap_or_default();
                 // The adjoint part: one solve per case and measure.
-                for (c, ((held, projectors, _), u)) in cases.iter().zip(&displacements).enumerate()
-                {
+                for (c, (case, u)) in cases.iter().zip(&displacements).enumerate() {
                     let fine = Fine::new(
                         dims,
                         &brick,
                         &stiffness,
-                        held,
-                        projectors,
+                        &case.held,
+                        &case.projectors,
                         SCALAR_BELOW * modulus * h,
                     );
                     let mut measures: Vec<(usize, Vec<f64>)> =
@@ -1097,6 +1199,9 @@ pub fn generate_on(
                         }
                         let products =
                             element_products(dims, &brick, lambda, u, &stiffness, threads);
+                        // Where the material weighs, its weight's slope against λ too.
+                        let work = (case.acceleration != [0.0; 3])
+                            .then(|| corner_work(dims, lambda, case.acceleration));
                         let target = if k == 0 {
                             &mut per_voxel
                         } else {
@@ -1105,6 +1210,9 @@ pub fn generate_on(
                         for v in 0..voxels {
                             if state[v] == State::Free {
                                 target[v] -= products[v] * stiffness_slope(v);
+                                if let Some(w) = &work {
+                                    target[v] += weight_slope(v) * w[v];
+                                }
                             }
                         }
                     }
@@ -1148,8 +1256,13 @@ pub fn generate_on(
                     let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
                         (lo.min(s.compliance), hi.max(s.compliance))
                     });
-                    hi - lo <= STEADY_COMPLIANCE * hi
-                        && (mass_now - target).abs() <= STEADY_MASS * target
+                    // Weighted, the stiffest design may weigh less than the target.
+                    let on_target = if weighted {
+                        mass_now <= (1.0 + STEADY_MASS) * target
+                    } else {
+                        (mass_now - target).abs() <= STEADY_MASS * target
+                    };
+                    hi - lo <= STEADY_COMPLIANCE * hi && on_target
                 }
                 // The mass steady, the limits met.
                 Some(_) => {
@@ -1537,9 +1650,67 @@ fn element_products(
     out
 }
 
-/// A load case as each iteration solves it: per node the index of its projector (or
-/// `NONE`), the projectors, and the loads, three per node.
-type CaseSystem = (Vec<u32>, Vec<[f64; 9]>, Vec<f64>);
+/// A load case as each iteration solves it.
+struct CaseSystem {
+    /// Per node: the index of its projector, or `NONE`.
+    held: Vec<u32>,
+    projectors: Vec<[f64; 9]>,
+    /// N, three per node: the forces, the pressures and the remote masses' weight.
+    loads: Vec<f64>,
+    /// m/s²: what weighs the material too; zero for none.
+    acceleration: V3,
+}
+
+/// A voxel's share of its solid weight at projected density `r`, and its slope: the
+/// density above [`WEIGHT_KNEE`], its cube scaled to meet it below.
+fn weight_share(r: f64) -> (f64, f64) {
+    if r >= WEIGHT_KNEE {
+        (r, 1.0)
+    } else {
+        let c = 1.0 / (WEIGHT_KNEE * WEIGHT_KNEE);
+        (c * r * r * r, 3.0 * c * r * r)
+    }
+}
+
+/// Adds to `forces` (N, three per node) the weight of voxels of `masses` (kg) under
+/// `acceleration` (m/s²): an eighth of each at each of its corners, voxel by voxel in
+/// order.
+fn add_weight(dims: Dims, masses: &[f64], acceleration: V3, forces: &mut [f64]) {
+    let offsets = dims.corner_offsets();
+    for (v, m) in masses.iter().enumerate() {
+        if *m == 0.0 {
+            continue;
+        }
+        let base = dims.node(dims.cell_coords(v));
+        for off in &offsets {
+            let n = base + off;
+            for (x, a) in acceleration.iter().enumerate() {
+                forces[3 * n + x] += m * a / 8.0;
+            }
+        }
+    }
+}
+
+/// Per voxel: `field` at its corners against `acceleration`, averaged, `Σ aᵀ f / 8`, what a
+/// kilogram more of it does to `fieldᵀ f` through its weight.
+fn corner_work(dims: Dims, field: &[f64], acceleration: V3) -> Vec<f64> {
+    let offsets = dims.corner_offsets();
+    (0..dims.cell_count())
+        .map(|v| {
+            let base = dims.node(dims.cell_coords(v));
+            offsets
+                .iter()
+                .map(|off| {
+                    let n = base + off;
+                    (0..3)
+                        .map(|x| acceleration[x] * field[3 * n + x])
+                        .sum::<f64>()
+                })
+                .sum::<f64>()
+                / 8.0
+        })
+        .collect()
+}
 
 /// Densities as the files keep them: 0 to 255.
 fn bytes(rho: &[f64], state: &[State]) -> Vec<u8> {

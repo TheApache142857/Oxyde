@@ -80,6 +80,8 @@ fn bracket(voxel_size: f64, iterations: usize) -> GenerativeStudy {
             },
             labels: vec![11],
         }],
+        gravity: Vec::new(),
+        remote_masses: Vec::new(),
         load_cases: Vec::new(),
         objective: Default::default(),
         mass_target: 0.25 * 60.0 * 20.0 * 10.0 * 7850.0 * 1e-9,

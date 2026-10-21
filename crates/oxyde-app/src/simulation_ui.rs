@@ -336,10 +336,22 @@ pub enum ItemKind {
     Preserve {
         depth: f64,
     },
+    /// A generative study's acceleration, m/s² in world coordinates (Y up): what weighs the
+    /// material and the remote masses of the load cases holding it. No faces. (A static
+    /// study's weight is its `gravity` switch.)
+    Gravity {
+        acceleration: [f64; 3],
+    },
+    /// A generative study's component carried by the faces: its mass, kg, and its centre
+    /// of mass, mm. The load cases' gravity weighs it.
+    RemoteMass {
+        kg: f64,
+        point: [f64; 3],
+    },
 }
 
 /// The names items are numbered after, as SolidWorks names them.
-pub(crate) const ITEM_BASES: [&str; 12] = [
+pub(crate) const ITEM_BASES: [&str; 14] = [
     "Fixed",
     "Roller/Slider",
     "Force",
@@ -351,6 +363,8 @@ pub(crate) const ITEM_BASES: [&str; 12] = [
     "Radiation",
     "Internal Heat",
     "Preserve",
+    "Gravity",
+    "Remote Mass",
     "Contact",
 ];
 
@@ -385,6 +399,8 @@ impl ItemKind {
             ItemKind::Radiation { .. } => "Radiation",
             ItemKind::InternalHeat { .. } => "Internal Heat",
             ItemKind::Preserve { .. } => "Preserve",
+            ItemKind::Gravity { .. } => "Gravity",
+            ItemKind::RemoteMass { .. } => "Remote Mass",
         }
     }
 
@@ -392,6 +408,7 @@ impl ItemKind {
     pub(crate) fn fits(&self, t: StudyType) -> bool {
         match self {
             ItemKind::Preserve { .. } => t == StudyType::Topology,
+            ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. } => t == StudyType::Generative,
             k if k.is_thermal() => t.is_thermal(),
             _ => t.is_structural(),
         }
@@ -1840,6 +1857,8 @@ impl OxydeApp {
                     labels,
                     depth: depth.max(0.0),
                 }),
+                // Generative studies' alone, which the Generative Design tab solves.
+                ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. } => {}
             }
         }
         if !mesh_only {
@@ -2749,6 +2768,13 @@ impl OxydeApp {
                             egui::Stroke::new(width * 0.7, egui::Color32::WHITE),
                         );
                     }
+                    ItemKind::RemoteMass { .. } => {
+                        // A weight hung on the face: a ring round a dot.
+                        painter.circle_filled(tip, 3.5, load_color);
+                        painter.circle_stroke(tip, 7.5, egui::Stroke::new(width, load_color));
+                    }
+                    // No faces: never reached.
+                    ItemKind::Gravity { .. } => {}
                 }
             }
         }
@@ -4234,28 +4260,36 @@ pub(crate) fn item_row(
     selected: &mut Option<usize>,
     action: &mut Option<PanelAction>,
 ) {
+    // Gravity acts on the whole design, on no faces.
+    let on_faces = !matches!(item.kind, ItemKind::Gravity { .. });
     ui.horizontal(|ui| {
         let is_selected = *selected == Some(index);
         if ui
             .selectable_label(is_selected, &item.name)
-            .on_hover_text("Select its faces in the model")
+            .on_hover_text(if on_faces {
+                "Select its faces in the model"
+            } else {
+                "It weighs the whole design"
+            })
             .clicked()
         {
             *action = Some(PanelAction::Select(index));
         }
-        ui.label(
-            egui::RichText::new(format!("{} face(s)", item.faces.len()))
-                .small()
-                .weak(),
-        );
+        let what = if on_faces {
+            format!("{} face(s)", item.faces.len())
+        } else {
+            "the material and the remote masses".to_owned()
+        };
+        ui.label(egui::RichText::new(what).small().weak());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("×").on_hover_text("Delete").clicked() {
                 *action = Some(PanelAction::Delete(index));
             }
-            if ui
-                .small_button("Use selection")
-                .on_hover_text("Put it on the faces selected now instead")
-                .clicked()
+            if on_faces
+                && ui
+                    .small_button("Use selection")
+                    .on_hover_text("Put it on the faces selected now instead")
+                    .clicked()
             {
                 *action = Some(PanelAction::UseSelection(index));
             }
@@ -4407,6 +4441,69 @@ pub(crate) fn item_row(
                         "How deep under the faces the material stays; 0 keeps the elements on them",
                     )
                     .changed();
+            });
+        }
+        ItemKind::Gravity { acceleration } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                for (value, axis) in acceleration.iter_mut().zip(["X ", "Y ", "Z "]) {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(value)
+                                .speed(0.1)
+                                .max_decimals(3)
+                                .prefix(axis)
+                                .suffix(" m/s²"),
+                        )
+                        .on_hover_text(
+                            "The acceleration, world axes (Y up): 9.81 m/s² down is gravity; a \
+                             shock of 10 g is ten times that",
+                        )
+                        .changed();
+                }
+            });
+            let g = (acceleration[0].powi(2) + acceleration[1].powi(2) + acceleration[2].powi(2))
+                .sqrt()
+                / 9.81;
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new(format!("{g:.2} g")).small().weak());
+                if ui
+                    .small_button("1 g down")
+                    .on_hover_text("Gravity: 9.81 m/s² along −Y")
+                    .clicked()
+                {
+                    *acceleration = [0.0, -9.81, 0.0];
+                    changed = true;
+                }
+            });
+        }
+        ItemKind::RemoteMass { kg, point } => {
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                changed |= ui
+                    .add(
+                        egui::DragValue::new(kg)
+                            .range(0.0..=1e6)
+                            .speed(0.01)
+                            .max_decimals(4)
+                            .suffix(" kg"),
+                    )
+                    .on_hover_text(
+                        "The component's mass: the load cases' gravity weighs it, and its weight \
+                         reaches the faces as a force and a moment",
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("at").small());
+                for v in point.iter_mut() {
+                    changed |= ui
+                        .add(egui::DragValue::new(v).speed(0.5).suffix(" mm"))
+                        .on_hover_text("Its centre of mass, world coordinates")
+                        .changed();
+                }
             });
         }
     }

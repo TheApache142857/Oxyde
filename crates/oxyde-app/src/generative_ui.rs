@@ -37,13 +37,15 @@ use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical,
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError, GenerativeStudy, Grid,
-    MAX_VOXELS, Method, Objective, Obstacle, Sides, Voxel, decimate_holding, exact_surface,
-    generate_on, solid_pieces, surface, voxel_size,
+    MAX_VOXELS, Method, Objective, Obstacle, RemoteMass, Sides, Voxel, decimate_holding,
+    exact_surface, generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
 use crate::app::OxydeApp;
-use crate::simulation_ui::{ItemKind, PanelAction, Study, Surfaces, format_value, item_row};
+use crate::simulation_ui::{
+    ItemKind, PanelAction, SimFace, Study, Surfaces, format_value, item_row,
+};
 
 /// The colours of the bodies' roles while setting up, as Fusion 360 shows them.
 pub(crate) const PRESERVE_COLOR: [u8; 3] = [70, 170, 95];
@@ -386,14 +388,24 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
 
     let mut fixtures = Vec::new();
     let mut loads = Vec::new();
+    let mut gravity = Vec::new();
+    let mut remote_masses = Vec::new();
     // Their names, in the same order, for the load cases.
     let mut fixture_names: Vec<&str> = Vec::new();
     let mut load_names: Vec<&str> = Vec::new();
+    let mut gravity_names: Vec<&str> = Vec::new();
+    let mut remote_names: Vec<&str> = Vec::new();
     for item in study
         .items
         .iter()
         .filter(|i| i.kind.fits(StudyType::Generative))
     {
+        // Gravity weighs the whole design: no faces.
+        if let ItemKind::Gravity { acceleration } = item.kind {
+            gravity.push(acceleration);
+            gravity_names.push(&item.name);
+            continue;
+        }
         let labels = surfaces.labels(&item.faces);
         if labels.is_empty() {
             return Err(format!(
@@ -413,10 +425,10 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
                 item.name
             ));
         }
-        if matches!(item.kind, ItemKind::Fixed | ItemKind::Roller) {
-            fixture_names.push(&item.name);
-        } else {
-            load_names.push(&item.name);
+        match item.kind {
+            ItemKind::Fixed | ItemKind::Roller => fixture_names.push(&item.name),
+            ItemKind::RemoteMass { .. } => remote_names.push(&item.name),
+            _ => load_names.push(&item.name),
         }
         match item.kind {
             ItemKind::Fixed => fixtures.push(oxyde_sim::Fixture {
@@ -438,6 +450,11 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
                 kind: LoadKind::Pressure { value: mpa },
                 labels,
             }),
+            ItemKind::RemoteMass { kg, point } => remote_masses.push(RemoteMass {
+                mass: kg,
+                point,
+                labels,
+            }),
             _ => {}
         }
     }
@@ -447,11 +464,19 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
                 .to_owned(),
         );
     }
-    if loads.is_empty() {
+    if loads.is_empty() && gravity.is_empty() {
         return Err(
-            "Nothing loads the design: select faces of a preserve body, then Force or Pressure"
+            "Nothing loads the design: select faces of a preserve body, then Force or Pressure, \
+             or add Gravity"
                 .to_owned(),
         );
+    }
+    if gravity.is_empty()
+        && let Some(name) = remote_names.first()
+    {
+        return Err(format!(
+            "{name} weighs nothing without gravity: add Gravity (Design conditions)"
+        ));
     }
     let index = |names: &[String], list: &[&str]| -> Vec<usize> {
         names
@@ -464,8 +489,10 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         let case = oxyde_sim::generative::LoadCase {
             fixtures: index(&c.fixtures, &fixture_names),
             loads: index(&c.loads, &load_names),
+            gravity: index(&c.loads, &gravity_names),
+            remote_masses: index(&c.loads, &remote_names),
         };
-        if case.fixtures.is_empty() || case.loads.is_empty() {
+        if case.fixtures.is_empty() || (case.loads.is_empty() && case.gravity.is_empty()) {
             return Err(format!(
                 "{} carries nothing: tick a fixture and a load for it (Design conditions)",
                 c.name
@@ -496,6 +523,8 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         space,
         fixtures,
         loads,
+        gravity,
+        remote_masses,
         load_cases,
         objective,
         mass_target: g.mass_target,
@@ -514,21 +543,63 @@ fn engine_symmetry(s: Option<SymmetryPlanes>) -> Option<Symmetry> {
 }
 
 /// A new fixture or load joins the study's load cases, when it has some: a fixture every
-/// case (most hold the part the same way), a load the last case (the one being set up).
+/// case (most hold the part the same way), gravity and a remote mass every case too (the
+/// part always weighs, and carries what is fixed to it), another load the last case (the
+/// one being set up).
 pub(crate) fn join_load_cases(study: &mut Study, item: usize) {
     let Some(item) = study.items.get(item) else {
         return;
     };
     let name = item.name.clone();
     let fixture = matches!(item.kind, ItemKind::Fixed | ItemKind::Roller);
+    let always = matches!(
+        item.kind,
+        ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. }
+    );
     let cases = &mut study.generative.load_cases;
     if fixture {
         for c in cases.iter_mut() {
             c.fixtures.push(name.clone());
         }
+    } else if always {
+        for c in cases.iter_mut() {
+            c.loads.push(name.clone());
+        }
     } else if let Some(c) = cases.last_mut() {
         c.loads.push(name);
     }
+}
+
+/// The area-weighted centre of `faces`, mm: where a remote mass carried by them starts.
+fn faces_centre(surfaces: &Surfaces, faces: &[SimFace]) -> Option<[f64; 3]> {
+    let labels = surfaces.labels(faces);
+    let (mut sum, mut area) = ([0.0; 3], 0.0);
+    for s in &surfaces.solids {
+        for (t, l) in s.triangles.iter().zip(&s.labels) {
+            if !labels.contains(l) {
+                continue;
+            }
+            let p = |i: u32| s.positions.get(i as usize).copied();
+            let (Some(a), Some(b), Some(c)) = (p(t[0]), p(t[1]), p(t[2])) else {
+                continue;
+            };
+            let e: [[f64; 3]; 2] = [
+                std::array::from_fn(|k| b[k] - a[k]),
+                std::array::from_fn(|k| c[k] - a[k]),
+            ];
+            let n = [
+                e[0][1] * e[1][2] - e[0][2] * e[1][1],
+                e[0][2] * e[1][0] - e[0][0] * e[1][2],
+                e[0][0] * e[1][1] - e[0][1] * e[1][0],
+            ];
+            let w = 0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            for k in 0..3 {
+                sum[k] += w * (a[k] + b[k] + c[k]) / 3.0;
+            }
+            area += w;
+        }
+    }
+    (area > 0.0).then(|| sum.map(|v| v / area))
 }
 
 /// A fixture or load deleted leaves the load cases.
@@ -1321,6 +1392,62 @@ impl OxydeApp {
         self.simulation.generative.job.is_some()
     }
 
+    /// Gravity: 9.81 m/s² down on the whole design and its remote masses, in every load
+    /// case.
+    pub(crate) fn add_gravity(&mut self) {
+        if !self.generative_study_open() || self.generative_running() {
+            return;
+        }
+        let study = &mut self.simulation.study;
+        let index = study.add(
+            ItemKind::Gravity {
+                acceleration: [0.0, -9.81, 0.0],
+            },
+            Vec::new(),
+        );
+        join_load_cases(study, index);
+        self.simulation.selected = Some(index);
+        self.simulation.generative.show = false;
+        if let Some(item) = self.simulation.study.items.get(index) {
+            self.status = format!(
+                "{}: 9.81 m/s² down on the design and its remote masses; set so many g in the panel",
+                item.name
+            );
+        }
+    }
+
+    /// Remote Mass: 1 kg carried by the selected faces, at their centre until it is set.
+    pub(crate) fn add_remote_mass(&mut self) {
+        if !self.generative_study_open() || self.generative_running() {
+            return;
+        }
+        let faces = self.selected_sim_faces();
+        if faces.is_empty() {
+            self.status =
+                "Remote Mass: select the faces of a preserve body it is fixed to, then click it"
+                    .to_owned();
+            self.simulation.generative.show = false;
+            return;
+        }
+        let point = self
+            .ensure_surfaces()
+            .ok()
+            .and(self.simulation.surfaces.as_ref())
+            .and_then(|s| faces_centre(s, &faces))
+            .unwrap_or([0.0; 3]);
+        let study = &mut self.simulation.study;
+        let index = study.add(ItemKind::RemoteMass { kg: 1.0, point }, faces);
+        join_load_cases(study, index);
+        self.simulation.selected = Some(index);
+        self.simulation.generative.show = false;
+        if let Some(item) = self.simulation.study.items.get(index) {
+            self.status = format!(
+                "{}: 1 kg at the faces' centre; set its mass and its centre of mass in the panel",
+                item.name
+            );
+        }
+    }
+
     /// Generate: the outcomes of the open study, on a thread.
     pub(crate) fn start_generation(&mut self) {
         self.simulation.generative.error = None;
@@ -1996,6 +2123,27 @@ impl OxydeApp {
                 self.add_study_item(kind);
             }
         }
+        if command_button(ui, Icon::Gravity, "Gravity", enabled, false)
+            .on_hover_text(
+                "The design's weight under an acceleration: 9.81 m/s² down, or so many g for a \
+                 shock (set it in the panel). It weighs the remote masses too",
+            )
+            .clicked()
+        {
+            self.add_gravity();
+        }
+        let hint = "A component fixed to the selected faces of a preserve body, its mass at its \
+                    centre of mass: gravity weighs it, and its weight reaches the faces as a \
+                    force and a moment";
+        let response = command_button(ui, Icon::MassProperties, "Remote Mass", enabled, false);
+        let response = if has_faces {
+            response.on_hover_text(hint)
+        } else {
+            response.on_hover_text(format!("{hint}\n(select faces first)"))
+        };
+        if response.clicked() {
+            self.add_remote_mass();
+        }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -2281,7 +2429,8 @@ impl OxydeApp {
                                         egui::RichText::new(
                                             "Select faces of a preserve body, then Fixed \
                                              Geometry or Roller/Slider to hold it, Force or \
-                                             Pressure to load it",
+                                             Pressure to load it; Gravity weighs it, and \
+                                             Remote Mass hangs a component on it",
                                         )
                                         .small()
                                         .weak(),
@@ -4016,6 +4165,82 @@ mod tests {
         leave_load_cases(&mut study, "Force-2");
         let why = engine_study(&study, &surfaces).unwrap_err();
         assert!(why.contains("Load Case 2"), "{why}");
+    }
+
+    #[test]
+    fn gravity_and_remote_masses_reach_the_engine_and_the_file() {
+        let (surfaces, mut study) = two_pads();
+        // 1.35 kg on the loaded pad's +X side, 6 mm beyond it, under 10 g down.
+        let remote = study.add(
+            ItemKind::RemoteMass {
+                kg: 1.35,
+                point: [46.0, 8.0, 4.0],
+            },
+            vec![pad_face(7)],
+        );
+        assert_eq!(study.items[remote].name, "Remote Mass-1");
+        // Without gravity it weighs nothing: refused, naming it.
+        let why = engine_study(&study, &surfaces).unwrap_err();
+        assert!(
+            why.contains("Remote Mass-1") && why.contains("Gravity"),
+            "{why}"
+        );
+        let gravity = study.add(
+            ItemKind::Gravity {
+                acceleration: [0.0, -98.1, 0.0],
+            },
+            Vec::new(),
+        );
+        assert_eq!(study.items[gravity].name, "Gravity-1");
+        let engine = engine_study(&study, &surfaces).unwrap();
+        assert_eq!(engine.gravity, [[0.0, -98.1, 0.0]]);
+        assert_eq!(engine.remote_masses.len(), 1);
+        assert_eq!(engine.remote_masses[0].mass, 1.35);
+        assert_eq!(engine.remote_masses[0].labels, [7]);
+        assert_eq!(engine.loads.len(), 1);
+        // The centre of the pad's +X side, where a remote mass starts.
+        let centre = faces_centre(&surfaces, &[pad_face(7)]).unwrap();
+        assert!((centre[0] - 40.0).abs() < 1e-12 && (centre[1] - 8.0).abs() < 1e-12);
+        // Load cases: gravity and remote masses join every case, and name them.
+        study.generative.load_cases = vec![
+            LoadCase {
+                name: "Load Case 1".to_owned(),
+                fixtures: vec!["Fixed-1".to_owned()],
+                loads: vec!["Force-1".to_owned()],
+            },
+            LoadCase {
+                name: "Shock".to_owned(),
+                fixtures: vec!["Fixed-1".to_owned()],
+                loads: Vec::new(),
+            },
+        ];
+        let shock = study.add(
+            ItemKind::Gravity {
+                acceleration: [29.4, 0.0, 0.0],
+            },
+            Vec::new(),
+        );
+        join_load_cases(&mut study, shock);
+        assert!(
+            study
+                .generative
+                .load_cases
+                .iter()
+                .all(|c| c.loads.contains(&"Gravity-2".to_owned()))
+        );
+        study.generative.load_cases[1].loads =
+            vec!["Gravity-1".to_owned(), "Remote Mass-1".to_owned()];
+        let engine = engine_study(&study, &surfaces).unwrap();
+        assert_eq!(engine.load_cases[0].gravity, [1]);
+        assert_eq!(engine.load_cases[1].gravity, [0]);
+        assert_eq!(engine.load_cases[1].remote_masses, [0]);
+        assert!(engine.load_cases[1].loads.is_empty());
+        // Saved and read back: the items as they were.
+        let file = crate::simulation_files::file_study(&study);
+        assert_eq!(file.loads.len(), 4);
+        let back = crate::simulation_files::study_of(&file);
+        assert_eq!(back.items, study.items);
+        assert!(!back.gravity);
     }
 
     #[test]
