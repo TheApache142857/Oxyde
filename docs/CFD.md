@@ -1,11 +1,10 @@
 # Flow simulation: CFD in Oxyde
 
-Status: **decided, being built** (October 2026). The owner chose OpenFOAM, run as a
-separate program and offered by Oxyde's installer; flow studies are a new study type of
-the Simulation tab; flow first, cooling later (§4). Built so far: `oxyde-flow`, which
-writes, runs and reads back OpenFOAM cases, tested against closed forms through
-OpenFOAM v2606 (§7). Not built yet: the study in the Simulation tab, its files and the
-installer's offer. §1–§3 are the survey the choice was made from.
+Status: **built** (October 2026): flow studies in the Simulation tab, run by OpenFOAM as a
+separate program, saved in `.oxysim` and `.oxyres` with their OpenFOAM case beside them, and
+OpenFOAM offered by the Windows installer (§4, §7). `oxyde-flow` is tested against closed
+forms through OpenFOAM v2606. Next: cooling studies, flow trajectories (§8). §1–§3 are the
+survey the choice was made from.
 
 The reference is SolidWorks Flow Simulation (and Fusion 360's CFD): a liquid or a gas
 flowing through the model (*internal*: a valve, a manifold, a duct) or around it
@@ -169,23 +168,24 @@ flows first, turbulence well after.
 4. **Flow first**: incompressible flow, internal and external, laminar or turbulent.
    **Cooling** (heat carried by the fluid and conducted through the solids) comes later,
    as a study type of its own.
+5. **Files**: flow studies in `.oxysim` like the others, as `format_version` 5 (after the
+   generative studies' 4 of the `topology-optimization` branch), their results in
+   `.oxyres` with the OpenFOAM case folder kept beside them.
+6. **The installer downloads OpenFOAM** from openfoam.com while installing, rather than
+   carrying it.
+7. **The crate** is `oxyde-flow`, standing alone like `oxyde-sim`.
 
 **Order of the work:**
 
 1. `oxyde-flow`, the engine's driver: built (§7).
-2. The *Flow* study in the Simulation tab: internal or external flow, the fluid (air and
-   water to start with), conditions on faces (inlet velocity, volume or mass flow; outlet
-   pressure; ideal walls), goals (forces, flow rates, mean pressures), the computational
-   domain drawn as a box, a mesh level, *Run* on a job thread with a live residual plot
-   and Cancel. Results: the goals, surface plots (pressure, wall shear) and cut plots
-   (velocity and pressure on a plane through the fluid), flow trajectories next.
-3. The files: flow studies and their results in `.oxysim` and `.oxyres` (§6).
-4. The installer's offer, and Preferences pointing at an installation (§5, *Installing*).
-5. Cooling studies: `buoyantSimpleFoam` for heat carried by the fluid,
-   `chtMultiRegionSimpleFoam` for heat through the solids as well.
+2. The *Flow* study in the Simulation tab: built (§7).
+3. The files: built (FORMAT.md §8–§9).
+4. The installer's offer, and Preferences pointing at an installation: built (§5,
+   *Installing*).
+5. Next, cooling studies: `buoyantSimpleFoam` for heat carried by the fluid,
+   `chtMultiRegionSimpleFoam` for heat through the solids as well; and flow trajectories.
 6. Later: rotating parts (a moving reference frame), porous media, transient flows
-   (`pimpleFoam`), runs on every core by default, and the fluid's pressures handed to
-   static studies as loads.
+   (`pimpleFoam`), the fluid's pressures handed to static studies as loads.
 
 ## 5. How a flow study runs
 
@@ -237,7 +237,7 @@ As `oxyde-flow` does it:
   pressures in pascals, where OpenFOAM's incompressible solvers hold them divided by the
   density.
 
-### Installing (to build)
+### Installing
 
 On Windows, the Inno Setup installer gets a task, *Install OpenFOAM v2606 for flow
 simulations*, which downloads OpenCFD's installer from openfoam.com
@@ -249,19 +249,48 @@ another installer, so there, and on macOS (openfoam-app, through Homebrew) and L
 (OpenCFD's packages), Preferences say where to get it. Preferences also take an
 installation's folder; `OXYDE_OPENFOAM_DIR` does the same for tests and scripts.
 
-## 6. Questions still open for the owner
+## 6. The owner's answers
 
-1. **Files.** Flow studies saved in `.oxysim` like the others (a new `format_version`,
-   numbered after the generative studies' 4 on the `topology-optimization` branch), with
-   their results in `.oxyres` (the goals, the residual history and what the plots need)
-   and the OpenFOAM case folder kept beside them for ParaView; or only the case folder?
-2. **The installer.** Download OpenFOAM while installing (proposed above), or ship its
-   installer inside Oxyde's (some 200 MB more, and Oxyde's download then carries GPL
-   software, with its source)?
-3. **The crate.** Built as `oxyde-flow`, standing alone like `oxyde-sim` (the layering
-   table and its test changed with it); renaming it is easy now.
+The questions this plan asked are answered (§4, *Decided*): OpenFOAM in OpenCFD's line, run
+as a separate program; the installer downloads it; flow studies are a study type of the
+Simulation tab; flow first and cooling later; flow studies and results in `.oxysim` and
+`.oxyres`, the case folder beside them; the crate `oxyde-flow`.
 
-## 7. What is built: `oxyde-flow`
+## 7. What is built
+
+### In the application
+
+- **New Study › Flow** (`simulation_studies.rs`); the study's settings are
+  `oxyde_format::simulation::FlowSettings` (the fluid, internal or external, laminar or
+  turbulent, the mesh level, the iterations and the residual), its conditions and goals
+  items of the Simulation tab like fixtures and loads (`ItemKind::InletVelocity`,
+  `InletVolumeFlow`, `InletMassFlow`, `StaticPressure`, `IdealWall`, `Goal`), picked from the
+  selection, listed, edited and drawn on the model the same way.
+- **`flow_ui.rs`**: the command bar (Inlet ▾, Static Pressure, Ideal Wall, Goal ▾, Run, the
+  plots), the panel (Fluid, Boundary conditions, Goals, Mesh and solver, Results with the
+  residual chart, live while it runs), the study turned into an `oxyde_flow::FlowStudy`
+  (the mesh from the level and the model's size, `setup::mesh_for_level`, within the
+  memory budget at 2 KB a cell; the domain from the model's box; an internal flow's point
+  in the fluid three of the finest cells in from its largest opening triangle,
+  `setup::point_inside`), the run on its own thread (OpenFOAM found, the processes chosen,
+  the case written and run, the flow read back, the goals measured), and the plots: cut
+  planes (`plot::cut`, square to X, Y or Z, the model drawn faint around them) and the
+  wetted faces (`plot::surface`), split into the legend's colour bands.
+- **Leaks**: after meshing, an internal flow whose fluid reached the domain's box (an open
+  cavity) is stopped with what to do (`RunError::Leak`).
+- **Files** (`simulation_files.rs`): the study's items and settings to and from `.oxysim`;
+  the run's record (`oxyde_format::results::FlowRun`) to `.oxyres`, the case copied beside
+  the study when it was solved before the study was saved (without its processor folders),
+  and read back from there when the results are opened.
+- **Preferences › Simulation**: the OpenFOAM folder (with *Check*), the processes (0: one
+  per core up to eight when MPI is there), where to get OpenFOAM.
+- **The Windows installer** (`packaging/installer.iss`): the task *Download and install
+  OpenFOAM v2606*, OpenCFD's installer downloaded with Inno Setup's download page, checked
+  against its SHA-256 and run after Oxyde's files are in place; a failed download leaves
+  Oxyde installed and says where to get OpenFOAM. The `.msi` cannot chain an installer:
+  Preferences says where to get it.
+
+### `oxyde-flow`
 
 - `study`: the study as plain data (`FlowStudy`: labelled surfaces, `FlowType` internal or
   external, `Fluid`, `Turbulence`, `Condition`s, `Goal`s, `Domain`, `MeshSettings`,
@@ -273,13 +302,16 @@ installation's folder; `OXYDE_OPENFOAM_DIR` does the same for tests and scripts.
 - `run`: the programs one after the other, logs followed, `Progress` reported, Cancel;
   `RunReport` (cells, mesh checks, iterations, convergence, the residual history).
 - `log`, `foam`, `mesh`, `results`: OpenFOAM's logs, its ASCII files, the mesh with its
-  geometry, the fields on it, the goals.
+  geometry, the fields on it, the goals; `results::label_of_patch` reads a patch's model
+  face from its name, so a case folder alone is enough to read results back.
+- `setup`: the mesh of a level, the automatic domain, the point inside a cavity.
+- `plot`: cut planes and wetted surfaces as polygons with values.
 
-**Tests.** 34 unit tests that need no OpenFOAM: the case's files, the mesh and field
+**Tests.** 42 unit tests that need no OpenFOAM: the case's files, the mesh and field
 readers (both face formats, compact lists, every kind of patch entry), the geometry of
 faces and cells, the log reader (residuals, convergence, fatal errors, divergence,
-`checkMesh`), the run's log following, an installation's environment from a fake
-`etc/bashrc`. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped without it), on a
+`checkMesh`), the run's log following, the leak check, an installation's environment from
+a fake `etc/bashrc`, the mesh levels, the point inside a cavity, cut and surface plots. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped without it), on a
 Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run):
 
 | Case | Cells | Iterations | Meshing + solving | Against |
@@ -289,7 +321,20 @@ Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run):
 | Sphere in air at Re 20, the domain five diameters round it and ten behind | 19 351 | 102 | 13 s + 29 s | Drag coefficient 2.738, Clift, Grace and Weber's correlation 2.735 (+0.1 %); side forces 10⁻⁴ of the drag |
 | Turbulent pipe: water at Re 19 924, k-ω SST, three layers along the wall | 75 296 | 100 | 43 s + 180 s | Inlet pressure 812 Pa, 1.5 times Blasius's 531 Pa for a developed flow over L/D = 10: the entrance adds the rest (a check of order only) |
 
-## 8. Testing without OpenFOAM installed
+## 8. Next
+
+- **Cooling** (a study type of its own, as decided): the energy equation with buoyancy
+  (`buoyantSimpleFoam`) for heat carried by the fluid, then heat through the solids as well
+  (`chtMultiRegionSimpleFoam`, a region per body), heat sources in the solids, and the
+  temperatures handed to thermal and thermal stress studies.
+- **Flow trajectories**: lines seeded on inlets and followed through the cells.
+- Seeing the mesh before solving, a domain the user sizes, rotating regions, porous media,
+  transient flows.
+- To check on Windows and macOS: OpenCFD's MinGW build and openfoam-app found and run
+  (`install.rs`, untested there), Microsoft MPI for parallel runs, a case folder whose path
+  has spaces.
+
+## 9. Testing without OpenFOAM installed
 
 OpenCFD publishes images for amd64 and arm64. Build the test binary, then run it in one:
 

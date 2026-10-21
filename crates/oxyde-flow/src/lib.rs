@@ -20,6 +20,10 @@
 //!   progress and residuals, and stops them on cancel.
 //! - [`results`] reads the mesh and the last fields back (OpenFOAM's ASCII files, through
 //!   [`foam`]) and works out the goals: forces, flow rates and mean pressures.
+//! - [`plot`] cuts planes through the fluid and gathers the model's wetted faces, with the
+//!   pressure or speed on them, for the application to draw in colour bands.
+//! - [`setup`] works out what a study leaves to Oxyde: the mesh from a level 1 to 7, the
+//!   computational domain, a point inside an internal flow's cavity.
 //!
 //! Units at the interface are Oxyde's: millimetres for positions and lengths, SI otherwise
 //! (m/s, Pa, kg/m³, Pa·s, m³/s, kg/s, N). OpenFOAM works in metres: the case is scaled on
@@ -58,8 +62,10 @@ pub mod foam;
 pub mod install;
 pub mod log;
 pub mod mesh;
+pub mod plot;
 pub mod results;
 pub mod run;
+pub mod setup;
 pub mod study;
 
 pub use case::{Case, CaseError, FacePatch, Role, write_case};

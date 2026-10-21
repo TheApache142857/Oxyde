@@ -96,6 +96,8 @@ pub struct Case {
     pub density: f64,
     /// Whether k-ω SST fields (`k`, `omega`, `nut`) are solved.
     pub turbulent: bool,
+    /// An internal flow: its mesh must not reach the domain's box.
+    pub internal: bool,
     pub goals: Vec<CaseGoal>,
 }
 
@@ -198,6 +200,7 @@ pub fn write_case(dir: &Path, study: &FlowStudy) -> Result<Case, CaseError> {
         iterations: study.solver.iterations,
         density: study.fluid.density,
         turbulent: matches!(study.turbulence, Turbulence::KOmegaSst { .. }),
+        internal: matches!(study.flow_type, FlowType::Internal { .. }),
         goals,
     };
 

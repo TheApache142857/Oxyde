@@ -1,5 +1,5 @@
 //! The Simulation tab's studies, as Fusion 360 keeps them: the tab opens on *New Study*,
-//! which makes a static stress, thermal, transient thermal or thermal stress study, and a
+//! which makes a static stress, thermal, transient thermal, thermal stress or flow study, and a
 //! model has as many as wanted, each with its own fixtures, loads, contacts, mesh settings,
 //! material overrides and results. One is open at a time; the panel's list switches
 //! between them, and *Save* writes them all to the model's `.oxysim`.
@@ -22,7 +22,7 @@ pub(crate) struct Parked {
 }
 
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 5] = [
     (
         StudyType::Static,
         "Static Stress",
@@ -43,6 +43,11 @@ pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 4] = [
         "Thermal Stress",
         "The steady temperatures, then the stresses of the expansion they cause, with fixtures and loads",
     ),
+    (
+        StudyType::Flow,
+        "Flow",
+        "A liquid or a gas through or around the model: velocities, pressures, forces and flow rates, solved by OpenFOAM",
+    ),
 ];
 
 /// What the panel and the menus call a study type.
@@ -60,6 +65,7 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::Thermal => "Thermal",
         StudyType::TransientThermal => "Transient",
         StudyType::ThermalStress => "Thermal Stress",
+        StudyType::Flow => "Flow",
     }
 }
 
@@ -191,6 +197,7 @@ impl OxydeApp {
                     "select faces, add temperatures, heat and cooling, then Run".to_owned(),
                 StudyType::ThermalStress =>
                     "select faces, add fixtures and temperatures or heat, then Run".to_owned(),
+                StudyType::Flow => "set the fluid in the panel; select the inner faces of the lids, add an inlet and a static pressure, then Run".to_owned(),
             }
         );
     }
@@ -298,7 +305,7 @@ impl OxydeApp {
         }
     }
 
-    /// The panel's top while no study is open: the four types to start one, as Fusion 360's
+    /// The panel's top while no study is open: the five types to start one, as Fusion 360's
     /// New Study dialog offers them, and Open for a study saved before.
     pub(crate) fn new_study_chooser(&mut self, ui: &mut egui::Ui) {
         ui.strong("New Study");
@@ -319,6 +326,7 @@ impl OxydeApp {
                             StudyType::Thermal => crate::icons::Icon::TemperaturePlot,
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
+                            StudyType::Flow => crate::icons::Icon::FlowStudy,
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {

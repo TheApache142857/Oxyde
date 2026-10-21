@@ -2519,6 +2519,7 @@ dependencies = [
  "eframe",
  "image",
  "oxyde-assembly",
+ "oxyde-flow",
  "oxyde-format",
  "oxyde-geom",
  "oxyde-kernel",

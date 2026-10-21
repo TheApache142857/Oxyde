@@ -1,7 +1,9 @@
 //! Simulation studies (`.oxysim`): what holds a part or an assembly, what loads it (forces
 //! and pressures, or heat), how its bodies touch, how it is meshed and which mechanical and
 //! thermal properties the study uses instead of the materials' own. A document holds any
-//! number of studies of four types: static, thermal, transient thermal and thermal stress.
+//! number of studies of five types: static, thermal, transient thermal, thermal stress and
+//! flow (a liquid or a gas through or around the model, solved by OpenFOAM: its fluid,
+//! boundary conditions and goals; `docs/CFD.md`).
 //!
 //! A study document refers to the model it studies (a part or an assembly file, by relative
 //! path and document id) and to its faces by persistent name, never by index, so a study
@@ -23,8 +25,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::schema::{FaceRefDto, MechanicalDto, ThermalDto, face_dto, face_from};
 use crate::{
-    DocumentKind, FORMAT_VERSION, FormatError, MANIFEST, SIMULATION_FORMAT_VERSION, expect_kind,
-    from_json, manifest_version, new_document_id, read_entry, read_manifest, to_json, write_file,
+    DocumentKind, FLOW_FORMAT_VERSION, FORMAT_VERSION, FormatError, MANIFEST,
+    THERMAL_FORMAT_VERSION, expect_kind, from_json, manifest_version, new_document_id, read_entry,
+    read_manifest, to_json, write_file,
 };
 
 /// File extension of simulation studies.
@@ -113,6 +116,9 @@ pub enum StudyType {
     /// The steady temperatures, then the stresses of the expansion they cause with the
     /// fixtures and loads of a static study ([`Study::reference_temperature`]).
     ThermalStress,
+    /// The steady flow of a liquid or a gas through or around the model, solved by
+    /// OpenFOAM ([`Study::flow`], [`Study::conditions`], [`Study::goals`]).
+    Flow,
 }
 
 impl StudyType {
@@ -123,7 +129,16 @@ impl StudyType {
 
     /// Whether it takes thermal loads.
     pub fn is_thermal(self) -> bool {
-        !matches!(self, StudyType::Static)
+        matches!(
+            self,
+            StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress
+        )
+    }
+
+    /// Whether it is a flow study: a fluid, boundary conditions and goals instead of
+    /// fixtures and loads.
+    pub fn is_flow(self) -> bool {
+        self == StudyType::Flow
     }
 }
 
@@ -168,6 +183,12 @@ pub struct Study {
     /// The temperature at which a thermal stress study's model is free of stress, °C;
     /// ignored by the other types.
     pub reference_temperature: f64,
+    /// A flow study's fluid, flow and solver settings; ignored by the other types.
+    pub flow: FlowSettings,
+    /// A flow study's boundary conditions.
+    pub conditions: Vec<FlowCondition>,
+    /// A flow study's goals: what it measures.
+    pub goals: Vec<FlowGoal>,
 }
 
 impl Study {
@@ -189,6 +210,9 @@ impl Study {
             thermal_materials: BTreeMap::new(),
             transient: TransientSettings::default(),
             reference_temperature: 20.0,
+            flow: FlowSettings::default(),
+            conditions: Vec::new(),
+            goals: Vec::new(),
         }
     }
 }
@@ -355,17 +379,150 @@ pub enum MeshSize {
     ElementSize(f64),
 }
 
-/// The `format_version` `file` is written with: 2 when a study is not static (version 1
-/// readers would refuse it anyway), else 1, which readers of version 1 still open.
+/// A flow study's fluid, flow and solver settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowSettings {
+    pub analysis: FlowAnalysis,
+    pub fluid: Fluid,
+    pub turbulence: FlowTurbulence,
+    /// The mesh's resolution, from 1 (coarse) to 7 (fine), as SolidWorks' *level of
+    /// initial mesh*.
+    pub mesh_level: u32,
+    /// The most iterations of the solver.
+    pub iterations: u32,
+    /// The flow has converged when every equation's residual is under this.
+    pub residual: f64,
+}
+
+impl Default for FlowSettings {
+    fn default() -> Self {
+        Self {
+            analysis: FlowAnalysis::Internal,
+            fluid: Fluid::water(),
+            turbulence: FlowTurbulence::Laminar,
+            mesh_level: 3,
+            iterations: 500,
+            residual: 1e-4,
+        }
+    }
+}
+
+/// Where the fluid flows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlowAnalysis {
+    /// Through the model's cavity, closed by lids where the fluid comes in and goes out.
+    Internal,
+    /// Around the model, at `velocity` (m/s, world coordinates) far from it.
+    External { velocity: [f64; 3] },
+}
+
+/// A fluid, with constant properties: the flow is incompressible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fluid {
+    pub name: String,
+    /// kg/m³.
+    pub density: f64,
+    /// Dynamic viscosity, Pa·s.
+    pub viscosity: f64,
+}
+
+impl Fluid {
+    /// Water at 20 °C.
+    pub fn water() -> Self {
+        Self {
+            name: "Water".to_owned(),
+            density: 998.2,
+            viscosity: 1.002e-3,
+        }
+    }
+
+    /// Air at 20 °C and 101 325 Pa.
+    pub fn air() -> Self {
+        Self {
+            name: "Air".to_owned(),
+            density: 1.204,
+            viscosity: 1.825e-5,
+        }
+    }
+}
+
+/// Laminar or turbulent flow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlowTurbulence {
+    Laminar,
+    /// Turbulent, with the k-ω SST model. The turbulence of the fluid coming in: an
+    /// `intensity` (0.05 for 5 %) and a `length` scale, mm.
+    Turbulent {
+        intensity: f64,
+        length: f64,
+    },
+}
+
+/// A boundary condition of a flow study. Faces in none are walls the fluid sticks to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowCondition {
+    /// `Inlet Velocity-1`… unique among the study's conditions and goals.
+    pub name: String,
+    pub kind: FlowConditionKind,
+    pub faces: Vec<StudyFace>,
+    /// Kept in the study but not applied.
+    pub suppressed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlowConditionKind {
+    /// Fluid coming in normal to the faces at `speed`, m/s.
+    InletVelocity { speed: f64 },
+    /// Fluid coming in through the faces, m³/s, shared between them by area.
+    InletVolumeFlow { rate: f64 },
+    /// Fluid coming in through the faces, kg/s, shared between them by area.
+    InletMassFlow { rate: f64 },
+    /// An opening at a static `pressure`, Pa (gauge), where the fluid goes out.
+    StaticPressure { pressure: f64 },
+    /// A wall the fluid slips along without friction.
+    IdealWall,
+}
+
+/// A value a flow study measures on model faces, as SolidWorks' surface goals.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowGoal {
+    /// Unique like a condition's.
+    pub name: String,
+    pub kind: FlowGoalKind,
+    pub faces: Vec<StudyFace>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowGoalKind {
+    /// The force of the fluid on the faces, N: pressure and friction.
+    Force,
+    /// The volume flow out of the fluid through the faces, m³/s (negative coming in).
+    VolumeFlow,
+    /// The mass flow out of the fluid through the faces, kg/s (negative coming in).
+    MassFlow,
+    /// The area-weighted mean static pressure on the faces, Pa (gauge).
+    MeanPressure,
+}
+
+/// The `format_version` `file` is written with: the oldest that holds its studies' types,
+/// so that older readers still open what they can. 1 for static studies only, 2 with a
+/// thermal one, 5 with a flow one.
 pub fn simulation_version(file: &SimulationFile) -> u32 {
-    if file
-        .studies
+    file.studies
         .iter()
-        .any(|s| s.study_type != StudyType::Static)
-    {
-        SIMULATION_FORMAT_VERSION
-    } else {
-        FORMAT_VERSION
+        .map(|s| study_version(s.study_type))
+        .max()
+        .unwrap_or(FORMAT_VERSION)
+}
+
+/// The `format_version` a study of `t` (and its results) needs.
+pub(crate) fn study_version(t: StudyType) -> u32 {
+    match t {
+        StudyType::Static => FORMAT_VERSION,
+        StudyType::Thermal | StudyType::TransientThermal | StudyType::ThermalStress => {
+            THERMAL_FORMAT_VERSION
+        }
+        StudyType::Flow => FLOW_FORMAT_VERSION,
     }
 }
 
@@ -469,8 +626,9 @@ struct StudyDto {
     loads: Vec<LoadDto>,
     #[serde(default)]
     contacts: Vec<ContactDto>,
-    #[serde(default)]
-    mesh: MeshDto,
+    /// Absent in a flow study, whose `flow.mesh_level` sets its mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh: Option<MeshDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     materials: BTreeMap<String, MechanicalDto>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -481,6 +639,13 @@ struct StudyDto {
     /// °C; only in a thermal stress study.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reference_temperature: Option<f64>,
+    /// Only in a flow study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    flow: Option<FlowDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conditions: Vec<ConditionDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    goals: Vec<GoalDto>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -491,6 +656,7 @@ pub(crate) enum StudyTypeDto {
     Thermal,
     TransientThermal,
     ThermalStress,
+    Flow,
 }
 
 impl StudyTypeDto {
@@ -500,6 +666,7 @@ impl StudyTypeDto {
             StudyType::Thermal => StudyTypeDto::Thermal,
             StudyType::TransientThermal => StudyTypeDto::TransientThermal,
             StudyType::ThermalStress => StudyTypeDto::ThermalStress,
+            StudyType::Flow => StudyTypeDto::Flow,
         }
     }
 
@@ -509,6 +676,7 @@ impl StudyTypeDto {
             StudyTypeDto::Thermal => StudyType::Thermal,
             StudyTypeDto::TransientThermal => StudyType::TransientThermal,
             StudyTypeDto::ThermalStress => StudyType::ThermalStress,
+            StudyTypeDto::Flow => StudyType::Flow,
         }
     }
 
@@ -691,6 +859,136 @@ enum QualityDto {
     Draft,
 }
 
+/// A flow study's settings: `velocity` only in an external flow, `intensity` and `length`
+/// only in a turbulent one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FlowDto {
+    analysis: AnalysisDto,
+    /// m/s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    velocity: Option<[f64; 3]>,
+    fluid: FluidDto,
+    turbulence: TurbulenceDto,
+    /// 0 to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intensity: Option<f64>,
+    /// mm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    length: Option<f64>,
+    #[serde(default = "default_mesh_level")]
+    mesh_level: u32,
+    #[serde(default = "default_iterations")]
+    iterations: u32,
+    #[serde(default = "default_residual")]
+    residual: f64,
+}
+
+fn default_mesh_level() -> u32 {
+    FlowSettings::default().mesh_level
+}
+
+fn default_iterations() -> u32 {
+    FlowSettings::default().iterations
+}
+
+fn default_residual() -> f64 {
+    FlowSettings::default().residual
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AnalysisDto {
+    Internal,
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct FluidDto {
+    name: String,
+    /// kg/m³.
+    density: f64,
+    /// Pa·s.
+    viscosity: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TurbulenceDto {
+    Laminar,
+    Turbulent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ConditionDto {
+    name: String,
+    #[serde(flatten)]
+    kind: ConditionKindDto,
+    #[serde(default)]
+    faces: Vec<StudyFaceDto>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConditionKindDto {
+    /// m/s.
+    InletVelocity {
+        velocity: f64,
+    },
+    /// m³/s.
+    InletVolumeFlow {
+        volume_flow: f64,
+    },
+    /// kg/s.
+    InletMassFlow {
+        mass_flow: f64,
+    },
+    /// Pa.
+    StaticPressure {
+        pressure: f64,
+    },
+    IdealWall,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct GoalDto {
+    name: String,
+    #[serde(rename = "type")]
+    kind: GoalKindDto,
+    #[serde(default)]
+    faces: Vec<StudyFaceDto>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GoalKindDto {
+    Force,
+    VolumeFlow,
+    MassFlow,
+    MeanPressure,
+}
+
+impl GoalKindDto {
+    pub(crate) fn of(k: FlowGoalKind) -> Self {
+        match k {
+            FlowGoalKind::Force => GoalKindDto::Force,
+            FlowGoalKind::VolumeFlow => GoalKindDto::VolumeFlow,
+            FlowGoalKind::MassFlow => GoalKindDto::MassFlow,
+            FlowGoalKind::MeanPressure => GoalKindDto::MeanPressure,
+        }
+    }
+
+    pub(crate) fn kind(self) -> FlowGoalKind {
+        match self {
+            GoalKindDto::Force => FlowGoalKind::Force,
+            GoalKindDto::VolumeFlow => FlowGoalKind::VolumeFlow,
+            GoalKindDto::MassFlow => FlowGoalKind::MassFlow,
+            GoalKindDto::MeanPressure => FlowGoalKind::MeanPressure,
+        }
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -830,7 +1128,7 @@ fn study_dto(study: &Study) -> StudyDto {
                 suppressed: c.suppressed,
             })
             .collect(),
-        mesh: MeshDto {
+        mesh: (!study.study_type.is_flow()).then_some(MeshDto {
             mesher: match study.mesh.mesher {
                 Mesher::Netgen => MesherDto::Netgen,
                 Mesher::Lattice => MesherDto::Lattice,
@@ -847,7 +1145,7 @@ fn study_dto(study: &Study) -> StudyDto {
                 MeshSize::Automatic { .. } => None,
                 MeshSize::ElementSize(size) => Some(size),
             },
-        },
+        }),
         materials: study
             .materials
             .iter()
@@ -884,6 +1182,76 @@ fn study_dto(study: &Study) -> StudyDto {
         }),
         reference_temperature: (study.study_type == StudyType::ThermalStress)
             .then_some(study.reference_temperature),
+        flow: study.study_type.is_flow().then(|| flow_dto(&study.flow)),
+        conditions: if study.study_type.is_flow() {
+            study.conditions.iter().map(condition_dto).collect()
+        } else {
+            Vec::new()
+        },
+        goals: if study.study_type.is_flow() {
+            study
+                .goals
+                .iter()
+                .map(|g| GoalDto {
+                    name: g.name.clone(),
+                    kind: GoalKindDto::of(g.kind),
+                    faces: faces_dto(&g.faces),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn flow_dto(flow: &FlowSettings) -> FlowDto {
+    let (analysis, velocity) = match flow.analysis {
+        FlowAnalysis::Internal => (AnalysisDto::Internal, None),
+        FlowAnalysis::External { velocity } => (AnalysisDto::External, Some(velocity)),
+    };
+    let (turbulence, intensity, length) = match flow.turbulence {
+        FlowTurbulence::Laminar => (TurbulenceDto::Laminar, None, None),
+        FlowTurbulence::Turbulent { intensity, length } => {
+            (TurbulenceDto::Turbulent, Some(intensity), Some(length))
+        }
+    };
+    FlowDto {
+        analysis,
+        velocity,
+        fluid: FluidDto {
+            name: flow.fluid.name.clone(),
+            density: flow.fluid.density,
+            viscosity: flow.fluid.viscosity,
+        },
+        turbulence,
+        intensity,
+        length,
+        mesh_level: flow.mesh_level,
+        iterations: flow.iterations,
+        residual: flow.residual,
+    }
+}
+
+fn condition_dto(c: &FlowCondition) -> ConditionDto {
+    ConditionDto {
+        name: c.name.clone(),
+        kind: match c.kind {
+            FlowConditionKind::InletVelocity { speed } => {
+                ConditionKindDto::InletVelocity { velocity: speed }
+            }
+            FlowConditionKind::InletVolumeFlow { rate } => {
+                ConditionKindDto::InletVolumeFlow { volume_flow: rate }
+            }
+            FlowConditionKind::InletMassFlow { rate } => {
+                ConditionKindDto::InletMassFlow { mass_flow: rate }
+            }
+            FlowConditionKind::StaticPressure { pressure } => {
+                ConditionKindDto::StaticPressure { pressure }
+            }
+            FlowConditionKind::IdealWall => ConditionKindDto::IdealWall,
+        },
+        faces: faces_dto(&c.faces),
+        suppressed: c.suppressed,
     }
 }
 
@@ -979,6 +1347,7 @@ fn celsius(value: f64, what: &str) -> Result<f64, String> {
 }
 
 fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
+    let kind_of_model = kind;
     let study_type = dto.study_type.study_type();
     // Fixtures, loads and contacts share one set of names, as in SolidWorks' study tree.
     let mut names = BTreeSet::new();
@@ -993,7 +1362,22 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
     };
 
     if !study_type.is_structural() && !dto.fixtures.is_empty() {
-        return Err("a thermal study has fixtures".to_owned());
+        return Err(if study_type.is_flow() {
+            "a flow study has fixtures".to_owned()
+        } else {
+            "a thermal study has fixtures".to_owned()
+        });
+    }
+    if study_type.is_flow() && !dto.loads.is_empty() {
+        return Err("a flow study has loads".to_owned());
+    }
+    if study_type.is_flow() && !dto.contacts.is_empty() {
+        return Err("a flow study has contacts".to_owned());
+    }
+    if !study_type.is_flow()
+        && (dto.flow.is_some() || !dto.conditions.is_empty() || !dto.goals.is_empty())
+    {
+        return Err("only a flow study has a fluid, boundary conditions or goals".to_owned());
     }
     let mut fixtures = Vec::with_capacity(dto.fixtures.len());
     for f in dto.fixtures {
@@ -1140,7 +1524,8 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         });
     }
 
-    let size = match (dto.mesh.density, dto.mesh.element_size) {
+    let mesh = dto.mesh.unwrap_or_default();
+    let size = match (mesh.density, mesh.element_size) {
         (Some(_), Some(_)) => {
             return Err("the mesh has both a density and an element size".to_owned());
         }
@@ -1216,6 +1601,55 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, None) => 20.0,
     };
 
+    let flow = match dto.flow {
+        Some(f) => flow_from(f)?,
+        None => FlowSettings::default(),
+    };
+    let mut conditions = Vec::with_capacity(dto.conditions.len());
+    for c in dto.conditions {
+        named(&c.name)?;
+        let item = |e: String| format!("{}: {e}", c.name);
+        let not_negative = |value: f64, what: &str| -> Result<f64, String> {
+            let value = finite(value, what)?;
+            if value < 0.0 {
+                return Err(format!("{what} is negative"));
+            }
+            Ok(value)
+        };
+        let kind = match c.kind {
+            ConditionKindDto::InletVelocity { velocity } => FlowConditionKind::InletVelocity {
+                speed: not_negative(velocity, "the velocity").map_err(item)?,
+            },
+            ConditionKindDto::InletVolumeFlow { volume_flow } => {
+                FlowConditionKind::InletVolumeFlow {
+                    rate: not_negative(volume_flow, "the volume flow").map_err(item)?,
+                }
+            }
+            ConditionKindDto::InletMassFlow { mass_flow } => FlowConditionKind::InletMassFlow {
+                rate: not_negative(mass_flow, "the mass flow").map_err(item)?,
+            },
+            ConditionKindDto::StaticPressure { pressure } => FlowConditionKind::StaticPressure {
+                pressure: finite(pressure, "the pressure").map_err(item)?,
+            },
+            ConditionKindDto::IdealWall => FlowConditionKind::IdealWall,
+        };
+        conditions.push(FlowCondition {
+            kind,
+            faces: faces_from(c.faces, kind_of_model).map_err(item)?,
+            suppressed: c.suppressed,
+            name: c.name,
+        });
+    }
+    let mut goals = Vec::with_capacity(dto.goals.len());
+    for g in dto.goals {
+        named(&g.name)?;
+        goals.push(FlowGoal {
+            kind: g.kind.kind(),
+            faces: faces_from(g.faces, kind_of_model).map_err(|e| format!("{}: {e}", g.name))?,
+            name: g.name,
+        });
+    }
+
     Ok(Study {
         name: dto.name,
         study_type,
@@ -1223,11 +1657,11 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         loads,
         contacts,
         mesh: MeshSettings {
-            mesher: match dto.mesh.mesher {
+            mesher: match mesh.mesher {
                 MesherDto::Netgen => Mesher::Netgen,
                 MesherDto::Lattice => Mesher::Lattice,
             },
-            quality: match dto.mesh.quality {
+            quality: match mesh.quality {
                 QualityDto::High => MeshQuality::High,
                 QualityDto::Draft => MeshQuality::Draft,
             },
@@ -1237,12 +1671,79 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         thermal_materials,
         transient,
         reference_temperature,
+        flow,
+        conditions,
+        goals,
+    })
+}
+
+/// A flow study's settings, checked.
+fn flow_from(f: FlowDto) -> Result<FlowSettings, String> {
+    let analysis = match (f.analysis, f.velocity) {
+        (AnalysisDto::Internal, None) => FlowAnalysis::Internal,
+        (AnalysisDto::Internal, Some(_)) => {
+            return Err("an internal flow has a free stream's velocity".to_owned());
+        }
+        (AnalysisDto::External, Some(v)) => FlowAnalysis::External {
+            velocity: finite_vector(v, "the free stream's velocity")?,
+        },
+        (AnalysisDto::External, None) => {
+            return Err("an external flow has no free stream's velocity".to_owned());
+        }
+    };
+    let density = finite(f.fluid.density, "the fluid's density")?;
+    let viscosity = finite(f.fluid.viscosity, "the fluid's viscosity")?;
+    if density <= 0.0 || viscosity <= 0.0 {
+        return Err("the fluid's density and viscosity are not positive".to_owned());
+    }
+    let turbulence = match (f.turbulence, f.intensity, f.length) {
+        (TurbulenceDto::Laminar, None, None) => FlowTurbulence::Laminar,
+        (TurbulenceDto::Laminar, _, _) => {
+            return Err("a laminar flow has a turbulence intensity or length".to_owned());
+        }
+        (TurbulenceDto::Turbulent, Some(intensity), Some(length)) => {
+            let intensity = finite(intensity, "the turbulence intensity")?;
+            let length = finite(length, "the turbulence length")?;
+            if !(intensity > 0.0 && intensity <= 1.0) {
+                return Err("the turbulence intensity is not above 0 and up to 1".to_owned());
+            }
+            if length <= 0.0 {
+                return Err("the turbulence length is not positive".to_owned());
+            }
+            FlowTurbulence::Turbulent { intensity, length }
+        }
+        (TurbulenceDto::Turbulent, _, _) => {
+            return Err("a turbulent flow needs a turbulence intensity and length".to_owned());
+        }
+    };
+    if !(1..=7).contains(&f.mesh_level) {
+        return Err("the mesh level is not from 1 to 7".to_owned());
+    }
+    if !(1..=100_000).contains(&f.iterations) {
+        return Err("the iterations are not from 1 to 100 000".to_owned());
+    }
+    let residual = finite(f.residual, "the residual")?;
+    if residual <= 0.0 {
+        return Err("the residual is not positive".to_owned());
+    }
+    Ok(FlowSettings {
+        analysis,
+        fluid: Fluid {
+            name: f.fluid.name,
+            density,
+            viscosity,
+        },
+        turbulence,
+        mesh_level: f.mesh_level,
+        iterations: f.iterations,
+        residual,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SIMULATION_FORMAT_VERSION;
     use oxyde_model::FeatureId;
 
     fn face(feature: u32) -> FaceName {
@@ -1606,7 +2107,7 @@ mod tests {
         let good = bytes(&sample());
         let newer = edited(&good, MANIFEST, |m| {
             m.replace(
-                &format!("\"format_version\": {SIMULATION_FORMAT_VERSION}"),
+                &format!("\"format_version\": {THERMAL_FORMAT_VERSION}"),
                 &format!("\"format_version\": {}", SIMULATION_FORMAT_VERSION + 1),
             )
         });
@@ -1682,6 +2183,225 @@ mod tests {
             )),
             Err(FormatError::Json { .. })
         ));
+    }
+
+    /// A part's flow studies: an internal one with every condition and goal, an external
+    /// one, turbulent, with a goal.
+    fn flow_sample() -> SimulationFile {
+        let mut file = SimulationFile::new(StudiedModel {
+            kind: ModelKind::Part,
+            path: "valve.oxyprt".to_owned(),
+            document_id: "66666666-6666-6666-6666-666666666666".to_owned(),
+        });
+        let on = |f| vec![StudyFace::part(face(f))];
+        let mut internal = Study::of_type("Flow 1", StudyType::Flow);
+        internal.conditions = vec![
+            FlowCondition {
+                name: "Inlet Velocity-1".to_owned(),
+                kind: FlowConditionKind::InletVelocity { speed: 2.5 },
+                faces: on(2),
+                suppressed: false,
+            },
+            FlowCondition {
+                name: "Inlet Volume Flow-1".to_owned(),
+                kind: FlowConditionKind::InletVolumeFlow { rate: 1e-4 },
+                faces: on(3),
+                suppressed: true,
+            },
+            FlowCondition {
+                name: "Inlet Mass Flow-1".to_owned(),
+                kind: FlowConditionKind::InletMassFlow { rate: 0.1 },
+                faces: on(4),
+                suppressed: false,
+            },
+            FlowCondition {
+                name: "Static Pressure-1".to_owned(),
+                kind: FlowConditionKind::StaticPressure { pressure: -150.0 },
+                faces: on(5),
+                suppressed: false,
+            },
+            FlowCondition {
+                name: "Ideal Wall-1".to_owned(),
+                kind: FlowConditionKind::IdealWall,
+                faces: on(6),
+                suppressed: false,
+            },
+        ];
+        internal.goals = vec![
+            FlowGoal {
+                name: "Pressure Goal-1".to_owned(),
+                kind: FlowGoalKind::MeanPressure,
+                faces: on(2),
+            },
+            FlowGoal {
+                name: "Flow Goal-1".to_owned(),
+                kind: FlowGoalKind::VolumeFlow,
+                faces: on(5),
+            },
+            FlowGoal {
+                name: "Mass Flow Goal-1".to_owned(),
+                kind: FlowGoalKind::MassFlow,
+                faces: on(5),
+            },
+        ];
+        let mut external = Study::of_type("Flow 2", StudyType::Flow);
+        external.flow = FlowSettings {
+            analysis: FlowAnalysis::External {
+                velocity: [12.0, 0.0, -0.5],
+            },
+            fluid: Fluid::air(),
+            turbulence: FlowTurbulence::Turbulent {
+                intensity: 0.02,
+                length: 3.0,
+            },
+            mesh_level: 5,
+            iterations: 1200,
+            residual: 1e-5,
+        };
+        external.goals.push(FlowGoal {
+            name: "Force Goal-1".to_owned(),
+            kind: FlowGoalKind::Force,
+            faces: on(7),
+        });
+        file.studies = vec![internal, external];
+        file
+    }
+
+    #[test]
+    fn flow_studies_round_trip_as_version_5() {
+        let file = flow_sample();
+        assert_eq!(read_simulation(Cursor::new(bytes(&file))).unwrap(), file);
+        assert_eq!(simulation_version(&file), 5);
+        let mut both = sample();
+        both.studies.extend(flow_sample().studies);
+        assert_eq!(simulation_version(&both), 5);
+        let mut archive = ZipArchive::new(Cursor::new(bytes(&file))).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 5);
+    }
+
+    #[test]
+    fn flow_studies_are_written_as_documented() {
+        let v = json(&flow_sample());
+        let internal = &v["studies"][0];
+        assert_eq!(internal["type"], "flow");
+        // A flow study has its own mesh setting, and none of the other types' items.
+        assert!(internal.get("mesh").is_none());
+        assert!(
+            internal
+                .get("fixtures")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let flow = &internal["flow"];
+        assert_eq!(flow["analysis"], "internal");
+        assert!(flow.get("velocity").is_none());
+        assert_eq!(flow["fluid"]["name"], "Water");
+        assert_eq!(flow["fluid"]["density"], 998.2);
+        assert_eq!(flow["fluid"]["viscosity"], 1.002e-3);
+        assert_eq!(flow["turbulence"], "laminar");
+        assert!(flow.get("intensity").is_none());
+        assert_eq!(flow["mesh_level"], 3);
+        assert_eq!(flow["iterations"], 500);
+        assert_eq!(flow["residual"], 1e-4);
+        let c = &internal["conditions"];
+        assert_eq!(c[0]["type"], "inlet_velocity");
+        assert_eq!(c[0]["velocity"], 2.5);
+        assert_eq!(c[0]["faces"][0]["face"]["key"]["type"], "end_cap");
+        assert_eq!(c[1]["type"], "inlet_volume_flow");
+        assert_eq!(c[1]["volume_flow"], 1e-4);
+        assert_eq!(c[1]["suppressed"], true);
+        assert_eq!(c[2]["type"], "inlet_mass_flow");
+        assert_eq!(c[2]["mass_flow"], 0.1);
+        assert_eq!(c[3]["type"], "static_pressure");
+        assert_eq!(c[3]["pressure"], -150.0);
+        assert_eq!(c[4]["type"], "ideal_wall");
+        assert_eq!(internal["goals"][0]["type"], "mean_pressure");
+        assert_eq!(internal["goals"][1]["type"], "volume_flow");
+        assert_eq!(internal["goals"][2]["type"], "mass_flow");
+        let external = &v["studies"][1];
+        assert_eq!(external["flow"]["analysis"], "external");
+        assert_eq!(
+            external["flow"]["velocity"],
+            serde_json::json!([12.0, 0.0, -0.5])
+        );
+        assert_eq!(external["flow"]["turbulence"], "turbulent");
+        assert_eq!(external["flow"]["intensity"], 0.02);
+        assert_eq!(external["flow"]["length"], 3.0);
+        assert_eq!(external["goals"][0]["type"], "force");
+        assert!(external.get("conditions").is_none());
+
+        // The other types are written exactly as before: no flow keys, their mesh.
+        let v = json(&sample());
+        for study in v["studies"].as_array().unwrap() {
+            assert!(study.get("flow").is_none() && study.get("conditions").is_none());
+            assert!(study.get("goals").is_none() && study.get("mesh").is_some());
+        }
+    }
+
+    #[test]
+    fn inconsistent_flow_studies_are_refused() {
+        let good = bytes(&flow_sample());
+        let refused = |edit: &dyn Fn(&str) -> String, why: &str| match read_simulation(Cursor::new(
+            edited(&good, SIMULATION, edit),
+        )) {
+            Err(FormatError::InvalidSimulation(e)) => assert!(e.contains(why), "{e}"),
+            other => panic!("expected an invalid study ({why}), got {other:?}"),
+        };
+        refused(
+            &|s| s.replace("\"mesh_level\": 5", "\"mesh_level\": 9"),
+            "mesh level",
+        );
+        refused(
+            &|s| s.replace("\"velocity\": 2.5", "\"velocity\": -2.5"),
+            "velocity is negative",
+        );
+        refused(
+            &|s| s.replace("\"density\": 998.2", "\"density\": 0"),
+            "density",
+        );
+        refused(
+            &|s| s.replace("\"intensity\": 0.02", "\"intensity\": 2"),
+            "intensity",
+        );
+        refused(
+            &|s| s.replace("\"analysis\": \"internal\"", "\"analysis\": \"external\""),
+            "no free stream",
+        );
+        refused(
+            &|s| {
+                s.replace(
+                    "\"turbulence\": \"laminar\"",
+                    "\"turbulence\": \"turbulent\"",
+                )
+            },
+            "needs a turbulence intensity",
+        );
+        refused(
+            &|s| s.replace("Flow Goal-1", "Inlet Velocity-1"),
+            "two items",
+        );
+        refused(
+            &|s| s.replacen("\"type\": \"flow\"", "\"type\": \"static\"", 1),
+            "only a flow study",
+        );
+        // A flow study holds no fixtures, loads or contacts.
+        let mut fixed = flow_sample();
+        fixed.studies[0].fixtures.push(Fixture {
+            name: "Fixed-1".to_owned(),
+            kind: FixtureKind::Fixed,
+            faces: Vec::new(),
+            suppressed: false,
+        });
+        match read_simulation(Cursor::new(bytes(&fixed))) {
+            Err(FormatError::InvalidSimulation(e)) => {
+                assert!(e.contains("flow study has fixtures"), "{e}")
+            }
+            other => panic!("expected fixtures refused, got {other:?}"),
+        }
     }
 
     #[test]

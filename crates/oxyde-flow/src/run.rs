@@ -103,6 +103,8 @@ pub enum RunError {
     },
     /// The solution blew up: residuals that are not numbers, or a floating point exception.
     Diverged { iteration: u32, log: PathBuf },
+    /// An internal flow's fluid reached the domain's box: its cavity is open somewhere.
+    Leak { faces: usize },
     /// A file of the case could not be read or written.
     Io { path: PathBuf, error: io::Error },
 }
@@ -122,6 +124,12 @@ impl fmt::Display for RunError {
                 f,
                 "the solution diverged at iteration {iteration}: try a finer mesh, \
                  or check the conditions"
+            ),
+            RunError::Leak { faces } => write!(
+                f,
+                "the fluid leaks out of the model ({faces} faces of the mesh reached the \
+                 computational domain): close every opening with a lid, and check that \
+                 the inlets and outlets are on the lids' inner faces"
             ),
             RunError::Io { path, error } => write!(f, "{}: {error}", path.display()),
         }
@@ -156,6 +164,9 @@ pub fn run(
     runner.program(Stage::Background, "blockMesh", &[], false)?;
     runner.program(Stage::Features, "surfaceFeatureExtract", &[], false)?;
     runner.program(Stage::Snapping, "snappyHexMesh", &["-overwrite"], false)?;
+    if case.internal {
+        check_closed(&case.dir)?;
+    }
     let check = runner.program(Stage::Checking, "checkMesh", &[], false)?;
     report.cells = check.cells;
     report.mesh_ok = check.mesh_ok;
@@ -349,6 +360,48 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// An internal flow's mesh must stay inside the model: faces on the domain's box mean the
+/// cavity is open somewhere and the fluid filled the box around the model.
+fn check_closed(dir: &Path) -> Result<(), RunError> {
+    let path = dir.join("constant").join("polyMesh").join("boundary");
+    let text = fs::read(&path).map_err(|error| RunError::Io {
+        path: path.clone(),
+        error,
+    })?;
+    let faces = domain_faces(&text).unwrap_or(0);
+    if faces > 0 {
+        return Err(RunError::Leak { faces });
+    }
+    Ok(())
+}
+
+/// The faces of the domain's patch in a `boundary` file's text.
+fn domain_faces(text: &[u8]) -> Option<usize> {
+    let mut lex = crate::foam::Lexer::new(text);
+    crate::foam::header(&mut lex).ok()?;
+    let patches = lex
+        .list(|l| {
+            let name = l.word()?.to_string();
+            l.expect(b'{')?;
+            let mut faces = 0;
+            while !l.eat(b'}') {
+                match l.word()? {
+                    "nFaces" => {
+                        faces = l.label()?;
+                        l.expect(b';')?;
+                    }
+                    _ => l.skip_value()?,
+                }
+            }
+            Ok((name, faces))
+        })
+        .ok()?;
+    patches
+        .into_iter()
+        .find(|(name, _)| name == crate::case::DOMAIN_PATCH)
+        .map(|(_, faces)| faces)
+}
+
 /// Copies the starting fields from `0.orig` to `0`, which `snappyHexMesh` may have
 /// written mesh data into.
 fn copy_initial_fields(dir: &Path) -> Result<(), RunError> {
@@ -402,6 +455,21 @@ mod tests {
         assert_eq!(state.iterations(), 2);
         assert_eq!(state.history[0].residuals, vec![("Ux".to_string(), 0.5)]);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_mesh_reaching_the_domain_is_a_leak() {
+        let boundary = b"FoamFile { format ascii; class polyBoundaryMesh; object boundary; }
+3
+(
+    domain { type wall; inGroups 1(wall); nFaces 12; startFace 100; }
+    inlet_0 { type patch; nFaces 4; startFace 112; }
+    wall_1 { type wall; nFaces 40; startFace 116; }
+)";
+        assert_eq!(domain_faces(boundary), Some(12));
+        let closed = String::from_utf8_lossy(boundary).replace("nFaces 12", "nFaces 0");
+        assert_eq!(domain_faces(closed.as_bytes()), Some(0));
+        assert!(RunError::Leak { faces: 12 }.to_string().contains("lid"));
     }
 
     #[test]

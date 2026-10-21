@@ -91,9 +91,15 @@ pub struct FlowResults {
 impl FlowResults {
     /// Reads the last results of `case`.
     pub fn read(case: &Case) -> Result<Self, ReadError> {
-        let dir = &case.dir;
-        let (time, _) =
-            latest_time(dir).ok_or_else(|| ReadError::NoResults { dir: dir.clone() })?;
+        Self::read_folder(&case.dir, case.density)
+    }
+
+    /// Reads the last results in the case folder `dir`, of a fluid of `density` (kg/m³):
+    /// what a results file points to. Each patch's model face comes from its name.
+    pub fn read_folder(dir: &Path, density: f64) -> Result<Self, ReadError> {
+        let (time, _) = latest_time(dir).ok_or_else(|| ReadError::NoResults {
+            dir: dir.to_path_buf(),
+        })?;
         let mesh = PolyMesh::read(dir)?;
         let time_dir = dir.join(&time);
         let file = |name: &str| {
@@ -110,11 +116,8 @@ impl FlowResults {
         let (velocity, boundary_velocity) = on_mesh(&mesh, &u, &u_path)?;
         let (kinematic, boundary_kinematic) = on_mesh(&mesh, &p, &p_path)?;
         // Incompressible solvers hold the pressure divided by the density.
-        let pressure = kinematic.iter().map(|p| p * case.density).collect();
-        let boundary_pressure = boundary_kinematic
-            .iter()
-            .map(|p| p * case.density)
-            .collect();
+        let pressure = kinematic.iter().map(|p| p * density).collect();
+        let boundary_pressure = boundary_kinematic.iter().map(|p| p * density).collect();
 
         // The fluxes the solver balanced: exact where velocities on the boundary are only
         // their cells' (an outlet's).
@@ -130,7 +133,7 @@ impl FlowResults {
         let first = mesh.internal_faces();
         let mut boundary_labels = vec![None; mesh.faces() - first];
         for patch in &mesh.patches {
-            let label = case.label_of(&patch.name);
+            let label = label_of_patch(&patch.name);
             for f in patch.start..patch.start + patch.count {
                 if let Some(slot) = boundary_labels.get_mut(f - first) {
                     *slot = label;
@@ -255,6 +258,16 @@ impl FlowResults {
             })
             .collect()
     }
+}
+
+/// The model face a patch was made from, by its name ([`crate::case`] names them after
+/// their role and label: `wall_12` is face 12); `None` for the domain's patch.
+pub fn label_of_patch(name: &str) -> Option<u32> {
+    let (role, label) = name.rsplit_once('_')?;
+    if !matches!(role, "wall" | "inlet" | "outlet" | "slip") {
+        return None;
+    }
+    label.parse().ok()
 }
 
 /// The last time folder of a case after the start (`0`), by its name and time.
@@ -414,6 +427,7 @@ mod tests {
             iterations: 10,
             density: 1000.0,
             turbulent: false,
+            internal: true,
             goals: vec![
                 CaseGoal {
                     name: "In".to_string(),
@@ -534,6 +548,17 @@ boundaryField
             }
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patches_name_their_faces() {
+        assert_eq!(label_of_patch("wall_12"), Some(12));
+        assert_eq!(label_of_patch("inlet_0"), Some(0));
+        assert_eq!(label_of_patch("outlet_7"), Some(7));
+        assert_eq!(label_of_patch("slip_3"), Some(3));
+        assert_eq!(label_of_patch("domain"), None);
+        assert_eq!(label_of_patch("wall_x"), None);
+        assert_eq!(label_of_patch("other_4"), None);
     }
 
     #[test]

@@ -104,7 +104,10 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   shadows and glass, saved as PNG.
 - **Simulation tab:** static stress, thermal, transient thermal and thermal stress studies, with
   fixtures, loads and contacts between bodies, meshed into tetrahedra by Netgen; stress,
-  displacement, factor of safety and temperature drawn on the model.
+  displacement, factor of safety and temperature drawn on the model. **Flow studies** (CFD):
+  liquids and gases through or around the model, laminar or turbulent, with inlets, openings
+  and goals on faces, solved by [OpenFOAM](https://www.openfoam.com) run as a separate program;
+  forces, flow rates and pressures, cut plots and surface plots ([docs/CFD.md](docs/CFD.md)).
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,
@@ -196,7 +199,8 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 [MIT](LICENSE). The downloads also ship OpenCASCADE and Netgen (the Simulation tab's mesher),
 both under the LGPL 2.1 and linked dynamically, so they can be replaced;
 [packaging/THIRD-PARTY.txt](packaging/THIRD-PARTY.txt) gives the details and where their sources
-are.
+are. Flow studies run OpenFOAM (GPL-3.0), a separate program installed apart and never linked;
+the Windows installer can download it from openfoam.com.
 
 Oxyde is independent. It follows the conventions of feature-based CAD (feature names, dimension
 names, select first and then run a command) and is not affiliated with or endorsed by any CAD
