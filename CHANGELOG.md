@@ -40,6 +40,12 @@ release yet; the git history has every detail.
   marked, as parts of the shape did not settle crisp there. An outcome that stops changing
   while still grey is no longer called settled and runs on to the end. In files: each
   outcome's `grayness` (FORMAT.md §9).
+- **Milling from several sides.** *Milling* can make one outcome milled from all the sides
+  picked (*All sides in one outcome*), the part turned over between setups, as Autodesk's
+  machinery example mills from +Y and −Y: every spot is reached from one side or another,
+  so the shape can have hollows on both faces. Off, it is an outcome per side as before.
+  In files: `combined` on the `milling` method, and a milled outcome's `directions`
+  (FORMAT.md §8–§9).
 - **Minimum thickness and the tool's width are aims.** The panel and the documents now say
   what they are: the density filter keeps bars and walls from coming out thinner than the
   minimum thickness, and pockets narrower than a milling tool, wherever the shape allows,

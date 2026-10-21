@@ -37,8 +37,8 @@ use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical,
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError, GenerativeStudy, Grid,
-    MAX_VOXELS, Method, Objective, Obstacle, Voxel, decimate_holding, exact_surface, generate_on,
-    solid_pieces, surface, voxel_size,
+    MAX_VOXELS, Method, Objective, Obstacle, Sides, Voxel, decimate_holding, exact_surface,
+    generate_on, solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -215,8 +215,18 @@ pub(crate) fn method_label(m: &OutcomeMethod) -> String {
             direction,
             parting: Some(_),
         } => format!("Casting ±{}", axis_label(direction.axis())),
-        OutcomeMethod::Milling { direction, .. } => {
-            format!("Milling from {}", direction_label(*direction))
+        OutcomeMethod::Milling { sides, .. } => {
+            let labels: Vec<String> = sides
+                .directions()
+                .into_iter()
+                .map(direction_label)
+                .collect();
+            match labels.split_last() {
+                Some((last, rest)) if !rest.is_empty() => {
+                    format!("Milling from {} and {last}", rest.join(", "))
+                }
+                _ => format!("Milling from {}", labels.concat()),
+            }
         }
     }
 }
@@ -242,15 +252,25 @@ pub(crate) fn engine_method(m: &OutcomeMethod) -> Result<Method, String> {
             },
         }),
         OutcomeMethod::Milling {
-            direction,
+            sides,
             tool_diameter,
-        } => Ok(Method::Milling {
-            direction: Direction {
-                axis: direction.axis(),
-                positive: direction.is_positive(),
-            },
-            tool_diameter,
-        }),
+        } => {
+            let directions: Vec<Direction> = sides
+                .directions()
+                .into_iter()
+                .map(|d| Direction {
+                    axis: d.axis(),
+                    positive: d.is_positive(),
+                })
+                .collect();
+            if directions.is_empty() {
+                return Err("Milling from no side: pick one".to_owned());
+            }
+            Ok(Method::Milling {
+                sides: Sides::of(&directions),
+                tool_diameter,
+            })
+        }
     }
 }
 
@@ -3018,6 +3038,7 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
             GenerativeMethod::Milling {
                 directions: vec![AxisDirection::PlusY],
                 tool_diameter: Some(6.0),
+                combined: false,
             },
         );
         changed = true;
@@ -3025,6 +3046,7 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
     if let Some(GenerativeMethod::Milling {
         directions,
         tool_diameter,
+        combined,
     }) = g.methods.iter_mut().find(|m| m.name() == "milling")
     {
         ui.horizontal_wrapped(|ui| {
@@ -3068,6 +3090,19 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
                     )
                     .changed();
             }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(18.0);
+            changed |= ui
+                .add_enabled(
+                    directions.len() > 1 || *combined,
+                    egui::Checkbox::new(combined, "All sides in one outcome"),
+                )
+                .on_hover_text(
+                    "One outcome milled from every side picked, the part turned over between \
+                     setups (each spot reached from one of them); off, an outcome per side",
+                )
+                .changed();
         });
         if directions.is_empty() {
             weak(ui, "Pick a side, or untick it");
@@ -3644,6 +3679,30 @@ mod tests {
             }),
             "2-axis cutting along X"
         );
+        let both = OutcomeMethod::Milling {
+            sides: oxyde_format::simulation::AxisSides::of(&[
+                AxisDirection::MinusY,
+                AxisDirection::PlusY,
+            ]),
+            tool_diameter: None,
+        };
+        assert_eq!(method_label(&both), "Milling from +Y and −Y");
+        assert_eq!(
+            engine_method(&both),
+            Ok(Method::Milling {
+                sides: Sides::of(&[
+                    Direction {
+                        axis: 1,
+                        positive: true
+                    },
+                    Direction {
+                        axis: 1,
+                        positive: false
+                    }
+                ]),
+                tool_diameter: None
+            })
+        );
         assert_eq!(
             engine_method(&OutcomeMethod::Casting {
                 direction: AxisDirection::MinusZ,
@@ -3969,6 +4028,7 @@ mod tests {
         g.methods = vec![GenerativeMethod::Milling {
             directions: vec![AxisDirection::PlusZ],
             tool_diameter: Some(4.0),
+            combined: false,
         }];
         let engine = engine_study(&study, &surfaces).unwrap();
         assert_eq!(

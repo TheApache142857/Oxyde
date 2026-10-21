@@ -429,8 +429,46 @@ impl AxisDirection {
     }
 }
 
+/// Some of the six directions along the world axes, as a set: the sides a generative outcome
+/// is milled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct AxisSides(u8);
+
+impl AxisSides {
+    /// The sides of `directions`, each once whatever their order.
+    pub fn of(directions: &[AxisDirection]) -> Self {
+        Self(directions.iter().fold(0, |bits, &d| bits | Self::bit(d)))
+    }
+
+    /// One side.
+    pub fn single(direction: AxisDirection) -> Self {
+        Self(Self::bit(direction))
+    }
+
+    fn bit(d: AxisDirection) -> u8 {
+        1 << (2 * d.axis() + usize::from(!d.is_positive()))
+    }
+
+    /// The directions, in the order +X, −X, +Y, −Y, +Z, −Z.
+    pub fn directions(self) -> Vec<AxisDirection> {
+        (0..6)
+            .filter(|i| self.0 & (1 << i) != 0)
+            .map(|i| AxisDirection::new(i / 2, i % 2 == 0))
+            .collect()
+    }
+
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// A way of making a generative study's shapes, along one or more directions: each direction
-/// is an outcome of its own ([`GenerativeMethod::outcomes`]).
+/// is an outcome of its own ([`GenerativeMethod::outcomes`]), but milling's when its sides
+/// are combined.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenerativeMethod {
     /// No constraint.
@@ -447,11 +485,13 @@ pub enum GenerativeMethod {
         directions: Vec<AxisDirection>,
         parting: Option<[f64; 3]>,
     },
-    /// 3-axis milled from each direction's side (one outcome each): no undercut seen from
-    /// the tool, no pocket narrower than `tool_diameter` (mm) when given.
+    /// 3-axis milled from each direction's side (one outcome each), or, `combined`, from all
+    /// of them in one outcome (the part turned over between setups): no undercut seen from
+    /// the tool, pockets narrower than `tool_diameter` (mm) discouraged when given.
     Milling {
         directions: Vec<AxisDirection>,
         tool_diameter: Option<f64>,
+        combined: bool,
     },
 }
 
@@ -492,10 +532,19 @@ impl GenerativeMethod {
             GenerativeMethod::Milling {
                 directions,
                 tool_diameter,
+                combined: true,
+            } => vec![OutcomeMethod::Milling {
+                sides: AxisSides::of(directions),
+                tool_diameter: *tool_diameter,
+            }],
+            GenerativeMethod::Milling {
+                directions,
+                tool_diameter,
+                combined: false,
             } => directions
                 .iter()
                 .map(|&direction| OutcomeMethod::Milling {
-                    direction,
+                    sides: AxisSides::single(direction),
                     tool_diameter: *tool_diameter,
                 })
                 .collect(),
@@ -520,9 +569,10 @@ pub enum OutcomeMethod {
         direction: AxisDirection,
         parting: Option<[f64; 3]>,
     },
-    /// Milled from the side `direction` points to, with a tool of `tool_diameter` (mm).
+    /// Milled from the sides `sides` point to (one, or several combined), with a tool of
+    /// `tool_diameter` (mm).
     Milling {
-        direction: AxisDirection,
+        sides: AxisSides,
         tool_diameter: Option<f64>,
     },
 }
@@ -1032,6 +1082,9 @@ enum MethodDto {
         /// mm.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_diameter: Option<f64>,
+        /// All the directions in one outcome; absent or false: an outcome each.
+        #[serde(default, skip_serializing_if = "is_false")]
+        combined: bool,
     },
 }
 
@@ -1631,9 +1684,11 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
                 GenerativeMethod::Milling {
                     directions,
                     tool_diameter,
+                    combined,
                 } => MethodDto::Milling {
                     directions: directions.clone(),
                     tool_diameter: *tool_diameter,
+                    combined: *combined,
                 },
             })
             .collect(),
@@ -2283,9 +2338,11 @@ fn generative_from(
             MethodDto::Milling {
                 directions,
                 tool_diameter,
+                combined,
             } => GenerativeMethod::Milling {
                 directions: directions_from(directions, "milling", true)?,
                 tool_diameter: positive_size(tool_diameter, "the tool diameter")?,
+                combined,
             },
             MethodDto::Casting {
                 directions,
@@ -2701,8 +2758,9 @@ mod tests {
                     parting: Some([0.0, 10.0, 0.0]),
                 },
                 GenerativeMethod::Milling {
-                    directions: vec![AxisDirection::PlusZ],
+                    directions: vec![AxisDirection::PlusZ, AxisDirection::MinusZ],
                     tool_diameter: Some(6.0),
+                    combined: true,
                 },
             ],
             materials: vec![
@@ -2803,10 +2861,38 @@ mod tests {
                     parting: Some([0.0, 10.0, 0.0])
                 },
                 OutcomeMethod::Milling {
-                    direction: AxisDirection::PlusZ,
+                    sides: AxisSides::of(&[AxisDirection::MinusZ, AxisDirection::PlusZ]),
                     tool_diameter: Some(6.0)
                 },
             ]
+        );
+        // Milling's sides not combined: an outcome each, in the order given.
+        let apart = GenerativeMethod::Milling {
+            directions: vec![AxisDirection::MinusZ, AxisDirection::PlusX],
+            tool_diameter: None,
+            combined: false,
+        };
+        assert_eq!(
+            apart.outcomes(),
+            [
+                OutcomeMethod::Milling {
+                    sides: AxisSides::single(AxisDirection::MinusZ),
+                    tool_diameter: None
+                },
+                OutcomeMethod::Milling {
+                    sides: AxisSides::single(AxisDirection::PlusX),
+                    tool_diameter: None
+                },
+            ]
+        );
+        assert_eq!(
+            AxisSides::of(&[
+                AxisDirection::MinusZ,
+                AxisDirection::PlusX,
+                AxisDirection::MinusZ
+            ])
+            .directions(),
+            [AxisDirection::PlusX, AxisDirection::MinusZ]
         );
         // In an assembly, its bodies name their components.
         let mut assembly = generative_sample();
@@ -2902,7 +2988,7 @@ mod tests {
                 { "type": "additive", "directions": ["+z", "+y"], "overhang": 45.0 },
                 { "type": "cutting", "directions": ["-y"] },
                 { "type": "casting", "directions": ["+y", "-x"], "parting": [0.0, 10.0, 0.0] },
-                { "type": "milling", "directions": ["+z"], "tool_diameter": 6.0 }
+                { "type": "milling", "directions": ["+z", "-z"], "tool_diameter": 6.0, "combined": true }
             ])
         );
         assert_eq!(

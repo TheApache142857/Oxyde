@@ -20,8 +20,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::simulation::{
-    ADDITIVE_OVERHANG, AxisDirection, OutcomeMethod, Study, StudyFace, StudyFaceDto, StudyType,
-    StudyTypeDto, study_face_dto, study_face_from, type_version,
+    ADDITIVE_OVERHANG, AxisDirection, AxisSides, OutcomeMethod, Study, StudyFace, StudyFaceDto,
+    StudyType, StudyTypeDto, study_face_dto, study_face_from, type_version,
 };
 use crate::{
     AssemblyFile, DocumentKind, FormatError, MANIFEST, PartFile, assembly_json, expect_kind,
@@ -764,12 +764,22 @@ fn generative_dto(g: &GenerativeResults) -> GenerativeDto {
                         OutcomeMethodDto::Casting { direction, parting }
                     }
                     OutcomeMethod::Milling {
-                        direction,
+                        sides,
                         tool_diameter,
-                    } => OutcomeMethodDto::Milling {
-                        direction,
-                        tool_diameter,
-                    },
+                    } => {
+                        // One side as `direction`, as before sides were combined; several
+                        // as `directions`.
+                        let list = sides.directions();
+                        let (direction, directions) = match list.as_slice() {
+                            [one] => (Some(*one), Vec::new()),
+                            _ => (None, list.clone()),
+                        };
+                        OutcomeMethodDto::Milling {
+                            direction,
+                            directions,
+                            tool_diameter,
+                        }
+                    }
                 },
                 status: match o.status {
                     OutcomeStatus::Converged => OutcomeStatusDto::Converged,
@@ -1083,30 +1093,53 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
             outcomes.push(GenerativeOutcome {
                 id: o.id,
                 material: o.material.clone(),
-                method: match o.method {
+                method: match &o.method {
                     OutcomeMethodDto::Unrestricted => OutcomeMethod::Unrestricted,
                     OutcomeMethodDto::Additive {
                         direction,
                         overhang,
                     } => {
-                        if overhang != ADDITIVE_OVERHANG {
+                        if *overhang != ADDITIVE_OVERHANG {
                             return Err(what(&format!(
                                 "the overhang is {overhang}°, not {ADDITIVE_OVERHANG}°"
                             )));
                         }
-                        OutcomeMethod::Additive { direction }
+                        OutcomeMethod::Additive {
+                            direction: *direction,
+                        }
                     }
-                    OutcomeMethodDto::Cutting { direction } => OutcomeMethod::Cutting { direction },
-                    OutcomeMethodDto::Casting { direction, parting } => {
-                        OutcomeMethod::Casting { direction, parting }
-                    }
+                    OutcomeMethodDto::Cutting { direction } => OutcomeMethod::Cutting {
+                        direction: *direction,
+                    },
+                    OutcomeMethodDto::Casting { direction, parting } => OutcomeMethod::Casting {
+                        direction: *direction,
+                        parting: *parting,
+                    },
                     OutcomeMethodDto::Milling {
                         direction,
+                        directions,
                         tool_diameter,
-                    } => OutcomeMethod::Milling {
-                        direction,
-                        tool_diameter,
-                    },
+                    } => {
+                        let sides = match (direction, directions.as_slice()) {
+                            (Some(d), []) => AxisSides::single(*d),
+                            (None, list) if !list.is_empty() => {
+                                let sides = AxisSides::of(list);
+                                if sides.len() != list.len() {
+                                    return Err(what("it is milled from a side twice"));
+                                }
+                                sides
+                            }
+                            _ => {
+                                return Err(what(
+                                    "a milled outcome needs a direction or directions, not both",
+                                ));
+                            }
+                        };
+                        OutcomeMethod::Milling {
+                            sides,
+                            tool_diameter: *tool_diameter,
+                        }
+                    }
                 },
                 status,
                 iterations: o.iterations,
@@ -1406,6 +1439,11 @@ fn validate_generative(g: &GenerativeResults) -> Result<(), String> {
                 ));
             }
         }
+        if let OutcomeMethod::Milling { sides, .. } = o.method
+            && sides.is_empty()
+        {
+            return Err(format!("outcome {id} is milled from no side"));
+        }
         let parting = match o.method {
             OutcomeMethod::Casting {
                 parting: Some(p), ..
@@ -1527,8 +1565,9 @@ enum OutcomeStatusDto {
     Failed,
 }
 
-/// A study's method with one `direction` in place of its `directions`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// A study's method with one `direction` in place of its `directions`; a milled outcome's
+/// several sides, combined, as `directions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutcomeMethodDto {
     Unrestricted,
@@ -1548,7 +1587,12 @@ enum OutcomeMethodDto {
         parting: Option<[f64; 3]>,
     },
     Milling {
-        direction: AxisDirection,
+        /// One side; absent with `directions`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        direction: Option<AxisDirection>,
+        /// Several sides combined, each once; absent with `direction`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        directions: Vec<AxisDirection>,
         /// mm.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_diameter: Option<f64>,
@@ -1996,7 +2040,13 @@ mod tests {
         );
         second.status = OutcomeStatus::Limit;
         second.min_factor_of_safety = None;
-        let mut failed = outcome(4, OutcomeMethod::Unrestricted);
+        let mut failed = outcome(
+            4,
+            OutcomeMethod::Milling {
+                sides: AxisSides::of(&[AxisDirection::PlusY, AxisDirection::MinusY]),
+                tool_diameter: Some(5.0),
+            },
+        );
         failed.material = "Titanium (Ti-6Al-4V)".to_owned();
         failed.status = OutcomeStatus::Failed("the loads are not held".to_owned());
         failed.iterations = 0;
@@ -2101,6 +2151,10 @@ mod tests {
         let failed = &g["outcomes"][2];
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["message"], "the loads are not held");
+        assert_eq!(
+            failed["method"],
+            serde_json::json!({ "type": "milling", "directions": ["+y", "-y"], "tool_diameter": 5.0 })
+        );
         assert!(failed.get("grayness").is_none());
         let snapshots = json["entries"]
             .as_array()
@@ -2241,6 +2295,19 @@ mod tests {
         refused(
             json_edit(|v| v["generative"]["outcomes"][0]["snapshots"] = serde_json::json!([1])),
             "2 snapshots for 1 iterations",
+        );
+        refused(
+            json_edit(|v| {
+                v["generative"]["outcomes"][2]["method"] = serde_json::json!({ "type": "milling", "direction": "+y", "directions": ["-y", "+x"] });
+            }),
+            "needs a direction or directions, not both",
+        );
+        refused(
+            json_edit(|v| {
+                v["generative"]["outcomes"][2]["method"] =
+                    serde_json::json!({ "type": "milling", "directions": ["-y", "-y"] });
+            }),
+            "milled from a side twice",
         );
         refused(json_edit(|v| v["units"]["mass"] = "g".into()), "units");
         refused(

@@ -1096,3 +1096,32 @@ NASA's Evolved Structures and the literature on length scales say (the owner ask
   fewer faces than triangles. The boolean with the exact bodies is still not tried: with
   the flat faces merged the faceted regions remain, thousands of faces where the shape is
   organic.
+
+**Built (October 2026): step 8**, milling from several sides in one outcome, as Fusion 360
+offers setup orientations and as Autodesk's machinery example (Crocetti and Gasso, Autodesk
+University) mills the outcome it keeps from +Y and −Y.
+
+- **The formulation** (`generative::reach`): along each side's lines, from the tool
+  inwards, each voxel is raised to the densest one in front of it, as the tool cannot take
+  away what it cannot reach from that side; then the least over the sides is taken, as what
+  the tool reaches from one side is gone. From one side this is the one-way pull; from
+  several it composes where carving each side's pull and keeping the densest would not (a
+  void reached from one side may sit behind material another side keeps). Like casting's
+  cap it is a running maximum with the voxel it came from, so the slopes go back through
+  that voxel alone (Langelaar 2019 and Gasick and Qian 2021 smooth it; the hard form keeps
+  the sums exact and cost nothing, as casting showed). Milling from one side keeps the
+  pull of step 6, so its outcomes are as before.
+- **The design space** (`reachable`): a voxel behind a preserve voxel from every side is
+  solid; each void voxel (an obstacle, outside the starting shape) is reached from the side
+  with the fewest design voxels in front of it, the first of equals, and those are made
+  void; a void voxel behind a preserve voxel from every side is refused (`NotMakeable`). A
+  symmetry plane across an axis needs both of its sides or neither.
+- **In files**: `combined` on the study's `milling` method, and an outcome's `directions`
+  for two or more sides, one side still written as `direction` (FORMAT.md §8–§9).
+- **Tests**: a bracket milled from +Z and −Z rises then falls along every column across Z,
+  on its mass target; an obstacle at the bottom is reached from below, leaving the voxels
+  above it free, where milling from +Z alone makes them void; one side of a crossed axis
+  refused; the format's round trip, its one-per-side split and a milled outcome naming
+  both or neither refused; the panel's label and the engine's method.
+- **Not yet**: the tool's length and its holder, which need the closing of the shape by the
+  tool's own (a cutter of a radius over a length, then the head): their own step.

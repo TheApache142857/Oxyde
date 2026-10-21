@@ -32,6 +32,14 @@
 //!   *Additive* prints layer by layer along the build direction (`additive`): a voxel can
 //!   only be as dense as the voxel under it and that one's four neighbours across the layer
 //!   (a cross), which keeps overhangs within 45° in every direction.
+//! - **Milling from several sides** (Fusion 360's setup orientations, as Autodesk's
+//!   machinery example mills from +Y and −Y): along each side's lines from the tool inwards,
+//!   each voxel is raised to the densest one in front of it (what the tool cannot reach from
+//!   that side stays), then the least over the sides is taken (what it reaches from one side
+//!   is gone). Each void voxel (an obstacle) is reached from the side with the fewest design
+//!   voxels in front of it, which are made void; a voxel behind a preserve voxel from every
+//!   side is made solid. From one side this is the one-way pull of casting, which milling
+//!   from one side keeps.
 //! - **Grayness** (Sigmund's measure of non-discreteness, `4 ρ (1 − ρ)` averaged over the
 //!   design voxels' projected densities: 0 when every one is solid or void, 1 when all are
 //!   half) is reported with each outcome, and a design greyer than [`GRAYNESS_SETTLED`]
@@ -214,6 +222,60 @@ pub struct Direction {
     pub positive: bool,
 }
 
+impl Direction {
+    /// Its bit in [`Sides`]: +X, −X, +Y, −Y, +Z, −Z.
+    fn bit(self) -> u8 {
+        1 << (2 * self.axis.min(2) + usize::from(!self.positive))
+    }
+
+    fn label(self) -> String {
+        format!(
+            "{}{}",
+            if self.positive { "+" } else { "−" },
+            ["X", "Y", "Z"][self.axis.min(2)]
+        )
+    }
+}
+
+/// Some of the six directions along the axes, as a set: the sides a part is milled from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Sides(u8);
+
+impl Sides {
+    /// The sides of `directions` (each once, whatever their order).
+    pub fn of(directions: &[Direction]) -> Sides {
+        Sides(directions.iter().fold(0, |bits, d| bits | d.bit()))
+    }
+
+    /// One side.
+    pub fn single(direction: Direction) -> Sides {
+        Sides(direction.bit())
+    }
+
+    /// The directions, in the order +X, −X, +Y, −Y, +Z, −Z.
+    pub fn directions(self) -> Vec<Direction> {
+        (0..6)
+            .filter(|i| self.0 & (1 << i) != 0)
+            .map(|i| Direction {
+                axis: i / 2,
+                positive: i % 2 == 0,
+            })
+            .collect()
+    }
+
+    pub fn contains(self, direction: Direction) -> bool {
+        self.0 & direction.bit() != 0
+    }
+
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// How an outcome is to be made.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Method {
@@ -231,24 +293,36 @@ pub enum Method {
     /// Printed in layers along `direction`, from a build plate at the grid's end behind it:
     /// nothing overhangs more than 45° from the direction.
     Additive { direction: Direction },
-    /// 3-axis milled from the side `direction` points to: the tool reaches every face from
-    /// there, so the shape has no undercut seen from it (a one-way pull towards the tool),
-    /// and pockets and gaps narrower than `tool_diameter` (mm) are discouraged: the density
+    /// 3-axis milled from the sides `sides` point to: the tool reaches every face from one
+    /// of them, so the shape has no undercut seen from all of them at once. From one side
+    /// that is a one-way pull towards the tool; from several, each voxel the tool cannot
+    /// reach from any of them stays (module documentation, *Milling from several sides*).
+    /// Pockets and gaps narrower than `tool_diameter` (mm) are discouraged: the density
     /// filter's radius is at least half of it, which tends to keep them out but does not
     /// rule them out.
     Milling {
-        direction: Direction,
+        sides: Sides,
         tool_diameter: Option<f64>,
     },
 }
 
 impl Method {
     /// The one-way pull a method makes the shape keep, with its parting point: casting's
-    /// own, or milling's, towards the tool.
+    /// own, or milling's from one side, towards the tool.
     fn pull(self) -> Option<(Direction, Option<V3>)> {
         match self {
             Method::Casting { direction, parting } => Some((direction, parting)),
-            Method::Milling { direction, .. } => Some((direction, None)),
+            Method::Milling { sides, .. } if sides.len() == 1 => {
+                sides.directions().first().map(|d| (*d, None))
+            }
+            _ => None,
+        }
+    }
+
+    /// The sides a part milled from more than one side is milled from.
+    fn several_sides(self) -> Option<Sides> {
+        match self {
+            Method::Milling { sides, .. } if sides.len() > 1 => Some(sides),
             _ => None,
         }
     }
@@ -283,12 +357,15 @@ impl std::fmt::Display for Method {
                 if direction.positive { "+" } else { "−" },
                 axis(direction.axis)
             ),
-            Method::Milling { direction, .. } => write!(
-                f,
-                "3-axis milling from {}{}",
-                if direction.positive { "+" } else { "−" },
-                axis(direction.axis)
-            ),
+            Method::Milling { sides, .. } => {
+                let labels: Vec<String> = sides.directions().iter().map(|d| d.label()).collect();
+                match labels.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        write!(f, "3-axis milling from {} and {last}", rest.join(", "))
+                    }
+                    _ => write!(f, "3-axis milling from {}", labels.concat()),
+                }
+            }
         }
     }
 }
@@ -683,6 +760,14 @@ pub fn generate_on(
     let chains = method
         .pull()
         .map(|(direction, parting)| casting_chains(grid, direction, parting));
+    // Milled from several sides: each side's chains, from the back to the front.
+    let reaches: Option<Vec<Vec<Vec<usize>>>> = method.several_sides().map(|sides| {
+        sides
+            .directions()
+            .into_iter()
+            .map(|d| casting_chains(grid, d, None))
+            .collect()
+    });
     let printing = match method {
         Method::Additive { direction } => Some(additive::Printing::new(grid, direction)),
         _ => None,
@@ -796,12 +881,14 @@ pub fn generate_on(
             })
             .collect();
         let filtered = filter.forward(&design, threads);
-        // Capped along a casting direction, or printed layer by layer.
+        // Capped along a casting direction, reached from the milling sides, or printed
+        // layer by layer.
         let printed = printing.as_ref().map(|p| p.forward(&filtered, &state));
-        let (capped, source) = match (&chains, &printed) {
-            (Some(chains), _) => cap(chains, &state, &filtered),
-            (None, Some(p)) => (p.printed.clone(), Vec::new()),
-            (None, None) => (filtered.clone(), Vec::new()),
+        let (capped, source) = match (&chains, &reaches, &printed) {
+            (Some(chains), _, _) => cap(chains, &state, &filtered),
+            (None, Some(sides), _) => reach(sides, &state, &filtered),
+            (None, None, Some(p)) => (p.printed.clone(), Vec::new()),
+            (None, None, None) => (filtered.clone(), Vec::new()),
         };
         let rho: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
@@ -1685,6 +1772,23 @@ fn states(
     {
         return Err(GenerativeError::BuildAcrossSymmetry);
     }
+    if let (Some(sides), Some(s)) = (method.several_sides(), symmetry) {
+        // Milled from both ends of an axis a plane crosses, the mirror holds; from one end
+        // only, it cannot.
+        for a in 0..3 {
+            let plus = sides.contains(Direction {
+                axis: a,
+                positive: true,
+            });
+            let minus = sides.contains(Direction {
+                axis: a,
+                positive: false,
+            });
+            if s.planes[a] && plus != minus {
+                return Err(GenerativeError::PullAcrossSymmetry);
+            }
+        }
+    }
     if symmetric.contains(&true) {
         for v in 0..state.len() {
             let images = mirror_images(grid, v, symmetric);
@@ -1714,8 +1818,13 @@ fn states(
     match method {
         // Printing makes any design space: what nothing holds up is printed empty.
         Method::Unrestricted | Method::Additive { .. } => {}
-        Method::Milling { direction, .. } => {
-            one_way(grid, direction, None, &mut state).map_err(not_makeable)?
+        Method::Milling { sides, .. } if sides.len() > 1 => {
+            reachable(grid, sides, &mut state).map_err(not_makeable)?
+        }
+        Method::Milling { sides, .. } => {
+            if let Some(&direction) = sides.directions().first() {
+                one_way(grid, direction, None, &mut state).map_err(not_makeable)?
+            }
         }
         Method::Cutting { axis } => {
             for line in lines(grid, axis.min(2)) {
@@ -1767,6 +1876,74 @@ fn one_way(
                 State::Free if solid => state[v] = State::Solid,
                 _ => {}
             }
+        }
+    }
+    Ok(())
+}
+
+/// The states milling from several sides at once leaves: a voxel behind a preserve voxel
+/// from every side the tool comes from is solid (no side reaches it); a void voxel (an
+/// obstacle, outside the starting shape) is reached from the side with the fewest design
+/// voxels in front of it, those made void. A void voxel behind a preserve voxel from every
+/// side is an undercut: that voxel is the error.
+fn reachable(grid: &Grid, sides: Sides, state: &mut [State]) -> Result<(), usize> {
+    let n = state.len();
+    let directions = sides.directions();
+    let chains: Vec<Vec<Vec<usize>>> = directions
+        .iter()
+        .map(|&d| casting_chains(grid, d, None))
+        .collect();
+    // Per side: whether a preserve voxel is in front of each voxel (towards the tool), and
+    // how many design voxels are.
+    let mut blocked = vec![vec![false; n]; chains.len()];
+    let mut cost = vec![vec![0u32; n]; chains.len()];
+    for (k, side) in chains.iter().enumerate() {
+        for chain in side {
+            let (mut solid, mut free) = (false, 0u32);
+            for &v in chain.iter().rev() {
+                blocked[k][v] = solid;
+                cost[k][v] = free;
+                match state[v] {
+                    State::Solid => solid = true,
+                    State::Free => free += 1,
+                    State::Void => {}
+                }
+            }
+        }
+    }
+    // Each void voxel's side: the cheapest unblocked one, the first of equals.
+    let mut chosen = vec![usize::MAX; n];
+    for v in 0..n {
+        if state[v] != State::Void {
+            continue;
+        }
+        let best = (0..chains.len())
+            .filter(|&k| !blocked[k][v])
+            .min_by_key(|&k| (cost[k][v], k));
+        match best {
+            Some(k) => chosen[v] = k,
+            None => return Err(v),
+        }
+    }
+    let solid: Vec<usize> = (0..n)
+        .filter(|&v| state[v] == State::Free && (0..chains.len()).all(|k| blocked[k][v]))
+        .collect();
+    // In front of a void voxel along its side, from the back to the front: void.
+    for (k, side) in chains.iter().enumerate() {
+        for chain in side {
+            let mut clearing = false;
+            for &v in chain {
+                if state[v] == State::Void && chosen[v] == k {
+                    clearing = true;
+                } else if clearing && state[v] == State::Free {
+                    state[v] = State::Void;
+                }
+            }
+        }
+    }
+    for v in solid {
+        if state[v] == State::Free {
+            state[v] = State::Solid;
         }
     }
     Ok(())
@@ -1859,6 +2036,57 @@ fn cap(chains: &[Vec<usize>], state: &[State], filtered: &[f64]) -> (Vec<f64>, V
                     behind = Some((out[v], source[v]));
                 }
             }
+        }
+    }
+    (out, source)
+}
+
+/// Densities milled from several sides: along each side's `chains` (back to front) from the
+/// tool inwards, every voxel raised to the densest one in front of it, as the tool cannot
+/// take away what it cannot reach from there; then the least over the sides, as what it
+/// reaches from one side is gone. Each with the voxel whose filtered density it took (the
+/// first side's of equals, the voxel's own over an equal one in front).
+fn reach(sides: &[Vec<Vec<usize>>], state: &[State], filtered: &[f64]) -> (Vec<f64>, Vec<u32>) {
+    let n = filtered.len();
+    let own = |v: usize| match state[v] {
+        State::Solid => 1.0,
+        State::Void => 0.0,
+        State::Free => filtered[v],
+    };
+    let mut out = vec![f64::INFINITY; n];
+    let mut source: Vec<u32> = (0..n as u32).collect();
+    let mut fill = vec![0.0; n];
+    let mut from = vec![0u32; n];
+    for chains in sides {
+        for chain in chains {
+            let mut front: Option<(f64, u32)> = None;
+            for &v in chain.iter().rev() {
+                let mine = (own(v), v as u32);
+                let taken = match front {
+                    Some(f) if f.0 > mine.0 => f,
+                    _ => mine,
+                };
+                fill[v] = taken.0;
+                from[v] = taken.1;
+                front = Some(taken);
+            }
+        }
+        for v in 0..n {
+            if fill[v] < out[v] {
+                out[v] = fill[v];
+                source[v] = from[v];
+            }
+        }
+    }
+    for v in 0..n {
+        match state[v] {
+            State::Solid => out[v] = 1.0,
+            State::Void => out[v] = 0.0,
+            State::Free if !out[v].is_finite() => {
+                out[v] = filtered[v];
+                source[v] = v as u32;
+            }
+            State::Free => {}
         }
     }
     (out, source)

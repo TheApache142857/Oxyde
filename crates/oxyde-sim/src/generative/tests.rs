@@ -404,10 +404,10 @@ fn a_milled_bracket_has_no_undercut_seen_from_the_tool() {
     // Milled from +Z with a 6 mm tool: no voxel denser than the one under it.
     let study = bracket(2.0);
     let milled = Method::Milling {
-        direction: Direction {
+        sides: Sides::single(Direction {
             axis: 2,
             positive: true,
-        },
+        }),
         tool_diameter: Some(6.0),
     };
     let (grid, outcome) = run(&study, milled, 0);
@@ -421,6 +421,121 @@ fn a_milled_bracket_has_no_undercut_seen_from_the_tool() {
     // The tool's radius widens the filter past the default 1.5 voxels.
     assert!((outcome.filter_radius - 3.0).abs() < 1e-12);
     assert!((outcome.mass - study.mass_target).abs() < 0.06 * study.mass_target);
+}
+
+#[test]
+fn a_bracket_milled_from_both_sides_has_no_undercut_seen_from_both() {
+    // Milled from +Z and −Z at once, as Autodesk's example mills from +Y and −Y: along
+    // every column across Z the material is one run, no void between two solid voxels
+    // (each voxel is either reached from above, from below, or stays).
+    let study = bracket(2.0);
+    let up = Direction {
+        axis: 2,
+        positive: true,
+    };
+    let down = Direction {
+        axis: 2,
+        positive: false,
+    };
+    let milled = Method::Milling {
+        sides: Sides::of(&[up, down]),
+        tool_diameter: None,
+    };
+    assert_eq!(milled.to_string(), "3-axis milling from +Z and −Z");
+    let (grid, outcome) = run(&study, milled, 0);
+    let n = grid.counts;
+    for j in 0..n[1] {
+        for i in 0..n[0] {
+            let column: Vec<u8> = (0..n[2])
+                .map(|k| outcome.density[grid.index([i, j, k])])
+                .collect();
+            // Rising to its densest voxel, then falling: never down then up again.
+            let peak = (0..column.len())
+                .max_by_key(|&k| (column[k], std::cmp::Reverse(k)))
+                .unwrap();
+            assert!(
+                column[..=peak].windows(2).all(|w| w[0] <= w[1])
+                    && column[peak..].windows(2).all(|w| w[0] >= w[1]),
+                "({i}, {j}): {column:?}"
+            );
+        }
+    }
+    assert!((outcome.mass - study.mass_target).abs() < 0.06 * study.mass_target);
+
+    // From one side only across a symmetry plane: refused; from both, it keeps the mirror.
+    let mut study = bracket(2.0);
+    study.symmetry = Some(Symmetry {
+        point: [0.0, 0.0, 5.0],
+        planes: [false, false, true],
+    });
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let one = Method::Milling {
+        sides: Sides::of(&[
+            up,
+            Direction {
+                axis: 1,
+                positive: true,
+            },
+        ]),
+        tool_diameter: None,
+    };
+    let refused = generate(
+        &grid,
+        &study,
+        one,
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    );
+    assert_eq!(refused, Err(GenerativeError::PullAcrossSymmetry));
+}
+
+#[test]
+fn an_obstacle_is_reached_from_the_nearer_side() {
+    // A block between the pads, an obstacle from z = 0 to 3: milled from +Z and −Z, the
+    // tool reaches it from below (nothing in front of it there), so nothing above it is
+    // made void; milled from +Z alone, the column above it is.
+    let mut study = bracket(1.0);
+    study.space.obstacles.push(Obstacle {
+        surface: block(2, [20.0, 8.0, 0.0], [30.0, 12.0, 3.0]),
+        offset: 0.0,
+    });
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let up = Direction {
+        axis: 2,
+        positive: true,
+    };
+    let down = Direction {
+        axis: 2,
+        positive: false,
+    };
+    let above = grid.index([25, 10, 6]);
+    assert_eq!(grid.kinds[above], Voxel::Design);
+    let both = states(
+        &grid,
+        Method::Milling {
+            sides: Sides::of(&[up, down]),
+            tool_diameter: None,
+        },
+        None,
+        [false; 3],
+    )
+    .unwrap();
+    assert_eq!(both[above], State::Free);
+    let top = states(
+        &grid,
+        Method::Milling {
+            sides: Sides::single(up),
+            tool_diameter: None,
+        },
+        None,
+        [false; 3],
+    )
+    .unwrap();
+    assert_eq!(top[above], State::Void);
 }
 
 #[test]
