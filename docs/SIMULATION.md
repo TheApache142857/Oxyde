@@ -1220,7 +1220,7 @@ clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency s
   mass at each corner, in tonnes as millimetres and newtons take them), by the block LOBPCG
   of `crate::eigen` with two guard vectors, preconditioned by one V-cycle of the static
   solve's multigrid on `K` (`multigrid::Cycle`), warm-started from the last iteration's
-  modes. On the CPU, also when the static solves are on the graphics card.
+  modes. On the graphics card when the static solves are (step 12).
 - **The mass interpolation**: a voxel's mass goes as its projected density, and below a
   tenth as the sixth power of it scaled to meet it there (Du and Olhoff, 2007): the
   stiffness goes as the cube, so near-void regions lighter than they are weak would
@@ -1241,6 +1241,41 @@ clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency s
   frequency at the limit, on or under its mass target; no frequency sought without a
   limit; a negative limit refused; the format's round trip and refusals, and the panel's
   mapping to the engine.
+
+**Built (October 2026): step 12**, the frequency limit's eigensolve on the graphics card,
+when the static solves are there (the owner asked for it).
+
+- **Why all of it**: per LOBPCG iteration, the products by `K` and the multigrid cycles cost
+  a few static conjugate gradient iterations, but making a block of fifteen vectors (and
+  their products by `K` and `M`) orthonormal and combining them is over a thousand passes
+  over vectors of the grid's size, which on one CPU thread outweigh the products several
+  times (an estimate from the operation counts, not yet timed).
+  Products alone on the card would have changed little; the vectors live there instead.
+- **The seam**: the eigensolver works in an `EigenSpace` (`eigen.rs`, public as
+  `generative::EigenSpace`): vectors by handle, made, written, read and given back; `A`,
+  `B`, the preconditioner and the projection; batches of dot products; `dst += Σ c v`;
+  scaling. The CPU's is the closures it had (`HostSpace`); a backend offers its own through
+  `Backend::eigen_space`, `None` by default, which leaves the eigensolve to the CPU. The
+  orthonormalization is classical Gram–Schmidt twice so that each vector's components come
+  back in one batch: three round trips per vector, one for the residuals' sizes and one for
+  the Rayleigh–Ritz matrix per iteration, the small eigenproblem still on the CPU.
+- **On the card** (`oxyde-sim-gpu`, `GpuSpace`): each vector a buffer of its own, kept from
+  one optimization iteration to the next; `A` the conjugate gradients' double-precision
+  product, then projected (`project64`); `B` the lumped masses (`mass64`, projected); the
+  preconditioner the static solve's single-precision cycle between its conversions, on the
+  plan uploaded for the iteration; dot products in the static solve's two passes into one
+  buffer, read back together; `axpy64` and `scale64` with their coefficients in a buffer
+  written before each pass. The eigenvectors come back to the CPU once per iteration, for
+  the slopes. A failure on the card fails the outcome there, and the application makes it
+  again on the CPU, as for the static solves.
+- **Memory**: up to about eighty vectors of the grid's unknowns at once (the block, its
+  candidates, the next block and their products), some 4 GB on the card at two million
+  voxels, beside the static solve's buffers; a card without the room fails the outcome,
+  which the CPU then makes.
+- **Tests** (`oxyde-sim-gpu`, skipped without a card): with the static solves on the CPU and
+  the eigensolve on the card, the bracket's lowest frequency is the CPU's to 10⁻⁶, one
+  eigensolve per iteration; with everything on the card, to a percent; the same run twice
+  the same to the byte. The eigensolver's own tests run on the CPU's space unchanged.
 
 ## 10. Frequency studies
 
@@ -1294,7 +1329,10 @@ twentieth of the model's diagonal, and *True scale* at 1 mm.
   times 10⁻¹²), and `ω²` comes out in s⁻².
 - **The eigensolver** (`eigen.rs`) is LOBPCG (Knyazev, 2001): a block of approximate modes,
   their preconditioned residuals and the last step's directions, made M-orthonormal
-  together by modified Gram–Schmidt run twice, a vector that depends on the others dropped
+  together by classical Gram–Schmidt run twice (modified Gram–Schmidt at first; the
+  classical form, as accurate run twice, asks for a vector's components along the others in
+  one batch, which the graphics card's eigensolve needs, §9 step 12), a vector that depends
+  on the others dropped
   (the basis selection of Hetmaniuk and Lehoucq, 2006: the Cholesky factorization of the
   block's Gram matrix, the textbook way, fails as the modes converge), then the small
   eigenproblem on that basis solved by cyclic Jacobi rotations. The block holds a few guard

@@ -218,6 +218,77 @@ fn the_card_repeats_itself() {
     assert_eq!(first, second);
 }
 
+/// Static solves on the CPU, the frequency limit's eigensolve on the card.
+struct EigenOnCard<'a> {
+    gpu: &'a mut GpuBackend,
+    spaces: usize,
+}
+
+impl Backend for EigenOnCard<'_> {
+    fn solve(
+        &mut self,
+        system: &System<'_>,
+        x: &mut [f64],
+        tolerance: f64,
+        max_iterations: usize,
+        cancel: &AtomicBool,
+    ) -> Result<Solved, GenerativeError> {
+        CpuBackend.solve(system, x, tolerance, max_iterations, cancel)
+    }
+
+    fn eigen_space<'s>(
+        &'s mut self,
+        system: &System<'_>,
+        nodal: &[f64],
+    ) -> Option<Result<Box<dyn EigenSpace + 's>, GenerativeError>> {
+        self.spaces += 1;
+        self.gpu.eigen_space(system, nodal)
+    }
+}
+
+#[test]
+fn the_card_finds_the_cpus_natural_frequencies() {
+    let Some(mut card) = gpu() else {
+        return;
+    };
+    // A limit too low to act, so the designs stay alike: the lowest frequency the card
+    // finds is the CPU's, to the eigensolve's tolerance.
+    let mut study = bracket(1.25, 8);
+    study.min_frequency = Some(1.0);
+    let (_, cpu) = run(&study, None);
+    let mut eigen = EigenOnCard {
+        gpu: &mut card,
+        spaces: 0,
+    };
+    let (_, on_card) = run(&study, Some(&mut eigen));
+    assert_eq!(eigen.spaces, on_card.history.len());
+    let (card_hz, cpu_hz) = (on_card.frequency.unwrap(), cpu.frequency.unwrap());
+    assert!(
+        (card_hz - cpu_hz).abs() <= 1e-6 * cpu_hz,
+        "{card_hz} Hz on the card, {cpu_hz} Hz on the CPU"
+    );
+    // The static solves on the card too: close, the designs a little apart.
+    let (_, all) = run(&study, Some(&mut card));
+    let all_hz = all.frequency.unwrap();
+    assert!(
+        (all_hz - cpu_hz).abs() <= 1e-2 * cpu_hz,
+        "{all_hz} Hz all on the card, {cpu_hz} Hz on the CPU"
+    );
+}
+
+#[test]
+fn the_cards_eigensolve_repeats_itself() {
+    let Some(mut card) = gpu() else {
+        return;
+    };
+    let mut study = bracket(1.0, 6);
+    study.min_frequency = Some(1.0);
+    let (_, first) = run(&study, Some(&mut card));
+    let (_, second) = run(&study, Some(&mut card));
+    assert!(first.frequency.is_some());
+    assert_eq!(first, second);
+}
+
 #[test]
 fn every_kernel_has_its_source() {
     for k in K::ALL {

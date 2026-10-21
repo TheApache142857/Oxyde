@@ -4,28 +4,31 @@
 //! and mass ([`crate::modal`]), and what a frequency limit in generative design needs of
 //! the voxel grid's.
 //!
-//! - **The operators are closures** on flat vectors, so the assembled matrices of a mesh
-//!   and the matrix-free bricks of a grid can both be handed in. `project` keeps a vector
-//!   to the unknowns solved for (held ones zeroed), so the modes of held unknowns never
-//!   show.
+//! - **The vectors live in a space** ([`EigenSpace`]) that does every product and sum on
+//!   them: the CPU's memory, the operators closures on flat vectors ([`EigenProblem`]), so
+//!   the assembled matrices of a mesh and the matrix-free bricks of a grid can both be
+//!   handed in; or a graphics card's (`oxyde-sim-gpu`), which keeps the block there and sends
+//!   back only dot products. `project` keeps a vector to the unknowns solved for (held ones
+//!   zeroed), so the modes of held unknowns never show.
 //! - **Each iteration** takes the block of approximate eigenvectors `X`, the preconditioned
 //!   residuals `W` of the pairs not yet converged and the last step's directions `P` of the
-//!   same pairs, makes the three B-orthonormal together (modified Gram–Schmidt, twice,
-//!   dropping a vector that depends on the others: the basis selection of Hetmaniuk and
-//!   Lehoucq, 2006, which keeps the small problem well conditioned where the Cholesky
-//!   factorization of the Gram matrix of `[X, W, P]` fails as the pairs converge), and
-//!   solves the small symmetric eigenproblem of `A` on that basis (Rayleigh–Ritz, by cyclic
-//!   Jacobi rotations). Its lowest pairs are the next `X`; the part of them that came from
-//!   `W` and `P` is the next `P`. Every combination is applied to the vectors and to their
-//!   products by `A` and `B` together, so an iteration costs one product by each and one
-//!   preconditioning per pair not converged.
+//!   same pairs, makes the three B-orthonormal together (classical Gram–Schmidt, twice,
+//!   which is as accurate as the modified form and asks for each vector's components along
+//!   the others in one batch; a vector that depends on the others is dropped: the basis
+//!   selection of Hetmaniuk and Lehoucq, 2006, which keeps the small problem well
+//!   conditioned where the Cholesky factorization of the Gram matrix of `[X, W, P]` fails as
+//!   the pairs converge), and solves the small symmetric eigenproblem of `A` on that basis
+//!   (Rayleigh–Ritz, by cyclic Jacobi rotations). Its lowest pairs are the next `X`; the part
+//!   of them that came from `W` and `P` is the next `P`. Every combination is applied to the
+//!   vectors and to their products by `A` and `B` together, so an iteration costs one
+//!   product by each and one preconditioning per pair not converged.
 //! - **Guard vectors** beyond those wanted speed the last of them up: the block then holds
 //!   the next eigenvalues too. A pair is converged when its residual `‖A x − λ B x‖` is under
 //!   `tolerance` times `‖A x‖ + |λ| ‖B x‖` (a backward error, as meaningful for a zero
 //!   eigenvalue as for a large one); it then stops being expanded (soft locking) but still
 //!   takes part in the Rayleigh–Ritz.
 //! - **Deterministic**: a fixed pseudo-random start when none is given, and every sum in a
-//!   fixed order, so a run repeats exactly.
+//!   fixed order, so a run repeats exactly in the same space.
 
 // Indices into the blocks and the small dense matrices, all sized here.
 #![allow(clippy::indexing_slicing, clippy::needless_range_loop)]
@@ -44,7 +47,39 @@ const JACOBI_TOLERANCE: f64 = 1e-15;
 /// Attempts at a start block of independent vectors.
 const START_ATTEMPTS: usize = 4;
 
-/// The pencil `A − λ B`, as closures on vectors of `size` values.
+/// A vector of an [`EigenSpace`], by the number the space gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vector(pub u32);
+
+/// Where an eigensolve keeps its vectors and works on them, all of the same length: the
+/// CPU's memory, or a graphics card's. The solver asks for dot products in batches, so that
+/// a card answers many in one round trip; anything that fails says why.
+pub trait EigenSpace {
+    /// The values in a vector.
+    fn size(&self) -> usize;
+    /// A new vector, all zero.
+    fn create(&mut self) -> Result<Vector, String>;
+    /// Gives back a vector no longer needed.
+    fn release(&mut self, v: Vector);
+    fn write(&mut self, v: Vector, values: &[f64]) -> Result<(), String>;
+    fn read(&mut self, v: Vector) -> Result<Vec<f64>, String>;
+    /// `dst = A src`.
+    fn apply_a(&mut self, src: Vector, dst: Vector) -> Result<(), String>;
+    /// `dst = B src`.
+    fn apply_b(&mut self, src: Vector, dst: Vector) -> Result<(), String>;
+    /// `dst ≈ A⁻¹ src`: a symmetric positive preconditioner (a multigrid cycle).
+    fn precondition(&mut self, src: Vector, dst: Vector) -> Result<(), String>;
+    /// `v` kept to the unknowns solved for: zero at the held ones.
+    fn project(&mut self, v: Vector) -> Result<(), String>;
+    /// `aᵀ b` of each pair, in order, each summed in a fixed order.
+    fn dots(&mut self, pairs: &[(Vector, Vector)]) -> Result<Vec<f64>, String>;
+    /// `dst += Σ c v` over `terms`, none of which is `dst`.
+    fn add(&mut self, dst: Vector, terms: &[(f64, Vector)]) -> Result<(), String>;
+    /// `v *= c`.
+    fn scale(&mut self, v: Vector, c: f64) -> Result<(), String>;
+}
+
+/// The pencil `A − λ B`, as closures on vectors of `size` values in the CPU's memory.
 pub(crate) struct EigenProblem<'a> {
     /// The length of a vector.
     pub size: usize,
@@ -87,49 +122,176 @@ pub(crate) struct Eigenpairs {
 }
 
 /// Why no eigenpairs could be found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EigenError {
     Cancelled,
     /// No block of independent vectors could be made: fewer unknowns are kept than pairs
     /// are wanted, or `B` is zero on them.
     Degenerate,
+    /// The space failed (a graphics card out of memory, or lost): why.
+    Failed(String),
 }
 
-/// A vector with its products by `A` and `B` (`av` empty until it is computed), combined
-/// together so the three stay consistent without new products.
-#[derive(Debug, Clone)]
-struct Column {
-    v: Vec<f64>,
-    av: Vec<f64>,
-    bv: Vec<f64>,
+impl From<String> for EigenError {
+    fn from(why: String) -> Self {
+        EigenError::Failed(why)
+    }
 }
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-fn norm(a: &[f64]) -> f64 {
-    dot(a, a).sqrt()
-}
-
-/// `y += c x`.
-fn axpy(y: &mut [f64], c: f64, x: &[f64]) {
-    for (y, x) in y.iter_mut().zip(x) {
-        *y += c * x;
-    }
-}
-
-fn scale(v: &mut [f64], c: f64) {
-    for x in v {
-        *x *= c;
-    }
-}
-
 /// `f(v)` in a new vector.
+#[cfg(test)]
 fn apply(f: &dyn Fn(&[f64], &mut [f64]), v: &[f64]) -> Vec<f64> {
     let mut out = vec![0.0; v.len()];
     f(v, &mut out);
     out
+}
+
+/// The CPU's memory as an [`EigenSpace`], the products by `problem`'s closures. Vectors
+/// given back are kept for the next ones asked for.
+struct HostSpace<'p, 'a> {
+    problem: &'p mut EigenProblem<'a>,
+    vectors: Vec<Vec<f64>>,
+    free: Vec<u32>,
+}
+
+impl HostSpace<'_, '_> {
+    fn at(&self, v: Vector) -> Result<&[f64], String> {
+        self.vectors
+            .get(v.0 as usize)
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("vector {} is not in the space", v.0))
+    }
+
+    /// Vector `dst` taken out while `f` fills it from the others, then put back.
+    fn fill(
+        &mut self,
+        dst: Vector,
+        f: impl FnOnce(&Self, &mut Vec<f64>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let slot = self
+            .vectors
+            .get_mut(dst.0 as usize)
+            .ok_or_else(|| format!("vector {} is not in the space", dst.0))?;
+        let mut out = std::mem::take(slot);
+        let result = f(self, &mut out);
+        self.vectors[dst.0 as usize] = out;
+        result
+    }
+}
+
+impl EigenSpace for HostSpace<'_, '_> {
+    fn size(&self) -> usize {
+        self.problem.size
+    }
+
+    fn create(&mut self) -> Result<Vector, String> {
+        let n = self.problem.size;
+        match self.free.pop() {
+            Some(i) => {
+                let v = &mut self.vectors[i as usize];
+                v.clear();
+                v.resize(n, 0.0);
+                Ok(Vector(i))
+            }
+            None => {
+                self.vectors.push(vec![0.0; n]);
+                Ok(Vector((self.vectors.len() - 1) as u32))
+            }
+        }
+    }
+
+    fn release(&mut self, v: Vector) {
+        if (v.0 as usize) < self.vectors.len() && !self.free.contains(&v.0) {
+            self.free.push(v.0);
+        }
+    }
+
+    fn write(&mut self, v: Vector, values: &[f64]) -> Result<(), String> {
+        self.fill(v, |_, out| {
+            if out.len() != values.len() {
+                return Err("a vector of the wrong length".to_owned());
+            }
+            out.copy_from_slice(values);
+            Ok(())
+        })
+    }
+
+    fn read(&mut self, v: Vector) -> Result<Vec<f64>, String> {
+        self.at(v).map(<[f64]>::to_vec)
+    }
+
+    fn apply_a(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        self.fill(dst, |s, out| {
+            (s.problem.apply_a)(s.at(src)?, out);
+            Ok(())
+        })
+    }
+
+    fn apply_b(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        self.fill(dst, |s, out| {
+            (s.problem.apply_b)(s.at(src)?, out);
+            Ok(())
+        })
+    }
+
+    fn precondition(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        let r = self.at(src)?.to_vec();
+        let slot = self
+            .vectors
+            .get_mut(dst.0 as usize)
+            .ok_or_else(|| format!("vector {} is not in the space", dst.0))?;
+        (self.problem.precondition)(&r, slot);
+        Ok(())
+    }
+
+    fn project(&mut self, v: Vector) -> Result<(), String> {
+        let slot = self
+            .vectors
+            .get_mut(v.0 as usize)
+            .ok_or_else(|| format!("vector {} is not in the space", v.0))?;
+        (self.problem.project)(slot);
+        Ok(())
+    }
+
+    fn dots(&mut self, pairs: &[(Vector, Vector)]) -> Result<Vec<f64>, String> {
+        pairs
+            .iter()
+            .map(|&(a, b)| -> Result<f64, String> { Ok(dot(self.at(a)?, self.at(b)?)) })
+            .collect()
+    }
+
+    fn add(&mut self, dst: Vector, terms: &[(f64, Vector)]) -> Result<(), String> {
+        self.fill(dst, |s, out| {
+            for &(c, v) in terms {
+                for (y, x) in out.iter_mut().zip(s.at(v)?) {
+                    *y += c * x;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn scale(&mut self, v: Vector, c: f64) -> Result<(), String> {
+        self.fill(v, |_, out| {
+            for x in out.iter_mut() {
+                *x *= c;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A vector of the block with its products by `A` and `B` (`av` none until it is
+/// computed), combined together so the three stay consistent without new products.
+#[derive(Debug, Clone, Copy)]
+struct Column {
+    v: Vector,
+    av: Option<Vector>,
+    bv: Vector,
 }
 
 /// The lowest `options.count` eigenpairs of `problem`, from the vectors of `start` (a
@@ -141,7 +303,25 @@ pub(crate) fn smallest(
     start: Option<&[Vec<f64>]>,
     cancel: &AtomicBool,
 ) -> Result<Eigenpairs, EigenError> {
-    let n = problem.size;
+    let progress = problem.progress;
+    let mut space = HostSpace {
+        problem,
+        vectors: Vec::new(),
+        free: Vec::new(),
+    };
+    smallest_in(&mut space, options, start, cancel, progress)
+}
+
+/// [`smallest`] in `space`, wherever it keeps its vectors; `progress` hears how far the
+/// wanted pairs are from converging, from 0 to 1.
+pub(crate) fn smallest_in<S: EigenSpace + ?Sized>(
+    space: &mut S,
+    options: &EigenOptions,
+    start: Option<&[Vec<f64>]>,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(f64),
+) -> Result<Eigenpairs, EigenError> {
+    let n = space.size();
     let count = options.count.min(n);
     if count == 0 {
         return Ok(Eigenpairs {
@@ -167,22 +347,21 @@ pub(crate) fn smallest(
         };
         let mut candidates = Vec::with_capacity(block - x.len());
         for k in 0..block - x.len() {
-            let mut v = match given.get(k) {
+            let values = match given.get(k) {
                 Some(g) if g.len() == n => g.clone(),
                 _ => {
                     seed += 1;
                     random_vector(n, seed)
                 }
             };
-            (problem.project)(&mut v);
-            let bv = apply(problem.apply_b, &v);
-            candidates.push(Column {
-                v,
-                av: Vec::new(),
-                bv,
-            });
+            let v = space.create()?;
+            space.write(v, &values)?;
+            space.project(v)?;
+            let bv = space.create()?;
+            space.apply_b(v, bv)?;
+            candidates.push(Column { v, av: None, bv });
         }
-        let kept = orthonormalize(&[x.as_slice()], candidates);
+        let kept = orthonormalize(space, &x, candidates)?;
         x.extend(kept);
         if x.len() == block {
             break;
@@ -192,11 +371,14 @@ pub(crate) fn smallest(
         return Err(EigenError::Degenerate);
     }
     for c in &mut x {
-        c.av = apply(problem.apply_a, &c.v);
+        let av = space.create()?;
+        space.apply_a(c.v, av)?;
+        c.av = Some(av);
     }
     let (mut values, mut x, _) = {
-        let basis: Vec<&Column> = x.iter().collect();
-        rayleigh_ritz(&basis, basis.len(), basis.len(), n)
+        let (values, next, p) = rayleigh_ritz(space, &x, x.len(), x.len())?;
+        release(space, &x);
+        (values, next, p)
     };
     // The last step's directions, one per vector of the block (none at first).
     let mut directions: Vec<Column> = Vec::new();
@@ -205,19 +387,28 @@ pub(crate) fn smallest(
         if cancel.load(Ordering::Relaxed) {
             return Err(EigenError::Cancelled);
         }
-        // The residuals, and the pairs not yet converged.
-        let mut active: Vec<usize> = Vec::new();
-        let mut residuals: Vec<Vec<f64>> = Vec::new();
-        let mut worst = 0.0f64;
+        // The residuals `A x − λ B x`, and their sizes against the products', in one batch.
+        let mut residuals: Vec<Vector> = Vec::with_capacity(x.len());
+        let mut pairs = Vec::with_capacity(3 * x.len());
         for (i, c) in x.iter().enumerate() {
-            let lambda = values[i];
-            let r: Vec<f64> =
-                c.av.iter()
-                    .zip(&c.bv)
-                    .map(|(a, b)| a - lambda * b)
-                    .collect();
-            let size = norm(&c.av) + lambda.abs() * norm(&c.bv);
-            let relative = if size > 0.0 { norm(&r) / size } else { 0.0 };
+            let av = c.av.ok_or_else(missing_product)?;
+            let r = space.create()?;
+            space.add(r, &[(1.0, av), (-values[i], c.bv)])?;
+            residuals.push(r);
+            pairs.extend([(r, r), (av, av), (c.bv, c.bv)]);
+        }
+        let sizes = space.dots(&pairs)?;
+        let mut active: Vec<usize> = Vec::new();
+        let mut kept: Vec<Vector> = Vec::new();
+        let mut worst = 0.0f64;
+        for (i, r) in residuals.into_iter().enumerate() {
+            let [rr, aa, bb] = [sizes[3 * i], sizes[3 * i + 1], sizes[3 * i + 2]];
+            let size = aa.max(0.0).sqrt() + values[i].abs() * bb.max(0.0).sqrt();
+            let relative = if size > 0.0 {
+                rr.max(0.0).sqrt() / size
+            } else {
+                0.0
+            };
             let relative = if relative.is_finite() {
                 relative
             } else {
@@ -228,7 +419,9 @@ pub(crate) fn smallest(
             }
             if relative > options.tolerance {
                 active.push(i);
-                residuals.push(r);
+                kept.push(r);
+            } else {
+                space.release(r);
             }
         }
         residual = worst;
@@ -237,161 +430,256 @@ pub(crate) fn smallest(
         } else {
             1.0
         };
-        (problem.progress)(done);
+        progress(done);
         if worst <= options.tolerance {
-            return Ok(finish(values, x, count, iteration, true, residual));
+            for r in kept {
+                space.release(r);
+            }
+            release(space, &directions);
+            return finish(space, values, x, count, iteration, true, residual);
         }
 
         // The preconditioned residuals, B-orthonormal to the block and to each other, with
         // their products by A.
-        let mut w = Vec::with_capacity(residuals.len());
-        for r in &residuals {
-            let mut z = vec![0.0; n];
-            (problem.precondition)(r, &mut z);
-            (problem.project)(&mut z);
-            let bz = apply(problem.apply_b, &z);
+        let mut w = Vec::with_capacity(kept.len());
+        for r in kept {
+            let z = space.create()?;
+            space.precondition(r, z)?;
+            space.project(z)?;
+            space.release(r);
+            let bz = space.create()?;
+            space.apply_b(z, bz)?;
             w.push(Column {
                 v: z,
-                av: Vec::new(),
+                av: None,
                 bv: bz,
             });
         }
-        let mut w = orthonormalize(&[x.as_slice()], w);
+        let mut w = orthonormalize(space, &x, w)?;
         for c in &mut w {
-            c.av = apply(problem.apply_a, &c.v);
+            let av = space.create()?;
+            space.apply_a(c.v, av)?;
+            c.av = Some(av);
         }
         // The last directions of the same pairs, B-orthonormal to both.
-        let last: Vec<Column> = active
-            .iter()
-            .filter_map(|&i| directions.get(i).cloned())
-            .collect();
-        let p = orthonormalize(&[x.as_slice(), w.as_slice()], last);
+        let mut last: Vec<Column> = Vec::new();
+        for (i, d) in std::mem::take(&mut directions).into_iter().enumerate() {
+            if active.contains(&i) {
+                last.push(d);
+            } else {
+                release(space, &[d]);
+            }
+        }
+        let against: Vec<Column> = x.iter().chain(&w).copied().collect();
+        let p = orthonormalize(space, &against, last)?;
         if w.is_empty() && p.is_empty() {
             // Nothing new to search: the residuals lie in the block already.
-            return Ok(finish(values, x, count, iteration, false, residual));
+            return finish(space, values, x, count, iteration, false, residual);
         }
-        let (next_values, next_x, next_p) = {
-            let basis: Vec<&Column> = x.iter().chain(&w).chain(&p).collect();
-            rayleigh_ritz(&basis, x.len(), x.len(), n)
-        };
+        let basis: Vec<Column> = x.iter().chain(&w).chain(&p).copied().collect();
+        let (next_values, next_x, next_p) = rayleigh_ritz(space, &basis, x.len(), x.len())?;
+        release(space, &basis);
         values = next_values;
         x = next_x;
         directions = next_p;
 
         if (iteration + 1) % REORTHONORMALIZE_EVERY == 0 {
             let before = x.len();
-            x = orthonormalize(&[], x);
+            x = orthonormalize(space, &[], x)?;
             if x.len() < count {
                 return Err(EigenError::Degenerate);
             }
             if x.len() != before {
-                let basis: Vec<&Column> = x.iter().collect();
-                let (v, again, _) = rayleigh_ritz(&basis, basis.len(), basis.len(), n);
+                let (v, again, _) = rayleigh_ritz(space, &x, x.len(), x.len())?;
+                release(space, &x);
                 values = v;
                 x = again;
+                release(space, &directions);
                 directions.clear();
             }
         }
     }
-    Ok(finish(
+    release(space, &directions);
+    finish(
+        space,
         values,
         x,
         count,
         options.max_iterations,
         false,
         residual,
-    ))
+    )
 }
 
-/// The first `count` pairs of the block.
-fn finish(
+fn missing_product() -> EigenError {
+    EigenError::Failed("a vector of the block has no product by A".to_owned())
+}
+
+/// Gives back the vectors of `columns`.
+fn release<S: EigenSpace + ?Sized>(space: &mut S, columns: &[Column]) {
+    for c in columns {
+        space.release(c.v);
+        space.release(c.bv);
+        if let Some(av) = c.av {
+            space.release(av);
+        }
+    }
+}
+
+/// The first `count` pairs of the block, read back; the rest of the block given back.
+fn finish<S: EigenSpace + ?Sized>(
+    space: &mut S,
     values: Vec<f64>,
     x: Vec<Column>,
     count: usize,
     iterations: usize,
     converged: bool,
     residual: f64,
-) -> Eigenpairs {
-    Eigenpairs {
+) -> Result<Eigenpairs, EigenError> {
+    let mut vectors = Vec::with_capacity(count);
+    for c in x.iter().take(count) {
+        vectors.push(space.read(c.v)?);
+    }
+    release(space, &x);
+    Ok(Eigenpairs {
         values: values.into_iter().take(count).collect(),
-        vectors: x.into_iter().take(count).map(|c| c.v).collect(),
+        vectors,
         iterations,
         converged,
         residual,
-    }
+    })
 }
 
-/// `candidates` made B-orthonormal to the B-orthonormal blocks of `basis` and among
-/// themselves, by modified Gram–Schmidt twice: each loses its components along the others
-/// (its `A` product too when it has one, the basis then having theirs); one left with under
-/// [`DEPENDENT`] of its B-norm is dropped. The candidates kept, in order.
-fn orthonormalize(basis: &[&[Column]], candidates: Vec<Column>) -> Vec<Column> {
+/// `candidates` made B-orthonormal to the B-orthonormal `basis` and among themselves, one
+/// by one, by classical Gram–Schmidt twice: each loses its components along the others
+/// (asked for in one batch, each `uᵀ B c` as `(B u)ᵀ c`), its `A` product too when it has
+/// one, the basis then having theirs; one left with under [`DEPENDENT`] of its B-norm is
+/// dropped and given back. The candidates kept, in order.
+fn orthonormalize<S: EigenSpace + ?Sized>(
+    space: &mut S,
+    basis: &[Column],
+    candidates: Vec<Column>,
+) -> Result<Vec<Column>, EigenError> {
     let mut out: Vec<Column> = Vec::with_capacity(candidates.len());
-    for mut c in candidates {
-        let start = dot(&c.v, &c.bv);
+    for c in candidates {
+        let against: Vec<Column> = basis.iter().chain(&out).copied().collect();
+        // Its B-norm, and its components along the others, in one batch.
+        let mut pairs = vec![(c.v, c.bv)];
+        pairs.extend(against.iter().map(|u| (u.bv, c.v)));
+        let first = space.dots(&pairs)?;
+        let start = first[0];
         if !(start > 0.0 && start.is_finite()) {
+            release(space, &[c]);
             continue;
         }
-        for _ in 0..2 {
-            for u in basis.iter().flat_map(|b| b.iter()).chain(out.iter()) {
-                let k = dot(&u.bv, &c.v);
-                if k == 0.0 {
-                    continue;
-                }
-                axpy(&mut c.v, -k, &u.v);
-                axpy(&mut c.bv, -k, &u.bv);
-                if !c.av.is_empty() {
-                    axpy(&mut c.av, -k, &u.av);
-                }
+        let mut components: Vec<f64> = first[1..].to_vec();
+        for pass in 0..2 {
+            if pass == 1 {
+                let pairs: Vec<(Vector, Vector)> = against.iter().map(|u| (u.bv, c.v)).collect();
+                components = space.dots(&pairs)?;
+            }
+            let take = |part: fn(&Column) -> Option<Vector>| -> Option<Vec<(f64, Vector)>> {
+                against
+                    .iter()
+                    .zip(&components)
+                    .filter(|(_, k)| **k != 0.0)
+                    .map(|(u, k)| part(u).map(|v| (-k, v)))
+                    .collect()
+            };
+            if let Some(terms) = take(|u| Some(u.v)) {
+                space.add(c.v, &terms)?;
+            }
+            if let Some(terms) = take(|u| Some(u.bv)) {
+                space.add(c.bv, &terms)?;
+            }
+            if let Some(av) = c.av {
+                let terms = take(|u| u.av).ok_or_else(missing_product)?;
+                space.add(av, &terms)?;
             }
         }
-        let left = dot(&c.v, &c.bv);
+        let left = space.dots(&[(c.v, c.bv)])?[0];
         if !(left > DEPENDENT * DEPENDENT * start && left.is_finite()) {
+            release(space, &[c]);
             continue;
         }
         let s = 1.0 / left.sqrt();
-        scale(&mut c.v, s);
-        scale(&mut c.bv, s);
-        scale(&mut c.av, s);
+        space.scale(c.v, s)?;
+        space.scale(c.bv, s)?;
+        if let Some(av) = c.av {
+            space.scale(av, s)?;
+        }
         out.push(c);
     }
-    out
+    Ok(out)
 }
 
-/// `Σ coefficient(k) · columns[k]`, with the products.
-fn combine(columns: &[&Column], coefficient: impl Fn(usize) -> f64, n: usize) -> Column {
-    let mut out = Column {
-        v: vec![0.0; n],
-        av: vec![0.0; n],
-        bv: vec![0.0; n],
+/// `Σ coefficient(k) · columns[k]`, with the products, in new vectors.
+fn combine<S: EigenSpace + ?Sized>(
+    space: &mut S,
+    columns: &[Column],
+    coefficient: impl Fn(usize) -> f64,
+) -> Result<Column, EigenError> {
+    let terms =
+        |part: &dyn Fn(&Column) -> Option<Vector>| -> Result<Vec<(f64, Vector)>, EigenError> {
+            columns
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| coefficient(*k) != 0.0)
+                .map(|(k, c)| {
+                    part(c)
+                        .map(|v| (coefficient(k), v))
+                        .ok_or_else(missing_product)
+                })
+                .collect()
+        };
+    let (tv, tav, tbv) = (
+        terms(&|c| Some(c.v))?,
+        terms(&|c| c.av)?,
+        terms(&|c| Some(c.bv))?,
+    );
+    let out = Column {
+        v: space.create()?,
+        av: Some(space.create()?),
+        bv: space.create()?,
     };
-    for (k, c) in columns.iter().enumerate() {
-        let y = coefficient(k);
-        if y == 0.0 {
-            continue;
-        }
-        axpy(&mut out.v, y, &c.v);
-        axpy(&mut out.av, y, &c.av);
-        axpy(&mut out.bv, y, &c.bv);
+    space.add(out.v, &tv)?;
+    if let Some(av) = out.av {
+        space.add(av, &tav)?;
     }
-    out
+    space.add(out.bv, &tbv)?;
+    Ok(out)
 }
 
 /// Rayleigh–Ritz on the B-orthonormal `basis` (each column with its products): the lowest
-/// `keep` eigenpairs of `Sᵀ A S`, as values and vectors, and the part of each vector that
-/// comes from the columns from `split` on (the next search directions).
-fn rayleigh_ritz(
-    basis: &[&Column],
+/// `keep` eigenpairs of `Sᵀ A S`, as values and new vectors, and the part of each vector that
+/// comes from the columns from `split` on (the next search directions). The basis is left
+/// as it was, for the caller to give back.
+fn rayleigh_ritz<S: EigenSpace + ?Sized>(
+    space: &mut S,
+    basis: &[Column],
     keep: usize,
     split: usize,
-    n: usize,
-) -> (Vec<f64>, Vec<Column>, Vec<Column>) {
+) -> Result<(Vec<f64>, Vec<Column>, Vec<Column>), EigenError> {
     let s = basis.len();
-    let mut g = vec![0.0; s * s];
+    // Symmetric to rounding: the mean of the two products, all asked for in one batch.
+    let mut pairs = Vec::with_capacity(s * (s + 1));
     for i in 0..s {
         for j in i..s {
-            // Symmetric to rounding: the mean of the two products.
-            let v = 0.5 * (dot(&basis[i].v, &basis[j].av) + dot(&basis[j].v, &basis[i].av));
+            let (ai, aj) = (
+                basis[i].av.ok_or_else(missing_product)?,
+                basis[j].av.ok_or_else(missing_product)?,
+            );
+            pairs.push((basis[i].v, aj));
+            pairs.push((basis[j].v, ai));
+        }
+    }
+    let products = space.dots(&pairs)?;
+    let mut g = vec![0.0; s * s];
+    let mut k = 0;
+    for i in 0..s {
+        for j in i..s {
+            let v = 0.5 * (products[k] + products[k + 1]);
+            k += 2;
             g[i * s + j] = v;
             g[j * s + i] = v;
         }
@@ -401,12 +689,12 @@ fn rayleigh_ritz(
     let mut x = Vec::with_capacity(keep);
     let mut p = Vec::with_capacity(keep);
     for j in 0..keep {
-        x.push(combine(basis, |k| y[k * s + j], n));
+        x.push(combine(space, basis, |k| y[k * s + j])?);
         if split < s {
-            p.push(combine(&basis[split..], |k| y[(split + k) * s + j], n));
+            p.push(combine(space, &basis[split..], |k| y[(split + k) * s + j])?);
         }
     }
-    (theta.into_iter().take(keep).collect(), x, p)
+    Ok((theta.into_iter().take(keep).collect(), x, p))
 }
 
 /// The eigenvalues of the symmetric `a` (`n × n`, row-major), ascending, and its

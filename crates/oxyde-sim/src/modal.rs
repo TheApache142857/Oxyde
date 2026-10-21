@@ -155,6 +155,7 @@ pub fn solve_frequencies(
                 "it is too coarse for the modes asked for: ask for fewer, or mesh it finer"
                     .to_owned(),
             ),
+            EigenError::Failed(why) => SolveError::Invalid(why),
         })?;
     if !found.converged {
         return Err(SolveError::NotConverged {

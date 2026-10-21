@@ -68,6 +68,7 @@ mod mma;
 mod multigrid;
 mod surface;
 
+pub use crate::eigen::{EigenSpace, Vector};
 pub use check::{CheckError, Missing, PartCheck, check_part};
 pub use decimate::{decimate, decimate_holding, solid_pieces};
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
@@ -719,6 +720,20 @@ pub trait Backend {
         max_iterations: usize,
         cancel: &AtomicBool,
     ) -> Result<Solved, GenerativeError>;
+
+    /// Where the frequency limit's eigensolve runs on the backend, for `system` (the
+    /// stiffness and the first load case's fixtures; its loads zero) and `nodal`, each
+    /// node's mass in tonnes: its vectors kept there, `A` the system's product, `B` the
+    /// masses (both kept to the allowed motions, as [`System::loads`] are), the
+    /// preconditioner one cycle of the multigrid of [`System::plan`]. `None`, the default,
+    /// leaves the eigensolve to the CPU.
+    fn eigen_space<'s>(
+        &'s mut self,
+        _system: &System<'_>,
+        _nodal: &[f64],
+    ) -> Option<Result<Box<dyn EigenSpace + 's>, GenerativeError>> {
+        None
+    }
 }
 
 /// The CPU's own multigrid as a [`Backend`]: the reference other backends are tested
@@ -1105,7 +1120,8 @@ pub fn generate_on(
                     .collect();
                 let nodal = frequency::nodal_masses(dims, &masses);
                 let start = (!modes.is_empty()).then_some(modes.as_slice());
-                match frequency::lowest_modes(&fine, &nodal, start, cancel, threads) {
+                let on = backend.as_deref_mut();
+                match frequency::lowest_modes(&fine, &nodal, start, on, cancel, threads) {
                     Ok(found) => Some(found),
                     Err(GenerativeError::Cancelled) if !history.is_empty() => {
                         stopped = true;

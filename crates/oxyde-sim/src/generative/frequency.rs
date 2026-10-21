@@ -7,6 +7,9 @@
 //!   each of its corners), solved for its lowest pairs by LOBPCG ([`crate::eigen`])
 //!   preconditioned by one V-cycle of the static solve's multigrid ([`Cycle`]), and
 //!   warm-started from the last iteration's modes, which change little from one to the next.
+//!   With a backend that takes it (a graphics card's, [`Backend::eigen_space`]), the whole
+//!   eigensolve runs there: its vectors, products, cycles and sums; only the dot products
+//!   come back.
 //! - **The mass** of a voxel goes as its projected density, but below [`MASS_KNEE`] as the
 //!   sixth power of it, scaled to meet it there (Du and Olhoff, 2007): the stiffness goes as
 //!   the cube, so near-void regions, lighter than they are weak, would otherwise vibrate on
@@ -17,10 +20,10 @@
 
 use std::sync::atomic::AtomicBool;
 
-use super::GenerativeError;
 use super::brick::Brick;
 use super::element_energies;
 use super::multigrid::{Cycle, Dims, Fine, Operator};
+use super::{Backend, GenerativeError, System};
 use crate::eigen::{self, EigenError, EigenOptions, EigenProblem};
 
 /// The modes a frequency limit keeps above it, the lowest first.
@@ -77,14 +80,48 @@ pub(super) fn nodal_masses(dims: Dims, masses: &[f64]) -> Vec<f64> {
 }
 
 /// The lowest [`LIMITED_MODES`] modes of `fine` (its held nodes the fixtures') with the
-/// nodes' masses `nodal` (tonnes), from `start` (the last iteration's) when there is one.
+/// nodes' masses `nodal` (tonnes), from `start` (the last iteration's) when there is one; on
+/// `backend` when it takes the eigensolve, else on the CPU.
 pub(super) fn lowest_modes(
     fine: &Fine,
     nodal: &[f64],
     start: Option<&[Vec<f64>]>,
+    backend: Option<&mut dyn Backend>,
     cancel: &AtomicBool,
     threads: usize,
 ) -> Result<Modes, GenerativeError> {
+    let options = EigenOptions {
+        count: LIMITED_MODES,
+        guard: MODE_GUARD,
+        tolerance: MODE_TOLERANCE,
+        max_iterations: MODE_ITERATIONS,
+    };
+    // Out of iterations, the modes as far as they got: the next iteration starts from them.
+    let failed = |e: EigenError| match e {
+        EigenError::Cancelled => GenerativeError::Cancelled,
+        EigenError::Degenerate => GenerativeError::Solver(
+            "the design space has too few voxels for its natural frequencies".to_owned(),
+        ),
+        EigenError::Failed(why) => GenerativeError::Solver(why),
+    };
+    if let Some(backend) = backend {
+        // No loads: the system is the stiffness and the fixtures.
+        let system = System {
+            fine,
+            loads: vec![0.0; 3 * nodal.len()],
+            threads,
+        };
+        if let Some(space) = backend.eigen_space(&system, nodal) {
+            let mut space = space?;
+            let found = eigen::smallest_in(space.as_mut(), &options, start, cancel, &|_| {})
+                .map_err(failed)?;
+            return Ok(Modes {
+                values: found.values,
+                vectors: found.vectors,
+                iterations: found.iterations,
+            });
+        }
+    }
     let mut cycle = Cycle::new(fine, threads)?;
     let apply_a = |x: &[f64], y: &mut [f64]| {
         fine.apply(x, y, threads);
@@ -108,19 +145,7 @@ pub(super) fn lowest_modes(
         project: &project,
         progress: &|_| {},
     };
-    let options = EigenOptions {
-        count: LIMITED_MODES,
-        guard: MODE_GUARD,
-        tolerance: MODE_TOLERANCE,
-        max_iterations: MODE_ITERATIONS,
-    };
-    // Out of iterations, the modes as far as they got: the next iteration starts from them.
-    let found = eigen::smallest(&mut problem, &options, start, cancel).map_err(|e| match e {
-        EigenError::Cancelled => GenerativeError::Cancelled,
-        EigenError::Degenerate => GenerativeError::Solver(
-            "the design space has too few voxels for its natural frequencies".to_owned(),
-        ),
-    })?;
+    let found = eigen::smallest(&mut problem, &options, start, cancel).map_err(failed)?;
     Ok(Modes {
         values: found.values,
         vectors: found.vectors,

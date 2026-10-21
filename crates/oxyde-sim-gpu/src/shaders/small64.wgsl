@@ -190,3 +190,94 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) 
         dir[i] = z[i] + scalars[BETA] * dir[i];
     }
 }
+
+//!! project64
+// The frequency limit's eigensolve: a vector kept to the allowed motions in place, projected
+// at held nodes, zero at nodes no cell touches.
+@group(0) @binding(0) var<storage, read_write> v: array<f64>;
+@group(0) @binding(1) var<storage, read> held: array<u32>;
+@group(0) @binding(2) var<storage, read> proj: array<f64>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let n = record(gid, groups);
+    if (n >= p.count) {
+        return;
+    }
+    let h = held[n];
+    if (h == FREE) {
+        return;
+    }
+    let o = 3u * n;
+    if (h == INACTIVE) {
+        v[o] = f64(0.0);
+        v[o + 1u] = f64(0.0);
+        v[o + 2u] = f64(0.0);
+        return;
+    }
+    let q = 12u * h;
+    let x = vec3<f64>(v[o], v[o + 1u], v[o + 2u]);
+    v[o] = proj[q] * x.x + proj[q + 1u] * x.y + proj[q + 2u] * x.z;
+    v[o + 1u] = proj[q + 3u] * x.x + proj[q + 4u] * x.y + proj[q + 5u] * x.z;
+    v[o + 2u] = proj[q + 6u] * x.x + proj[q + 7u] * x.y + proj[q + 8u] * x.z;
+}
+
+//!! mass64
+// The lumped masses times a vector, node by node, kept to the allowed motions.
+@group(0) @binding(0) var<storage, read> src: array<f64>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f64>;
+@group(0) @binding(2) var<storage, read> mass: array<f64>;
+@group(0) @binding(3) var<storage, read> held: array<u32>;
+@group(0) @binding(4) var<storage, read> proj: array<f64>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let n = record(gid, groups);
+    if (n >= p.count) {
+        return;
+    }
+    let o = 3u * n;
+    let h = held[n];
+    let x = mass[n] * vec3<f64>(src[o], src[o + 1u], src[o + 2u]);
+    if (h == FREE) {
+        dst[o] = x.x;
+        dst[o + 1u] = x.y;
+        dst[o + 2u] = x.z;
+    } else if (h == INACTIVE) {
+        dst[o] = f64(0.0);
+        dst[o + 1u] = f64(0.0);
+        dst[o + 2u] = f64(0.0);
+    } else {
+        let q = 12u * h;
+        dst[o] = proj[q] * x.x + proj[q + 1u] * x.y + proj[q + 2u] * x.z;
+        dst[o + 1u] = proj[q + 3u] * x.x + proj[q + 4u] * x.y + proj[q + 5u] * x.z;
+        dst[o + 2u] = proj[q + 6u] * x.x + proj[q + 7u] * x.y + proj[q + 8u] * x.z;
+    }
+}
+
+//!! axpy64
+// dst += c src, c the coefficients' slot `p.slot`.
+@group(0) @binding(0) var<storage, read_write> dst: array<f64>;
+@group(0) @binding(1) var<storage, read> src: array<f64>;
+@group(0) @binding(2) var<storage, read> coef: array<f64>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let i = record(gid, groups);
+    if (i < p.count) {
+        dst[i] += coef[p.slot] * src[i];
+    }
+}
+
+//!! scale64
+// v *= c, c the coefficients' slot `p.slot`.
+@group(0) @binding(0) var<storage, read_write> v: array<f64>;
+@group(0) @binding(1) var<storage, read> coef: array<f64>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+    let i = record(gid, groups);
+    if (i < p.count) {
+        v[i] *= coef[p.slot];
+    }
+}

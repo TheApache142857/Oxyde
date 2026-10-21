@@ -1117,7 +1117,7 @@ fn the_frequency_limits_slopes_are_its_eigenvalues_differences() {
                 &projectors,
                 SCALAR_BELOW * modulus,
             );
-            lowest_modes(&fine, &nodal, None, &cancel, 1).unwrap()
+            lowest_modes(&fine, &nodal, None, None, &cancel, 1).unwrap()
         };
         (stiffness, found)
     };

@@ -95,7 +95,8 @@ release yet; the git history has every detail.
   a motor's speed or a launch's vibration. Explore shows each outcome's lowest frequency,
   marked when it falls short, and the part *Create Part* makes is checked for it too. A
   limit makes outcomes take longer, as their natural frequencies are found at every
-  iteration, and the stiffest outcome for its target may then weigh less. In files:
+  iteration (on the graphics card, with the rest of the solve, when one is used), and the
+  stiffest outcome for its target may then weigh less. In files:
   `min_frequency` in generative studies and each outcome's `frequency` (FORMAT.md §8–§9).
 - **The part made is checked.** Once *Create Part* has made the part, the panel checks it
   as a static study would: the part filled with tetrahedra, the faces of the bodies kept

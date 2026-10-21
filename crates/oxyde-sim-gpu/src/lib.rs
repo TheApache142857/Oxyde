@@ -14,6 +14,11 @@
 //!   the dot products (in two passes, summed in a fixed order, so a run repeats exactly on
 //!   one card) and the conjugate gradients' scalars, kept in a buffer on the card. The
 //!   residual is read back every few iterations to see whether it is small enough.
+//! - **The frequency limit's eigensolve** (`GpuSpace`, through `Backend::eigen_space`):
+//!   `oxyde_sim`'s LOBPCG with its vectors on the card, each in a buffer kept from one
+//!   iteration to the next; `A` the conjugate gradients' product, `B` the lumped masses, the
+//!   preconditioner the same cycle, every combination there, the dot products read back a
+//!   batch at a time and the small eigenproblem solved on the CPU.
 //! - **Two precisions**: the conjugate gradients (their vectors, dot products, scalars and
 //!   the product they take) in double precision, the multigrid cycle that preconditions
 //!   them in single. A node's rows of `K u` sum terms near a million newtons down to loads
@@ -52,8 +57,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use oxyde_sim::generative::{
-    Backend, CellKind, GenerativeError, Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved,
-    System,
+    Backend, CellKind, EigenSpace, GenerativeError, Plan, PlanLevel, SMOOTHING_DEGREE,
+    SPECTRUM_RATIO, Solved, System, Vector,
 };
 
 const COMMON: &str = include_str!("shaders/common.wgsl");
@@ -107,10 +112,15 @@ enum K {
     Start64,
     UpdateXr64,
     UpdateDir64,
+    // The frequency limit's eigensolve, in double.
+    Project64,
+    Mass64,
+    Axpy64,
+    Scale64,
 }
 
 impl K {
-    const ALL: [K; 18] = [
+    const ALL: [K; 22] = [
         K::FineProduct,
         K::CoarseProduct,
         K::DinvStart,
@@ -129,6 +139,10 @@ impl K {
         K::Start64,
         K::UpdateXr64,
         K::UpdateDir64,
+        K::Project64,
+        K::Mass64,
+        K::Axpy64,
+        K::Scale64,
     ];
 
     fn name(self) -> &'static str {
@@ -151,6 +165,10 @@ impl K {
             K::Start64 => "start64",
             K::UpdateXr64 => "update_xr64",
             K::UpdateDir64 => "update_dir64",
+            K::Project64 => "project64",
+            K::Mass64 => "mass64",
+            K::Axpy64 => "axpy64",
+            K::Scale64 => "scale64",
         }
     }
 
@@ -169,7 +187,9 @@ impl K {
             K::Alpha64 => &[true],
             K::Beta64 | K::Start64 => &[true, true],
             K::UpdateXr64 => &[true, true, false, false, false],
-            K::UpdateDir64 => &[true, false, false],
+            K::UpdateDir64 | K::Project64 | K::Axpy64 => &[true, false, false],
+            K::Mass64 => &[false, true, false, false, false],
+            K::Scale64 => &[true, false],
         }
     }
 
@@ -286,6 +306,8 @@ pub struct GpuBackend {
     params_layout: wgpu::BindGroupLayout,
     /// Buffers kept from one solve to the next, by name, grown when too small.
     buffers: BTreeMap<String, wgpu::Buffer>,
+    /// The frequency limit's eigensolve's vectors, kept for the next one (`GpuSpace`).
+    eigen_vectors: Vec<wgpu::Buffer>,
     /// What wgpu reported going wrong, instead of panicking as it would by default.
     error: Arc<Mutex<Option<String>>>,
 }
@@ -435,6 +457,7 @@ impl GpuBackend {
             kernels,
             params_layout,
             buffers: BTreeMap::new(),
+            eigen_vectors: Vec::new(),
             error,
         };
         // Compiling the shaders is where a driver would object.
@@ -530,17 +553,31 @@ impl GpuBackend {
 
     /// A bind group of `kernel` over the buffers named, in binding order.
     fn group(&self, kernel: K, names: &[&str]) -> Result<wgpu::BindGroup, GenerativeError> {
+        let buffers = names
+            .iter()
+            .map(|name| self.buffer(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.group_of(kernel, &buffers)
+    }
+
+    /// A bind group of `kernel` over `buffers`, in binding order.
+    fn group_of(
+        &self,
+        kernel: K,
+        buffers: &[&wgpu::Buffer],
+    ) -> Result<wgpu::BindGroup, GenerativeError> {
         let k = self
             .kernels
             .get(&kernel)
             .ok_or_else(|| gpu_error("a kernel is missing"))?;
-        let mut entries = Vec::with_capacity(names.len());
-        for (i, name) in names.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry {
+        let entries: Vec<wgpu::BindGroupEntry> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
                 binding: i as u32,
-                resource: self.buffer(name)?.as_entire_binding(),
-            });
-        }
+                resource: b.as_entire_binding(),
+            })
+            .collect();
         Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(kernel.name()),
             layout: &k.layout,
@@ -548,8 +585,8 @@ impl GpuBackend {
         }))
     }
 
-    /// Reads `count` doubles of buffer `name` back.
-    fn read_f64(&mut self, name: &str, count: usize) -> Result<Vec<f64>, GenerativeError> {
+    /// Makes sure the buffer results are read back through holds `count` doubles.
+    fn reserve_readback(&mut self, count: usize) {
         let bytes = (8 * count as u64).max(8);
         let fits = self
             .buffers
@@ -564,38 +601,18 @@ impl GpuBackend {
             });
             self.buffers.insert("readback".to_owned(), buffer);
         }
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_buffer_to_buffer(self.buffer(name)?, 0, self.buffer("readback")?, 0, bytes);
-        self.queue.submit(Some(encoder.finish()));
-        let staging = self.buffer("readback")?;
-        let slice = staging.slice(0..bytes);
-        let done: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> =
-            Arc::new(Mutex::new(None));
-        let sink = done.clone();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        let mapped = done.lock().unwrap_or_else(PoisonError::into_inner).take();
-        match mapped {
-            Some(Ok(())) => {}
-            Some(Err(e)) => return Err(gpu_error(e)),
-            None => return Err(gpu_error("the results did not come back")),
-        }
-        let values = {
-            let data = slice.get_mapped_range();
-            data.as_chunks::<8>()
-                .0
-                .iter()
-                .take(count)
-                .map(|c| f64::from_le_bytes(*c))
-                .collect()
-        };
-        staging.unmap();
+    }
+
+    /// Reads `count` doubles of buffer `name` back.
+    fn read_f64(&mut self, name: &str, count: usize) -> Result<Vec<f64>, GenerativeError> {
+        self.reserve_readback(count);
+        let values = read_back(
+            &self.device,
+            &self.queue,
+            self.buffer(name)?,
+            self.buffer("readback")?,
+            count,
+        )?;
         self.check()?;
         Ok(values)
     }
@@ -675,6 +692,47 @@ impl GpuBackend {
     }
 }
 
+/// Reads the first `count` doubles of `source` back through `staging` (mappable, large
+/// enough), waiting for the card.
+fn read_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    staging: &wgpu::Buffer,
+    count: usize,
+) -> Result<Vec<f64>, GenerativeError> {
+    let bytes = (8 * count as u64).max(8);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("readback"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, staging, 0, bytes);
+    queue.submit(Some(encoder.finish()));
+    let slice = staging.slice(0..bytes);
+    let done: Arc<Mutex<Option<Result<(), wgpu::BufferAsyncError>>>> = Arc::new(Mutex::new(None));
+    let sink = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    let mapped = done.lock().unwrap_or_else(PoisonError::into_inner).take();
+    match mapped {
+        Some(Ok(())) => {}
+        Some(Err(e)) => return Err(gpu_error(e)),
+        None => return Err(gpu_error("the results did not come back")),
+    }
+    let values = {
+        let data = slice.get_mapped_range();
+        data.as_chunks::<8>()
+            .0
+            .iter()
+            .take(count)
+            .map(|c| f64::from_le_bytes(*c))
+            .collect()
+    };
+    staging.unmap();
+    Ok(values)
+}
+
 /// The Chebyshev coefficients `(c1, c2)` of each smoothing step for an interval topped at
 /// `upper`, as the CPU's smoother works them out.
 fn chebyshev(upper: f64) -> [(f32, f32); SMOOTHING_DEGREE] {
@@ -747,10 +805,12 @@ struct LevelDispatches {
     prolong: Dispatch,
 }
 
-/// A solve's dispatches: those before the first iteration and those of one iteration.
+/// A solve's dispatches: those before the first iteration and those of one iteration; and
+/// the preconditioner alone, from `r64` to `z64` (the eigensolve's).
 struct Script {
     start: Vec<Dispatch>,
     iteration: Vec<Dispatch>,
+    precondition: Vec<Dispatch>,
 }
 
 impl Backend for GpuBackend {
@@ -816,6 +876,14 @@ impl Backend for GpuBackend {
                 residual: last.max(0.0).sqrt() / scale,
             }),
         }
+    }
+
+    fn eigen_space<'s>(
+        &'s mut self,
+        system: &System<'_>,
+        nodal: &[f64],
+    ) -> Option<Result<Box<dyn EigenSpace + 's>, GenerativeError>> {
+        Some(GpuSpace::new(self, system, nodal).map(|s| Box::new(s) as Box<dyn EigenSpace + 's>))
     }
 }
 
@@ -1204,6 +1272,10 @@ impl GpuBackend {
             groups: groups_for(values),
         };
 
+        let mut precondition = vec![to_f32];
+        precondition.extend(cycle.iter().copied());
+        precondition.push(to_f64);
+
         let mut start_list = vec![init_residual, to_f32];
         start_list.extend(cycle.iter().copied());
         start_list.push(to_f64);
@@ -1226,7 +1298,353 @@ impl GpuBackend {
         Ok(Script {
             start: start_list,
             iteration,
+            precondition,
         })
+    }
+}
+
+// ---- The frequency limit's eigensolve -------------------------------------------------------
+
+/// The frequency limit's eigensolve on the card: the block's vectors in buffers of their
+/// own (kept from one solve to the next), `A` the finest level's product in double precision
+/// as the conjugate gradients take it, `B` the lumped masses, the preconditioner the static
+/// solve's cycle in single precision between the conversions, every combination there; the
+/// dot products in two passes summed in a fixed order, read back a batch at a time.
+struct GpuSpace<'b> {
+    backend: &'b mut GpuBackend,
+    cells: [usize; 3],
+    nodes: usize,
+    /// Values per vector: three per node.
+    size: usize,
+    vectors: Vec<wgpu::Buffer>,
+    free: Vec<u32>,
+    /// The cycle's dispatches, with their bind groups and parameters.
+    recorder: Recorder,
+    params: wgpu::BindGroup,
+    _params_buffer: wgpu::Buffer,
+    precondition: Vec<Dispatch>,
+}
+
+/// What failed, as the eigensolve says it.
+fn text(e: GenerativeError) -> String {
+    match e {
+        GenerativeError::Solver(why) => why,
+        e => e.to_string(),
+    }
+}
+
+impl<'b> GpuSpace<'b> {
+    /// Uploads `system` (its stiffness, fixtures and multigrid plan) and the nodes' masses,
+    /// and records the cycle.
+    fn new(
+        backend: &'b mut GpuBackend,
+        system: &System<'_>,
+        nodal: &[f64],
+    ) -> Result<GpuSpace<'b>, GenerativeError> {
+        let cells = system.cells();
+        let n = nodes(cells);
+        if nodal.len() != n {
+            return Err(gpu_error("the masses do not fit the grid"));
+        }
+        let size = 3 * n;
+        let plan = system.plan(COARSEST_NODES)?;
+        backend.load(system, &plan, &vec![0.0; size], 0)?;
+        backend.upload_f64("mass64", nodal.iter().copied())?;
+        let mut recorder = Recorder {
+            groups: Vec::new(),
+            params: Vec::new(),
+        };
+        let script = backend.script(system, &plan, &mut recorder)?;
+        let (params_buffer, params) = backend.params(&recorder)?;
+        // The last solve's vectors, when they fit this grid.
+        let mut vectors = std::mem::take(&mut backend.eigen_vectors);
+        if vectors.iter().any(|b| b.size() != 8 * size as u64) {
+            vectors.clear();
+        }
+        let free = (0..vectors.len() as u32).rev().collect();
+        Ok(GpuSpace {
+            backend,
+            cells,
+            nodes: n,
+            size,
+            vectors,
+            free,
+            recorder,
+            params,
+            _params_buffer: params_buffer,
+            precondition: script.precondition,
+        })
+    }
+
+    fn vector(&self, v: Vector) -> Result<&wgpu::Buffer, String> {
+        self.vectors
+            .get(v.0 as usize)
+            .ok_or_else(|| format!("on the graphics card: vector {} is not there", v.0))
+    }
+
+    fn named(&self, name: &str) -> Result<&wgpu::Buffer, String> {
+        self.backend.buffer(name).map_err(text)
+    }
+
+    /// Runs `steps` (a kernel, its buffers in binding order, its parameters and its
+    /// groups) in one pass.
+    fn run_steps(&self, steps: &[(K, Vec<&wgpu::Buffer>, Params, u32)]) -> Result<(), String> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+        let mut recorder = Recorder {
+            groups: Vec::new(),
+            params: Vec::new(),
+        };
+        let mut list = Vec::with_capacity(steps.len());
+        for (kernel, buffers, params, groups) in steps {
+            recorder
+                .groups
+                .push(self.backend.group_of(*kernel, buffers).map_err(text)?);
+            let group = recorder.groups.len() - 1;
+            let slot = recorder.slot(*params);
+            list.push(Dispatch {
+                kernel: *kernel,
+                group,
+                slot,
+                groups: *groups,
+            });
+        }
+        let (_buffer, params) = self.backend.params(&recorder).map_err(text)?;
+        self.backend.run(&recorder, &params, &list).map_err(text)
+    }
+
+    /// Copies all of `source` into `target`.
+    fn copy(&self, source: &wgpu::Buffer, target: &wgpu::Buffer) {
+        let mut encoder =
+            self.backend
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("eigen copy"),
+                });
+        encoder.copy_buffer_to_buffer(source, 0, target, 0, 8 * self.size as u64);
+        self.backend.queue.submit(Some(encoder.finish()));
+    }
+
+    /// A dispatch over every node.
+    fn per_node(&self) -> (Params, u32) {
+        (
+            Params {
+                cells: cells32(self.cells),
+                count: self.nodes as u32,
+                ..Params::default()
+            },
+            groups_for(self.nodes),
+        )
+    }
+
+    /// A dispatch over every value, with the coefficients' slot `slot`.
+    fn per_value(&self, slot: usize) -> (Params, u32) {
+        (
+            Params {
+                count: self.size as u32,
+                slot: slot as u32,
+                ..Params::default()
+            },
+            groups_for(self.size),
+        )
+    }
+}
+
+impl Drop for GpuSpace<'_> {
+    /// The vectors go back to the card's pool, for the next solve.
+    fn drop(&mut self) {
+        self.backend.eigen_vectors = std::mem::take(&mut self.vectors);
+    }
+}
+
+impl EigenSpace for GpuSpace<'_> {
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    fn create(&mut self) -> Result<Vector, String> {
+        if let Some(i) = self.free.pop() {
+            let buffer = self.vector(Vector(i))?;
+            let mut encoder =
+                self.backend
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("eigen clear"),
+                    });
+            encoder.clear_buffer(buffer, 0, None);
+            self.backend.queue.submit(Some(encoder.finish()));
+            return Ok(Vector(i));
+        }
+        // Zero when made, as wgpu makes every buffer.
+        let buffer = self.backend.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("eigen vector"),
+            size: 8 * self.size as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.vectors.push(buffer);
+        self.backend.check().map_err(text)?;
+        Ok(Vector((self.vectors.len() - 1) as u32))
+    }
+
+    fn release(&mut self, v: Vector) {
+        if (v.0 as usize) < self.vectors.len() && !self.free.contains(&v.0) {
+            self.free.push(v.0);
+        }
+    }
+
+    fn write(&mut self, v: Vector, values: &[f64]) -> Result<(), String> {
+        if values.len() != self.size {
+            return Err("on the graphics card: a vector of the wrong length".to_owned());
+        }
+        let mut bytes = Vec::with_capacity(8 * values.len());
+        for x in values {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        self.backend.queue.write_buffer(self.vector(v)?, 0, &bytes);
+        Ok(())
+    }
+
+    fn read(&mut self, v: Vector) -> Result<Vec<f64>, String> {
+        self.backend.reserve_readback(self.size);
+        let values = read_back(
+            &self.backend.device,
+            &self.backend.queue,
+            self.vector(v)?,
+            self.named("readback")?,
+            self.size,
+        )
+        .map_err(text)?;
+        self.backend.check().map_err(text)?;
+        Ok(values)
+    }
+
+    fn apply_a(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        let (node, groups) = self.per_node();
+        let product = vec![
+            self.vector(src)?,
+            self.named("loads64")?,
+            self.vector(dst)?,
+            self.named("cell64")?,
+            self.named("consts64")?,
+            self.named("held")?,
+            self.named("proj64")?,
+        ];
+        // The product's held rows are the projected stiffness's; projected again, so that
+        // rounding leaves nothing along a held direction.
+        let project = vec![
+            self.vector(dst)?,
+            self.named("held")?,
+            self.named("proj64")?,
+        ];
+        self.run_steps(&[
+            (K::FineProduct64, product, node, groups),
+            (K::Project64, project, node, groups),
+        ])
+    }
+
+    fn apply_b(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        let (node, groups) = self.per_node();
+        let buffers = vec![
+            self.vector(src)?,
+            self.vector(dst)?,
+            self.named("mass64")?,
+            self.named("held")?,
+            self.named("proj64")?,
+        ];
+        self.run_steps(&[(K::Mass64, buffers, node, groups)])
+    }
+
+    fn precondition(&mut self, src: Vector, dst: Vector) -> Result<(), String> {
+        self.copy(self.vector(src)?, self.named("r64")?);
+        self.backend
+            .run(&self.recorder, &self.params, &self.precondition)
+            .map_err(text)?;
+        self.copy(self.named("z64")?, self.vector(dst)?);
+        Ok(())
+    }
+
+    fn project(&mut self, v: Vector) -> Result<(), String> {
+        let (node, groups) = self.per_node();
+        let buffers = vec![self.vector(v)?, self.named("held")?, self.named("proj64")?];
+        self.run_steps(&[(K::Project64, buffers, node, groups)])
+    }
+
+    fn dots(&mut self, pairs: &[(Vector, Vector)]) -> Result<Vec<f64>, String> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.backend.reserve("gram", 8 * pairs.len() as u64);
+        let partial_groups = (self.size as u32).div_ceil(DOT_BLOCK).max(1);
+        let mut steps = Vec::with_capacity(2 * pairs.len());
+        for (i, &(a, b)) in pairs.iter().enumerate() {
+            let partial = Params {
+                count: self.size as u32,
+                ..Params::default()
+            };
+            let finish = Params {
+                count: partial_groups,
+                slot: i as u32,
+                ..Params::default()
+            };
+            steps.push((
+                K::DotPartial64,
+                vec![self.vector(a)?, self.vector(b)?, self.named("partials")?],
+                partial,
+                partial_groups,
+            ));
+            steps.push((
+                K::DotFinish64,
+                vec![self.named("partials")?, self.named("gram")?],
+                finish,
+                1,
+            ));
+        }
+        self.run_steps(&steps)?;
+        self.backend.reserve_readback(pairs.len());
+        let values = read_back(
+            &self.backend.device,
+            &self.backend.queue,
+            self.named("gram")?,
+            self.named("readback")?,
+            pairs.len(),
+        )
+        .map_err(text)?;
+        self.backend.check().map_err(text)?;
+        Ok(values)
+    }
+
+    fn add(&mut self, dst: Vector, terms: &[(f64, Vector)]) -> Result<(), String> {
+        if terms.is_empty() {
+            return Ok(());
+        }
+        // The coefficients first: the queue writes them before the pass that reads them.
+        self.backend
+            .upload_f64("coef", terms.iter().map(|t| t.0))
+            .map_err(text)?;
+        let mut steps = Vec::with_capacity(terms.len());
+        for (k, &(_, v)) in terms.iter().enumerate() {
+            let (params, groups) = self.per_value(k);
+            steps.push((
+                K::Axpy64,
+                vec![self.vector(dst)?, self.vector(v)?, self.named("coef")?],
+                params,
+                groups,
+            ));
+        }
+        self.run_steps(&steps)
+    }
+
+    fn scale(&mut self, v: Vector, c: f64) -> Result<(), String> {
+        self.backend
+            .upload_f64("coef", std::iter::once(c))
+            .map_err(text)?;
+        let (params, groups) = self.per_value(0);
+        let buffers = vec![self.vector(v)?, self.named("coef")?];
+        self.run_steps(&[(K::Scale64, buffers, params, groups)])
     }
 }
 
