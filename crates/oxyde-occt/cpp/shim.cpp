@@ -60,6 +60,7 @@
 #include <STEPCAFControl_Writer.hxx>
 #include <Quantity_Color.hxx>
 #include <Quantity_ColorRGBA.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <TopLoc_Location.hxx>
 #include <TopTools_DataMapOfShapeShape.hxx>
 #include <XCAFDoc_ColorTool.hxx>
@@ -1482,6 +1483,25 @@ OpResultData Session::solid_from_mesh(rust::Slice<const double> points,
             result.Reverse();
         }
         check_valid(result, "the solid made from the triangles is not valid");
+        // Triangles lying in one plane (where the part meets a flat face of a body kept, a
+        // flat side of the starting shape or of an obstacle) merged into one face, so the
+        // part has flat faces to select, sketch on and mate to instead of hundreds of
+        // triangles. Only planes that agree to a nanoradian: merging looser leaves the
+        // merged face's corners off its plane. A merge that fails or leaves an invalid
+        // solid is dropped, the triangles kept as they are.
+        try {
+            ShapeUpgrade_UnifySameDomain unify(result, Standard_True, Standard_True,
+                                               Standard_False);
+            unify.SetAngularTolerance(1e-9);
+            unify.Build();
+            const TopoDS_Shape merged = unify.Shape();
+            if (!merged.IsNull() && merged.ShapeType() == TopAbs_SOLID &&
+                BRepCheck_Analyzer(merged).IsValid()) {
+                result = merged;
+            }
+        } catch (const Standard_Failure&) {
+        } catch (const std::exception&) {
+        }
 
         TopTools_IndexedMapOfShape result_faces;
         TopExp::MapShapes(result, TopAbs_FACE, result_faces);

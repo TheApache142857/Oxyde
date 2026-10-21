@@ -426,6 +426,14 @@ fn an_outcome_cut_from_its_starting_shape_meets_its_faces() {
         .unwrap()
         .shape;
     eprintln!("a solid in {:.2} s", start.elapsed().as_secs_f64());
+    // The plate's top and bottom, met where they are, are flat faces of the part: fewer
+    // faces than triangles.
+    let faces = kernel.topology_counts(solid).unwrap().faces;
+    assert!(
+        faces < pieces[0].triangles.len(),
+        "{faces} faces for {} triangles",
+        pieces[0].triangles.len()
+    );
     let plate = body.solids[2].shape;
     let (lo, hi) = kernel.bounds(solid).unwrap();
     let (plate_lo, plate_hi) = kernel.bounds(plate).unwrap();

@@ -958,7 +958,12 @@ stays on show.
 - **A solid of each piece** by a new `Kernel` operation, `solid_from_mesh` (ARCHITECTURE.md
   §4): OCCT's `BRepBuilderAPI_MakeShapeOnMesh` makes one planar face per triangle with shared
   edges, which come back loose and are gathered into a shell, checked closed, made a solid,
-  turned outward and checked valid.
+  turned outward and checked valid. Since step 7, neighbouring triangles in one plane (to a
+  nanoradian: where the surface meets a flat face of a body it was held on) are merged into
+  one face by `ShapeUpgrade_UnifySameDomain`, so the part has flat faces to sketch on and
+  mate to; a merge that fails or leaves an invalid solid is dropped. A looser tolerance
+  would merge the near-flat organic regions too, but leaves the merged face's corners off
+  its plane, which OCCT's checks then refuse.
 - **No boolean**: the solids go to STEP as they are, with the outcome's material, into the
   Imported feature of a new part in that material, kept as an imported STEP file is: no
   change to `.oxyprt`. The panel then offers to open it. The first *Create Part* fused the
@@ -1085,3 +1090,9 @@ NASA's Evolved Structures and the literature on length scales say (the owner ask
   robust formulation (eroded, intermediate and dilated designs) that would guarantee them
   costs two to three solves an iteration and a finer grid for the same thickness, and is
   left for later.
+- **Flat faces whole in Create Part.** The solid's triangles that lie in one plane (where
+  the surface was held on a flat face of a body kept, of the starting shape or of an
+  obstacle) are one face (step 4). Test: the plate with two bored rings makes a solid of
+  fewer faces than triangles. The boolean with the exact bodies is still not tried: with
+  the flat faces merged the faceted regions remain, thousands of faces where the shape is
+  organic.
