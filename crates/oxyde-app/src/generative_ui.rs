@@ -36,9 +36,9 @@ use oxyde_kernel::{FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
 use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical, Part};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
-    Backend, DesignSpace, Direction, GenerativeError, GenerativeStudy, Grid, MAX_VOXELS, Method,
-    Objective, Obstacle, Voxel, decimate_holding, exact_surface, generate_on, solid_pieces,
-    surface, voxel_size,
+    Backend, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError, GenerativeStudy, Grid,
+    MAX_VOXELS, Method, Objective, Obstacle, Voxel, decimate_holding, exact_surface, generate_on,
+    solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -582,6 +582,7 @@ pub(crate) fn outcome_of(
         max_displacement: o.max_displacement,
         max_von_mises: o.max_von_mises,
         min_factor_of_safety: o.min_factor_of_safety,
+        grayness: Some(o.grayness),
         history: o
             .history
             .iter()
@@ -617,6 +618,7 @@ pub(crate) fn failed_outcome(plan: &OutcomePlan, why: String, seconds: f64) -> G
         max_displacement: 0.0,
         max_von_mises: 0.0,
         min_factor_of_safety: None,
+        grayness: None,
         history: Vec::new(),
         density: Vec::new(),
         snapshots: Vec::new(),
@@ -3005,7 +3007,7 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
         .checkbox(&mut milling, "Milling")
         .on_hover_text(
             "3-axis milled from the side picked: the tool reaches every face from there, and \
-             no pocket is narrower than the tool",
+             pockets narrower than the tool are kept out where the shape allows",
         )
         .changed()
     {
@@ -3047,7 +3049,10 @@ fn manufacturing_rows(ui: &mut egui::Ui, g: &mut GenerativeSettings) -> bool {
             let mut set = tool_diameter.is_some();
             if ui
                 .checkbox(&mut set, "Tool diameter")
-                .on_hover_text("No pocket or gap narrower than the tool")
+                .on_hover_text(
+                    "Pockets and gaps narrower than the tool are discouraged (the density \
+                     filter is as wide as the tool): a tendency, so check the part made",
+                )
                 .changed()
             {
                 *tool_diameter = set.then_some(6.0);
@@ -3213,7 +3218,11 @@ fn resolution_rows(
                 let mut set = g.member_size.is_some();
                 if ui
                     .checkbox(&mut set, "")
-                    .on_hover_text("The thinnest bar or wall wanted; about three voxels when off")
+                    .on_hover_text(
+                        "The thinnest bar or wall wanted; about three voxels when off. A \
+                         tendency: the density filter discourages thinner ones, it does not \
+                         rule them out",
+                    )
                     .changed()
                 {
                     g.member_size = set.then(|| estimate.map_or(3.0, |(h, _)| 3.0 * h));
@@ -3509,6 +3518,24 @@ fn picked_rows(
                     text.color(egui::Color32::from_rgb(210, 140, 30))
                 } else {
                     text
+                });
+                ui.end_row();
+            }
+            if let Some(g) = o.grayness {
+                ui.label("Grayness");
+                let text = egui::RichText::new(format!("{:.1} %", 100.0 * g));
+                let grey = g > GRAYNESS_SETTLED;
+                ui.label(if grey {
+                    text.color(egui::Color32::from_rgb(210, 140, 30))
+                } else {
+                    text
+                })
+                .on_hover_text(if grey {
+                    "Parts of the design are neither solid nor void: it did not settle into a \
+                     crisp shape there, and the surface cut through them is a guess"
+                } else {
+                    "How much of the design is neither solid nor void: a few percent is the thin \
+                     band where the shape ends"
                 });
                 ui.end_row();
             }
@@ -3821,8 +3848,10 @@ mod tests {
             assert!(o.compliance > 0.0 && o.max_von_mises > 0.0);
             assert!((o.mass - study.generative.mass_target).abs() < 0.1 * o.mass);
             assert!(o.min_factor_of_safety.is_some());
+            assert!(o.grayness.is_some_and(|g| (0.0..=1.0).contains(&g)));
         }
-        // Printed up +Y: nothing above the first layer hangs over air.
+        // Printed up +Y: nothing above the first layer hangs over air, each voxel standing
+        // on the one under it or one of that one's four neighbours (45° at most).
         let printed = &outcomes[2].density;
         let n = grid.counts;
         for v in 0..grid.voxel_count() {
@@ -3831,8 +3860,9 @@ mod tests {
                 continue;
             }
             let held = (c[0].saturating_sub(1)..=(c[0] + 1).min(n[0] - 1)).any(|x| {
-                (c[2].saturating_sub(1)..=(c[2] + 1).min(n[2] - 1))
-                    .any(|z| printed[grid.index([x, c[1] - 1, z])] >= 128)
+                (c[2].saturating_sub(1)..=(c[2] + 1).min(n[2] - 1)).any(|z| {
+                    (x == c[0] || z == c[2]) && printed[grid.index([x, c[1] - 1, z])] >= 128
+                })
             });
             assert!(held, "{c:?} hangs");
         }

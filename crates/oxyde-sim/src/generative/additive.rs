@@ -1,11 +1,18 @@
 //! Additive manufacturing's overhang, as Langelaar's filter makes it (2016; in three
 //! dimensions, 2017): printed layer by layer from the build plate up, a voxel can only be as
-//! dense as what holds it up, the 3 × 3 voxels under it, which keeps every overhang within
-//! 45° of the build direction on a cubic grid.
+//! dense as what holds it up, the voxel under it and its four neighbours across the layer (a
+//! cross), which keeps every overhang within 45° of the build direction on a cubic grid.
+//!
+//! The cross, not the 3 × 3 under the voxel: support from a diagonal neighbour lets a wall
+//! step √2 voxels sideways per layer, an overhang of 54.7° from the build direction, and a
+//! shape grown on that stencil overhangs past 45° wherever it leans along a diagonal of the
+//! layer. Across the cross a wall steps one voxel per layer along the axes (45°, exactly)
+//! and needs two layers to step one voxel along a diagonal (35.3°): never more than 45°,
+//! steeper than needed along the diagonals.
 //!
 //! Going up from the plate, each voxel's printed density is the smooth minimum of its
 //! filtered density and the support under it, the smooth maximum of the printed densities
-//! of those nine voxels (fewer at the grid's sides); the first layer stands on the plate.
+//! of those five voxels (fewer at the grid's sides); the first layer stands on the plate.
 //! Preserve voxels are printed whatever holds them, void ones never. The slopes go back down
 //! the layers by the chain rule (the filter's adjoint), so the optimization sees what a
 //! change costs in the layers it holds up.
@@ -70,7 +77,8 @@ impl<'a> Printing<'a> {
         })
     }
 
-    /// The voxels holding up voxel `v` (not on the plate): the 3 × 3 in the layer under it.
+    /// The voxels holding up voxel `v` (not on the plate): the one under it and that one's
+    /// four neighbours across the layer.
     fn supports(&self, v: usize) -> impl Iterator<Item = usize> + '_ {
         let (a, b, c) = (self.axis, (self.axis + 1) % 3, (self.axis + 2) % 3);
         let n = self.grid.counts;
@@ -83,6 +91,10 @@ impl<'a> Printing<'a> {
         below.into_iter().flat_map(move |under| {
             (-1i64..=1).flat_map(move |dk| {
                 (-1i64..=1).filter_map(move |dj| {
+                    // A cross: no diagonal neighbour (module documentation).
+                    if dj != 0 && dk != 0 {
+                        return None;
+                    }
                     let j = at[b] as i64 + dj;
                     let k = at[c] as i64 + dk;
                     if j < 0 || k < 0 || j >= n[b] as i64 || k >= n[c] as i64 {
@@ -208,8 +220,8 @@ mod tests {
 
     #[test]
     fn the_smooth_bounds_are_close_and_their_slopes_right() {
-        // Nine supports at the threshold give it exactly; one solid support holds a voxel up.
-        assert!((smax(std::iter::repeat_n(XI0, 9)) - XI0).abs() < 1e-12);
+        // Five supports at the threshold give it exactly; one solid support holds a voxel up.
+        assert!((smax(std::iter::repeat_n(XI0, 5)) - XI0).abs() < 1e-12);
         assert!(smax([1.0, 0.0, 0.0].into_iter()) > 0.95);
         assert!(smax([0.0; 9].into_iter()) == 0.0);
         assert!((smin(1.0, 1.0) - 1.0).abs() < 1e-12);
@@ -297,5 +309,46 @@ mod tests {
                 slopes[v]
             );
         }
+    }
+
+    #[test]
+    fn a_voxel_held_up_only_along_a_diagonal_does_not_print() {
+        // Printed up +Y on a 3 × 2 × 3 grid: one solid voxel on the plate in a corner, and
+        // the voxel above the opposite corner of its 3 × 3 neighbourhood wanted solid. Only
+        // a diagonal neighbour would hold it up (an overhang of 54.7°): it prints empty. The
+        // one straight above the solid voxel, and those beside it along the axes, print.
+        let counts = [3, 2, 3];
+        let grid = Grid::from_parts(
+            [0.0; 3],
+            1.0,
+            counts,
+            vec![Voxel::Design; counts.iter().product()],
+        )
+        .unwrap();
+        let state = vec![State::Free; grid.voxel_count()];
+        let printing = Printing::new(
+            &grid,
+            Direction {
+                axis: 1,
+                positive: true,
+            },
+        );
+        let plate = grid.index([0, 0, 0]);
+        let filtered: Vec<f64> = (0..grid.voxel_count())
+            .map(|v| {
+                if v == plate || grid.coords(v)[1] == 1 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let p = printing.forward(&filtered, &state);
+        assert!(p.printed[grid.index([0, 1, 0])] > 0.99);
+        assert!(p.printed[grid.index([1, 1, 0])] > 0.99);
+        assert!(p.printed[grid.index([0, 1, 1])] > 0.99);
+        let diagonal = p.printed[grid.index([1, 1, 1])];
+        assert!(diagonal < 0.05, "{diagonal}");
+        assert!(p.printed[grid.index([2, 1, 2])] < 0.05);
     }
 }

@@ -441,7 +441,9 @@ fn a_printed_bracket_holds_itself_up() {
         outcome.mass,
         study.mass_target
     );
-    // Every voxel of the material above the plate stands on one of the nine under it.
+    // Every voxel of the material above the plate stands on the one under it or one of
+    // that one's four neighbours across the layer: nothing overhangs more than 45°, along
+    // the diagonals of the layer too.
     let n = grid.counts;
     let (mut material, mut hanging) = (0, 0);
     for v in 0..grid.voxel_count() {
@@ -453,7 +455,8 @@ fn a_printed_bracket_holds_itself_up() {
         let held = (-1i64..=1).any(|dz| {
             (-1i64..=1).any(|dx| {
                 let (x, z) = (c[0] as i64 + dx, c[2] as i64 + dz);
-                x >= 0
+                (dx == 0 || dz == 0)
+                    && x >= 0
                     && z >= 0
                     && x < n[0] as i64
                     && z < n[2] as i64
@@ -490,6 +493,12 @@ fn a_bracket_grows_a_crisp_load_path_at_its_mass_target() {
     assert!(load_path(&grid, &outcome.density, &loaded, &held));
     assert!(outcome.max_displacement > 0.0 && outcome.max_von_mises > 0.0);
     assert!(outcome.min_factor_of_safety.is_some());
+    // Settled crisp: few voxels neither solid nor void.
+    assert!(
+        outcome.grayness < GRAYNESS_SETTLED,
+        "grayness {}",
+        outcome.grayness
+    );
     assert_eq!(
         outcome.snapshots.len(),
         outcome.history.len() / SNAPSHOT_EVERY
@@ -599,6 +608,16 @@ fn manufacturing_methods_shape_the_outcome() {
             assert!(outcome.density[v] <= outcome.density[w], "{c:?}");
         }
     }
+}
+
+#[test]
+fn grayness_counts_the_design_voxels_neither_solid_nor_void() {
+    let state = [State::Free, State::Free, State::Solid, State::Void];
+    assert_eq!(grayness(&[0.0, 1.0, 1.0, 0.0], &state), 0.0);
+    assert!((grayness(&[0.5, 0.5, 1.0, 0.0], &state) - 1.0).abs() < 1e-12);
+    // Half the design voxels at a half: half as grey. Preserve and void voxels left out.
+    assert!((grayness(&[0.5, 1.0, 0.3, 0.7], &state) - 0.5).abs() < 1e-12);
+    assert_eq!(grayness(&[1.0, 0.0], &[State::Solid, State::Void]), 0.0);
 }
 
 /// Every edge of a closed, consistently wound surface is used once each way.

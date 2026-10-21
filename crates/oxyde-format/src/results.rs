@@ -454,6 +454,10 @@ pub struct GenerativeOutcome {
     pub max_von_mises: f64,
     /// `None` when the material has no known strength.
     pub min_factor_of_safety: Option<f64>,
+    /// How grey its densities are at the end, from 0 (every design voxel solid or void) to
+    /// 1 (all of them half); `None` for a failed outcome, and in files written before it was
+    /// kept.
+    pub grayness: Option<f64>,
     /// Every iteration, in order.
     pub history: Vec<GenerativeIteration>,
     /// Each voxel's density at the end, 0 (no material) to 255 (solid), before the
@@ -784,6 +788,7 @@ fn generative_dto(g: &GenerativeResults) -> GenerativeDto {
                 max_displacement: o.max_displacement,
                 max_von_mises: o.max_von_mises,
                 min_factor_of_safety: o.min_factor_of_safety,
+                grayness: o.grayness,
                 history: o.history.clone(),
                 snapshots: o.snapshots.iter().map(|s| s.iteration).collect(),
             })
@@ -1111,6 +1116,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
                 max_displacement: o.max_displacement,
                 max_von_mises: o.max_von_mises,
                 min_factor_of_safety: o.min_factor_of_safety,
+                grayness: o.grayness,
                 history: o.history.clone(),
                 density,
                 snapshots,
@@ -1424,6 +1430,9 @@ fn validate_generative(g: &GenerativeResults) -> Result<(), String> {
         if numbers.into_iter().any(|v| !v.is_finite()) {
             return Err(format!("outcome {id} has a number that is not finite"));
         }
+        if o.grayness.is_some_and(|g| !(0.0..=1.0).contains(&g)) {
+            return Err(format!("outcome {id}'s grayness is not between 0 and 1"));
+        }
     }
     Ok(())
 }
@@ -1499,6 +1508,9 @@ struct OutcomeDto {
     max_von_mises: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     min_factor_of_safety: Option<f64>,
+    /// 0 to 1; absent for a failed outcome and in files written before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grayness: Option<f64>,
     #[serde(default)]
     history: Vec<GenerativeIteration>,
     /// The iterations `snapshots.bin` holds, from 1, increasing.
@@ -1954,6 +1966,7 @@ mod tests {
             max_displacement: 0.081,
             max_von_mises: 92.4,
             min_factor_of_safety: Some(2.98),
+            grayness: Some(0.031),
             history: vec![step(120.4, 0.2), step(40.0, 0.05), step(35.2, 0.004)],
             density: vec![255, 0, 128, 255, 0, 0],
             snapshots: Vec::new(),
@@ -1989,6 +2002,7 @@ mod tests {
         failed.iterations = 0;
         failed.history.clear();
         failed.density.clear();
+        failed.grayness = None;
         file.generative = Some(GenerativeResults {
             grid: VoxelGrid {
                 origin: [-40.0, -5.0, -30.0],
@@ -2071,6 +2085,7 @@ mod tests {
         assert_eq!(first["max_displacement"], 0.081);
         assert_eq!(first["max_von_mises"], 92.4);
         assert_eq!(first["min_factor_of_safety"], 2.98);
+        assert_eq!(first["grayness"], 0.031);
         assert_eq!(
             first["history"][2],
             serde_json::json!({ "compliance": 35.2, "mass": 0.25, "change": 0.004 })
@@ -2086,6 +2101,7 @@ mod tests {
         let failed = &g["outcomes"][2];
         assert_eq!(failed["status"], "failed");
         assert_eq!(failed["message"], "the loads are not held");
+        assert!(failed.get("grayness").is_none());
         let snapshots = json["entries"]
             .as_array()
             .unwrap()
@@ -2159,6 +2175,10 @@ mod tests {
         refused(
             edit(|g| g.outcomes[0].history[1].compliance = f64::NAN),
             "not finite",
+        );
+        refused(
+            edit(|g| g.outcomes[1].grayness = Some(1.5)),
+            "grayness is not between 0 and 1",
         );
         let mut meshed = generative_sample();
         meshed.mesh = sample().mesh;

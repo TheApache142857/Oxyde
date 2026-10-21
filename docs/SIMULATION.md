@@ -709,7 +709,9 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   value, the slopes summed); 2-axis cutting keeps one value per column along the direction;
   casting caps each voxel at the one behind it along the direction (§8's pull, the
   neighbour exact on a grid); additive applies Langelaar's filter (2016, 2017): a layer is
-  printed only where the 3 × 3 voxels under it hold it up, smoothly, with its adjoint for the
+  printed only where the voxel under it and that one's four neighbours across the layer
+  (a cross; the 3 × 3 at first, step 7 below says why not) hold it up, smoothly, with its
+  adjoint for the
   slopes, and the first layer stands on the build plate.
 - **Each outcome** keeps its densities at the end and every tenth iteration (one byte per
   voxel, as the files keep them: the densities before the projection, which the surface is
@@ -986,7 +988,8 @@ stays on show.
   density filter and the projection, as the design above has it. From the plate at the
   grid's end behind the build direction, layer by layer, a voxel's printed density is the
   smooth minimum (ε 10⁻⁴) of its filtered density and the smooth maximum (P 40, exact at a
-  half) of the printed densities of the 3 × 3 under it; preserve voxels print solid, void
+  half) of the printed densities of the 3 × 3 under it (the cross since step 7); preserve
+  voxels print solid, void
   ones empty, the first layer stands on the plate. The slopes go back down the layers by the
   filter's adjoint. A build direction across a symmetry plane is refused
   (`BuildAcrossSymmetry`): layers printed one way cannot give a mirrored shape. The smooth
@@ -1052,3 +1055,33 @@ stays on show.
   bracket with no undercut seen from the tool and the tool's radius in the filter; the
   format's objective, limit and milling round trips and refusals; through the app, a milled
   pair of pads minimized in mass under its stress limit.
+
+**Built (October 2026): step 7**, the promises made exact, after reading what Fusion 360,
+NASA's Evolved Structures and the literature on length scales say (the owner asked for it).
+
+- **Overhangs within 45° in every direction.** The 3 × 3 support of step 5 let a voxel stand
+  on a diagonal neighbour: a wall leaning along a diagonal of the layer could step √2 voxels
+  per layer, an overhang of 54.7° from the build direction, where the panel and the files
+  said 45°. The support is now the voxel under and its four neighbours across the layer (a
+  cross): along the axes a wall steps one voxel per layer (45°, exactly), along a diagonal
+  it needs two layers to step one (35.3°), never more than 45° and steeper than needed
+  there. A disc over two layers would come closer to a 45° cone in every direction, at
+  twice the support's cost and a costlier adjoint; the cross keeps the promise first.
+  Tests: a voxel held up only along a diagonal prints empty; the printed bracket's voxels
+  each stand on the cross under them (the engine's and the app's tests).
+- **Grayness.** Each outcome reports Sigmund's measure of non-discreteness of its projected
+  densities, `4 ρ (1 − ρ)` averaged over the design voxels (0 solid or void everywhere, 1
+  all at a half), kept in the results (`grayness`, FORMAT.md §9) and shown in Explore,
+  marked over `GRAYNESS_SETTLED` (0.1). A design greyer than that does not count as settled
+  by the change or the steady-compliance tests and runs on to the end of the last stage:
+  a design that stops moving grey (as topology studies' casting pulled in the plane of
+  bending does) is no longer called settled. A crisp design at the last sharpness is grey
+  only in the band where it ends, a few hundredths of the design voxels: the test bracket
+  stays under the limit (test).
+- **Minimum thickness and the tool's width are tendencies.** Projection alone guarantees no
+  length scale (Wang, Lazarov and Sigmund, 2011): members thinner than the filter's
+  diameter, and pockets narrower than a milling tool, can survive it. The panel, the files'
+  description and the engine's documents now say they are discouraged, not ruled out; the
+  robust formulation (eroded, intermediate and dilated designs) that would guarantee them
+  costs two to three solves an iteration and a finer grid for the same thickness, and is
+  left for later.

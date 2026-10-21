@@ -15,10 +15,11 @@
 //!   (`mma`) towards the least mass that keeps them.
 //! - **The optimization** is SIMP as in [`crate::topology`]: a design density per voxel (or
 //!   per group of voxels the manufacturing ties together), averaged over a sphere (the
-//!   density filter: no member thinner than the minimum thickness), then pushed towards
-//!   solid or void by a smoothed Heaviside projection whose sharpness `β` doubles as the
-//!   design settles, so the shape comes out crisp rather than grey; the stiffness goes as
-//!   the cube of the projected density. Optimality criteria move the design, the mass target
+//!   density filter, of radius half the minimum thickness: members thinner than that are
+//!   discouraged, not ruled out, as projection alone guarantees no length scale), then
+//!   pushed towards solid or void by a smoothed Heaviside projection whose sharpness `β`
+//!   doubles as the design settles, so the shape comes out crisp rather than grey; the
+//!   stiffness goes as the cube of the projected density. Optimality criteria move the design, the mass target
 //!   met by the projected densities (linearised at each iteration, so it is met once the
 //!   design settles).
 //! - **Manufacturing** ([`Method`]): *symmetry* ties each voxel to its mirror images (the
@@ -29,7 +30,12 @@
 //!   Material a method cannot avoid (behind a preserve voxel, in line with one) is made
 //!   solid, and room it cannot use (in front of an obstacle, in line with one) void.
 //!   *Additive* prints layer by layer along the build direction (`additive`): a voxel can
-//!   only be as dense as the 3 × 3 under it, which keeps overhangs within 45°.
+//!   only be as dense as the voxel under it and that one's four neighbours across the layer
+//!   (a cross), which keeps overhangs within 45° in every direction.
+//! - **Grayness** (Sigmund's measure of non-discreteness, `4 ρ (1 − ρ)` averaged over the
+//!   design voxels' projected densities: 0 when every one is solid or void, 1 when all are
+//!   half) is reported with each outcome, and a design greyer than [`GRAYNESS_SETTLED`]
+//!   does not count as settled.
 //! - [`surface`] cuts the densities into a smooth closed surface; [`decimate`] and
 //!   [`solid_pieces`] make it something a modelling kernel takes.
 
@@ -86,6 +92,12 @@ const LATE_MOVE_LIMIT: f64 = 0.1;
 /// run as long as the others. At the last sharpness the compliance jitters by a few tenths
 /// of a percent and the mass by about one: a tighter test was met or missed by chance.
 const SETTLED_CHANGE: f64 = 0.01;
+/// Nor, by either of those tests, while its grayness is over this: a design that stopped
+/// moving grey (a casting pulled in the plane the part bends in, in topology studies) has
+/// not settled, and runs on to the end of the last stage. At the last sharpness a crisp
+/// design's only grey voxels are a thin band where it ends, a few hundredths of the
+/// design voxels.
+pub const GRAYNESS_SETTLED: f64 = 0.1;
 const STEADY_COMPLIANCE: f64 = 5e-3;
 const STEADY_OVER: usize = 10;
 const STEADY_MASS: f64 = 0.01;
@@ -170,7 +182,8 @@ pub struct GenerativeStudy {
     pub objective: Objective,
     /// kg: the outcome's mass, preserve voxels included ([`Objective::MaxStiffness`]).
     pub mass_target: f64,
-    /// mm: the thinnest member wanted; `None` for three voxels.
+    /// mm: the thinnest member wanted, which the density filter's radius (half of it)
+    /// discourages thinner ones from; `None` for three voxels.
     pub member_size: Option<f64>,
     pub max_iterations: usize,
     /// mm: the voxels' edge ([`voxel_size`] gives it from a resolution).
@@ -220,8 +233,9 @@ pub enum Method {
     Additive { direction: Direction },
     /// 3-axis milled from the side `direction` points to: the tool reaches every face from
     /// there, so the shape has no undercut seen from it (a one-way pull towards the tool),
-    /// and no pocket or gap is narrower than `tool_diameter` (mm; the density filter's
-    /// radius at least half of it).
+    /// and pockets and gaps narrower than `tool_diameter` (mm) are discouraged: the density
+    /// filter's radius is at least half of it, which tends to keep them out but does not
+    /// rule them out.
     Milling {
         direction: Direction,
         tool_diameter: Option<f64>,
@@ -325,6 +339,10 @@ pub struct Outcome {
     pub solver_iterations: usize,
     /// mm: the density filter's radius.
     pub filter_radius: f64,
+    /// Its projected densities' grayness: `4 ρ (1 − ρ)` averaged over the design voxels, 0
+    /// when every one is solid or void, 1 when all are half (Sigmund's measure of
+    /// non-discreteness).
+    pub grayness: f64,
 }
 
 /// Why an outcome could not be generated.
@@ -792,6 +810,7 @@ pub fn generate_on(
                 State::Void => 0.0,
             })
             .collect();
+        let gray = grayness(&rho, &state);
         let stiffness: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
                 State::Free => {
@@ -1055,7 +1074,9 @@ pub fn generate_on(
             }
         };
         let last_stage_done = beta >= BETA_MAX && at_beta >= BETA_STEP_AFTER;
-        if (beta >= BETA_MAX && change < SETTLED_CHANGE && feasible) || steady || last_stage_done {
+        let crisp = gray <= GRAYNESS_SETTLED;
+        let settled = (beta >= BETA_MAX && change < SETTLED_CHANGE && feasible) || steady;
+        if (settled && crisp) || last_stage_done {
             converged = true;
             break;
         }
@@ -1112,6 +1133,7 @@ pub fn generate_on(
         min_factor_of_safety,
         solver_iterations,
         filter_radius: radius,
+        grayness: grayness(&solved_rho, &state),
     })
 }
 
@@ -1442,6 +1464,21 @@ fn bytes(rho: &[f64], state: &[State]) -> Vec<u8> {
             State::Free => (r.clamp(0.0, 1.0) * 255.0).round() as u8,
         })
         .collect()
+}
+
+/// Sigmund's measure of non-discreteness of the projected densities `rho`: `4 ρ (1 − ρ)`
+/// averaged over the free voxels, 0 when each is solid or void, 1 when all are half; 0
+/// without a free voxel.
+fn grayness(rho: &[f64], state: &[State]) -> f64 {
+    let (sum, count) = rho
+        .iter()
+        .zip(state)
+        .filter(|(_, s)| **s == State::Free)
+        .fold((0.0, 0usize), |(sum, n), (r, _)| {
+            let r = r.clamp(0.0, 1.0);
+            (sum + 4.0 * r * (1.0 - r), n + 1)
+        });
+    if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
 /// The smoothed Heaviside projection at sharpness `beta`, and its slope.

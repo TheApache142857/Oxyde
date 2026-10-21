@@ -19,16 +19,31 @@ release yet; the git history has every detail.
   writes it as STL, OBJ or 3MF. The outcomes are saved beside the study and come back with
   it. Topology studies are still made in the Simulation tab, under New Study.
 - **Additive manufacturing and load cases.** *Additive* grows shapes that print without
-  supports along the build direction picked: nothing overhangs more than 45°. *Load cases*
-  (Design conditions › Add a load case) give the loads a part meets at different times, each
-  with its own fixtures: the outcomes are as stiff as can be for them all. In files:
-  `load_cases` in the study's `generative` block (FORMAT.md §8).
+  supports along the build direction picked: nothing overhangs more than 45°, in any
+  direction. *Load cases* (Design conditions › Add a load case) give the loads a part meets
+  at different times, each with its own fixtures: the outcomes are as stiff as can be for
+  them all. In files: `load_cases` in the study's `generative` block (FORMAT.md §8).
 - **Minimize mass, a displacement limit, milling.** *Minimize mass* (Objectives) finds the
   lightest shape whose stress stays under the material's strength over the safety factor,
   and whose displacement stays under a limit when one is set; *Maximize stiffness* still
   takes a mass target. *Milling* grows shapes a 3-axis mill reaches from the side picked,
-  no pocket narrower than the tool. In files: `objective: "min_mass"`, `displacement_limit`
-  and the `milling` method (FORMAT.md §8).
+  pockets narrower than the tool kept out where the shape allows. In files:
+  `objective: "min_mass"`, `displacement_limit` and the `milling` method (FORMAT.md §8).
+- **Overhangs within 45° in every direction.** Additive outcomes could lean up to about
+  55° from the build direction where a wall ran along a diagonal between the axes: each
+  layer was allowed to rest on a diagonal neighbour. Now nothing overhangs more than 45° in
+  any direction (walls leaning along a diagonal come out a little steeper than needed), so
+  the outcomes print without supports as promised. Additive outcomes generated again
+  differ from earlier ones.
+- **How grey an outcome is.** Explore shows each outcome's *grayness*: how much of it is
+  neither solid nor void. A few percent is the thin band where the shape ends; more is
+  marked, as parts of the shape did not settle crisp there. An outcome that stops changing
+  while still grey is no longer called settled and runs on to the end. In files: each
+  outcome's `grayness` (FORMAT.md §9).
+- **Minimum thickness and the tool's width are aims.** The panel and the documents now say
+  what they are: the density filter keeps bars and walls from coming out thinner than the
+  minimum thickness, and pockets narrower than a milling tool, wherever the shape allows,
+  but does not rule them out. Check the part made.
 - **Generative design in assemblies.** A generative study of an assembly takes the bodies
   of its parts: keep the brackets' mounting bosses, stay clear of the motor next to them, and
   the outcome grows between them; *Create Part* inserts the part made where it was grown,
