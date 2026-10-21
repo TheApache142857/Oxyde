@@ -45,7 +45,7 @@ pub enum Role {
 }
 
 impl Role {
-    fn prefix(self) -> &'static str {
+    pub(crate) fn prefix(self) -> &'static str {
         match self {
             Role::Wall => "wall",
             Role::Inlet => "inlet",
@@ -99,6 +99,10 @@ pub struct Case {
     /// An internal flow: its mesh must not reach the domain's box.
     pub internal: bool,
     pub goals: Vec<CaseGoal>,
+    /// A cooling study, solved by `chtMultiRegionSimpleFoam` in a fluid and a solid region
+    /// ([`crate::cooling`]): its regions' files are written from it once the mesh is split.
+    /// `None` for a flow alone.
+    pub cooling: Option<Box<FlowStudy>>,
 }
 
 impl Case {
@@ -195,14 +199,24 @@ pub fn write_case(dir: &Path, study: &FlowStudy) -> Result<Case, CaseError> {
     let case = Case {
         dir: dir.to_path_buf(),
         patches,
-        solver: "simpleFoam".to_string(),
+        solver: if study.heat.is_some() {
+            "chtMultiRegionSimpleFoam"
+        } else {
+            "simpleFoam"
+        }
+        .to_string(),
         processes: study.solver.processes,
         iterations: study.solver.iterations,
         density: study.fluid.density,
         turbulent: matches!(study.turbulence, Turbulence::KOmegaSst { .. }),
         internal: matches!(study.flow_type, FlowType::Internal { .. }),
         goals,
+        cooling: study.heat.is_some().then(|| Box::new(study.clone())),
     };
+    if study.heat.is_some() {
+        crate::cooling::write(&case)?;
+        return Ok(case);
+    }
 
     put(
         &dir.join("constant/triSurface/model.stl"),
@@ -250,7 +264,7 @@ pub fn write_case(dir: &Path, study: &FlowStudy) -> Result<Case, CaseError> {
 
 /// Removes what an earlier case left in `dir`: the files this module writes, the mesh,
 /// time folders, processor folders, post-processing output and logs.
-fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
+pub(crate) fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
     let io_err = |path: &Path, error| CaseError::Io {
         path: path.to_path_buf(),
         error,
@@ -262,6 +276,9 @@ fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
         "constant/polyMesh",
         "constant/triSurface",
         "constant/extendedFeatureEdgeMesh",
+        "constant/fluid",
+        "constant/solid",
+        "constant/outside",
         "system",
         "0.orig",
         "postProcessing",
@@ -288,7 +305,7 @@ fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
     Ok(())
 }
 
-fn put(path: &Path, text: &str) -> Result<(), CaseError> {
+pub(crate) fn put(path: &Path, text: &str) -> Result<(), CaseError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| CaseError::Io {
             path: parent.to_path_buf(),
@@ -301,7 +318,7 @@ fn put(path: &Path, text: &str) -> Result<(), CaseError> {
     })
 }
 
-fn metres(p: [f64; 3]) -> [f64; 3] {
+pub(crate) fn metres(p: [f64; 3]) -> [f64; 3] {
     [p[0] * M_PER_MM, p[1] * M_PER_MM, p[2] * M_PER_MM]
 }
 
@@ -351,7 +368,7 @@ fn stl(study: &FlowStudy, case: &Case) -> String {
 
 /// The computational domain cut into cubes of the cell size. The box grows to a whole
 /// number of cubes along each axis.
-fn block_mesh_dict(study: &FlowStudy) -> String {
+pub(crate) fn block_mesh_dict(study: &FlowStudy) -> String {
     let n = study.background_cells();
     let h = study.mesh.cell_size;
     let min = study.domain.min;
@@ -430,7 +447,7 @@ fn surface_feature_extract_dict() -> String {
 /// The point the mesh keeps the fluid side of, in metres: inside the cavity for an
 /// internal flow, inside the domain's first cube for an external one. It is moved off the
 /// planes cell faces lie on by a small odd fraction of the finest cell.
-fn location_in_mesh(study: &FlowStudy) -> [f64; 3] {
+pub(crate) fn location_in_mesh(study: &FlowStudy) -> [f64; 3] {
     let fine = study.mesh.finest();
     let p = match study.flow_type {
         FlowType::Internal { point } => [
@@ -557,7 +574,7 @@ mergeTolerance 1e-6;
     s
 }
 
-fn mesh_quality_dict() -> String {
+pub(crate) fn mesh_quality_dict() -> String {
     let mut s = header("dictionary", "meshQualityDict");
     s.push_str(
         "maxNonOrtho 65;
@@ -744,7 +761,7 @@ relaxationFactors
     s
 }
 
-fn decompose_par_dict(study: &FlowStudy) -> String {
+pub(crate) fn decompose_par_dict(study: &FlowStudy) -> String {
     let mut s = header("dictionary", "decomposeParDict");
     let _ = writeln!(s, "numberOfSubdomains {};", study.solver.processes);
     s.push_str("method          scotch;\n");
@@ -762,7 +779,7 @@ fn transport_properties(study: &FlowStudy) -> String {
     s
 }
 
-fn turbulence_properties(study: &FlowStudy) -> String {
+pub(crate) fn turbulence_properties(study: &FlowStudy) -> String {
     let mut s = header("dictionary", "turbulenceProperties");
     match study.turbulence {
         Turbulence::Laminar => s.push_str("simulationType  laminar;\n"),
@@ -783,7 +800,7 @@ RAS
 
 /// A typical speed of the flow, m/s: the free stream's, or the fastest inlet's. It sets the
 /// starting turbulence.
-fn reference_speed(study: &FlowStudy, case: &Case) -> f64 {
+pub(crate) fn reference_speed(study: &FlowStudy, case: &Case) -> f64 {
     let speed = match study.flow_type {
         FlowType::External { velocity } => norm(velocity),
         FlowType::Internal { .. } => study
@@ -815,7 +832,7 @@ fn reference_speed(study: &FlowStudy, case: &Case) -> f64 {
 
 /// The share of `labels`' total area that `patch` has: a condition's flow rate is shared
 /// between its faces by area.
-fn area_share(case: &Case, labels: &[u32], patch: &FacePatch) -> f64 {
+pub(crate) fn area_share(case: &Case, labels: &[u32], patch: &FacePatch) -> f64 {
     let total: f64 = labels
         .iter()
         .filter_map(|&l| case.patch_of(l).map(|q| q.area))
@@ -824,7 +841,7 @@ fn area_share(case: &Case, labels: &[u32], patch: &FacePatch) -> f64 {
 }
 
 /// Velocity entering a face at `rate`, m³/s.
-fn flow_rate_inlet(rate: f64) -> String {
+pub(crate) fn flow_rate_inlet(rate: f64) -> String {
     format!(
         "type            flowRateInletVelocity;\nvolumetricFlowRate {};\nextrapolateProfile no;\nvalue           uniform (0 0 0);",
         num(rate)
@@ -832,7 +849,7 @@ fn flow_rate_inlet(rate: f64) -> String {
 }
 
 /// One boundary condition entry.
-fn entry(s: &mut String, patch: &str, body: &str) {
+pub(crate) fn entry(s: &mut String, patch: &str, body: &str) {
     let _ = writeln!(s, "    {patch}\n    {{");
     for line in body.lines() {
         let _ = writeln!(s, "        {line}");
@@ -1060,6 +1077,7 @@ mod tests {
             }],
             mesh: MeshSettings::new(1.0),
             solver: SolverSettings::default(),
+            heat: None,
         }
     }
 

@@ -77,13 +77,17 @@ pub const PART_FORMAT_VERSION: u32 = 2;
 /// thermal studies, 5 flow studies (3 and 4 are the topology and generative studies of the
 /// `topology-optimization` branch). A document is written with the oldest version that
 /// holds what it has, so older readers still open what they can.
-pub const SIMULATION_FORMAT_VERSION: u32 = 5;
+pub const SIMULATION_FORMAT_VERSION: u32 = 6;
 
 /// The `format_version` of simulation documents holding a thermal study (and no flow one).
 pub const THERMAL_FORMAT_VERSION: u32 = 2;
 
 /// The `format_version` of simulation documents holding a flow study.
 pub const FLOW_FORMAT_VERSION: u32 = 5;
+
+/// The `format_version` of study and results documents holding a cooling study (flow with
+/// heat conducted through the solids).
+pub const COOLING_FORMAT_VERSION: u32 = 6;
 
 const FORMAT_NAME: &str = "oxyde";
 const MANIFEST: &str = "manifest.json";

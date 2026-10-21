@@ -1,4 +1,5 @@
-//! Flow studies run through a real OpenFOAM (OpenCFD's v2606), against closed forms.
+//! Flow and cooling studies run through a real OpenFOAM (OpenCFD's v2606), against closed
+//! forms and correlations.
 //!
 //! Each test is skipped, with a note, when no OpenFOAM is installed. Where it is not,
 //! OpenCFD's image runs them (docs/CFD.md, *Testing*): build the test binary with
@@ -13,7 +14,8 @@ use std::sync::atomic::AtomicBool;
 
 use oxyde_flow::{
     Condition, ConditionKind, Domain, FlowResults, FlowStudy, FlowType, Fluid, Goal, GoalKind,
-    GoalValue, Installation, MeshSettings, SolverSettings, Surface, Turbulence, run, write_case,
+    GoalValue, Heat, HeatLoad, HeatLoadKind, Installation, MeshSettings, Solid, SolverSettings,
+    Surface, Turbulence, run, write_case,
 };
 
 fn openfoam() -> Option<Installation> {
@@ -257,6 +259,7 @@ fn laminar_pipe(install: &Installation, name: &str, processes: u32) {
             residual: 1e-5,
             processes,
         },
+        heat: None,
     };
     let (case, report, results, remove) = solve(install, name, &study);
     assert!(report.converged, "the flow converged");
@@ -376,6 +379,7 @@ fn sphere_drag_at_re_20() {
             residual: 1e-5,
             processes: 1,
         },
+        heat: None,
     };
     let (case, report, results, remove) = solve(&install, "sphere", &study);
     assert!(report.converged, "the flow converged");
@@ -444,6 +448,7 @@ fn turbulent_pipe_flow_runs() {
             residual: 1e-4,
             processes: 1,
         },
+        heat: None,
     };
     let (case, report, results, remove) = solve(&install, "turbulent", &study);
     let goals = results.goals(&case);
@@ -469,6 +474,483 @@ fn turbulent_pipe_flow_runs() {
         (inflow + mean * area).abs() < 0.02 * mean * area,
         "{inflow}"
     );
+    if remove {
+        let _ = std::fs::remove_dir_all(&case.dir);
+    }
+}
+
+/// A box from `lo` to `hi` (mm), its sides labelled `first`… in the order −x, +x, −y, +y,
+/// −z, +z. Normals point out.
+fn cuboid(lo: [f64; 3], hi: [f64; 3], first: u32) -> Surface {
+    let corner = |i: u32| {
+        [
+            if i & 1 == 0 { lo[0] } else { hi[0] },
+            if i & 2 == 0 { lo[1] } else { hi[1] },
+            if i & 4 == 0 { lo[2] } else { hi[2] },
+        ]
+    };
+    let mut s = Surface {
+        positions: (0..8).map(corner).collect(),
+        ..Surface::default()
+    };
+    for (side, [a, b, c, d]) in [
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        s.triangles.extend([[a, b, c], [a, c, d]]);
+        s.labels.extend([first + side as u32; 2]);
+    }
+    s
+}
+
+fn scalar_goal(goals: &[GoalValue], i: usize) -> f64 {
+    match &goals[i] {
+        GoalValue::Scalar { value, .. } => *value,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A cold plate: water at 0.1 m/s through a 4 mm square channel along an aluminium plate
+/// (four bars round the channel), closed by plastic lids, with a 10 W ceramic chip on top.
+/// At steady state the water carries the chip's heat away: m cp ΔT at the outlet, and what
+/// leaves the channel's walls, are 10 W. Two processes: every region decomposed and put back.
+#[test]
+fn a_cold_plate_carries_its_chip_heat_away() {
+    let Some(install) = openfoam() else { return };
+    let aluminium = |name: &str| Solid {
+        name: name.to_string(),
+        conductivity: 200.0,
+        density: 2700.0,
+    };
+    let surfaces = vec![
+        cuboid([-20.0, 0.0, -10.0], [20.0, 3.0, 10.0], 0),
+        cuboid([-20.0, 7.0, -10.0], [20.0, 10.0, 10.0], 6),
+        cuboid([-20.0, 3.0, -10.0], [20.0, 7.0, -2.0], 12),
+        cuboid([-20.0, 3.0, 2.0], [20.0, 7.0, 10.0], 18),
+        cuboid([-21.0, 3.0, -2.0], [-20.0, 7.0, 2.0], 24),
+        cuboid([20.0, 3.0, -2.0], [21.0, 7.0, 2.0], 30),
+        cuboid([-5.0, 10.0, -5.0], [5.0, 12.0, 5.0], 36),
+    ];
+    let lid = |name: &str| Solid {
+        name: name.to_string(),
+        conductivity: 0.2,
+        density: 1200.0,
+    };
+    let solids = vec![
+        aluminium("Bottom"),
+        aluminium("Top"),
+        aluminium("Front"),
+        aluminium("Back"),
+        lid("Inlet lid"),
+        lid("Outlet lid"),
+        Solid {
+            name: "Chip".to_string(),
+            conductivity: 20.0,
+            density: 3000.0,
+        },
+    ];
+    let (inlet, outlet, chip_top) = (25, 30, 39);
+    let channel = vec![3, 8, 17, 22];
+    let speed = 0.1;
+    let mut study = FlowStudy {
+        surfaces,
+        flow_type: FlowType::Internal {
+            point: [0.3, 5.3, 0.3],
+        },
+        domain: Domain::internal(([-21.0, 0.0, -10.0], [21.0, 12.0, 10.0]), 2.0),
+        fluid: Fluid::water(),
+        turbulence: Turbulence::Laminar,
+        conditions: vec![
+            Condition {
+                kind: ConditionKind::InletVelocity { speed },
+                labels: vec![inlet],
+            },
+            Condition {
+                kind: ConditionKind::OutletPressure { pressure: 0.0 },
+                labels: vec![outlet],
+            },
+        ],
+        goals: vec![
+            Goal {
+                name: "Into the water".to_string(),
+                kind: GoalKind::HeatFlow,
+                labels: channel.clone(),
+            },
+            Goal {
+                name: "Chip".to_string(),
+                kind: GoalKind::MaxTemperature,
+                labels: vec![chip_top],
+            },
+            Goal {
+                name: "Out".to_string(),
+                kind: GoalKind::MassFlow,
+                labels: vec![outlet],
+            },
+        ],
+        mesh: MeshSettings::new(1.0),
+        solver: SolverSettings {
+            iterations: 600,
+            residual: 1e-4,
+            processes: 2,
+        },
+        heat: Some(Heat {
+            solids,
+            loads: vec![HeatLoad {
+                kind: HeatLoadKind::Internal { watts: 10.0 },
+                labels: vec![chip_top],
+            }],
+            ..Heat::water()
+        }),
+    };
+    study.mesh.surface_level = 1;
+    let (case, report, results, remove) = solve(&install, "cold-plate", &study);
+    assert!(report.converged, "the run converged");
+    let goals = results.goals(&case);
+    let (into_water, chip, mass) = (
+        scalar_goal(&goals, 0),
+        scalar_goal(&goals, 1),
+        scalar_goal(&goals, 2),
+    );
+    // What the outlet carries: the mass flux times cp times the rise over 20 °C.
+    let heat = study.heat.as_ref().unwrap();
+    let first = results.mesh.internal_faces();
+    let temperatures = results.boundary_temperature.as_ref().unwrap();
+    let flux = results.boundary_flux.as_ref().unwrap();
+    let carried: f64 = results
+        .boundary_labels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == Some(outlet))
+        .map(|(i, _)| {
+            flux[i]
+                * study.fluid.density
+                * heat.specific_heat
+                * (temperatures[i] - heat.temperature)
+        })
+        .sum();
+    let expected_mass = study.fluid.density * speed * 16e-6;
+    eprintln!(
+        "cold plate: {} cells; into the water {into_water:.4} W, carried out {carried:.4} W, \
+         chip {chip:.2} °C, {mass:.5} kg/s out ({expected_mass:.5} set); first face {first}",
+        report.cells.unwrap_or(0)
+    );
+    assert!((carried - 10.0).abs() < 0.1, "carried {carried} W");
+    assert!((into_water - 10.0).abs() < 0.3, "walls {into_water} W");
+    assert!((mass / expected_mass - 1.0).abs() < 0.01, "{mass} kg/s");
+    assert!(
+        chip > heat.temperature + 1.0 && chip < 100.0,
+        "chip {chip} °C"
+    );
+    if remove {
+        let _ = std::fs::remove_dir_all(&case.dir);
+    }
+}
+
+/// The same cold plate with the water at 2 m/s (Re 8000, k-ω SST), its 10 W let in through
+/// the chip's top face (Heat Power) and its bottom face losing heat to 20 °C surroundings
+/// (Convection, 50 W/m²·K): what the water carries and what the bottom loses add up to 10 W.
+#[test]
+fn a_turbulent_cold_plate_balances_its_heat() {
+    let Some(install) = openfoam() else { return };
+    let aluminium = |name: &str| Solid {
+        name: name.to_string(),
+        conductivity: 200.0,
+        density: 2700.0,
+    };
+    let lid = |name: &str| Solid {
+        name: name.to_string(),
+        conductivity: 0.2,
+        density: 1200.0,
+    };
+    let surfaces = vec![
+        cuboid([-20.0, 0.0, -10.0], [20.0, 3.0, 10.0], 0),
+        cuboid([-20.0, 7.0, -10.0], [20.0, 10.0, 10.0], 6),
+        cuboid([-20.0, 3.0, -10.0], [20.0, 7.0, -2.0], 12),
+        cuboid([-20.0, 3.0, 2.0], [20.0, 7.0, 10.0], 18),
+        cuboid([-21.0, 3.0, -2.0], [-20.0, 7.0, 2.0], 24),
+        cuboid([20.0, 3.0, -2.0], [21.0, 7.0, 2.0], 30),
+        cuboid([-5.0, 10.0, -5.0], [5.0, 12.0, 5.0], 36),
+    ];
+    let solids = vec![
+        aluminium("Bottom"),
+        aluminium("Top"),
+        aluminium("Front"),
+        aluminium("Back"),
+        lid("Inlet lid"),
+        lid("Outlet lid"),
+        Solid {
+            name: "Chip".to_string(),
+            conductivity: 20.0,
+            density: 3000.0,
+        },
+    ];
+    let (inlet, outlet, chip_top, bottom) = (25, 30, 39, 2);
+    let mut study = FlowStudy {
+        surfaces,
+        flow_type: FlowType::Internal {
+            point: [0.3, 5.3, 0.3],
+        },
+        domain: Domain::internal(([-21.0, 0.0, -10.0], [21.0, 12.0, 10.0]), 2.0),
+        fluid: Fluid::water(),
+        turbulence: Turbulence::KOmegaSst {
+            intensity: 0.05,
+            length: 0.3,
+        },
+        conditions: vec![
+            Condition {
+                kind: ConditionKind::InletVelocity { speed: 2.0 },
+                labels: vec![inlet],
+            },
+            Condition {
+                kind: ConditionKind::OutletPressure { pressure: 0.0 },
+                labels: vec![outlet],
+            },
+        ],
+        goals: vec![
+            Goal {
+                name: "Into the water".to_string(),
+                kind: GoalKind::HeatFlow,
+                labels: vec![3, 8, 17, 22],
+            },
+            Goal {
+                name: "Off the bottom".to_string(),
+                kind: GoalKind::HeatFlow,
+                labels: vec![bottom],
+            },
+            Goal {
+                name: "Chip".to_string(),
+                kind: GoalKind::MaxTemperature,
+                labels: vec![chip_top],
+            },
+        ],
+        mesh: MeshSettings::new(1.0),
+        solver: SolverSettings {
+            iterations: 800,
+            residual: 1e-4,
+            processes: 1,
+        },
+        heat: Some(Heat {
+            solids,
+            loads: vec![
+                HeatLoad {
+                    kind: HeatLoadKind::Power { watts: 10.0 },
+                    labels: vec![chip_top],
+                },
+                HeatLoad {
+                    kind: HeatLoadKind::Convection {
+                        coefficient: 50.0,
+                        ambient: 20.0,
+                    },
+                    labels: vec![bottom],
+                },
+            ],
+            ..Heat::water()
+        }),
+    };
+    study.mesh.surface_level = 1;
+    let (case, report, results, remove) = solve(&install, "turbulent-plate", &study);
+    let goals = results.goals(&case);
+    let (into_water, off_bottom, chip) = (
+        scalar_goal(&goals, 0),
+        scalar_goal(&goals, 1),
+        scalar_goal(&goals, 2),
+    );
+    let heat = study.heat.as_ref().unwrap();
+    let temperatures = results.boundary_temperature.as_ref().unwrap();
+    let flux = results.boundary_flux.as_ref().unwrap();
+    let carried: f64 = results
+        .boundary_labels
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == Some(outlet))
+        .map(|(i, _)| {
+            flux[i]
+                * study.fluid.density
+                * heat.specific_heat
+                * (temperatures[i] - heat.temperature)
+        })
+        .sum();
+    eprintln!(
+        "turbulent plate: converged {}, into the water {into_water:.4} W, carried out {carried:.4} W, \
+         off the bottom {off_bottom:.4} W, chip {chip:.2} °C",
+        report.converged
+    );
+    assert!(report.converged, "the run converged");
+    assert!(off_bottom > 0.0, "the bottom loses heat: {off_bottom} W");
+    assert!(
+        (into_water + off_bottom - 10.0).abs() < 0.2,
+        "{into_water} + {off_bottom} W"
+    );
+    assert!((carried - into_water).abs() < 0.1, "carried {carried} W");
+    if remove {
+        let _ = std::fs::remove_dir_all(&case.dir);
+    }
+}
+
+/// A heated copper sphere (10 mm) in a stream of air at Re = 20: its Nusselt number
+/// against Clift, Grace and Weber's correlation, Nu = 1 + (1 + 1/(Re Pr))^⅓ Re^0.41 Pr^⅓
+/// = 4.12 (Whitaker's gives 3.94, Ranz and Marshall's 4.39).
+#[test]
+fn a_heated_sphere_in_a_stream_matches_its_nusselt_number() {
+    let Some(install) = openfoam() else { return };
+    let d = 10.0; // mm
+    let fluid = Fluid::air();
+    let heat = Heat::air();
+    let reynolds = 20.0;
+    let speed = reynolds * fluid.kinematic_viscosity() / (d * 1e-3);
+    let watts = 0.033;
+    let study = FlowStudy {
+        surfaces: vec![sphere(d / 2.0, [0.0; 3], 3)],
+        flow_type: FlowType::External {
+            velocity: [speed, 0.0, 0.0],
+        },
+        domain: Domain {
+            min: [-5.0 * d, -5.0 * d, -5.0 * d],
+            max: [10.0 * d, 5.0 * d, 5.0 * d],
+        },
+        fluid: fluid.clone(),
+        turbulence: Turbulence::Laminar,
+        conditions: vec![],
+        goals: vec![
+            Goal {
+                name: "Surface".to_string(),
+                kind: GoalKind::MeanTemperature,
+                labels: vec![0],
+            },
+            Goal {
+                name: "Out".to_string(),
+                kind: GoalKind::HeatFlow,
+                labels: vec![0],
+            },
+        ],
+        mesh: MeshSettings {
+            cell_size: 5.0,
+            surface_level: 3,
+            feature_level: 3,
+            layers: 0,
+            max_cells: 1_000_000,
+        },
+        solver: SolverSettings {
+            iterations: 1500,
+            residual: 1e-5,
+            processes: 1,
+        },
+        heat: Some(Heat {
+            solids: vec![Solid {
+                name: "Copper".to_string(),
+                conductivity: 400.0,
+                density: 8960.0,
+            }],
+            loads: vec![HeatLoad {
+                kind: HeatLoadKind::Internal { watts },
+                labels: vec![0],
+            }],
+            ..heat.clone()
+        }),
+    };
+    let (case, report, results, remove) = solve(&install, "hot-sphere", &study);
+    assert!(report.converged, "the run converged");
+    let goals = results.goals(&case);
+    let (surface, out) = (scalar_goal(&goals, 0), scalar_goal(&goals, 1));
+    let area = PI * (d * 1e-3).powi(2);
+    let nusselt = watts * d * 1e-3 / (area * heat.conductivity * (surface - heat.temperature));
+    let pr = heat.specific_heat * fluid.viscosity / heat.conductivity;
+    let clift = 1.0
+        + (1.0 + 1.0 / (reynolds * pr)).powf(1.0 / 3.0) * reynolds.powf(0.41) * pr.powf(1.0 / 3.0);
+    eprintln!(
+        "hot sphere: surface {surface:.3} °C, {out:.5} W out of {watts}, Nu {nusselt:.3}, \
+         Clift {clift:.3}, {:+.1} %",
+        100.0 * (nusselt / clift - 1.0)
+    );
+    assert!((out / watts - 1.0).abs() < 0.03, "{out} W out");
+    assert!((nusselt / clift - 1.0).abs() < 0.12, "Nu {nusselt}");
+    if remove {
+        let _ = std::fs::remove_dir_all(&case.dir);
+    }
+}
+
+/// The same sphere, 20 mm, in still air with gravity: natural convection. Churchill's
+/// correlation, Nu = 2 + 0.589 Ra^¼ / (1 + (0.469/Pr)^(9/16))^(4/9), for the Rayleigh
+/// number of the sphere's rise over the air (the domain reaches four diameters round it and
+/// eight above, for the plume).
+#[test]
+fn a_heated_sphere_in_still_air_matches_churchill() {
+    let Some(install) = openfoam() else { return };
+    let d = 20.0; // mm
+    let fluid = Fluid::air();
+    let heat = Heat::air();
+    let watts = 0.5;
+    let study = FlowStudy {
+        surfaces: vec![sphere(d / 2.0, [0.0; 3], 3)],
+        flow_type: FlowType::External { velocity: [0.0; 3] },
+        domain: Domain {
+            min: [-4.0 * d, -4.0 * d, -4.0 * d],
+            max: [4.0 * d, 8.0 * d, 4.0 * d],
+        },
+        fluid: fluid.clone(),
+        turbulence: Turbulence::Laminar,
+        conditions: vec![],
+        goals: vec![Goal {
+            name: "Surface".to_string(),
+            kind: GoalKind::MeanTemperature,
+            labels: vec![0],
+        }],
+        mesh: MeshSettings {
+            cell_size: 8.0,
+            surface_level: 3,
+            feature_level: 3,
+            layers: 0,
+            max_cells: 1_000_000,
+        },
+        solver: SolverSettings {
+            iterations: 1500,
+            residual: 1e-4,
+            processes: 1,
+        },
+        heat: Some(Heat {
+            gravity: Some([0.0, -9.81, 0.0]),
+            solids: vec![Solid {
+                name: "Copper".to_string(),
+                conductivity: 400.0,
+                density: 8960.0,
+            }],
+            loads: vec![HeatLoad {
+                kind: HeatLoadKind::Internal { watts },
+                labels: vec![0],
+            }],
+            ..heat.clone()
+        }),
+    };
+    let (case, report, results, remove) = solve(&install, "still-sphere", &study);
+    let goals = results.goals(&case);
+    let surface = scalar_goal(&goals, 0);
+    let rise = surface - heat.temperature;
+    let area = PI * (d * 1e-3).powi(2);
+    let nusselt = watts * d * 1e-3 / (area * heat.conductivity * rise);
+    let nu = fluid.kinematic_viscosity();
+    let alpha = heat.conductivity / (fluid.density * heat.specific_heat);
+    let rayleigh = 9.81 * heat.expansion * rise * (d * 1e-3).powi(3) / (nu * alpha);
+    let pr = nu / alpha;
+    let churchill =
+        2.0 + 0.589 * rayleigh.powf(0.25) / (1.0 + (0.469 / pr).powf(9.0 / 16.0)).powf(4.0 / 9.0);
+    eprintln!(
+        "still sphere: converged {}, surface {surface:.2} °C, Ra {rayleigh:.0}, Nu {nusselt:.3}, \
+         Churchill {churchill:.3}, {:+.1} %",
+        report.converged,
+        100.0 * (nusselt / churchill - 1.0)
+    );
+    // The plume never quite stops moving: the run ends once the sphere's temperature has
+    // settled.
+    assert!(report.converged, "the temperatures settled");
+    assert!(report.iterations < 1000, "{} iterations", report.iterations);
+    assert!((nusselt / churchill - 1.0).abs() < 0.2, "Nu {nusselt}");
     if remove {
         let _ = std::fs::remove_dir_all(&case.dir);
     }

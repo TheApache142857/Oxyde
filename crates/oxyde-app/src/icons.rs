@@ -136,6 +136,8 @@ pub enum Icon {
     HeatFluxPlot,
     /// A flow study: streamlines bending round a body.
     FlowStudy,
+    /// A cooling study: a heat sink's fins, warm at the base, in a blue stream.
+    CoolingStudy,
     /// An inlet: blue arrows into a lid.
     Inlet,
     /// A static pressure opening, where the fluid goes out: blue arrows leaving a lid.
@@ -1315,6 +1317,24 @@ fn draw(pen: &Pen, icon: Icon) {
                 pen.arrow((1.0, y), (21.0, y), 1.5, *color);
             }
         }
+        CoolingStudy => {
+            // A heat sink: a warm base and three fins, air flowing between them.
+            pen.poly(
+                &[(4.0, 16.0), (20.0, 16.0), (20.0, 20.0), (4.0, 20.0)],
+                HOT,
+                INK,
+            );
+            for x in [5.0, 10.5, 16.0] {
+                pen.poly(
+                    &[(x, 6.0), (x + 3.0, 6.0), (x + 3.0, 16.0), (x, 16.0)],
+                    BODY,
+                    INK,
+                );
+            }
+            pen.arrow((1.0, 4.0), (23.0, 4.0), 1.5, COOL);
+            pen.line(&[(8.0, 11.0), (10.5, 11.0)], 1.5, COOL);
+            pen.line(&[(13.5, 11.0), (16.0, 11.0)], 1.5, COOL);
+        }
         FlowStudy => {
             // A body, and three streamlines bending round it.
             pen.poly(
@@ -1665,7 +1685,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 102] = {
+pub const ALL: [Icon; 103] = {
     use Icon::*;
     [
         Sketch,
@@ -1748,6 +1768,7 @@ pub const ALL: [Icon; 102] = {
         TemperaturePlot,
         HeatFluxPlot,
         FlowStudy,
+        CoolingStudy,
         Inlet,
         Outlet,
         IdealWall,

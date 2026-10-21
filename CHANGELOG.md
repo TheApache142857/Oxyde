@@ -5,6 +5,26 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Cooling studies: heat carried away by a flow (unreleased, October 2026)
+
+- **New Study › Cooling** computes the temperatures of a model cooled by air or water
+  flowing through or around it, the heat conducted through its bodies with their
+  materials' conductivities (conjugate heat transfer), as SolidWorks Flow Simulation's
+  *heat conduction in solids*. It takes everything a flow study does, and in the panel's
+  **Heat** section the temperature the fluid comes in at, its specific heat, conductivity and
+  expansion (set with the fluid), and **gravity**, for natural convection: warmer fluid rises.
+  Bodies touching one another pass heat across the faces they share.
+- **Heat ▾** puts *Internal Heat* in the bodies of the selected faces (a chip's power),
+  lets *Heat Power* or *Heat Flux* in through faces, holds faces at a *Temperature*, or
+  cools faces outside the fluid by *Convection*. **Goals** add the hottest temperature of
+  the bodies, the mean temperature of faces and the heat leaving through faces.
+- **Results**: the goals, a temperature cut plot through the fluid and the bodies, the
+  temperature on the model's faces, and the flow's plots. A run stops once its residuals
+  meet the target or, since a plume never quite stops moving, once the bodies' hottest
+  temperature has settled.
+- **Files**: cooling studies and their results are `format_version` 6 (FORMAT.md §8–§9);
+  documents without one are written as before.
+
 ### Flow studies: CFD with OpenFOAM (unreleased, October 2026)
 
 - **New Study › Flow** computes the steady flow of a liquid or a gas through the model

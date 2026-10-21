@@ -13,7 +13,15 @@ pub struct Iteration {
     pub time: f64,
     /// The initial residual of each equation solved, by field (`Ux`, `p`, `k`…), in the
     /// order they were solved; the first solve of a field when it is solved more than once.
+    ///
+    /// A multi-region solver's solid is `T (solid)` instead: how much its hottest temperature
+    /// moved since the last iteration, over its rise above the fluid's coldest. The solid's
+    /// own residual is no measure: a body that conducts well is nearly uniform, and OpenFOAM
+    /// divides its residual by how far the field is from uniform.
     pub residuals: Vec<(String, f64)>,
+    /// A multi-region solver's solid's hottest temperature and its rise above the fluid's
+    /// coldest, K, once the iteration is done.
+    pub hottest: Option<(f64, f64)>,
 }
 
 impl Iteration {
@@ -36,13 +44,21 @@ pub struct LogState {
     pub diverged: bool,
     /// The text of a `FOAM FATAL ERROR`.
     pub fatal: Option<String>,
-    /// `checkMesh`: the number of cells.
+    /// `checkMesh`: the number of cells, over every region it checked.
     pub cells: Option<u64>,
-    /// `checkMesh`: whether every check passed (`Mesh OK.`), and how many failed if not.
+    /// `checkMesh`: whether every check passed (`Mesh OK.`) in every region, and how many
+    /// failed if not.
     pub mesh_ok: Option<bool>,
     pub failed_checks: u32,
     tail: VecDeque<String>,
     in_fatal: bool,
+    /// The solid region a multi-region solver is solving, if it is in one.
+    solid: Option<String>,
+    /// The fluid's coldest temperature and the solid's hottest, K, in the iteration being
+    /// read; the solid's hottest in the iteration before.
+    fluid_min: Option<f64>,
+    solid_max: Option<f64>,
+    last_solid_max: Option<f64>,
 }
 
 impl LogState {
@@ -79,7 +95,31 @@ impl LogState {
             self.diverged = true;
             return false;
         }
+        // `chtMultiRegionSimpleFoam` solves each region in turn, the fluid first.
+        if let Some(region) = text.strip_prefix("Solving for solid region ") {
+            self.solid = Some(region.trim().to_string());
+            return false;
+        }
+        if text.starts_with("Solving for fluid region ") {
+            self.solid = None;
+            return false;
+        }
+        if let Some(rest) = text.strip_prefix("Min/max T:") {
+            let mut values = rest
+                .split_whitespace()
+                .filter_map(|v| v.parse::<f64>().ok());
+            if let (Some(lo), Some(hi)) = (values.next(), values.next()) {
+                if self.solid.is_some() {
+                    self.solid_max = Some(self.solid_max.map_or(hi, |m: f64| m.max(hi)));
+                } else {
+                    self.fluid_min = Some(self.fluid_min.map_or(lo, |m: f64| m.min(lo)));
+                }
+            }
+            return false;
+        }
         if let Some(rest) = text.strip_prefix("Time = ") {
+            self.solid = None;
+            self.close_solid();
             // `Time = 12`, or with a unit on other lines of OpenFOAM: `12s`.
             let number: String = rest
                 .chars()
@@ -89,6 +129,7 @@ impl LogState {
                 self.history.push(Iteration {
                     time,
                     residuals: Vec::new(),
+                    hottest: None,
                 });
                 return true;
             }
@@ -96,6 +137,13 @@ impl LogState {
         }
         if let Some(solved) = parse_residual(text) {
             let (field, residual) = solved;
+            if self.solid.is_some() {
+                // Measured by its temperature instead (see `Iteration::residuals`).
+                if !residual.is_finite() {
+                    self.diverged = true;
+                }
+                return false;
+            }
             if !residual.is_finite() {
                 self.diverged = true;
             }
@@ -117,23 +165,45 @@ impl LogState {
         }
         if let Some(rest) = text.strip_prefix("cells:") {
             if let Ok(cells) = rest.trim().parse::<u64>() {
-                self.cells = Some(cells);
+                self.cells = Some(self.cells.unwrap_or(0) + cells);
             }
             return false;
         }
         if text == "Mesh OK." {
-            self.mesh_ok = Some(true);
+            self.mesh_ok.get_or_insert(true);
         } else if let Some(rest) = text.strip_prefix("Failed ")
             && rest.ends_with("mesh checks.")
         {
             self.mesh_ok = Some(false);
-            self.failed_checks = rest
+            self.failed_checks += rest
                 .split_whitespace()
                 .next()
-                .and_then(|n| n.parse().ok())
+                .and_then(|n| n.parse::<u32>().ok())
                 .unwrap_or(0);
         }
         false
+    }
+
+    /// At the end of an iteration of a multi-region solver: the solid's temperature change,
+    /// as a residual of the iteration.
+    fn close_solid(&mut self) {
+        let (Some(now), Some(min)) = (self.solid_max.take(), self.fluid_min.take()) else {
+            return;
+        };
+        let rise = (now - min).max(1.0);
+        if let Some(iteration) = self.history.last_mut() {
+            iteration.hottest = Some((now, rise));
+            if let Some(before) = self.last_solid_max {
+                let change = (now - before).abs() / rise;
+                iteration.residuals.push(("T (solid)".to_string(), change));
+            }
+        }
+        self.last_solid_max = Some(now);
+    }
+
+    /// Ends the log: the last iteration's solid change, once the solver has stopped.
+    pub fn finish(&mut self) {
+        self.close_solid();
     }
 
     /// The iterations so far.
@@ -272,5 +342,59 @@ FOAM exiting
         let mut ok = LogState::default();
         ok.feed("Mesh OK.");
         assert_eq!(ok.mesh_ok, Some(true));
+
+        // Every region of a multi-region case: cells add up, one failure fails the mesh.
+        let mut regions = LogState::default();
+        for line in [
+            "    cells:            1000",
+            "Failed 2 mesh checks.",
+            "    cells:            250",
+            "Mesh OK.",
+        ] {
+            regions.feed(line);
+        }
+        assert_eq!(regions.cells, Some(1250));
+        assert_eq!((regions.mesh_ok, regions.failed_checks), (Some(false), 2));
+    }
+
+    #[test]
+    fn a_solid_is_measured_by_its_temperature() {
+        let mut log = LogState::default();
+        let iteration = |t: u32, hottest: f64| {
+            format!(
+                "Time = {t}
+
+Solving for fluid region fluid
+DILUPBiCGStab:  Solving for Ux, Initial residual = 0.01, Final residual = 1e-4, No Iterations 1
+DILUPBiCGStab:  Solving for h, Initial residual = 0.02, Final residual = 1e-4, No Iterations 3
+Min/max T:293.15 300
+GAMG:  Solving for p_rgh, Initial residual = 0.03, Final residual = 1e-4, No Iterations 3
+
+Solving for solid region solid
+DICPCG:  Solving for h, Initial residual = 0.4, Final residual = 1e-6, No Iterations 40
+Min/max T:301 {hottest}
+Solving for solid region solid
+DICPCG:  Solving for h, Initial residual = 0.3, Final residual = 1e-6, No Iterations 9
+Min/max T:301 {hottest}
+"
+            )
+        };
+        for (t, hottest) in [(1, 303.0), (2, 313.0), (3, 313.15)] {
+            for line in iteration(t, hottest).lines() {
+                log.feed(line);
+            }
+        }
+        log.finish();
+        let names: Vec<&str> = log.history[1]
+            .residuals
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .collect();
+        // The solid's residual is not kept; its temperature's change is, from the second.
+        assert_eq!(names, ["Ux", "h", "p_rgh", "T (solid)"]);
+        assert_eq!(log.history[0].residuals.len(), 3);
+        // 10 K over its rise of 19.85 K above the fluid's 293.15 K, then 0.15 K over 20 K.
+        assert!((log.history[1].residuals[3].1 - 10.0 / 19.85).abs() < 1e-9);
+        assert!((log.history[2].residuals[3].1 - 0.15 / 20.0).abs() < 1e-9);
     }
 }

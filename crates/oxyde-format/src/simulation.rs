@@ -25,9 +25,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::schema::{FaceRefDto, MechanicalDto, ThermalDto, face_dto, face_from};
 use crate::{
-    DocumentKind, FLOW_FORMAT_VERSION, FORMAT_VERSION, FormatError, MANIFEST,
-    THERMAL_FORMAT_VERSION, expect_kind, from_json, manifest_version, new_document_id, read_entry,
-    read_manifest, to_json, write_file,
+    COOLING_FORMAT_VERSION, DocumentKind, FLOW_FORMAT_VERSION, FORMAT_VERSION, FormatError,
+    MANIFEST, THERMAL_FORMAT_VERSION, expect_kind, from_json, manifest_version, new_document_id,
+    read_entry, read_manifest, to_json, write_file,
 };
 
 /// File extension of simulation studies.
@@ -119,6 +119,10 @@ pub enum StudyType {
     /// The steady flow of a liquid or a gas through or around the model, solved by
     /// OpenFOAM ([`Study::flow`], [`Study::conditions`], [`Study::goals`]).
     Flow,
+    /// A flow that carries heat away from the model, which conducts it through its solids
+    /// (conjugate heat transfer): a flow study's settings, conditions and goals, the
+    /// fluid's thermal properties ([`Study::cooling`]) and thermal loads.
+    Cooling,
 }
 
 impl StudyType {
@@ -135,10 +139,15 @@ impl StudyType {
         )
     }
 
-    /// Whether it is a flow study: a fluid, boundary conditions and goals instead of
-    /// fixtures and loads.
+    /// Whether it is solved by OpenFOAM, a flow or cooling study: a fluid, boundary
+    /// conditions and goals instead of fixtures.
     pub fn is_flow(self) -> bool {
-        self == StudyType::Flow
+        matches!(self, StudyType::Flow | StudyType::Cooling)
+    }
+
+    /// Whether it is a cooling study: a flow with heat.
+    pub fn is_cooling(self) -> bool {
+        self == StudyType::Cooling
     }
 }
 
@@ -189,6 +198,9 @@ pub struct Study {
     pub conditions: Vec<FlowCondition>,
     /// A flow study's goals: what it measures.
     pub goals: Vec<FlowGoal>,
+    /// A cooling study's fluid temperature, thermal properties and gravity; ignored by the
+    /// other types.
+    pub cooling: CoolingSettings,
 }
 
 impl Study {
@@ -213,6 +225,7 @@ impl Study {
             flow: FlowSettings::default(),
             conditions: Vec::new(),
             goals: Vec::new(),
+            cooling: CoolingSettings::default(),
         }
     }
 }
@@ -446,6 +459,52 @@ impl Fluid {
     }
 }
 
+/// What a cooling study adds to its fluid: how it carries heat, the temperature it comes in
+/// at, and gravity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoolingSettings {
+    /// J/(kg·K).
+    pub specific_heat: f64,
+    /// Thermal conductivity, W/(m·K).
+    pub conductivity: f64,
+    /// Volumetric thermal expansion, 1/K: with gravity, warmer fluid rises.
+    pub expansion: f64,
+    /// °C: the fluid coming in (inlets, openings, the free stream), and the model at the
+    /// start.
+    pub temperature: f64,
+    /// m/s², world coordinates (Y up): natural convection; `None` for none.
+    pub gravity: Option<[f64; 3]>,
+}
+
+impl CoolingSettings {
+    /// Water's at 20 °C, coming in at 20 °C, without gravity.
+    pub fn water() -> Self {
+        Self {
+            specific_heat: 4182.0,
+            conductivity: 0.598,
+            expansion: 2.07e-4,
+            temperature: 20.0,
+            gravity: None,
+        }
+    }
+
+    /// Air's at 20 °C and 101 325 Pa (a gas expands by 1/T).
+    pub fn air() -> Self {
+        Self {
+            specific_heat: 1006.0,
+            conductivity: 0.0257,
+            expansion: 1.0 / 293.15,
+            ..Self::water()
+        }
+    }
+}
+
+impl Default for CoolingSettings {
+    fn default() -> Self {
+        Self::water()
+    }
+}
+
 /// Laminar or turbulent flow.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlowTurbulence {
@@ -502,11 +561,27 @@ pub enum FlowGoalKind {
     MassFlow,
     /// The area-weighted mean static pressure on the faces, Pa (gauge).
     MeanPressure,
+    /// A cooling study's hottest temperature in the bodies the faces belong to, °C.
+    MaxTemperature,
+    /// A cooling study's area-weighted mean temperature of the faces, °C.
+    MeanTemperature,
+    /// The heat leaving the model through the faces, W (negative coming in).
+    HeatFlow,
+}
+
+impl FlowGoalKind {
+    /// Whether it measures temperature or heat, which only a cooling study has.
+    pub fn is_thermal(self) -> bool {
+        matches!(
+            self,
+            FlowGoalKind::MaxTemperature | FlowGoalKind::MeanTemperature | FlowGoalKind::HeatFlow
+        )
+    }
 }
 
 /// The `format_version` `file` is written with: the oldest that holds its studies' types,
 /// so that older readers still open what they can. 1 for static studies only, 2 with a
-/// thermal one, 5 with a flow one.
+/// thermal one, 5 with a flow one, 6 with a cooling one.
 pub fn simulation_version(file: &SimulationFile) -> u32 {
     file.studies
         .iter()
@@ -523,6 +598,7 @@ pub(crate) fn study_version(t: StudyType) -> u32 {
             THERMAL_FORMAT_VERSION
         }
         StudyType::Flow => FLOW_FORMAT_VERSION,
+        StudyType::Cooling => COOLING_FORMAT_VERSION,
     }
 }
 
@@ -646,6 +722,25 @@ struct StudyDto {
     conditions: Vec<ConditionDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     goals: Vec<GoalDto>,
+    /// Only in a cooling study.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cooling: Option<CoolingDto>,
+}
+
+/// A cooling study's fluid temperature, thermal properties and gravity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CoolingDto {
+    /// J/(kg·K).
+    specific_heat: f64,
+    /// W/(m·K).
+    conductivity: f64,
+    /// 1/K.
+    expansion: f64,
+    /// °C.
+    temperature: f64,
+    /// m/s²; absent without gravity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gravity: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -657,6 +752,7 @@ pub(crate) enum StudyTypeDto {
     TransientThermal,
     ThermalStress,
     Flow,
+    Cooling,
 }
 
 impl StudyTypeDto {
@@ -667,6 +763,7 @@ impl StudyTypeDto {
             StudyType::TransientThermal => StudyTypeDto::TransientThermal,
             StudyType::ThermalStress => StudyTypeDto::ThermalStress,
             StudyType::Flow => StudyTypeDto::Flow,
+            StudyType::Cooling => StudyTypeDto::Cooling,
         }
     }
 
@@ -677,6 +774,7 @@ impl StudyTypeDto {
             StudyTypeDto::TransientThermal => StudyType::TransientThermal,
             StudyTypeDto::ThermalStress => StudyType::ThermalStress,
             StudyTypeDto::Flow => StudyType::Flow,
+            StudyTypeDto::Cooling => StudyType::Cooling,
         }
     }
 
@@ -967,6 +1065,9 @@ pub(crate) enum GoalKindDto {
     VolumeFlow,
     MassFlow,
     MeanPressure,
+    MaxTemperature,
+    MeanTemperature,
+    HeatFlow,
 }
 
 impl GoalKindDto {
@@ -976,6 +1077,9 @@ impl GoalKindDto {
             FlowGoalKind::VolumeFlow => GoalKindDto::VolumeFlow,
             FlowGoalKind::MassFlow => GoalKindDto::MassFlow,
             FlowGoalKind::MeanPressure => GoalKindDto::MeanPressure,
+            FlowGoalKind::MaxTemperature => GoalKindDto::MaxTemperature,
+            FlowGoalKind::MeanTemperature => GoalKindDto::MeanTemperature,
+            FlowGoalKind::HeatFlow => GoalKindDto::HeatFlow,
         }
     }
 
@@ -985,6 +1089,9 @@ impl GoalKindDto {
             GoalKindDto::VolumeFlow => FlowGoalKind::VolumeFlow,
             GoalKindDto::MassFlow => FlowGoalKind::MassFlow,
             GoalKindDto::MeanPressure => FlowGoalKind::MeanPressure,
+            GoalKindDto::MaxTemperature => FlowGoalKind::MaxTemperature,
+            GoalKindDto::MeanTemperature => FlowGoalKind::MeanTemperature,
+            GoalKindDto::HeatFlow => FlowGoalKind::HeatFlow,
         }
     }
 }
@@ -1201,6 +1308,13 @@ fn study_dto(study: &Study) -> StudyDto {
         } else {
             Vec::new()
         },
+        cooling: study.study_type.is_cooling().then_some(CoolingDto {
+            specific_heat: study.cooling.specific_heat,
+            conductivity: study.cooling.conductivity,
+            expansion: study.cooling.expansion,
+            temperature: study.cooling.temperature,
+            gravity: study.cooling.gravity,
+        }),
     }
 }
 
@@ -1368,8 +1482,11 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             "a thermal study has fixtures".to_owned()
         });
     }
-    if study_type.is_flow() && !dto.loads.is_empty() {
+    if study_type == StudyType::Flow && !dto.loads.is_empty() {
         return Err("a flow study has loads".to_owned());
+    }
+    if !study_type.is_cooling() && dto.cooling.is_some() {
+        return Err("only a cooling study has the fluid's thermal properties".to_owned());
     }
     if study_type.is_flow() && !dto.contacts.is_empty() {
         return Err("a flow study has contacts".to_owned());
@@ -1470,13 +1587,19 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
                 watts: finite(power, "the power").map_err(item)?,
             },
         };
-        if load_kind.is_thermal() && !study_type.is_thermal() {
+        if load_kind.is_thermal() && !(study_type.is_thermal() || study_type.is_cooling()) {
             return Err(item("a static study has a thermal load".to_owned()));
         }
         if !load_kind.is_thermal() && !study_type.is_structural() {
-            return Err(item(
-                "a thermal study has a force, a pressure or gravity".to_owned(),
-            ));
+            return Err(item(if study_type.is_cooling() {
+                "a cooling study has a force, a pressure or gravity (its gravity is the fluid's)"
+                    .to_owned()
+            } else {
+                "a thermal study has a force, a pressure or gravity".to_owned()
+            }));
+        }
+        if study_type.is_cooling() && matches!(load_kind, LoadKind::Radiation { .. }) {
+            return Err(item("a cooling study takes no radiation".to_owned()));
         }
         loads.push(Load {
             name: l.name,
@@ -1643,12 +1766,23 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
     let mut goals = Vec::with_capacity(dto.goals.len());
     for g in dto.goals {
         named(&g.name)?;
+        if g.kind.kind().is_thermal() && !study_type.is_cooling() {
+            return Err(format!(
+                "{}: only a cooling study measures temperature or heat",
+                g.name
+            ));
+        }
         goals.push(FlowGoal {
             kind: g.kind.kind(),
             faces: faces_from(g.faces, kind_of_model).map_err(|e| format!("{}: {e}", g.name))?,
             name: g.name,
         });
     }
+
+    let cooling = match dto.cooling {
+        Some(c) => cooling_from(c)?,
+        None => CoolingSettings::default(),
+    };
 
     Ok(Study {
         name: dto.name,
@@ -1674,6 +1808,37 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         flow,
         conditions,
         goals,
+        cooling,
+    })
+}
+
+/// A cooling study's fluid properties, temperature and gravity, checked.
+fn cooling_from(c: CoolingDto) -> Result<CoolingSettings, String> {
+    let specific_heat = finite(c.specific_heat, "the fluid's specific heat")?;
+    let conductivity = finite(c.conductivity, "the fluid's conductivity")?;
+    let expansion = finite(c.expansion, "the fluid's expansion")?;
+    if specific_heat <= 0.0 || conductivity <= 0.0 {
+        return Err("the fluid's specific heat and conductivity are not positive".to_owned());
+    }
+    if expansion < 0.0 {
+        return Err("the fluid's expansion is negative".to_owned());
+    }
+    let gravity = match c.gravity {
+        Some(g) => {
+            let g = finite_vector(g, "gravity")?;
+            if g.iter().all(|x| *x == 0.0) {
+                return Err("gravity is a zero vector".to_owned());
+            }
+            Some(g)
+        }
+        None => None,
+    };
+    Ok(CoolingSettings {
+        specific_heat,
+        conductivity,
+        expansion,
+        temperature: celsius(c.temperature, "the fluid's temperature")?,
+        gravity,
     })
 }
 
@@ -2402,6 +2567,179 @@ mod tests {
             }
             other => panic!("expected fixtures refused, got {other:?}"),
         }
+    }
+
+    /// The flow sample with a cooling study: air flowing up past the model with gravity,
+    /// 5 W made inside a body, convection off an outer face, temperature and heat goals.
+    fn cooling_sample() -> SimulationFile {
+        let mut file = flow_sample();
+        let on = |f| vec![StudyFace::part(face(f))];
+        let mut cooling = Study::of_type("Cooling 1", StudyType::Cooling);
+        cooling.flow = FlowSettings {
+            analysis: FlowAnalysis::External {
+                velocity: [0.0, 0.5, 0.0],
+            },
+            fluid: Fluid::air(),
+            ..FlowSettings::default()
+        };
+        cooling.cooling = CoolingSettings {
+            temperature: 25.0,
+            gravity: Some([0.0, -9.81, 0.0]),
+            ..CoolingSettings::air()
+        };
+        cooling.loads = vec![
+            Load {
+                name: "Internal Heat-1".to_owned(),
+                kind: LoadKind::InternalHeat {
+                    faces: on(8),
+                    watts: 5.0,
+                },
+                suppressed: false,
+            },
+            Load {
+                name: "Convection-1".to_owned(),
+                kind: LoadKind::Convection {
+                    faces: on(9),
+                    coefficient: 10.0,
+                    ambient: 30.0,
+                },
+                suppressed: false,
+            },
+        ];
+        cooling.goals = vec![
+            FlowGoal {
+                name: "Max Temperature Goal-1".to_owned(),
+                kind: FlowGoalKind::MaxTemperature,
+                faces: on(8),
+            },
+            FlowGoal {
+                name: "Heat Flow Goal-1".to_owned(),
+                kind: FlowGoalKind::HeatFlow,
+                faces: on(9),
+            },
+            FlowGoal {
+                name: "Mean Temperature Goal-1".to_owned(),
+                kind: FlowGoalKind::MeanTemperature,
+                faces: on(9),
+            },
+        ];
+        file.studies.push(cooling);
+        file
+    }
+
+    #[test]
+    fn cooling_studies_round_trip_as_version_6() {
+        let file = cooling_sample();
+        assert_eq!(read_simulation(Cursor::new(bytes(&file))).unwrap(), file);
+        assert_eq!(simulation_version(&file), 6);
+        let mut archive = ZipArchive::new(Cursor::new(bytes(&file))).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
+        assert_eq!(manifest["format_version"], 6);
+        // Without it, the flow studies are version 5 again.
+        let mut flows = file.clone();
+        flows.studies.pop();
+        assert_eq!(simulation_version(&flows), 5);
+    }
+
+    #[test]
+    fn cooling_studies_are_written_as_documented() {
+        let v = json(&cooling_sample());
+        let study = &v["studies"][2];
+        assert_eq!(study["type"], "cooling");
+        assert!(study.get("mesh").is_none());
+        assert_eq!(study["flow"]["fluid"]["name"], "Air");
+        let cooling = &study["cooling"];
+        assert_eq!(cooling["specific_heat"], 1006.0);
+        assert_eq!(cooling["conductivity"], 0.0257);
+        assert_eq!(cooling["temperature"], 25.0);
+        assert_eq!(cooling["gravity"], serde_json::json!([0.0, -9.81, 0.0]));
+        assert_eq!(study["loads"][0]["type"], "internal_heat");
+        assert_eq!(study["loads"][0]["power"], 5.0);
+        assert_eq!(study["loads"][1]["type"], "convection");
+        assert_eq!(study["goals"][0]["type"], "max_temperature");
+        assert_eq!(study["goals"][1]["type"], "heat_flow");
+        assert_eq!(study["goals"][2]["type"], "mean_temperature");
+        // Flow studies have no cooling block; without gravity, none is written.
+        assert!(v["studies"][0].get("cooling").is_none());
+        let mut still = cooling_sample();
+        still.studies[2].cooling.gravity = None;
+        assert!(
+            json(&still)["studies"][2]["cooling"]
+                .get("gravity")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inconsistent_cooling_studies_are_refused() {
+        let good = bytes(&cooling_sample());
+        let refused = |edit: &dyn Fn(&str) -> String, why: &str| match read_simulation(Cursor::new(
+            edited(&good, SIMULATION, edit),
+        )) {
+            Err(FormatError::InvalidSimulation(e)) => assert!(e.contains(why), "{e}"),
+            other => panic!("expected an invalid study ({why}), got {other:?}"),
+        };
+        refused(
+            &|s| s.replace("\"specific_heat\": 1006.0", "\"specific_heat\": 0.0"),
+            "specific heat",
+        );
+        refused(
+            &|s| s.replace("\"expansion\": 0.0034", "\"expansion\": -0.0034"),
+            "expansion is negative",
+        );
+        refused(
+            &|s| s.replace("\"temperature\": 25.0", "\"temperature\": -300.0"),
+            "temperature",
+        );
+        refused(
+            &|s| s.replace("\"type\": \"cooling\"", "\"type\": \"flow\""),
+            "a flow study has loads",
+        );
+        let refused_file =
+            |file: SimulationFile, why: &str| match read_simulation(Cursor::new(bytes(&file))) {
+                Err(FormatError::InvalidSimulation(e)) => assert!(e.contains(why), "{e}"),
+                other => panic!("expected an invalid study ({why}), got {other:?}"),
+            };
+        let mut zero = cooling_sample();
+        zero.studies[2].cooling.gravity = Some([0.0; 3]);
+        refused_file(zero, "zero vector");
+        let mut radiating = cooling_sample();
+        radiating.studies[2].loads.push(Load {
+            name: "Radiation-1".to_owned(),
+            kind: LoadKind::Radiation {
+                faces: Vec::new(),
+                emissivity: 0.9,
+                ambient: 20.0,
+            },
+            suppressed: false,
+        });
+        refused_file(radiating, "no radiation");
+        let mut pushed = cooling_sample();
+        pushed.studies[2].loads.push(Load {
+            name: "Force-1".to_owned(),
+            kind: LoadKind::Force {
+                faces: Vec::new(),
+                newtons: 1.0,
+                direction: ForceDirection::Normal,
+            },
+            suppressed: false,
+        });
+        refused_file(pushed, "a cooling study has a force");
+        // Temperature goals belong to cooling studies, the fluid's heat too.
+        let mut measuring = flow_sample();
+        measuring.studies[0].goals.push(FlowGoal {
+            name: "Heat Flow Goal-1".to_owned(),
+            kind: FlowGoalKind::HeatFlow,
+            faces: Vec::new(),
+        });
+        refused_file(measuring, "only a cooling study measures");
+        refused(
+            &|s| {
+                s.replacen("\"type\": \"flow\"", "\"type\": \"flow\", \"cooling\": { \"specific_heat\": 1, \"conductivity\": 1, \"expansion\": 0, \"temperature\": 20 }", 1)
+            },
+            "only a cooling study has",
+        );
     }
 
     #[test]

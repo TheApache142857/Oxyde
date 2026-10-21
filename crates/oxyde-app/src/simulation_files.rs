@@ -254,6 +254,7 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
     out.transient = study.transient;
     out.reference_temperature = study.reference_temperature;
     out.flow = study.flow.clone();
+    out.cooling = study.cooling;
     out
 }
 
@@ -411,6 +412,7 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
         });
     }
     study.flow = file.flow.clone();
+    study.cooling = file.cooling;
     study.recount();
     study
 }
@@ -499,10 +501,12 @@ pub(crate) fn results_file(
         solver: SolverInfo {
             program: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
             mesher: done.mesher.to_owned(),
-            method: if done.flow.is_some() {
-                "simpleFoam".to_owned()
-            } else {
-                "pcg+amg".to_owned()
+            method: match (&done.flow, done.study_type) {
+                (Some(_), oxyde_format::simulation::StudyType::Cooling) => {
+                    "chtMultiRegionSimpleFoam".to_owned()
+                }
+                (Some(_), _) => "simpleFoam".to_owned(),
+                (None, _) => "pcg+amg".to_owned(),
             },
             iterations: iterations as u64,
             residual,
@@ -1169,6 +1173,58 @@ mod tests {
         thermal.study_type = StudyType::Thermal;
         let file = file_study(&thermal);
         assert!(file.conditions.is_empty() && file.goals.is_empty());
+    }
+
+    #[test]
+    fn a_cooling_study_survives_its_file() {
+        use oxyde_format::simulation::{CoolingSettings, FlowGoalKind};
+        let mut study = Study::of_type(StudyType::Cooling, "Cooling 1");
+        for (k, kind) in [
+            ItemKind::InletVelocity { speed: 0.5 },
+            ItemKind::StaticPressure { pascals: 0.0 },
+            ItemKind::InternalHeat { watts: 12.0 },
+            ItemKind::Convection {
+                coefficient: 10.0,
+                ambient: 25.0,
+            },
+            ItemKind::Goal(FlowGoalKind::MaxTemperature),
+            ItemKind::Goal(FlowGoalKind::HeatFlow),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            study.items.push(StudyItem {
+                name: format!("{}-1", kind.base_name()),
+                kind,
+                faces: vec![face(k as u32 + 2)],
+            });
+        }
+        study.cooling = CoolingSettings {
+            temperature: 35.0,
+            gravity: Some([0.0, -9.81, 0.0]),
+            ..CoolingSettings::air()
+        };
+        let file = file_study(&study);
+        assert_eq!(
+            (file.conditions.len(), file.loads.len(), file.goals.len()),
+            (2, 2, 2)
+        );
+        assert_eq!(file.cooling, study.cooling);
+        let mut back = study_of(&file);
+        back.made.clear();
+        study.made.clear();
+        // Conditions, then loads, then goals: their order in the file.
+        let order = |s: &Study| -> Vec<String> { s.items.iter().map(|i| i.name.clone()).collect() };
+        assert_eq!(order(&back).len(), 6);
+        back.items.sort_by(|a, b| a.name.cmp(&b.name));
+        study.items.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(back, study);
+        // A flow study takes neither the heat nor the thermal goals.
+        let mut flow = study.clone();
+        flow.study_type = StudyType::Flow;
+        let file = file_study(&flow);
+        assert!(file.loads.is_empty());
+        assert_eq!(file.goals.len(), 0);
     }
 
     #[test]

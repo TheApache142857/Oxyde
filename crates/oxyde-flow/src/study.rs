@@ -160,6 +160,105 @@ pub enum GoalKind {
     MassFlow,
     /// The area-weighted mean static pressure on the faces, Pa (gauge).
     MeanPressure,
+    /// A cooling study's hottest temperature in the bodies the faces belong to, °C.
+    MaxTemperature,
+    /// A cooling study's area-weighted mean temperature of the faces, °C.
+    MeanTemperature,
+    /// The heat leaving the solids through the faces, W (negative where it comes in).
+    HeatFlow,
+}
+
+impl GoalKind {
+    /// Whether it measures temperatures or heat, which only a cooling study has.
+    pub fn is_thermal(self) -> bool {
+        matches!(
+            self,
+            GoalKind::MaxTemperature | GoalKind::MeanTemperature | GoalKind::HeatFlow
+        )
+    }
+}
+
+/// What a cooling study adds to a flow: heat carried by the fluid and conducted through
+/// the solids (conjugate heat transfer). Every surface is then a solid body that conducts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Heat {
+    /// The fluid's specific heat, J/(kg·K).
+    pub specific_heat: f64,
+    /// The fluid's thermal conductivity, W/(m·K).
+    pub conductivity: f64,
+    /// The fluid's volumetric thermal expansion, 1/K: with gravity, warmer fluid rises
+    /// (Boussinesq's approximation; a gas's is 1/T).
+    pub expansion: f64,
+    /// °C: the fluid coming in (inlets, openings, the free stream) and everything at the
+    /// start.
+    pub temperature: f64,
+    /// m/s², world coordinates: buoyancy, so natural convection; `None` for none.
+    pub gravity: Option<[f64; 3]>,
+    /// The solids, one per surface and in the same order.
+    pub solids: Vec<Solid>,
+    /// Where heat comes from and goes.
+    pub loads: Vec<HeatLoad>,
+}
+
+impl Heat {
+    /// Water's thermal properties at 20 °C, the fluid at 20 °C, no gravity, no solid.
+    pub fn water() -> Self {
+        Self {
+            specific_heat: 4182.0,
+            conductivity: 0.598,
+            expansion: 2.07e-4,
+            temperature: 20.0,
+            gravity: None,
+            solids: Vec::new(),
+            loads: Vec::new(),
+        }
+    }
+
+    /// Air's at 20 °C and 101 325 Pa.
+    pub fn air() -> Self {
+        Self {
+            specific_heat: 1006.0,
+            conductivity: 0.0257,
+            expansion: 1.0 / 293.15,
+            ..Self::water()
+        }
+    }
+}
+
+/// A solid body of a cooling study: the material it conducts heat through.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Solid {
+    /// Its name, for messages.
+    pub name: String,
+    /// Thermal conductivity, W/(m·K).
+    pub conductivity: f64,
+    /// Density, kg/m³.
+    pub density: f64,
+}
+
+/// Heat put in or taken out, on faces or in bodies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeatLoad {
+    pub kind: HeatLoadKind,
+    /// The faces it acts on; [`HeatLoadKind::Internal`] acts in the bodies they belong to.
+    pub labels: Vec<u32>,
+}
+
+/// What a [`HeatLoad`] does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HeatLoadKind {
+    /// The faces held at a temperature, °C.
+    Temperature { celsius: f64 },
+    /// Heat coming in through the faces, W in all, shared by area; negative takes it out.
+    Power { watts: f64 },
+    /// Heat coming in through the faces, W/m²; negative takes it out.
+    Flux { flux: f64 },
+    /// The faces lose heat to surroundings at `ambient` °C, the film coefficient in
+    /// W/(m²·K). Only where no fluid of the study touches them: there the flow works it
+    /// out.
+    Convection { coefficient: f64, ambient: f64 },
+    /// Heat made inside the bodies of the faces, W in all, shared by volume.
+    Internal { watts: f64 },
 }
 
 /// The computational domain: a box, mm, cut into the background mesh's cubes.
@@ -270,9 +369,37 @@ pub struct FlowStudy {
     pub goals: Vec<Goal>,
     pub mesh: MeshSettings,
     pub solver: SolverSettings,
+    /// A cooling study's heat: the fluid's thermal properties, the solids that conduct,
+    /// the heat loads. `None` for a flow alone.
+    pub heat: Option<Heat>,
 }
 
 impl FlowStudy {
+    /// The surface (solid) each label lies on.
+    pub fn body_of(&self) -> BTreeMap<u32, usize> {
+        let mut of = BTreeMap::new();
+        for (body, surface) in self.surfaces.iter().enumerate() {
+            for &label in &surface.labels {
+                of.entry(label).or_insert(body);
+            }
+        }
+        of
+    }
+
+    /// Each surface's volume, mm³ (by the divergence theorem: its triangles must face out).
+    pub fn volumes(&self) -> Vec<f64> {
+        self.surfaces
+            .iter()
+            .map(|s| {
+                (0..s.triangles.len())
+                    .filter_map(|t| s.corners(t))
+                    .map(|[a, b, c]| dot(a, cross(b, c)) / 6.0)
+                    .sum::<f64>()
+                    .abs()
+            })
+            .collect()
+    }
+
     /// Every label carried by a triangle, in order.
     pub fn labels(&self) -> BTreeSet<u32> {
         self.surfaces
@@ -378,6 +505,12 @@ impl FlowStudy {
             if let Some(&label) = goal.labels.iter().find(|l| !labels.contains(l)) {
                 return Err(StudyError::UnknownLabel { label });
             }
+            if goal.kind.is_thermal() && self.heat.is_none() {
+                return Err(StudyError::NoHeat);
+            }
+        }
+        if let Some(heat) = &self.heat {
+            self.check_heat(heat, &labels)?;
         }
         let fluid = &self.fluid;
         if !(fluid.density.is_finite() && fluid.density > 0.0)
@@ -467,6 +600,84 @@ impl FlowStudy {
         }
         Ok(())
     }
+
+    /// A cooling study's heat: the fluid's thermal properties, one solid per surface, and
+    /// loads on known faces with sensible values.
+    fn check_heat(&self, heat: &Heat, labels: &BTreeSet<u32>) -> Result<(), StudyError> {
+        let positive = |x: f64| x.is_finite() && x > 0.0;
+        if !positive(heat.specific_heat)
+            || !positive(heat.conductivity)
+            || !(heat.expansion.is_finite() && heat.expansion >= 0.0)
+        {
+            return Err(StudyError::BadValue {
+                what: "the fluid's specific heat, conductivity or expansion",
+            });
+        }
+        let temperature = |t: f64| t.is_finite() && t > -273.15;
+        if !temperature(heat.temperature) {
+            return Err(StudyError::BadValue {
+                what: "the fluid's temperature",
+            });
+        }
+        if heat
+            .gravity
+            .is_some_and(|g| !g.iter().all(|x| x.is_finite()))
+        {
+            return Err(StudyError::BadValue { what: "gravity" });
+        }
+        if heat.solids.len() != self.surfaces.len() {
+            return Err(StudyError::SolidsMismatch {
+                solids: heat.solids.len(),
+                surfaces: self.surfaces.len(),
+            });
+        }
+        if let Some(solid) = heat
+            .solids
+            .iter()
+            .find(|s| !positive(s.conductivity) || !positive(s.density))
+        {
+            return Err(StudyError::BadSolid {
+                name: solid.name.clone(),
+            });
+        }
+        // A face takes one condition of the solid's surface: a temperature or convection.
+        let mut held = BTreeSet::new();
+        for load in &heat.loads {
+            if load.labels.is_empty() {
+                return Err(StudyError::NoFaces);
+            }
+            if let Some(&label) = load.labels.iter().find(|l| !labels.contains(l)) {
+                return Err(StudyError::UnknownLabel { label });
+            }
+            let ok = match load.kind {
+                HeatLoadKind::Temperature { celsius } => temperature(celsius),
+                HeatLoadKind::Power { watts } | HeatLoadKind::Internal { watts } => {
+                    watts.is_finite()
+                }
+                HeatLoadKind::Flux { flux } => flux.is_finite(),
+                HeatLoadKind::Convection {
+                    coefficient,
+                    ambient,
+                } => coefficient.is_finite() && coefficient >= 0.0 && temperature(ambient),
+            };
+            if !ok {
+                return Err(StudyError::BadValue {
+                    what: "a heat load's value",
+                });
+            }
+            if matches!(
+                load.kind,
+                HeatLoadKind::Temperature { .. } | HeatLoadKind::Convection { .. }
+            ) {
+                for &label in &load.labels {
+                    if !held.insert(label) {
+                        return Err(StudyError::LabelInTwoConditions { label });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Why a case cannot be written from a study.
@@ -495,6 +706,12 @@ pub enum StudyError {
     ModelOutsideDomain,
     /// The background mesh alone would have more cells than allowed.
     TooManyCells { cells: u64, max: u64 },
+    /// A goal measures temperature or heat in a study without heat.
+    NoHeat,
+    /// A cooling study's solids are not one per surface.
+    SolidsMismatch { solids: usize, surfaces: usize },
+    /// A solid's conductivity or density is out of range.
+    BadSolid { name: String },
 }
 
 impl fmt::Display for StudyError {
@@ -533,6 +750,19 @@ impl fmt::Display for StudyError {
                 f,
                 "the computational domain would start with {cells} cells, more than the {max} allowed: \
                  make the cells larger or the domain smaller"
+            ),
+            StudyError::NoHeat => write!(
+                f,
+                "a goal measures temperature or heat, which only a cooling study works out"
+            ),
+            StudyError::SolidsMismatch { solids, surfaces } => write!(
+                f,
+                "{solids} solids were given for {surfaces} surfaces: a cooling study needs \
+                 one per surface"
+            ),
+            StudyError::BadSolid { name } => write!(
+                f,
+                "{name} has no thermal conductivity or density: give it a material"
             ),
         }
     }
@@ -640,6 +870,7 @@ mod tests {
             goals: vec![],
             mesh: MeshSettings::new(1.0),
             solver: SolverSettings::default(),
+            heat: None,
         }
     }
 

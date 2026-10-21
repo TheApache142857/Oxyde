@@ -22,7 +22,7 @@ pub(crate) struct Parked {
 }
 
 /// The study types *New Study* offers: label and what it computes.
-pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 5] = [
+pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 6] = [
     (
         StudyType::Static,
         "Static Stress",
@@ -48,6 +48,11 @@ pub(crate) const STUDY_TYPES: [(StudyType, &str, &str); 5] = [
         "Flow",
         "A liquid or a gas through or around the model: velocities, pressures, forces and flow rates, solved by OpenFOAM",
     ),
+    (
+        StudyType::Cooling,
+        "Cooling",
+        "Air or water carrying heat away from the model, the heat conducted through its bodies: temperatures and heat flows, solved by OpenFOAM",
+    ),
 ];
 
 /// What the panel and the menus call a study type.
@@ -66,6 +71,7 @@ fn base_name(t: StudyType) -> &'static str {
         StudyType::TransientThermal => "Transient",
         StudyType::ThermalStress => "Thermal Stress",
         StudyType::Flow => "Flow",
+        StudyType::Cooling => "Cooling",
     }
 }
 
@@ -198,6 +204,7 @@ impl OxydeApp {
                 StudyType::ThermalStress =>
                     "select faces, add fixtures and temperatures or heat, then Run".to_owned(),
                 StudyType::Flow => "set the fluid in the panel; select the inner faces of the lids, add an inlet and a static pressure, then Run".to_owned(),
+                StudyType::Cooling => "set the fluid in the panel; add Internal Heat where heat is made, and an inlet and a static pressure or a stream, then Run".to_owned(),
             }
         );
     }
@@ -327,6 +334,7 @@ impl OxydeApp {
                             StudyType::TransientThermal => crate::icons::Icon::Temperature,
                             StudyType::ThermalStress => crate::icons::Icon::HeatPower,
                             StudyType::Flow => crate::icons::Icon::FlowStudy,
+                            StudyType::Cooling => crate::icons::Icon::CoolingStudy,
                         };
                         crate::icons::small(ui, icon, 26.0);
                         ui.vertical(|ui| {

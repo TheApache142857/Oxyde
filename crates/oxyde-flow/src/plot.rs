@@ -1,8 +1,10 @@
 //! Plots of a flow's results, as SolidWorks Flow Simulation draws them: the model's faces
-//! coloured by the pressure on them (a surface plot), and a plane through the fluid
-//! coloured by speed or pressure (a cut plot). Both are polygons with a value each, which
-//! the application splits into colour bands and draws.
+//! coloured by the pressure or (in a cooling study) the temperature on them (a surface
+//! plot), and a plane through the fluid coloured by speed, pressure or temperature (a cut
+//! plot), which in a cooling study cuts through the solids too. Both are polygons with a
+//! value each, which the application splits into colour bands and draws.
 
+use crate::mesh::PolyMesh;
 use crate::results::FlowResults;
 use crate::study::{add, cross, dot, norm, scale, sub};
 
@@ -13,6 +15,8 @@ pub enum Quantity {
     Pressure,
     /// The flow's speed, m/s.
     Speed,
+    /// A cooling study's temperature, °C, in the fluid and the solids.
+    Temperature,
 }
 
 impl Quantity {
@@ -20,6 +24,7 @@ impl Quantity {
         match self {
             Quantity::Pressure => "Pressure",
             Quantity::Speed => "Velocity",
+            Quantity::Temperature => "Temperature",
         }
     }
 
@@ -27,22 +32,26 @@ impl Quantity {
         match self {
             Quantity::Pressure => "Pa",
             Quantity::Speed => "m/s",
+            Quantity::Temperature => "°C",
         }
     }
 
-    /// Its value in each cell.
+    /// Its value in each cell of the fluid.
     pub fn cells(self, r: &FlowResults) -> Vec<f64> {
         match self {
             Quantity::Pressure => r.pressure.clone(),
             Quantity::Speed => r.velocity.iter().map(|u| norm(*u)).collect(),
+            Quantity::Temperature => r.temperature.clone().unwrap_or_default(),
         }
     }
 
-    /// Its value on each boundary face, in face order from the first boundary face.
+    /// Its value on each boundary face of the fluid, in face order from the first boundary
+    /// face.
     pub fn boundary(self, r: &FlowResults) -> Vec<f64> {
         match self {
             Quantity::Pressure => r.boundary_pressure.clone(),
             Quantity::Speed => r.boundary_velocity.iter().map(|u| norm(*u)).collect(),
+            Quantity::Temperature => r.boundary_temperature.clone().unwrap_or_default(),
         }
     }
 }
@@ -54,39 +63,62 @@ pub struct Polygon {
     pub value: f64,
 }
 
-/// The mesh's faces on the model (not on the domain's box): the wetted surface, each face
-/// with `quantity` on it.
+/// The mesh's faces on the model (not on the domain's box), each with `quantity` on it: the
+/// wetted surface; for a cooling study's temperature, every face of the solids.
 pub fn surface(r: &FlowResults, quantity: Quantity) -> Vec<Polygon> {
-    let values = quantity.boundary(r);
-    let first = r.mesh.internal_faces();
-    r.boundary_labels
+    if quantity == Quantity::Temperature
+        && let Some(solid) = &r.solid
+    {
+        return faces_on(
+            &solid.mesh,
+            &solid.boundary_labels,
+            &solid.boundary_temperature,
+        );
+    }
+    faces_on(&r.mesh, &r.boundary_labels, &quantity.boundary(r))
+}
+
+/// The boundary faces of `mesh` on a model face, with their `values`.
+fn faces_on(mesh: &PolyMesh, labels: &[Option<u32>], values: &[f64]) -> Vec<Polygon> {
+    let first = mesh.internal_faces();
+    labels
         .iter()
-        .zip(&values)
+        .zip(values)
         .enumerate()
         .filter(|(_, (label, _))| label.is_some())
         .map(|(i, (_, &value))| Polygon {
-            points: face_points(r, first + i),
+            points: face_points(mesh, first + i),
             value,
         })
         .filter(|p| p.points.len() >= 3)
         .collect()
 }
 
-/// The plane through `origin` (mm) square to `normal` cut through the fluid: one polygon
-/// per cell it crosses, with that cell's `quantity`.
+/// The plane through `origin` (mm) square to `normal` cut through the fluid (and, for a
+/// cooling study's temperature, the solids): one polygon per cell it crosses, with that
+/// cell's `quantity`.
 pub fn cut(
     r: &FlowResults,
     origin: [f64; 3],
     normal: [f64; 3],
     quantity: Quantity,
 ) -> Vec<Polygon> {
+    let mut out = cut_mesh(&r.mesh, &quantity.cells(r), origin, normal);
+    if quantity == Quantity::Temperature
+        && let Some(solid) = &r.solid
+    {
+        out.extend(cut_mesh(&solid.mesh, &solid.temperature, origin, normal));
+    }
+    out
+}
+
+/// The plane cut through `mesh`, each polygon with its cell's value.
+fn cut_mesh(mesh: &PolyMesh, values: &[f64], origin: [f64; 3], normal: [f64; 3]) -> Vec<Polygon> {
     let length = norm(normal);
     if !(length > 0.0 && length.is_finite()) {
         return Vec::new();
     }
     let n = scale(normal, 1.0 / length);
-    let values = quantity.cells(r);
-    let mesh = &r.mesh;
     let side: Vec<f64> = mesh
         .points
         .iter()
@@ -202,10 +234,16 @@ pub fn range(polygons: &[Polygon]) -> Option<(f64, f64)> {
     lo.is_finite().then_some((lo, hi))
 }
 
-/// The box holding the fluid mesh, mm.
+/// The box holding the fluid mesh and a cooling study's solids, mm.
 pub fn bounds(r: &FlowResults) -> Option<([f64; 3], [f64; 3])> {
-    let first = *r.mesh.points.first()?;
-    Some(r.mesh.points.iter().fold((first, first), |(lo, hi), p| {
+    let solid = r
+        .solid
+        .as_ref()
+        .map(|s| s.mesh.points.as_slice())
+        .unwrap_or(&[]);
+    let mut points = r.mesh.points.iter().chain(solid);
+    let first = *points.next()?;
+    Some(points.fold((first, first), |(lo, hi), p| {
         (
             crate::study::zip(lo, *p, f64::min),
             crate::study::zip(hi, *p, f64::max),
@@ -213,11 +251,10 @@ pub fn bounds(r: &FlowResults) -> Option<([f64; 3], [f64; 3])> {
     }))
 }
 
-fn face_points(r: &FlowResults, f: usize) -> Vec<[f64; 3]> {
-    r.mesh
-        .face(f)
+fn face_points(mesh: &PolyMesh, f: usize) -> Vec<[f64; 3]> {
+    mesh.face(f)
         .iter()
-        .filter_map(|&p| r.mesh.points.get(p as usize).copied())
+        .filter_map(|&p| mesh.points.get(p as usize).copied())
         .collect()
 }
 
@@ -271,6 +308,10 @@ mod tests {
             boundary_flux: None,
             boundary_labels,
             mesh,
+            temperature: None,
+            boundary_temperature: None,
+            boundary_alphat: None,
+            solid: None,
         }
     }
 

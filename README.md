@@ -107,7 +107,9 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   displacement, factor of safety and temperature drawn on the model. **Flow studies** (CFD):
   liquids and gases through or around the model, laminar or turbulent, with inlets, openings
   and goals on faces, solved by [OpenFOAM](https://www.openfoam.com) run as a separate program;
-  forces, flow rates and pressures, cut plots and surface plots ([docs/CFD.md](docs/CFD.md)).
+  forces, flow rates and pressures, cut plots and surface plots; **cooling studies**, the fluid
+  carrying heat away and the bodies conducting it, with natural convection
+  ([docs/CFD.md](docs/CFD.md)).
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,

@@ -1,5 +1,5 @@
-//! Flow simulation for Oxyde: the Simulation tab's *Flow* studies, computed by OpenFOAM
-//! run as a separate program (`docs/CFD.md`).
+//! Flow simulation for Oxyde: the Simulation tab's *Flow* and *Cooling* studies, computed by
+//! OpenFOAM run as a separate program (`docs/CFD.md`).
 //!
 //! OpenFOAM is GPL-3.0 and Oxyde MIT, so this crate never links it: it writes an OpenFOAM
 //! case (a folder of text files), starts OpenFOAM's programs in their own environment and
@@ -24,6 +24,9 @@
 //!   pressure or speed on them, for the application to draw in colour bands.
 //! - [`setup`] works out what a study leaves to Oxyde: the mesh from a level 1 to 7, the
 //!   computational domain, a point inside an internal flow's cavity.
+//! - [`cooling`] writes a *Cooling* study (a flow with [`Heat`]): the fluid and the solids
+//!   meshed together and split into a fluid and a solid region, solved for the flow and the
+//!   temperatures by `chtMultiRegionSimpleFoam` (conjugate heat transfer).
 //!
 //! Units at the interface are Oxyde's: millimetres for positions and lengths, SI otherwise
 //! (m/s, Pa, kg/m³, Pa·s, m³/s, kg/s, N). OpenFOAM works in metres: the case is scaled on
@@ -57,6 +60,7 @@
 )]
 
 pub mod case;
+pub mod cooling;
 mod dict;
 pub mod foam;
 pub mod install;
@@ -75,6 +79,6 @@ pub use mesh::PolyMesh;
 pub use results::{FlowResults, GoalValue, ReadError};
 pub use run::{Progress, RunError, RunReport, Stage, run};
 pub use study::{
-    Condition, ConditionKind, Domain, FlowStudy, FlowType, Fluid, Goal, GoalKind, MeshSettings,
-    SolverSettings, StudyError, Surface, Turbulence,
+    Condition, ConditionKind, Domain, FlowStudy, FlowType, Fluid, Goal, GoalKind, Heat, HeatLoad,
+    HeatLoadKind, MeshSettings, Solid, SolverSettings, StudyError, Surface, Turbulence,
 };

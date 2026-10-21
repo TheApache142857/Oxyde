@@ -1,8 +1,14 @@
-//! The Simulation tab's flow studies, as SolidWorks Flow Simulation has them
+//! The Simulation tab's flow and cooling studies, as SolidWorks Flow Simulation has them
 //! (`docs/CFD.md`). The panel sets the fluid and the flow: internal (through the model's
 //! cavity, closed by lids over its openings) or external (around the model, in a stream),
 //! laminar or turbulent. Faces take inlets, static pressures (where the fluid goes out),
 //! ideal walls and goals (forces, flow rates, mean pressures); faces in none are walls.
+//!
+//! A cooling study adds heat: the fluid's thermal properties and temperature, gravity for
+//! natural convection, the bodies' thermal conductivities (from their materials), thermal
+//! loads (internal heat, heat power or flux, held temperatures, convection outside the
+//! fluid) and goals of temperature and heat. Its plots add temperatures, through the fluid
+//! and the solids.
 //!
 //! *Run* turns the study into an OpenFOAM case and runs it on a thread of its own
 //! (`oxyde_flow`: OpenFOAM is a separate program, GPL, never linked), the residuals plotted
@@ -21,7 +27,7 @@ use eframe::egui;
 use oxyde_flow::plot::Quantity;
 use oxyde_format::results::{FlowRun, GoalOutcome, GoalResult, SolverInfo};
 use oxyde_format::simulation::{
-    FlowAnalysis, FlowGoalKind, FlowSettings, FlowTurbulence, Fluid, StudyType,
+    CoolingSettings, FlowAnalysis, FlowGoalKind, FlowSettings, FlowTurbulence, Fluid, StudyType,
 };
 use oxyde_kernel::{FaceMesh, Mesh};
 use oxyde_render::{Material as RenderMaterial, Scene};
@@ -62,8 +68,13 @@ pub(crate) struct FlowDone {
 /// What the status bar says once a flow is solved.
 pub(crate) fn flow_status(f: &FlowDone, seconds: f64) -> String {
     let run = &f.run;
+    let what = if f.fields.as_ref().is_some_and(|r| r.temperature.is_some()) {
+        "Cooling"
+    } else {
+        "Flow"
+    };
     format!(
-        "Flow solved in {seconds:.0} s: {} cells, {} iterations{}",
+        "{what} solved in {seconds:.0} s: {} cells, {} iterations{}",
         run.cells,
         run.iterations,
         if run.converged {
@@ -74,14 +85,21 @@ pub(crate) fn flow_status(f: &FlowDone, seconds: f64) -> String {
     )
 }
 
-/// What to do first, in the viewport's corner while a flow study has no results.
-pub(crate) fn setup_hint(flow: &FlowSettings) -> &'static str {
-    match flow.analysis {
-        FlowAnalysis::Internal => {
+/// What to do first, in the viewport's corner while a flow or cooling study has no results.
+pub(crate) fn setup_hint(study: &Study) -> &'static str {
+    let cooling = study.study_type.is_cooling();
+    match (study.flow.analysis, cooling) {
+        (FlowAnalysis::Internal, false) => {
             "Select the inner faces of the lids, add an Inlet and a Static Pressure, then Run"
         }
-        FlowAnalysis::External { .. } => {
+        (FlowAnalysis::External { .. }, false) => {
             "Set the free stream in the panel, add goals on the faces to measure, then Run"
+        }
+        (FlowAnalysis::Internal, true) => {
+            "Add Internal Heat where heat is made, an Inlet and a Static Pressure on the lids, then Run"
+        }
+        (FlowAnalysis::External { .. }, true) => {
+            "Add Internal Heat where heat is made, set the stream or gravity in the panel, then Run"
         }
     }
 }
@@ -93,6 +111,9 @@ pub(crate) fn goal_hint(kind: FlowGoalKind) -> &'static str {
         FlowGoalKind::VolumeFlow => "The volume flowing out through the faces (negative in)",
         FlowGoalKind::MassFlow => "The mass flowing out through the faces (negative in)",
         FlowGoalKind::MeanPressure => "The mean static pressure on the faces",
+        FlowGoalKind::MaxTemperature => "The hottest point of the bodies the faces belong to",
+        FlowGoalKind::MeanTemperature => "The mean temperature of the faces",
+        FlowGoalKind::HeatFlow => "The heat leaving the model through the faces (negative in)",
     }
 }
 
@@ -102,6 +123,9 @@ fn goal_kind(kind: FlowGoalKind) -> oxyde_flow::GoalKind {
         FlowGoalKind::VolumeFlow => oxyde_flow::GoalKind::VolumeFlow,
         FlowGoalKind::MassFlow => oxyde_flow::GoalKind::MassFlow,
         FlowGoalKind::MeanPressure => oxyde_flow::GoalKind::MeanPressure,
+        FlowGoalKind::MaxTemperature => oxyde_flow::GoalKind::MaxTemperature,
+        FlowGoalKind::MeanTemperature => oxyde_flow::GoalKind::MeanTemperature,
+        FlowGoalKind::HeatFlow => oxyde_flow::GoalKind::HeatFlow,
     }
 }
 
@@ -116,7 +140,8 @@ fn sentence(text: &str) -> String {
 
 /// The study as `oxyde_flow` takes it, or what is missing. The mesh comes from the level
 /// and the model's size, the domain from the model's box, and an internal flow's point in
-/// the fluid from its openings' faces.
+/// the fluid from its openings' faces. A cooling study's bodies conduct heat with their
+/// materials' conductivities.
 pub(crate) fn flow_study(
     study: &Study,
     surfaces: &Surfaces,
@@ -176,6 +201,11 @@ pub(crate) fn flow_study(
             *b = b.max(h);
         }
     }
+    let heat = if study.study_type.is_cooling() {
+        Some(heat_of(study, surfaces)?)
+    } else {
+        None
+    };
     let turbulent = matches!(flow.turbulence, FlowTurbulence::Turbulent { .. });
     let guess = match flow.analysis {
         FlowAnalysis::Internal => oxyde_flow::FlowType::Internal { point: [0.0; 3] },
@@ -206,10 +236,19 @@ pub(crate) fn flow_study(
         }
         FlowAnalysis::External { velocity } => oxyde_flow::FlowType::External { velocity },
     };
+    // Still surroundings: the domain reaches further above, for the plume.
+    let domain = match (flow_type, heat.as_ref().and_then(|h| h.gravity)) {
+        (oxyde_flow::FlowType::External { velocity }, Some(g))
+            if velocity.iter().all(|v| *v == 0.0) =>
+        {
+            oxyde_flow::Domain::external(bounds, [-g[0], -g[1], -g[2]])
+        }
+        _ => oxyde_flow::setup::automatic_domain(bounds, flow_type, mesh.cell_size),
+    };
     let out = oxyde_flow::FlowStudy {
         surfaces: solids,
         flow_type,
-        domain: oxyde_flow::setup::automatic_domain(bounds, flow_type, mesh.cell_size),
+        domain,
         fluid: oxyde_flow::Fluid {
             name: flow.fluid.name.clone(),
             density: flow.fluid.density,
@@ -229,9 +268,71 @@ pub(crate) fn flow_study(
             residual: flow.residual,
             processes: 1,
         },
+        heat,
     };
     out.check().map_err(|e| sentence(&e.to_string()))?;
     Ok(out)
+}
+
+/// A cooling study's heat: the fluid's, each body's conductivity, the thermal loads.
+fn heat_of(study: &Study, surfaces: &Surfaces) -> Result<oxyde_flow::Heat, String> {
+    let solids = surfaces
+        .conductivities(study)?
+        .into_iter()
+        .map(|(name, conductivity, density)| oxyde_flow::Solid {
+            name,
+            conductivity,
+            density,
+        })
+        .collect();
+    let mut loads = Vec::new();
+    for item in study
+        .items
+        .iter()
+        .filter(|i| i.kind.is_thermal() && i.kind.fits(StudyType::Cooling))
+    {
+        let labels = surfaces.labels(&item.faces);
+        if labels.is_empty() {
+            return Err(format!(
+                "{} is on no face of the model any more: select its faces again",
+                item.name
+            ));
+        }
+        let kind = match item.kind {
+            ItemKind::Temperature { celsius } => oxyde_flow::HeatLoadKind::Temperature { celsius },
+            ItemKind::HeatPower { watts } => oxyde_flow::HeatLoadKind::Power { watts },
+            ItemKind::HeatFlux { flux } => oxyde_flow::HeatLoadKind::Flux { flux },
+            ItemKind::Convection {
+                coefficient,
+                ambient,
+            } => oxyde_flow::HeatLoadKind::Convection {
+                coefficient,
+                ambient,
+            },
+            ItemKind::InternalHeat { watts } => oxyde_flow::HeatLoadKind::Internal { watts },
+            _ => continue,
+        };
+        loads.push(oxyde_flow::HeatLoad { kind, labels });
+    }
+    if !loads
+        .iter()
+        .any(|l| !matches!(l.kind, oxyde_flow::HeatLoadKind::Convection { .. }))
+    {
+        return Err(
+            "Nothing heats the model: select faces and add Internal Heat, a Heat Power or Flux, or a Temperature"
+                .to_owned(),
+        );
+    }
+    let c = &study.cooling;
+    Ok(oxyde_flow::Heat {
+        specific_heat: c.specific_heat,
+        conductivity: c.conductivity,
+        expansion: c.expansion,
+        temperature: c.temperature,
+        gravity: c.gravity,
+        solids,
+        loads,
+    })
 }
 
 /// Where a flow study's OpenFOAM case is kept beside its study file:
@@ -374,6 +475,7 @@ fn flow_thread(
             Stage::Background => 0.02,
             Stage::Features => 0.04,
             Stage::Snapping => 0.06,
+            Stage::Regions => 0.2,
             Stage::Checking => 0.25,
             Stage::Decomposing => 0.27,
             Stage::Initialising => 0.28,
@@ -412,6 +514,9 @@ fn flow_thread(
                 oxyde_flow::GoalKind::VolumeFlow => FlowGoalKind::VolumeFlow,
                 oxyde_flow::GoalKind::MassFlow => FlowGoalKind::MassFlow,
                 oxyde_flow::GoalKind::MeanPressure => FlowGoalKind::MeanPressure,
+                oxyde_flow::GoalKind::MaxTemperature => FlowGoalKind::MaxTemperature,
+                oxyde_flow::GoalKind::MeanTemperature => FlowGoalKind::MeanTemperature,
+                oxyde_flow::GoalKind::HeatFlow => FlowGoalKind::HeatFlow,
             },
             value: match value {
                 oxyde_flow::GoalValue::Scalar { value, .. } => GoalOutcome::Value(value),
@@ -548,9 +653,12 @@ fn residual_chart(ui: &mut egui::Ui, fields: &[String], rows: &[Vec<f64>], targe
     ));
 }
 
-/// The fluids the panel offers, and their properties.
-fn fluid_presets() -> [Fluid; 2] {
-    [Fluid::water(), Fluid::air()]
+/// The fluids the panel offers, their properties, and how they carry heat.
+fn fluid_presets() -> [(Fluid, CoolingSettings); 2] {
+    [
+        (Fluid::water(), CoolingSettings::water()),
+        (Fluid::air(), CoolingSettings::air()),
+    ]
 }
 
 impl OxydeApp {
@@ -615,9 +723,13 @@ impl OxydeApp {
             faces,
             bodies: Vec::new(),
             fingerprint,
-            study_type: StudyType::Flow,
+            study_type: self.simulation.study.study_type,
         });
-        self.status = "Running the flow study with OpenFOAM…".to_owned();
+        self.status = if self.simulation.study.study_type.is_cooling() {
+            "Running the cooling study with OpenFOAM…".to_owned()
+        } else {
+            "Running the flow study with OpenFOAM…".to_owned()
+        };
     }
 
     /// A flow study's case moved beside its study file, where its results go, when it is
@@ -674,12 +786,12 @@ impl OxydeApp {
         }
         let quantity = match plot {
             Some(PlotChoice::FlowCutVelocity) => Quantity::Speed,
+            Some(PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature) => {
+                Quantity::Temperature
+            }
             _ => Quantity::Pressure,
         };
-        let cutting = matches!(
-            plot,
-            Some(PlotChoice::FlowCutVelocity | PlotChoice::FlowCutPressure)
-        );
+        let cutting = plot.is_some_and(PlotChoice::is_cut);
         let position = prefs.cut_position.clamp(0.0, 1.0);
         let key = PlotKey {
             id: done.id,
@@ -833,6 +945,7 @@ impl OxydeApp {
     ) {
         use crate::icons::command_button;
         let enabled = has_model && !running;
+        let cooling = self.simulation.study.study_type.is_cooling();
         let hint = |text: &str| {
             if has_faces {
                 text.to_owned()
@@ -898,6 +1011,64 @@ impl OxydeApp {
         {
             add = Some(ItemKind::IdealWall);
         }
+        if cooling {
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            // Heat, a menu of the thermal loads a cooling study takes.
+            let heat = command_button(ui, Icon::InternalHeat, "Heat", enabled, false)
+                .on_hover_text(hint(
+                    "Heat made in the bodies or let in through faces, held temperatures, convection where no fluid touches",
+                ));
+            crate::icons::dropdown_marker(ui, &heat);
+            let heat_popup = ui.make_persistent_id("cooling_heat_menu");
+            if heat.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(heat_popup));
+            }
+            egui::popup::popup_below_widget(
+                ui,
+                heat_popup,
+                &heat,
+                egui::PopupCloseBehavior::CloseOnClick,
+                |ui| {
+                    ui.set_min_width(170.0);
+                    for (label, kind, text) in [
+                        (
+                            "Internal Heat",
+                            ItemKind::InternalHeat { watts: 5.0 },
+                            "Heat made inside the bodies of the selected faces, W in all: a chip's or a motor's losses",
+                        ),
+                        (
+                            "Heat Power",
+                            ItemKind::HeatPower { watts: 10.0 },
+                            "Heat coming in through the selected faces, W in all, shared by area",
+                        ),
+                        (
+                            "Heat Flux",
+                            ItemKind::HeatFlux { flux: 1000.0 },
+                            "Heat coming in through the selected faces, W/m²",
+                        ),
+                        (
+                            "Temperature",
+                            ItemKind::Temperature { celsius: 60.0 },
+                            "Hold the selected faces at a temperature",
+                        ),
+                        (
+                            "Convection",
+                            ItemKind::Convection {
+                                coefficient: 10.0,
+                                ambient: 20.0,
+                            },
+                            "Faces the study's fluid does not touch lose heat to surroundings (10 W/m²·K: still air)",
+                        ),
+                    ] {
+                        if ui.button(label).on_hover_text(text).clicked() {
+                            add = Some(kind);
+                        }
+                    }
+                },
+            );
+        }
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
@@ -916,12 +1087,20 @@ impl OxydeApp {
             egui::PopupCloseBehavior::CloseOnClick,
             |ui| {
                 ui.set_min_width(170.0);
+                let thermal = [
+                    ("Max Temperature", FlowGoalKind::MaxTemperature),
+                    ("Mean Temperature", FlowGoalKind::MeanTemperature),
+                    ("Heat Flow", FlowGoalKind::HeatFlow),
+                ];
                 for (label, kind) in [
                     ("Force", FlowGoalKind::Force),
                     ("Volume Flow", FlowGoalKind::VolumeFlow),
                     ("Mass Flow", FlowGoalKind::MassFlow),
                     ("Mean Pressure", FlowGoalKind::MeanPressure),
-                ] {
+                ]
+                .into_iter()
+                .chain(thermal.into_iter().filter(|_| cooling))
+                {
                     if ui.button(label).on_hover_text(goal_hint(kind)).clicked() {
                         add = Some(ItemKind::Goal(kind));
                     }
@@ -956,7 +1135,22 @@ impl OxydeApp {
             .as_ref()
             .filter(|d| d.solved() && d.revision == self.document_revision());
         let mut show = None;
-        for (icon, label, plot, text) in [
+        let temperatures = [
+            (
+                Icon::TemperaturePlot,
+                "Temperature",
+                PlotChoice::CoolingCutTemperature,
+                "The temperature on a plane through the fluid and the solids (set the plane in the panel)",
+            ),
+            (
+                Icon::SurfacePlot,
+                "Surface Temperature",
+                PlotChoice::CoolingSurfaceTemperature,
+                "The temperature on the model's faces",
+            ),
+        ];
+        let temperatures = temperatures.into_iter().filter(|_| cooling);
+        for (icon, label, plot, text) in temperatures.chain([
             (
                 Icon::CutPlot,
                 "Velocity",
@@ -975,7 +1169,7 @@ impl OxydeApp {
                 PlotChoice::FlowSurfacePressure,
                 "The pressure on the model's faces the fluid wets",
             ),
-        ] {
+        ]) {
             let available = done.is_some_and(|d| d.has(plot));
             let active =
                 available && self.simulation.show_plot && self.prefs.simulation.plot == plot;
@@ -1009,10 +1203,12 @@ impl OxydeApp {
                 let study = &mut self.simulation.study;
                 let selected = &mut self.simulation.selected;
                 let mut edited = false;
+                let cooling = study.study_type.is_cooling();
                 egui::CollapsingHeader::new("Fluid")
                     .default_open(true)
                     .show(ui, |ui| {
-                        edited |= fluid_rows(ui, &mut study.flow);
+                        let heat = cooling.then_some(&mut study.cooling);
+                        edited |= fluid_rows(ui, &mut study.flow, heat);
                     });
                 egui::CollapsingHeader::new("Boundary conditions")
                     .default_open(true)
@@ -1037,6 +1233,30 @@ impl OxydeApp {
                             ui.label(egui::RichText::new(text).small().weak());
                         }
                     });
+                if cooling {
+                    egui::CollapsingHeader::new("Heat")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            edited |= heat_rows(ui, &mut study.cooling);
+                            let mut any = false;
+                            for (i, item) in study.items.iter_mut().enumerate() {
+                                if !item.kind.is_thermal() {
+                                    continue;
+                                }
+                                any = true;
+                                item_row(ui, i, item, selected, &mut action);
+                            }
+                            if !any {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Select a face of each body that makes heat, then Heat › Internal Heat. Bodies conduct with their materials' conductivity.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                            }
+                        });
+                }
                 egui::CollapsingHeader::new("Goals")
                     .default_open(true)
                     .show(ui, |ui| {
@@ -1050,9 +1270,11 @@ impl OxydeApp {
                         }
                         if !any {
                             ui.label(
-                                egui::RichText::new(
-                                    "Select faces, then Goal: a force, a flow rate or a mean pressure to measure on them",
-                                )
+                                egui::RichText::new(if cooling {
+                                    "Select faces, then Goal: a temperature, a heat flow, a force or a flow rate to measure on them"
+                                } else {
+                                    "Select faces, then Goal: a force, a flow rate or a mean pressure to measure on them"
+                                })
                                 .small()
                                 .weak(),
                             );
@@ -1146,6 +1368,7 @@ impl OxydeApp {
                             action = Some(PanelAction::ShowPlot(shown));
                         }
                         let p = &mut self.prefs.simulation;
+                        let study_type = d.study_type;
                         egui::Grid::new("flow_plot")
                             .num_columns(2)
                             .spacing([10.0, 4.0])
@@ -1155,15 +1378,15 @@ impl OxydeApp {
                                 egui::ComboBox::from_id_salt("flow_plot_choice")
                                     .selected_text(shown.label())
                                     .show_ui(ui, |ui| {
-                                        for c in PlotChoice::ALL.into_iter().filter(|c| c.is_flow()) {
+                                        for c in PlotChoice::ALL
+                                            .into_iter()
+                                            .filter(|c| c.is_flow() && c.fits(study_type))
+                                        {
                                             ui.selectable_value(&mut p.plot, c, c.label());
                                         }
                                     });
                                 ui.end_row();
-                                if matches!(
-                                    shown,
-                                    PlotChoice::FlowCutVelocity | PlotChoice::FlowCutPressure
-                                ) {
+                                if shown.is_cut() {
                                     ui.label("Plane");
                                     egui::ComboBox::from_id_salt("flow_cut_axis")
                                         .selected_text(p.cut_axis.label())
@@ -1211,7 +1434,7 @@ impl OxydeApp {
             assembly: self.asm.is_some(),
             mesh: TetMesh::default(),
             report: no_mesh(),
-            study_type: StudyType::Flow,
+            study_type: self.simulation.study.study_type,
             results: None,
             summary: None,
             thermal: None,
@@ -1245,6 +1468,8 @@ fn goal_row(ui: &mut egui::Ui, goal: &GoalResult) {
         FlowGoalKind::VolumeFlow => "m³/s",
         FlowGoalKind::MassFlow => "kg/s",
         FlowGoalKind::MeanPressure => "Pa",
+        FlowGoalKind::MaxTemperature | FlowGoalKind::MeanTemperature => "°C",
+        FlowGoalKind::HeatFlow => "W",
     };
     match &goal.value {
         GoalOutcome::Value(v) => {
@@ -1294,8 +1519,13 @@ fn goal_row(ui: &mut egui::Ui, goal: &GoalResult) {
     }
 }
 
-/// The fluid and the flow; whether one changed.
-fn fluid_rows(ui: &mut egui::Ui, flow: &mut FlowSettings) -> bool {
+/// The fluid and the flow; whether one changed. A cooling study's `heat` takes the
+/// preset fluid's thermal properties with it.
+fn fluid_rows(
+    ui: &mut egui::Ui,
+    flow: &mut FlowSettings,
+    mut heat: Option<&mut CoolingSettings>,
+) -> bool {
     let mut changed = false;
     egui::Grid::new("flow_fluid")
         .num_columns(2)
@@ -1351,12 +1581,12 @@ fn fluid_rows(ui: &mut egui::Ui, flow: &mut FlowSettings) -> bool {
             let presets = fluid_presets();
             let current = presets
                 .iter()
-                .find(|f| **f == flow.fluid)
-                .map_or_else(|| "Custom".to_owned(), |f| f.name.clone());
+                .find(|(f, _)| *f == flow.fluid)
+                .map_or_else(|| "Custom".to_owned(), |(f, _)| f.name.clone());
             egui::ComboBox::from_id_salt("flow_fluid")
                 .selected_text(current)
                 .show_ui(ui, |ui| {
-                    for f in presets {
+                    for (f, thermal) in presets {
                         let hint = format!(
                             "At 20 °C: {} kg/m³, {} mPa·s",
                             format_number(f.density),
@@ -1368,6 +1598,11 @@ fn fluid_rows(ui: &mut egui::Ui, flow: &mut FlowSettings) -> bool {
                             .clicked()
                         {
                             flow.fluid = f;
+                            if let Some(h) = heat.as_deref_mut() {
+                                h.specific_heat = thermal.specific_heat;
+                                h.conductivity = thermal.conductivity;
+                                h.expansion = thermal.expansion;
+                            }
                             changed = true;
                         }
                     }
@@ -1464,6 +1699,85 @@ fn fluid_rows(ui: &mut egui::Ui, flow: &mut FlowSettings) -> bool {
                     .changed();
                 ui.end_row();
             }
+        });
+    changed
+}
+
+/// A cooling study's heat: the fluid's temperature coming in, gravity, and how it carries
+/// heat; whether one changed.
+fn heat_rows(ui: &mut egui::Ui, heat: &mut CoolingSettings) -> bool {
+    let mut changed = false;
+    egui::Grid::new("cooling_heat")
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("Fluid in at");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut heat.temperature)
+                        .range(-100.0..=1000.0)
+                        .speed(0.5)
+                        .max_decimals(2)
+                        .suffix(" °C"),
+                )
+                .on_hover_text(
+                    "The temperature of the fluid coming in, of the free stream and of everything at the start",
+                )
+                .changed();
+            ui.end_row();
+            ui.label("Gravity");
+            let mut on = heat.gravity.is_some();
+            if ui
+                .checkbox(&mut on, "Warm fluid rises")
+                .on_hover_text(
+                    "Natural convection: gravity along −Y (the model's down), so warmer, lighter fluid rises",
+                )
+                .changed()
+            {
+                heat.gravity = on.then_some([0.0, -9.81, 0.0]);
+                changed = true;
+            }
+            ui.end_row();
+            ui.label("Specific heat");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut heat.specific_heat)
+                        .range(1.0..=100_000.0)
+                        .speed(1.0)
+                        .max_decimals(1)
+                        .suffix(" J/(kg·K)"),
+                )
+                .changed();
+            ui.end_row();
+            ui.label("Conductivity");
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut heat.conductivity)
+                        .range(1e-4..=1000.0)
+                        .speed(0.001)
+                        .max_decimals(4)
+                        .suffix(" W/(m·K)"),
+                )
+                .on_hover_text("The fluid's: water 0.6, air 0.026")
+                .changed();
+            ui.end_row();
+            ui.label("Expansion");
+            let mut per_mille = heat.expansion * 1000.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut per_mille)
+                        .range(0.0..=100.0)
+                        .speed(0.01)
+                        .max_decimals(4)
+                        .suffix(" ×10⁻³/K"),
+                )
+                .on_hover_text("How much the fluid swells as it warms: water 0.21, air 3.4 (1/T)")
+                .changed()
+            {
+                heat.expansion = per_mille / 1000.0;
+                changed = true;
+            }
+            ui.end_row();
         });
     changed
 }
@@ -1660,6 +1974,74 @@ mod tests {
     }
 
     #[test]
+    fn a_cooling_study_takes_the_bodies_heat() {
+        let mut study = Study::of_type(StudyType::Cooling, "Cooling 1");
+        study.items = vec![
+            item(
+                "Inlet Velocity-1",
+                ItemKind::InletVelocity { speed: 1.0 },
+                0,
+            ),
+            item(
+                "Static Pressure-1",
+                ItemKind::StaticPressure { pascals: 0.0 },
+                1,
+            ),
+            item("Internal Heat-1", ItemKind::InternalHeat { watts: 3.0 }, 2),
+            item(
+                "Max Temperature Goal-1",
+                ItemKind::Goal(FlowGoalKind::MaxTemperature),
+                2,
+            ),
+        ];
+        // A body without a conductivity is named.
+        let why = flow_study(&study, &cavity(), 1_000_000).unwrap_err();
+        assert!(
+            why.contains("Body 0") && why.contains("thermal conductivity"),
+            "{why}"
+        );
+        study.thermal_overrides.insert(
+            "test:0".to_owned(),
+            oxyde_model::Thermal::new(200.0, 900.0, 2.3e-5),
+        );
+        let flow = flow_study(&study, &cavity(), 1_000_000).unwrap();
+        assert_eq!(flow.goals[0].kind, oxyde_flow::GoalKind::MaxTemperature);
+        let heat = flow.heat.unwrap();
+        assert_eq!(heat.solids[0].conductivity, 200.0);
+        assert_eq!(heat.temperature, 20.0);
+        assert_eq!(heat.loads.len(), 1);
+        assert!(matches!(
+            heat.loads[0].kind,
+            oxyde_flow::HeatLoadKind::Internal { watts } if watts == 3.0
+        ));
+        // Nothing heating it is said.
+        study.items.retain(|i| !i.kind.is_thermal());
+        let why = flow_study(&study, &cavity(), 1_000_000).unwrap_err();
+        assert!(why.contains("Nothing heats"), "{why}");
+    }
+
+    #[test]
+    fn still_air_reaches_further_above() {
+        let mut study = Study::of_type(StudyType::Cooling, "Cooling 1");
+        study.flow.analysis = FlowAnalysis::External { velocity: [0.0; 3] };
+        study.cooling.gravity = Some([0.0, -9.81, 0.0]);
+        study.items = vec![item(
+            "Internal Heat-1",
+            ItemKind::InternalHeat { watts: 1.0 },
+            0,
+        )];
+        study.thermal_overrides.insert(
+            "test:0".to_owned(),
+            oxyde_model::Thermal::new(400.0, 385.0, 1.7e-5),
+        );
+        let flow = flow_study(&study, &cavity(), 1_000_000).unwrap();
+        // The 10 mm cube: twice its size below, five times above, for the plume.
+        assert_eq!(flow.domain.min[1], -5.0 - 20.0);
+        assert_eq!(flow.domain.max[1], 5.0 + 50.0);
+        assert_eq!(flow.domain.max[0], 5.0 + 20.0);
+    }
+
+    #[test]
     fn residuals_line_up_by_field() {
         let history = vec![
             vec![("Ux".to_owned(), 1.0), ("p".to_owned(), 1.0)],
@@ -1712,8 +2094,10 @@ mod tests {
 
     #[test]
     fn goals_and_hints_read_well() {
-        let flow = FlowSettings::default();
-        assert!(setup_hint(&flow).contains("lids"));
+        let study = Study::of_type(StudyType::Flow, "Flow 1");
+        assert!(setup_hint(&study).contains("lids"));
+        let cooling = Study::of_type(StudyType::Cooling, "Cooling 1");
+        assert!(setup_hint(&cooling).contains("Internal Heat"));
         assert!(goal_hint(FlowGoalKind::Force).contains("force"));
         assert_eq!(sentence("the fluid leaks"), "The fluid leaks");
     }

@@ -1,10 +1,10 @@
 # Flow simulation: CFD in Oxyde
 
-Status: **built** (October 2026): flow studies in the Simulation tab, run by OpenFOAM as a
-separate program, saved in `.oxysim` and `.oxyres` with their OpenFOAM case beside them, and
-OpenFOAM offered by the Windows installer (§4, §7). `oxyde-flow` is tested against closed
-forms through OpenFOAM v2606. Next: cooling studies, flow trajectories (§8). §1–§3 are the
-survey the choice was made from.
+Status: **built** (October 2026): flow and cooling studies in the Simulation tab, run by
+OpenFOAM as a separate program, saved in `.oxysim` and `.oxyres` with their OpenFOAM case
+beside them, and OpenFOAM offered by the Windows installer (§4, §7). `oxyde-flow` is tested
+against closed forms and correlations through OpenFOAM v2606. Next: flow trajectories,
+radiation, transient flows (§8). §1–§3 are the survey the choice was made from.
 
 The reference is SolidWorks Flow Simulation (and Fusion 360's CFD): a liquid or a gas
 flowing through the model (*internal*: a valve, a manifold, a duct) or around it
@@ -166,8 +166,9 @@ flows first, turbulence well after.
 3. **A new study type of the Simulation tab** (*New Study* › *Flow*), beside the static and
    thermal studies, as Fusion 360 lists CFD among its studies.
 4. **Flow first**: incompressible flow, internal and external, laminar or turbulent.
-   **Cooling** (heat carried by the fluid and conducted through the solids) comes later,
-   as a study type of its own.
+   **Cooling** (heat carried by the fluid and conducted through the solids) next, as a
+   study type of its own, **with conduction in the solids** from the start (conjugate heat
+   transfer), in `format_version` 6.
 5. **Files**: flow studies in `.oxysim` like the others, as `format_version` 5 (after the
    generative studies' 4 of the `topology-optimization` branch), their results in
    `.oxyres` with the OpenFOAM case folder kept beside them.
@@ -182,10 +183,12 @@ flows first, turbulence well after.
 3. The files: built (FORMAT.md §8–§9).
 4. The installer's offer, and Preferences pointing at an installation: built (§5,
    *Installing*).
-5. Next, cooling studies: `buoyantSimpleFoam` for heat carried by the fluid,
-   `chtMultiRegionSimpleFoam` for heat through the solids as well; and flow trajectories.
-6. Later: rotating parts (a moving reference frame), porous media, transient flows
-   (`pimpleFoam`), the fluid's pressures handed to static studies as loads.
+5. Cooling studies, with conduction in the solids (`chtMultiRegionSimpleFoam`): built (§5,
+   *Cooling*; §7).
+6. Next: flow trajectories.
+7. Later: rotating parts (a moving reference frame), porous media, transient flows
+   (`pimpleFoam`), radiation, the fluid's pressures and the solids' temperatures handed to
+   static and thermal stress studies as loads.
 
 ## 5. How a flow study runs
 
@@ -237,6 +240,77 @@ As `oxyde-flow` does it:
   pressures in pascals, where OpenFOAM's incompressible solvers hold them divided by the
   density.
 
+### Cooling
+
+A *Cooling* study is a flow whose fluid carries heat away from the model, which conducts it
+through its bodies (conjugate heat transfer, `chtMultiRegionSimpleFoam`), as SolidWorks
+Flow Simulation's *heat conduction in solids*:
+
+- **The fluid and the solids are meshed together.** Each body is an STL file of its own
+  (`body_<k>.stl`, a region per model face). `snappyHexMesh` puts the cells inside each body
+  in a cell zone (`body_<k>`, `cellZoneInside inside`) and the faces on each model face in a
+  face zone of their own (`faceZoneNaming region`: `body_<k>_wall_<label>`), keeping every
+  cell, since no surface blocks it. `topoSet` gathers the cells reached from the fluid's point
+  without crossing a body in a `fluid` zone and the rest of the unzoned cells (round an
+  internal flow's model, or pockets the bodies close off) in an `outside` zone, and
+  `splitMeshRegions -cellZonesOnly -useFaceZones -addZones '((solid body_0 …))'` splits the
+  mesh into the regions `fluid`, `solid` and `outside`, the last not solved. Between fluid
+  and solid it makes a coupled pair of patches per model face, conformal face for face. No
+  layers grow along the walls yet, turbulent or not: the walls are faces inside the mesh,
+  where `snappyHexMesh` grows none (§8); the wall functions take the first cell as it is.
+- **One solid region.** Every body is in the `solid` region, its material a species of a
+  multi-component mixture whose mass fraction is one in the body's cells (`setFields` from
+  the zones): heat crosses from body to body inside one matrix. Bodies as regions of their own
+  were coupled only from one iteration to the next, which converged hundreds of times slower
+  where they touch: a chip on an aluminium plate lost half a percent of its error per
+  iteration, where one region converges in fifty. The species share one specific heat, which
+  a steady state never uses, so that the enthalpy is continuous where the temperature is, and
+  the conductivities meet harmonically at a change of material (`laplacian(alpha,h) Gauss
+  harmonic`). OpenFOAM's mixture turns a mass fraction of exactly zero into a NaN, so the
+  other species keep 10⁻⁸.
+- **Patches by face and role.** After the split Oxyde renames the patches: on the fluid's side
+  `wall_<label>` (coupled), `inlet_<label>`, `outlet_<label>` (made plain patches),
+  `slip_<label>`; on the solid's, `wall_<label>` (coupled), `free_<label>` (under an opening:
+  adiabatic) and `outer_<label>` (facing `outside`). The coupled walls are
+  `compressible::turbulentTemperatureRadCoupledMixed`, each side taking the other's
+  temperature and conductance.
+- **The fluid** has constant properties and, with gravity, a density falling as it warms
+  (Boussinesq: ρ = ρ₀ (1 − β (T − T₀))); warmer fluid rises. Its pressures are absolute
+  (`p_rgh` around 10⁵ Pa). With gravity the fluid starts at rest under its weight: `p` is
+  written hydrostatic from the cells' heights, since the solver makes `p_rgh = p − ρ g·x`
+  from it (a uniform `p` left the whole fluid's weight unbalanced on the first iteration: a
+  sphere in still air went down to 135 K and diverged). Inlets bring fluid in at the study's
+  temperature; openings (a fixed `p_rgh`: their pressure above the surroundings', which are
+  at rest) and the free stream (`freestreamPressure`, or `totalPressure` on `p_rgh` in still
+  surroundings) take it in at that temperature where it flows back. SIMPLE with
+  under-relaxation 0.7 for the velocity and 0.3 for the pressure, the energy unrelaxed.
+- **Heat loads.** *Internal heat* is a source in the bodies' zones (`scalarSemiImplicitSource`,
+  W in all, shared by volume); *heat power* and *heat flux* heat the solid's cells along their
+  faces, wherever the faces are; a *temperature* holds the faces (both sides of a wetted
+  one); *convection* acts on faces outside the fluid (`externalWallHeatFluxTemperature`),
+  since where the fluid touches, the flow works it out.
+- **Stopping.** `chtMultiRegionSimpleFoam` has no residual test of its own: Oxyde follows the
+  fluid's residuals and, for the solid, `T (solid)`, how far its hottest temperature moved
+  in the iteration over its rise above the fluid's coldest (the solid's own residual is no
+  measure: a body that conducts well is nearly uniform, and OpenFOAM divides its residual by
+  how far it is from uniform, so a copper sphere settled to a thousandth of a kelvin still
+  showed 0.05). Once every one is under the target, Oxyde sets `stopAt writeNow` in the
+  `controlDict`, which the solver re-reads while it runs. A plume never quite stops moving,
+  though: in still air the fluid's residuals level off near 0.2 however long the run goes.
+  So the run also stops once the bodies' hottest temperature has settled: after a hundred
+  iterations at least, it kept within twenty times the target of its rise over the last
+  fifty (a sphere in still air, 39 K above the air, within 0.08 K at 10⁻⁴: stopped at 103
+  iterations, its surface where 1500 left it). The pressure's solve is capped at a hundred
+  cycles: near convergence it can stall short of its relative tolerance.
+- **Goals.** The force and flow goals as a flow study's (the fluxes are of mass there);
+  *max temperature* is the hottest cell or face of the bodies of the goal's faces, *mean
+  temperature* the faces' area-weighted temperature, *heat flow* Fourier's law across each
+  face's half cell: on the fluid's side where the fluid touches, (κ + cp αt) (T_face −
+  T_cell) A / d with the wall functions' αt, on the solid's elsewhere. (The solid's side
+  is no measure where it conducts thousands of times better than the fluid: a copper
+  sphere's faces differ from its cells by a ten-thousandth of a kelvin, and the sum came
+  out 44 % short.)
+
 ### Installing
 
 On Windows, the Inno Setup installer gets a task, *Install OpenFOAM v2606 for flow
@@ -254,7 +328,8 @@ installation's folder; `OXYDE_OPENFOAM_DIR` does the same for tests and scripts.
 The questions this plan asked are answered (§4, *Decided*): OpenFOAM in OpenCFD's line, run
 as a separate program; the installer downloads it; flow studies are a study type of the
 Simulation tab; flow first and cooling later; flow studies and results in `.oxysim` and
-`.oxyres`, the case folder beside them; the crate `oxyde-flow`.
+`.oxyres`, the case folder beside them; the crate `oxyde-flow`. Cooling studies are a study
+type of their own in `format_version` 6, with conduction in the solids.
 
 ## 7. What is built
 
@@ -289,6 +364,17 @@ Simulation tab; flow first and cooling later; flow studies and results in `.oxys
   against its SHA-256 and run after Oxyde's files are in place; a failed download leaves
   Oxyde installed and says where to get OpenFOAM. The `.msi` cannot chain an installer:
   Preferences says where to get it.
+- **New Study › Cooling**: everything a flow study has, and in the panel a **Heat** section
+  (the temperature the fluid comes in at, gravity for natural convection, the fluid's
+  specific heat, conductivity and expansion, which the fluid's preset sets too) and a
+  **Material** section (each body's conductivity, from its material or typed in, as in
+  thermal studies). The command bar's **Heat ▾** adds *Internal Heat*, *Heat Power*, *Heat
+  Flux*, *Temperature* and *Convection*, the thermal studies' items; **Goal ▾** adds *Max
+  Temperature*, *Mean Temperature* and *Heat Flow*; the plots add a temperature cut plot
+  (through the fluid and the bodies) and the temperature on the model's faces.
+  `flow_study` hands `oxyde_flow` a `Heat` with each body's conductivity
+  (`Surfaces::conductivities`) and the thermal items as loads; the study and its results
+  are saved as `format_version` 6.
 
 ### `oxyde-flow`
 
@@ -305,14 +391,24 @@ Simulation tab; flow first and cooling later; flow studies and results in `.oxys
   geometry, the fields on it, the goals; `results::label_of_patch` reads a patch's model
   face from its name, so a case folder alone is enough to read results back.
 - `setup`: the mesh of a level, the automatic domain, the point inside a cavity.
-- `plot`: cut planes and wetted surfaces as polygons with values.
+- `plot`: cut planes and wetted surfaces as polygons with values; for a cooling study's
+  temperature, the cut goes through the solid too and the surface is the solid's.
+- `cooling`: a cooling study's case (§5, *Cooling*): the bodies' STL files and zones, the
+  `topoSet` and `splitMeshRegions` steps, then [`cooling::finish`] after the split: the
+  patches renamed, the leak check, and every region's files (thermophysics, a heat source
+  per load, a cell set per face load, the starting fields). `run` runs it with the solver
+  stopped at convergence; `results` reads both regions back (temperatures in °C, pressures
+  gauge) and works out the temperature and heat goals.
 
-**Tests.** 42 unit tests that need no OpenFOAM: the case's files, the mesh and field
+**Tests.** 49 unit tests that need no OpenFOAM: the case's files, the mesh and field
 readers (both face formats, compact lists, every kind of patch entry), the geometry of
 faces and cells, the log reader (residuals, convergence, fatal errors, divergence,
-`checkMesh`), the run's log following, the leak check, an installation's environment from
-a fake `etc/bashrc`, the mesh levels, the point inside a cavity, cut and surface plots. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped without it), on a
-Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run):
+`checkMesh`, the solid's temperature), the run's log following and stopping, the leak
+check, an installation's environment from a fake `etc/bashrc`, the mesh levels, the point
+inside a cavity, cut and surface plots; for cooling, the bodies' zones, the split's patches
+renamed and every region's files. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped
+without it), on a Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run
+and the first cold plate):
 
 | Case | Cells | Iterations | Meshing + solving | Against |
 |---|---|---|---|---|
@@ -320,14 +416,17 @@ Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run):
 | The same pipe on two processes (MPI) | 41 696 | 45 | 36 s + 24 s | The same gradient (−1.0 %) |
 | Sphere in air at Re 20, the domain five diameters round it and ten behind | 19 351 | 102 | 13 s + 29 s | Drag coefficient 2.738, Clift, Grace and Weber's correlation 2.735 (+0.1 %); side forces 10⁻⁴ of the drag |
 | Turbulent pipe: water at Re 19 924, k-ω SST, three layers along the wall | 75 296 | 100 | 43 s + 180 s | Inlet pressure 812 Pa, 1.5 times Blasius's 531 Pa for a developed flow over L/D = 10: the entrance adds the rest (a check of order only) |
+| Cold plate (cooling): water at 0.1 m/s through a 4 mm square channel in an aluminium plate of four bars and two plastic lids, a 10 W ceramic chip on top; on two processes | 65 856 | 98 | 71 s + 117 s | Heat into the water through the channel's walls 10.0000 W, carried out by it (ṁ cp ΔT) 9.9989 W; the chip at 37.5 °C |
+| The same plate turbulent: water at 2 m/s (Re 8000, k-ω SST), the 10 W let in through the chip's top face, the bottom face losing heat to 20 °C (50 W/m²·K) | 65 856 | 102 | 71 s + 124 s | Into the water 9.977 W, off the bottom 0.023 W: 10.000 W; stopped once its temperatures settled, the same to four figures as at 120 iterations, where its residuals met the target |
+| Copper sphere, 10 mm, heated by 0.033 W inside, in air at Re 20 | 21 303 | 124 | 17 s + 157 s | Heat flow off its faces 0.03298 W (−0.1 %); Nusselt number 3.98, Clift, Grace and Weber's 4.12 (−3.4 %) |
+| The same sphere, 20 mm, heated by 0.5 W in still air with gravity (natural convection, Ra 3.3 × 10⁴) | 25 454 | 103 | 19 s + 53 s | Nusselt number 7.87, Churchill's 8.12 (−3.1 %); stopped once its temperature settled, which 1500 iterations left as it was (59.35 °C) |
 
 ## 8. Next
 
-- **Cooling** (a study type of its own, as decided): the energy equation with buoyancy
-  (`buoyantSimpleFoam`) for heat carried by the fluid, then heat through the solids as well
-  (`chtMultiRegionSimpleFoam`, a region per body), heat sources in the solids, and the
-  temperatures handed to thermal and thermal stress studies.
 - **Flow trajectories**: lines seeded on inlets and followed through the cells.
+- **Cooling, further**: radiation between faces and to the surroundings, contact
+  resistance between bodies, layers along cooled walls, fans as conditions, and the
+  temperatures handed to thermal stress studies.
 - Seeing the mesh before solving, a domain the user sizes, rotating regions, porous media,
   transient flows.
 - To check on Windows and macOS: OpenCFD's MinGW build and openfoam-app found and run

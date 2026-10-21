@@ -40,7 +40,52 @@ pub struct PolyMesh {
 impl PolyMesh {
     /// Reads `constant/polyMesh` from a case folder.
     pub fn read(case_dir: &Path) -> Result<Self, ReadError> {
-        let dir = case_dir.join("constant").join("polyMesh");
+        Self::read_dir(&case_dir.join("constant").join("polyMesh"))
+    }
+
+    /// Reads a region's mesh, `constant/<region>/polyMesh`, from a case folder.
+    pub fn read_region(case_dir: &Path, region: &str) -> Result<Self, ReadError> {
+        Self::read_dir(&case_dir.join("constant").join(region).join("polyMesh"))
+    }
+
+    /// The cell zones of a region's mesh (`constant/<region>/polyMesh/cellZones`), by name;
+    /// none when the file is missing.
+    pub fn cell_zones(case_dir: &Path, region: &str) -> Result<Vec<(String, Vec<u32>)>, ReadError> {
+        let path = case_dir
+            .join("constant")
+            .join(region)
+            .join("polyMesh")
+            .join("cellZones");
+        let Ok(text) = fs::read(&path) else {
+            return Ok(Vec::new());
+        };
+        let mut lex = Lexer::new(&text);
+        header(&mut lex).map_err(|e| ReadError::parse(&path, e))?;
+        lex.list(|l| {
+            let name = l.word()?.to_string();
+            l.expect(b'{')?;
+            let mut cells = Vec::new();
+            while !l.eat(b'}') {
+                match l.word()? {
+                    "cellLabels" => {
+                        // `List<label>`, then the list.
+                        if l.peek().is_some_and(|b| b.is_ascii_alphabetic()) {
+                            l.word()?;
+                        }
+                        cells = l.list(|m| m.label().map(|i| i as u32))?;
+                        l.expect(b';')?;
+                    }
+                    _ => l.skip_value()?,
+                }
+            }
+            Ok((name, cells))
+        })
+        .map_err(|e| ReadError::parse(&path, e))
+    }
+
+    /// Reads a `polyMesh` folder.
+    pub fn read_dir(dir: &Path) -> Result<Self, ReadError> {
+        let dir = dir.to_path_buf();
         let read = |name: &str| {
             let path = dir.join(name);
             fs::read(&path).map_err(|error| ReadError::Io { path, error })

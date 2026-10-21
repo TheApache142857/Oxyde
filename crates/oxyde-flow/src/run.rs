@@ -30,6 +30,9 @@ pub enum Stage {
     Features,
     /// `snappyHexMesh`: cells refined, cut and snapped to the surfaces.
     Snapping,
+    /// A cooling study's `topoSet` and `splitMeshRegions`: the mesh split into the fluid
+    /// and the solids.
+    Regions,
     /// `checkMesh`: the mesh's quality.
     Checking,
     /// `decomposePar`: the mesh split between processes.
@@ -49,6 +52,7 @@ impl Stage {
             Stage::Background => "Filling the domain with cells",
             Stage::Features => "Finding sharp edges",
             Stage::Snapping => "Fitting the mesh to the model",
+            Stage::Regions => "Splitting the fluid from the solids",
             Stage::Checking => "Checking the mesh",
             Stage::Decomposing => "Sharing the mesh between processes",
             Stage::Initialising => "Starting the flow",
@@ -62,10 +66,11 @@ impl Stage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Progress {
     pub stage: Stage,
-    /// The solver's iterations so far, and the most it will take.
+    /// The solver's iterations done, and the most it will take.
     pub iteration: u32,
     pub iterations: u32,
-    /// The initial residuals of the last iteration, by field.
+    /// The initial residuals of the last iteration done, by field: every equation's, where
+    /// the iteration still running has only some.
     pub residuals: Vec<(String, f64)>,
 }
 
@@ -105,6 +110,10 @@ pub enum RunError {
     Diverged { iteration: u32, log: PathBuf },
     /// An internal flow's fluid reached the domain's box: its cavity is open somewhere.
     Leak { faces: usize },
+    /// A cooling study's mesh has no fluid: its point was inside a solid.
+    NoFluid,
+    /// A heat load's faces are on no face of the solids' mesh.
+    LoadOffMesh { load: usize },
     /// A file of the case could not be read or written.
     Io { path: PathBuf, error: io::Error },
 }
@@ -131,6 +140,15 @@ impl fmt::Display for RunError {
                  computational domain): close every opening with a lid, and check that \
                  the inlets and outlets are on the lids' inner faces"
             ),
+            RunError::NoFluid => write!(
+                f,
+                "the mesh has no fluid: the point it was meshed from lies inside a solid"
+            ),
+            RunError::LoadOffMesh { load } => write!(
+                f,
+                "the faces of heat load {} are not in the mesh: try a finer mesh",
+                load + 1
+            ),
             RunError::Io { path, error } => write!(f, "{}: {error}", path.display()),
         }
     }
@@ -152,6 +170,9 @@ pub fn run(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&Progress),
 ) -> Result<RunReport, RunError> {
+    if case.cooling.is_some() {
+        return run_cooling(case, install, cancel, progress);
+    }
     let parallel = case.processes > 1;
     let mut report = RunReport::default();
     let mut runner = Runner {
@@ -159,6 +180,7 @@ pub fn run(
         install,
         cancel,
         progress,
+        stop_at: None,
     };
 
     runner.program(Stage::Background, "blockMesh", &[], false)?;
@@ -201,11 +223,83 @@ pub fn run(
     Ok(report)
 }
 
+/// A cooling case: the mesh split into a fluid and a solid region ([`crate::cooling`]),
+/// `chtMultiRegionSimpleFoam` on both, stopped once its residuals meet the target (it has no
+/// such test of its own).
+fn run_cooling(
+    case: &Case,
+    install: &Installation,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<RunReport, RunError> {
+    let parallel = case.processes > 1;
+    let mut report = RunReport::default();
+    let target = case.cooling.as_deref().map(|s| s.solver.residual);
+    let mut runner = Runner {
+        case,
+        install,
+        cancel,
+        progress,
+        stop_at: None,
+    };
+    runner.program(Stage::Background, "blockMesh", &[], false)?;
+    runner.program(Stage::Features, "surfaceFeatureExtract", &[], false)?;
+    runner.program(Stage::Snapping, "snappyHexMesh", &["-overwrite"], false)?;
+    runner.program(Stage::Regions, "topoSet", &[], false)?;
+    let split = crate::cooling::split_arguments(case);
+    let split: Vec<&str> = split.iter().map(String::as_str).collect();
+    runner.program(Stage::Regions, "splitMeshRegions", &split, false)?;
+    crate::cooling::finish(case)?;
+    let check = runner.program(Stage::Checking, "checkMesh", &["-allRegions"], false)?;
+    report.cells = check.cells;
+    report.mesh_ok = check.mesh_ok;
+    report.failed_checks = check.failed_checks;
+    if crate::cooling::has_mixture(case) {
+        let region = crate::cooling::SOLID;
+        runner.program(
+            Stage::Initialising,
+            "setFields",
+            &["-region", region],
+            false,
+        )?;
+    }
+    copy_file(
+        &case.dir.join("system/controlDict.solve"),
+        &case.dir.join("system/controlDict"),
+    )?;
+    if parallel {
+        runner.program(
+            Stage::Decomposing,
+            "decomposePar",
+            &["-allRegions", "-force"],
+            false,
+        )?;
+    }
+    runner.stop_at = target;
+    let solve = runner.program(Stage::Solving, &case.solver, &[], parallel)?;
+    runner.stop_at = None;
+    report.iterations = solve.iterations();
+    report.converged = solve.converged;
+    report.history = solve.history;
+    if parallel {
+        runner.program(
+            Stage::Reconstructing,
+            "reconstructPar",
+            &["-allRegions", "-latestTime"],
+            false,
+        )?;
+    }
+    Ok(report)
+}
+
 struct Runner<'a> {
     case: &'a Case,
     install: &'a Installation,
     cancel: &'a AtomicBool,
     progress: &'a mut dyn FnMut(&Progress),
+    /// A residual target the running solver is stopped at (writing its fields), for a
+    /// solver without a test of its own.
+    stop_at: Option<f64>,
 }
 
 impl Runner<'_> {
@@ -255,19 +349,23 @@ impl Runner<'_> {
         let mut state = LogState::default();
         let iterations = self.case.iterations;
         let report = |state: &LogState, progress: &mut dyn FnMut(&Progress)| {
+            // The iteration still running has only some of its residuals (a cooling case's
+            // solid's comes as the next begins): the one before is the last done.
+            let done = state.history.len().saturating_sub(1);
             progress(&Progress {
                 stage,
-                iteration: state.iterations(),
+                iteration: u32::try_from(done).unwrap_or(u32::MAX),
                 iterations,
-                residuals: state
-                    .history
-                    .last()
+                residuals: done
+                    .checked_sub(1)
+                    .and_then(|i| state.history.get(i))
                     .map(|i| i.residuals.clone())
                     .unwrap_or_default(),
             });
         };
         report(&state, &mut *self.progress);
 
+        let mut stopping = false;
         let status = loop {
             let finished = child.try_wait().map_err(|e| io_err(&log_path, e))?;
             // Read after checking: a program that has exited has written all its log.
@@ -275,6 +373,14 @@ impl Runner<'_> {
                 .map_err(|e| io_err(&log_path, e))?;
             if changed {
                 report(&state, &mut *self.progress);
+            }
+            if let Some(target) = self.stop_at
+                && !stopping
+                && converged(&state.history, target)
+            {
+                state.converged = true;
+                stopping = true;
+                request_stop(&dir.join("system").join("controlDict"))?;
             }
             if let Some(status) = finished {
                 break status;
@@ -288,6 +394,7 @@ impl Runner<'_> {
         if !pending.is_empty() {
             state.feed(&String::from_utf8_lossy(&pending));
         }
+        state.finish();
         if state.diverged {
             return Err(RunError::Diverged {
                 iteration: state.iterations(),
@@ -303,6 +410,66 @@ impl Runner<'_> {
         }
         Ok(state)
     }
+}
+
+/// The iterations over which a cooling run's temperatures must have settled.
+const SETTLING: usize = 50;
+
+/// Whether the last complete iteration of `history` (the one before the last, which may
+/// still be running) solved every equation to under `target`; or, for a cooling case, whether
+/// its solid's hottest temperature has settled: over the last [`SETTLING`] iterations it
+/// stayed within twenty times `target` of its rise above the fluid. Natural convection's flow
+/// keeps moving a little, its residuals level off far above any target, while the
+/// temperatures it gives have long settled.
+fn converged(history: &[Iteration], target: f64) -> bool {
+    let Some(last) = history.len().checked_sub(2) else {
+        return false;
+    };
+    let Some(done) = history.get(last) else {
+        return false;
+    };
+    if !done.residuals.is_empty() && done.residuals.iter().all(|(_, r)| *r < target) {
+        return true;
+    }
+    if last + 1 < 2 * SETTLING {
+        return false;
+    }
+    let window = history
+        .get(last + 1 - SETTLING..=last)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|i| i.hottest);
+    let (mut lo, mut hi, mut rise, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0);
+    for (t, r) in window {
+        lo = lo.min(t);
+        hi = hi.max(t);
+        rise = r;
+        count += 1;
+    }
+    count == SETTLING && hi - lo <= 20.0 * target * rise
+}
+
+/// Asks a running solver to write its fields and stop, through its `controlDict`, which it
+/// re-reads while it runs.
+fn request_stop(control: &Path) -> Result<(), RunError> {
+    let text = fs::read_to_string(control).map_err(|error| RunError::Io {
+        path: control.to_path_buf(),
+        error,
+    })?;
+    let stopped: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("stopAt") {
+                "stopAt          writeNow;".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    fs::write(control, stopped.join("\n") + "\n").map_err(|error| RunError::Io {
+        path: control.to_path_buf(),
+        error,
+    })
 }
 
 /// The MPI launcher and its option for the number of processes: OpenMPI's `mpirun` on
@@ -475,5 +642,48 @@ mod tests {
     #[test]
     fn stages_say_what_they_do() {
         assert_eq!(Stage::Snapping.describe(), "Fitting the mesh to the model");
+        assert!(RunError::NoFluid.to_string().contains("inside a solid"));
+    }
+
+    #[test]
+    fn a_converged_solver_is_asked_to_stop() {
+        let it = |r: &[f64]| Iteration {
+            time: 1.0,
+            residuals: r
+                .iter()
+                .enumerate()
+                .map(|(i, &r)| (format!("f{i}"), r))
+                .collect(),
+            hottest: None,
+        };
+        let history = vec![it(&[1e-3, 1e-5]), it(&[5e-5, 1e-6]), it(&[])];
+        assert!(converged(&history, 1e-4));
+        assert!(!converged(&history[..2], 1e-4), "the last may still run");
+        assert!(!converged(&history, 1e-5));
+        // Natural convection: residuals level off at 0.2, while the solid's hottest
+        // temperature, 39 K above the fluid, wanders by 0.02 K.
+        let wandering = |n: usize, spread: f64| -> Vec<Iteration> {
+            (0..n)
+                .map(|k| Iteration {
+                    time: k as f64,
+                    residuals: vec![("Ux".to_string(), 0.2)],
+                    hottest: Some((332.5 + spread * ((k % 7) as f64 / 6.0 - 0.5), 39.0)),
+                })
+                .collect()
+        };
+        assert!(converged(&wandering(101, 0.02), 1e-4));
+        assert!(!converged(&wandering(101, 0.2), 1e-4), "still moving");
+        assert!(!converged(&wandering(60, 0.0), 1e-4), "too soon to tell");
+        let path = std::env::temp_dir().join(format!("oxyde-flow-stop-{}", std::process::id()));
+        fs::write(
+            &path,
+            "endTime         10;\nstopAt          endTime;\nwriteInterval   10;\n",
+        )
+        .unwrap();
+        request_stop(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("stopAt          writeNow;"));
+        assert!(text.contains("endTime         10;"));
+        let _ = fs::remove_file(&path);
     }
 }

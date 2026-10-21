@@ -43,7 +43,9 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use oxyde_assembly::Placement;
 use oxyde_format::results::{Fingerprint, SolverInfo};
-use oxyde_format::simulation::{FlowGoalKind, FlowSettings, StudyType, TransientSettings};
+use oxyde_format::simulation::{
+    CoolingSettings, FlowGoalKind, FlowSettings, StudyType, TransientSettings,
+};
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
@@ -97,10 +99,14 @@ pub enum PlotChoice {
     FlowCutVelocity,
     /// Pa, a flow study's static pressure on a plane through the fluid.
     FlowCutPressure,
+    /// °C, a cooling study's temperature on a plane through the fluid and the solids.
+    CoolingCutTemperature,
+    /// °C, a cooling study's temperature on the model's faces.
+    CoolingSurfaceTemperature,
 }
 
 impl PlotChoice {
-    pub(crate) const ALL: [PlotChoice; 10] = [
+    pub(crate) const ALL: [PlotChoice; 12] = [
         PlotChoice::Temperature,
         PlotChoice::HeatFlux,
         PlotChoice::VonMises,
@@ -108,6 +114,8 @@ impl PlotChoice {
         PlotChoice::Displacement,
         PlotChoice::FactorOfSafety,
         PlotChoice::ContactPressure,
+        PlotChoice::CoolingCutTemperature,
+        PlotChoice::CoolingSurfaceTemperature,
         PlotChoice::FlowCutVelocity,
         PlotChoice::FlowCutPressure,
         PlotChoice::FlowSurfacePressure,
@@ -118,20 +126,40 @@ impl PlotChoice {
         matches!(self, PlotChoice::Temperature | PlotChoice::HeatFlux)
     }
 
-    /// Whether it plots a flow study's results.
+    /// Whether it plots a flow or cooling study's results.
     pub(crate) fn is_flow(self) -> bool {
         matches!(
             self,
             PlotChoice::FlowSurfacePressure
                 | PlotChoice::FlowCutVelocity
                 | PlotChoice::FlowCutPressure
+                | PlotChoice::CoolingCutTemperature
+                | PlotChoice::CoolingSurfaceTemperature
+        )
+    }
+
+    /// Whether it plots a cooling study's temperatures.
+    pub(crate) fn is_cooling(self) -> bool {
+        matches!(
+            self,
+            PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature
+        )
+    }
+
+    /// Whether it cuts a plane through the fluid.
+    pub(crate) fn is_cut(self) -> bool {
+        matches!(
+            self,
+            PlotChoice::FlowCutVelocity
+                | PlotChoice::FlowCutPressure
+                | PlotChoice::CoolingCutTemperature
         )
     }
 
     /// Whether a study of `t` has this plot.
     pub(crate) fn fits(self, t: StudyType) -> bool {
         if self.is_flow() {
-            t.is_flow()
+            t.is_flow() && (t.is_cooling() || !self.is_cooling())
         } else if self.is_thermal() {
             t.is_thermal()
         } else {
@@ -150,7 +178,9 @@ impl PlotChoice {
             | PlotChoice::HeatFlux
             | PlotChoice::FlowSurfacePressure
             | PlotChoice::FlowCutVelocity
-            | PlotChoice::FlowCutPressure => None,
+            | PlotChoice::FlowCutPressure
+            | PlotChoice::CoolingCutTemperature
+            | PlotChoice::CoolingSurfaceTemperature => None,
         }
     }
 
@@ -162,6 +192,8 @@ impl PlotChoice {
             PlotChoice::FlowSurfacePressure => "Surface pressure",
             PlotChoice::FlowCutVelocity => "Velocity (cut plot)",
             PlotChoice::FlowCutPressure => "Pressure (cut plot)",
+            PlotChoice::CoolingCutTemperature => "Temperature (cut plot)",
+            PlotChoice::CoolingSurfaceTemperature => "Surface temperature",
             other => other.quantity().map_or("", Quantity::label),
         }
     }
@@ -173,6 +205,7 @@ impl PlotChoice {
             PlotChoice::HeatFlux => "W/m²",
             PlotChoice::FlowSurfacePressure | PlotChoice::FlowCutPressure => "Pa",
             PlotChoice::FlowCutVelocity => "m/s",
+            PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature => "°C",
             other => other.quantity().map_or("", Quantity::unit),
         }
     }
@@ -404,7 +437,7 @@ pub enum ItemKind {
 }
 
 /// The names items are numbered after, as SolidWorks names them.
-pub(crate) const ITEM_BASES: [&str; 20] = [
+pub(crate) const ITEM_BASES: [&str; 23] = [
     "Fixed",
     "Roller/Slider",
     "Force",
@@ -425,6 +458,9 @@ pub(crate) const ITEM_BASES: [&str; 20] = [
     "Volume Flow Goal",
     "Mass Flow Goal",
     "Pressure Goal",
+    "Max Temperature Goal",
+    "Mean Temperature Goal",
+    "Heat Flow Goal",
 ];
 
 impl ItemKind {
@@ -463,6 +499,11 @@ impl ItemKind {
         matches!(self, ItemKind::Goal(_))
     }
 
+    /// Whether it is a goal only a cooling study measures: a temperature or heat.
+    pub(crate) fn is_thermal_goal(&self) -> bool {
+        matches!(self, ItemKind::Goal(kind) if kind.is_thermal())
+    }
+
     pub(crate) fn base_name(&self) -> &'static str {
         match self {
             ItemKind::Fixed => "Fixed",
@@ -484,15 +525,19 @@ impl ItemKind {
             ItemKind::Goal(FlowGoalKind::VolumeFlow) => "Volume Flow Goal",
             ItemKind::Goal(FlowGoalKind::MassFlow) => "Mass Flow Goal",
             ItemKind::Goal(FlowGoalKind::MeanPressure) => "Pressure Goal",
+            ItemKind::Goal(FlowGoalKind::MaxTemperature) => "Max Temperature Goal",
+            ItemKind::Goal(FlowGoalKind::MeanTemperature) => "Mean Temperature Goal",
+            ItemKind::Goal(FlowGoalKind::HeatFlow) => "Heat Flow Goal",
         }
     }
 
-    /// Whether a study of `t` takes it.
+    /// Whether a study of `t` takes it. A cooling study takes a flow's conditions and goals,
+    /// its own goals of temperature and heat, and the thermal loads but radiation.
     pub(crate) fn fits(&self, t: StudyType) -> bool {
         if self.is_flow() {
-            t.is_flow()
+            t.is_flow() && (t.is_cooling() || !self.is_thermal_goal())
         } else if self.is_thermal() {
-            t.is_thermal()
+            t.is_thermal() || (t.is_cooling() && !matches!(self, ItemKind::Radiation { .. }))
         } else {
             t.is_structural()
         }
@@ -611,6 +656,8 @@ pub struct Study {
     pub mesh: StudyMesh,
     /// A flow study's fluid, flow and solver settings.
     pub flow: FlowSettings,
+    /// A cooling study's fluid temperature, thermal properties and gravity.
+    pub cooling: CoolingSettings,
     /// Items made so far of each kind, for their names.
     pub(crate) made: BTreeMap<&'static str, u32>,
 }
@@ -638,6 +685,7 @@ impl Study {
             contacts_found: false,
             mesh: StudyMesh::default(),
             flow: FlowSettings::default(),
+            cooling: CoolingSettings::default(),
             made: BTreeMap::new(),
         }
     }
@@ -769,15 +817,24 @@ pub(crate) struct Surfaces {
 
 #[cfg(test)]
 impl Surfaces {
-    /// The surfaces of `solids` whose labels stand for `faces`, for tests.
+    /// The surfaces of `solids` whose labels stand for `faces`, for tests: a body each
+    /// (`Body 0`…, material group `test:0`…), without a material.
     pub(crate) fn of_solids(solids: Vec<SurfaceMesh>, faces: Vec<SimFace>) -> Self {
+        let bodies = (0..solids.len())
+            .map(|i| BodyInfo {
+                name: format!("Body {i}"),
+                key: format!("test:{i}"),
+                material: None,
+                path: None,
+            })
+            .collect();
         Self {
             revision: 0,
             assembly: false,
             solids,
             faces,
             face_body: Vec::new(),
-            bodies: Vec::new(),
+            bodies,
             sources: Vec::new(),
             volume: 0.0,
             area: 0.0,
@@ -787,6 +844,30 @@ impl Surfaces {
 }
 
 impl Surfaces {
+    /// Each solid's name, thermal conductivity (W/(m·K)) and density (kg/m³; 1000 where its
+    /// material gives none, which a steady state never uses), in the order of `solids`; or
+    /// which body has no conductivity.
+    pub(crate) fn conductivities(&self, study: &Study) -> Result<Vec<(String, f64, f64)>, String> {
+        self.bodies
+            .iter()
+            .map(|body| match thermal_material_of(study, body) {
+                Some(t) if t.conductivity.is_finite() && t.conductivity > 0.0 => Ok((
+                    body.name.clone(),
+                    t.conductivity,
+                    if t.density.is_finite() && t.density > 0.0 {
+                        t.density
+                    } else {
+                        1000.0
+                    },
+                )),
+                _ => Err(format!(
+                    "{} has no known thermal conductivity: apply a material or type it in Material",
+                    body.name
+                )),
+            })
+            .collect()
+    }
+
     /// The labels of `faces`.
     pub(crate) fn labels(&self, faces: &[SimFace]) -> Vec<u32> {
         self.faces
@@ -932,7 +1013,11 @@ impl Done {
     /// Whether it can draw `plot`.
     pub(crate) fn has(&self, plot: PlotChoice) -> bool {
         if plot.is_flow() {
-            self.flow.as_ref().is_some_and(|f| f.fields.is_some())
+            self.flow.as_ref().is_some_and(|f| {
+                f.fields
+                    .as_ref()
+                    .is_some_and(|r| !plot.is_cooling() || r.temperature.is_some())
+            })
         } else if plot.is_thermal() {
             self.thermal.is_some()
         } else {
@@ -1901,8 +1986,8 @@ impl OxydeApp {
                 materials: elastic()?,
                 reference: study.reference_temperature,
             },
-            // A flow study runs OpenFOAM (`flow_ui.rs`), never these solvers.
-            StudyType::Flow => {
+            // Flow and cooling studies run OpenFOAM (`flow_ui.rs`), never these solvers.
+            StudyType::Flow | StudyType::Cooling => {
                 return Err(
                     "A flow study is solved by OpenFOAM, not meshed into tetrahedra".to_owned(),
                 );
@@ -2764,7 +2849,7 @@ impl OxydeApp {
             "New Study: pick what to study in the panel".to_owned()
         } else if s.done.is_none() {
             if s.study.study_type.is_flow() {
-                crate::flow_ui::setup_hint(&s.study.flow).to_owned()
+                crate::flow_ui::setup_hint(&s.study).to_owned()
             } else if s.study.study_type.is_structural() {
                 "Select faces, add fixtures and loads, then Run".to_owned()
             } else {
@@ -3168,6 +3253,31 @@ impl OxydeApp {
                 );
             }
             if study_type.is_flow() {
+                if study_type.is_cooling() {
+                    // The bodies conduct heat: their materials' conductivities, or typed in.
+                    let study = &mut self.simulation.study;
+                    let unknown = groups.iter().any(|g| g.thermal.is_none());
+                    egui::CollapsingHeader::new("Material")
+                        .default_open(unknown)
+                        .show(ui, |ui| {
+                            if groups.is_empty() {
+                                ui.label(egui::RichText::new("Nothing to study yet").weak());
+                            }
+                            for (i, g) in groups.iter().enumerate() {
+                                if let Some(a) = material_rows(
+                                    ui,
+                                    study_type,
+                                    &mut study.overrides,
+                                    &mut study.thermal_overrides,
+                                    g,
+                                    i,
+                                    &material_names,
+                                ) {
+                                    action = Some(a);
+                                }
+                            }
+                        });
+                }
                 if let Some(a) = self.flow_panel(ui, max_height) {
                     action = Some(a);
                 }
@@ -4218,8 +4328,10 @@ fn material_rows(
     let mut action = None;
     let source = g.effective.map(|(_, s)| s);
     let thermal_source = g.thermal.map(|(_, s)| s);
+    // A cooling study's bodies conduct heat as a thermal study's do.
+    let thermal = study_type.is_thermal() || study_type.is_cooling();
     let typed = (study_type.is_structural() && source == Some(PropsSource::Study))
-        || (study_type.is_thermal() && thermal_source == Some(PropsSource::Study));
+        || (thermal && thermal_source == Some(PropsSource::Study));
     ui.horizontal(|ui| {
         let parts = if g.bodies.len() > 1 {
             format!("{} bodies: {}", g.bodies.len(), g.bodies.join(", "))
@@ -4275,7 +4387,7 @@ fn material_rows(
             }
         }
     });
-    if study_type.is_thermal() {
+    if thermal {
         thermal_material_rows(ui, study_type, thermal_overrides, g);
     }
     if !study_type.is_structural() {
