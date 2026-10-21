@@ -1,8 +1,11 @@
-# Flow simulation: a plan for CFD in Oxyde
+# Flow simulation: CFD in Oxyde
 
-Status: **proposal** (October 2026). Which open-source engines could compute flows for
-Oxyde, how each would attach to it, and a recommendation. The engine is a new dependency,
-so the choice is the owner's (§6); nothing is built yet.
+Status: **decided, being built** (October 2026). The owner chose OpenFOAM, run as a
+separate program and offered by Oxyde's installer; flow studies are a new study type of
+the Simulation tab; flow first, cooling later (§4). Built so far: `oxyde-flow`, which
+writes, runs and reads back OpenFOAM cases, tested against closed forms through
+OpenFOAM v2606 (§7). Not built yet: the study in the Simulation tab, its files and the
+installer's offer. §1–§3 are the survey the choice was made from.
 
 The reference is SolidWorks Flow Simulation (and Fusion 360's CFD): a liquid or a gas
 flowing through the model (*internal*: a valve, a manifold, a duct) or around it
@@ -153,71 +156,149 @@ flows first, turbulence well after.
   curved high-order meshes or hexahedra.
 - **Gmsh** (GPL) as a mesher: already ruled out in SIMULATION.md §2.
 
-## 4. Recommendation and order
+## 4. Decisions and order
 
-1. **Whatever the engine, the study and the results are ours**, as for stress: a flow
-   study (internal or external, the fluid, gravity, the computational domain's box),
-   conditions on faces by persistent name (inlet velocity, mass or volume flow; outlet or
-   environment pressure; walls, with roughness and heat), heat sources in solids, goals;
-   the results read into plain arrays and drawn by us (surface plots on the model, cut
-   plots, flow trajectories, goal and convergence plots), and later the pressures and
-   temperatures passed to static and thermal studies.
-2. **The engine: OpenFOAM, OpenCFD's line, as a separate program.** It is the only
-   open-source engine covering what Flow Simulation users expect (internal and external
-   flows, turbulence, heat in fluids and solids, rotating parts, porous media); it meshes
-   the fluid from the surface meshes we already make, so neither booleans nor a fluid
-   mesher are ours to write; it runs natively on Windows, Linux and macOS; and, never
-   linked, it leaves Oxyde MIT. The price is an install for users.
-3. **Later, if wanted: an in-house Cartesian solver**, for a quick look without any
-   install and on the GPU, tested against OpenFOAM on the same cases, as the CPU solver is
-   the GPU's reference in generative design.
+**Decided (October 2026, the owner):**
 
-SU2 is the better choice only if shipping everything inside Oxyde's installer matters
-more than the meshing work and the narrower physics.
+1. **OpenFOAM**, run as a separate program, in OpenCFD's line (openfoam.com, v2606 today):
+   the line with native Windows and macOS builds, and the one the cases are written for
+   (the Foundation's names its solvers differently).
+2. **Oxyde's installer offers it**, so that users do not have to find it themselves.
+3. **A new study type of the Simulation tab** (*New Study* › *Flow*), beside the static and
+   thermal studies, as Fusion 360 lists CFD among its studies.
+4. **Flow first**: incompressible flow, internal and external, laminar or turbulent.
+   **Cooling** (heat carried by the fluid and conducted through the solids) comes later,
+   as a study type of its own.
 
-## 5. The OpenFOAM route, sketched
+**Order of the work:**
 
-- **A crate standing alone**, `oxyde-flow`, like `oxyde-sim`: plain structs in (labelled
-  triangle meshes, the study by labels), plain arrays out. It writes the case, runs the
-  programs, follows them and reads the results; the app maps labels to persistent names.
-- **The case**: the surfaces as one STL with a named region per group of faces (each
-  inlet, outlet and wall condition; each solid, for heat in solids), scaled from
-  millimetres to metres; `blockMeshDict` from the domain box; `snappyHexMeshDict` with its
-  refinement and layers from one resolution setting (SolidWorks' *global mesh* level), and
-  `locationInMesh` a point outside every solid for an external flow, inside the cavity for
-  an internal one; the `0/` fields from the conditions; `controlDict` with function
-  objects for the goals (forces, flow rates and mean pressures on patches, probes).
-- **Lids**: flat openings capped automatically (their boundary loop is planar), besides
-  lid features made by hand as SolidWorks asks.
-- **Running**: `blockMesh`, `snappyHexMesh`, `checkMesh`, then the solver (split across
-  cores with `decomposePar` and MPI when wanted), each started inside the distribution's
-  environment, its install folder found in the usual places or set in Preferences. The
-  log gives the residuals and the goals' values every iteration, for a live plot (Flow
-  Simulation's solver monitor); Cancel stops the process; a run that diverges says so.
-- **Results**: the mesh (`constant/polyMesh`: points, faces, owners, neighbours, patches)
-  and the last time's fields, written as ASCII to keep the reader small. Incompressible
-  solvers write the pressure divided by the density (m²/s²): the reader multiplies it
-  back. Cut plots intersect the cells with a plane; trajectories are integrated through
-  the cells by us. The case folder stays openable in ParaView.
-- **Tests**: those that run OpenFOAM skip without it, as the Netgen tests do. Against
-  closed forms and benchmarks: laminar pipe flow (the Hagen–Poiseuille pressure drop), a
-  flat plate's drag (Blasius), the Schäfer–Turek cylinder, turbulent pipe friction
-  (Moody), a duct with a heated wall (a Nusselt correlation).
+1. `oxyde-flow`, the engine's driver: built (§7).
+2. The *Flow* study in the Simulation tab: internal or external flow, the fluid (air and
+   water to start with), conditions on faces (inlet velocity, volume or mass flow; outlet
+   pressure; ideal walls), goals (forces, flow rates, mean pressures), the computational
+   domain drawn as a box, a mesh level, *Run* on a job thread with a live residual plot
+   and Cancel. Results: the goals, surface plots (pressure, wall shear) and cut plots
+   (velocity and pressure on a plane through the fluid), flow trajectories next.
+3. The files: flow studies and their results in `.oxysim` and `.oxyres` (§6).
+4. The installer's offer, and Preferences pointing at an installation (§5, *Installing*).
+5. Cooling studies: `buoyantSimpleFoam` for heat carried by the fluid,
+   `chtMultiRegionSimpleFoam` for heat through the solids as well.
+6. Later: rotating parts (a moving reference frame), porous media, transient flows
+   (`pimpleFoam`), runs on every core by default, and the fluid's pressures handed to
+   static studies as loads.
 
-## 6. Questions for the owner
+## 5. How a flow study runs
 
-1. **The engine**: OpenFOAM as a separate program (recommended), SU2 shipped with Oxyde,
-   or in house from the start?
-2. **If OpenFOAM**: OpenCFD's line (native Windows and macOS builds) rather than the
-   Foundation's? Installed by users, Oxyde finding it, or its Windows installer offered
-   from Oxyde's (allowed for a separate program, with its source)?
-3. **Where it lives**: a *Flow* study type in the Simulation tab (*New Study*), as Fusion
-   360 lists CFD among its studies, or a tab of its own, like SolidWorks' Flow Simulation
-   add-in?
-4. **First scope**: steady incompressible flow, internal and external, laminar and k-ω
-   SST, then heat in the fluid, heat in the solids, transient flows, rotating parts; or
-   heat from the start (electronics cooling)?
-5. **Files**: flow studies in `.oxysim` (a new `format_version`); results as the OpenFOAM
-   case folder beside the study, or read into `.oxyres`?
-6. **The crate**: `oxyde-flow`, standing alone like `oxyde-sim` (the layering table and
-   its test change with it)?
+As `oxyde-flow` does it:
+
+- **One patch per model face.** The surfaces are written as one STL file, in metres, with
+  a region per face named after its role and label (`wall_12`, `inlet_3`, `outlet_7`,
+  `slip_9`). Each face becomes a boundary patch of its own, so conditions, goals and
+  results work face by face, and the application maps labels to persistent names as it
+  does for the static study. Faces in no condition are walls the fluid sticks to.
+- **Meshing.** `blockMesh` fills the computational domain with cubes of the cell size (the
+  box grows to whole cubes); `surfaceFeatureExtract` finds the sharp edges, and the faces'
+  boundaries; `snappyHexMesh` halves the cells along the surfaces and edges as many times
+  as the study asks, keeps those on the side of `locationInMesh`, snaps them to the
+  surfaces and edges, and grows layers along walls when asked. For an internal flow the
+  point is the study's (moved off the cells' planes by a small odd fraction of the finest
+  cell); for an external flow it sits in the domain's first cube, which the study's check
+  keeps clear of the model.
+- **Internal flows need closed cavities.** The openings are capped by lids (SolidWorks'
+  *Create Lids*), whose faces carry the inlet and outlet conditions. A cavity left open
+  leaks into the domain's box, which is a wall in internal flows.
+- **Solving.** `potentialFoam -writephi` gives the flow a start, then `simpleFoam`
+  (SIMPLEC, `linearUpwindV` for the momentum, upwind for the turbulence, one
+  non-orthogonal correction, GAMG for the pressure) runs until every initial residual is
+  under the study's target or the iterations run out. Turbulence is k-ω SST with
+  Spalding's wall function (`nutUSpaldingWallFunction`), which accepts any distance from
+  the wall to the first cell; the turbulence coming in follows from an intensity and a
+  length: k = 1.5 (I U)², ω = √k / (Cμ^¼ ℓ).
+- **Boundary conditions.** Inlet velocities: `surfaceNormalFixedValue`; volume and mass
+  flows: `flowRateInletVelocity`, a condition's rate shared between its faces by area;
+  outlets: a fixed static pressure with `pressureInletOutletVelocity`, which lets the
+  fluid come back in where it must; ideal walls: `slip`; external flows:
+  `freestreamVelocity` and `freestreamPressure` all round the domain.
+- **Goals.** Forces come from OpenFOAM's `forces` function object (pressure and friction).
+  It is in the solver's `controlDict` only: the meshing programs read one without it, and
+  the run copies `controlDict.solve` over it before solving. Flow rates are summed from the
+  solver's face fluxes (`phi`), so what comes in is what goes out to the solver's
+  tolerance; mean pressures are area-weighted over the faces.
+- **Running.** The installation's environment is read once, through OpenCFD's launcher
+  (`etc/openfoam -c`) or `setEnvVariables-v*.bat` on Windows; then each program starts
+  directly in it, writing `log.<program>` in the case, which is read as it grows for
+  progress and residuals. Cancel stops the program (and MPI's processes: `taskkill /T` on
+  Windows). A program that fails stops the run with its `FOAM FATAL ERROR`; residuals that
+  are not numbers, or a floating point trap, are a divergence.
+- **Results.** The mesh (`constant/polyMesh`, its faces as lists or as OpenCFD's compact
+  lists) and the last time's `U`, `p` and `phi`, all ASCII; cell centres and volumes worked
+  out as OpenFOAM does. The case folder opens in ParaView (`case.foam`).
+- **Units.** Millimetres at the crate's interface, metres in the case; pressures are gauge
+  pressures in pascals, where OpenFOAM's incompressible solvers hold them divided by the
+  density.
+
+### Installing (to build)
+
+On Windows, the Inno Setup installer gets a task, *Install OpenFOAM v2606 for flow
+simulations*, which downloads OpenCFD's installer from openfoam.com
+(`https://dl.openfoam.com/source/v2606/OpenFOAM-v2606-windows-mingw.exe`, 203 MB; the
+version is pinned so that every install meets the cases this crate writes) and runs it.
+Downloaded from its makers, OpenFOAM is not inside Oxyde's download, which stays small and
+carries no GPL code. Parallel runs also need Microsoft MPI 10. The `.msi` cannot chain
+another installer, so there, and on macOS (openfoam-app, through Homebrew) and Linux
+(OpenCFD's packages), Preferences say where to get it. Preferences also take an
+installation's folder; `OXYDE_OPENFOAM_DIR` does the same for tests and scripts.
+
+## 6. Questions still open for the owner
+
+1. **Files.** Flow studies saved in `.oxysim` like the others (a new `format_version`,
+   numbered after the generative studies' 4 on the `topology-optimization` branch), with
+   their results in `.oxyres` (the goals, the residual history and what the plots need)
+   and the OpenFOAM case folder kept beside them for ParaView; or only the case folder?
+2. **The installer.** Download OpenFOAM while installing (proposed above), or ship its
+   installer inside Oxyde's (some 200 MB more, and Oxyde's download then carries GPL
+   software, with its source)?
+3. **The crate.** Built as `oxyde-flow`, standing alone like `oxyde-sim` (the layering
+   table and its test changed with it); renaming it is easy now.
+
+## 7. What is built: `oxyde-flow`
+
+- `study`: the study as plain data (`FlowStudy`: labelled surfaces, `FlowType` internal or
+  external, `Fluid`, `Turbulence`, `Condition`s, `Goal`s, `Domain`, `MeshSettings`,
+  `SolverSettings`) and its check, with messages for the user (`StudyError`).
+- `case`: `write_case`, the OpenFOAM case of §5; it clears what an earlier run left (mesh,
+  time and processor folders, logs) and nothing else.
+- `install`: `Installation::find` (`OXYDE_OPENFOAM_DIR`, then the usual places per system,
+  newest first), the environment read once, programs started in it.
+- `run`: the programs one after the other, logs followed, `Progress` reported, Cancel;
+  `RunReport` (cells, mesh checks, iterations, convergence, the residual history).
+- `log`, `foam`, `mesh`, `results`: OpenFOAM's logs, its ASCII files, the mesh with its
+  geometry, the fields on it, the goals.
+
+**Tests.** 34 unit tests that need no OpenFOAM: the case's files, the mesh and field
+readers (both face formats, compact lists, every kind of patch entry), the geometry of
+faces and cells, the log reader (residuals, convergence, fatal errors, divergence,
+`checkMesh`), the run's log following, an installation's environment from a fake
+`etc/bashrc`. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped without it), on a
+Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run):
+
+| Case | Cells | Iterations | Meshing + solving | Against |
+|---|---|---|---|---|
+| Laminar pipe: water, 10 mm bore, 100 mm long, Re 20 | 41 696 | 44 | 37 s + 31 s | Pressure gradient past the entrance −0.6347 Pa/m, Hagen–Poiseuille's −0.6413 (−1.0 %); velocity on the axis twice the mean within 2.5 %; flow out equal to flow in to 1.2 × 10⁻⁷; the wall's friction (5.28 µN) balancing the inlet pressure over the bore (5.37 µN) |
+| The same pipe on two processes (MPI) | 41 696 | 45 | 36 s + 24 s | The same gradient (−1.0 %) |
+| Sphere in air at Re 20, the domain five diameters round it and ten behind | 19 351 | 102 | 13 s + 29 s | Drag coefficient 2.738, Clift, Grace and Weber's correlation 2.735 (+0.1 %); side forces 10⁻⁴ of the drag |
+| Turbulent pipe: water at Re 19 924, k-ω SST, three layers along the wall | 75 296 | 100 | 43 s + 180 s | Inlet pressure 812 Pa, 1.5 times Blasius's 531 Pa for a developed flow over L/D = 10: the entrance adds the rest (a check of order only) |
+
+## 8. Testing without OpenFOAM installed
+
+OpenCFD publishes images for amd64 and arm64. Build the test binary, then run it in one:
+
+```sh
+cargo test -p oxyde-flow --test openfoam --no-run      # prints the binary's path
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD/target:$PWD/target:ro" --entrypoint "$PWD/target/debug/deps/openfoam-<hash>" \
+  opencfd/openfoam-run:2606 --test-threads=1 --nocapture
+```
+
+The image (Ubuntu 26.04) runs a binary built on an older Linux. Add
+`-e OXYDE_FLOW_TEST_DIR=<folder> -v <folder>:<folder>` to keep the cases and their logs.

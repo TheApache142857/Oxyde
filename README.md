@@ -185,6 +185,7 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking; the Render tab's path tracer |
 | `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, result plots; depends on no other crate |
+| `oxyde-flow` | Flow simulation through OpenFOAM, run as a separate program: cases written, run and read back; depends on no other crate |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-mcp` | MCP server: an AI assistant models, inspects and compares parts and assemblies |

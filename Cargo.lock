@@ -2560,6 +2560,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxyde-flow"
+version = "0.0.8"
+
+[[package]]
 name = "oxyde-format"
 version = "0.0.8"
 dependencies = [

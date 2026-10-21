@@ -23,12 +23,15 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-format` | `geom`, `model`, `assembly`, `kernel` (STEP structure types only) | `occt`, `app` |
 | `oxyde-render` | `kernel` (mesh types only) | `occt`, `model`, `app` |
 | `oxyde-sim` | — | anything else in the workspace |
+| `oxyde-flow` | — | anything else in the workspace |
 | `oxyde-app` | all of the above | — |
 | `oxyde-cli` | `format`, `model`, `occt`, `kernel`, `render` | `app`, `eframe` |
 | `oxyde-mcp` | `geom`, `sketch`, `kernel`, `occt`, `model`, `assembly`, `format`, `render`, `cli` | `app`, `eframe` |
 | `oxyde-tests` | `model`, `occt`, `cli` (dev only) | — |
 
 `oxyde-sim` (the Simulation tab's mesher and solver) stands alone like `oxyde-geom`: it takes plain triangle meshes with face labels and gives back numbers, so the application turns the kernel's meshes and the persistent names of fixtures and loads into labels, and a better mesher or solver can replace its parts without touching the rest (`docs/SIMULATION.md`).
+
+`oxyde-flow` (the Simulation tab's flow studies) stands alone the same way, on the same kind of labelled triangle meshes. Its solver is OpenFOAM, which is GPL-3.0, so it is never linked: the crate writes an OpenFOAM case (text files), starts OpenFOAM's programs as separate processes in the installation's environment, and reads back the files they write (`docs/CFD.md`).
 
 `oxyde-app`, `oxyde-cli` and `oxyde-mcp` are the only places where a concrete kernel backend is chosen. `oxyde-tests` holds end-to-end tests that drive the model through OCCT, so neither crate has to depend on the other.
 
@@ -266,6 +269,7 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 | **Features II** (done) | Sweep (profile along a path), configurations (ConfigurationManager tab, `model.json` `configurations`), Interference Detection, File › Export menu (STEP, IGES, STL, OBJ, 3MF, PNG), edit in place at any depth |
 | **Render** (started) | Done: the Render tab with a path tracer on the CPU (`oxyde_render::pathtrace`) and on the GPU (`gpu_trace.rs`, a WGSL compute shader, 0.0.6), finishes guessed from materials, glTF export (app and CLI). To do: the Blender add-on, HDRI environments, textures on the GPU, a rasterised preview, looks and render setups in the files (`docs/RENDERING.md`; the owner decides the format changes) |
 | **Simulation** (started) | Done: the Simulation tab in parts and assemblies with any number of studies (static stress, thermal, transient thermal, thermal stress), contacts, Netgen or the in-house lattice mesher, the in-house solvers in `oxyde-sim`, studies and results in `.oxysim` and `.oxyres`, mechanical and thermal properties on materials. To do: probing, a report, mesh controls, frequency and buckling studies, thermal contact resistance, temperature-dependent properties (`docs/SIMULATION.md`) |
+| **Flow** (started) | Decided: OpenFOAM (OpenCFD's line), run as a separate program and offered by the installer; flow studies as a study type of the Simulation tab; cooling studies later. Done: `oxyde-flow`, OpenFOAM cases written from labelled surfaces, run and read back, tested through OpenFOAM v2606 against closed forms. To do: the *Flow* study in the Simulation tab, its files, the installer's offer, cooling studies (`docs/CFD.md`) |
 | **M7** (started) | Done: drawing export (standard views with hidden lines, centre marks, title block; PDF, SVG, DXF at true size; app and CLI). To do: a drawing document (`.oxydrw`), dimensions and annotations, section and detail views, a BOM table |
 
 ## STEP assembly import
