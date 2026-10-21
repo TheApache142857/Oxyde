@@ -41,8 +41,9 @@ pub fn surface(grid: &Grid, density: &[u8], smoothing: usize) -> Shape {
 }
 
 /// [`surface`], meeting the design space's bodies on their faces: where a lattice edge runs
-/// from the material out of a preserve body into empty design space, out of the starting
-/// shape, or into an obstacle, the surface crosses it where that body's surface does (as
+/// from the material out of a preserve body (or a region's body) into empty design space or
+/// a hole, out of the starting shape, or into an obstacle, the surface crosses it where that
+/// body's surface does (as
 /// its triangles have it), not where the densities say, and keeps that point through the
 /// smoothing. Its faces there lie on the bodies' faces (their tessellations', to a fiftieth
 /// of the edge), so *Create Part* makes the part's solid of it alone: no boolean with the
@@ -62,7 +63,9 @@ pub fn exact_surface(
         let triangles: Vec<[V3; 3]> = meshes.flat_map(triangles_of).collect();
         (!triangles.is_empty()).then(|| Bvh::new(triangles))
     };
-    let preserve = tree(&mut space.preserve.iter());
+    // A region's material ends on its body's faces, as a preserve body's on its own: a
+    // lattice edge out of it, inside the body, crosses none.
+    let preserve = tree(&mut space.preserve.iter().chain(&space.region_bodies));
     let start = tree(&mut space.starting_shape.iter());
     let obstacles = tree(&mut space.obstacles.iter().map(|o| &o.surface));
     let n = grid.counts;

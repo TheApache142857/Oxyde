@@ -22,9 +22,10 @@ use oxyde_format::results::{
 };
 use oxyde_format::simulation::{
     Contact as FileContact, ContactDetection, ContactKind as FileContactKind, Fixture,
-    FixtureKind as FileFixtureKind, ForceDirection, Load, LoadKind as FileLoadKind, MeshQuality,
-    MeshSettings, MeshSize, Mesher, ModelKind, PreservedRegion, PullDirection, SimulationFile,
-    StudiedModel, Study as FileStudy, StudyFace, StudyType, SymmetryPlanes,
+    FixtureKind as FileFixtureKind, ForceDirection, GenerativeSettings, Load,
+    LoadKind as FileLoadKind, MeshQuality, MeshSettings, MeshSize, Mesher, ModelKind,
+    PreservedRegion, PullDirection, SimulationFile, StudiedModel, Study as FileStudy, StudyFace,
+    StudyType, SymmetryPlanes,
 };
 use oxyde_format::{AssemblyFile, PartFile};
 use oxyde_sim::{
@@ -214,8 +215,10 @@ pub(crate) fn file_study(study: &Study) -> FileStudy {
     out.topology.one_piece = goal.one_piece;
     out.generative = study.generative.clone();
     out.frequency.modes = study.modes;
-    // A generative study's grid and materials are in its block; it has no contacts.
+    // A generative study's grid, materials and preserved regions are in its block; it has
+    // no contacts.
     if study.study_type == StudyType::Generative {
+        out.generative.preserved = std::mem::take(&mut out.topology.preserved);
         return out;
     }
     if study.gravity && study.study_type.takes_gravity() {
@@ -377,7 +380,13 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
             }),
         }
     }
-    for p in file.topology.preserved.iter().filter(|p| !p.suppressed) {
+    // A topology study's preserved regions, or a generative study's: the study's items.
+    let preserved = file
+        .topology
+        .preserved
+        .iter()
+        .chain(&file.generative.preserved);
+    for p in preserved.filter(|p| !p.suppressed) {
         study.items.push(StudyItem {
             name: p.name.clone(),
             kind: ItemKind::Preserve { depth: p.depth },
@@ -432,7 +441,11 @@ pub(crate) fn study_of(file: &FileStudy) -> Study {
     study.thermal_overrides = file.thermal_materials.clone();
     study.transient = file.transient;
     study.reference_temperature = file.reference_temperature;
-    study.generative = file.generative.clone();
+    // Its preserved regions are items, as a topology study's are.
+    study.generative = GenerativeSettings {
+        preserved: Vec::new(),
+        ..file.generative.clone()
+    };
     study.modes = file.frequency.modes;
     study.recount();
     study

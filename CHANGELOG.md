@@ -81,6 +81,18 @@ release yet; the git history has every detail.
   of its parts: keep the brackets' mounting bosses, stay clear of the motor next to them, and
   the outcome grows between them; *Create Part* inserts the part made where it was grown,
   fixed. In files: bodies named with their component, as faces are (FORMAT.md §8).
+- **A single body, redesigned in a few clicks.** A part that is one body no longer has to be
+  cut into bodies to keep: select faces to keep (its holes, its mounting faces), *Preserve
+  Region*, and give a depth; the material within that depth inside the body is kept, and the
+  body can be the starting shape (to redesign it inside itself) or have no role (to grow
+  around it). Fixtures and loads go on those faces. Holes whose faces are kept, held,
+  loaded or carry a remote mass stay empty, as if a pin were in them, without modelling one.
+  *Margin* now takes a value per axis: 0 along Y keeps the outcome within the part's own
+  height. Before
+  *Generate*, the panel warns of a setup that would disappoint: every body kept (the outcome
+  can only add lumps), most of the design space kept, no material, voxels too coarse for
+  what is kept. In files: `preserved` and a `margin` per axis in the `generative` block
+  (FORMAT.md §8).
 - **Create Part.** The outcome picked becomes a part file of its own: its surface made a
   solid that meets the bodies kept, the starting shape and the bodies to stay clear of on
   their faces (flat faces exactly, round ones as their tessellation does), in seconds even

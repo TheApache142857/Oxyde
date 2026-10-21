@@ -343,8 +343,8 @@ pub enum ItemKind {
     InternalHeat {
         watts: f64,
     },
-    /// A topology study's preserved region: its material stays, on the faces and this deep
-    /// under them, mm.
+    /// A topology or generative study's preserved region: its material stays, on the faces
+    /// and this deep under them, mm.
     Preserve {
         depth: f64,
     },
@@ -419,7 +419,9 @@ impl ItemKind {
     /// Whether a study of `t` takes it.
     pub(crate) fn fits(&self, t: StudyType) -> bool {
         match self {
-            ItemKind::Preserve { .. } => t == StudyType::Topology,
+            ItemKind::Preserve { .. } => {
+                matches!(t, StudyType::Topology | StudyType::Generative)
+            }
             ItemKind::Gravity { .. } | ItemKind::RemoteMass { .. } => t == StudyType::Generative,
             k if k.is_thermal() => t.is_thermal(),
             k if k.is_fixture() => t.takes_fixtures(),
@@ -4052,8 +4054,9 @@ impl OxydeApp {
                                             ui.end_row();
                                         }
                                     });
-                                let total: [f64; 3] = std::array::from_fn(|d| {
-                                    f.modes.iter().map(|m| m.participation[d]).sum::<f64>()
+                                let total = f.modes.iter().fold([0.0; 3], |[x, y, z], m| {
+                                    let [px, py, pz] = m.participation;
+                                    [x + px, y + py, z + pz]
                                 });
                                 ui.label(
                                     egui::RichText::new(format!(
@@ -4642,7 +4645,8 @@ pub(crate) fn item_row(
                             .suffix(" mm"),
                     )
                     .on_hover_text(
-                        "How deep under the faces the material stays; 0 keeps the elements on them",
+                        "How deep under the faces the material stays; 0 keeps only what is on \
+                         them (an element, or a voxel, deep)",
                     )
                     .changed();
             });

@@ -1,9 +1,11 @@
 //! Generative design: shapes grown between bodies to keep and bodies to stay clear of, as
 //! Fusion 360's generative design makes them (`docs/SIMULATION.md` §9).
 //!
-//! - **The design space** ([`Grid`]): the box around the preserve bodies cut into cubic
-//!   voxels, each *preserve* (always material), *obstacle* or *outside* (never material) or
-//!   *design*. Fixtures and loads act on the grid's nodes through the preserve voxels.
+//! - **The design space** ([`Grid`]): the box around the preserve bodies (and the bodies of
+//!   the preserve regions: faces kept to a depth) cut into cubic voxels, each *preserve*
+//!   (always material), *obstacle* or *outside* (never material: in an obstacle, in a hole
+//!   kept clear, out of the starting shape) or *design*. Fixtures and loads act on the
+//!   grid's nodes through the preserve voxels.
 //! - **The elements** are the voxels themselves, eight-node bricks all alike, solved by
 //!   conjugate gradients preconditioned by geometric multigrid, the finest level never
 //!   assembled (`multigrid`): that is what lets the grid be fine.
@@ -159,18 +161,46 @@ pub struct Obstacle {
     pub offset: f64,
 }
 
+/// Faces whose material is kept to a depth inside the body they are on, as a topology
+/// study's preserved region keeps it: the body itself needs no role.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreserveRegion {
+    /// The body the faces are on: an index into [`DesignSpace::region_bodies`].
+    pub body: usize,
+    /// The faces, by label.
+    pub labels: Vec<u32>,
+    /// mm under the faces; the voxels are kept at least a voxel deep.
+    pub depth: f64,
+}
+
 /// Where material may go, from the model's bodies.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DesignSpace {
     /// The bodies kept as they are, their faces labelled: fixtures and loads name them.
     pub preserve: Vec<SurfaceMesh>,
+    /// Faces kept to a depth: fixtures and loads may name them too.
+    pub regions: Vec<PreserveRegion>,
+    /// The bodies the regions are on, their faces labelled as the preserve bodies' are.
+    pub region_bodies: Vec<SurfaceMesh>,
     pub obstacles: Vec<Obstacle>,
     /// A body the material starts in and stays inside; `None` for the box around the
-    /// preserve bodies.
+    /// preserve bodies and the regions' bodies.
     pub starting_shape: Option<SurfaceMesh>,
-    /// mm the box is grown by around the preserve bodies when there is no starting shape;
-    /// `None` for a tenth of its largest side.
-    pub margin: Option<f64>,
+    /// mm the box is grown by along X, Y and Z (on both sides) when there is no starting
+    /// shape; `None` on an axis for a tenth of the box's largest side.
+    pub margin: [Option<f64>; 3],
+}
+
+impl DesignSpace {
+    /// Whether anything is kept: a preserve body or a region with a surface.
+    pub fn keeps_anything(&self) -> bool {
+        self.preserve.iter().any(|s| !s.triangles.is_empty())
+            || self.regions.iter().any(|r| {
+                self.region_bodies
+                    .get(r.body)
+                    .is_some_and(|b| b.labels.iter().any(|l| r.labels.contains(l)))
+            })
+    }
 }
 
 /// Fixtures and loads the outcome carries at once: indices into the study's `fixtures`,
@@ -219,7 +249,8 @@ pub enum Objective {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerativeStudy {
     pub space: DesignSpace,
-    /// On faces of the preserve bodies, by label.
+    /// On faces of the preserve bodies or of the regions, by label. Holes these faces (and
+    /// the regions') wrap around are kept clear ([`Grid`]).
     pub fixtures: Vec<Fixture>,
     pub loads: Vec<Load>,
     /// Accelerations, m/s² (gravity, 9.81 down; a shock of so many g): a load case's sum
@@ -247,6 +278,24 @@ pub struct GenerativeStudy {
 }
 
 impl GenerativeStudy {
+    /// The faces whose holes are kept clear: the regions', the fixtures', the loads' and the
+    /// remote masses' (something sits in them: a pin, a bolt, a bearing), sorted.
+    pub fn hole_faces(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .space
+            .regions
+            .iter()
+            .flat_map(|r| r.labels.iter())
+            .chain(self.fixtures.iter().flat_map(|f| f.labels.iter()))
+            .chain(self.loads.iter().flat_map(|l| l.labels.iter()))
+            .chain(self.remote_masses.iter().flat_map(|r| r.labels.iter()))
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The load cases: [`GenerativeStudy::load_cases`], or one of every fixture and load.
     pub fn cases(&self) -> Vec<LoadCase> {
         if self.load_cases.is_empty() {
@@ -476,7 +525,7 @@ pub struct Outcome {
 /// Why an outcome could not be generated.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GenerativeError {
-    /// No preserve body, or one without a surface.
+    /// Nothing kept: no preserve body or region with a surface.
     NoPreserve,
     /// The voxel size is not a positive length.
     BadVoxelSize,
@@ -490,7 +539,12 @@ pub enum GenerativeError {
         obstacle: usize,
         preserve: usize,
     },
-    /// A fixture or a load is on a face of no preserve body.
+    /// An obstacle reaches well into the material a region keeps (their indices).
+    ObstacleOverRegion {
+        obstacle: usize,
+        region: usize,
+    },
+    /// A fixture or a load is on a face of no preserve body or region.
     FaceNotOnPreserve {
         label: u32,
     },
@@ -541,7 +595,7 @@ impl std::fmt::Display for GenerativeError {
         match self {
             GenerativeError::NoPreserve => write!(
                 f,
-                "the study has no preserve body: give one or more bodies the Preserve role"
+                "the study keeps nothing: give a body the Preserve role, or make a Preserve Region of faces"
             ),
             GenerativeError::BadVoxelSize => {
                 write!(f, "the resolution does not give a usable voxel size")
@@ -560,9 +614,15 @@ impl std::fmt::Display for GenerativeError {
                 obstacle + 1,
                 preserve + 1
             ),
+            GenerativeError::ObstacleOverRegion { obstacle, region } => write!(
+                f,
+                "obstacle {} reaches into preserve region {}: material cannot be both kept and kept out",
+                obstacle + 1,
+                region + 1
+            ),
             GenerativeError::FaceNotOnPreserve { .. } => write!(
                 f,
-                "a fixture or a load is on a face of a body that is not a preserve body: put them on preserve bodies"
+                "a fixture or a load is on a face that is not kept: put them on preserve bodies or preserve regions"
             ),
             GenerativeError::NotHeld => write!(
                 f,

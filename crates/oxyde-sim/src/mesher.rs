@@ -207,11 +207,11 @@ pub(crate) struct Surfaces {
 }
 
 impl Surfaces {
-    pub(crate) fn new(solids: &[SurfaceMesh]) -> Surfaces {
+    pub(crate) fn new<'a>(solids: impl IntoIterator<Item = &'a SurfaceMesh>) -> Surfaces {
         let mut triangles = Vec::new();
         let mut solid = Vec::new();
         let mut label = Vec::new();
-        for (s, mesh) in solids.iter().enumerate() {
+        for (s, mesh) in solids.into_iter().enumerate() {
             for (k, t) in mesh.triangles.iter().enumerate() {
                 let p = |i: u32| mesh.positions.get(i as usize).copied();
                 let (Some(a), Some(b), Some(c)) = (p(t[0]), p(t[1]), p(t[2])) else {
@@ -232,6 +232,12 @@ impl Surfaces {
             solid,
             label,
         }
+    }
+
+    /// The solid and the label of the hierarchy's triangle `triangle`.
+    pub(crate) fn solid_and_label(&self, triangle: u32) -> Option<(u32, u32)> {
+        let t = triangle as usize;
+        Some((*self.solid.get(t)?, *self.label.get(t)?))
     }
 
     /// The solids containing each point along a line, by the parity of crossings: per

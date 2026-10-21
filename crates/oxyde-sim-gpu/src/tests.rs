@@ -67,7 +67,8 @@ fn bracket(voxel_size: f64, iterations: usize) -> GenerativeStudy {
             ],
             obstacles: Vec::new(),
             starting_shape: None,
-            margin: Some(0.0),
+            margin: [Some(0.0); 3],
+            ..DesignSpace::default()
         },
         fixtures: vec![Fixture {
             kind: FixtureKind::Fixed,

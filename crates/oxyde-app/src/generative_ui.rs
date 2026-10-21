@@ -37,9 +37,9 @@ use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical,
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::generative::{
     Backend, CheckError, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError,
-    GenerativeStudy, Grid, MAX_VOXELS, Method, Objective, Obstacle, PartCheck, RemoteMass, Sides,
-    Voxel, check_part, decimate_holding, exact_surface, generate_on, solid_pieces, surface,
-    voxel_size,
+    GenerativeStudy, Grid, MAX_VOXELS, Method, Objective, Obstacle, PartCheck, PreserveRegion,
+    RemoteMass, Sides, Voxel, check_part, decimate_holding, exact_surface, generate_on,
+    solid_pieces, surface, voxel_size,
 };
 use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
 
@@ -169,6 +169,18 @@ fn roles_hash(g: &GenerativeSettings) -> u64 {
         .collect::<Vec<_>>()
         .hash(&mut h);
     g.starting_shape.hash(&mut h);
+    h.finish()
+}
+
+/// [`roles_hash`] and the faces of the preserve regions, painted as preserve bodies are.
+fn colours_hash(study: &Study) -> u64 {
+    let mut h = DefaultHasher::new();
+    roles_hash(&study.generative).hash(&mut h);
+    for (_, _, faces) in preserve_items(study) {
+        for f in faces {
+            (&f.occurrence, &f.face).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -339,25 +351,37 @@ pub(crate) fn outcome_plan(g: &GenerativeSettings, part: Option<&Material>) -> V
 
 // ---- The engine's study --------------------------------------------------------------------
 
-/// The design space of `g` on `surfaces`, and the preserve bodies' indices into them.
-fn design_space(
-    g: &GenerativeSettings,
-    surfaces: &Surfaces,
-) -> Result<(DesignSpace, Vec<usize>), String> {
+/// The study's preserve regions (Preserve Region items, as topology studies have them).
+pub(crate) fn preserve_items(study: &Study) -> impl Iterator<Item = (&str, f64, &[SimFace])> {
+    study.items.iter().filter_map(|i| match i.kind {
+        ItemKind::Preserve { depth } => Some((i.name.as_str(), depth, i.faces.as_slice())),
+        _ => None,
+    })
+}
+
+/// A study's design space on `surfaces`, with the preserve bodies' indices into them and
+/// the faces the regions keep, by label.
+struct Space {
+    space: DesignSpace,
+    preserve: Vec<usize>,
+    kept: Vec<u32>,
+}
+
+/// The design space of `study` on `surfaces`: its bodies by role, and each preserve region
+/// on the bodies its faces are on.
+fn design_space(study: &Study, surfaces: &Surfaces) -> Result<Space, String> {
+    let g = &study.generative;
     let body = |id: &StudyBody| -> Result<usize, String> {
         solid_of(surfaces, id)
             .map(|(i, _)| i)
             .ok_or_else(|| format!("Body {id} is no longer in the model: give its role again"))
     };
-    if g.preserve.is_empty() {
-        return Err(
-            "Nothing to keep: select a face of each body to keep, then Preserve".to_owned(),
-        );
-    }
     let preserve: Vec<usize> = g.preserve.iter().map(body).collect::<Result<_, _>>()?;
     let mut obstacles = Vec::new();
+    let mut obstacle_bodies = Vec::new();
     for o in &g.obstacles {
         let i = body(&o.body)?;
+        obstacle_bodies.push(i);
         if let Some(s) = surfaces.solids.get(i) {
             obstacles.push(Obstacle {
                 surface: s.clone(),
@@ -369,8 +393,58 @@ fn design_space(
         Some(id) => surfaces.solids.get(body(id)?).cloned(),
         None => None,
     };
+    // Each region on each body its faces are on; the bodies once each, in order.
+    let mut carriers: Vec<usize> = Vec::new();
+    let mut regions = Vec::new();
+    let mut kept = Vec::new();
+    for (name, depth, faces) in preserve_items(study) {
+        let labels = surfaces.labels(faces);
+        if labels.is_empty() {
+            return Err(format!(
+                "{name} is on no face of the part any more: select its faces again"
+            ));
+        }
+        let mut by_body: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for l in labels {
+            if let Some(&b) = surfaces.face_body.get(l as usize) {
+                by_body.entry(b as usize).or_default().push(l);
+            }
+        }
+        for (b, labels) in by_body {
+            if obstacle_bodies.contains(&b) {
+                return Err(format!(
+                    "{name} is on an obstacle: material is kept out of it, so none can be kept there"
+                ));
+            }
+            let at = match carriers.iter().position(|&c| c == b) {
+                Some(at) => at,
+                None => {
+                    carriers.push(b);
+                    carriers.len() - 1
+                }
+            };
+            kept.extend(&labels);
+            regions.push(PreserveRegion {
+                body: at,
+                labels,
+                depth: depth.max(0.0),
+            });
+        }
+    }
+    if preserve.is_empty() && regions.is_empty() {
+        return Err(
+            "Nothing to keep: select a face of each body to keep, then Preserve; or the \
+                    faces to keep (holes, mounting faces), then Preserve Region"
+                .to_owned(),
+        );
+    }
     let space = DesignSpace {
         preserve: preserve
+            .iter()
+            .filter_map(|&i| surfaces.solids.get(i).cloned())
+            .collect(),
+        regions,
+        region_bodies: carriers
             .iter()
             .filter_map(|&i| surfaces.solids.get(i).cloned())
             .collect(),
@@ -378,14 +452,23 @@ fn design_space(
         starting_shape,
         margin: g.margin,
     };
-    Ok((space, preserve))
+    Ok(Space {
+        space,
+        preserve,
+        kept,
+    })
 }
 
 /// The engine's study for `study` on `surfaces` (the part's, made for the document as it
-/// is), with the faces the fixtures and loads are on checked to be preserve bodies'.
+/// is), with the faces the fixtures and loads are on checked to be kept: preserve bodies'
+/// or preserve regions'.
 pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<GenerativeStudy, String> {
     let g = &study.generative;
-    let (space, preserve) = design_space(g, surfaces)?;
+    let Space {
+        space,
+        preserve,
+        kept,
+    } = design_space(study, surfaces)?;
 
     let mut fixtures = Vec::new();
     let mut loads = Vec::new();
@@ -396,11 +479,7 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
     let mut load_names: Vec<&str> = Vec::new();
     let mut gravity_names: Vec<&str> = Vec::new();
     let mut remote_names: Vec<&str> = Vec::new();
-    for item in study
-        .items
-        .iter()
-        .filter(|i| i.kind.fits(StudyType::Generative))
-    {
+    for item in study.items.iter().filter(|i| is_condition(&i.kind)) {
         // Gravity weighs the whole design: no faces.
         if let ItemKind::Gravity { acceleration } = item.kind {
             gravity.push(acceleration);
@@ -415,14 +494,16 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
             ));
         }
         let on_preserve = labels.iter().all(|&l| {
-            surfaces
-                .face_body
-                .get(l as usize)
-                .is_some_and(|b| preserve.contains(&(*b as usize)))
+            kept.contains(&l)
+                || surfaces
+                    .face_body
+                    .get(l as usize)
+                    .is_some_and(|b| preserve.contains(&(*b as usize)))
         });
         if !on_preserve {
             return Err(format!(
-                "{} is on a body that is not kept: fixtures and loads go on preserve bodies",
+                "{} is on a face that is not kept: put fixtures and loads on preserve bodies, \
+                 or make a Preserve Region of their faces first",
                 item.name
             ));
         }
@@ -537,6 +618,11 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
     })
 }
 
+/// Whether an item is a generative study's fixture or load (not a preserve region).
+fn is_condition(kind: &ItemKind) -> bool {
+    kind.fits(StudyType::Generative) && !matches!(kind, ItemKind::Preserve { .. })
+}
+
 fn engine_symmetry(s: Option<SymmetryPlanes>) -> Option<Symmetry> {
     s.filter(|s| s.planes.contains(&true)).map(|s| Symmetry {
         point: s.point,
@@ -549,7 +635,7 @@ fn engine_symmetry(s: Option<SymmetryPlanes>) -> Option<Symmetry> {
 /// part always weighs, and carries what is fixed to it), another load the last case (the
 /// one being set up).
 pub(crate) fn join_load_cases(study: &mut Study, item: usize) {
-    let Some(item) = study.items.get(item) else {
+    let Some(item) = study.items.get(item).filter(|i| is_condition(&i.kind)) else {
         return;
     };
     let name = item.name.clone();
@@ -582,21 +668,26 @@ fn faces_centre(surfaces: &Surfaces, faces: &[SimFace]) -> Option<[f64; 3]> {
                 continue;
             }
             let p = |i: u32| s.positions.get(i as usize).copied();
-            let (Some(a), Some(b), Some(c)) = (p(t[0]), p(t[1]), p(t[2])) else {
+            let (Some([ax, ay, az]), Some([bx, by, bz]), Some([cx, cy, cz])) =
+                (p(t[0]), p(t[1]), p(t[2]))
+            else {
                 continue;
             };
-            let e: [[f64; 3]; 2] = [
-                std::array::from_fn(|k| b[k] - a[k]),
-                std::array::from_fn(|k| c[k] - a[k]),
-            ];
+            let u = [bx - ax, by - ay, bz - az];
+            let v = [cx - ax, cy - ay, cz - az];
             let n = [
-                e[0][1] * e[1][2] - e[0][2] * e[1][1],
-                e[0][2] * e[1][0] - e[0][0] * e[1][2],
-                e[0][0] * e[1][1] - e[0][1] * e[1][0],
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
             ];
-            let w = 0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            for k in 0..3 {
-                sum[k] += w * (a[k] + b[k] + c[k]) / 3.0;
+            let w = 0.5 * n.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let centre = [
+                (ax + bx + cx) / 3.0,
+                (ay + by + cy) / 3.0,
+                (az + bz + cz) / 3.0,
+            ];
+            for (total, x) in sum.iter_mut().zip(centre) {
+                *total += w * x;
             }
             area += w;
         }
@@ -612,41 +703,192 @@ pub(crate) fn leave_load_cases(study: &mut Study, name: &str) {
     }
 }
 
-/// mm and voxels: the size the study's resolution gives the voxels, and about how many
-/// the design space takes, from the preserve bodies and the starting shape alone.
-pub(crate) fn voxel_estimate(study: &Study, surfaces: &Surfaces) -> Option<(f64, usize)> {
-    let g = &study.generative;
-    let solid = |id: &StudyBody| solid_of(surfaces, id).map(|(_, s)| s.clone());
-    let space = DesignSpace {
-        preserve: g.preserve.iter().filter_map(solid).collect(),
-        obstacles: Vec::new(),
-        starting_shape: g.starting_shape.as_ref().and_then(solid),
-        margin: g.margin,
-    };
-    let symmetry = engine_symmetry(g.symmetry);
+/// mm: the voxels' edge the study's resolution gives its design space.
+fn study_voxel_size(g: &GenerativeSettings, space: &DesignSpace) -> Option<f64> {
     let h = match g.resolution {
         MeshSize::ElementSize(h) => h,
-        MeshSize::Automatic { density } => voxel_size(&space, symmetry.as_ref(), density)?,
+        MeshSize::Automatic { density } => {
+            voxel_size(space, engine_symmetry(g.symmetry).as_ref(), density)?
+        }
     };
+    (h.is_finite() && h > 0.0).then_some(h)
+}
+
+/// mm and voxels: the size the study's resolution gives the voxels, and about how many
+/// the design space takes, from the box around its bodies.
+pub(crate) fn voxel_estimate(study: &Study, surfaces: &Surfaces) -> Option<(f64, usize)> {
+    let g = &study.generative;
+    let space = design_space(study, surfaces).ok()?.space;
+    let h = study_voxel_size(g, &space)?;
+    let symmetry = engine_symmetry(g.symmetry);
     let (lo, hi) = oxyde_sim::generative::design_box(&space, symmetry.as_ref())?;
     let count = lo
         .iter()
         .zip(&hi)
         .map(|(l, u)| ((u - l) / h).ceil().max(1.0))
         .product::<f64>();
-    (h.is_finite() && h > 0.0 && count.is_finite()).then_some((h, count as usize))
+    count.is_finite().then_some((h, count as usize))
 }
 
-/// The preserve bodies' mass in `material`, kg: the least an outcome can weigh.
-pub(crate) fn preserve_mass(study: &Study, surfaces: &Surfaces, density: f64) -> f64 {
-    let volume: f64 = study
-        .generative
-        .preserve
-        .iter()
-        .filter_map(|id| solid_of(surfaces, id).map(|(_, s)| s))
-        .map(|s| s.volume().abs())
-        .sum();
+/// How a study's design space is shared out, laid on a grid coarse enough to take a
+/// moment: for the panel's warnings, and the least an outcome weighs once regions keep
+/// parts of bodies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Census {
+    /// mm: the voxels' edge, the study's or coarser.
+    pub(crate) voxel: f64,
+    /// Voxels always material.
+    pub(crate) preserve: usize,
+    /// Voxels material may go in.
+    pub(crate) design: usize,
+}
+
+/// The most voxels a census lays: some hundredths of a second.
+const CENSUS_VOXELS: f64 = 50_000.0;
+
+/// The study's design space laid on its voxels, or coarser ones when those would be more
+/// than [`CENSUS_VOXELS`]; `None` until it has something kept.
+pub(crate) fn census(study: &Study, surfaces: &Surfaces) -> Option<Census> {
+    let g = &study.generative;
+    let Space { space, kept, .. } = design_space(study, surfaces).ok()?;
+    let symmetry = engine_symmetry(g.symmetry);
+    let (lo, hi) = oxyde_sim::generative::design_box(&space, symmetry.as_ref())?;
+    let volume: f64 = lo.iter().zip(&hi).map(|(l, u)| (u - l).max(1e-9)).product();
+    let h = study_voxel_size(g, &space)?.max((volume / CENSUS_VOXELS).cbrt());
+    // The holes kept clear, as the generation keeps them: in the regions' faces, the
+    // fixtures' and the loads'.
+    let mut holes = kept;
+    for item in study.items.iter().filter(|i| is_condition(&i.kind)) {
+        holes.extend(surfaces.labels(&item.faces));
+    }
+    holes.sort_unstable();
+    holes.dedup();
+    let never = AtomicBool::new(false);
+    let grid = Grid::lay(&space, symmetry.as_ref(), h, &holes, 0, &never).ok()?;
+    let count = |k: Voxel| grid.kinds.iter().filter(|v| **v == k).count();
+    Some(Census {
+        voxel: grid.size,
+        preserve: count(Voxel::Preserve),
+        design: count(Voxel::Design),
+    })
+}
+
+/// The kept material's mass in a material of `density` (kg/m³), kg: the least an outcome
+/// can weigh. The preserve bodies' exactly; with preserve regions, the census's preserve
+/// voxels, which measure them as the voxels do.
+pub(crate) fn preserve_mass(
+    study: &Study,
+    surfaces: &Surfaces,
+    census: Option<&Census>,
+    density: f64,
+) -> f64 {
+    let volume: f64 = match census {
+        Some(c) if preserve_items(study).next().is_some() => c.preserve as f64 * c.voxel.powi(3),
+        _ => study
+            .generative
+            .preserve
+            .iter()
+            .filter_map(|id| solid_of(surfaces, id).map(|(_, s)| s))
+            .map(|s| s.volume().abs())
+            .sum(),
+    };
     volume * 1e-9 * density
+}
+
+/// A surface's area, mm².
+fn area_of(s: &SurfaceMesh) -> f64 {
+    let p = |i: u32| s.positions.get(i as usize).copied();
+    s.triangles
+        .iter()
+        .filter_map(|t| {
+            let ([ax, ay, az], [bx, by, bz], [cx, cy, cz]) = (p(t[0])?, p(t[1])?, p(t[2])?);
+            let u = [bx - ax, by - ay, bz - az];
+            let v = [cx - ax, cy - ay, cz - az];
+            let n = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            Some(0.5 * n.iter().map(|x| x * x).sum::<f64>().sqrt())
+        })
+        .sum()
+}
+
+/// What makes a study's outcomes disappoint, said before Generate, one line each: every
+/// body kept (nothing to design), the kept material most of the design space, no material
+/// to make them of, voxels too coarse for what is kept. `bodies` are the model's, with
+/// their names; `materials` the study's ([`study_materials`]); `estimate` the voxels'
+/// size and number ([`voxel_estimate`]).
+pub(crate) fn setup_warnings(
+    study: &Study,
+    surfaces: &Surfaces,
+    bodies: &[(StudyBody, String)],
+    materials: &[(String, Result<Elastic, String>, [u8; 3])],
+    estimate: Option<(f64, usize)>,
+    census: Option<&Census>,
+) -> Vec<String> {
+    let g = &study.generative;
+    let mut out = Vec::new();
+    let all_kept = !bodies.is_empty()
+        && g.starting_shape.is_none()
+        && bodies.iter().all(|(b, _)| g.preserve.contains(b));
+    if all_kept {
+        out.push(
+            "Every body is kept as it is: the outcomes can only add material around them. \
+             To redesign a part, give it the Starting shape role (or none), and keep its holes \
+             and mounting faces with Preserve Region instead"
+                .to_owned(),
+        );
+    } else if let Some(c) = census {
+        let share = c.preserve as f64 / (c.preserve + c.design).max(1) as f64;
+        if share >= 0.5 {
+            out.push(format!(
+                "What is kept is {:.0} % of the design space: little is left to design. Keep \
+                 less (shallower regions, fewer bodies), or give the material more room",
+                100.0 * share
+            ));
+        }
+    }
+    if materials.is_empty() {
+        out.push("No material: add one under Materials, or apply one to the part".to_owned());
+    }
+    for (_, elastic, _) in materials {
+        if let Err(why) = elastic {
+            out.push(format!("{why}: no outcome can be made of it"));
+        }
+    }
+    if let Some((h, _)) = estimate {
+        let coarse = |what: String| {
+            format!(
+                "The voxels ({} mm) are coarse for {what}: fewer than two across it. Raise \
+                 the resolution (Resolution)",
+                format_number_short(h)
+            )
+        };
+        for (name, depth, _) in preserve_items(study) {
+            if depth > 0.0 && depth < 2.0 * h {
+                out.push(coarse(format!("{name} ({depth} mm deep)")));
+            }
+        }
+        // A body's thickness, as a plate's: twice its volume over its area.
+        for id in &g.preserve {
+            let Some((_, s)) = solid_of(surfaces, id) else {
+                continue;
+            };
+            let thickness = 2.0 * s.volume().abs() / area_of(s).max(1e-12);
+            if thickness < h {
+                let name = bodies
+                    .iter()
+                    .find(|(b, _)| b == id)
+                    .map_or_else(|| id.to_string(), |(_, n)| n.clone());
+                out.push(coarse(format!(
+                    "{name} (about {} mm thick)",
+                    format_number_short(thickness)
+                )));
+            }
+        }
+    }
+    out
 }
 
 // ---- Outcomes ------------------------------------------------------------------------------
@@ -1202,6 +1444,10 @@ fn capitalized(text: &str) -> String {
 /// What an outcome's surface is made from: the generation, the outcome, the iteration.
 type SurfaceKey = (u64, u32, Option<usize>);
 
+/// What the panel shows of a study's setup: the voxels' size and number
+/// ([`voxel_estimate`]) and the [`census`].
+type Setup = (Option<(f64, usize)>, Option<Census>);
+
 /// What is shown in the viewport for an outcome: anything else, and it is drawn again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShownKey {
@@ -1234,8 +1480,8 @@ pub(crate) struct GenView {
     surface: Option<(SurfaceKey, Shape)>,
     /// The study whose saved outcomes were looked for, so they are looked for once.
     looked_for: Option<String>,
-    /// The voxels the resolution gives, by what it was worked out from.
-    estimate: Option<(u64, Option<(f64, usize)>)>,
+    /// The voxels the resolution gives and the census, by what they were worked out from.
+    setup: Option<(u64, Setup)>,
     /// The part file *Create Part* made last, to open.
     pub(crate) created: Option<PathBuf>,
     /// What the check of the part being made takes, set aside while *Create Part* makes it.
@@ -1317,7 +1563,7 @@ impl OxydeApp {
         // otherwise. Not while an outcome is drawn: its scene would be replaced.
         let roles = self
             .generative_active()
-            .then(|| roles_hash(&self.simulation.study.generative));
+            .then(|| colours_hash(&self.simulation.study));
         if self.simulation.generative.shown.is_none()
             && roles != self.simulation.generative.roles_shown
         {
@@ -1329,8 +1575,9 @@ impl OxydeApp {
         self.load_saved_outcomes();
     }
 
-    /// The bodies' faces in the colours of their roles, while the tab is set up: called
-    /// with the materials of the model's faces (empty for the default everywhere).
+    /// The bodies' faces in the colours of their roles, and the faces of the preserve
+    /// regions in the preserve bodies' green, while the tab is set up: called with the
+    /// materials of the model's faces (empty for the default everywhere).
     pub(crate) fn tint_generative_roles(&self, materials: &mut Vec<RenderMaterial>) {
         if !self.generative_active() {
             return;
@@ -1344,6 +1591,7 @@ impl OxydeApp {
                 };
             }
         };
+        let kept = || preserve_items(&self.simulation.study).flat_map(|(_, _, faces)| faces);
         match &self.asm {
             None => {
                 let Some(body) = self.shown_body() else {
@@ -1359,6 +1607,15 @@ impl OxydeApp {
                         .map_or(Role::None, |s| role_of(g, &StudyBody::part(s.id)));
                     paint(m, role);
                 }
+                for f in kept().filter(|f| f.occurrence.is_none()) {
+                    if let Some(m) = body
+                        .naming
+                        .find_face(&f.face)
+                        .and_then(|i| materials.get_mut(i as usize))
+                    {
+                        paint(m, Role::Preserve);
+                    }
+                }
             }
             Some(doc) => {
                 // Each part occurrence's faces, by the scene's ranges.
@@ -1373,6 +1630,15 @@ impl OxydeApp {
                         });
                         if let Some(m) = materials.get_mut(index as usize) {
                             paint(m, role);
+                        }
+                    }
+                    for f in kept().filter(|f| f.occurrence.as_ref() == Some(&r.owner)) {
+                        if let Some(m) = body
+                            .naming
+                            .find_face(&f.face)
+                            .and_then(|i| materials.get_mut((r.faces.start + i) as usize))
+                        {
+                            paint(m, Role::Preserve);
                         }
                     }
                 }
@@ -1797,14 +2063,30 @@ impl OxydeApp {
         self.simulation.generative.shown = Some(key);
     }
 
-    /// [`voxel_estimate`], worked out again only when what it depends on changed.
-    fn cached_voxel_estimate(&mut self) -> Option<(f64, usize)> {
-        let surfaces = self.simulation.surfaces.as_ref()?;
-        let g = &self.simulation.study.generative;
+    /// [`voxel_estimate`] and [`census`], worked out again only when what they depend on
+    /// changed: the bodies, their roles, the regions, the faces held and loaded (whose
+    /// holes are kept clear), the margin, the resolution and the symmetry.
+    fn cached_setup(&mut self) -> Setup {
+        let Some(surfaces) = self.simulation.surfaces.as_ref() else {
+            return (None, None);
+        };
+        let study = &self.simulation.study;
+        let g = &study.generative;
         let mut h = DefaultHasher::new();
         surfaces.revision.hash(&mut h);
         roles_hash(g).hash(&mut h);
-        g.margin.map(f64::to_bits).hash(&mut h);
+        for item in study
+            .items
+            .iter()
+            .filter(|i| i.kind.fits(StudyType::Generative))
+        {
+            let depth = match item.kind {
+                ItemKind::Preserve { depth } => Some(depth.to_bits()),
+                _ => None,
+            };
+            (depth, surfaces.labels(&item.faces)).hash(&mut h);
+        }
+        g.margin.map(|m| m.map(f64::to_bits)).hash(&mut h);
         match g.resolution {
             MeshSize::Automatic { density } => (0u8, density.to_bits()),
             MeshSize::ElementSize(size) => (1u8, size.to_bits()),
@@ -1814,14 +2096,14 @@ impl OxydeApp {
             .map(|s| (s.planes, s.point.map(f64::to_bits)))
             .hash(&mut h);
         let key = h.finish();
-        if let Some((k, e)) = self.simulation.generative.estimate
+        if let Some((k, setup)) = self.simulation.generative.setup
             && k == key
         {
-            return e;
+            return setup;
         }
-        let e = voxel_estimate(&self.simulation.study, surfaces);
-        self.simulation.generative.estimate = Some((key, e));
-        e
+        let setup = (voxel_estimate(study, surfaces), census(study, surfaces));
+        self.simulation.generative.setup = Some((key, setup));
+        setup
     }
 
     /// The colour of the study material `name`: its appearance's.
@@ -1945,7 +2227,7 @@ impl OxydeApp {
             .ensure_surfaces()
             .ok()
             .and(self.simulation.surfaces.as_ref());
-        let space = surfaces.and_then(|s| design_space(&self.simulation.study.generative, s).ok());
+        let space = surfaces.and_then(|s| design_space(&self.simulation.study, s).ok());
         // The study as the check of the part takes it.
         let engine = match surfaces {
             Some(s) => engine_study(&self.simulation.study, s),
@@ -1965,7 +2247,7 @@ impl OxydeApp {
         // The densities shown: the iteration picked on the slider, else the last.
         let density = densities(o, view.snapshot);
         let (shape, held) = match &space {
-            Some((space, _)) => exact_surface(&generated.grid, density, SMOOTHING, space),
+            Some(s) => exact_surface(&generated.grid, density, SMOOTHING, &s.space),
             None => (surface(&generated.grid, density, SMOOTHING), Vec::new()),
         };
         if shape.triangles.is_empty() {
@@ -2251,7 +2533,7 @@ impl OxydeApp {
         ui.add_space(2.0);
         let roles = [
             (
-                Icon::Preserve,
+                Icon::PreserveBody,
                 "Preserve",
                 Role::Preserve,
                 "Keep the bodies of the selected faces as they are: the outcomes join them",
@@ -2279,6 +2561,18 @@ impl OxydeApp {
             if response.clicked() {
                 self.assign_role(role);
             }
+        }
+        let hint = "Keep the material under the selected faces, as deep inside their body as set \
+                    in the panel: around a hole (which stays clear), under a mounting face. The \
+                    body needs no role: make it the starting shape to redesign it inside itself";
+        let response = command_button(ui, Icon::Preserve, "Preserve Region", enabled, false);
+        let response = if has_faces {
+            response.on_hover_text(hint)
+        } else {
+            response.on_hover_text(format!("{hint}\n(select faces first)"))
+        };
+        if response.clicked() {
+            self.add_study_item(ItemKind::Preserve { depth: 0.0 });
         }
         ui.add_space(2.0);
         ui.separator();
@@ -2476,8 +2770,9 @@ impl OxydeApp {
             .unwrap_or_default();
         let library: Vec<Material> = self.materials.materials().to_vec();
         let part_material = self.doc.part.material().cloned();
-        let estimate = self.cached_voxel_estimate();
+        let (estimate, census) = self.cached_setup();
         let materials = study_materials(&self.simulation.study.generative, part_material.as_ref());
+        let regions = preserve_items(&self.simulation.study).next().is_some();
         let preserve_masses: Vec<(String, f64)> = match self.simulation.surfaces.as_ref() {
             Some(s) => materials
                 .iter()
@@ -2485,10 +2780,21 @@ impl OxydeApp {
                     let e = e.as_ref().ok()?;
                     Some((
                         name.clone(),
-                        preserve_mass(&self.simulation.study, s, e.density),
+                        preserve_mass(&self.simulation.study, s, census.as_ref(), e.density),
                     ))
                 })
                 .collect(),
+            None => Vec::new(),
+        };
+        let warnings = match self.simulation.surfaces.as_ref() {
+            Some(s) => setup_warnings(
+                &self.simulation.study,
+                s,
+                &bodies,
+                &materials,
+                estimate,
+                census.as_ref(),
+            ),
             None => Vec::new(),
         };
         let running = self.generative_running();
@@ -2598,6 +2904,16 @@ impl OxydeApp {
                         .color(egui::Color32::from_rgb(210, 60, 60)),
                 );
             }
+            // Before Generate: what would make the outcomes disappoint.
+            if !running {
+                for w in &warnings {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {w}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(205, 135, 30)),
+                    );
+                }
+            }
             egui::ScrollArea::vertical()
                 .id_salt("generative_panel")
                 .max_height(max_height)
@@ -2609,8 +2925,14 @@ impl OxydeApp {
                         egui::CollapsingHeader::new("Design space")
                             .default_open(true)
                             .show(ui, |ui| {
-                                if design_space_rows(ui, &mut study.generative, &bodies) {
+                                let regions = preserve_items(study).count();
+                                if design_space_rows(ui, &mut study.generative, &bodies, regions) {
                                     action.get_or_insert(GenAction::Edited);
+                                }
+                                for (i, item) in study.items.iter_mut().enumerate() {
+                                    if matches!(item.kind, ItemKind::Preserve { .. }) {
+                                        item_row(ui, i, item, selected, &mut item_action);
+                                    }
                                 }
                             });
                         egui::CollapsingHeader::new("Design conditions")
@@ -2618,7 +2940,7 @@ impl OxydeApp {
                             .show(ui, |ui| {
                                 let mut any = false;
                                 for (i, item) in study.items.iter_mut().enumerate() {
-                                    if !item.kind.fits(StudyType::Generative) {
+                                    if !is_condition(&item.kind) {
                                         continue;
                                     }
                                     any = true;
@@ -2627,9 +2949,9 @@ impl OxydeApp {
                                 if !any {
                                     ui.label(
                                         egui::RichText::new(
-                                            "Select faces of a preserve body, then Fixed \
-                                             Geometry or Roller/Slider to hold it, Force or \
-                                             Pressure to load it; Gravity weighs it, and \
+                                            "Select faces of a preserve body or region, then \
+                                             Fixed Geometry or Roller/Slider to hold it, Force \
+                                             or Pressure to load it; Gravity weighs it, and \
                                              Remote Mass hangs a component on it",
                                         )
                                         .small()
@@ -2650,7 +2972,12 @@ impl OxydeApp {
                         egui::CollapsingHeader::new("Objectives and limits")
                             .default_open(true)
                             .show(ui, |ui| {
-                                if objective_rows(ui, &mut study.generative, &preserve_masses) {
+                                if objective_rows(
+                                    ui,
+                                    &mut study.generative,
+                                    &preserve_masses,
+                                    regions,
+                                ) {
                                     action.get_or_insert(GenAction::Edited);
                                 }
                             });
@@ -2892,11 +3219,13 @@ fn weak(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).small().weak());
 }
 
-/// The bodies with their roles, the obstacles' offsets and the margin.
+/// The bodies with their roles, the obstacles' offsets and the margin; `regions` the
+/// study's preserve regions, listed after.
 fn design_space_rows(
     ui: &mut egui::Ui,
     g: &mut GenerativeSettings,
     bodies: &[(StudyBody, String)],
+    regions: usize,
 ) -> bool {
     let mut changed = false;
     if bodies.is_empty() {
@@ -2943,35 +3272,45 @@ fn design_space_rows(
             }
         });
     }
-    if g.preserve.is_empty() {
+    if g.preserve.is_empty() && regions == 0 {
         weak(
             ui,
-            "Select a face of each body to keep (where the part is held and loaded), then Preserve",
+            "Keep where the part is held and loaded: select a face of each body to keep, then \
+             Preserve; or, to redesign a body, the faces to keep (its holes, its mounting \
+             faces), then Preserve Region",
         );
     }
     if g.starting_shape.is_none() {
-        ui.horizontal(|ui| {
-            let mut custom = g.margin.is_some();
-            if ui
-                .checkbox(&mut custom, "Margin")
-                .on_hover_text(
-                    "How far the material may go beyond the preserve bodies on every side; \
-                     a tenth of their size when off",
-                )
-                .changed()
-            {
-                g.margin = custom.then_some(10.0);
-                changed = true;
-            }
-            if let Some(m) = g.margin.as_mut() {
-                changed |= ui
-                    .add(
-                        egui::DragValue::new(m)
-                            .range(0.0..=10_000.0)
-                            .speed(0.5)
-                            .suffix(" mm"),
-                    )
-                    .changed();
+        // Each axis its own room: 0 along one keeps the outcome within the bodies there,
+        // a part's own thickness.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Margin").on_hover_text(
+                "How far the material may go beyond the bodies kept, both ways along each \
+                 axis; a tenth of their size where off. 0 along an axis keeps the outcome \
+                 within the bodies along it (a part's own thickness)",
+            );
+            for (margin, name) in g.margin.iter_mut().zip(["X", "Y", "Z"]) {
+                let mut set = margin.is_some();
+                if ui
+                    .checkbox(&mut set, name)
+                    .on_hover_text(format!(
+                        "The room along {name}, both ways; a tenth of the bodies' size when off"
+                    ))
+                    .changed()
+                {
+                    *margin = set.then_some(0.0);
+                    changed = true;
+                }
+                if let Some(m) = margin.as_mut() {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(m)
+                                .range(0.0..=10_000.0)
+                                .speed(0.5)
+                                .suffix(" mm"),
+                        )
+                        .changed();
+                }
             }
         });
     }
@@ -2982,7 +3321,7 @@ fn design_space_rows(
 fn item_names(items: &[crate::simulation_ui::StudyItem]) -> (Vec<String>, Vec<String>) {
     let mut fixtures = Vec::new();
     let mut loads = Vec::new();
-    for i in items.iter().filter(|i| i.kind.fits(StudyType::Generative)) {
+    for i in items.iter().filter(|i| is_condition(&i.kind)) {
         if matches!(i.kind, ItemKind::Fixed | ItemKind::Roller) {
             fixtures.push(i.name.clone());
         } else {
@@ -3099,11 +3438,14 @@ fn load_case_rows(
     changed
 }
 
-/// Maximize stiffness, the mass target, the safety factor and the limits.
+/// Maximize stiffness, the mass target, the safety factor and the limits; `preserve_masses`
+/// what the kept material weighs in each material, measured by the voxels when `regions`
+/// keep some.
 fn objective_rows(
     ui: &mut egui::Ui,
     g: &mut GenerativeSettings,
     preserve_masses: &[(String, f64)],
+    regions: bool,
 ) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
@@ -3221,10 +3563,15 @@ fn objective_rows(
         });
     if stiffest {
         for (name, mass) in preserve_masses {
+            let what = if regions {
+                "What is kept weighs about"
+            } else {
+                "The preserve bodies weigh"
+            };
             weak(
                 ui,
                 &format!(
-                    "The preserve bodies weigh {} in {name}: the target must be more",
+                    "{what} {} in {name}: the target must be more",
                     format_value(*mass, "kg")
                 ),
             );
@@ -4330,7 +4677,7 @@ mod tests {
         set_role(g, body(3), Role::Preserve);
         // A fifth of the box in steel; voxels of 2 mm, a few hundred of them.
         g.mass_target = 0.2 * 40.0 * 16.0 * 8.0 * 7850.0 * 1e-9;
-        g.margin = Some(0.0);
+        g.margin = [Some(0.0); 3];
         g.resolution = MeshSize::ElementSize(2.0);
         g.iterations = 30;
         g.materials = vec![steel()];
@@ -4374,8 +4721,148 @@ mod tests {
         );
         let estimate = voxel_estimate(&study, &surfaces).unwrap();
         assert_eq!(estimate, (2.0, 20 * 8 * 4));
-        let mass = preserve_mass(&study, &surfaces, 7850.0);
+        let mass = preserve_mass(&study, &surfaces, None, 7850.0);
         assert!((mass - (4.0 * 16.0 * 8.0 + 4.0 * 6.0 * 4.0) * 7850e-9).abs() < 1e-12);
+    }
+
+    /// A part of one body, a plate 40 × 10 × 4 mm, made the starting shape: kept 2 mm under
+    /// its ends (Preserve Region), held at its −X end, loaded at its +X end.
+    fn one_plate() -> (Surfaces, Study) {
+        let surfaces = Surfaces::for_test(
+            vec![cube([0.0, 0.0, 0.0], [40.0, 10.0, 4.0], 0)],
+            (0..6).map(pad_face).collect(),
+            vec![0; 6],
+            vec![("Body 1".to_owned(), Some(body(2).body), Some(steel()))],
+        );
+        let mut study = Study::of_type(StudyType::Generative, "Generative 1");
+        study.add(ItemKind::Preserve { depth: 2.0 }, vec![pad_face(0)]);
+        study.add(ItemKind::Preserve { depth: 2.0 }, vec![pad_face(1)]);
+        study.add(ItemKind::Fixed, vec![pad_face(0)]);
+        study.add(
+            ItemKind::Force {
+                newtons: -500.0,
+                direction: crate::simulation_ui::LoadDirection::Y,
+            },
+            vec![pad_face(1)],
+        );
+        let g = &mut study.generative;
+        set_role(g, body(2), Role::StartingShape);
+        g.mass_target = 0.4 * 40.0 * 10.0 * 4.0 * 7850.0 * 1e-9;
+        g.resolution = MeshSize::ElementSize(1.0);
+        g.materials = vec![steel()];
+        (surfaces, study)
+    }
+
+    #[test]
+    fn a_single_body_is_kept_by_its_regions() {
+        let (surfaces, study) = one_plate();
+        let engine = engine_study(&study, &surfaces).unwrap();
+        // Two regions on the one body, which is the starting shape; no preserve body.
+        assert!(engine.space.preserve.is_empty());
+        assert_eq!(engine.space.region_bodies.len(), 1);
+        let regions: Vec<(usize, &[u32], f64)> = engine
+            .space
+            .regions
+            .iter()
+            .map(|r| (r.body, r.labels.as_slice(), r.depth))
+            .collect();
+        assert_eq!(regions, [(0, &[0][..], 2.0), (0, &[1][..], 2.0)]);
+        assert!(engine.space.starting_shape.is_some());
+        // The regions are no fixtures or loads: one of each, in the one load case.
+        assert_eq!((engine.fixtures.len(), engine.loads.len()), (1, 1));
+        let (fixtures, loads) = item_names(&study.items);
+        assert_eq!(
+            (fixtures, loads),
+            (vec!["Fixed-1".to_owned()], vec!["Force-1".to_owned()])
+        );
+        // Laid on voxels, the ends are kept and the middle is design.
+        let grid = Grid::build(&engine, 0, &AtomicBool::new(false)).unwrap();
+        let count = |k: Voxel| grid.kinds.iter().filter(|v| **v == k).count();
+        assert_eq!(count(Voxel::Preserve), 2 * 2 * 10 * 4);
+        assert_eq!(count(Voxel::Design), 36 * 10 * 4);
+
+        // A fixture on a face nothing keeps, a region on an obstacle, nothing kept at all:
+        // refused, each saying why.
+        let mut loose = study.clone();
+        loose.items[2].faces = vec![pad_face(2)];
+        let why = engine_study(&loose, &surfaces).unwrap_err();
+        assert!(why.contains("Fixed-1") && why.contains("not kept"), "{why}");
+        let mut blocked = study.clone();
+        set_role(&mut blocked.generative, body(2), Role::Obstacle);
+        let why = engine_study(&blocked, &surfaces).unwrap_err();
+        assert!(
+            why.contains("Preserve-1") && why.contains("obstacle"),
+            "{why}"
+        );
+        let mut none = study.clone();
+        none.items
+            .retain(|i| !matches!(i.kind, ItemKind::Preserve { .. }));
+        let why = engine_study(&none, &surfaces).unwrap_err();
+        assert!(why.contains("Preserve Region"), "{why}");
+
+        // What is kept weighs what its voxels do.
+        let census = census(&study, &surfaces).unwrap();
+        assert_eq!((census.voxel, census.preserve), (1.0, 160));
+        let mass = preserve_mass(&study, &surfaces, Some(&census), 7850.0);
+        assert!((mass - 160.0 * 7850e-9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_study_set_up_to_disappoint_is_warned_about() {
+        let warnings = |study: &Study, surfaces: &Surfaces| {
+            let bodies: Vec<(StudyBody, String)> = surfaces
+                .bodies
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (body(2 + i as u32), format!("Body {}", i + 1)))
+                .collect();
+            let materials = study_materials(&study.generative, None);
+            setup_warnings(
+                study,
+                surfaces,
+                &bodies,
+                &materials,
+                voxel_estimate(study, surfaces),
+                census(study, surfaces).as_ref(),
+            )
+        };
+        // Every body kept, no starting shape: the outcome can only add lumps; and the
+        // second pad, 4 mm across, is about a voxel thick.
+        let (surfaces, study) = two_pads();
+        let said = warnings(&study, &surfaces);
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].starts_with("Every body is kept"), "{said:?}");
+        assert!(said[1].contains("Body 2"), "{said:?}");
+
+        // The plate redesigned with its ends kept: nothing to say.
+        let (surfaces, study) = one_plate();
+        assert_eq!(warnings(&study, &surfaces), Vec::<String>::new());
+        // Its ends kept 15 mm deep: three quarters of it kept.
+        let mut deep = study.clone();
+        for item in &mut deep.items {
+            if let ItemKind::Preserve { depth } = &mut item.kind {
+                *depth = 15.0;
+            }
+        }
+        let said = warnings(&deep, &surfaces);
+        assert!(
+            said.iter().any(|w| w.starts_with("What is kept is 75 %")),
+            "{said:?}"
+        );
+        // Voxels of 3 mm for regions 2 mm deep; and no material.
+        let mut coarse = study.clone();
+        coarse.generative.resolution = MeshSize::ElementSize(3.0);
+        coarse.generative.materials.clear();
+        let said = warnings(&coarse, &surfaces);
+        assert!(
+            said.iter().any(|w| w.starts_with("No material")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|w| w.contains("(3.00 mm)") && w.contains("Preserve-1 (2 mm deep)")),
+            "{said:?}"
+        );
     }
 
     #[test]
@@ -4719,5 +5206,31 @@ mod tests {
         let back = crate::simulation_files::study_of(&file);
         assert_eq!(back.generative, study.generative);
         assert_eq!(back.items, study.items);
+
+        // One body redesigned: its preserved regions go in the generative block, its room
+        // along each axis too, and come back as the study's items.
+        let (_, mut study) = one_plate();
+        study.generative.margin = [None, Some(0.0), None];
+        let file = crate::simulation_files::file_study(&study);
+        let names: Vec<(&str, f64)> = file
+            .generative
+            .preserved
+            .iter()
+            .map(|p| (p.name.as_str(), p.depth))
+            .collect();
+        assert_eq!(names, [("Preserve-1", 2.0), ("Preserve-2", 2.0)]);
+        assert!(file.topology.preserved.is_empty());
+        assert_eq!(file.generative.margin, [None, Some(0.0), None]);
+        assert_eq!((file.fixtures.len(), file.loads.len()), (1, 1));
+        let back = crate::simulation_files::study_of(&file);
+        assert!(back.generative.preserved.is_empty());
+        assert_eq!(back.generative, study.generative);
+        // Read back, the regions come after the fixtures and loads.
+        let by_name = |s: &Study| {
+            let mut items = s.items.clone();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            items
+        };
+        assert_eq!(by_name(&back), by_name(&study));
     }
 }

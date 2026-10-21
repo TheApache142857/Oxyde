@@ -141,6 +141,8 @@ pub enum Icon {
     HeatFluxPlot,
     /// Generative design: two green bosses joined by grown, branching members.
     Generative,
+    /// Preserve (a body's role): a green block kept as it is, a padlock on it.
+    PreserveBody,
     /// Obstacle: a red block material stays out of.
     Obstacle,
     /// Starting shape: a yellow block the material starts in.
@@ -191,6 +193,11 @@ const COOL: Color32 = Color32::from_rgb(40, 125, 215);
 const KEEP: Color32 = Color32::from_rgb(25, 150, 150);
 /// Generative design's roles, as Fusion 360 colours them: preserve, obstacle, starting shape.
 const PRESERVE: Color32 = Color32::from_rgb(70, 170, 95);
+const PRESERVE_BLOCK: [Color32; 3] = [
+    Color32::from_rgb(165, 220, 175),
+    PRESERVE,
+    Color32::from_rgb(45, 120, 65),
+];
 const OBSTACLE: [Color32; 3] = [
     Color32::from_rgb(240, 160, 150),
     Color32::from_rgb(215, 75, 65),
@@ -1279,6 +1286,19 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.ring(5.5, 18.0, 3.2, 2.2, PRESERVE);
             pen.ring(18.5, 6.0, 3.2, 2.2, PRESERVE);
         }
+        PreserveBody => {
+            pen.block(4.0, 10.0, 12.0, 10.0, 5.0, PRESERVE_BLOCK);
+            // Kept as it is: a white padlock on its face.
+            pen.line(
+                &Pen::arc_points(10.0, 14.5, 1.9, 2.0, PI, 2.0 * PI),
+                1.4,
+                WHITE,
+            );
+            pen.fill(
+                &[(7.5, 14.5), (12.5, 14.5), (12.5, 18.5), (7.5, 18.5)],
+                WHITE,
+            );
+        }
         Obstacle => {
             pen.block(4.0, 10.0, 12.0, 10.0, 5.0, OBSTACLE);
             // No material: a white bar across.
@@ -1667,7 +1687,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 101] = {
+pub const ALL: [Icon; 102] = {
     use Icon::*;
     [
         Sketch,
@@ -1752,6 +1772,7 @@ pub const ALL: [Icon; 101] = {
         TemperaturePlot,
         HeatFluxPlot,
         Generative,
+        PreserveBody,
         Obstacle,
         StartingShape,
         Explore,

@@ -266,7 +266,7 @@ mod tests {
     /// The first bending frequency of a cantilever by Euler–Bernoulli: `(1.8751)² / 2π ·
     /// √(EI / ρAL⁴)`, the section `width` across the bending and `depth` along it.
     fn beam_frequency(width: f64, depth: f64) -> f64 {
-        let (e, rho, length) = (200_000.0, 7850.0 * 1e-12, 200.0);
+        let (e, rho, length): (f64, f64, f64) = (200_000.0, 7850.0 * 1e-12, 200.0);
         let i = width * depth.powi(3) / 12.0;
         let area = width * depth;
         let beta = 1.875_104_068_7f64;

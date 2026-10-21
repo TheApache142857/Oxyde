@@ -650,6 +650,9 @@ fn combine<S: EigenSpace + ?Sized>(
     Ok(out)
 }
 
+/// What [`rayleigh_ritz`] finds: the values, the new vectors and the search directions.
+type Ritz = (Vec<f64>, Vec<Column>, Vec<Column>);
+
 /// Rayleigh–Ritz on the B-orthonormal `basis` (each column with its products): the lowest
 /// `keep` eigenpairs of `Sᵀ A S`, as values and new vectors, and the part of each vector that
 /// comes from the columns from `split` on (the next search directions). The basis is left
@@ -659,7 +662,7 @@ fn rayleigh_ritz<S: EigenSpace + ?Sized>(
     basis: &[Column],
     keep: usize,
     split: usize,
-) -> Result<(Vec<f64>, Vec<Column>, Vec<Column>), EigenError> {
+) -> Result<Ritz, EigenError> {
     let s = basis.len();
     // Symmetric to rounding: the mean of the two products, all asked for in one batch.
     let mut pairs = Vec::with_capacity(s * (s + 1));

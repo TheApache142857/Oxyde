@@ -246,8 +246,8 @@ pub struct PullDirection {
     pub parting: Option<[f64; 3]>,
 }
 
-/// Faces a topology study keeps material under: the elements on them, and those within
-/// `depth` of them.
+/// Faces a topology or generative study keeps material under: the elements (or voxels) on
+/// them, and those within `depth` of them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreservedRegion {
     /// `Preserve-1`… unique like a fixture's.
@@ -263,16 +263,21 @@ pub struct PreservedRegion {
 /// making them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerativeSettings {
-    /// Bodies kept as they are; at least one. Fixtures and loads are on their faces.
+    /// Bodies kept as they are. Fixtures and loads are on their faces or on the preserved
+    /// regions'; a study has one of these or a preserved region at least.
     pub preserve: Vec<StudyBody>,
+    /// Faces whose material is kept, as deep inside the body they are on as their depth, as
+    /// a topology study's preserved regions keep theirs: the body needs no role.
+    pub preserved: Vec<PreservedRegion>,
     /// Bodies no material may go into.
     pub obstacles: Vec<GenerativeObstacle>,
     /// A body the material starts in and stays inside; `None` for the box around the
-    /// preserve bodies, grown by [`GenerativeSettings::margin`].
+    /// preserve bodies and the preserved regions' bodies, grown by
+    /// [`GenerativeSettings::margin`].
     pub starting_shape: Option<StudyBody>,
-    /// mm the box around the preserve bodies is grown by on every side, without a starting
-    /// shape; `None` for a tenth of the box's largest side.
-    pub margin: Option<f64>,
+    /// mm the box is grown by along X, Y and Z (on both sides), without a starting shape;
+    /// `None` on an axis for a tenth of the box's largest side.
+    pub margin: [Option<f64>; 3],
     pub objective: GenerativeObjective,
     /// kg: every outcome's mass, preserve bodies included, whatever its material, when
     /// maximizing stiffness; positive (0 in a new study until it is set, and while
@@ -321,9 +326,10 @@ impl Default for GenerativeSettings {
     fn default() -> Self {
         Self {
             preserve: Vec::new(),
+            preserved: Vec::new(),
             obstacles: Vec::new(),
             starting_shape: None,
-            margin: None,
+            margin: [None; 3],
             objective: GenerativeObjective::MaxStiffness,
             mass_target: 0.0,
             safety_factor: 2.0,
@@ -1019,16 +1025,17 @@ fn default_modes() -> u32 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct GenerativeDto {
-    /// At least one.
+    /// At least one, or a preserved region.
     #[serde(default)]
     preserve: Vec<StudyBodyDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preserved: Vec<PreservedDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     obstacles: Vec<ObstacleDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     starting_shape: Option<StudyBodyDto>,
-    /// mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    margin: Option<f64>,
+    margin: Option<MarginDto>,
     #[serde(default)]
     objective: ObjectiveDto,
     /// kg; required when maximizing stiffness.
@@ -1058,6 +1065,23 @@ struct GenerativeDto {
     materials: Vec<MaterialDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     load_cases: Vec<LoadCaseDto>,
+}
+
+/// mm: one margin for every axis, or one each for X, Y and Z, `null` for the default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum MarginDto {
+    Every(f64),
+    Axes([Option<f64>; 3]),
+}
+
+/// The margin as written: nothing for the defaults, one number for three alike.
+fn margin_dto(margin: [Option<f64>; 3]) -> Option<MarginDto> {
+    match margin {
+        [None, None, None] => None,
+        [Some(x), Some(y), Some(z)] if x == y && y == z => Some(MarginDto::Every(x)),
+        axes => Some(MarginDto::Axes(axes)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1663,16 +1687,7 @@ fn study_dto(study: &Study) -> StudyDto {
                 target_mass: t.target_mass,
                 member_size: t.member_size,
                 iterations: t.iterations,
-                preserved: t
-                    .preserved
-                    .iter()
-                    .map(|p| PreservedDto {
-                        name: p.name.clone(),
-                        faces: faces_dto(&p.faces),
-                        depth: p.depth,
-                        suppressed: p.suppressed,
-                    })
-                    .collect(),
+                preserved: preserved_dto(&t.preserved),
                 symmetry: symmetry_dto(t.symmetry),
                 pull: t.pull.map(|p| PullDto {
                     direction: p.direction,
@@ -1697,6 +1712,18 @@ fn size_dto(size: MeshSize) -> (Option<f64>, Option<f64>) {
     }
 }
 
+fn preserved_dto(preserved: &[PreservedRegion]) -> Vec<PreservedDto> {
+    preserved
+        .iter()
+        .map(|p| PreservedDto {
+            name: p.name.clone(),
+            faces: faces_dto(&p.faces),
+            depth: p.depth,
+            suppressed: p.suppressed,
+        })
+        .collect()
+}
+
 /// Planes without one on are none.
 fn symmetry_dto(symmetry: Option<SymmetryPlanes>) -> Option<SymmetryDto> {
     symmetry
@@ -1718,6 +1745,7 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
     let no_textures = TextureTable::default();
     GenerativeDto {
         preserve: g.preserve.iter().map(study_body_dto).collect(),
+        preserved: preserved_dto(&g.preserved),
         obstacles: g
             .obstacles
             .iter()
@@ -1727,7 +1755,7 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
             })
             .collect(),
         starting_shape: g.starting_shape.as_ref().map(study_body_dto),
-        margin: g.margin,
+        margin: margin_dto(g.margin),
         objective: match g.objective {
             GenerativeObjective::MaxStiffness => ObjectiveDto::MaxStiffness,
             GenerativeObjective::MinMass => ObjectiveDto::MinMass,
@@ -2150,21 +2178,7 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
             if !(1..=10_000).contains(&t.iterations) {
                 return Err("the iterations are not from 1 to 10 000".to_owned());
             }
-            let mut preserved = Vec::with_capacity(t.preserved.len());
-            for p in t.preserved {
-                named(&p.name)?;
-                let item = |e: String| format!("{}: {e}", p.name);
-                let depth = finite(p.depth, "the depth").map_err(item)?;
-                if depth < 0.0 {
-                    return Err(item("the depth is negative".to_owned()));
-                }
-                preserved.push(PreservedRegion {
-                    faces: faces_from(p.faces, kind).map_err(item)?,
-                    depth,
-                    suppressed: p.suppressed,
-                    name: p.name,
-                });
-            }
+            let preserved = preserved_from(t.preserved, kind, &mut named)?;
             let symmetry = symmetry_from(t.symmetry)?;
             let pull = match t.pull {
                 Some(p) => {
@@ -2197,7 +2211,9 @@ fn study_from(dto: StudyDto, kind: ModelKind) -> Result<Study, String> {
         (_, None) => TopologySettings::default(),
     };
     let generative = match (study_type, dto.generative) {
-        (StudyType::Generative, Some(g)) => generative_from(g, kind, &fixtures, &loads)?,
+        (StudyType::Generative, Some(g)) => {
+            generative_from(g, kind, &fixtures, &loads, &mut named)?
+        }
         (StudyType::Generative, None) => {
             return Err("a generative study has no generative block".to_owned());
         }
@@ -2322,11 +2338,45 @@ fn directions_from(
     Ok(directions)
 }
 
+/// Preserved regions, their names checked by `named` with the study's other items'.
+fn preserved_from(
+    list: Vec<PreservedDto>,
+    kind: ModelKind,
+    named: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<Vec<PreservedRegion>, String> {
+    let mut preserved = Vec::with_capacity(list.len());
+    for p in list {
+        named(&p.name)?;
+        let item = |e: String| format!("{}: {e}", p.name);
+        let depth = finite(p.depth, "the depth").map_err(item)?;
+        if depth < 0.0 {
+            return Err(item("the depth is negative".to_owned()));
+        }
+        preserved.push(PreservedRegion {
+            faces: faces_from(p.faces, kind).map_err(item)?,
+            depth,
+            suppressed: p.suppressed,
+            name: p.name,
+        });
+    }
+    Ok(preserved)
+}
+
+/// mm: a margin, not negative.
+fn margin_from(m: f64) -> Result<f64, String> {
+    let m = finite(m, "the margin")?;
+    if m < 0.0 {
+        return Err("the margin is negative".to_owned());
+    }
+    Ok(m)
+}
+
 fn generative_from(
     dto: GenerativeDto,
     kind: ModelKind,
     fixtures: &[Fixture],
     loads: &[Load],
+    named: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> Result<GenerativeSettings, String> {
     // A body has one role at most, and names a component exactly in an assembly.
     let mut bodies = BTreeSet::new();
@@ -2358,14 +2408,18 @@ fn generative_from(
             Err(format!("the body {b} is listed twice"))
         }
     };
-    if dto.preserve.is_empty() {
-        return Err("the generative study has no body to preserve".to_owned());
+    if dto.preserve.is_empty() && dto.preserved.is_empty() {
+        return Err(
+            "the generative study keeps nothing: no body to preserve, no preserved region"
+                .to_owned(),
+        );
     }
     let preserve = dto
         .preserve
         .into_iter()
         .map(&mut body)
         .collect::<Result<Vec<_>, _>>()?;
+    let preserved = preserved_from(dto.preserved, kind, named)?;
     let mut obstacles = Vec::with_capacity(dto.obstacles.len());
     for o in dto.obstacles {
         let offset = finite(o.offset, "an obstacle's offset")?;
@@ -2379,14 +2433,15 @@ fn generative_from(
     }
     let starting_shape = dto.starting_shape.map(&mut body).transpose()?;
     let margin = match dto.margin {
-        Some(m) => {
-            let m = finite(m, "the margin")?;
-            if m < 0.0 {
-                return Err("the margin is negative".to_owned());
+        None => [None; 3],
+        Some(MarginDto::Every(m)) => [Some(margin_from(m)?); 3],
+        Some(MarginDto::Axes(axes)) => {
+            let mut out = [None; 3];
+            for (o, m) in out.iter_mut().zip(axes) {
+                *o = m.map(margin_from).transpose()?;
             }
-            Some(m)
+            out
         }
-        None => None,
     };
     let objective = match dto.objective {
         ObjectiveDto::MaxStiffness => GenerativeObjective::MaxStiffness,
@@ -2527,6 +2582,7 @@ fn generative_from(
 
     Ok(GenerativeSettings {
         preserve,
+        preserved,
         obstacles,
         starting_shape,
         margin,
@@ -2831,6 +2887,20 @@ mod tests {
         });
         study.generative = GenerativeSettings {
             preserve: vec![body(3, 0), body(9, 1)],
+            preserved: vec![
+                PreservedRegion {
+                    name: "Preserve-1".to_owned(),
+                    faces: vec![StudyFace::part(face(4)), StudyFace::part(face(5))],
+                    depth: 1.5,
+                    suppressed: false,
+                },
+                PreservedRegion {
+                    name: "Preserve-2".to_owned(),
+                    faces: vec![StudyFace::part(face(6))],
+                    depth: 0.0,
+                    suppressed: true,
+                },
+            ],
             obstacles: vec![
                 GenerativeObstacle {
                     body: body(12, 0),
@@ -2842,7 +2912,7 @@ mod tests {
                 },
             ],
             starting_shape: Some(body(15, 0)),
-            margin: Some(4.0),
+            margin: [Some(4.0); 3],
             objective: GenerativeObjective::MaxStiffness,
             mass_target: 0.25,
             safety_factor: 2.5,
@@ -3052,6 +3122,10 @@ mod tests {
         g.preserve.iter_mut().for_each(place);
         g.obstacles.iter_mut().for_each(|o| place(&mut o.body));
         g.starting_shape.iter_mut().for_each(place);
+        g.preserved
+            .iter_mut()
+            .flat_map(|p| p.faces.iter_mut())
+            .for_each(on);
         assert_eq!(
             read_simulation(Cursor::new(bytes(&assembly))).unwrap(),
             assembly
@@ -3083,6 +3157,36 @@ mod tests {
         ] {
             assert_eq!(AxisDirection::new(d.axis(), d.is_positive()), d);
         }
+
+        // One body redesigned: no preserve body, its faces kept by preserved regions, and
+        // the room limited along Y only.
+        let mut one = generative_sample();
+        let g = &mut one.studies[0].generative;
+        g.preserve.clear();
+        g.starting_shape = None;
+        g.margin = [None, Some(0.0), None];
+        assert_eq!(read_simulation(Cursor::new(bytes(&one))).unwrap(), one);
+        let v = json(&one);
+        let g = &v["studies"][0]["generative"];
+        assert_eq!(g["preserve"], serde_json::json!([]));
+        assert_eq!(g["margin"], serde_json::json!([null, 0.0, null]));
+        // Three margins alike are one number; one given with two defaults, an array.
+        for (margin, written) in [
+            ([Some(2.0); 3], serde_json::json!(2.0)),
+            (
+                [Some(1.0), None, None],
+                serde_json::json!([1.0, null, null]),
+            ),
+            (
+                [Some(1.0), Some(2.0), Some(3.0)],
+                serde_json::json!([1.0, 2.0, 3.0]),
+            ),
+        ] {
+            let mut file = generative_sample();
+            file.studies[0].generative.margin = margin;
+            assert_eq!(read_simulation(Cursor::new(bytes(&file))).unwrap(), file);
+            assert_eq!(json(&file)["studies"][0]["generative"]["margin"], written);
+        }
     }
 
     #[test]
@@ -3108,6 +3212,15 @@ mod tests {
         );
         assert_eq!(g["starting_shape"]["feature"], 15);
         assert_eq!(g["margin"], 4.0);
+        assert_eq!(g["preserved"][0]["name"], "Preserve-1");
+        assert_eq!(g["preserved"][0]["depth"], 1.5);
+        assert_eq!(g["preserved"][0]["faces"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            g["preserved"][0]["faces"][0]["face"]["key"]["type"],
+            "end_cap"
+        );
+        assert!(g["preserved"][1].get("depth").is_none());
+        assert_eq!(g["preserved"][1]["suppressed"], true);
         assert_eq!(g["objective"], "max_stiffness");
         assert_eq!(g["mass_target"], 0.25);
         assert_eq!(g["safety_factor"], 2.5);
@@ -3276,10 +3389,25 @@ mod tests {
             "only a topology study",
         );
 
-        // The bodies.
+        // The bodies, and the preserved regions.
         refused(
-            &|v| block(v)["preserve"] = serde_json::json!([]),
-            "no body to preserve",
+            &|v| {
+                block(v)["preserve"] = serde_json::json!([]);
+                block(v).as_object_mut().unwrap().remove("preserved");
+            },
+            "keeps nothing",
+        );
+        refused(
+            &|v| block(v)["preserved"][0]["name"] = "Fixed-1".into(),
+            "two items are named \"Fixed-1\"",
+        );
+        refused(
+            &|v| block(v)["preserved"][0]["depth"] = (-1.5).into(),
+            "Preserve-1: the depth is negative",
+        );
+        refused(
+            &|v| block(v)["preserved"][0]["faces"][0]["component"] = 2.into(),
+            "Preserve-1",
         );
         refused(
             &|v| block(v)["starting_shape"] = serde_json::json!({ "feature": 9, "index": 1 }),
@@ -3297,6 +3425,22 @@ mod tests {
             &|v| block(v)["margin"] = (-1.0).into(),
             "margin is negative",
         );
+        refused(
+            &|v| block(v)["margin"] = serde_json::json!([null, -1.0, null]),
+            "margin is negative",
+        );
+        // A margin array not of three numbers or nulls is no margin.
+        for margin in [
+            serde_json::json!([1.0, 2.0]),
+            serde_json::json!([1.0, "a", 2.0]),
+        ] {
+            let bytes = edited(&good, SIMULATION, |s| {
+                let mut v: serde_json::Value = serde_json::from_str(s).unwrap();
+                block(&mut v)["margin"] = margin.clone();
+                serde_json::to_string(&v).unwrap()
+            });
+            assert!(read_simulation(Cursor::new(bytes)).is_err());
+        }
 
         // The numbers.
         refused(

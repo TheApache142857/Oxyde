@@ -46,7 +46,6 @@ pub(super) struct Modes {
     pub values: Vec<f64>,
     /// Normalised to `φᵀ M φ = 1`, M in tonnes.
     pub vectors: Vec<Vec<f64>>,
-    pub iterations: usize,
 }
 
 /// A voxel's share of its solid mass in the frequencies at projected density `r`, and its
@@ -86,7 +85,7 @@ pub(super) fn lowest_modes(
     fine: &Fine,
     nodal: &[f64],
     start: Option<&[Vec<f64>]>,
-    backend: Option<&mut dyn Backend>,
+    backend: Option<&mut (dyn Backend + '_)>,
     cancel: &AtomicBool,
     threads: usize,
 ) -> Result<Modes, GenerativeError> {
@@ -118,7 +117,6 @@ pub(super) fn lowest_modes(
             return Ok(Modes {
                 values: found.values,
                 vectors: found.vectors,
-                iterations: found.iterations,
             });
         }
     }
@@ -128,7 +126,12 @@ pub(super) fn lowest_modes(
         fine.project(y);
     };
     let apply_b = |x: &[f64], y: &mut [f64]| {
-        for ((out, input), m) in y.chunks_exact_mut(3).zip(x.chunks_exact(3)).zip(nodal) {
+        let pairs = y
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(x.as_chunks::<3>().0);
+        for ((out, input), m) in pairs.zip(nodal) {
             for (o, i) in out.iter_mut().zip(input) {
                 *o = m * i;
             }
@@ -149,7 +152,6 @@ pub(super) fn lowest_modes(
     Ok(Modes {
         values: found.values,
         vectors: found.vectors,
-        iterations: found.iterations,
     })
 }
 
