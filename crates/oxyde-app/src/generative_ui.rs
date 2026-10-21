@@ -533,6 +533,7 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
         max_iterations: g.iterations.max(1) as usize,
         voxel_size,
         symmetry,
+        min_frequency: g.min_frequency,
     })
 }
 
@@ -675,6 +676,7 @@ pub(crate) fn outcome_of(
         max_von_mises: o.max_von_mises,
         min_factor_of_safety: o.min_factor_of_safety,
         grayness: Some(o.grayness),
+        frequency: o.frequency,
         history: o
             .history
             .iter()
@@ -711,6 +713,7 @@ pub(crate) fn failed_outcome(plan: &OutcomePlan, why: String, seconds: f64) -> G
         max_von_mises: 0.0,
         min_factor_of_safety: None,
         grayness: None,
+        frequency: None,
         history: Vec::new(),
         density: Vec::new(),
         snapshots: Vec::new(),
@@ -2728,7 +2731,7 @@ impl OxydeApp {
                                         &mut view.snapshot,
                                         &mut view.show,
                                         &mut view.show_obstacles,
-                                        study.generative.safety_factor,
+                                        &study.generative,
                                     )
                                 {
                                     action = Some(a);
@@ -3096,7 +3099,7 @@ fn load_case_rows(
     changed
 }
 
-/// Maximize stiffness, the mass target and the safety factor.
+/// Maximize stiffness, the mass target, the safety factor and the limits.
 fn objective_rows(
     ui: &mut egui::Ui,
     g: &mut GenerativeSettings,
@@ -3186,6 +3189,35 @@ fn objective_rows(
                 });
                 ui.end_row();
             }
+            // With either objective, as Fusion 360 limits the modal frequency.
+            ui.label("Minimum frequency");
+            ui.horizontal(|ui| {
+                let mut on = g.min_frequency.is_some();
+                if ui
+                    .checkbox(&mut on, "")
+                    .on_hover_text(
+                        "The lowest natural frequency the outcome may have, held by the first \
+                         load case's fixtures: above what will shake it (a motor's speed, a \
+                         launch's vibration)",
+                    )
+                    .changed()
+                {
+                    g.min_frequency = on.then_some(100.0);
+                    changed = true;
+                }
+                if let Some(f) = g.min_frequency.as_mut() {
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(f)
+                                .range(0.1..=100_000.0)
+                                .speed(1.0)
+                                .max_decimals(1)
+                                .suffix(" Hz"),
+                        )
+                        .changed();
+                }
+            });
+            ui.end_row();
         });
     if stiffest {
         for (name, mass) in preserve_masses {
@@ -3888,8 +3920,9 @@ fn picked_rows(
     snapshot: &mut Option<usize>,
     show: &mut bool,
     show_obstacles: &mut bool,
-    safety_factor: f64,
+    settings: &GenerativeSettings,
 ) -> Option<GenAction> {
+    let (safety_factor, min_frequency) = (settings.safety_factor, settings.min_frequency);
     let mut action = None;
     ui.separator();
     ui.strong(format!(
@@ -3962,6 +3995,27 @@ fn picked_rows(
                 ui.label(o.min_factor_of_safety.map_or_else(none, short));
                 if checked.is_some() {
                     ui.label(part_safety.map_or_else(none, short));
+                }
+                ui.end_row();
+            }
+            let part_frequency = checked.and_then(|c| c.frequency);
+            if o.frequency.is_some() || part_frequency.is_some() {
+                ui.label("Lowest frequency");
+                let hertz = |f: f64| {
+                    let text = egui::RichText::new(format_value(f, "Hz"));
+                    if min_frequency.is_some_and(|least| f < least) {
+                        text.color(egui::Color32::from_rgb(210, 140, 30))
+                    } else {
+                        text
+                    }
+                };
+                let none = || egui::RichText::new("—");
+                ui.label(o.frequency.map_or_else(none, hertz)).on_hover_text(
+                    "The first natural frequency, held by the first load case's fixtures; marked \
+                     under the minimum",
+                );
+                if checked.is_some() {
+                    ui.label(part_frequency.map_or_else(none, hertz));
                 }
                 ui.end_row();
             }
@@ -4322,6 +4376,17 @@ mod tests {
         assert_eq!(estimate, (2.0, 20 * 8 * 4));
         let mass = preserve_mass(&study, &surfaces, 7850.0);
         assert!((mass - (4.0 * 16.0 * 8.0 + 4.0 * 6.0 * 4.0) * 7850e-9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_frequency_limit_reaches_the_engine() {
+        let (surfaces, mut study) = two_pads();
+        assert_eq!(engine_study(&study, &surfaces).unwrap().min_frequency, None);
+        study.generative.min_frequency = Some(80.0);
+        assert_eq!(
+            engine_study(&study, &surfaces).unwrap().min_frequency,
+            Some(80.0)
+        );
     }
 
     #[test]

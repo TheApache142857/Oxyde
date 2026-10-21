@@ -1205,6 +1205,43 @@ and Gasso; "always validate", Schnitger, Cadalyst 2018).
 - **Not yet:** the check's stresses drawn on the part in Explore, and the check rerun on a
   part edited after it was made (a static study of the part in the Simulation tab does it).
 
+**Built (October 2026): step 11**, a minimum natural frequency, as Fusion 360's generative
+design limits the modal frequency and NASA's Evolved Structures keeps a bracket's first mode
+clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency studies (§10).
+
+- **The limit** (`GenerativeStudy::min_frequency`, Hz, with either objective): the lowest
+  natural frequencies of the design, held by the first load case's fixtures, kept at or
+  above it. Each of the lowest three modes is a constraint of its own for the method of
+  moving asymptotes, `1 − λᵢ / λ_min ≤ 0` (`λ = ω²`), so the limit holds when two modes swap
+  places as the design changes; a limited *Maximize stiffness* moves by MMA, as a weighted one
+  does, the mass target a constraint, so the stiffest design may weigh less than it.
+- **The modes** (`generative::frequency`): `K φ = λ M φ` on the grid each iteration, `K`
+  the iteration's own stiffness, never assembled, `M` lumped (an eighth of each voxel's
+  mass at each corner, in tonnes as millimetres and newtons take them), by the block LOBPCG
+  of `crate::eigen` with two guard vectors, preconditioned by one V-cycle of the static
+  solve's multigrid on `K` (`multigrid::Cycle`), warm-started from the last iteration's
+  modes. On the CPU, also when the static solves are on the graphics card.
+- **The mass interpolation**: a voxel's mass goes as its projected density, and below a
+  tenth as the sixth power of it scaled to meet it there (Du and Olhoff, 2007): the
+  stiffness goes as the cube, so near-void regions lighter than they are weak would
+  otherwise vibrate on their own near 0 Hz and hide the structure's modes. A floor of 10⁻⁹
+  of the solid mass keeps `M` positive where there are elements.
+- **The slopes**: for `φ` normalised to `φᵀ M φ = 1`, `dλ/dρ = φₑᵀ (dK/dρ − λ dM/dρ) φₑ` voxel
+  by voxel (the brick's energy times the stiffness's slope, less `λ` times the mass's slope
+  times `Σ |φ|² / 8` over the corners), carried back through the projection, the
+  manufacturing controls and the filter as the compliance's are.
+- **In files**: `min_frequency` in the study's `generative` block, and each outcome's
+  `frequency`, its lowest in Hz (FORMAT.md §8–§9). Explore shows it, marked under the limit;
+  *Create Part*'s check (step 10) finds the part's own by the frequency study's solver
+  (`modal::solve_frequencies`), held by the same fixtures, on its mesh of tetrahedra.
+- **Tests:** the mass interpolation meets itself at a tenth and never vanishes; on a
+  cantilever of uneven densities, the lowest eigenvalue's slopes for a voxel at the root,
+  the tip and between them are its central differences to a thousandth of the largest; the
+  bracket under a limit a tenth over the frequency it had without one keeps its lowest
+  frequency at the limit, on or under its mass target; no frequency sought without a
+  limit; a negative limit refused; the format's round trip and refusals, and the panel's
+  mapping to the engine.
+
 ## 10. Frequency studies
 
 **Decided (October 2026, the owner):** a frequency study in the Simulation tab, as SolidWorks

@@ -89,6 +89,7 @@ fn bracket(voxel_size: f64, iterations: usize) -> GenerativeStudy {
         max_iterations: iterations,
         voxel_size,
         symmetry: None,
+        min_frequency: None,
     }
 }
 

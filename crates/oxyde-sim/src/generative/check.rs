@@ -1,6 +1,7 @@
 //! The check of a part made of an outcome (*Create Part*): its surface filled with ten-node
-//! tetrahedra by the lattice mesher, the preserve bodies' faces found on it, and each load
-//! case of the study solved on it by the static solver. The outcome's numbers come from
+//! tetrahedra by the lattice mesher, the preserve bodies' faces found on it, each load case
+//! of the study solved on it by the static solver, and, when the study limits it, its
+//! lowest natural frequency found by the frequency study's solver (`crate::modal`). The outcome's numbers come from
 //! voxels, whose corners concentrate stress and whose steps the smoothing and simplifying
 //! take away; these are the part's own, to set against them (`docs/SIMULATION.md` §9).
 
@@ -12,6 +13,7 @@ use crate::bvh::Bvh;
 use crate::material::Elastic;
 use crate::math::{V3, add, cross, dot, normalize, scale, sub};
 use crate::mesher::{MeshError, MeshOptions, SurfaceMesh, mesh_solids};
+use crate::modal::{FrequencyStudy, solve_frequencies};
 use crate::solve::{self, Load, LoadKind, SolveError, SolveOptions, Study};
 use crate::topology::Shape;
 
@@ -56,6 +58,9 @@ pub struct PartCheck {
     pub max_von_mises: f64,
     /// The yield strength over it, when the material has one.
     pub min_factor_of_safety: Option<f64>,
+    /// Hz: the lowest natural frequency, held by the first load case's fixtures, when the
+    /// study limits it.
+    pub frequency: Option<f64>,
 }
 
 /// What the check needs found on the part and could not find.
@@ -82,6 +87,8 @@ pub enum CheckError {
         case: usize,
         error: SolveError,
     },
+    /// The part's natural frequencies could not be found.
+    Frequency(SolveError),
     Cancelled,
 }
 
@@ -103,6 +110,9 @@ impl std::fmt::Display for CheckError {
             }
             CheckError::Solve { case, error } => {
                 write!(f, "load case {} could not be solved: {error}", case + 1)
+            }
+            CheckError::Frequency(error) => {
+                write!(f, "its natural frequencies could not be found: {error}")
             }
             CheckError::Cancelled => write!(f, "cancelled"),
         }
@@ -155,6 +165,12 @@ pub fn check_part(
     let materials = vec![*material; solids.len().max(1)];
 
     let cases = study.cases();
+    // The solves' share of the progress, the frequency's after them.
+    let solving = if study.min_frequency.is_some() {
+        0.55
+    } else {
+        0.7
+    };
     let mut compliance = 0.0;
     let mut max_displacement = 0.0f64;
     let mut max_von_mises = 0.0f64;
@@ -230,7 +246,7 @@ pub fn check_part(
             gravity: weighs.then_some(acceleration),
             contacts: Vec::new(),
         };
-        let share = 0.7 / cases.len() as f64;
+        let share = solving / cases.len() as f64;
         let start = 0.3 + share * c as f64;
         let what = if cases.len() > 1 {
             format!("Solving load case {} of {}", c + 1, cases.len())
@@ -274,6 +290,35 @@ pub fn check_part(
             .fold(0.0f64, f64::max);
         max_von_mises = max_von_mises.max(peak);
     }
+    // The lowest natural frequency, held by the first case's fixtures, as the outcome's.
+    let frequency = match (study.min_frequency, cases.first()) {
+        (Some(_), Some(case)) => {
+            let start = 0.3 + solving;
+            let frequency_study = FrequencyStudy {
+                fixtures: case
+                    .fixtures
+                    .iter()
+                    .filter_map(|&i| study.fixtures.get(i).cloned())
+                    .collect(),
+                contacts: Vec::new(),
+                modes: 1,
+            };
+            let found = solve_frequencies(
+                &mesh,
+                &materials,
+                &frequency_study,
+                &SolveOptions::default(),
+                cancel,
+                &|f| progress("Finding its lowest frequency", start + (1.0 - start) * f),
+            )
+            .map_err(|error| match error {
+                SolveError::Cancelled => CheckError::Cancelled,
+                error => CheckError::Frequency(error),
+            })?;
+            found.modes.first().map(|m| m.frequency)
+        }
+        _ => None,
+    };
     progress("Done", 1.0);
     let min_factor_of_safety = (material.yield_strength > 0.0 && max_von_mises > 0.0)
         .then(|| material.yield_strength / max_von_mises);
@@ -293,6 +338,7 @@ pub fn check_part(
         max_displacement,
         max_von_mises,
         min_factor_of_safety,
+        frequency,
     })
 }
 

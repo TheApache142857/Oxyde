@@ -51,6 +51,7 @@ fn bracket(voxel_size: f64) -> GenerativeStudy {
         max_iterations: 150,
         voxel_size,
         symmetry: None,
+        min_frequency: None,
     }
 }
 
@@ -1015,6 +1016,7 @@ fn bar_part() -> (GenerativeStudy, crate::topology::Shape) {
         max_iterations: 1,
         voxel_size: 2.0,
         symmetry: None,
+        min_frequency: None,
     };
     let surface = box_surface(lo, hi);
     let part = crate::topology::Shape {
@@ -1067,4 +1069,136 @@ fn a_part_off_the_kept_faces_is_not_checked() {
             index: 0
         }
     );
+}
+
+#[test]
+fn a_voxels_mass_in_the_frequencies_goes_as_the_sixth_power_below_a_tenth() {
+    use super::frequency::{MASS_KNEE, mass_share};
+    // Its density above the knee; the sixth power below, meeting it there.
+    assert_eq!(mass_share(0.5), (0.5, 1.0));
+    let below = mass_share(MASS_KNEE - 1e-12).0;
+    assert!((below - MASS_KNEE).abs() < 1e-9, "{below}");
+    let (half, slope) = mass_share(0.5 * MASS_KNEE);
+    assert!((half - MASS_KNEE / 64.0).abs() < 1e-12);
+    assert!((slope - 6.0 * MASS_KNEE.powi(-5) * (0.5 * MASS_KNEE).powi(5)).abs() < 1e-9);
+    // Never quite nothing where there is an element.
+    assert!(mass_share(0.0).0 > 0.0 && mass_share(0.0).1 == 0.0);
+}
+
+#[test]
+fn the_frequency_limits_slopes_are_its_eigenvalues_differences() {
+    use super::frequency::{eigenvalue_slopes, hertz, lowest_modes, mass_share, nodal_masses};
+    // A cantilever of 8 × 3 × 2 voxels of 1 mm, held at x = 0, of uneven densities: its
+    // lowest eigenvalue's slope for a voxel's density, against central differences.
+    let dims = Dims { cells: [8, 3, 2] };
+    let brick = Brick::new(0.3);
+    let modulus = STEEL.youngs_modulus;
+    let tonnes = STEEL.density * 1e-9 * 1e-3;
+    let held: Vec<u32> = (0..dims.node_count())
+        .map(|n| if dims.node_coords(n)[0] == 0 { 0 } else { NONE })
+        .collect();
+    let projectors = [[0.0; 9]];
+    let cancel = AtomicBool::new(false);
+    let base: Vec<f64> = (0..dims.cell_count())
+        .map(|v| 0.5 + 0.05 * (v % 7) as f64)
+        .collect();
+    let stiffness_of =
+        |r: f64| modulus * (VOID_STIFFNESS + r.powf(PENALTY) * (1.0 - VOID_STIFFNESS));
+    let modes = |rho: &[f64]| {
+        let stiffness: Vec<f64> = rho.iter().map(|&r| stiffness_of(r)).collect();
+        let masses: Vec<f64> = rho.iter().map(|&r| tonnes * mass_share(r).0).collect();
+        let nodal = nodal_masses(dims, &masses);
+        let found = {
+            let fine = Fine::new(
+                dims,
+                &brick,
+                &stiffness,
+                &held,
+                &projectors,
+                SCALAR_BELOW * modulus,
+            );
+            lowest_modes(&fine, &nodal, None, &cancel, 1).unwrap()
+        };
+        (stiffness, found)
+    };
+    let (stiffness, found) = modes(&base);
+    let lambda = found.values[0];
+    // Bending across the thinner side first, well apart from across the wider one.
+    assert!(
+        lambda > 0.0 && found.values[1] > 1.05 * lambda,
+        "{:?}",
+        found.values
+    );
+    assert!((hertz(lambda) - lambda.sqrt() / (2.0 * std::f64::consts::PI)).abs() < 1e-12);
+    let stiffness_slope =
+        |v: usize| PENALTY * base[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * modulus;
+    let mass_slope = |v: usize| tonnes * mass_share(base[v]).1;
+    let slopes = eigenvalue_slopes(
+        dims,
+        &brick,
+        &found.vectors[0],
+        &stiffness,
+        lambda,
+        &stiffness_slope,
+        &mass_slope,
+        1,
+    );
+    let largest = slopes.iter().fold(0.0f64, |m, s| m.max(s.abs()));
+    // At the root, which bends most, stiffer raises it; at the tip, which moves most,
+    // heavier lowers it.
+    let root = dims.cell([0, 1, 0]);
+    let tip = dims.cell([7, 1, 1]);
+    assert!(slopes[root] > 0.0 && slopes[tip] < slopes[root]);
+    for v in [root, tip, dims.cell([4, 2, 0])] {
+        let step = 1e-4;
+        let at = |d: f64| {
+            let mut rho = base.clone();
+            rho[v] += d;
+            modes(&rho).1.values[0]
+        };
+        let difference = (at(step) - at(-step)) / (2.0 * step);
+        assert!(
+            (slopes[v] - difference).abs() <= 1e-3 * largest,
+            "voxel {v}: {} against {difference}",
+            slopes[v]
+        );
+    }
+}
+
+#[test]
+fn a_frequency_limit_raises_the_lowest_frequency() {
+    // The bracket with a limit too low to act, then one a tenth over the frequency it gave:
+    // the second outcome keeps its lowest frequency at the limit, on its mass target.
+    let mut study = bracket(2.0);
+    study.min_frequency = Some(1.0);
+    let (_, free) = run(&study, Method::Unrestricted, 0);
+    let first = free.frequency.unwrap();
+    assert!(first > 1.0, "{first}");
+    let limit = 1.1 * first;
+    study.min_frequency = Some(limit);
+    let (_, limited) = run(&study, Method::Unrestricted, 0);
+    let raised = limited.frequency.unwrap();
+    assert!(
+        raised >= 0.99 * limit,
+        "{raised} Hz for {limit}: {first} without"
+    );
+    assert!(limited.mass <= 1.02 * study.mass_target, "{}", limited.mass);
+    // Without a limit, no frequency is sought.
+    study.min_frequency = None;
+    study.max_iterations = 3;
+    assert_eq!(run(&study, Method::Unrestricted, 0).1.frequency, None);
+    // A limit that is no frequency is refused.
+    study.min_frequency = Some(-5.0);
+    let cancel = AtomicBool::new(false);
+    let grid = Grid::build(&study, 0, &cancel).unwrap();
+    let refused = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &STEEL,
+        &SolveOptions::default(),
+        &cancel,
+        &|_| {},
+    );
+    assert!(matches!(refused, Err(GenerativeError::BadFrequency)));
 }

@@ -153,6 +153,7 @@ fn study(bracket: &Bracket, density: f64) -> GenerativeStudy {
         max_iterations: 40,
         voxel_size,
         symmetry: None,
+        min_frequency: None,
     }
 }
 
@@ -407,6 +408,7 @@ fn an_outcome_cut_from_its_starting_shape_meets_its_faces() {
         max_iterations: 30,
         voxel_size: 1.0,
         symmetry: None,
+        min_frequency: None,
     };
     let cancel = AtomicBool::new(false);
     let grid = Grid::build(&study, 0, &cancel).unwrap();

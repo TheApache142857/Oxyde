@@ -283,6 +283,9 @@ pub struct GenerativeSettings {
     pub safety_factor: f64,
     /// mm: the most an outcome may move when minimizing mass; `None` for no limit.
     pub displacement_limit: Option<f64>,
+    /// Hz: the lowest natural frequency an outcome may have, held by the first load case's
+    /// fixtures, with either objective; `None` for no limit.
+    pub min_frequency: Option<f64>,
     /// mm: the minimum thickness; `None` for three voxels.
     pub member_size: Option<f64>,
     /// Iterations at most, for each outcome.
@@ -325,6 +328,7 @@ impl Default for GenerativeSettings {
             mass_target: 0.0,
             safety_factor: 2.0,
             displacement_limit: None,
+            min_frequency: None,
             member_size: None,
             iterations: 150,
             resolution: MeshSize::Automatic { density: 0.5 },
@@ -1035,6 +1039,9 @@ struct GenerativeDto {
     /// mm; only when minimizing mass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     displacement_limit: Option<f64>,
+    /// Hz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    min_frequency: Option<f64>,
     /// mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     member_size: Option<f64>,
@@ -1730,6 +1737,7 @@ fn generative_dto(g: &GenerativeSettings) -> GenerativeDto {
             .then_some(g.mass_target),
         safety_factor: g.safety_factor,
         displacement_limit: g.displacement_limit,
+        min_frequency: g.min_frequency,
         member_size: g.member_size,
         iterations: g.iterations,
         resolution: ResolutionDto {
@@ -2526,6 +2534,7 @@ fn generative_from(
         mass_target,
         safety_factor,
         displacement_limit,
+        min_frequency: positive_size(dto.min_frequency, "the minimum frequency")?,
         member_size: positive_size(dto.member_size, "the member size")?,
         iterations: dto.iterations,
         resolution: size_from(
@@ -2838,6 +2847,7 @@ mod tests {
             mass_target: 0.25,
             safety_factor: 2.5,
             displacement_limit: None,
+            min_frequency: Some(120.0),
             member_size: Some(4.0),
             iterations: 120,
             resolution: MeshSize::ElementSize(0.8),
@@ -3064,6 +3074,8 @@ mod tests {
         assert_eq!(g["objective"], "min_mass");
         assert!(g.get("mass_target").is_none());
         assert_eq!(g["displacement_limit"], 0.2);
+        // The frequency limit, with either objective, in hertz.
+        assert_eq!(g["min_frequency"], 120.0);
         for d in [
             AxisDirection::MinusX,
             AxisDirection::PlusY,
@@ -3408,6 +3420,10 @@ mod tests {
                 block(v)["displacement_limit"] = (-1.0).into();
             },
             "displacement limit is not positive",
+        );
+        refused(
+            &|v| block(v)["min_frequency"] = 0.0.into(),
+            "minimum frequency is not positive",
         );
         refused(
             &|v| block(v)["methods"][4]["tool_diameter"] = 0.0.into(),

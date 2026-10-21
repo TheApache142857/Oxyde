@@ -1312,6 +1312,28 @@ impl Hierarchy {
     }
 }
 
+/// One V-cycle of a finest level's hierarchy from zero, kept to the allowed motions: the
+/// preconditioner of other solvers on that level (the frequency limit's eigensolver).
+pub(crate) struct Cycle {
+    hierarchy: Hierarchy,
+    threads: usize,
+}
+
+impl Cycle {
+    pub(crate) fn new(fine: &Fine, threads: usize) -> Result<Cycle, GenerativeError> {
+        Ok(Cycle {
+            hierarchy: Hierarchy::new(fine, COARSEST_NODES, threads)?,
+            threads,
+        })
+    }
+
+    /// `z ≈ A⁻¹ r` on `fine`, the level the cycle was made for.
+    pub(crate) fn apply(&mut self, fine: &Fine, r: &[f64], z: &mut [f64]) {
+        self.hierarchy.apply(fine, r, z, self.threads);
+        fine.project(z);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cycle(
     fine: &Fine,

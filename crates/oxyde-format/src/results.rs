@@ -481,6 +481,9 @@ pub struct GenerativeOutcome {
     /// 1 (all of them half); `None` for a failed outcome, and in files written before it was
     /// kept.
     pub grayness: Option<f64>,
+    /// Hz: its lowest natural frequency, held by the first load case's fixtures, when the
+    /// study limits it; `None` otherwise.
+    pub frequency: Option<f64>,
     /// Every iteration, in order.
     pub history: Vec<GenerativeIteration>,
     /// Each voxel's density at the end, 0 (no material) to 255 (solid), before the
@@ -844,6 +847,7 @@ fn generative_dto(g: &GenerativeResults) -> GenerativeDto {
                 max_von_mises: o.max_von_mises,
                 min_factor_of_safety: o.min_factor_of_safety,
                 grayness: o.grayness,
+                frequency: o.frequency,
                 history: o.history.clone(),
                 snapshots: o.snapshots.iter().map(|s| s.iteration).collect(),
             })
@@ -1235,6 +1239,7 @@ pub fn read_results<R: Read + Seek>(reader: R) -> Result<ResultsFile, FormatErro
                 max_von_mises: o.max_von_mises,
                 min_factor_of_safety: o.min_factor_of_safety,
                 grayness: o.grayness,
+                frequency: o.frequency,
                 history: o.history.clone(),
                 density,
                 snapshots,
@@ -1588,6 +1593,9 @@ fn validate_generative(g: &GenerativeResults) -> Result<(), String> {
         if o.grayness.is_some_and(|g| !(0.0..=1.0).contains(&g)) {
             return Err(format!("outcome {id}'s grayness is not between 0 and 1"));
         }
+        if o.frequency.is_some_and(|f| !(f.is_finite() && f >= 0.0)) {
+            return Err(format!("outcome {id}'s frequency is not a number of hertz"));
+        }
     }
     Ok(())
 }
@@ -1686,6 +1694,9 @@ struct OutcomeDto {
     /// 0 to 1; absent for a failed outcome and in files written before it was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     grayness: Option<f64>,
+    /// Hz; only when the study limits the frequency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frequency: Option<f64>,
     #[serde(default)]
     history: Vec<GenerativeIteration>,
     /// The iterations `snapshots.bin` holds, from 1, increasing.
@@ -2249,6 +2260,7 @@ mod tests {
             max_von_mises: 92.4,
             min_factor_of_safety: Some(2.98),
             grayness: Some(0.031),
+            frequency: Some(143.5),
             history: vec![step(120.4, 0.2), step(40.0, 0.05), step(35.2, 0.004)],
             density: vec![255, 0, 128, 255, 0, 0],
             snapshots: Vec::new(),
@@ -2291,6 +2303,7 @@ mod tests {
         failed.history.clear();
         failed.density.clear();
         failed.grayness = None;
+        failed.frequency = None;
         file.generative = Some(GenerativeResults {
             grid: VoxelGrid {
                 origin: [-40.0, -5.0, -30.0],
@@ -2374,6 +2387,7 @@ mod tests {
         assert_eq!(first["max_von_mises"], 92.4);
         assert_eq!(first["min_factor_of_safety"], 2.98);
         assert_eq!(first["grayness"], 0.031);
+        assert_eq!(first["frequency"], 143.5);
         assert_eq!(
             first["history"][2],
             serde_json::json!({ "compliance": 35.2, "mass": 0.25, "change": 0.004 })
@@ -2393,7 +2407,7 @@ mod tests {
             failed["method"],
             serde_json::json!({ "type": "milling", "directions": ["+y", "-y"], "tool_diameter": 5.0 })
         );
-        assert!(failed.get("grayness").is_none());
+        assert!(failed.get("grayness").is_none() && failed.get("frequency").is_none());
         let snapshots = json["entries"]
             .as_array()
             .unwrap()
@@ -2471,6 +2485,10 @@ mod tests {
         refused(
             edit(|g| g.outcomes[1].grayness = Some(1.5)),
             "grayness is not between 0 and 1",
+        );
+        refused(
+            edit(|g| g.outcomes[1].frequency = Some(-3.0)),
+            "frequency is not a number of hertz",
         );
         let mut meshed = generative_sample();
         meshed.mesh = sample().mesh;

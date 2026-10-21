@@ -46,6 +46,11 @@
 //!   does not count as settled.
 //! - [`surface`] cuts the densities into a smooth closed surface; [`decimate`] and
 //!   [`solid_pieces`] make it something a modelling kernel takes.
+//! - **A frequency limit** (`frequency`) keeps the design's lowest natural frequencies, held
+//!   by the first load case's fixtures, at or above a minimum: the lowest modes found each
+//!   iteration by LOBPCG preconditioned by the multigrid cycle, each a constraint for the
+//!   method of moving asymptotes, the mass going as the sixth power of the density below a
+//!   tenth so near-void regions do not vibrate on their own.
 //! - [`check_part`] checks the part made of an outcome: its surface meshed with
 //!   tetrahedra, each load case solved on it by the static solver, for numbers the voxels
 //!   only estimate.
@@ -57,6 +62,7 @@ mod additive;
 mod brick;
 mod check;
 mod decimate;
+mod frequency;
 mod grid;
 mod mma;
 mod multigrid;
@@ -234,6 +240,9 @@ pub struct GenerativeStudy {
     pub voxel_size: f64,
     /// Planes the outcome is mirrored about.
     pub symmetry: Option<Symmetry>,
+    /// Hz: the lowest natural frequency the outcome may have, held by the first load case's
+    /// fixtures; `None` for no limit.
+    pub min_frequency: Option<f64>,
 }
 
 impl GenerativeStudy {
@@ -458,6 +467,9 @@ pub struct Outcome {
     /// when every one is solid or void, 1 when all are half (Sigmund's measure of
     /// non-discreteness).
     pub grayness: f64,
+    /// Hz: the lowest natural frequency of the design solved, held by the first load case's
+    /// fixtures, when the study limits it.
+    pub frequency: Option<f64>,
 }
 
 /// Why an outcome could not be generated.
@@ -512,6 +524,8 @@ pub enum GenerativeError {
     /// A build direction crosses a symmetry plane: layers printed one way cannot give a
     /// mirrored shape.
     BuildAcrossSymmetry,
+    /// The minimum frequency is not a positive number of hertz.
+    BadFrequency,
     NotConverged {
         iterations: usize,
         residual: f64,
@@ -583,6 +597,12 @@ impl std::fmt::Display for GenerativeError {
                 f,
                 "the build direction crosses a symmetry plane, and layers printed one way cannot give a mirrored shape: print along the plane, or take it off"
             ),
+            GenerativeError::BadFrequency => {
+                write!(
+                    f,
+                    "the minimum frequency must be a positive number of hertz"
+                )
+            }
             GenerativeError::PullAcrossSymmetry => write!(
                 f,
                 "the casting or milling direction crosses a symmetry plane, and a shape made from one side cannot be mirrored across it: pull both ways from that plane, or take it off"
@@ -887,6 +907,15 @@ pub fn generate_on(
     }
     // The material weighs in some case: its loads change with the design.
     let weighted = cases.iter().any(|c| c.acceleration != [0.0; 3]);
+    // ω², s⁻², that the lowest natural frequencies must keep at or above, when the study
+    // limits them.
+    let least_eigenvalue = match study.min_frequency {
+        None => None,
+        Some(f) if f.is_finite() && f > 0.0 => Some((2.0 * std::f64::consts::PI * f).powi(2)),
+        Some(_) => return Err(GenerativeError::BadFrequency),
+    };
+    // Optimality criteria take neither: the method of moving asymptotes moves the design.
+    let moving_asymptotes = weighted || least_eigenvalue.is_some();
 
     // The design starts uniform: at the density whose projection meets the target, or solid
     // (where the stresses are least) to minimize mass.
@@ -919,6 +948,10 @@ pub fn generate_on(
     let mut compliance = 0.0;
     // N·mm: the first compliance, what weighted stiffness studies scale theirs to.
     let mut first_compliance: Option<f64> = None;
+    // The last iteration's modes, the next eigensolve's start, and the lowest natural
+    // frequency of the design solved (Hz).
+    let mut modes: Vec<Vec<f64>> = Vec::new();
+    let mut lowest_frequency: Option<f64> = None;
 
     'iterations: for iteration in 0..iterations {
         // Stopped after an iteration or more: the design as far as it got.
@@ -1050,6 +1083,44 @@ pub fn generate_on(
         }
         let mass_now: f64 = rho.iter().sum::<f64>() * voxel_mass;
 
+        // The lowest modes, held by the first case's fixtures, when the frequency is limited.
+        // Tonnes, as millimetres and newtons take them: kg × 10⁻³.
+        let tonnes = voxel_mass * 1e-3;
+        let found = match (least_eigenvalue, cases.first()) {
+            (Some(_), Some(case)) => {
+                let fine = Fine::new(
+                    dims,
+                    &brick,
+                    &stiffness,
+                    &case.held,
+                    &case.projectors,
+                    SCALAR_BELOW * modulus * h,
+                );
+                let masses: Vec<f64> = (0..voxels)
+                    .map(|v| match state[v] {
+                        State::Free => tonnes * frequency::mass_share(rho[v]).0,
+                        State::Solid => tonnes,
+                        State::Void => 0.0,
+                    })
+                    .collect();
+                let nodal = frequency::nodal_masses(dims, &masses);
+                let start = (!modes.is_empty()).then_some(modes.as_slice());
+                match frequency::lowest_modes(&fine, &nodal, start, cancel, threads) {
+                    Ok(found) => Some(found),
+                    Err(GenerativeError::Cancelled) if !history.is_empty() => {
+                        stopped = true;
+                        break 'iterations;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            _ => None,
+        };
+        if let Some(found) = &found {
+            lowest_frequency = found.values.first().map(|&l| frequency::hertz(l));
+            modes.clone_from(&found.vectors);
+        }
+
         // The slopes of the compliance and the mass for the projected densities, carried
         // back through the projection, the cap and the filter to the design groups.
         let back = |per_voxel: &dyn Fn(usize) -> f64| -> Vec<f64> {
@@ -1089,6 +1160,25 @@ pub fn generate_on(
             |v: usize| PENALTY * rho[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * modulus * h;
         // kg: what each free voxel's weight gains per unit of projected density.
         let weight_slope = |v: usize| voxel_mass * weight_share(rho[v]).1;
+        // The frequency limit, a constraint per mode, `1 − λ / λ_min` (met at or under 0),
+        // and its slopes for the design groups.
+        let mass_slope = |v: usize| tonnes * frequency::mass_share(rho[v]).1;
+        let mut frequency_limits: Vec<(f64, Vec<f64>)> = Vec::new();
+        if let (Some(least), Some(found)) = (least_eigenvalue, &found) {
+            for (&lambda, phi) in found.values.iter().zip(&found.vectors) {
+                let per_voxel = frequency::eigenvalue_slopes(
+                    dims,
+                    &brick,
+                    phi,
+                    &stiffness,
+                    lambda,
+                    &stiffness_slope,
+                    &mass_slope,
+                    threads,
+                );
+                frequency_limits.push((1.0 - lambda / least, back(&|v| -per_voxel[v] / least)));
+            }
+        }
         let next = match limits {
             None => {
                 // The compliance's slope: the stiffness's, and where the material weighs,
@@ -1108,20 +1198,25 @@ pub fn generate_on(
                     }
                 }
                 let dc = back(&|v| per_voxel[v]);
-                if weighted {
+                if moving_asymptotes {
                     // Weight turns the compliance's slope positive where material loads
-                    // more than it stiffens, and optimality criteria assume it never does:
-                    // the method of moving asymptotes moves the design, the compliance
-                    // scaled to the first one its objective, the mass target its limit
-                    // (the stiffest design may weigh less than it).
+                    // more than it stiffens, and optimality criteria assume it never does;
+                    // nor do they take a frequency limit: the method of moving asymptotes
+                    // moves the design, the compliance scaled to the first one its
+                    // objective, the mass target and the frequency limit its constraints
+                    // (the stiffest design may weigh less than the target).
                     let reference =
                         *first_compliance.get_or_insert(compliance.max(f64::MIN_POSITIVE));
                     let df0: Vec<f64> = dc.iter().map(|d| d / reference).collect();
-                    let value = mass_now / target - 1.0;
-                    feasible = value <= LIMIT_TOLERANCE;
-                    let slope: Vec<f64> = dm.iter().map(|m| m / target).collect();
+                    let mut values = vec![mass_now / target - 1.0];
+                    let mut slopes = vec![dm.iter().map(|m| m / target).collect::<Vec<f64>>()];
+                    for (value, slope) in frequency_limits {
+                        values.push(value);
+                        slopes.push(slope);
+                    }
+                    feasible = values.iter().all(|g| *g <= LIMIT_TOLERANCE);
                     let limit = if beta >= 8.0 { LATE_MMA_MOVE } else { MMA_MOVE };
-                    mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &[value], &[slope])
+                    mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &values, &slopes)
                 } else {
                     let budget =
                         target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
@@ -1229,6 +1324,10 @@ pub fn generate_on(
                     let factor = displacement_scale / allowed;
                     slopes.push(back(&|v| factor * displacement_voxel[v]));
                 }
+                for (value, slope) in frequency_limits {
+                    values.push(value);
+                    slopes.push(slope);
+                }
                 feasible = values.iter().all(|g| *g <= LIMIT_TOLERANCE);
                 // Mass as a share of the whole design space's.
                 let df0: Vec<f64> = dm.iter().map(|m| m / max).collect();
@@ -1261,13 +1360,14 @@ pub fn generate_on(
                     let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
                         (lo.min(s.compliance), hi.max(s.compliance))
                     });
-                    // Weighted, the stiffest design may weigh less than the target.
-                    let on_target = if weighted {
+                    // Weighted or limited in frequency, the stiffest design may weigh less
+                    // than the target.
+                    let on_target = if moving_asymptotes {
                         mass_now <= (1.0 + STEADY_MASS) * target
                     } else {
                         (mass_now - target).abs() <= STEADY_MASS * target
                     };
-                    hi - lo <= STEADY_COMPLIANCE * hi && on_target
+                    hi - lo <= STEADY_COMPLIANCE * hi && on_target && feasible
                 }
                 // The mass steady, the limits met.
                 Some(_) => {
@@ -1339,6 +1439,7 @@ pub fn generate_on(
         solver_iterations,
         filter_radius: radius,
         grayness: grayness(&solved_rho, &state),
+        frequency: lowest_frequency,
     })
 }
 
