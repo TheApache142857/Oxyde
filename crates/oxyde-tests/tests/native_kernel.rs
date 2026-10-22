@@ -460,12 +460,15 @@ fn an_intersection_keeps_what_both_share() {
         &mut sketch,
         &[(-5.0, -5.0), (25.0, -5.0), (25.0, 18.0), (-5.0, 12.0)],
     );
+    // On the Front plane, under the block: an intersection, like a cut, goes against the
+    // sketch's normal unless reversed (into the material from a face it is sketched on), so
+    // it is reversed to reach up into the block.
     extrude(
         &mut part,
         sketch,
         ExtrudeOp::Intersect,
         ExtrudeExtent::Blind { depth: 6.0 },
-        false,
+        true,
     );
     assert_same_part("intersection", &part);
 }
