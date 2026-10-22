@@ -41,6 +41,8 @@ mod equations_ui;
 mod evaluate;
 mod export;
 mod features_ui;
+mod flow_ui;
+mod generative_ui;
 mod gpu;
 mod gpu_trace;
 mod hole_wizard;

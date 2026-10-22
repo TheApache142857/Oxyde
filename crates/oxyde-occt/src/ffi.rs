@@ -397,6 +397,14 @@ pub(crate) mod bridge {
         /// Copy moved by the 3 × 4 matrix `rows` (row-major), which may be a mirror.
         fn transform(self: Pin<&mut Session>, shape: u64, rows: &[f64]) -> Result<OpResultData>;
 
+        /// A solid from a closed triangle mesh, `points` x y z after one another,
+        /// `triangles` three indices each.
+        fn solid_from_mesh(
+            self: Pin<&mut Session>,
+            points: &[f64],
+            triangles: &[u32],
+        ) -> Result<OpResultData>;
+
         /// `kind`: 0 = fuse, 1 = cut, 2 = common; all `tools` at once.
         fn boolean_op(
             self: Pin<&mut Session>,

@@ -93,8 +93,11 @@ pub enum CommandTab {
     Evaluate,
     /// The model drawn by the path tracer (`render_ui`).
     Render,
-    /// A linear static study (`simulation_ui`).
+    /// The model's studies: static, thermal and topology (`simulation_ui`).
     Simulation,
+    /// The model's generative studies: shapes grown between bodies to keep, as Fusion
+    /// 360's Generative Design workspace has them (`generative_ui`).
+    Generative,
 }
 
 /// A plane or axis drawn over the viewport, which can be clicked.
@@ -1352,6 +1355,7 @@ impl OxydeApp {
         self.sync_preview(ui.ctx());
         self.refresh_scene();
         self.simulation_scene();
+        self.generative_scene();
         if self.sketch.is_some() {
             // A dimension's value is previewed only while its window is open.
             if !matches!(self.dialog, Some(Dialog::Dimension { .. }))
@@ -1943,6 +1947,7 @@ impl OxydeApp {
         match tessellate_bodies(&self.kernel, body, self.mesh_fraction()) {
             Ok(mut mesh) => {
                 let (mut materials, textures) = self.part_materials();
+                self.tint_generative_roles(&mut materials);
                 self.add_context(&mut mesh, &mut materials);
                 self.viewport.pickable = self.own_mesh_counts(&mesh);
                 let mut scene = Scene::from_mesh(&mesh);
@@ -2262,6 +2267,9 @@ impl OxydeApp {
                 }
                 if self.tab == CommandTab::Simulation && self.sketch.is_none() {
                     self.simulation_panel(ui);
+                }
+                if self.tab == CommandTab::Generative && self.sketch.is_none() {
+                    self.generative_panel(ui);
                 }
                 self.property_manager(ui);
                 self.left_panel_tabs(ui);

@@ -74,9 +74,28 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const PART_FORMAT_VERSION: u32 = 2;
 
 /// The newest `format_version` of simulation studies and results this crate reads: 2 adds
-/// thermal studies. A document is written with 1 when it holds only what version 1 knows,
-/// so older readers still open static studies.
-pub const SIMULATION_FORMAT_VERSION: u32 = 2;
+/// thermal studies, 3 topology studies, 4 generative studies, 5 flow studies, 6 cooling
+/// studies. A document is written with the oldest version that holds what it has, so older
+/// readers still open what they can.
+pub const SIMULATION_FORMAT_VERSION: u32 = 6;
+
+/// The `format_version` of simulation documents holding a thermal study (and no flow one).
+pub const THERMAL_FORMAT_VERSION: u32 = 2;
+
+/// The `format_version` of simulation documents holding a topology study (and nothing
+/// newer).
+pub const TOPOLOGY_FORMAT_VERSION: u32 = 3;
+
+/// The `format_version` of simulation documents holding a generative or a frequency study
+/// (and nothing newer).
+pub const GENERATIVE_FORMAT_VERSION: u32 = 4;
+
+/// The `format_version` of simulation documents holding a flow study.
+pub const FLOW_FORMAT_VERSION: u32 = 5;
+
+/// The `format_version` of study and results documents holding a cooling study (flow with
+/// heat conducted through the solids).
+pub const COOLING_FORMAT_VERSION: u32 = 6;
 
 const FORMAT_NAME: &str = "oxyde";
 const MANIFEST: &str = "manifest.json";

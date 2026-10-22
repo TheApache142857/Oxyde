@@ -118,6 +118,11 @@ pub enum Icon {
     Safety,
     /// New Study: a study sheet with a green plus.
     NewStudy,
+    /// Topology: a bracket hollowed into a truss inside the dashed outline of the block it
+    /// was.
+    Topology,
+    /// Preserve Region: a block with its top face kept, and a padlock.
+    Preserve,
     /// Temperature: a thermometer, red.
     Temperature,
     /// Heat Power: orange arrows into a block, a flame.
@@ -134,6 +139,32 @@ pub enum Icon {
     TemperaturePlot,
     /// The heat flux plot: a block with arrows through it in plot colours.
     HeatFluxPlot,
+    /// Generative design: two green bosses joined by grown, branching members.
+    Generative,
+    /// Preserve (a body's role): a green block kept as it is, a padlock on it.
+    PreserveBody,
+    /// Obstacle: a red block material stays out of.
+    Obstacle,
+    /// Starting shape: a yellow block the material starts in.
+    StartingShape,
+    /// Explore: outcomes as dots on a plot, one picked.
+    Explore,
+    /// A flow study: streamlines bending round a body.
+    FlowStudy,
+    /// A cooling study: a heat sink's fins, warm at the base, in a blue stream.
+    CoolingStudy,
+    /// An inlet: blue arrows into a lid.
+    Inlet,
+    /// A static pressure opening, where the fluid goes out: blue arrows leaving a lid.
+    Outlet,
+    /// An ideal wall: a wall the fluid slips along.
+    IdealWall,
+    /// A goal: a flag on a face, what a flow study measures.
+    Goal,
+    /// A cut plot: a plane through the fluid in plot colours.
+    CutPlot,
+    /// A surface plot: a body's faces in plot colours, with flow lines past it.
+    SurfacePlot,
     // View and edit
     ViewFront,
     ViewTop,
@@ -174,6 +205,25 @@ const HEAT: Color32 = Color32::from_rgb(235, 120, 25);
 const HOT: Color32 = Color32::from_rgb(220, 45, 35);
 /// A fluid carrying heat away.
 const COOL: Color32 = Color32::from_rgb(40, 125, 215);
+/// Material a topology study keeps.
+const KEEP: Color32 = Color32::from_rgb(25, 150, 150);
+/// Generative design's roles, as Fusion 360 colours them: preserve, obstacle, starting shape.
+const PRESERVE: Color32 = Color32::from_rgb(70, 170, 95);
+const PRESERVE_BLOCK: [Color32; 3] = [
+    Color32::from_rgb(165, 220, 175),
+    PRESERVE,
+    Color32::from_rgb(45, 120, 65),
+];
+const OBSTACLE: [Color32; 3] = [
+    Color32::from_rgb(240, 160, 150),
+    Color32::from_rgb(215, 75, 65),
+    Color32::from_rgb(165, 50, 45),
+];
+const STARTING: [Color32; 3] = [
+    Color32::from_rgb(250, 228, 150),
+    Color32::from_rgb(235, 190, 60),
+    Color32::from_rgb(190, 148, 40),
+];
 const WHITE: Color32 = Color32::WHITE;
 
 /// Draws on the 24-unit grid of one icon.
@@ -1187,6 +1237,124 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.line(&[(14.0, 17.0), (20.0, 17.0)], 2.2, WHITE);
             pen.line(&[(17.0, 14.0), (17.0, 20.0)], 2.2, WHITE);
         }
+        Topology => {
+            // The block it was, dashed, and what is left of it: a wall where it is held,
+            // two arms meeting at the loaded tip, a strut between them.
+            pen.dashed(
+                &[
+                    (2.0, 4.0),
+                    (22.0, 4.0),
+                    (22.0, 20.0),
+                    (2.0, 20.0),
+                    (2.0, 4.0),
+                ],
+                1.0,
+                INK,
+                2.0,
+                1.6,
+            );
+            pen.poly(
+                &[(2.0, 4.0), (5.5, 4.0), (5.5, 20.0), (2.0, 20.0)],
+                BODY,
+                INK,
+            );
+            pen.poly(
+                &[
+                    (5.5, 4.0),
+                    (9.0, 4.0),
+                    (22.0, 10.5),
+                    (22.0, 13.5),
+                    (5.5, 8.5),
+                ],
+                BODY_TOP,
+                INK,
+            );
+            pen.poly(
+                &[
+                    (5.5, 20.0),
+                    (9.0, 20.0),
+                    (22.0, 13.5),
+                    (22.0, 10.5),
+                    (5.5, 15.5),
+                ],
+                BODY_SIDE,
+                INK,
+            );
+            pen.poly(
+                &[(10.0, 7.8), (12.5, 9.0), (12.5, 15.0), (10.0, 16.2)],
+                BODY,
+                INK,
+            );
+        }
+        Generative => {
+            // Members grown from the lower boss to the upper one, branching on the way.
+            let members: [&[(f32, f32)]; 3] = [
+                &[(7.0, 16.0), (10.5, 14.5), (13.5, 11.0), (17.0, 7.5)],
+                &[(5.5, 15.0), (6.5, 10.5), (10.0, 7.0), (16.0, 5.5)],
+                &[(10.5, 14.5), (14.5, 15.0), (18.0, 10.0), (18.5, 8.5)],
+            ];
+            for m in members {
+                pen.line(m, 3.4, INK);
+            }
+            for m in members {
+                pen.line(m, 2.0, BODY);
+            }
+            pen.ring(5.5, 18.0, 3.2, 2.2, PRESERVE);
+            pen.ring(18.5, 6.0, 3.2, 2.2, PRESERVE);
+        }
+        PreserveBody => {
+            pen.block(4.0, 10.0, 12.0, 10.0, 5.0, PRESERVE_BLOCK);
+            // Kept as it is: a white padlock on its face.
+            pen.line(
+                &Pen::arc_points(10.0, 14.5, 1.9, 2.0, PI, 2.0 * PI),
+                1.4,
+                WHITE,
+            );
+            pen.fill(
+                &[(7.5, 14.5), (12.5, 14.5), (12.5, 18.5), (7.5, 18.5)],
+                WHITE,
+            );
+        }
+        Obstacle => {
+            pen.block(4.0, 10.0, 12.0, 10.0, 5.0, OBSTACLE);
+            // No material: a white bar across.
+            pen.line(&[(6.5, 15.0), (13.5, 15.0)], 2.4, WHITE);
+        }
+        StartingShape => {
+            pen.block(3.0, 9.0, 14.0, 11.0, 5.0, STARTING);
+            // The shape that grows inside it.
+            pen.line(&[(6.0, 17.0), (9.5, 13.0), (14.0, 12.0)], 2.2, INK);
+        }
+        Explore => {
+            pen.line(&[(3.0, 3.0), (3.0, 21.0), (21.0, 21.0)], 1.4, INK);
+            for (x, y, c) in [
+                (7.0, 8.0, SKETCH),
+                (10.0, 13.0, ACCENT),
+                (13.5, 9.5, SKETCH),
+                (17.0, 16.0, ACCENT),
+            ] {
+                pen.circle(x, y, 1.9, c, None);
+            }
+            pen.circle(11.0, 17.0, 2.2, PRESERVE, None);
+            pen.circle(11.0, 17.0, 3.6, Color32::TRANSPARENT, Some((1.3, INK)));
+        }
+        Preserve => {
+            pen.block(3.0, 11.0, 12.0, 9.0, 5.0, [KEEP, BODY, BODY_SIDE]);
+            // A padlock: its shackle, then its body.
+            pen.line(
+                &Pen::arc_points(18.5, 9.0, 2.6, 2.8, PI, 2.0 * PI),
+                1.8,
+                INK,
+            );
+            pen.line(&[(15.9, 9.0), (15.9, 10.5)], 1.8, INK);
+            pen.line(&[(21.1, 9.0), (21.1, 10.5)], 1.8, INK);
+            pen.poly(
+                &[(14.5, 10.5), (22.5, 10.5), (22.5, 17.0), (14.5, 17.0)],
+                ACCENT,
+                INK,
+            );
+            pen.circle(18.5, 13.5, 1.1, INK, None);
+        }
         Temperature => {
             // A thermometer: the tube, the bulb, the red column.
             pen.poly(
@@ -1300,6 +1468,140 @@ fn draw(pen: &Pen, icon: Icon) {
                 let y = 12.0 + 3.0 * k as f32;
                 pen.arrow((1.0, y), (21.0, y), 1.5, *color);
             }
+        }
+        CoolingStudy => {
+            // A heat sink: a warm base and three fins, air flowing between them.
+            pen.poly(
+                &[(4.0, 16.0), (20.0, 16.0), (20.0, 20.0), (4.0, 20.0)],
+                HOT,
+                INK,
+            );
+            for x in [5.0, 10.5, 16.0] {
+                pen.poly(
+                    &[(x, 6.0), (x + 3.0, 6.0), (x + 3.0, 16.0), (x, 16.0)],
+                    BODY,
+                    INK,
+                );
+            }
+            pen.arrow((1.0, 4.0), (23.0, 4.0), 1.5, COOL);
+            pen.line(&[(8.0, 11.0), (10.5, 11.0)], 1.5, COOL);
+            pen.line(&[(13.5, 11.0), (16.0, 11.0)], 1.5, COOL);
+        }
+        FlowStudy => {
+            // A body, and three streamlines bending round it.
+            pen.poly(
+                &[(9.0, 9.0), (15.0, 9.0), (15.0, 15.0), (9.0, 15.0)],
+                BODY,
+                INK,
+            );
+            pen.line(
+                &[
+                    (2.0, 6.0),
+                    (7.0, 6.0),
+                    (12.0, 4.5),
+                    (17.0, 6.0),
+                    (22.0, 6.0),
+                ],
+                1.5,
+                COOL,
+            );
+            pen.line(&[(2.0, 12.0), (7.0, 12.0)], 1.5, COOL);
+            pen.line(&[(17.0, 12.0), (22.0, 12.0)], 1.5, COOL);
+            pen.line(
+                &[
+                    (2.0, 18.0),
+                    (7.0, 18.0),
+                    (12.0, 19.5),
+                    (17.0, 18.0),
+                    (22.0, 18.0),
+                ],
+                1.5,
+                COOL,
+            );
+            pen.head((22.0, 6.0), 1.0, 0.0, 3.0, COOL);
+            pen.head((22.0, 18.0), 1.0, 0.0, 3.0, COOL);
+        }
+        Inlet => {
+            // A lid, and the fluid coming in through it.
+            pen.poly(
+                &[(14.0, 3.0), (18.0, 3.0), (18.0, 21.0), (14.0, 21.0)],
+                BODY_TOP,
+                INK,
+            );
+            for y in [7.0, 12.0, 17.0] {
+                pen.arrow((2.0, y), (13.0, y), 1.6, COOL);
+            }
+        }
+        Outlet => {
+            // A lid, and the fluid going out past it.
+            pen.poly(
+                &[(6.0, 3.0), (10.0, 3.0), (10.0, 21.0), (6.0, 21.0)],
+                BODY_TOP,
+                INK,
+            );
+            for y in [7.0, 12.0, 17.0] {
+                pen.arrow((11.0, y), (22.0, y), 1.6, COOL);
+            }
+        }
+        IdealWall => {
+            // A hatched wall, and the fluid gliding along it.
+            pen.line(&[(3.0, 16.0), (21.0, 16.0)], 1.8, INK);
+            for x in [5.0, 9.0, 13.0, 17.0, 21.0] {
+                pen.line(&[(x, 16.0), (x - 3.0, 20.0)], 1.0, INK);
+            }
+            pen.arrow((3.0, 12.0), (21.0, 12.0), 1.6, COOL);
+            pen.arrow((6.0, 7.0), (18.0, 7.0), 1.4, COOL);
+        }
+        Goal => {
+            // A flag planted on a face.
+            pen.solid(3.0, 15.0, 14.0, 6.0, 3.0);
+            pen.line(&[(11.0, 15.0), (11.0, 2.0)], 1.6, INK);
+            pen.poly(&[(11.0, 2.5), (20.0, 5.0), (11.0, 8.0)], ACCENT, INK);
+        }
+        CutPlot => {
+            // A plane through the fluid, banded cold to hot.
+            let bands = [
+                Color32::from_rgb(0, 60, 255),
+                Color32::from_rgb(0, 200, 255),
+                Color32::from_rgb(40, 220, 60),
+                Color32::from_rgb(250, 220, 0),
+                Color32::from_rgb(240, 40, 20),
+            ];
+            for (k, color) in bands.iter().enumerate() {
+                let x = 4.0 + 3.2 * k as f32;
+                let skew = 4.0;
+                pen.fill(
+                    &[
+                        (x + skew, 5.0),
+                        (x + 3.2 + skew, 5.0),
+                        (x + 3.2, 19.0),
+                        (x, 19.0),
+                    ],
+                    *color,
+                );
+            }
+            pen.closed(
+                &[(8.0, 5.0), (24.0, 5.0), (20.0, 19.0), (4.0, 19.0)],
+                1.0,
+                INK,
+            );
+            pen.arrow((1.0, 12.0), (7.0, 12.0), 1.3, COOL);
+        }
+        SurfacePlot => {
+            // A body's faces in plot colours, and the fluid going past.
+            pen.block(
+                5.0,
+                10.0,
+                11.0,
+                10.0,
+                4.0,
+                [
+                    Color32::from_rgb(250, 220, 0),
+                    Color32::from_rgb(240, 40, 20),
+                    Color32::from_rgb(0, 200, 255),
+                ],
+            );
+            pen.arrow((1.0, 5.0), (12.0, 5.0), 1.4, COOL);
         }
         Configurations => {
             // A small table: three rows, the middle one marked as the active configuration.
@@ -1535,7 +1837,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 95] = {
+pub const ALL: [Icon; 110] = {
     use Icon::*;
     [
         Sketch,
@@ -1609,6 +1911,8 @@ pub const ALL: [Icon; 95] = {
         Displacement,
         Safety,
         NewStudy,
+        Topology,
+        Preserve,
         Temperature,
         HeatPower,
         HeatFlux,
@@ -1617,6 +1921,19 @@ pub const ALL: [Icon; 95] = {
         InternalHeat,
         TemperaturePlot,
         HeatFluxPlot,
+        Generative,
+        PreserveBody,
+        Obstacle,
+        StartingShape,
+        Explore,
+        FlowStudy,
+        CoolingStudy,
+        Inlet,
+        Outlet,
+        IdealWall,
+        Goal,
+        CutPlot,
+        SurfacePlot,
         ViewFront,
         ViewTop,
         ViewRight,

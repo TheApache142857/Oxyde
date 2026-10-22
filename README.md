@@ -102,9 +102,30 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   distances between holes, diameters, and mass properties with the centre of mass.
 - **Render tab:** a path tracer on the GPU or the CPU, with materials, studio or sky light, soft
   shadows and glass, saved as PNG.
-- **Simulation tab:** static stress, thermal, transient thermal and thermal stress studies, with
-  fixtures, loads and contacts between bodies, meshed into tetrahedra by Netgen; stress,
-  displacement, factor of safety and temperature drawn on the model.
+- **Simulation tab:** static stress, frequency, thermal, transient thermal and thermal stress
+  studies, with fixtures, loads and contacts between bodies, meshed into tetrahedra by Netgen;
+  stress, displacement, factor of safety and temperature drawn on the model, the natural
+  frequencies listed with their mass participation and each mode's shape drawn. Topology
+  studies: the stiffest shape that keeps a share of the part's mass, with regions to keep, a
+  thinnest member, symmetry planes and a mould's pull direction, shown as a smooth surface and
+  exported as STL. **Flow studies** (CFD):
+  liquids and gases through or around the model, laminar or turbulent, with inlets, openings
+  and goals on faces, solved by [OpenFOAM](https://www.openfoam.com) run as a separate program;
+  forces, flow rates and pressures, cut plots and surface plots; **cooling studies**, the fluid
+  carrying heat away and the bodies conducting it, with natural convection
+  ([docs/CFD.md](docs/CFD.md)).
+- **Generative Design tab:** shapes grown between the bodies to keep and the bodies to stay
+  clear of, in parts and assemblies, as Fusion 360 grows them, or a single body redesigned
+  from the faces to keep (its holes kept clear, the room limited along each axis), with
+  warnings before a setup that would disappoint: the stiffest shape for a mass
+  target or the lightest under a safety factor (and a displacement limit), with load cases,
+  for several materials and ways of making it (unrestricted, additive without supports,
+  2-axis cutting, milling, casting), an outcome for each, on the graphics card when there is
+  one; compared on a plot of mass against stress or stiffness, shown iteration by iteration,
+  exported as STL, OBJ or 3MF, or made a part (*Create Part*: a solid meeting the bodies
+  kept on their faces, then checked on a mesh of its own against every load case).
+  Gravity and remote masses weigh the shapes, a minimum natural frequency keeps them clear
+  of what shakes them, and milling can reach from several sides.
 - **Files and exchange:** `.oxyprt` parts and `.oxyasm` assemblies are ZIP archives of plain
   JSON, [documented](docs/FORMAT.md) so any script or tool can read them. STEP import of parts
   and whole assemblies, with their colours and materials, as a base to build on; export to STEP,
@@ -184,7 +205,9 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-assembly` | Assemblies: components, mates and the 3D mate solver, bill of materials |
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |
 | `oxyde-render` | Viewport scene and camera; software renderer (GPU fallback and reference), pixel-exact picking; the Render tab's path tracer |
-| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static and thermal solvers, result plots; depends on no other crate |
+| `oxyde-sim` | Finite element simulation: tetrahedral meshing, static, frequency and thermal solvers, topology optimization, generative design on a grid of voxels, result plots; depends on no other crate |
+| `oxyde-sim-gpu` | Generative design's solve on a graphics card: WGSL compute shaders through `wgpu`, the CPU's solve as fallback and reference |
+| `oxyde-flow` | Flow simulation through OpenFOAM, run as a separate program: cases written, run and read back; depends on no other crate |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-mcp` | MCP server: an AI assistant models, inspects and compares parts and assemblies |
@@ -195,7 +218,8 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 [MIT](LICENSE). The downloads also ship OpenCASCADE and Netgen (the Simulation tab's mesher),
 both under the LGPL 2.1 and linked dynamically, so they can be replaced;
 [packaging/THIRD-PARTY.txt](packaging/THIRD-PARTY.txt) gives the details and where their sources
-are.
+are. Flow studies run OpenFOAM (GPL-3.0), a separate program installed apart and never linked;
+the Windows installer can download it from openfoam.com.
 
 Oxyde is independent. It follows the conventions of feature-based CAD (feature names, dimension
 names, select first and then run a command) and is not affiliated with or endorsed by any CAD

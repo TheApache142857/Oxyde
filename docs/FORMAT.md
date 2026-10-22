@@ -414,7 +414,7 @@ bracket.oxysim
 └── simulation.json      required  — the model studied and its studies
 ```
 
-A study document holds what the Simulation tab needs to solve a model again: no geometry, no mesh and no results (those go in a `.oxyres`, §9). It refers to one part or assembly file and to its faces by persistent name, so it survives edits of the model as mates do. It holds every study of the model, of four types: static stress, thermal (steady state), transient thermal and thermal stress. Oxyde saves it next to the model as `<model>.oxysim` by default and opens it with the model.
+A study document holds what the Simulation tab needs to solve a model again: no geometry, no mesh and no results (those go in a `.oxyres`, §9). It refers to one part or assembly file and to its faces by persistent name, so it survives edits of the model as mates do. It holds every study of the model, of nine types: static stress, frequency, thermal (steady state), transient thermal, thermal stress, topology, generative design, flow and cooling. Oxyde saves it next to the model as `<model>.oxysim` by default and opens it with the model.
 
 ```json
 {
@@ -471,26 +471,112 @@ A study document holds what the Simulation tab needs to solve a model again: no 
       "fixtures": [ … ],
       "loads": [ { "name": "Temperature-1", "type": "temperature", "temperature": 150, "faces": [ … ] } ],
       "reference_temperature": 22
+    },
+    {
+      "name": "Topology 1",
+      "type": "topology",
+      "fixtures": [ … ],
+      "loads": [ { "name": "Force-1", "type": "force", "force": 500, "direction": [0, -1, 0], "faces": [ … ] } ],
+      "topology": { "target_mass": 0.4, "member_size": 5, "iterations": 60,
+                    "preserved": [ { "name": "Preserve-1", "depth": 2, "faces": [ … ] } ],
+                    "symmetry": { "planes": ["right", "front"], "point": [0, 0, 0] },
+                    "pull": { "direction": [0, 1, 0], "parting": [0, 10, 0] },
+                    "one_piece": true }
+    },
+    {
+      "name": "Generative 1",
+      "type": "generative",
+      "fixtures": [ … ],
+      "loads": [ { "name": "Force-1", "type": "force", "force": 800, "direction": [0, -1, 0], "faces": [ … ] } ],
+      "generative": {
+        "preserve": [ { "feature": 3 }, { "feature": 9, "index": 1 } ],
+        "preserved": [ { "name": "Preserve-1", "depth": 1.5, "faces": [ … ] } ],
+        "obstacles": [ { "body": { "feature": 12 }, "offset": 1.5 } ],
+        "starting_shape": { "feature": 15 },
+        "objective": "max_stiffness", "mass_target": 0.25, "safety_factor": 2,
+        "member_size": 4, "iterations": 150, "resolution": { "density": 0.5 },
+        "symmetry": { "planes": ["right"], "point": [0, 0, 0] },
+        "methods": [
+          { "type": "unrestricted" },
+          { "type": "additive", "directions": ["+z", "+y"], "overhang": 45 },
+          { "type": "cutting", "directions": ["+y"] },
+          { "type": "casting", "directions": ["+y"], "parting": [0, 10, 0] },
+          { "type": "milling", "directions": ["+z", "-z"], "tool_diameter": 6 }
+        ],
+        "materials": [ { "name": "Aluminium 6061-T6", "density": 2700, "mechanical": { … } },
+                       { "name": "Titanium (Ti-6Al-4V)", "density": 4430, "mechanical": { … } } ],
+        "load_cases": [ { "name": "Load Case 1", "fixtures": ["Fixed-1"], "loads": ["Force-1"] },
+                        { "name": "Load Case 2", "fixtures": ["Fixed-1"], "loads": ["Pressure-1"] } ]
+      }
+    },
+    {
+      "name": "Flow 1",
+      "type": "flow",
+      "flow": {
+        "analysis": "internal",
+        "fluid": { "name": "Water", "density": 998.2, "viscosity": 0.001002 },
+        "turbulence": "turbulent", "intensity": 0.05, "length": 1,
+        "mesh_level": 3, "iterations": 500, "residual": 0.0001
+      },
+      "conditions": [
+        { "name": "Inlet Velocity-1", "type": "inlet_velocity", "velocity": 2.5, "faces": [ … ] },
+        { "name": "Inlet Volume Flow-1", "type": "inlet_volume_flow", "volume_flow": 0.0001, "faces": [ … ] },
+        { "name": "Inlet Mass Flow-1", "type": "inlet_mass_flow", "mass_flow": 0.1, "faces": [ … ] },
+        { "name": "Static Pressure-1", "type": "static_pressure", "pressure": 0, "faces": [ … ] },
+        { "name": "Ideal Wall-1", "type": "ideal_wall", "faces": [ … ] }
+      ],
+      "goals": [
+        { "name": "Force Goal-1", "type": "force", "faces": [ … ] },
+        { "name": "Pressure Goal-1", "type": "mean_pressure", "faces": [ … ] }
+      ]
+    },
+    {
+      "name": "Cooling 1",
+      "type": "cooling",
+      "flow": {
+        "analysis": "external", "velocity": [ 0, 0.5, 0 ],
+        "fluid": { "name": "Air", "density": 1.204, "viscosity": 1.825e-05 },
+        "turbulence": "laminar", "mesh_level": 3, "iterations": 500, "residual": 0.0001
+      },
+      "cooling": {
+        "specific_heat": 1006, "conductivity": 0.0257, "expansion": 0.0034112,
+        "temperature": 25, "gravity": [ 0, -9.81, 0 ]
+      },
+      "loads": [
+        { "name": "Internal Heat-1", "type": "internal_heat", "power": 5, "faces": [ … ] },
+        { "name": "Convection-1", "type": "convection", "coefficient": 10, "ambient": 30, "faces": [ … ] }
+      ],
+      "goals": [
+        { "name": "Max Temperature Goal-1", "type": "max_temperature", "faces": [ … ] },
+        { "name": "Heat Flow Goal-1", "type": "heat_flow", "faces": [ … ] }
+      ]
     }
   ]
 }
 ```
 
 - **`model`**: `kind` is `part` or `assembly`; `path` is relative to the study document's folder, with `/` separators. `document_id` is the model's, so a moved or renamed model can be found again by it, as an assembly finds its parts (§6).
-- **Studies**: `name` is unique in the document. `type` is `static` (linear static stress: displacements, stresses, factor of safety), `thermal` (the temperatures once heat flow has settled), `transient_thermal` (the temperatures over time) or `thermal_stress` (the steady temperatures, then the stresses of the expansion they cause); another type is an error. `fixtures`, `loads` and `contacts` may be absent (empty). Their `name`s are unique within the study, together (`Fixed-1`, `Force-2`, `Temperature-1`, `Contact-1`, as SolidWorks numbers them). `suppressed` items are kept but not applied.
-- **What each type takes**: a `static` study takes fixtures and the `force`, `pressure` and `gravity` loads; `thermal` and `transient_thermal` take the thermal loads only (no fixtures); `thermal_stress` takes all of them. Readers refuse a study holding what its type does not take. `transient` is only in a `transient_thermal` study and `reference_temperature` only in a `thermal_stress` one; readers refuse them elsewhere.
+- **Studies**: `name` is unique in the document. `type` is `static` (linear static stress: displacements, stresses, factor of safety), `frequency` (the lowest natural frequencies of the model held by its fixtures, and its mode shapes), `thermal` (the temperatures once heat flow has settled), `transient_thermal` (the temperatures over time), `thermal_stress` (the steady temperatures, then the stresses of the expansion they cause), `topology` (the stiffest shape that keeps a share of the model's mass under fixtures and loads), `generative` (shapes grown between bodies to keep and bodies to stay clear of, for several materials and ways of making them: generative design, as Fusion 360 has it), `flow` (the steady flow of a liquid or a gas through or around the model, solved by OpenFOAM) or `cooling` (a flow that carries heat away from the model, which conducts it through its solids, solved by OpenFOAM); another type is an error. `fixtures`, `loads` and `contacts` may be absent (empty). Their `name`s are unique within the study, together (`Fixed-1`, `Force-2`, `Temperature-1`, `Contact-1`, as SolidWorks numbers them). `suppressed` items are kept but not applied.
+- **What each type takes**: a `static` study takes fixtures and the `force`, `pressure` and `gravity` loads; `frequency` takes fixtures and contacts but no loads (a linear study's frequencies do not depend on them), and its `frequency` block; `thermal` and `transient_thermal` take the thermal loads only (no fixtures); `thermal_stress` takes all of them; `topology` takes fixtures and the `force` and `pressure` loads (no `gravity`: the weight would change with the shape), and its `topology` block; `generative` takes fixtures, the `force`, `pressure` and `gravity` loads (any number of `gravity` loads, which its load cases pick) and the `remote_mass` loads that only it takes, and its `generative` block, but no `contacts`, `mesh` or `materials` (its grid and materials are in the block). A `flow` study takes `conditions` and `goals` and no fixtures, loads or contacts, and has a `flow` block instead of a `mesh` (a `mesh` there is ignored). A `cooling` study takes what a `flow` study does, a `cooling` block, and the thermal loads but `radiation`. Readers refuse a study holding what its type does not take. `transient` is only in a `transient_thermal` study, `reference_temperature` only in a `thermal_stress` one, `flow`, `conditions` and `goals` only in a `flow` or `cooling` one, and `cooling` only in a `cooling` one; readers refuse them elsewhere.
 - **Faces** are written as a mate's references are (§6): `face` is a FaceRef (§3 *References*), resolved in the rebuilt part. In an assembly study, `component` names the component holding it (from 1) and `path`, when the component is a sub-assembly, the component ids inside it down to the part; in a part study both are absent. Readers refuse a face of the other kind.
 - **Fixtures**: `fixed` (no displacement at all) or `roller` (roller/slider: free in the face's plane, not along its normal).
-- **Loads**: `force` is a total in N shared over its faces by area, along `direction`: `"normal"` (normal to each face, into it) or a vector in world coordinates (Y up; only its direction counts, not zero). A negative force pushes the other way. `pressure` is in MPa (N/mm²), into each face along its normal. `gravity` has no faces: an `acceleration` vector in m/s², in world coordinates, applied to the whole model with its materials' densities.
+- **Loads**: `force` is a total in N shared over its faces by area, along `direction`: `"normal"` (normal to each face, into it) or a vector in world coordinates (Y up; only its direction counts, not zero). A negative force pushes the other way. `pressure` is in MPa (N/mm²), into each face along its normal. `gravity` has no faces: an `acceleration` vector in m/s², in world coordinates, applied to the whole model with its materials' densities (in a generative study, to the shape as it grows and to the remote masses of the load cases holding it). `remote_mass` (generative studies only): a component carried by its `faces`, of `mass` kg (positive) with its centre of mass at `point` (mm, world coordinates); the accelerations of a load case holding it weigh it, and its weight reaches the faces as a force and a moment spread over them by area (a distributing link: it stiffens nothing). Written `{ "name": "Remote Mass-1", "type": "remote_mass", "faces": [ … ], "mass": 1.35, "point": [40, 25, 0] }`. A file without them reads as before.
 - **Thermal loads**, temperatures in °C (not under −273.15): `temperature` holds the faces at `temperature`. `heat_power` is a total heat flow into the faces in W, shared by area (`power`; negative takes heat out). `heat_flux` is in W/m² into the faces (`flux`). `convection` cools (or warms) the faces towards a fluid at `ambient` with a film `coefficient` in W/(m²·K), not negative. `radiation` exchanges heat with surroundings at `ambient` by `emissivity` (0 to 1) × σ (T⁴ − T∞⁴), in kelvin. `internal_heat` is a `power` in W made inside the bodies the faces belong to, spread through their volume. Faces with no thermal load are insulated.
 - **`transient`** (a `transient_thermal` study; these defaults when absent): the `duration` in seconds (positive), the number of time `steps` (1 to 100 000; 60) and the uniform `initial_temperature` the model starts at (°C; 20). The boundary conditions apply from the first instant.
 - **`reference_temperature`** (a `thermal_stress` study; 20 when absent): the temperature, °C, at which the model is free of stress; it expands by its materials' `expansion` (§3) times the difference.
+- **`frequency`** (a `frequency` study; these defaults when absent, and readers refuse it in another type): `modes`, how many natural frequencies are wanted, the lowest first, 1 to 50 (5, SolidWorks' default). Every body needs its material's `density` (§3; the study's `materials` hold none): Oxyde refuses to solve otherwise.
+- **`topology`** (a `topology` study; these defaults when absent, and readers refuse it in another type): `target_mass`, the share of the model's mass the shape keeps, between 0 and 1, both excluded (0.5); `member_size`, the thinnest member wanted in mm, positive (absent: as thin as the mesh allows, about three elements); `iterations`, the most the optimization makes, 1 to 10 000 (60); `preserved`, regions whose material stays: a `name` unique with the study's items (`Preserve-1`), `faces`, a `depth` in mm under the faces (0 or absent: the elements on the faces only) and `suppressed`. The faces of fixtures and loads keep their material without being listed. The manufacturing controls, each absent for none: `symmetry`, the planes the shape is mirrored about, `planes` naming the standard planes they are parallel to (`right`, normal to X; `top`, Y; `front`, Z; at least one, another name an error) and `point` the point in mm they pass through (absent: the origin, the standard planes themselves); `pull`, the direction a mould is pulled off the shape along, so that going that way the shape never widens and has no undercut: `direction` a vector in world coordinates (Y up; only its direction counts, not zero), and `parting` a point in mm for a two-part mould pulled off both ways from the plane through it across the direction (absent: one way). `one_piece: true` asks for the shape in one piece: once optimized, the pieces of the shape cut at half density that hold a fixture, a load or a preserved region but that the loads do not reach are joined to the one the loads are on, and loose bits holding none of them taken away (absent or false: the shape as the optimization leaves it, floating pieces and all). Readers that do not know these keys (an earlier build of version 3) ignore them.
+- **`generative`** (a `generative` study, required there; readers refuse it in another type). The model's bodies by role, each a body as §3 *Bodies* names it (`{"feature": 7, "index": 0}`), in an assembly's study with the `component` holding it and its `path`, as faces have them (`{"component": 2, "path": [5], "feature": 7, "index": 0}`; readers refuse a body of the other kind): `preserve`, the bodies kept as they are; `preserved`, regions of faces whose material is kept, as `topology`'s `preserved` has them (a `name` unique with the study's items, `faces`, a `depth` in mm, `suppressed`): the material inside the body the faces are on, within `depth` of them (at least a voxel deep; 0 or absent: the voxels on the faces only), a body of any role or none (the starting shape, to redesign a part inside itself, or none, the box around it the design space); a study has at least one preserve body or preserved region (`preserve` may then be empty); `obstacles`, bodies no material may go into, each `body` with an `offset` in mm that grows it (0 or absent: none); `starting_shape`, a body the material starts in and stays inside (absent: the box around the preserve bodies and the bodies of the preserved regions, grown by `margin` mm: a number, the same along every axis, or an array of three for X, Y and Z, world axes, each a number or `null`; absent or `null`, a tenth of the box's largest side; not negative, so `[null, 0, null]` keeps the outcome within the bodies' own height). A body has one role at most; bodies with none are left out, unless preserved regions are on them. Fixtures and loads must be on faces of preserve bodies or of preserved regions, and a preserved region not on an obstacle: Oxyde refuses to generate otherwise (a reader cannot tell which body a face is on without rebuilding the part). The inside of a hole whose faces carry a preserved region, a fixture or a load (a pin, a bolt, a bearing sits there) is no design space, whatever the starting shape; another hole, in a preserve body, is (a wheel's rim encloses the room for its spokes as a boss does its bolt hole). Writers write a `margin` the same along every axis as one number. Readers of an earlier build of version 4 ignore `preserved` and refuse an empty `preserve` and an array `margin`. `objective`: `max_stiffness`, the stiffest shape for `mass_target`, the outcome's mass in kg (positive, required with this objective), preserve bodies included, the same for every material; or `min_mass`, the lightest shape whose estimated von Mises stress stays under the material's yield strength (else its tensile strength) over `safety_factor` and, with a `displacement_limit` (mm, positive, only with this objective), whose displacement stays under it; `mass_target` then optional and unused (another objective is an error; absent: `max_stiffness`). `min_frequency`, with either objective: the lowest natural frequency an outcome may have, in Hz, held by the first load case's fixtures (positive; absent: no limit). `safety_factor`: what each outcome's estimated factor of safety is held against, the limit itself when minimizing mass (positive; 2). `member_size`: the minimum thickness wanted, in mm (positive; absent: three voxels): the density filter's radius is half of it, which discourages thinner members without ruling them out. `iterations`: the most each outcome makes, 1 to 10 000 (150). `resolution`: the voxel size, as `mesh` gives an element size: `density` from coarse (0) to fine (1) relative to the design space (0.5 when neither is given), or `element_size` in mm, not both. `symmetry`: as in `topology`. `methods`, the ways of making it, at least one, no `type` twice: `unrestricted` (no constraint); `additive` (printed in layers along each of `directions`, nothing overhanging more than `overhang` degrees from it in any direction: 45, the only value for now, also when absent; another is an error); `cutting` (2-axis cutting: the shape the same all along each of `directions`, whose sign does not count, so `+y` and `-y` are the same direction there, not both); `casting` (a mould pulled off along each of `directions`, one way, or both ways from the plane through `parting`, a point in mm, across it: `topology`'s `pull`); `milling` (3-axis milled from the side each of `directions` points to: no undercut seen from the tool, and pockets or gaps narrower than `tool_diameter`, mm, positive, when given, discouraged: the density filter's radius is at least half of it; with `combined: true`, one outcome milled from all of `directions` at once, the part turned over between setups, each spot reached from one of them; absent or false, an outcome each). `directions` (required except for `unrestricted`, at least one, none twice) are `+x`, `-x`, `+y`, `-y`, `+z` or `-z`, world axes (Y up); every direction is a method of its own, but combined milling's. `materials`, at least one: entries shaped as a part's `material` (§3), copied in so the study never depends on a library, with a `density` and a `mechanical` block a solver can use (a material without them cannot be generated), names unique (absent: the part's own material). A study document holds no images, so they go without a texture: readers ignore one. Every material is generated with every method and direction: each pair is an *outcome*. `load_cases` (absent or empty: one case of every fixture and load): sets of the study's fixtures and loads the outcome carries each in turn, as Fusion 360's load cases, the stiffest shape for them all; each with a `name` unique among the cases and the `name`s of its `fixtures` and `loads` (at least one of each, items of the study of that kind, none twice; an item may be in several cases, and a load in none is not applied). A file without the key reads as before.
 - **Contacts** between two sets of faces `a` and `b`, as Fusion 360 names them: `bonded` (glued), `separation` (may part, not pass through, no friction), `sliding` (stays in touch, slides without friction), `rough` (may part, not slide) and `offset_bonded` (glued across a gap of `offset` mm; `offset` is 0 or absent for the others). `automatic: true` marks a contact Oxyde found itself, faces of different bodies closer than `tolerance` mm (required then, positive); a manual contact (`automatic` absent) has no `tolerance`.
 - **`mesh`** (optional; these defaults when absent): `mesher` `netgen` (default) or `lattice` (Oxyde's own); `quality` `high` (ten-node tetrahedra, default) or `draft` (four-node); and either `density`, from coarse (0) to fine (1) relative to the model's size (0.5 when neither is given), or `element_size` in mm (positive), not both.
 - **`materials`** (optional): mechanical properties this study uses instead of the materials' own, by material group: a material's `name`, or `part:` and a part's `document_id` for a part with no material. The values have the same four keys and units as a material's `mechanical` block (§3) and are read the same way: an entry a solver could not use is ignored, and the material's own values (or the typical ones for its name) apply.
 - **`thermal_materials`** (optional): thermal properties this study uses instead of the materials' own, by material group as `materials`, with the keys and units of a material's `thermal` block (§3), read the same way.
 - **Contacts in thermal studies** conduct heat as if bonded, whatever their `type`.
-- **Version.** A document holding only `static` studies is written with `format_version` 1, which readers of version 1 open; one holding any other type is written with 2 (version 1 readers would refuse its types anyway).
+- **`flow`** (a `flow` study; these defaults when absent): `analysis` is `internal` (through the model's cavity, closed by lids over its openings) or `external` (around the model, in a computational domain Oxyde sizes from it), the latter with the free stream's `velocity` in m/s, world coordinates (finite), the former without. `fluid` has a `name` (free text), a `density` in kg/m³ and a dynamic `viscosity` in Pa·s, both positive (default: water at 20 °C, 998.2 and 0.001002); the flow is incompressible. `turbulence` is `laminar` (default) or `turbulent` (the k-ω SST model, wall functions), the latter with the turbulence of the fluid coming in: an `intensity` above 0 and up to 1 (0.05 for 5 %) and a length scale `length` in mm, positive; a laminar flow has neither. `mesh_level` is the mesh's resolution from 1 (coarse) to 7 (fine), as SolidWorks' *level of initial mesh* (3); `iterations` the most iterations, 1 to 100 000 (500); `residual` the residual every equation must fall under for the flow to have converged, positive (0.0001).
+- **Conditions** (a `flow` study's `conditions`), on faces, named like fixtures: `inlet_velocity` (fluid coming in square to the faces at `velocity` m/s), `inlet_volume_flow` (`volume_flow` m³/s coming in, shared between the faces by area), `inlet_mass_flow` (`mass_flow` kg/s, likewise), `static_pressure` (an opening at a static `pressure` in Pa above the surroundings', where the fluid goes out; it may be negative) and `ideal_wall` (a wall the fluid slips along without friction; also a plane of symmetry). Velocities and flows are not negative. Faces in no condition are walls the fluid sticks to. An internal flow's conditions are on the inner faces of the lids closing its openings, and it needs a `static_pressure` somewhere. `suppressed` as for fixtures.
+- **Goals** (a `flow` study's `goals`): what the study measures on its `faces`, named like conditions (one set of names for both): `force` (the fluid's force on the faces, pressure and friction, N), `volume_flow` (out of the fluid through the faces, m³/s, negative coming in), `mass_flow` (likewise, kg/s) or `mean_pressure` (the area-weighted static pressure, Pa); a `cooling` study's also `max_temperature` (the hottest point of the bodies the faces belong to, °C), `mean_temperature` (the faces' area-weighted temperature, °C) and `heat_flow` (the heat leaving the model's solids through the faces, W, negative coming in). Their values are in the results (§9).
+- **`cooling`** (a `cooling` study; these defaults when absent): the fluid's `specific_heat` in J/(kg·K) and thermal `conductivity` in W/(m·K), both positive, its volumetric thermal `expansion` in 1/K, not negative (a gas's is 1/T); `temperature`, °C, is the fluid's coming in (through inlets and openings, and in the free stream) and the model's at the start; `gravity`, m/s² in world coordinates (Y up, not a zero vector), lets warmer fluid rise (natural convection), and is absent without it (default: water at 20 °C, 4182, 0.598 and 0.000207, no gravity). Every body of the model conducts heat with its material's thermal conductivity (or the study's `thermal_materials`). In a cooling study `temperature` and `convection` loads act on faces of the solids, `convection` only where no fluid of the study touches them; `heat_power` and `heat_flux` heat the solid along their faces, wherever they are; `internal_heat` heats the bodies.
+- **Version.** A document is written with the oldest `format_version` that has every type it holds, so older readers open what they know: only `static` studies, 1; thermal ones too, 2; a `topology` study, 3; a `generative` or `frequency` study, 4; a `flow` study, 5; a `cooling` study, 6. Readers of a version refuse the types of later ones anyway. The bytes of a study of an older type are the same whatever the version, so the hashes of their results' fingerprints (§9) do not change.
 
 ## 9. Simulation results (`.oxyres`)
 
@@ -511,10 +597,36 @@ bracket-Static 1.oxyres
 ├── fields/contact_pressure.bin      optional                 — f64 per node
 ├── fields/temperature.bin           thermal types            — f64 per node
 ├── fields/heat_flux.bin             thermal types            — f64 × 3 per node
-└── fields/temperature_history.bin   transient thermal        — f64 × nodes per time
+├── fields/temperature_history.bin   transient thermal        — f64 × nodes per time
+├── fields/density.bin               topology                 — f64 per element
+├── fields/mode_shapes.bin           frequency                — f64 × 3 × nodes per mode
+├── grid/voxels.bin                  generative               — u8 per voxel
+├── outcomes/<id>/density.bin        generative               — u8 per voxel
+├── outcomes/<id>/snapshots.bin      generative, optional     — u8 × voxels per snapshot
+└── flow/residuals.bin               flow                     — f64 × fields per iteration
 ```
 
+The `mesh/` entries are required in every type but `generative`, whose results are on a grid of voxels and have no tetrahedra (nor `bodies` or `labels`); readers ignore `mesh/` entries there.
+
 Results are kept apart from the study so the study stays small and diffs cleanly, and results can be deleted and computed again. They are a cache of a solve, never a source of truth. Oxyde saves each study's results beside its study document as `<study document>-<study name>.oxyres`.
+
+A `flow` or `cooling` study's results are a record of its OpenFOAM run: its mesh and fields stay in the OpenFOAM case folder, which Oxyde keeps beside the results as `<study document>-<study name>.openfoam` (OpenFOAM's own text files; `case.foam` in it opens the case in ParaView). Their `mesh/*.bin` entries are there, empty (no nodes, elements or facets), and the run is in `flow` and `flow/residuals.bin`:
+
+```json
+"flow": {
+  "case": "valve-Flow 1.openfoam",
+  "time": "245",
+  "openfoam": "v2606",
+  "cells": 41696, "iterations": 245, "converged": true,
+  "residual_fields": [ "Ux", "Uy", "Uz", "p" ],
+  "goals": [
+    { "name": "Force Goal-1", "type": "force", "force": [ 2.0, 0.0, -1e-6 ],
+      "pressure_force": [ 1.5, 0.0, 0.0 ], "viscous_force": [ 0.5, 0.0, -1e-6 ] },
+    { "name": "Flow Goal-1", "type": "volume_flow", "value": -1.5e-7 },
+    { "name": "Pressure Goal-1", "type": "mean_pressure", "missing": "the mesh has none of its faces" }
+  ]
+}
+```
 
 ```json
 {
@@ -549,9 +661,38 @@ Results are kept apart from the study so the study stays small and diffs cleanly
 
 - **`simulation`** and **`study`**: the document id of the `.oxysim` (§8) and the name of the study in it. **`type`**: the study's type, as in §8 (absent: `static`); it says which fields there are.
 - **`fingerprint`**: what the results were computed from, so a reader can tell stale results. `study` is the hash of the study as `simulation.json` holds it (its name, items, mesh settings and material overrides); `documents` lists every part and assembly file the model is made of, sorted by `document_id`, with the hash of its `model.json` (a part) or `assembly.json` (an assembly: components, placements and mates) as Oxyde writes it. A hash is `fnv1a128:` and 32 lower-case hex digits: FNV-1a, 128 bits, of the entry's bytes. The results hold while every hash matches the model and study as they are now; otherwise they are out of date and should be shown as such until the study is solved again.
-- **`units`**: always `mm`, `N`, `MPa`, `degC` and `W/m2` (the last two absent in version 1, which had no temperatures); readers refuse others. Displacements are in mm, stresses and strengths in MPa, temperatures in °C, heat fluxes in W/m².
-- **`summary`**, what the study computed, each with the node (an index into `mesh/nodes.bin`) where it is reached: for static and thermal stress studies the largest von Mises stress, the largest displacement (its length) and the smallest factor of safety (strength / von Mises stress; absent when no material has a known strength); for thermal studies `max_temperature`, `min_temperature` and `max_heat_flux` (its length), at the end of a transient study.
+- **`units`**: always `mm`, `N`, `MPa`, `degC` and `W/m2` (the last two absent in version 1, which had no temperatures), and `mass` `kg` from version 4; readers refuse others. Displacements are in mm, stresses and strengths in MPa, temperatures in °C, heat fluxes in W/m².
+- **`summary`**, what the study computed, each with the node (an index into `mesh/nodes.bin`) where it is reached: for static and thermal stress studies the largest von Mises stress, the largest displacement (its length) and the smallest factor of safety (strength / von Mises stress; absent when no material has a known strength); for thermal studies `max_temperature`, `min_temperature` and `max_heat_flux` (its length), at the end of a transient study; nothing for topology, generative and frequency studies, whose numbers are in `topology`, `generative` and `frequency`.
+- **`topology`** (topology results, required there): `initial_compliance`, the compliance of the whole model before material was taken away, in N·mm (the work the loads do, `Fᵀu`: the lower, the stiffer); `converged`, whether the densities settled before the iteration limit; `filter_radius`, the radius in mm the densities were averaged over; `history`, every iteration in order, each with its design's `compliance` (N·mm), its mass as a share of the model's (`mass_fraction`) and the largest change of a density it made (`change`). The last iteration is the design `fields/density.bin` holds, as solved; with `one_piece` in the study, `joining` (absent otherwise) says what was done to those densities afterwards: the pieces `joined` to the one the loads are on and the mass added to join them (`added_mass`, a share of the model's), the loose bits `removed` and their mass (`removed_mass`):
+
+  ```json
+  "topology": { "initial_compliance": 52.1, "converged": true, "filter_radius": 3.2,
+                "history": [ { "compliance": 812.5, "mass_fraction": 0.4, "change": 0.2 }, … ],
+                "joining": { "joined": 1, "added_mass": 0.012, "removed": 0, "removed_mass": 0.0 } }
+  ```
+- **`frequency`** (frequency results, required there): `mass`, the model's mass in kg (the materials' densities over the mesh's volume), and `modes`, the lowest first, at least one, each with `mode` (its number, from 1, in order), `frequency` in Hz (finite, never lower than the mode's before) and `participation`, its effective mass along X, Y and Z as a share of `mass`, as SolidWorks lists the mass participation: `(φᵀ M r)²` over the mass, for the mode `φ` scaled to `φᵀ M φ = 1`, `M` the mass matrix and `r` every node moving one along the axis. Summed over the modes, the participation says how much of the model's motion along each axis the modes found account for:
+
+  ```json
+  "frequency": { "mass": 0.314,
+                 "modes": [ { "mode": 1, "frequency": 203.6, "participation": [0.0, 0.0, 0.61] }, … ] }
+  ```
+- **`generative`** (generative results, required there): the `grid` and the `outcomes`. `grid`: `origin`, the corner of the first voxel with the smallest coordinates, in mm; `size`, a voxel's edge in mm; `counts`, the voxels along X, Y and Z. Voxel (i, j, k) spans `origin + size × (i, j, k)` to `origin + size × (i + 1, j + 1, k + 1)` and is record `i + nx (j + ny k)` of every per-voxel array. Each outcome: `id` (from 1, unique: its entries are under `outcomes/<id>/`), `material` (the name of one of the study's `materials`), `method` (one of the study's `methods` with one direction, `direction` in place of `directions`; an outcome of combined milling keeps its `directions`, two or more, none twice, and readers refuse a milled outcome with both or neither), `status` (`converged`; `limit`, the iteration limit reached; `stopped`, the run stopped with the densities as far as they got; `failed`, with a `message`, which only a failed outcome has, and no entries or `snapshots`), `iterations`, `seconds`, and the outcome's numbers: `mass` (kg), `compliance` (N·mm, the work of the loads summed over the load cases), `max_displacement` (mm), `max_von_mises` (MPa) and `min_factor_of_safety` (absent when the material has no known strength), the last three the worst over the load cases, the last two estimated at the centres of solid voxels; `grayness`, how far its projected densities are from solid or void, `4 ρ (1 − ρ)` averaged over the design voxels, from 0 (each solid or void) to 1 (each at a half), absent for a failed outcome (readers refuse one outside 0 to 1; files written before it was kept have none); `frequency`, its lowest natural frequency in Hz, held by the first load case's fixtures, only when the study has a `min_frequency` (readers refuse a negative one); `history`, every iteration's `compliance` (summed likewise), `mass` and largest `change` of a density, in order; `snapshots`, the iterations (from 1, increasing) whose densities `snapshots.bin` holds:
+
+  ```json
+  "generative": {
+    "grid": { "origin": [-40, -5, -30], "size": 0.8, "counts": [150, 90, 75] },
+    "outcomes": [
+      { "id": 1, "material": "Aluminium 6061-T6", "method": { "type": "additive", "direction": "+z", "overhang": 45 },
+        "status": "converged", "iterations": 112, "seconds": 140.2,
+        "mass": 0.251, "compliance": 35.2, "max_displacement": 0.081,
+        "max_von_mises": 92.4, "min_factor_of_safety": 2.98, "grayness": 0.031,
+        "history": [ { "compliance": 120.4, "mass": 0.251, "change": 0.2 }, … ],
+        "snapshots": [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110] }
+    ]
+  }
+  ```
 - **`times`** (transient thermal): the time, in seconds from the start, of each record of `fields/temperature_history.bin`, the start (0) first, going forward.
+- **`flow`** (flow studies only, and required there): `case` is the OpenFOAM case folder, relative to the results document's folder with `/` separators; `time` the name of its time folder holding the fields; `openfoam` the OpenFOAM version that solved it; `cells` the fluid mesh's cells; `iterations` and `converged` how the solver went (converged: every residual fell under the study's target). `residual_fields` names the equations whose residuals `flow/residuals.bin` records. `goals` gives each goal of the study (§8) by `name` and `type`, with its value in SI units: `value` for `volume_flow` (m³/s, out of the fluid), `mass_flow` (kg/s), `mean_pressure` (Pa), `max_temperature` and `mean_temperature` (°C) and `heat_flow` (W); `force`, `pressure_force` and `viscous_force` for `force` (N, world coordinates: the total and its pressure and friction parts); or `missing` and why, instead of a value. `summary` holds nothing for a flow study.
 - **`solver`**: for the record, free text and numbers: the program, the mesher, the solution method, iterations, the relative residual reached and the wall time in seconds.
 - **`bodies`**: the solids of the mesh, by `mesh/element_bodies.bin` index: a display `name` and the material group used (as in §8 `materials`).
 - **`labels`**: the model face each facet label stands for, written as §8 faces are (`component` and `path` in an assembly). Labels are unique; `4294967295` (`u32` max) is reserved for facets on no model face and is not listed.
@@ -566,6 +707,13 @@ The arrays:
 - `fields/displacement.bin`: mm, x y z. `fields/stress.bin`: the Cauchy stress, MPa, xx yy zz xy yz zx (in a thermal stress study, the stress the expansion leaves once the fixtures hold it). `fields/von_mises.bin`: MPa. `fields/yield_strength.bin`: MPa, the strength the factor of safety is measured against at the node (the yield strength, else the tensile strength; 0 when unknown). `fields/contact_pressure.bin`: MPa, the normal pressure between bodies in contact, present when the study has contacts. All have one record per node; static and thermal stress results have them, thermal results do not.
 - `fields/temperature.bin`: °C, one per node: the steady state, or the end of a transient study. `fields/heat_flux.bin`: the heat flux −k ∇T, W/m², x y z, one record per node, at the same time. Thermal, transient thermal and thermal stress results have them.
 - `fields/temperature_history.bin` (transient thermal only, and required there): one record per time of `times`, each with `components` equal to the node count: the temperature of every node at that time, °C.
-- **Version.** Static results are written with `format_version` 1; the others with 2.
+- `fields/density.bin` (topology only, and required there): the density of each element, from 0 (no material) to 1 (solid), one record per element of `mesh/elements.bin`. Topology results have no displacements, stresses or temperatures. The shape is where the density, averaged at the elements' corners, is above a threshold (Oxyde shows 0.5 by default).
+- `fields/mode_shapes.bin` (frequency only, and required there): one record per mode of `frequency.modes`, in order, each with `components` three times the node count: every node's displacement in the mode, x y z, node after node, scaled so that the largest is of length 1 (a mode's amplitude is arbitrary: only its shape and its frequency mean anything). Frequency results have no displacements, stresses or temperatures.
+- `grid/voxels.bin` (generative only, and required there): what each voxel is: 0 design (material may go there), 1 preserve (always material: in a preserve body or the material a preserved region keeps), 2 obstacle (in an obstacle, within its offset, or in a hole kept clear) and 3 outside the design space (never material).
+- `outcomes/<id>/density.bin` (generative, required for every outcome but a failed one): each voxel's density at the end, from 0 (no material) to 255 (solid), the density × 255 rounded: 255 in preserve voxels, 0 in obstacle and outside ones. These are the densities before the projection that makes them solid or void (the design averaged over the minimum thickness, capped along a casting direction): they vary smoothly where the shape ends. The outcome is where they are above half, interpolated between the voxels' centres, the voxels beyond the grid void (Oxyde draws the preserve bodies exact over it). One byte per voxel keeps a million-voxel outcome to a megabyte before the archive compresses it, and the isosurface needs no more.
+- `outcomes/<id>/snapshots.bin` (generative, optional): one record per iteration of the outcome's `snapshots`, each with `components` equal to the voxel count: the densities as `density.bin` has them, at that iteration.
+- `flow/residuals.bin` (flow only): one record per iteration, each with `components` equal to the number of `residual_fields`: each equation's initial residual at that iteration, in that order; NaN where an equation was not solved.
+- A **cooling** study's case folder holds three regions: `constant/fluid`, `constant/solid` (every body in one mesh, a cell zone `body_<k>` each) and `constant/outside` (not solved); its fields are under `<time>/fluid` and `<time>/solid`. The fluid's patches are named after their face and role as in a flow study's; the solid's are `wall_<label>` (touching the fluid), `free_<label>` (under an opening) and `outer_<label>` (outside the fluid). Pressures there are absolute, around 100 000 Pa, and temperatures in kelvin.
+- **Version.** Static results are written with `format_version` 1, thermal ones with 2, topology ones with 3, generative and frequency ones with 4, flow ones with 5, cooling ones with 6.
 
-Readers refuse a described entry that is missing or whose length does not match, a required entry not described, a `dtype` or `components` other than the above for a known entry, field arrays whose count is not the node count, and node, element, body or label indices out of range. They ignore entries, described or not, and keys they do not know, so later versions can add fields (strains, for instance) without a version bump.
+Readers refuse a described entry that is missing or whose length does not match, a required entry not described, a `dtype` or `components` other than the above for a known entry, field arrays whose count is not the node count (the element count for densities, the voxel count for a grid's arrays), densities outside 0 to 1, voxel kinds above 3, a grid with no voxel along an axis or more than 2³² − 1 in all, outcome ids 0 or used twice, snapshots whose iterations do not go forward or that `snapshots.bin` does not hold one for one, modes not numbered from 1 in order, whose frequencies go down or that `mode_shapes.bin` does not hold one for one, and node, element, body or label indices out of range. They ignore entries, described or not, and keys they do not know, so later versions can add fields (strains, for instance) without a version bump.
