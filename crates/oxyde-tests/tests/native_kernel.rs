@@ -5,7 +5,7 @@
 //! written from the mathematics (docs/ARCHITECTURE.md §10, Native kernel).
 
 use oxyde_geom::{Axis, Plane, Point2, Point3, Transform, Vec3};
-use oxyde_kernel::{Kernel, ShapeHandle, TopologyCounts};
+use oxyde_kernel::{Kernel, ShapeHandle, SurfaceKind, TopologyCounts};
 use oxyde_model::{
     AxisRef, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureId, FeatureKind,
     FeatureStatus, LinearPattern, Part, PatternDirection, Sketch, SketchPlane, StandardAxis,
@@ -66,12 +66,24 @@ fn assert_same_measures(what: &str, native: &Measures, occt: &Measures) {
     assert_eq!(native.counts, occt.counts, "{what}, topology counts");
 }
 
+/// A face as the model sees it: its name, its kind of surface, its area and centroid,
+/// and a plane's normal or a curved face's axis.
+#[derive(Debug)]
+struct SeenFace {
+    name: FaceName,
+    surface: SurfaceKind,
+    area: f64,
+    centroid: Point3,
+    normal: Option<Vec3>,
+    axis: Option<Axis>,
+}
+
 /// A part's body as built by one kernel: the measures of each solid and every name, with
-/// each face's area and normal, sorted by name.
+/// each face's surface, area, centroid and normal or axis, sorted by name.
 #[derive(Debug)]
 struct Built {
     solids: Vec<Measures>,
-    faces: Vec<(FaceName, f64, Option<Vec3>)>,
+    faces: Vec<SeenFace>,
     edges: Vec<EdgeName>,
     vertices: Vec<VertexName>,
 }
@@ -88,14 +100,21 @@ fn build<K: Kernel>(part: &Part, kernel: &mut K) -> Built {
         .iter()
         .map(|s| measures(kernel, s.shape))
         .collect();
-    let mut faces: Vec<(FaceName, f64, Option<Vec3>)> = body
+    let mut faces: Vec<SeenFace> = body
         .naming
         .faces()
         .iter()
         .zip(&body.topology.faces)
-        .map(|(name, face)| (name.clone(), face.area, face.normal))
+        .map(|(name, face)| SeenFace {
+            name: name.clone(),
+            surface: face.surface,
+            area: face.area,
+            centroid: face.centroid,
+            normal: face.normal,
+            axis: face.axis,
+        })
         .collect();
-    faces.sort_by(|a, b| a.0.cmp(&b.0));
+    faces.sort_by(|a, b| a.name.cmp(&b.name));
     let mut edges = body.naming.edges().to_vec();
     edges.sort();
     let mut vertices = body.naming.vertices().to_vec();
@@ -117,9 +136,8 @@ fn assert_same_part(what: &str, part: &Part) {
     for (i, (n, o)) in native.solids.iter().zip(&occt.solids).enumerate() {
         assert_same_measures(&format!("{what}, body {i}"), n, o);
     }
-    let names = |faces: &[(FaceName, f64, Option<Vec3>)]| -> Vec<FaceName> {
-        faces.iter().map(|f| f.0.clone()).collect()
-    };
+    let names =
+        |faces: &[SeenFace]| -> Vec<FaceName> { faces.iter().map(|f| f.name.clone()).collect() };
     assert_eq!(
         names(&native.faces),
         names(&occt.faces),
@@ -127,16 +145,34 @@ fn assert_same_part(what: &str, part: &Part) {
     );
     assert_eq!(native.edges, occt.edges, "{what}: edge names");
     assert_eq!(native.vertices, occt.vertices, "{what}: vertex names");
-    for ((name, n_area, n_normal), (_, o_area, o_normal)) in native.faces.iter().zip(&occt.faces) {
-        assert_close(&format!("{what}, area of {name:?}"), *n_area, *o_area);
-        let (n, o) = (
-            n_normal.expect("a planar face"),
-            o_normal.expect("a planar face"),
+    for (n, o) in native.faces.iter().zip(&occt.faces) {
+        let name = &n.name;
+        assert_eq!(n.surface, o.surface, "{what}, surface of {name:?}");
+        assert_close(&format!("{what}, area of {name:?}"), n.area, o.area);
+        assert_point_close(
+            &format!("{what}, centroid of {name:?}"),
+            n.centroid,
+            o.centroid,
         );
-        assert!(
-            (n - o).length() < 1e-9,
-            "{what}, normal of {name:?}: native {n:?}, OpenCASCADE {o:?}"
-        );
+        match (n.normal, o.normal) {
+            (Some(n), Some(o)) => assert!(
+                (n - o).length() < 1e-9,
+                "{what}, normal of {name:?}: native {n:?}, OpenCASCADE {o:?}"
+            ),
+            (None, None) => {}
+            other => panic!("{what}, normal of {name:?}: {other:?}"),
+        }
+        match (n.axis, o.axis) {
+            (Some(n), Some(o)) => {
+                assert!(
+                    (n.direction - o.direction).length() < 1e-9,
+                    "{what}, axis of {name:?}: native {n:?}, OpenCASCADE {o:?}"
+                );
+                assert_point_close(&format!("{what}, axis of {name:?}"), n.origin, o.origin);
+            }
+            (None, None) => {}
+            other => panic!("{what}, axis of {name:?}: {other:?}"),
+        }
     }
 }
 
@@ -180,6 +216,163 @@ fn base_block(part: &mut Part) -> FeatureId {
 /// A sketch on the top of `base_block`, whose coordinates are the model's x and y.
 fn on_top(base: FeatureId) -> Sketch {
     Sketch::new(SketchPlane::Face(FaceName::end_cap(base)))
+}
+
+/// A counter-clockwise arc about `center` from `start` to `end`, in the sketch's coordinates.
+fn arc(sketch: &mut Sketch, center: (f64, f64), start: (f64, f64), end: (f64, f64)) {
+    sketch.geometry.arc(
+        Point2::new(center.0, center.1),
+        Point2::new(start.0, start.1),
+        Point2::new(end.0, end.1),
+    );
+}
+
+#[test]
+fn a_round_boss_has_a_seam() {
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.circle(Point2::new(10.0, 10.0), 5.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 8.0 },
+        false,
+    );
+    assert_same_part("round boss", &part);
+}
+
+#[test]
+fn circles_on_every_standard_plane_either_way() {
+    for plane in [
+        StandardPlane::Front,
+        StandardPlane::Top,
+        StandardPlane::Right,
+    ] {
+        for (extent, reverse) in [
+            (ExtrudeExtent::Blind { depth: 6.0 }, false),
+            (ExtrudeExtent::Blind { depth: 6.0 }, true),
+            (ExtrudeExtent::MidPlane { depth: 6.0 }, false),
+        ] {
+            let mut part = Part::new();
+            let mut sketch = Sketch::new(SketchPlane::Standard(plane));
+            sketch.circle(Point2::new(-3.0, 7.0), 4.5);
+            boss(&mut part, sketch, extent.clone(), reverse);
+            assert_same_part(
+                &format!("circle on {plane:?}, {extent:?}, {reverse}"),
+                &part,
+            );
+        }
+    }
+}
+
+#[test]
+fn a_slot_of_lines_and_half_circles() {
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.line(Point2::new(0.0, 0.0), Point2::new(20.0, 0.0));
+    arc(&mut sketch, (20.0, 5.0), (20.0, 0.0), (20.0, 10.0));
+    sketch.line(Point2::new(20.0, 10.0), Point2::new(0.0, 10.0));
+    arc(&mut sketch, (0.0, 5.0), (0.0, 10.0), (0.0, 0.0));
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 4.0 },
+        false,
+    );
+    assert_same_part("slot", &part);
+}
+
+#[test]
+fn a_rounded_corner_and_a_notch() {
+    // A quarter round on one corner, bulging out, and a half-round notch cut into the
+    // opposite side, bulging in.
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.line(Point2::new(0.0, 0.0), Point2::new(30.0, 0.0));
+    sketch.line(Point2::new(30.0, 0.0), Point2::new(30.0, 15.0));
+    arc(&mut sketch, (25.0, 15.0), (30.0, 15.0), (25.0, 20.0));
+    sketch.line(Point2::new(25.0, 20.0), Point2::new(14.0, 20.0));
+    arc(&mut sketch, (10.0, 20.0), (14.0, 20.0), (6.0, 20.0));
+    sketch.line(Point2::new(6.0, 20.0), Point2::new(0.0, 20.0));
+    sketch.line(Point2::new(0.0, 20.0), Point2::new(0.0, 0.0));
+    boss(&mut part, sketch, ExtrudeExtent::Blind { depth: 5.0 }, true);
+    assert_same_part("rounded corner and notch", &part);
+}
+
+#[test]
+fn a_plate_with_round_holes_in_its_profile() {
+    let mut part = Part::new();
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 30.0);
+    sketch.circle(Point2::new(10.0, 15.0), 6.0);
+    sketch.circle(Point2::new(28.0, 12.0), 4.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    assert_same_part("plate with round holes", &part);
+}
+
+#[test]
+fn display_meshes_of_curved_faces_follow_them() {
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 30.0);
+    sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    let body = part.body().expect("a body");
+    let shape = body.solids[0].shape;
+    let topology = kernel.topology(shape).unwrap();
+    let deflection = 0.01;
+    let mesh = kernel.tessellate(shape, deflection).unwrap();
+    assert_eq!(mesh.faces.len(), topology.faces.len());
+    assert_eq!(mesh.edges.len(), topology.edges.len());
+    for (i, (face, info)) in mesh.faces.iter().zip(&topology.faces).enumerate() {
+        let mut area = 0.0;
+        for t in &face.triangles {
+            let p = |k: u32| {
+                let [x, y, z] = face.positions[k as usize];
+                Point3::new(f64::from(x), f64::from(y), f64::from(z))
+            };
+            let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+            let twice = (b - a).cross(c - a);
+            // Outward: along a plane's normal; a hole's wall faces its axis.
+            let outward = match (info.normal, info.axis) {
+                (Some(normal), _) => normal,
+                (None, Some(axis)) => {
+                    let centre = Point3::new(
+                        (a.x + b.x + c.x) / 3.0,
+                        (a.y + b.y + c.y) / 3.0,
+                        (a.z + b.z + c.z) / 3.0,
+                    );
+                    let d = centre - axis.origin;
+                    -(d - axis.direction * d.dot(axis.direction))
+                }
+                (None, None) => panic!("face {i}: neither a normal nor an axis"),
+            };
+            assert!(
+                twice.dot(outward) > 0.0,
+                "face {i}: a triangle faces inwards"
+            );
+            area += twice.length() / 2.0;
+        }
+        // Chords a deflection off a circle of radius 6 lose a share of the area of about
+        // two thirds of deflection / radius.
+        assert!(
+            (area - info.area).abs() <= 2e-3 * info.area,
+            "face {i}: the mesh covers {area} mm², the face {}",
+            info.area
+        );
+    }
 }
 
 #[test]
@@ -493,7 +686,8 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
         ExtrudeExtent::Blind { depth: 5.0 },
         false,
     );
-    // A cylinder: a circle, which the native kernel cannot extrude yet.
+    // A cylinder joined to them: the native kernel extrudes the circle but cannot join
+    // curved faces yet.
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
     sketch.circle(Point2::new(50.0, 0.0), 4.0);
     boss(
@@ -510,7 +704,10 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     assert_eq!(statuses[3], FeatureStatus::Ok);
     match &statuses[5] {
         FeatureStatus::Error(message) => {
-            assert!(message.contains("extrude arcs and circles"), "{message}")
+            assert!(
+                message.contains("join, cut or intersect curved faces"),
+                "{message}"
+            )
         }
         other => panic!("the cylinder should fail, not {other:?}"),
     }

@@ -127,7 +127,7 @@ fn split(plane: &Plane3, polygon: Polygon, eps: f64) -> Pieces {
                 }
             }
             let piece = |points: Vec<Point3>| {
-                (points.len() >= 3).then(|| Polygon {
+                (points.len() >= 3).then_some(Polygon {
                     points,
                     plane: polygon.plane,
                     source: polygon.source,

@@ -31,6 +31,11 @@ pub(crate) fn boolean(
     if tools.is_empty() {
         return Err(NativeError::Failed("a boolean needs a tool".to_owned()));
     }
+    if !target.is_straight() || tools.iter().any(|t| !t.is_straight()) {
+        return Err(NativeError::Unsupported(
+            "join, cut or intersect curved faces",
+        ));
+    }
     let eps = LINEAR_TOLERANCE;
     let mut tool_polygons = Vec::with_capacity(tools.len());
     for (i, tool) in tools.iter().enumerate() {
@@ -66,7 +71,12 @@ fn polygons(shape: &Shape, input: u32) -> Result<Vec<Polygon>, NativeError> {
         for face in &solid.faces {
             let (corners, triangles) =
                 tessellate::triangulate_face(solid, face).map_err(NativeError::Internal)?;
-            let plane = Plane3::through(face.plane.origin, face.plane.normal);
+            let Some(plane) = face.surface.plane() else {
+                return Err(NativeError::Unsupported(
+                    "join, cut or intersect curved faces",
+                ));
+            };
+            let plane = Plane3::through(plane.origin, plane.normal);
             for triangle in triangles {
                 out.push(Polygon {
                     points: triangle
@@ -95,13 +105,14 @@ fn check(
             "the boolean's result {what}, and was refused"
         )))
     };
-    let before = target.volume();
-    let largest = tools
-        .iter()
-        .map(|t| t.volume().abs())
-        .fold(before.abs().max(1.0), f64::max);
+    let volume = |shape: &Shape| shape.volume().map_err(NativeError::Internal);
+    let before = volume(target)?;
+    let mut largest = before.abs().max(1.0);
+    for tool in tools {
+        largest = largest.max(volume(tool)?.abs());
+    }
     let slack = 1e-6 * largest;
-    let after = result.volume();
+    let after = volume(result)?;
     if after < -slack {
         return wrong("has a negative volume");
     }

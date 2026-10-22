@@ -14,8 +14,12 @@ release yet; the git history has every detail.
   several closed contours included, and joins, cuts and intersects them: bosses on faces,
   pockets, holes through all, patterns of cuts, a body cut in two. Faces in one plane that
   touch become one face, as with OpenCASCADE, and the tests check that both kernels give
-  the same face, edge and vertex names, volume, centre of mass and bounds. Arcs and circles
-  are next.
+  the same face, edge and vertex names, volume, centre of mass and bounds.
+- It now extrudes sketches with arcs and circles too: round bosses, slots, rounded corners,
+  plates with round holes, on any plane and either way, with the same names, areas, axes
+  and mass properties as OpenCASCADE gives, and smooth display meshes. Joining, cutting
+  or intersecting round faces comes next; until then such a feature fails with a message
+  and the body stays as it was.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

@@ -21,6 +21,7 @@ use oxyde_kernel::{FaceSource, OpHistory};
 use crate::NativeError;
 use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, cyclic_pairs};
 use crate::bsp::{Plane3, Polygon, Source};
+use crate::geometry::Surface;
 
 /// Points closer than `tolerance` are one vertex, found through a grid of cells.
 struct Welder {
@@ -578,7 +579,7 @@ fn solids(faces: &[FaceBuild], points: &[Point3]) -> Result<(Shape, OpHistory), 
                             let start =
                                 local_vertex(&mut vertex_map, &mut solid.vertices, points, a);
                             let end = local_vertex(&mut vertex_map, &mut solid.vertices, points, b);
-                            solid.edges.push(Edge { start, end });
+                            solid.edges.push(Edge::line(start, end));
                             let local = solid.edges.len() as u32 - 1;
                             edge_map.insert(e, local);
                             local
@@ -596,7 +597,10 @@ fn solids(faces: &[FaceBuild], points: &[Point3]) -> Result<(Shape, OpHistory), 
                 .ok_or_else(|| NativeError::Internal("a face without corners".to_owned()))?;
             let plane = Plane::from_point_normal(anchor, face.normal)
                 .ok_or_else(|| NativeError::Internal("a face without a normal".to_owned()))?;
-            solid.faces.push(Face { plane, loops });
+            solid.faces.push(Face {
+                surface: Surface::Plane(plane),
+                loops,
+            });
             sources.push(
                 face.sources
                     .iter()
@@ -608,7 +612,7 @@ fn solids(faces: &[FaceBuild], points: &[Point3]) -> Result<(Shape, OpHistory), 
             solids: vec![solid],
         };
         // A shell facing inwards bounds a void inside another solid.
-        if piece.volume() < 0.0 {
+        if piece.volume().map_err(NativeError::Internal)? < 0.0 {
             return Err(NativeError::Unsupported("leave a void inside a solid"));
         }
         shape.solids.extend(piece.solids);

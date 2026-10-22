@@ -8,10 +8,10 @@
 //! `crates/oxyde-tests/tests/` compare what both kernels build. See `docs/ARCHITECTURE.md` §2
 //! and §10 (Native kernel).
 //!
-//! What it builds so far are solids with flat faces and straight edges: boxes, extrusions of
-//! profiles made of lines, their moved or mirrored copies, and booleans of them (fuse, cut,
-//! common), with their topology, exact mass properties, bounds and display meshes. Every
-//! other operation answers
+//! What it builds so far: boxes, extrusions of profiles of lines, arcs and circles (faces on
+//! planes and cylinders, edges on lines and circles), their moved or mirrored copies, and
+//! booleans (fuse, cut, common) of the straight-sided ones, with their topology, exact mass
+//! properties, bounds and display meshes. Every other operation answers
 //! [`NativeError::Unsupported`] until it is written, so a caller sees a failing feature with
 //! a message, never a crash.
 
@@ -43,6 +43,7 @@ mod boolean;
 mod brep;
 mod bsp;
 mod build;
+mod geometry;
 mod tessellate;
 mod triangulate;
 
@@ -257,22 +258,23 @@ impl Kernel for NativeKernel {
     }
 
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, NativeError> {
-        guarded(|| Ok(self.shape(shape)?.topology()))
+        guarded(|| self.shape(shape)?.topology().map_err(NativeError::Internal))
     }
 
-    /// Exact whatever `deflection` asks: every face is planar so far.
-    fn tessellate(&self, shape: ShapeHandle, _deflection: f64) -> Result<Mesh, NativeError> {
-        guarded(|| tessellate::mesh(self.shape(shape)?).map_err(NativeError::Internal))
+    /// Planar faces of straight edges exactly; arcs and cylinders within `deflection`.
+    fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, NativeError> {
+        guarded(|| tessellate::mesh(self.shape(shape)?, deflection).map_err(NativeError::Internal))
     }
 
     fn volume(&self, shape: ShapeHandle) -> Result<f64, NativeError> {
-        guarded(|| Ok(self.shape(shape)?.volume()))
+        guarded(|| self.shape(shape)?.volume().map_err(NativeError::Internal))
     }
 
     fn centre_of_mass(&self, shape: ShapeHandle) -> Result<Point3, NativeError> {
         guarded(|| {
             self.shape(shape)?
                 .centre_of_mass()
+                .map_err(NativeError::Internal)?
                 .ok_or_else(|| NativeError::Failed("the shape has no volume".to_owned()))
         })
     }
@@ -545,14 +547,17 @@ mod tests {
             },
         }])
         .unwrap();
-        let error = kernel.extrude(&Plane::FRONT, &circle, Vec3::Z).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "the native kernel cannot extrude arcs and circles yet"
-        );
+        let cylinder = kernel.extrude(&Plane::FRONT, &circle, Vec3::Z).unwrap();
         let shape = kernel
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
             .unwrap();
+        let error = kernel
+            .boolean(BooleanOp::Cut, shape, cylinder.shape)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the native kernel cannot join, cut or intersect curved faces yet"
+        );
         assert!(matches!(
             kernel.fillet(shape, &[0], 1.0),
             Err(NativeError::Unsupported(_))
