@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-app"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "eframe",
  "image",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-assembly"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-geom",
  "oxyde-kernel",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-cli"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "clap",
  "oxyde-format",
@@ -2563,11 +2563,11 @@ dependencies = [
 
 [[package]]
 name = "oxyde-flow"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "oxyde-format"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-assembly",
  "oxyde-geom",
@@ -2582,18 +2582,18 @@ dependencies = [
 
 [[package]]
 name = "oxyde-geom"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "oxyde-kernel"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-geom",
 ]
 
 [[package]]
 name = "oxyde-mcp"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-assembly",
  "oxyde-cli",
@@ -2611,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-model"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-geom",
  "oxyde-kernel",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "oxyde-occt"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "cxx",
  "cxx-build",
@@ -2630,18 +2630,18 @@ dependencies = [
 
 [[package]]
 name = "oxyde-render"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-kernel",
 ]
 
 [[package]]
 name = "oxyde-sim"
-version = "0.0.8"
+version = "0.0.9"
 
 [[package]]
 name = "oxyde-sim-gpu"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-sim",
  "wgpu",
@@ -2649,14 +2649,14 @@ dependencies = [
 
 [[package]]
 name = "oxyde-sketch"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-geom",
 ]
 
 [[package]]
 name = "oxyde-tests"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "oxyde-assembly",
  "oxyde-cli",
