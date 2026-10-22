@@ -2331,6 +2331,7 @@ impl OxydeApp {
                                     .unwrap_or_default(),
                                 ..oxyde_format::Properties::default()
                             },
+                            kernel: oxyde_format::PartKernel::Occt,
                         };
                         let saved = oxyde_format::save_part(&target, &file)
                             .map(|()| (note, pieces))

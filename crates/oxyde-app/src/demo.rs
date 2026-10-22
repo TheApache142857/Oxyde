@@ -169,6 +169,7 @@ mod tests {
             document_id: oxyde_format::new_document_id(),
             definition: part.definition(),
             properties: Properties::default(),
+            kernel: oxyde_format::PartKernel::Occt,
         };
         let bytes = write_part(Cursor::new(Vec::new()), &file)
             .unwrap()

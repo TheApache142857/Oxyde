@@ -30,6 +30,11 @@ pub(crate) struct Manifest {
     pub document_id: String,
     pub units: Units,
     pub created_by: String,
+    /// Parts only: the kernel that built the part when it was saved (`"occt"`, `"native"`).
+    /// Absent in other documents and in parts written before the key existed, which were all
+    /// built by OpenCASCADE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

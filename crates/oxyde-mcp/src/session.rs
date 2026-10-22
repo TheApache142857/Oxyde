@@ -147,6 +147,7 @@ impl Session {
             document_id: doc.document_id.clone(),
             definition: doc.part.definition(),
             properties: doc.properties.clone(),
+            kernel: oxyde_format::PartKernel::Occt,
         };
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;

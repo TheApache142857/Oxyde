@@ -14,6 +14,7 @@ oxyde-geom = { path = "crates/oxyde-geom" }
 oxyde-sketch = { path = "crates/oxyde-sketch" }
 oxyde-kernel = { path = "crates/oxyde-kernel" }
 oxyde-occt = { path = "crates/oxyde-occt" }
+oxyde-native-kernel = { path = "crates/oxyde-native-kernel" }
 oxyde-model = { path = "crates/oxyde-model" }
 oxyde-assembly = { path = "crates/oxyde-assembly" }
 oxyde-format = { path = "crates/oxyde-format" }

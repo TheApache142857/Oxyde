@@ -152,6 +152,8 @@ pub struct PartFile {
     pub document_id: String,
     pub definition: PartDefinition,
     pub properties: Properties,
+    /// The kernel that built the part (manifest `kernel`).
+    pub kernel: PartKernel,
 }
 
 impl PartFile {
@@ -161,6 +163,43 @@ impl PartFile {
             document_id: new_document_id(),
             definition: Part::new().definition(),
             properties: Properties::default(),
+            kernel: PartKernel::default(),
+        }
+    }
+}
+
+/// The kernel a part was built with when it was saved, as its manifest's `kernel` names it.
+///
+/// It is a record, not a requirement: a part opens with whichever kernel the build has, and
+/// the application warns when that is not the one named here, since a different kernel can
+/// give different topology and so resolve face and edge names differently.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PartKernel {
+    /// OpenCASCADE (`oxyde-occt`), `"occt"`; also every part saved before the key existed.
+    #[default]
+    Occt,
+    /// Oxyde's own kernel (`oxyde-native-kernel`), `"native"`.
+    Native,
+    /// A name this reader does not know, kept as it was so that it can be reported.
+    Other(String),
+}
+
+impl PartKernel {
+    /// The name written in the manifest.
+    pub fn name(&self) -> &str {
+        match self {
+            PartKernel::Occt => "occt",
+            PartKernel::Native => "native",
+            PartKernel::Other(name) => name,
+        }
+    }
+
+    /// The kernel a manifest names; `None` (no key) is OpenCASCADE.
+    fn from_manifest(name: Option<&str>) -> Self {
+        match name {
+            None | Some("occt") => PartKernel::Occt,
+            Some("native") => PartKernel::Native,
+            Some(other) => PartKernel::Other(other.to_owned()),
         }
     }
 }
@@ -291,6 +330,7 @@ fn manifest_version(kind: DocumentKind, document_id: &str, version: u32) -> Mani
             angle: "deg".to_owned(),
         },
         created_by: format!("oxyde {}", env!("CARGO_PKG_VERSION")),
+        kernel: None,
     }
 }
 
@@ -370,11 +410,14 @@ pub fn document_kind(path: &Path) -> Result<(DocumentKind, String), FormatError>
 
 /// Writes a part document as a ZIP archive (`.oxyprt`).
 pub fn write_part<W: Write + Seek>(writer: W, part: &PartFile) -> Result<W, FormatError> {
-    let manifest = manifest_version(
-        DocumentKind::Part,
-        &part.document_id,
-        part_version(&part.definition),
-    );
+    let manifest = Manifest {
+        kernel: Some(part.kernel.name().to_owned()),
+        ..manifest_version(
+            DocumentKind::Part,
+            &part.document_id,
+            part_version(&part.definition),
+        )
+    };
 
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     let mut zip = ZipWriter::new(writer);
@@ -477,6 +520,7 @@ pub fn read_part<R: Read + Seek>(reader: R) -> Result<PartFile, FormatError> {
         .definition();
 
     Ok(PartFile {
+        kernel: PartKernel::from_manifest(manifest.kernel.as_deref()),
         document_id: manifest.document_id,
         definition,
         properties,
@@ -1039,6 +1083,7 @@ mod tests {
             document_id: new_document_id(),
             definition: part.definition(),
             properties,
+            kernel: PartKernel::Occt,
         }
     }
 
@@ -1070,6 +1115,7 @@ mod tests {
             document_id: new_document_id(),
             definition: part.definition(),
             properties: Properties::default(),
+            kernel: PartKernel::Occt,
         };
         let read = round_trip(&file);
         assert_eq!(read, file);
@@ -1167,6 +1213,35 @@ mod tests {
         // The sample holds planes at an angle and through points: version 2.
         assert_eq!(manifest["format_version"], PART_FORMAT_VERSION);
         assert_eq!(manifest["kind"], "part");
+        assert_eq!(manifest["kernel"], "occt");
+    }
+
+    #[test]
+    fn the_manifest_records_the_kernel_and_keeps_names_it_does_not_know() {
+        for kernel in [
+            PartKernel::Occt,
+            PartKernel::Native,
+            PartKernel::Other("someday".to_owned()),
+        ] {
+            let part = PartFile {
+                kernel: kernel.clone(),
+                ..PartFile::new()
+            };
+            assert_eq!(round_trip(&part).kernel, kernel);
+        }
+    }
+
+    #[test]
+    fn a_part_without_a_kernel_key_was_built_by_occt() {
+        let bytes = archive_with(&[
+            (MANIFEST, MANIFEST_V1),
+            (MODEL, r#"{ "next_feature_id": 1, "features": [] }"#),
+            (PROPERTIES, "{}"),
+        ]);
+        assert_eq!(
+            read_part(Cursor::new(bytes)).unwrap().kernel,
+            PartKernel::Occt
+        );
     }
 
     fn archive_with(entries: &[(&str, &str)]) -> Vec<u8> {
@@ -1269,6 +1344,7 @@ mod tests {
             document_id: new_document_id(),
             definition: part.definition(),
             properties: Properties::default(),
+            kernel: PartKernel::Occt,
         };
         let bytes = write_part(Cursor::new(Vec::new()), &file)
             .unwrap()

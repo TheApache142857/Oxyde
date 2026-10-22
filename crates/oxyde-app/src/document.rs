@@ -90,6 +90,9 @@ impl Document {
             document_id: self.document_id.clone(),
             definition: self.part.definition(),
             properties: self.properties.clone(),
+            // The application builds every part with OpenCASCADE until it can choose a
+            // kernel (docs/ARCHITECTURE.md §10, Native kernel).
+            kernel: oxyde_format::PartKernel::Occt,
         }
     }
 

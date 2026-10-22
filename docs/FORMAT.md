@@ -40,13 +40,15 @@ Rules:
   "kind": "part",
   "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
   "units": { "length": "mm", "angle": "deg" },
-  "created_by": "oxyde 0.0.3"
+  "created_by": "oxyde 0.0.3",
+  "kernel": "occt"
 }
 ```
 
 - `kind`: `"part"`, `"assembly"` or `"drawing"`; `"simulation"` and `"simulation_results"` for §8 and §9.
 - `format_version`: 1 for assemblies and drawings. Parts are 1 when every reference plane in them is an offset plane and 2 when one is made another way (at an angle, through a line, through three points, normal to a curve: the `plane` feature's `construction`, §3), so readers of version 1 still open the others. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
+- `kernel` (parts only, optional): the kernel that built the part when it was saved, `"occt"` (OpenCASCADE) or `"native"` (Oxyde's own kernel). Absent in parts written before the key existed, which were all built by OpenCASCADE, so a reader takes no key as `"occt"`. It is a record, not a requirement: a reader opens the part with whichever kernel it has, and keeps a name it does not know so it can report it. No `format_version` depends on it; readers that do not know the key ignore it.
 - `units` are display units. Values in `model.json` are always millimetres.
 
 ## 3. `model.json`

@@ -903,6 +903,7 @@ impl OxydeApp {
                             document_id: p.document_id.clone(),
                             definition: p.part.definition(),
                             properties: p.properties.clone(),
+                            kernel: oxyde_format::PartKernel::Occt,
                         }),
                         Loaded::Assembly(a) => {
                             oxyde_format::results::assembly_hash(&AssemblyFile {

@@ -20,6 +20,10 @@ const FORBIDDEN: &[(&str, &[&str])] = &[
     ("oxyde-sketch", &["oxyde-kernel", "oxyde-occt"]),
     ("oxyde-kernel", &["oxyde-occt", "oxyde-model"]),
     ("oxyde-occt", &["oxyde-model", "oxyde-sketch", "oxyde-app"]),
+    (
+        "oxyde-native-kernel",
+        &["oxyde-occt", "oxyde-model", "oxyde-sketch", "oxyde-app"],
+    ),
     ("oxyde-model", &["oxyde-occt", "oxyde-app"]),
     ("oxyde-assembly", &["oxyde-occt", "oxyde-app"]),
     ("oxyde-format", &["oxyde-occt", "oxyde-app"]),

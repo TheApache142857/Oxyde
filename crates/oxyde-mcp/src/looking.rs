@@ -459,6 +459,7 @@ pub(crate) fn export(session: &mut Session, args: &Value) -> Result<ToolOutput> 
                 document_id: doc.document_id.clone(),
                 definition: doc.part.definition(),
                 properties: doc.properties.clone(),
+                kernel: oxyde_format::PartKernel::Occt,
             };
             oxyde_format::save_part(&scratch, &file).map_err(|e| e.to_string())?;
             let result = oxyde_cli::export(&scratch, &out);

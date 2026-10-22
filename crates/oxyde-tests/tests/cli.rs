@@ -74,6 +74,7 @@ fn save(path: &Path, part: &Part) {
         document_id: new_document_id(),
         definition: part.definition(),
         properties: Properties::default(),
+        kernel: oxyde_format::PartKernel::Occt,
     };
     save_part(path, &file).unwrap();
 }

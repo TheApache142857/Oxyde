@@ -5,6 +5,16 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### A kernel of Oxyde's own, started (unreleased, October 2026)
+
+- Work has begun on a geometry kernel written in Rust, as an alternative to OpenCASCADE
+  (`oxyde-native-kernel`). Nothing uses it yet: every part is still built by OpenCASCADE,
+  and the kernel will be offered beside it, not instead of it, once it builds the same parts.
+- **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
+  (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
+  builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is
+  unchanged.
+
 ### Cooling studies: heat carried away by a flow (unreleased, October 2026)
 
 - **New Study › Cooling** computes the temperatures of a model cooled by air or water
