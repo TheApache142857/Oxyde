@@ -14,7 +14,8 @@ path = "src/main.rs"
 [dependencies]
 oxyde-geom = { workspace = true }
 oxyde-kernel = { workspace = true }
-oxyde-occt = { workspace = true }
+oxyde-occt = { workspace = true, optional = true }
+oxyde-native-kernel = { workspace = true, optional = true }
 oxyde-model = { workspace = true }
 oxyde-sketch = { workspace = true }
 oxyde-assembly = { workspace = true }
@@ -28,6 +29,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# The kernels compiled in; the session's is chosen at start (src/kernel.rs). At least one.
+default = ["occt", "native"]
+occt = ["dep:oxyde-occt"]
+native = ["dep:oxyde-native-kernel"]
 
 [build-dependencies]
 winresource = "0.1"

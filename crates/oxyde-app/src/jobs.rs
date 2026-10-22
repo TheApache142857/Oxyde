@@ -20,12 +20,12 @@ use eframe::egui;
 use oxyde_format::step_import::ImportPlan;
 use oxyde_kernel::Kernel;
 use oxyde_model::{FileData, Import, Part, PartDefinition};
-use oxyde_occt::OcctKernel;
 
 use crate::app::OxydeApp;
 use crate::assembly::AssemblyDoc;
 use crate::document::Document;
 use crate::edit_in_place::Suspended;
+use crate::kernel::AppKernel;
 
 /// How far a job got, written by the job and read by the window.
 #[derive(Default)]
@@ -86,6 +86,8 @@ pub enum Outcome {
         doc: Result<Document, String>,
         path: PathBuf,
         read_only: bool,
+        /// Why the part may not be as it was saved: built by another kernel.
+        warning: Option<String>,
     },
     /// A part rebuilt with an Imported feature added (a new part from a STEP file, or
     /// Import STEP into the open part).
@@ -121,16 +123,16 @@ pub struct Job {
 impl Job {
     /// Runs `work` on a thread with a worker kernel, or at once on this thread when the
     /// kernel cannot open workers.
-    fn spawn<F>(title: &str, kernel: &mut OcctKernel, work: F) -> Self
+    fn spawn<F>(title: &str, kernel: &mut AppKernel, work: F) -> Self
     where
-        F: FnOnce(&mut OcctKernel, &Progress) -> Outcome + Send + 'static,
+        F: FnOnce(&mut AppKernel, &Progress) -> Outcome + Send + 'static,
     {
         let progress = Arc::new(Progress::default());
         let (sender, receiver) = mpsc::channel();
         let worker_progress = progress.clone();
-        let thread = match OcctKernel::open_worker() {
+        let thread = match AppKernel::open_worker() {
             Some(_) => Some(std::thread::spawn(move || {
-                let Some(mut worker) = OcctKernel::open_worker() else {
+                let Some(mut worker) = AppKernel::open_worker() else {
                     return;
                 };
                 let outcome = work(&mut worker, &worker_progress);
@@ -161,19 +163,20 @@ impl Job {
     }
 }
 
-/// Opens, rebuilds and meshes a part file.
+/// Opens, rebuilds and meshes a part file; with a warning when another kernel built it.
 fn open_part(
     path: &Path,
-    kernel: &mut OcctKernel,
+    kernel: &mut AppKernel,
     progress: &Progress,
-) -> Result<Document, String> {
+) -> Result<(Document, Option<String>), String> {
     progress.say(format!("Reading {}", name_of(path)));
     let file = oxyde_format::load_part(path).map_err(|e| e.to_string())?;
+    let warning = crate::kernel::rebuilt_warning(&file.kernel, kernel.kind());
     progress.say(format!("Rebuilding {}", name_of(path)));
     let mut doc = Document::from_file(file, Some(path.to_path_buf()))?;
     doc.rebuild(kernel)
         .map_err(|e| format!("internal error while rebuilding: {}", e.message))?;
-    Ok(doc)
+    Ok((doc, warning))
 }
 
 fn name_of(path: &Path) -> String {
@@ -190,7 +193,7 @@ impl OxydeApp {
 
     pub(crate) fn start_job<F>(&mut self, title: &str, work: F)
     where
-        F: FnOnce(&mut OcctKernel, &Progress) -> Outcome + Send + 'static,
+        F: FnOnce(&mut AppKernel, &Progress) -> Outcome + Send + 'static,
     {
         if let Some(job) = self.job.take() {
             job.join();
@@ -207,11 +210,15 @@ impl OxydeApp {
         self.start_job(
             &format!("Opening {}", name_of(&path)),
             move |kernel, progress| {
-                let doc = open_part(&path, kernel, progress);
+                let (doc, warning) = match open_part(&path, kernel, progress) {
+                    Ok((doc, warning)) => (Ok(doc), warning),
+                    Err(e) => (Err(e), None),
+                };
                 Outcome::PartOpened {
                     doc,
                     path,
                     read_only,
+                    warning,
                 }
             },
         );
@@ -428,6 +435,7 @@ impl OxydeApp {
                 doc,
                 path,
                 read_only,
+                warning,
             } => match doc {
                 Ok(mut doc) => {
                     doc.read_only = read_only;
@@ -439,6 +447,9 @@ impl OxydeApp {
                         format!("Opened {}", path.display())
                     };
                     self.report_errors();
+                    if let Some(warning) = warning {
+                        self.status = format!("{}: {warning}", self.status);
+                    }
                 }
                 Err(e) => {
                     self.status = format!("Could not open {}: {e}", path.display());

@@ -31,6 +31,8 @@ pub struct LoadedPart {
     pub mesh: Option<Mesh>,
     /// Corners of the part's bounding box, in its own coordinates.
     pub bounds: Option<(Point3, Point3)>,
+    /// Why the part may not be as it was saved: built by another kernel.
+    pub warning: Option<String>,
 }
 
 /// A sub-assembly file used by the assembly.
@@ -1005,8 +1007,12 @@ impl<'a> Walk<'a> {
         }
         let loaded = load_many(&parts, kernel, fraction, progress);
         for ((path, name), result) in parts.into_iter().zip(loaded) {
-            if let Err(e) = &result {
-                notes.push(format!("{name}: {e}"));
+            match &result {
+                Err(e) => notes.push(format!("{name}: {e}")),
+                Ok(LoadedPart {
+                    warning: Some(w), ..
+                }) => notes.push(format!("{name}: {w}")),
+                Ok(_) => {}
             }
             docs.insert(path, result.map(Loaded::Part));
         }
@@ -1168,6 +1174,8 @@ fn load_many<K: Kernel>(
 /// Opens and rebuilds a part file, and meshes it.
 pub fn load<K: Kernel>(path: &Path, kernel: &mut K, fraction: f64) -> Result<LoadedPart, String> {
     let file = oxyde_format::load_part(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The session's kernel, which `kernel` is (or a worker of it).
+    let warning = crate::kernel::rebuilt_warning(&file.kernel, crate::kernel::chosen());
     let mut part = Part::from_definition(file.definition).map_err(|e| e.to_string())?;
     part.rebuild(kernel);
     let (mesh, bounds) = match part.body() {
@@ -1184,6 +1192,7 @@ pub fn load<K: Kernel>(path: &Path, kernel: &mut K, fraction: f64) -> Result<Loa
         part,
         mesh,
         bounds,
+        warning,
     })
 }
 

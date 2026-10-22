@@ -2524,6 +2524,7 @@ dependencies = [
  "oxyde-geom",
  "oxyde-kernel",
  "oxyde-model",
+ "oxyde-native-kernel",
  "oxyde-occt",
  "oxyde-render",
  "oxyde-sim",

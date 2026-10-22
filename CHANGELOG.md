@@ -8,8 +8,20 @@ release yet; the git history has every detail.
 ### A kernel of Oxyde's own, started (unreleased, October 2026)
 
 - Work has begun on a geometry kernel written in Rust, as an alternative to OpenCASCADE
-  (`oxyde-native-kernel`). Nothing uses it yet: every part is still built by OpenCASCADE,
-  and the kernel will be offered beside it, not instead of it, once it builds the same parts.
+  (`oxyde-native-kernel`). It is offered beside OpenCASCADE, not instead of it, and
+  OpenCASCADE stays the default.
+- **Preferences › Debug › Kernel** chooses the kernel parts are built with, from the next
+  start: OpenCASCADE or Oxyde's own (experimental); `--kernel occt` or `--kernel native` on
+  the command line chooses it for one session. With Oxyde's own, a feature it cannot build
+  yet (a fillet, a revolve, a STEP import) fails with a message in the tree and the body
+  stays as it was; simulation meshes with the lattice mesher. The About box and the Debug
+  page say which kernel the session uses.
+- A part saved records the kernel that built it. Opening a part built by the other kernel
+  rebuilds it with this session's and says so in the status line (in an assembly, in its
+  notes): the two kernels may cut faces differently, so a fillet or a mate on a face or an
+  edge may find another or none.
+- Oxyde can be built with either kernel alone (Cargo features `occt` and `native`, both by
+  default); built with only its own, it needs no OpenCASCADE (docs/BUILDING.md §2).
 - So far it builds boxes and extrusions of sketches made of straight lines, holes and
   several closed contours included, and joins, cuts and intersects them: bosses on faces,
   pockets, holes through all, patterns of cuts, a body cut in two. Faces in one plane that

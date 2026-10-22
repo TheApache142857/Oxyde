@@ -670,11 +670,8 @@ impl OxydeApp {
                 window("About Oxyde").show(ctx, |ui| {
                     ui.heading("Oxyde");
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("Parametric CAD in Rust, on the OpenCASCADE kernel.");
-                    ui.label(format!(
-                        "OpenCASCADE {}",
-                        oxyde_occt::OcctKernel::occt_version()
-                    ));
+                    ui.label("Parametric CAD in Rust.");
+                    ui.label(format!("Kernel: {}", crate::kernel::description()));
                     ui.label(format!("Viewport: {}", self.viewport.renderer_name()));
                     if ui.button("Close").clicked() {
                         answer = Answer::Cancel;

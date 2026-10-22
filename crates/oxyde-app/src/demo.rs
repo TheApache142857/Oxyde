@@ -139,7 +139,7 @@ pub fn flange() -> Part {
     part
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "occt"))]
 mod tests {
     use std::io::Cursor;
 

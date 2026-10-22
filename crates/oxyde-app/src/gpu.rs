@@ -1709,7 +1709,7 @@ mod tests {
 
     /// A scene with everything the renderers must agree on: two boxes, face colours, a
     /// see-through face, a checker texture, and the floor reflection on.
-    fn material_scene(kernel: &mut oxyde_occt::OcctKernel) -> Scene {
+    fn material_scene(kernel: &mut crate::kernel::AppKernel) -> Scene {
         let a = kernel
             .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
             .unwrap();
@@ -1769,7 +1769,7 @@ mod tests {
         let Some(state) = gpu() else {
             return;
         };
-        let mut kernel = oxyde_occt::OcctKernel::new();
+        let mut kernel = crate::kernel::AppKernel::new(Default::default());
         let scene = material_scene(&mut kernel);
         let (w, h) = (480usize, 360usize);
         let mut camera = Camera::default();
@@ -1858,7 +1858,7 @@ mod tests {
         let Some(state) = gpu() else {
             return;
         };
-        let mut kernel = oxyde_occt::OcctKernel::new();
+        let mut kernel = crate::kernel::AppKernel::new(Default::default());
         let shape = kernel
             .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
             .unwrap();

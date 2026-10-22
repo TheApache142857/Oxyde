@@ -122,6 +122,8 @@ On a machine without OpenCASCADE (Linux, macOS), the whole workspace can still b
 
 Open `box.step` in SolidWorks, FreeCAD or eDrawings: you should see a 40 × 20 × 10 mm box.
 
+The application has a Cargo feature per kernel, both on by default: `occt` (OpenCASCADE, which needs the setup above) and `native` (Oxyde's own, in Rust). With both, each session builds its parts with one: Preferences › Debug › Kernel, from the next start, or `--kernel occt` / `--kernel native` for one session (`cargo run --release -p oxyde-app -- --kernel native part.oxyprt`). `cargo build -p oxyde-app --no-default-features --features native` builds an application with no OpenCASCADE at all, and so no DLLs to ship, that builds only what the native kernel can yet (ARCHITECTURE.md §10): no fillets, revolves, STEP or IGES, and no Netgen.
+
 In the application, **File › Open demo bracket** builds a part using every feature type. Use `--release` for smooth interaction: the renderer crate is optimized even in debug builds, the rest of the application is not.
 
 The viewport draws with the GPU (wgpu). If it shows nothing or crashes on startup on your machine, run with the software renderer and report the GPU and driver:

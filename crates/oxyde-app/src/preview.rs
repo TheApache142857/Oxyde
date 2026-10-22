@@ -354,7 +354,7 @@ impl OxydeApp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "occt"))]
 mod tests {
     use oxyde_geom::Point2;
     use oxyde_model::{EdgeBlend, EdgeName, Extrude, FaceName, Sketch, SketchPlane, StandardPlane};

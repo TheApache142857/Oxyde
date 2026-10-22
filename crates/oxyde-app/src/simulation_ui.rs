@@ -65,7 +65,6 @@ use oxyde_kernel::{
     VolumeMeshOptions,
 };
 use oxyde_model::{BodyId, FaceName, Material, Mechanical, Thermal};
-use oxyde_occt::OcctKernel;
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
     ContactCandidate, ContactKind, Elastic, FixtureKind, FrequencyResults, FrequencyStudy,
@@ -2379,7 +2378,10 @@ impl OxydeApp {
                     && !sim_study.contacts_found)))
             .then_some(sim_study.contact_tolerance.max(1e-6));
         let quadratic = sim_study.mesh.quality == ElementQuality::High;
-        let use_netgen = sim_study.mesh.mesher == MesherChoice::Netgen;
+        // Netgen meshes OpenCASCADE's shapes, on a worker sharing them: with Oxyde's own
+        // kernel the lattice mesher is used, as the mesh report then says.
+        let use_netgen = sim_study.mesh.mesher == MesherChoice::Netgen
+            && self.kernel.kind() == crate::kernel::KernelKind::Occt;
         let input = ThreadInput {
             solids: surfaces.solids.clone(),
             netgen: Vec::new(),
@@ -5829,7 +5831,7 @@ fn netgen_mesh(
     cancel: &AtomicBool,
     progress: &(dyn Fn(f64, &'static str) + Sync),
 ) -> Result<TetMesh, VolumeMeshError> {
-    let Some(mut kernel) = OcctKernel::open_worker() else {
+    let Some(mut kernel) = crate::kernel::AppKernel::open_worker() else {
         return Err(VolumeMeshError::Failed(
             "no kernel could be opened on the study's thread".to_owned(),
         ));

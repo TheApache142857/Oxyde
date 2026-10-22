@@ -1,5 +1,6 @@
 //! The Oxyde desktop application: timeline, properties and 3D viewport around the modeling
-//! engine. This is the only crate that picks a concrete kernel backend (OpenCASCADE).
+//! engine. This is the only crate that picks a concrete kernel backend: OpenCASCADE or
+//! Oxyde's own, chosen at start (`kernel.rs`).
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -49,6 +50,7 @@ mod hole_wizard;
 mod icons;
 mod interference;
 mod jobs;
+mod kernel;
 mod lockfile;
 mod materials;
 mod materials_ui;
@@ -136,20 +138,45 @@ fn run(renderer: eframe::Renderer, file: Option<PathBuf>) -> eframe::Result<()> 
 /// start, or with `OXYDE_RENDERER=cpu`, the window falls back to OpenGL and the viewport to
 /// the software renderer.
 fn main() -> eframe::Result<()> {
-    let first = std::env::args_os().nth(1);
-    // `--version`: prints the versions and quits; the bundle script uses it to check that
-    // every DLL is there (OpenCASCADE is loaded to ask it its version).
-    if first.as_deref() == Some(std::ffi::OsStr::new("--version")) {
-        println!(
-            "Oxyde {} (OpenCASCADE {})",
-            env!("CARGO_PKG_VERSION"),
-            oxyde_occt::OcctKernel::occt_version()
-        );
-        return Ok(());
+    let mut args = std::env::args_os().skip(1);
+    let mut file = None;
+    let mut wanted = None;
+    while let Some(arg) = args.next() {
+        if arg == "--version" {
+            // Prints the versions and quits; the bundle script uses it to check that every
+            // DLL is there (OpenCASCADE is loaded to ask it its version).
+            println!(
+                "Oxyde {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                kernel::description()
+            );
+            return Ok(());
+        } else if arg == "--kernel" {
+            // `--kernel occt|native`: this session's kernel, whatever the preference says.
+            let name = args.next().unwrap_or_default();
+            wanted = kernel::KernelKind::parse(&name.to_string_lossy());
+            if wanted.is_none() {
+                eprintln!(
+                    "--kernel takes occt or native, not {}",
+                    name.to_string_lossy()
+                );
+            }
+        } else {
+            file = Some(PathBuf::from(arg));
+        }
     }
-    let file = first.map(PathBuf::from);
+    let prefs = prefs::Preferences::load();
+    let wanted = wanted.unwrap_or(prefs.kernel);
+    let chosen = kernel::choose(wanted);
+    if chosen != wanted {
+        eprintln!(
+            "This build has no {} kernel; using {}",
+            wanted.label(),
+            chosen.label()
+        );
+    }
     let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))
-        || prefs::Preferences::load().graphics.renderer == prefs::Renderer::Software;
+        || prefs.graphics.renderer == prefs::Renderer::Software;
     if software {
         return run(eframe::Renderer::Glow, file);
     }

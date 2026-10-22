@@ -609,13 +609,34 @@ impl OxydeApp {
         .on_disabled_hover_text("Only in debug builds (cargo run without --release)");
         ui.checkbox(&mut d.ui_inspector, "Interface: egui inspector window");
         ui.add_space(8.0);
+        crate::property_manager::section(ui, "Kernel");
+        for kind in crate::kernel::KernelKind::ALL {
+            let radio = egui::RadioButton::new(self.prefs.kernel == kind, kind.label());
+            if ui
+                .add_enabled(kind.available(), radio)
+                .on_disabled_hover_text("Not compiled into this build")
+                .clicked()
+            {
+                self.prefs.kernel = kind;
+            }
+        }
+        ui.label(
+            RichText::new(format!(
+                "Takes effect at the next start. Now: {}. A part built by the other kernel \
+                 is rebuilt by this one and may lose references to its faces and edges.",
+                crate::kernel::chosen().label()
+            ))
+            .small()
+            .weak(),
+        );
+        ui.add_space(8.0);
         crate::property_manager::section(ui, "About this build");
         egui::Grid::new("build").num_columns(2).show(ui, |ui| {
             ui.label("Oxyde");
             ui.label(env!("CARGO_PKG_VERSION"));
             ui.end_row();
-            ui.label("OpenCASCADE");
-            ui.label(oxyde_occt::OcctKernel::occt_version());
+            ui.label("Kernel");
+            ui.label(crate::kernel::description());
             ui.end_row();
             ui.label("Viewport");
             ui.label(self.viewport.renderer_name());
