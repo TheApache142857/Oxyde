@@ -7,8 +7,9 @@
 use oxyde_geom::{Axis, Plane, Point2, Point3, Transform, Vec3};
 use oxyde_kernel::{Kernel, ShapeHandle, TopologyCounts};
 use oxyde_model::{
-    EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureKind, FeatureStatus, Part,
-    Sketch, SketchPlane, StandardPlane, VertexName,
+    AxisRef, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureId, FeatureKind,
+    FeatureStatus, LinearPattern, Part, PatternDirection, Sketch, SketchPlane, StandardAxis,
+    StandardPlane, VertexName,
 };
 use oxyde_native_kernel::NativeKernel;
 use oxyde_occt::OcctKernel;
@@ -147,12 +148,38 @@ fn polygon(sketch: &mut Sketch, corners: &[(f64, f64)]) {
     }
 }
 
-fn boss(part: &mut Part, sketch: Sketch, extent: ExtrudeExtent, reverse: bool) {
+fn extrude(
+    part: &mut Part,
+    sketch: Sketch,
+    op: ExtrudeOp,
+    extent: ExtrudeExtent,
+    reverse: bool,
+) -> FeatureId {
     let s = part.add_feature(FeatureKind::Sketch(sketch));
-    let mut extrude = Extrude::blind(s, ExtrudeOp::Boss, 1.0);
+    let mut extrude = Extrude::blind(s, op, 1.0);
     extrude.extent = extent;
     extrude.reverse = reverse;
-    part.add_feature(FeatureKind::Extrude(extrude));
+    part.add_feature(FeatureKind::Extrude(extrude))
+}
+
+fn boss(part: &mut Part, sketch: Sketch, extent: ExtrudeExtent, reverse: bool) -> FeatureId {
+    extrude(part, sketch, ExtrudeOp::Boss, extent, reverse)
+}
+
+fn front() -> Sketch {
+    Sketch::new(SketchPlane::Standard(StandardPlane::Front))
+}
+
+/// A 40 × 30 × 10 block on the Front plane: its top, at z = 10, is the extrusion's end cap.
+fn base_block(part: &mut Part) -> FeatureId {
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 30.0);
+    boss(part, sketch, ExtrudeExtent::Blind { depth: 10.0 }, false)
+}
+
+/// A sketch on the top of `base_block`, whose coordinates are the model's x and y.
+fn on_top(base: FeatureId) -> Sketch {
+    Sketch::new(SketchPlane::Face(FaceName::end_cap(base)))
 }
 
 #[test]
@@ -311,9 +338,142 @@ fn display_meshes_cover_each_face_once_and_face_outwards() {
 }
 
 #[test]
+fn a_boss_on_a_face() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.rectangle(Point2::new(10.0, 8.0), 15.0, 12.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 6.0 },
+        false,
+    );
+    assert_same_part("boss on a face", &part);
+}
+
+#[test]
+fn a_pocket_cut_from_a_face() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    polygon(
+        &mut sketch,
+        &[
+            (5.0, 5.0),
+            (25.0, 4.0),
+            (30.0, 20.0),
+            (12.0, 24.0),
+            (8.0, 14.0),
+        ],
+    );
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::Blind { depth: 4.0 },
+        false,
+    );
+    assert_same_part("pocket", &part);
+}
+
+#[test]
+fn a_hole_through_all() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    polygon(&mut sketch, &[(10.0, 10.0), (22.0, 9.0), (16.0, 21.0)]);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("hole through all", &part);
+}
+
+#[test]
+fn blocks_flush_with_each_other_make_one_box() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(20.0, 0.0), 40.0, 30.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    assert_same_part("flush blocks", &part);
+}
+
+#[test]
+fn a_slot_through_the_middle_leaves_two_solids() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(15.0, -5.0), 10.0, 40.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("slot", &part);
+}
+
+#[test]
+fn a_pattern_of_pockets() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.rectangle(Point2::new(4.0, 10.0), 5.0, 8.0);
+    let pocket = extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::Blind { depth: 3.0 },
+        false,
+    );
+    part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![pocket],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 11.0,
+            count: 3,
+            reverse: false,
+        },
+        second: None,
+        skip: Vec::new(),
+    }));
+    assert_same_part("pattern of pockets", &part);
+}
+
+#[test]
+fn an_intersection_keeps_what_both_share() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    polygon(
+        &mut sketch,
+        &[(-5.0, -5.0), (25.0, -5.0), (25.0, 18.0), (-5.0, 12.0)],
+    );
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Intersect,
+        ExtrudeExtent::Blind { depth: 6.0 },
+        false,
+    );
+    assert_same_part("intersection", &part);
+}
+
+#[test]
 fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut part = Part::new();
-    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    let mut sketch = front();
     sketch.rectangle(Point2::new(0.0, 0.0), 20.0, 20.0);
     boss(
         &mut part,
@@ -321,8 +481,8 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
         ExtrudeExtent::Blind { depth: 5.0 },
         false,
     );
-    // A second boss joins the first: a boolean.
-    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+    // A second boss joins the first.
+    let mut sketch = front();
     sketch.rectangle(Point2::new(10.0, 10.0), 20.0, 20.0);
     boss(
         &mut part,
@@ -330,7 +490,7 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
         ExtrudeExtent::Blind { depth: 5.0 },
         false,
     );
-    // And a cylinder: a circle.
+    // A cylinder: a circle, which the native kernel cannot extrude yet.
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
     sketch.circle(Point2::new(50.0, 0.0), 4.0);
     boss(
@@ -344,21 +504,20 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     part.rebuild(&mut kernel);
     let statuses: Vec<FeatureStatus> = part.timeline().into_iter().map(|e| e.status).collect();
     assert_eq!(statuses[1], FeatureStatus::Ok);
-    for (i, expected) in [(3, "combine solids"), (5, "extrude arcs and circles")] {
-        match &statuses[i] {
-            FeatureStatus::Error(message) => {
-                assert!(message.contains(expected), "feature {i}: {message}")
-            }
-            other => panic!("feature {i} should fail, not {other:?}"),
+    assert_eq!(statuses[3], FeatureStatus::Ok);
+    match &statuses[5] {
+        FeatureStatus::Error(message) => {
+            assert!(message.contains("extrude arcs and circles"), "{message}")
         }
+        other => panic!("the cylinder should fail, not {other:?}"),
     }
-    // The first block is still there, whole.
+    // The two blocks joined are still there, whole.
     let body = part.body().expect("a body");
     let volume: f64 = body
         .solids
         .iter()
         .map(|s| kernel.volume(s.shape).unwrap())
         .sum();
-    assert!((volume - 2000.0).abs() < 1e-9, "{volume}");
+    assert!((volume - 3500.0).abs() < 1e-9, "{volume}");
     part.release(&mut kernel);
 }

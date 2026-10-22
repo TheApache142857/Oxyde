@@ -33,10 +33,14 @@ fn single(p: Point3) -> [f32; 3] {
     [p.x as f32, p.y as f32, p.z as f32]
 }
 
-/// The face's corners, each once, triangulated in the face's plane. The plane's frame is
-/// right-handed about the outward normal, so triangles counter-clockwise in it are
-/// counter-clockwise seen from outside.
-fn face_mesh(solid: &Solid, face: &Face) -> Result<FaceMesh, String> {
+/// The face's corners, each once (vertices of the solid), and triangles over them (indices
+/// into the corners), triangulated in the face's plane. The plane's frame is right-handed
+/// about the outward normal, so triangles counter-clockwise in it are counter-clockwise
+/// seen from outside.
+pub(crate) fn triangulate_face(
+    solid: &Solid,
+    face: &Face,
+) -> Result<(Vec<u32>, Vec<[usize; 3]>), String> {
     let mut corners: Vec<u32> = Vec::new();
     let mut loops: Vec<Vec<usize>> = Vec::with_capacity(face.loops.len());
     for edges in &face.loops {
@@ -64,6 +68,11 @@ fn face_mesh(solid: &Solid, face: &Face) -> Result<FaceMesh, String> {
         })
         .collect();
     let triangles = triangulate::polygon_with_holes(&flat, &loops)?;
+    Ok((corners, triangles))
+}
+
+fn face_mesh(solid: &Solid, face: &Face) -> Result<FaceMesh, String> {
+    let (corners, triangles) = triangulate_face(solid, face)?;
     Ok(FaceMesh {
         positions: corners
             .iter()

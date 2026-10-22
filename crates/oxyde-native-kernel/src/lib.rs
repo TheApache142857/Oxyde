@@ -9,8 +9,9 @@
 //! and §10 (Native kernel).
 //!
 //! What it builds so far are solids with flat faces and straight edges: boxes, extrusions of
-//! profiles made of lines, and their moved or mirrored copies, with their topology, exact
-//! mass properties, bounds and display meshes. Every other operation answers
+//! profiles made of lines, their moved or mirrored copies, and booleans of them (fuse, cut,
+//! common), with their topology, exact mass properties, bounds and display meshes. Every
+//! other operation answers
 //! [`NativeError::Unsupported`] until it is written, so a caller sees a failing feature with
 //! a message, never a crash.
 
@@ -37,7 +38,10 @@
     )
 )]
 
+mod assemble;
+mod boolean;
 mod brep;
+mod bsp;
 mod build;
 mod tessellate;
 mod triangulate;
@@ -209,11 +213,21 @@ impl Kernel for NativeKernel {
 
     fn boolean_many(
         &mut self,
-        _op: BooleanOp,
-        _target: ShapeHandle,
-        _tools: &[ShapeHandle],
+        op: BooleanOp,
+        target: ShapeHandle,
+        tools: &[ShapeHandle],
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("combine solids (booleans)"))
+        guarded(|| {
+            let tool_shapes = tools
+                .iter()
+                .map(|&tool| self.shape(tool))
+                .collect::<Result<Vec<&Shape>, _>>()?;
+            let (shape, history) = boolean::boolean(op, self.shape(target)?, &tool_shapes)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
     }
 
     fn solid_from_mesh(
@@ -386,6 +400,140 @@ mod tests {
         assert!(mesh.faces.iter().all(|f| f.triangles.len() == 2));
     }
 
+    fn block(
+        kernel: &mut NativeKernel,
+        corner: (f64, f64, f64),
+        size: (f64, f64, f64),
+    ) -> ShapeHandle {
+        kernel
+            .make_box(
+                Point3::new(corner.0, corner.1, corner.2),
+                Vec3::new(size.0, size.1, size.2),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn booleans_of_boxes_have_the_volumes_they_should() {
+        let mut kernel = NativeKernel::new();
+        let a = block(&mut kernel, (0.0, 0.0, 0.0), (4.0, 4.0, 4.0));
+        // Overlapping a corner, and lying on a's top, facing the other way.
+        let b = block(&mut kernel, (2.0, 2.0, 2.0), (4.0, 4.0, 4.0));
+        let on_top = block(&mut kernel, (1.0, 1.0, 4.0), (2.0, 2.0, 1.0));
+        // Through a, flush with its top and its bottom.
+        let through = block(&mut kernel, (1.0, 1.0, 0.0), (1.0, 1.0, 4.0));
+        let cases = [
+            (BooleanOp::Fuse, b, 64.0 + 64.0 - 8.0),
+            (BooleanOp::Cut, b, 64.0 - 8.0),
+            (BooleanOp::Common, b, 8.0),
+            (BooleanOp::Fuse, on_top, 64.0 + 4.0),
+            (BooleanOp::Cut, through, 64.0 - 4.0),
+        ];
+        for (op, tool, volume) in cases {
+            let result = kernel.boolean(op, a, tool).unwrap();
+            let got = kernel.volume(result.shape).unwrap();
+            assert!(
+                (got - volume).abs() < 1e-9,
+                "{op:?}: {got} instead of {volume}"
+            );
+            let topology = kernel.topology(result.shape).unwrap();
+            assert_eq!(topology.faces.len(), result.history.faces.len());
+            assert!(
+                result
+                    .history
+                    .faces
+                    .iter()
+                    .all(|sources| !sources.is_empty()),
+                "{op:?}: a face with no source"
+            );
+            kernel.release(result.shape);
+        }
+        // A box fused with a box on its top makes one solid whose top has the small box's
+        // footprint taken out, and whose shared faces are gone.
+        let fused = kernel.boolean(BooleanOp::Fuse, a, on_top).unwrap();
+        let counts = kernel.topology_counts(fused.shape).unwrap();
+        assert_eq!((counts.solids, counts.faces), (1, 11));
+        // Cutting a through hole leaves one solid with four more faces.
+        let holed = kernel.boolean(BooleanOp::Cut, a, through).unwrap();
+        let counts = kernel.topology_counts(holed.shape).unwrap();
+        assert_eq!((counts.solids, counts.faces), (1, 10));
+    }
+
+    #[test]
+    fn two_boxes_side_by_side_fuse_into_one_with_six_faces() {
+        let mut kernel = NativeKernel::new();
+        let a = block(&mut kernel, (0.0, 0.0, 0.0), (4.0, 2.0, 1.0));
+        let b = block(&mut kernel, (2.0, 0.0, 0.0), (4.0, 2.0, 1.0));
+        let fused = kernel.boolean(BooleanOp::Fuse, a, b).unwrap();
+        let counts = kernel.topology_counts(fused.shape).unwrap();
+        assert_eq!(
+            (counts.solids, counts.faces, counts.edges, counts.vertices),
+            (1, 6, 12, 8)
+        );
+        assert!((kernel.volume(fused.shape).unwrap() - 12.0).abs() < 1e-9);
+        // The faces in one plane are one face, made of a face of each box.
+        let top = kernel
+            .topology(fused.shape)
+            .unwrap()
+            .faces
+            .iter()
+            .position(|f| f.normal == Some(Vec3::Z))
+            .unwrap();
+        assert_eq!(
+            fused.history.faces[top],
+            [
+                FaceSource::InputFace { input: 0, face: 5 },
+                FaceSource::InputFace { input: 1, face: 5 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cut_through_the_middle_leaves_two_solids_and_a_cut_of_everything_none() {
+        let mut kernel = NativeKernel::new();
+        let a = block(&mut kernel, (0.0, 0.0, 0.0), (6.0, 2.0, 2.0));
+        let slot = block(&mut kernel, (2.0, -1.0, -1.0), (2.0, 4.0, 4.0));
+        let cut = kernel.boolean(BooleanOp::Cut, a, slot).unwrap();
+        let counts = kernel.topology_counts(cut.shape).unwrap();
+        assert_eq!((counts.solids, counts.faces), (2, 12));
+        assert!((kernel.volume(cut.shape).unwrap() - 16.0).abs() < 1e-9);
+        let all = block(&mut kernel, (-1.0, -1.0, -1.0), (8.0, 4.0, 4.0));
+        let gone = kernel.boolean(BooleanOp::Cut, a, all).unwrap();
+        assert_eq!(kernel.topology_counts(gone.shape).unwrap().solids, 0);
+        assert!(gone.history.faces.is_empty());
+    }
+
+    #[test]
+    fn several_tools_are_cut_at_once() {
+        let mut kernel = NativeKernel::new();
+        let a = block(&mut kernel, (0.0, 0.0, 0.0), (10.0, 4.0, 2.0));
+        let holes: Vec<ShapeHandle> = (0..3)
+            .map(|i| {
+                block(
+                    &mut kernel,
+                    (1.0 + 3.0 * f64::from(i), 1.0, -1.0),
+                    (1.0, 1.0, 4.0),
+                )
+            })
+            .collect();
+        let cut = kernel.boolean_many(BooleanOp::Cut, a, &holes).unwrap();
+        assert!((kernel.volume(cut.shape).unwrap() - (80.0 - 3.0 * 2.0)).abs() < 1e-9);
+        // The walls of each hole come from its own tool.
+        let tools: Vec<u32> = cut
+            .history
+            .faces
+            .iter()
+            .flatten()
+            .map(|s| match s {
+                FaceSource::InputFace { input, .. } => *input,
+                _ => u32::MAX,
+            })
+            .collect();
+        for input in 0..=3 {
+            assert!(tools.contains(&input), "nothing from input {input}");
+        }
+    }
+
     #[test]
     fn what_is_not_written_yet_fails_with_a_message() {
         let mut kernel = NativeKernel::new();
@@ -406,7 +554,7 @@ mod tests {
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
             .unwrap();
         assert!(matches!(
-            kernel.boolean(BooleanOp::Fuse, shape, shape),
+            kernel.fillet(shape, &[0], 1.0),
             Err(NativeError::Unsupported(_))
         ));
         assert!(matches!(

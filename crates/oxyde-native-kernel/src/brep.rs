@@ -176,7 +176,8 @@ impl Solid {
         {
             return Err(format!("edge {e} ends at a vertex that does not exist"));
         }
-        let tolerance = LINEAR_TOLERANCE * self.scale().max(1.0);
+        // Corners welded by a boolean may sit up to its welding tolerance off a plane.
+        let tolerance = 10.0 * LINEAR_TOLERANCE * self.scale().max(1.0);
         let mut uses = vec![(0u32, 0u32); self.edges.len()];
         for (f, face) in self.faces.iter().enumerate() {
             if (face.plane.normal.length() - 1.0).abs() > 1e-9 {

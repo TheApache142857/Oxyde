@@ -11,9 +11,11 @@ release yet; the git history has every detail.
   (`oxyde-native-kernel`). Nothing uses it yet: every part is still built by OpenCASCADE,
   and the kernel will be offered beside it, not instead of it, once it builds the same parts.
 - So far it builds boxes and extrusions of sketches made of straight lines, holes and
-  several closed contours included, with the same face, edge and vertex names, volume,
-  centre of mass and bounds as OpenCASCADE gives (checked by tests); arcs, circles and
-  joining or cutting solids are next.
+  several closed contours included, and joins, cuts and intersects them: bosses on faces,
+  pockets, holes through all, patterns of cuts, a body cut in two. Faces in one plane that
+  touch become one face, as with OpenCASCADE, and the tests check that both kernels give
+  the same face, edge and vertex names, volume, centre of mass and bounds. Arcs and circles
+  are next.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is
