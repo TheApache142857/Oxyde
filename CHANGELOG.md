@@ -74,6 +74,13 @@ release yet; the git history has every detail.
 
 ### Generative design, under way (October 2026)
 
+- **A minimum frequency that holds, and a truer check of the part made.** With a minimum
+  natural frequency, outcomes could end a quarter under it: a mode that appeared late in the
+  run was found only now and then. It is now found every time, and the outcome kept at the
+  limit. *Create Part*'s check pulls a force through the centre of the faces it was set on,
+  as the study does (a slender part showed twice its displacement), leaves out of its
+  largest stress the elements where the fixtures and loads act, as the outcome does, and
+  now finds fixtures and loads on preserve regions too, not only on preserve bodies.
 - **A Generative Design tab in place of the Topology tab.** As in Fusion 360: give the part's
   bodies their roles (bodies to keep, bodies to stay clear of, a starting shape the material
   stays inside), each coloured in the viewport; hold and load the bodies to keep as in a

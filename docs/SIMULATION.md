@@ -1175,13 +1175,17 @@ and Gasso; "always validate", Schnitger, Cadalyst 2018).
 
 - **The check** (`generative::check_part`, on its own thread once *Create Part* has saved
   the part, with a bar and *Stop* in the panel): the simplified surface's pieces, the very
-  triangles the part's solid is made of, each triangle labelled with the preserve body's
-  face it lies on (its corners within a twentieth of a voxel of the bodies' faces, where
+  triangles the part's solid is made of, each triangle labelled with the face it lies on of
+  a preserve body or a preserve region (its corners within a twentieth of a voxel of the bodies' faces, where
   `exact_surface` held them, its centre within three tenths, for a chord across a curved
   face, and its normal within about 45° of the face's), filled with ten-node tetrahedra by
   the lattice mesher (§2) at a voxel's size, larger where that would pass 400 000 nodes,
   and each load case solved by the static solver: the case's fixtures and loads on those
-  faces, its accelerations as gravity, its remote masses' weight as remote forces.
+  faces, its accelerations as gravity, its remote masses' weight as remote forces. A force
+  along a direction goes on as a remote force through the centre of the faces it was set on:
+  the mesher bevels the part's edges at an element's scale, unevenly round a face, which
+  moves the centre of the faces' facets, and a slender member pulled off its axis bends (a
+  bar's end moved twice as far as it should before).
 - **Remote forces** (`LoadKind::Remote`, a force at a point off the faces): the static
   solver's form of the remote mass's link, each node of the faces taking its share of the
   force by area and of the moment the offset makes by its distance from their centre
@@ -1189,16 +1193,19 @@ and Gasso; "always validate", Schnitger, Cadalyst 2018).
   `Grid::link`. Not offered in the Simulation tab yet.
 - **What it gives**, beside the outcome's estimates in Explore: the part's mass, its
   compliance summed over the cases, its largest displacement, its largest von Mises stress
-  but at the nodes of the faces the case's fixtures and loads act on (singular there; the
-  outcome leaves out the voxels they act through likewise) and the factor of safety over it.
+  but in the elements touching the faces the case's fixtures and loads act on (singular
+  there, and where a bevelled face's fixture stops short of its edge; the outcome leaves out
+  the voxels they act through likewise) and the factor of safety over it.
   Where the mesh lost more than 2 % of the part's volume (members thinner than an element),
   the panel says the part checked is weaker than the one made. A fixture, load or remote
   mass whose faces are not on the part (material grown over a bore no obstacle kept clear)
   is named instead. Nothing is saved: the check is the part's, made again with it.
 - **Tests:** a remote force's nodal forces sum to it, with its moment about the faces'
   centre and none about its point, on linear and quadratic elements; a bar kept whole and
-  made a part, checked: its stress, displacement, compliance and mass as theory gives them
-  (no Poisson's ratio, so the fixed end does not hold it); the same part moved off the
+  made a part, checked: its stress, compliance and mass as theory gives them, its end's
+  displacement within a fifth (the bevels' share of its section and its fixed end; no
+  Poisson's ratio, so the fixed end does not hold it); the same bar kept by preserve
+  regions on its own body; the same part moved off the
   bar's faces refused, naming the fixture; through OpenCASCADE, the plate with two bored
   rings made a part and checked: the bores found, its mass the solid's, its compliance
   within a factor of three of the outcome's (still a little grey after 30 iterations).
@@ -1220,7 +1227,12 @@ clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency s
   mass at each corner, in tonnes as millimetres and newtons take them), by the block LOBPCG
   of `crate::eigen` with two guard vectors, preconditioned by one V-cycle of the static
   solve's multigrid on `K` (`multigrid::Cycle`), warm-started from the last iteration's
-  modes. On the graphics card when the static solves are (step 12).
+  modes. On the graphics card when the static solves are (step 12). The solve stops only
+  once the guards, which start at random, have settled too (to ten thousand times the
+  tolerance): the last modes are often converged already, and a mode come in under them (a
+  piece of the design hanging by a grey neck, as the projection sharpens) is found by the
+  guards alone. Stopping on the wanted modes alone, the solve missed it every other
+  iteration, and the design ended a quarter under its limit.
 - **The mass interpolation**: a voxel's mass goes as its projected density, and below a
   tenth as the sixth power of it scaled to meet it there (Du and Olhoff, 2007): the
   stiffness goes as the cube, so near-void regions lighter than they are weak would

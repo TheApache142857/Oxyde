@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::GenerativeStudy;
 use crate::bvh::Bvh;
 use crate::material::Elastic;
-use crate::math::{V3, add, cross, dot, normalize, scale, sub};
+use crate::math::{V3, add, cross, dot, norm, normalize, scale, sub};
 use crate::mesher::{MeshError, MeshOptions, SurfaceMesh, mesh_solids};
 use crate::modal::{FrequencyStudy, solve_frequencies};
 use crate::solve::{self, Load, LoadKind, SolveError, SolveOptions, Study};
@@ -52,9 +52,9 @@ pub struct PartCheck {
     pub compliance: f64,
     /// mm: the largest displacement over the load cases.
     pub max_displacement: f64,
-    /// MPa: the largest von Mises stress over the load cases, but at the nodes of the faces
-    /// the case's fixtures and loads act on (where stress is singular), as the outcome
-    /// leaves out the voxels they act through.
+    /// MPa: the largest von Mises stress over the load cases, but in the elements touching
+    /// the faces the case's fixtures and loads act on (where stress is singular), as the
+    /// outcome leaves out the voxels they act through.
     pub max_von_mises: f64,
     /// The yield strength over it, when the material has one.
     pub min_factor_of_safety: Option<f64>,
@@ -131,7 +131,8 @@ pub fn check_part(
 ) -> Result<PartCheck, CheckError> {
     let voxel = study.voxel_size;
     progress("Finding the faces kept on the part", 0.0);
-    let solids = labelled(study, pieces);
+    let kept = kept_faces(study);
+    let solids = labelled(study, &kept, pieces);
     if cancel.load(Ordering::Relaxed) {
         return Err(CheckError::Cancelled);
     }
@@ -200,7 +201,7 @@ pub fn check_part(
                     index: i,
                 });
             }
-            loads.push(load.clone());
+            loads.push(through_centre(load, &kept));
         }
         // m/s²: the case's accelerations, summed, which weigh the part and its remote
         // masses.
@@ -232,8 +233,8 @@ pub fn check_part(
                 });
             }
         }
-        // Stress is singular where the case's fixtures and loads act: their faces' nodes
-        // are left out of the largest stress.
+        // Stress is singular where the case's fixtures and loads act: their faces are left
+        // out of the largest stress.
         let acting: BTreeSet<u32> = fixtures
             .iter()
             .flat_map(|f| f.labels.iter())
@@ -272,12 +273,30 @@ pub fn check_part(
             .map(|(f, u)| dot(*f, *u))
             .sum::<f64>();
         max_displacement = max_displacement.max(results.summary().max_displacement.0);
-        let mut singular = vec![false; mesh.nodes.len()];
+        let mut on_faces = vec![false; mesh.nodes.len()];
         for facet in mesh.facets.iter().filter(|f| acting.contains(&f.label)) {
             let mids = mesh.facet_edge_nodes(facet).into_iter().flatten();
             for n in mesh.facet_corners(facet).into_iter().chain(mids) {
-                if let Some(s) = singular.get_mut(n as usize) {
+                if let Some(s) = on_faces.get_mut(n as usize) {
                     *s = true;
+                }
+            }
+        }
+        // And the elements touching those faces, a voxel deep as the outcome's: where the
+        // mesh bevels a face's edges, a fixture stops short of them, and the stress is
+        // singular where it stops.
+        let mut singular = on_faces.clone();
+        for e in 0..mesh.tets.len() {
+            let (nodes, count) = mesh.element_nodes(e);
+            let nodes = nodes.get(..count).unwrap_or(&[]);
+            if nodes
+                .iter()
+                .any(|&n| on_faces.get(n as usize).copied().unwrap_or(false))
+            {
+                for &n in nodes {
+                    if let Some(s) = singular.get_mut(n as usize) {
+                        *s = true;
+                    }
                 }
             }
         }
@@ -342,20 +361,85 @@ pub fn check_part(
     })
 }
 
-/// The pieces as the mesher takes them, each triangle labelled with the preserve body's
-/// face it lies on, or [`crate::NO_LABEL`].
-fn labelled(study: &GenerativeStudy, pieces: &[Shape]) -> Vec<SurfaceMesh> {
-    let mut faces: Vec<[V3; 3]> = Vec::new();
-    let mut labels: Vec<u32> = Vec::new();
-    for s in &study.space.preserve {
+/// The faces fixtures and loads may be on, by triangle with its label: every face of the
+/// preserve bodies, and the faces of the preserve regions on their bodies.
+fn kept_faces(study: &GenerativeStudy) -> Vec<([V3; 3], u32)> {
+    let space = &study.space;
+    let regions: BTreeSet<u32> = space
+        .regions
+        .iter()
+        .flat_map(|r| r.labels.iter())
+        .copied()
+        .collect();
+    let bodies = space
+        .preserve
+        .iter()
+        .map(|s| (s, None))
+        .chain(space.region_bodies.iter().map(|s| (s, Some(&regions))));
+    let mut out = Vec::new();
+    for (s, only) in bodies {
         for (t, &label) in s.triangles.iter().zip(&s.labels) {
+            if only.is_some_and(|only| !only.contains(&label)) {
+                continue;
+            }
             let p = |i: u32| s.positions.get(i as usize).copied();
             if let (Some(a), Some(b), Some(c)) = (p(t[0]), p(t[1]), p(t[2])) {
-                faces.push([a, b, c]);
-                labels.push(label);
+                out.push(([a, b, c], label));
             }
         }
     }
+    out
+}
+
+/// A force along a direction applied through the centre of the faces it was set on, as a
+/// remote force there. The check's mesh bevels the part's edges at the scale of an element,
+/// unevenly round a face, which takes a band off some sides of the face and so moves the
+/// centre of the load: on a slender member the moment that makes bends it, as the part
+/// would not be. Through the faces' own centre the load keeps the force and the moment the
+/// study gives it. Other loads are left as they are: a pressure's resultant on a bore is
+/// nothing, and the pressure is the load.
+fn through_centre(load: &Load, kept: &[([V3; 3], u32)]) -> Load {
+    let LoadKind::Force {
+        total,
+        direction: Some(direction),
+    } = load.kind
+    else {
+        return load.clone();
+    };
+    let Some(direction) = normalize(direction) else {
+        return load.clone();
+    };
+    let (mut area, mut moment) = (0.0, [0.0; 3]);
+    for (t, label) in kept {
+        if !load.labels.contains(label) {
+            continue;
+        }
+        let a = 0.5 * norm(cross(sub(t[1], t[0]), sub(t[2], t[0])));
+        let centre = scale(add(add(t[0], t[1]), t[2]), 1.0 / 3.0);
+        area += a;
+        moment = add(moment, scale(centre, a));
+    }
+    if area.is_nan() || area <= 0.0 {
+        return load.clone();
+    }
+    Load {
+        kind: LoadKind::Remote {
+            force: scale(direction, total),
+            point: scale(moment, 1.0 / area),
+        },
+        labels: load.labels.clone(),
+    }
+}
+
+/// The pieces as the mesher takes them, each triangle labelled with the kept face
+/// ([`kept_faces`]) it lies on, or [`crate::NO_LABEL`].
+fn labelled(
+    study: &GenerativeStudy,
+    kept: &[([V3; 3], u32)],
+    pieces: &[Shape],
+) -> Vec<SurfaceMesh> {
+    let faces: Vec<[V3; 3]> = kept.iter().map(|(t, _)| *t).collect();
+    let labels: Vec<u32> = kept.iter().map(|(_, l)| *l).collect();
     let tree = (!faces.is_empty()).then(|| Bvh::new(faces));
     let voxel = study.voxel_size;
     let near = |p: V3, slack: f64| -> Option<u32> {

@@ -1036,10 +1036,13 @@ fn a_part_is_checked_on_its_own_mesh() {
     let cancel = AtomicBool::new(false);
     let check = check_part(&study, &[part], &material, &cancel, &|_, _| {}).unwrap();
     // The end moves PL/EA = 0.05 mm, the load's work is 500 N·mm, and 10 cm³ of steel
-    // weighs 78.5 g. The mesher bevels the box's edges a little, which takes some volume
-    // and gathers a little stress where the bevels are held.
+    // weighs 78.5 g. The mesher bevels the box's edges at an element's scale (here a voxel,
+    // a fifth of the bar's side), which takes some of its section and leaves a band of the
+    // fixed end free, so the end's corners move up to a sixth more than the theory's; the
+    // load goes through the end's centre whatever the bevels take of it, else the bar
+    // bends and its end moves twice as far.
     let near = |value: f64, expected: f64, share: f64| (value - expected).abs() <= share * expected;
-    assert!(near(check.max_displacement, 0.05, 0.06), "{check:?}");
+    assert!(near(check.max_displacement, 0.05, 0.2), "{check:?}");
     assert!(near(check.compliance, 500.0, 0.06), "{check:?}");
     assert!(near(check.mass, 0.0785, 0.05), "{check:?}");
     assert!((90.0..=150.0).contains(&check.max_von_mises), "{check:?}");
@@ -1051,6 +1054,26 @@ fn a_part_is_checked_on_its_own_mesh() {
     );
     assert!(check.element_size >= study.voxel_size);
     assert!(check.nodes > 0 && check.elements > 0);
+}
+
+#[test]
+fn a_part_kept_by_preserve_regions_is_checked_on_their_faces() {
+    // The same bar with no preserve body: its ends kept as regions of its own body, the
+    // fixture and the load on them.
+    let (mut study, part) = bar_part();
+    let body = study.space.preserve.remove(0);
+    study.space.regions = vec![PreserveRegion {
+        body: 0,
+        labels: vec![0, 1],
+        depth: 2.0,
+    }];
+    study.space.region_bodies = vec![body];
+    let material = Elastic::new(200_000.0, 0.0, 250.0, 7850.0);
+    let cancel = AtomicBool::new(false);
+    let check = check_part(&study, &[part], &material, &cancel, &|_, _| {}).unwrap();
+    let near = |value: f64, expected: f64, share: f64| (value - expected).abs() <= share * expected;
+    assert!(near(check.compliance, 500.0, 0.06), "{check:?}");
+    assert!(near(check.max_displacement, 0.05, 0.2), "{check:?}");
 }
 
 #[test]

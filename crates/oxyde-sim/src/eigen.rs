@@ -23,7 +23,8 @@
 //!   vectors and to their products by `A` and `B` together, so an iteration costs one
 //!   product by each and one preconditioning per pair not converged.
 //! - **Guard vectors** beyond those wanted speed the last of them up: the block then holds
-//!   the next eigenvalues too. A pair is converged when its residual `‖A x − λ B x‖` is under
+//!   the next eigenvalues too. The solve stops once the guards have settled as well, more
+//!   loosely ([`GUARD_SLACK`]), so a warm start's converged pairs do not hide a lower one. A pair is converged when its residual `‖A x − λ B x‖` is under
 //!   `tolerance` times `‖A x‖ + |λ| ‖B x‖` (a backward error, as meaningful for a zero
 //!   eigenvalue as for a large one); it then stops being expanded (soft locking) but still
 //!   takes part in the Rayleigh–Ritz.
@@ -46,6 +47,11 @@ const JACOBI_SWEEPS: usize = 100;
 const JACOBI_TOLERANCE: f64 = 1e-15;
 /// Attempts at a start block of independent vectors.
 const START_ATTEMPTS: usize = 4;
+/// The guard vectors converge to this many times the tolerance before the solve stops. A
+/// warm start's wanted pairs may already be converged when the operators have changed a
+/// little, and a mode that has come in under them is found only by the guards, which start
+/// at random: stopping before they settle would hand back the old modes as the lowest.
+const GUARD_SLACK: f64 = 1e4;
 
 /// A vector of an [`EigenSpace`], by the number the space gave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +407,7 @@ pub(crate) fn smallest_in<S: EigenSpace + ?Sized>(
         let mut active: Vec<usize> = Vec::new();
         let mut kept: Vec<Vector> = Vec::new();
         let mut worst = 0.0f64;
+        let mut worst_guard = 0.0f64;
         for (i, r) in residuals.into_iter().enumerate() {
             let [rr, aa, bb] = [sizes[3 * i], sizes[3 * i + 1], sizes[3 * i + 2]];
             let size = aa.max(0.0).sqrt() + values[i].abs() * bb.max(0.0).sqrt();
@@ -416,6 +423,8 @@ pub(crate) fn smallest_in<S: EigenSpace + ?Sized>(
             };
             if i < count {
                 worst = worst.max(relative);
+            } else {
+                worst_guard = worst_guard.max(relative);
             }
             if relative > options.tolerance {
                 active.push(i);
@@ -431,7 +440,7 @@ pub(crate) fn smallest_in<S: EigenSpace + ?Sized>(
             1.0
         };
         progress(done);
-        if worst <= options.tolerance {
+        if worst <= options.tolerance && worst_guard <= GUARD_SLACK * options.tolerance {
             for r in kept {
                 space.release(r);
             }
@@ -960,10 +969,10 @@ mod tests {
     }
 
     #[test]
-    fn a_warm_start_converges_sooner_and_the_same_run_repeats() {
+    fn a_warm_start_finds_the_modes_a_cold_one_does_and_the_same_run_repeats() {
         let n = 80;
         let cancel = AtomicBool::new(false);
-        let solve = |stiffer: f64, start: Option<&[Vec<f64>]>| {
+        let solve = |stiffer: f64, count: usize, start: Option<&[Vec<f64>]>| {
             let a = |x: &[f64], y: &mut [f64]| tridiagonal(2.0 * stiffer, -stiffer, x, y);
             let b = |x: &[f64], y: &mut [f64]| tridiagonal(4.0 / 6.0, 1.0 / 6.0, x, y);
             let mut precondition = |r: &[f64], z: &mut [f64]| {
@@ -979,21 +988,27 @@ mod tests {
                 project: &|_: &mut [f64]| {},
                 progress: &|_| {},
             };
-            smallest(&mut problem, &options(3), start, &cancel).unwrap()
+            smallest(&mut problem, &options(count), start, &cancel).unwrap()
         };
-        let cold = solve(1.0, None);
-        assert_eq!(cold, solve(1.0, None));
+        let cold = solve(1.0, 4, None);
+        assert_eq!(cold, solve(1.0, 4, None));
         // A little stiffer: the same vectors, eigenvalues 1 % higher.
-        let warm = solve(1.01, Some(cold.vectors.as_slice()));
+        let warm = solve(1.01, 4, Some(cold.vectors.as_slice()));
         assert!(warm.converged && cold.converged);
-        assert!(
-            warm.iterations < cold.iterations,
-            "{} {}",
-            warm.iterations,
-            cold.iterations
-        );
         for (w, c) in warm.values.iter().zip(&cold.values) {
             assert!((w / c - 1.01).abs() < 1e-7);
+        }
+        // Started from the second to fourth modes, converged already: the lowest, under them,
+        // is still found, by the guards, which start at random.
+        let missing = solve(1.0, 3, Some(&cold.vectors[1..]));
+        assert!(missing.converged);
+        for (m, c) in missing.values.iter().zip(&cold.values) {
+            assert!(
+                (m / c - 1.0).abs() < 1e-7,
+                "{:?} {:?}",
+                missing.values,
+                cold.values
+            );
         }
     }
 
