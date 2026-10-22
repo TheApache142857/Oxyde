@@ -1,6 +1,7 @@
-//! Booleans of solids with planar faces: fuse, cut and common of a target with tools.
+//! Booleans: fuse, cut and common of a target with tools.
 //!
-//! Each input's faces are triangulated into convex pieces that remember their face, the
+//! Solids with curved faces are cut face by face along where they meet ([`crate::curved`]).
+//! Straight-sided solids go through BSP trees: each input's faces are triangulated into convex pieces that remember their face, the
 //! pieces are combined by BSP trees ([`crate::bsp`]) and glued back into faces and solids
 //! ([`crate::assemble`]). A result is then held to what the operation can do at all before
 //! it is used, the checks SolidCraft's kernel makes of its booleans (`boolean_guard.rs`
@@ -18,6 +19,7 @@ use crate::NativeError;
 use crate::assemble;
 use crate::brep::Shape;
 use crate::bsp::{self, Plane3, Polygon};
+use crate::curved;
 use crate::tessellate;
 
 /// `target` (input 0) fused with, cut by or in common with `tools` (inputs 1, 2…): a fuse
@@ -31,10 +33,12 @@ pub(crate) fn boolean(
     if tools.is_empty() {
         return Err(NativeError::Failed("a boolean needs a tool".to_owned()));
     }
+    // Curved faces are cut along where they meet ([`curved`]); straight-sided solids go
+    // through BSP trees.
     if !target.is_straight() || tools.iter().any(|t| !t.is_straight()) {
-        return Err(NativeError::Unsupported(
-            "join, cut or intersect curved faces",
-        ));
+        let (shape, history) = curved::boolean(op, target, tools)?;
+        check(op, target, tools, &shape)?;
+        return Ok((shape, history));
     }
     let eps = LINEAR_TOLERANCE;
     let mut tool_polygons = Vec::with_capacity(tools.len());

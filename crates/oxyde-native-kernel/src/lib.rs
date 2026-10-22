@@ -10,8 +10,8 @@
 //!
 //! What it builds so far: boxes, extrusions of profiles of lines, arcs and circles (faces on
 //! planes and cylinders, edges on lines and circles), their moved or mirrored copies, and
-//! booleans (fuse, cut, common) of the straight-sided ones, with their topology, exact mass
-//! properties, bounds and display meshes. Every other operation answers
+//! booleans (fuse, cut, common) of them where their faces meet in lines and circles, with
+//! their topology, exact mass properties, bounds and display meshes. Every other operation answers
 //! [`NativeError::Unsupported`] until it is written, so a caller sees a failing feature with
 //! a message, never a crash.
 
@@ -38,11 +38,13 @@
     )
 )]
 
+mod arrangement;
 mod assemble;
 mod boolean;
 mod brep;
 mod bsp;
 mod build;
+mod curved;
 mod geometry;
 mod tessellate;
 mod triangulate;
@@ -536,6 +538,78 @@ mod tests {
         }
     }
 
+    fn cylinder(
+        kernel: &mut NativeKernel,
+        at: (f64, f64),
+        radius: f64,
+        z: (f64, f64),
+    ) -> ShapeHandle {
+        let circle = Profile::from_curves(&[ProfileSegment {
+            id: 1,
+            curve: Curve2::Circle {
+                center: Point2::new(at.0, at.1),
+                radius,
+            },
+        }])
+        .unwrap();
+        let plane = Plane {
+            origin: Point3::new(0.0, 0.0, z.0),
+            x_dir: Vec3::X,
+            normal: Vec3::Z,
+        };
+        kernel
+            .extrude(&plane, &circle, Vec3::new(0.0, 0.0, z.1 - z.0))
+            .unwrap()
+            .shape
+    }
+
+    #[test]
+    fn booleans_with_cylinders_have_the_volumes_they_should() {
+        use std::f64::consts::PI;
+        let mut kernel = NativeKernel::new();
+        let a = block(&mut kernel, (0.0, 0.0, 0.0), (40.0, 30.0, 10.0));
+        let through = cylinder(&mut kernel, (20.0, 15.0), 6.0, (-5.0, 15.0));
+        let over_edge = cylinder(&mut kernel, (40.0, 15.0), 6.0, (-5.0, 15.0));
+        let on_top = cylinder(&mut kernel, (38.0, 15.0), 6.0, (10.0, 15.0));
+        let cases = [
+            (
+                BooleanOp::Cut,
+                through,
+                12_000.0 - 36.0 * PI * 10.0,
+                (7, 15, 10),
+            ),
+            (
+                BooleanOp::Cut,
+                over_edge,
+                12_000.0 - 18.0 * PI * 10.0,
+                (8, 18, 12),
+            ),
+            (BooleanOp::Common, through, 36.0 * PI * 10.0, (3, 3, 2)),
+            (
+                BooleanOp::Fuse,
+                on_top,
+                12_000.0 + 36.0 * PI * 5.0,
+                (9, 19, 12),
+            ),
+        ];
+        for (op, tool, volume, (faces, edges, vertices)) in cases {
+            let result = kernel.boolean(op, a, tool).unwrap();
+            let got = kernel.volume(result.shape).unwrap();
+            assert!(
+                (got - volume).abs() < 1e-6,
+                "{op:?}: {got} instead of {volume}"
+            );
+            let counts = kernel.topology_counts(result.shape).unwrap();
+            assert_eq!(
+                (counts.faces, counts.edges, counts.vertices),
+                (faces, edges, vertices),
+                "{op:?}"
+            );
+            assert!(result.history.faces.iter().all(|s| !s.is_empty()));
+            kernel.release(result.shape);
+        }
+    }
+
     #[test]
     fn what_is_not_written_yet_fails_with_a_message() {
         let mut kernel = NativeKernel::new();
@@ -547,17 +621,23 @@ mod tests {
             },
         }])
         .unwrap();
-        let cylinder = kernel.extrude(&Plane::FRONT, &circle, Vec3::Z).unwrap();
-        let shape = kernel
-            .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
+        // Two cylinders whose axes cross meet in a curve that is neither a line nor a circle.
+        let along_z = kernel
+            .extrude(&Plane::FRONT, &circle, Vec3::new(0.0, 0.0, 4.0))
+            .unwrap();
+        let along_x = kernel
+            .extrude(&Plane::RIGHT, &circle, Vec3::new(4.0, 0.0, 0.0))
             .unwrap();
         let error = kernel
-            .boolean(BooleanOp::Cut, shape, cylinder.shape)
+            .boolean(BooleanOp::Cut, along_z.shape, along_x.shape)
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "the native kernel cannot join, cut or intersect curved faces yet"
+            "the native kernel cannot intersect cylinders whose axes are not parallel yet"
         );
+        let shape = kernel
+            .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
+            .unwrap();
         assert!(matches!(
             kernel.fillet(shape, &[0], 1.0),
             Err(NativeError::Unsupported(_))

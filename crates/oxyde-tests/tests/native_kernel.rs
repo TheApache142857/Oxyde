@@ -375,6 +375,276 @@ fn display_meshes_of_curved_faces_follow_them() {
     }
 }
 
+fn cut(part: &mut Part, sketch: Sketch, extent: ExtrudeExtent) {
+    extrude(part, sketch, ExtrudeOp::Cut, extent, false);
+}
+
+#[test]
+fn a_round_hole_through_all() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_same_part("round hole", &part);
+}
+
+#[test]
+fn a_round_boss_on_a_face() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 5.0 },
+        false,
+    );
+    assert_same_part("round boss on a face", &part);
+}
+
+#[test]
+fn a_blind_round_pocket() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    cut(&mut part, sketch, ExtrudeExtent::Blind { depth: 4.0 });
+    assert_same_part("blind round pocket", &part);
+}
+
+#[test]
+fn half_holes_at_the_edges() {
+    // At +x the half kept leaves out angle zero; at x = 0 it holds it.
+    for x in [40.0, 0.0] {
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        sketch.circle(Point2::new(x, 15.0), 6.0);
+        cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+        assert_same_part(&format!("half hole at x = {x}"), &part);
+    }
+}
+
+#[test]
+fn a_hole_close_to_a_side() {
+    // Half a millimetre of wall between the hole's angle zero, where its seam is, and the
+    // side. (Touching the side, the hole would meet it along a line: OpenCASCADE then splits
+    // the side there and gives the seam to three faces, which the native kernel does not.)
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(33.5, 15.0), 6.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_same_part("hole close to a side", &part);
+}
+
+#[test]
+fn a_counterbore() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 4.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 7.0);
+    cut(&mut part, sketch, ExtrudeExtent::Blind { depth: 3.0 });
+    assert_same_part("counterbore", &part);
+}
+
+#[test]
+fn a_round_boss_overhanging_an_edge() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(38.0, 15.0), 6.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 5.0 },
+        false,
+    );
+    assert_same_part("round boss overhanging", &part);
+}
+
+#[test]
+fn a_slot_cut_through() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.line(Point2::new(10.0, 10.0), Point2::new(25.0, 10.0));
+    arc(&mut sketch, (25.0, 15.0), (25.0, 10.0), (25.0, 20.0));
+    sketch.line(Point2::new(25.0, 20.0), Point2::new(10.0, 20.0));
+    arc(&mut sketch, (10.0, 15.0), (10.0, 20.0), (10.0, 10.0));
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_same_part("slot cut through", &part);
+}
+
+#[test]
+fn a_hole_across_from_the_side() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    sketch.circle(Point2::new(-5.0, 15.0), 3.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("hole across from the side", &part);
+}
+
+#[test]
+fn a_round_boss_cut_in_two_by_a_pocket() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 8.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    sketch.rectangle(Point2::new(15.0, -40.0), 4.0, 50.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("round boss cut in two", &part);
+}
+
+#[test]
+fn a_hole_from_the_front_plane_reversed() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        true,
+    );
+    assert_same_part("hole from the front plane", &part);
+}
+
+#[test]
+fn round_bosses_stacked_on_one_axis() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 8.0);
+    let lower = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 4.0 },
+        false,
+    );
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(lower)));
+    sketch.circle(Point2::new(20.0, 15.0), 5.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 3.0 },
+        false,
+    );
+    assert_same_part("round bosses stacked", &part);
+}
+
+#[test]
+fn a_hole_through_a_round_boss() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 8.0);
+    let round = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 6.0 },
+        false,
+    );
+    let mut sketch = Sketch::new(SketchPlane::Face(FaceName::end_cap(round)));
+    sketch.circle(Point2::new(20.0, 15.0), 3.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_same_part("hole through a round boss", &part);
+}
+
+#[test]
+fn an_intersection_with_a_cylinder() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut sketch = front();
+    sketch.circle(Point2::new(30.0, 15.0), 12.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Intersect,
+        ExtrudeExtent::Blind { depth: 6.0 },
+        true,
+    );
+    assert_same_part("intersection with a cylinder", &part);
+}
+
+#[test]
+fn a_pattern_of_round_holes() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(6.0, 15.0), 3.0);
+    let hole = extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        false,
+    );
+    part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![hole],
+        first: PatternDirection {
+            axis: AxisRef::Standard(StandardAxis::X),
+            spacing: 9.0,
+            count: 4,
+            reverse: false,
+        },
+        second: None,
+        skip: Vec::new(),
+    }));
+    assert_same_part("pattern of round holes", &part);
+}
+
+#[test]
+fn a_rounded_rectangle_boss_on_a_face() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    // 20 × 12 with corners rounded to 3.
+    let (x0, y0, x1, y1, r) = (10.0, 9.0, 30.0, 21.0, 3.0);
+    sketch.line(Point2::new(x0 + r, y0), Point2::new(x1 - r, y0));
+    arc(&mut sketch, (x1 - r, y0 + r), (x1 - r, y0), (x1, y0 + r));
+    sketch.line(Point2::new(x1, y0 + r), Point2::new(x1, y1 - r));
+    arc(&mut sketch, (x1 - r, y1 - r), (x1, y1 - r), (x1 - r, y1));
+    sketch.line(Point2::new(x1 - r, y1), Point2::new(x0 + r, y1));
+    arc(&mut sketch, (x0 + r, y1 - r), (x0 + r, y1), (x0, y1 - r));
+    sketch.line(Point2::new(x0, y1 - r), Point2::new(x0, y0 + r));
+    arc(&mut sketch, (x0 + r, y0 + r), (x0, y0 + r), (x0 + r, y0));
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 4.0 },
+        false,
+    );
+    assert_same_part("rounded rectangle boss", &part);
+}
+
 #[test]
 fn a_block_on_the_front_plane() {
     let mut part = Part::new();
@@ -669,31 +939,20 @@ fn an_intersection_keeps_what_both_share() {
 #[test]
 fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut part = Part::new();
-    let mut sketch = front();
-    sketch.rectangle(Point2::new(0.0, 0.0), 20.0, 20.0);
-    boss(
+    let base = base_block(&mut part);
+    // A hole down through the block, which the native kernel cuts.
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 4.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    // A hole across it from the side: two cylinders whose axes cross meet in a curve that
+    // is neither a line nor a circle, which the native kernel cannot cut yet.
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    sketch.circle(Point2::new(-5.0, 15.0), 3.0);
+    extrude(
         &mut part,
         sketch,
-        ExtrudeExtent::Blind { depth: 5.0 },
-        false,
-    );
-    // A second boss joins the first.
-    let mut sketch = front();
-    sketch.rectangle(Point2::new(10.0, 10.0), 20.0, 20.0);
-    boss(
-        &mut part,
-        sketch,
-        ExtrudeExtent::Blind { depth: 5.0 },
-        false,
-    );
-    // A cylinder joined to them: the native kernel extrudes the circle but cannot join
-    // curved faces yet.
-    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
-    sketch.circle(Point2::new(50.0, 0.0), 4.0);
-    boss(
-        &mut part,
-        sketch,
-        ExtrudeExtent::Blind { depth: 5.0 },
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
         false,
     );
 
@@ -705,19 +964,20 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     match &statuses[5] {
         FeatureStatus::Error(message) => {
             assert!(
-                message.contains("join, cut or intersect curved faces"),
+                message.contains("cylinders whose axes are not parallel"),
                 "{message}"
             )
         }
-        other => panic!("the cylinder should fail, not {other:?}"),
+        other => panic!("the crossing hole should fail, not {other:?}"),
     }
-    // The two blocks joined are still there, whole.
+    // The block with its first hole is still there, whole.
     let body = part.body().expect("a body");
     let volume: f64 = body
         .solids
         .iter()
         .map(|s| kernel.volume(s.shape).unwrap())
         .sum();
-    assert!((volume - 3500.0).abs() < 1e-9, "{volume}");
+    let expected = 12_000.0 - std::f64::consts::PI * 16.0 * 10.0;
+    assert!((volume - expected).abs() < 1e-6, "{volume}");
     part.release(&mut kernel);
 }
