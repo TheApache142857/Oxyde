@@ -201,7 +201,7 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-sketch` | 2D sketch entities and the geometric constraint solver (degrees of freedom, fully defined, redundant/conflicting) |
 | `oxyde-kernel` | The `Kernel` trait: solid operations, topology queries, operation history, STEP I/O |
 | `oxyde-occt` | `Kernel` implementation backed by OpenCASCADE through a small C++ shim (`cxx`) |
-| `oxyde-native-kernel` | Oxyde's own `Kernel` implementation in Rust, being written; nothing uses it yet |
+| `oxyde-native-kernel` | Oxyde's own `Kernel` implementation in Rust, being written: boxes and extrusions of straight-sided sketches so far; nothing in the app uses it yet |
 | `oxyde-model` | Feature tree, dependency graph, rebuild, persistent topological naming |
 | `oxyde-assembly` | Assemblies: components, mates and the 3D mate solver, bill of materials |
 | `oxyde-format` | Reading and writing `.oxyprt` parts and `.oxyasm` assemblies |

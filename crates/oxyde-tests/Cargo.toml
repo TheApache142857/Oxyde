@@ -1,6 +1,6 @@
 [package]
 name = "oxyde-tests"
-description = "End-to-end tests: the modeling engine driving the OpenCASCADE kernel."
+description = "End-to-end tests: the modeling engine driving the OpenCASCADE kernel, and the native kernel compared with it."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ oxyde-geom = { workspace = true }
 oxyde-kernel = { workspace = true }
 oxyde-model = { workspace = true }
 oxyde-occt = { workspace = true }
+oxyde-native-kernel = { workspace = true }
 oxyde-sketch = { workspace = true }
 oxyde-format = { workspace = true }
 oxyde-assembly = { workspace = true }
