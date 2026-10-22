@@ -12,8 +12,10 @@
 //!
 //! *Run* turns the study into an OpenFOAM case and runs it on a thread of its own
 //! (`oxyde_flow`: OpenFOAM is a separate program, GPL, never linked), the residuals plotted
-//! in the panel as it goes. Then the goals' values are listed, and the viewport shows the
-//! pressure on the model's wetted faces or a cut plane through the fluid, in colour bands.
+//! in the panel as it goes. Then the goals' values are listed (an external flow's forces
+//! with their drag coefficient), and the viewport shows the pressure on the model's wetted
+//! faces or a cut plane through the fluid, in colour bands, or the flow's trajectories:
+//! particles carried by the flow, each with a trail, playing over the faint model.
 //!
 //! The case folder is the results' home: beside the study file once it is saved
 //! (`<study file>-<study>.openfoam`), in the temporary folder before; it opens in ParaView.
@@ -21,14 +23,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use oxyde_flow::plot::Quantity;
+use oxyde_flow::trajectory::{Seeding, Trajectory};
 use oxyde_format::results::{FlowRun, GoalOutcome, GoalResult, SolverInfo};
 use oxyde_format::simulation::{
     CoolingSettings, FlowAnalysis, FlowGoalKind, FlowSettings, FlowTurbulence, Fluid, StudyType,
 };
+use oxyde_geom::Point3;
 use oxyde_kernel::{FaceMesh, Mesh};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{MeshReport, TetMesh};
@@ -39,6 +43,7 @@ use crate::simulation_ui::{
     Done, ItemKind, Legend, Outcome, PanelAction, PlotChoice, PlotKey, RunMode, Shared, SimJob,
     Study, Surfaces, format_number, format_value, item_row,
 };
+use crate::viewport::ViewportOutput;
 
 /// What a flow run uses at its peak per cell of the mesh, bytes: OpenFOAM's meshing and
 /// its turbulent solver, with room to spare.
@@ -63,6 +68,15 @@ pub(crate) struct FlowDone {
     pub(crate) case_dir: PathBuf,
     /// The flow read from the case, for the plots; `None` when the case is gone.
     pub(crate) fields: Option<oxyde_flow::FlowResults>,
+    /// An external flow's free stream (m/s) and the model's frontal area seen along it
+    /// (mm²), for the drag coefficient: worked out when the flow is read, never saved.
+    pub(crate) frontal: Option<([f64; 3], f64)>,
+}
+
+/// The free stream `velocity` (m/s) and the model's frontal area along it (mm²): the
+/// silhouette of the mesh's faces on the model. `None` in still surroundings.
+fn frontal_of(fields: &oxyde_flow::FlowResults, velocity: [f64; 3]) -> Option<([f64; 3], f64)> {
+    oxyde_flow::drag::frontal_area(fields, velocity).map(|area| (velocity, area))
 }
 
 /// What the status bar says once a flow is solved.
@@ -549,6 +563,10 @@ fn flow_thread(
             },
         })
         .collect();
+    let frontal = match study.flow_type {
+        oxyde_flow::FlowType::External { velocity } => frontal_of(&fields, velocity),
+        oxyde_flow::FlowType::Internal { .. } => None,
+    };
     let history: Vec<Vec<(String, f64)>> =
         report.history.iter().map(|i| i.residuals.clone()).collect();
     let (residual_fields, residuals) = residual_table(&history);
@@ -579,6 +597,7 @@ fn flow_thread(
             run,
             case_dir: input.case_dir,
             fields: Some(fields),
+            frontal,
         }),
     })
 }
@@ -802,13 +821,32 @@ impl OxydeApp {
             self.simulation.prefs_dirty = true;
         }
         let quantity = match plot {
-            Some(PlotChoice::FlowCutVelocity) => Quantity::Speed,
+            Some(PlotChoice::FlowCutVelocity | PlotChoice::FlowTrajectories) => Quantity::Speed,
             Some(PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature) => {
                 Quantity::Temperature
             }
             _ => Quantity::Pressure,
         };
         let cutting = plot.is_some_and(PlotChoice::is_cut);
+        let tracing = plot == Some(PlotChoice::FlowTrajectories);
+        // The paths, followed again for other results or another number of them.
+        let wanted = (done.id, prefs.trajectories.clamp(10, 1000));
+        if tracing
+            && self
+                .simulation
+                .particles
+                .as_ref()
+                .is_none_or(|p| p.key != wanted)
+            && let Some(fields) = flow.fields.as_ref()
+        {
+            let playing = self.simulation.particles.as_ref().is_none_or(|p| p.playing);
+            let mut particles =
+                Particles::follow(fields, self.simulation.study.flow.analysis, wanted);
+            particles.playing = playing;
+            self.simulation.particles = Some(particles);
+            // The legend follows the new paths' speeds.
+            self.simulation.shown = None;
+        }
         let mut position = prefs.cut_position.clamp(0.0, 1.0);
         // A new result, or another axis, starts the plane through the middle of the model
         // rather than of the fluid, which for an external flow is far behind it; the slider
@@ -865,10 +903,17 @@ impl OxydeApp {
                 *n = 1.0;
             }
             oxyde_flow::plot::cut(fields, origin, normal, quantity)
+        } else if tracing {
+            // Drawn over the viewport, not in the scene: they move every frame.
+            Vec::new()
         } else {
             oxyde_flow::plot::surface(fields, quantity)
         };
-        let (lo, hi) = oxyde_flow::plot::range(&polygons).unwrap_or((0.0, 1.0));
+        let particles = self.simulation.particles.as_ref().filter(|_| tracing);
+        let (lo, hi) = match particles {
+            Some(p) => p.range,
+            None => oxyde_flow::plot::range(&polygons).unwrap_or((0.0, 1.0)),
+        };
         let bands = key.bands as usize;
         // Each polygon fanned into triangles, one face of the scene per colour band.
         let mut faces: Vec<FaceMesh> = (0..bands)
@@ -904,8 +949,10 @@ impl OxydeApp {
                 ..RenderMaterial::default()
             })
             .collect();
-        // A cut plane is seen in the model, drawn faint around it.
-        if cutting && let Some(surfaces) = &self.simulation.surfaces {
+        // A cut plane or the trajectories are seen in the model, drawn faint around them.
+        if (cutting || tracing)
+            && let Some(surfaces) = &self.simulation.surfaces
+        {
             let mut model = FaceMesh {
                 positions: Vec::new(),
                 triangles: Vec::new(),
@@ -939,11 +986,10 @@ impl OxydeApp {
                 let c = p.points.iter().fold([0.0; 3], |s, q| {
                     [s[0] + q[0] / n, s[1] + q[1] / n, s[2] + q[2] / n]
                 });
-                (
-                    c,
-                    format!("Max: {}", format_value(p.value, quantity.unit())),
-                )
-            });
+                (c, p.value)
+            })
+            .or_else(|| particles.and_then(Particles::fastest))
+            .map(|(c, v)| (c, format!("Max: {}", format_value(v, quantity.unit()))));
         let title = plot.map_or("Flow", PlotChoice::label).to_owned();
         let legend = Legend {
             title,
@@ -1205,6 +1251,12 @@ impl OxydeApp {
                 PlotChoice::FlowSurfacePressure,
                 "The pressure on the model's faces the fluid wets",
             ),
+            (
+                Icon::Trajectories,
+                "Trajectories",
+                PlotChoice::FlowTrajectories,
+                "Flow trajectories: particles carried by the flow from upstream of the model (or from the inlets), each with a trail coloured by speed",
+            ),
         ]) {
             let available = done.is_some_and(|d| d.has(plot));
             let active =
@@ -1350,8 +1402,22 @@ impl OxydeApp {
                                     .color(egui::Color32::from_rgb(210, 140, 30)),
                             );
                         }
+                        // The free stream the forces' drag coefficients are taken along: the
+                        // one solved, while the study still has it.
+                        let drag = match (study.flow.analysis, flow.frontal) {
+                            (FlowAnalysis::External { velocity }, Some((solved, area)))
+                                if velocity == solved =>
+                            {
+                                Some(Drag {
+                                    velocity,
+                                    density: study.flow.fluid.density,
+                                    area,
+                                })
+                            }
+                            _ => None,
+                        };
                         for goal in &run.goals {
-                            goal_row(ui, goal);
+                            goal_row(ui, goal, drag);
                         }
                         let state = if run.converged {
                             "converged".to_owned()
@@ -1402,6 +1468,7 @@ impl OxydeApp {
                             action = Some(PanelAction::ShowPlot(shown));
                         }
                         let p = &mut self.prefs.simulation;
+                        let particles = &mut self.simulation.particles;
                         let study_type = d.study_type;
                         egui::Grid::new("flow_plot")
                             .num_columns(2)
@@ -1438,6 +1505,44 @@ impl OxydeApp {
                                     .on_hover_text("Where the plane lies across the fluid");
                                     ui.end_row();
                                 }
+                                if shown == PlotChoice::FlowTrajectories {
+                                    ui.label("Trajectories");
+                                    egui::ComboBox::from_id_salt("flow_trajectories")
+                                        .selected_text(p.trajectories.to_string())
+                                        .show_ui(ui, |ui| {
+                                            for n in [25, 50, 100, 200, 400] {
+                                                ui.selectable_value(&mut p.trajectories, n, n.to_string());
+                                            }
+                                        })
+                                        .response
+                                        .on_hover_text(match study.flow.analysis {
+                                            FlowAnalysis::External { .. } => "About how many particles to follow, from a grid on a plane upstream of the model",
+                                            FlowAnalysis::Internal => "About how many particles to follow, from points spread over the inlets",
+                                        });
+                                    ui.end_row();
+                                    if let Some(q) = particles.as_mut().filter(|q| q.key.0 == d.id) {
+                                        ui.label("");
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .small_button(if q.playing { "⏸" } else { "▶" })
+                                                .on_hover_text(if q.playing { "Pause" } else { "Play the particles" })
+                                                .clicked()
+                                            {
+                                                q.playing = !q.playing;
+                                            }
+                                            let text = match q.note {
+                                                Some(note) => egui::RichText::new(note)
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(210, 140, 30)),
+                                                None => egui::RichText::new(format!("{} paths", q.paths.len()))
+                                                    .small()
+                                                    .weak(),
+                                            };
+                                            ui.label(text);
+                                        });
+                                        ui.end_row();
+                                    }
+                                }
                                 ui.label("Bands");
                                 ui.add(egui::Slider::new(&mut p.bands, 4..=64));
                                 ui.end_row();
@@ -1459,6 +1564,10 @@ impl OxydeApp {
     ) {
         let density = self.simulation.study.flow.fluid.density;
         let fields = oxyde_flow::FlowResults::read_folder(&case_dir, density).ok();
+        let frontal = match (&fields, self.simulation.study.flow.analysis) {
+            (Some(f), FlowAnalysis::External { velocity }) => frontal_of(f, velocity),
+            _ => None,
+        };
         self.restore_simulation_scene();
         self.simulation.frame = 0;
         self.simulation.playing = None;
@@ -1490,15 +1599,240 @@ impl OxydeApp {
                 run,
                 case_dir,
                 fields,
+                frontal,
             }),
         });
         self.simulation.error = None;
         self.simulation.show_plot = true;
     }
+
+    /// While a flow's trajectories play: their clock moves on, and the viewport is drawn
+    /// again a few dozen times a second.
+    pub(crate) fn advance_particles(&mut self, ctx: &egui::Context) {
+        let shown = self
+            .simulation
+            .shown
+            .filter(|k| k.plot == Some(PlotChoice::FlowTrajectories))
+            .map(|k| k.id);
+        let active = self.simulation_active();
+        let Some(p) = self.simulation.particles.as_mut() else {
+            return;
+        };
+        if !(p.playing && active && shown == Some(p.key.0) && !p.paths.is_empty()) {
+            p.last = None;
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = p.last {
+            // A slow frame does not make the particles jump.
+            p.clock += now.duration_since(last).as_secs_f64().min(0.1);
+        }
+        // What is drawn repeats every spacing of flow time: the clock stays small.
+        let period = p.spacing / p.rate;
+        if period > 0.0 && period.is_finite() {
+            p.clock = p.clock.rem_euclid(period);
+        }
+        p.last = Some(now);
+        ctx.request_repaint_after(Duration::from_millis(30));
+    }
+
+    /// Over the viewport, while the trajectories are shown: each particle with the trail of
+    /// its recent path, coloured by speed in the legend's bands and fading towards its
+    /// tail. Painted over the faint model rather than put in the scene, since they move
+    /// every frame.
+    pub(crate) fn paint_trajectories(&self, painter: &egui::Painter, output: &ViewportOutput) {
+        let Some(p) = self.simulation.particles.as_ref() else {
+            return;
+        };
+        let shown = self
+            .simulation
+            .shown
+            .is_some_and(|k| k.plot == Some(PlotChoice::FlowTrajectories) && k.id == p.key.0);
+        if !shown || !(p.spacing > 0.0 && p.trail > 0.0) {
+            return;
+        }
+        let bands = self.prefs.simulation.bands.clamp(2, 64);
+        let (lo, hi) = p.range;
+        let colour = |speed: f64, alpha: f64| {
+            let t = if hi > lo {
+                ((speed - lo) / (hi - lo)).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            let band = ((t * f64::from(bands)) as u32).min(bands - 1);
+            let [r, g, b] = oxyde_sim::rainbow((f64::from(band) + 0.5) / f64::from(bands));
+            egui::Color32::from_rgba_unmultiplied(r, g, b, (alpha.clamp(0.0, 1.0) * 255.0) as u8)
+        };
+        let to_screen = |q: [f64; 3]| {
+            self.viewport
+                .to_screen(Point3::new(q[0], q[1], q[2]), output)
+        };
+        let seen = output.rect.expand(8.0);
+        let time = p.clock * p.rate;
+        let mut trails = egui::Mesh::default();
+        let mut heads = Vec::new();
+        let mut kept: Vec<(egui::Pos2, egui::Color32)> = Vec::new();
+        for (j, path) in p.paths.iter().enumerate() {
+            let duration = path.duration();
+            // Each seed lets its particles go at its own moment, so that they do not move
+            // in rows.
+            let offset = (j as f64 * GOLDEN).fract() * p.spacing;
+            let mut age = (time + offset).rem_euclid(p.spacing);
+            while age <= duration {
+                let start = age - p.trail;
+                let samples = path.between(start, age);
+                kept.clear();
+                for (k, s) in samples.iter().enumerate() {
+                    let at = to_screen(s.position);
+                    // A point every few pixels is enough for a smooth trail; the head
+                    // always.
+                    let near = kept
+                        .last()
+                        .is_some_and(|(last, _)| (at - *last).length() < 3.0);
+                    if near && k + 1 < samples.len() {
+                        continue;
+                    }
+                    let fade = (s.time - start) / p.trail;
+                    kept.push((at, colour(s.speed, 0.1 + 0.9 * fade)));
+                }
+                for pair in kept.windows(2) {
+                    if let [a, b] = pair
+                        && (seen.contains(a.0) || seen.contains(b.0))
+                    {
+                        add_segment(&mut trails, *a, *b, 1.6);
+                    }
+                }
+                if let (Some(&(head, _)), Some(s)) = (kept.last(), samples.last())
+                    && seen.contains(head)
+                {
+                    heads.push((head, colour(s.speed, 1.0)));
+                }
+                age += p.spacing;
+            }
+        }
+        painter.add(egui::Shape::mesh(trails));
+        for (at, c) in heads {
+            painter.circle_filled(at, 2.2, c);
+        }
+    }
 }
 
-/// A goal's value in the panel.
-fn goal_row(ui: &mut egui::Ui, goal: &GoalResult) {
+/// The golden ratio's fraction: offsets spread by it never line up.
+const GOLDEN: f64 = 0.618_033_988_749_894_9;
+
+/// A flow's trajectories as the viewport animates them, as Autodesk Flow Design did: each
+/// seed lets a particle go at a steady rate, each particle drawn with a trail of its recent
+/// path. A view of the results: no undo step, no unsaved mark.
+pub(crate) struct Particles {
+    /// The results (`Done::id`) and the number of paths asked for.
+    pub(crate) key: (u64, u32),
+    pub(crate) paths: Vec<Trajectory>,
+    /// The slowest and fastest speeds along the paths, m/s: the legend's range.
+    pub(crate) range: (f64, f64),
+    /// Flow time between two particles from the same seed, and along a trail, s.
+    spacing: f64,
+    trail: f64,
+    /// Flow time played in a second.
+    rate: f64,
+    /// Seconds played, within one spacing.
+    clock: f64,
+    pub(crate) playing: bool,
+    /// When the clock last moved, while it plays.
+    last: Option<Instant>,
+    /// Why there are no paths, when there are none.
+    pub(crate) note: Option<&'static str>,
+}
+
+impl Particles {
+    /// The paths of `fields`' flow: from a plane upstream of the model in an external flow,
+    /// from the inlets in an internal one. The median path plays in eight seconds, and each
+    /// seed lets five particles go along it.
+    fn follow(fields: &oxyde_flow::FlowResults, analysis: FlowAnalysis, key: (u64, u32)) -> Self {
+        let seeding = match analysis {
+            FlowAnalysis::External { velocity } => Seeding::Upstream { velocity },
+            FlowAnalysis::Internal => Seeding::Inlets,
+        };
+        let paths = oxyde_flow::trajectory::trajectories(fields, seeding, key.1 as usize);
+        let note = paths.is_empty().then_some(match analysis {
+            FlowAnalysis::External { .. } => {
+                "No trajectories: the surroundings are still, so nothing comes from upstream"
+            }
+            FlowAnalysis::Internal => "No trajectories: there is no inlet to start from",
+        });
+        let speeds = || {
+            paths
+                .iter()
+                .flat_map(|p| p.speeds.iter().copied())
+                .filter(|s| s.is_finite())
+        };
+        let lo = speeds().fold(f64::INFINITY, f64::min);
+        let hi = speeds().fold(f64::NEG_INFINITY, f64::max);
+        let mut durations: Vec<f64> = paths
+            .iter()
+            .map(Trajectory::duration)
+            .filter(|d| *d > 0.0 && d.is_finite())
+            .collect();
+        durations.sort_by(f64::total_cmp);
+        let median = durations.get(durations.len() / 2).copied().unwrap_or(1.0);
+        Self {
+            key,
+            paths,
+            range: if lo <= hi { (lo, hi) } else { (0.0, 1.0) },
+            spacing: median / 5.0,
+            trail: 0.6 * median / 5.0,
+            rate: median / 8.0,
+            clock: 0.0,
+            playing: true,
+            last: None,
+            note,
+        }
+    }
+
+    /// The fastest point along the paths (mm) and its speed (m/s).
+    fn fastest(&self) -> Option<([f64; 3], f64)> {
+        self.paths
+            .iter()
+            .flat_map(|p| p.points.iter().zip(&p.speeds))
+            .filter(|(_, s)| s.is_finite())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(p, s)| (*p, *s))
+    }
+}
+
+/// A band `width` points wide from `a` to `b`, its colour going from one end's to the
+/// other's.
+fn add_segment(
+    mesh: &mut egui::Mesh,
+    (a, from): (egui::Pos2, egui::Color32),
+    (b, to): (egui::Pos2, egui::Color32),
+    width: f32,
+) {
+    let d = b - a;
+    let length = d.length();
+    if length <= 1e-3 || !length.is_finite() {
+        return;
+    }
+    let n = egui::vec2(-d.y, d.x) * (0.5 * width / length);
+    let i = mesh.vertices.len() as u32;
+    mesh.colored_vertex(a + n, from);
+    mesh.colored_vertex(a - n, from);
+    mesh.colored_vertex(b - n, to);
+    mesh.colored_vertex(b + n, to);
+    mesh.add_triangle(i, i + 1, i + 2);
+    mesh.add_triangle(i, i + 2, i + 3);
+}
+
+/// What a force's drag coefficient is taken from: the free stream (m/s), the fluid's
+/// density (kg/m³) and the model's frontal area (mm²).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Drag {
+    velocity: [f64; 3],
+    density: f64,
+    area: f64,
+}
+
+/// A goal's value in the panel; with `drag`, a force's drag coefficient under it.
+fn goal_row(ui: &mut egui::Ui, goal: &GoalResult, drag: Option<Drag>) {
     let unit = match goal.kind {
         FlowGoalKind::Force => "N",
         FlowGoalKind::VolumeFlow => "m³/s",
@@ -1545,6 +1879,14 @@ fn goal_row(ui: &mut egui::Ui, goal: &GoalResult) {
                 .small()
                 .weak(),
             );
+            if let Some(line) = drag.and_then(|d| drag_line(*total, d)) {
+                ui.label(egui::RichText::new(format!("    {line}")).small())
+                    .on_hover_text(
+                        "The drag coefficient, 2 F / (ρ V² A): F the force along the free stream, \
+                         V the stream's speed, ρ the fluid's density, A the model's frontal area, \
+                         its silhouette seen along the stream",
+                    );
+            }
         }
         GoalOutcome::Missing(why) => {
             ui.label(
@@ -1553,6 +1895,17 @@ fn goal_row(ui: &mut egui::Ui, goal: &GoalResult) {
             );
         }
     }
+}
+
+/// A force's drag coefficient and the frontal area it is taken on: `Cd 0.47 (frontal area
+/// 12.5 cm²)`.
+fn drag_line(force: [f64; 3], d: Drag) -> Option<String> {
+    let cd = oxyde_flow::drag::drag_coefficient(force, d.velocity, d.density, d.area)?;
+    Some(format!(
+        "Cd {} (frontal area {})",
+        format_number(cd),
+        format_value(d.area / 100.0, "cm²")
+    ))
 }
 
 /// The fluid and the flow; whether one changed. A cooling study's `heat` takes the
@@ -2159,5 +2512,33 @@ mod tests {
         assert!(setup_hint(&cooling).contains("Internal Heat"));
         assert!(goal_hint(FlowGoalKind::Force).contains("force"));
         assert_eq!(sentence("the fluid leaks"), "The fluid leaks");
+    }
+
+    #[test]
+    fn a_force_reads_with_its_drag_coefficient() {
+        // 1 N along a 10 m/s stream of 1.2 kg/m³ on 100 cm²: 2 / (1.2 · 100 · 0.01).
+        let drag = Drag {
+            velocity: [10.0, 0.0, 0.0],
+            density: 1.2,
+            area: 1e4,
+        };
+        assert_eq!(
+            drag_line([1.0, 0.3, 0.0], drag).as_deref(),
+            Some("Cd 1.667 (frontal area 100 cm²)")
+        );
+        let still = Drag {
+            velocity: [0.0; 3],
+            ..drag
+        };
+        assert_eq!(drag_line([1.0, 0.0, 0.0], still), None);
+    }
+
+    #[test]
+    fn flow_and_cooling_studies_have_trajectories() {
+        let trajectories = PlotChoice::FlowTrajectories;
+        assert!(trajectories.is_flow() && !trajectories.is_cut() && !trajectories.is_cooling());
+        assert!(trajectories.fits(StudyType::Flow) && trajectories.fits(StudyType::Cooling));
+        assert!(!trajectories.fits(StudyType::Static));
+        assert_eq!(trajectories.unit(), "m/s");
     }
 }

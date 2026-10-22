@@ -46,6 +46,14 @@ release yet; the git history has every detail.
   (the velocity or the pressure on a plane through the fluid, square to X, Y or Z, moved
   with a slider, the model faint around it) or the pressure on the faces the fluid wets,
   in colour bands with a legend and the largest value marked.
+- **Flow trajectories** (*Trajectories* in the command bar), as Autodesk Flow Design showed
+  them: particles carried by the flow from a plane upstream of the model (around it) or from
+  the inlets (through it), each with a trail of its recent path coloured by speed, playing in
+  the viewport over the faint model. The panel sets about how many (25 to 400) and pauses
+  them.
+- **Drag coefficient**: around the model, each Force goal shows its Cd = 2 F / (ρ V² A), F
+  along the free stream and A the model's frontal area, its silhouette seen along the stream,
+  shown beside it. Worked out when shown: nothing new in the files.
 - **Files**: flow studies are saved in the `.oxysim` (as `format_version` 5; documents
   without one are written exactly as before), their results in the `.oxyres` with the
   OpenFOAM case folder beside them (`<study file>-<study>.openfoam`, which ParaView opens):
