@@ -73,16 +73,31 @@ pub(crate) fn flow_status(f: &FlowDone, seconds: f64) -> String {
     } else {
         "Flow"
     };
+    let state = if run.converged {
+        String::new()
+    } else {
+        format!("; not converged: {}", not_converged(run))
+    };
     format!(
-        "{what} solved in {seconds:.0} s: {} cells, {} iterations{}",
-        run.cells,
-        run.iterations,
-        if run.converged {
-            ""
-        } else {
-            "; not converged: more iterations, a finer mesh or a higher target may help"
-        }
+        "{what} solved in {seconds:.0} s: {} cells, {} iterations{state}",
+        run.cells, run.iterations
     )
+}
+
+/// What may help a run whose residuals did not reach the target. Once they have stopped
+/// falling, more iterations will not: a steady solver's residuals level off and keep
+/// swinging when the flow does not settle, as a wake shedding eddies behind a blunt body
+/// does not.
+fn not_converged(run: &FlowRun) -> String {
+    match oxyde_flow::log::stopped_falling(&run.residuals) {
+        Some(after) => format!(
+            "its residuals stopped falling after about {} iterations, so more will not help; \
+             the flow may not settle (a wake shedding eddies), and a higher target ends such \
+             a run sooner",
+            ((after + 5) / 10 * 10).max(10)
+        ),
+        None => "more iterations, a finer mesh or a higher target may help".to_owned(),
+    }
 }
 
 /// What to do first, in the viewport's corner while a flow or cooling study has no results.
@@ -794,7 +809,23 @@ impl OxydeApp {
             _ => Quantity::Pressure,
         };
         let cutting = plot.is_some_and(PlotChoice::is_cut);
-        let position = prefs.cut_position.clamp(0.0, 1.0);
+        let mut position = prefs.cut_position.clamp(0.0, 1.0);
+        // A new result, or another axis, starts the plane through the middle of the model
+        // rather than of the fluid, which for an external flow is far behind it; the slider
+        // then moves it anywhere across the fluid.
+        let start = Some((done.id, prefs.cut_axis));
+        if cutting && self.simulation.cut_centred != start {
+            if let Some(middle) = flow
+                .fields
+                .as_ref()
+                .and_then(|f| oxyde_flow::plot::model_middle(f, prefs.cut_axis.index()))
+            {
+                position = middle;
+                self.prefs.simulation.cut_position = middle;
+                self.simulation.prefs_dirty = true;
+            }
+            self.simulation.cut_centred = start;
+        }
         let key = PlotKey {
             id: done.id,
             plot,
@@ -1335,11 +1366,9 @@ impl OxydeApp {
                             ui.label(egui::RichText::new(line).small().weak());
                         } else {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "{line}: more iterations, a finer mesh or a higher target may help"
-                                ))
-                                .small()
-                                .color(egui::Color32::from_rgb(210, 140, 30)),
+                                egui::RichText::new(format!("{line}: {}", not_converged(run)))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(210, 140, 30)),
                             );
                         }
                         if !run.residuals.is_empty() {
@@ -2062,6 +2091,29 @@ mod tests {
         assert_eq!(fields, ["Ux", "p", "k"]);
         assert_eq!(rows[1], [0.1, 0.2, 0.5]);
         assert!(rows[0][2].is_nan());
+    }
+
+    /// A run whose residuals levelled off is not told that more iterations may help.
+    #[test]
+    fn a_run_that_stopped_falling_is_not_told_to_run_longer() {
+        let falling = |i: u32| 0.1 * 0.97f64.powf(f64::from(i));
+        let mut run = FlowRun {
+            iterations: 500,
+            residual_fields: vec!["Ux".to_owned()],
+            residuals: (0..500).map(|i| vec![falling(i)]).collect(),
+            ..FlowRun::default()
+        };
+        assert!(not_converged(&run).starts_with("more iterations"));
+        // Level from the 120th on, swinging by a tenth.
+        run.residuals = (0..500)
+            .map(|i| vec![falling(i.min(120)) * (1.0 + 0.1 * f64::from(i % 7) / 7.0)])
+            .collect();
+        let said = not_converged(&run);
+        assert!(
+            said.starts_with("its residuals stopped falling after about"),
+            "{said}"
+        );
+        assert!(!said.contains("more iterations"), "{said}");
     }
 
     #[test]

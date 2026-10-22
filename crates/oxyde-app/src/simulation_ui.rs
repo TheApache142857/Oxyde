@@ -1332,6 +1332,9 @@ pub struct SimulationView {
     /// The plot (or the mesh) is shown over the model; off while setting up.
     pub(crate) show_plot: bool,
     pub(crate) shown: Option<PlotKey>,
+    /// The flow result (its `Done` id) and axis the cut plane was last put through the
+    /// middle of the model for: a new result or axis starts it there again.
+    pub(crate) cut_centred: Option<(u64, CutAxis)>,
     pub(crate) legend: Option<Legend>,
     pub(crate) error: Option<String>,
     pub(crate) prefs_dirty: bool,

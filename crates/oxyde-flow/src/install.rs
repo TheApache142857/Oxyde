@@ -60,11 +60,7 @@ impl Installation {
     /// The installation in `root`, its environment read.
     pub fn open(root: &Path) -> Result<Self, InstallError> {
         let env = read_environment(root)?;
-        let get = |name: &str| {
-            env.iter()
-                .find(|(k, _)| k == name)
-                .map(|(_, v)| v.to_string_lossy().into_owned())
-        };
+        let get = |name: &str| lookup(&env, name).map(|v| v.to_string_lossy().into_owned());
         if get("WM_PROJECT_DIR").is_none() {
             return Err(InstallError::Environment {
                 root: root.to_path_buf(),
@@ -95,10 +91,7 @@ impl Installation {
 
     /// A variable of OpenFOAM's environment.
     pub fn var(&self, name: &str) -> Option<&OsStr> {
-        self.env
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_os_str())
+        lookup(&self.env, name)
     }
 
     /// The path of `program` (`blockMesh`, `simpleFoam`, `mpirun`…) on OpenFOAM's `PATH`.
@@ -117,6 +110,21 @@ impl Installation {
         command.envs(self.env.iter().map(|(k, v)| (k, v)));
         Ok(command)
     }
+}
+
+/// The value of the variable `name` in an environment listing. Windows ignores the case of
+/// variable names and spells the search path `Path`, which `set` lists as it is spelled, so
+/// names are compared without case there.
+fn lookup<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
+    env.iter()
+        .find(|(k, _)| {
+            if cfg!(windows) {
+                k.eq_ignore_ascii_case(name)
+            } else {
+                k == name
+            }
+        })
+        .map(|(_, v)| v.as_os_str())
 }
 
 /// The program `name` in the folders of a `PATH` value.
@@ -436,6 +444,37 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("/etc with v9999"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fake installation as OpenCFD's MinGW build lays it out: a `setEnvVariables` batch
+    /// file that puts a `bin` folder on the search path, spelled `Path` as Windows spells it
+    /// for a program started from Explorer or a terminal.
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_file_installation_finds_its_programs() {
+        let root = std::env::temp_dir().join(format!("oxyde-flow-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(
+            root.join("setEnvVariables-v9999.bat"),
+            "@echo off\r\necho noise\r\nset \"WM_PROJECT_DIR=%~dp0\"\r\n\
+             set WM_PROJECT_VERSION=v9999\r\nset \"_p=%PATH%\"\r\nset PATH=\r\n\
+             set \"Path=%~dp0bin;%_p%\"\r\nset _p=\r\n",
+        )
+        .unwrap();
+        // Only found, never run: an empty file is enough.
+        let program = root.join("bin").join("blockMesh.exe");
+        std::fs::write(&program, b"").unwrap();
+
+        let found = Installation::open(&root).unwrap();
+        assert_eq!(found.version(), "v9999");
+        assert!(found.var("PATH").is_some() && found.var("Path").is_some());
+        assert_eq!(found.program("blockMesh").unwrap(), program);
+        assert!(matches!(
+            found.program("simpleFoam"),
+            Err(InstallError::ProgramMissing { .. })
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

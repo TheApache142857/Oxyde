@@ -350,7 +350,11 @@ type of their own in `format_version` 6, with conduction in the solids.
   `setup::point_inside`), the run on its own thread (OpenFOAM found, the processes chosen,
   the case written and run, the flow read back, the goals measured), and the plots: cut
   planes (`plot::cut`, square to X, Y or Z, the model drawn faint around them) and the
-  wetted faces (`plot::surface`), split into the legend's colour bands.
+  wetted faces (`plot::surface`), split into the legend's colour bands. A new result, or
+  another axis, starts the plane through the middle of the model (`plot::model_middle`),
+  not of the fluid, which for an external flow lies in the far wake; the slider then moves
+  it across the whole fluid. A run that did not converge says what may help, but not more
+  iterations once its residuals have stopped falling (`log::stopped_falling`).
 - **Leaks**: after meshing, an internal flow whose fluid reached the domain's box (an open
   cavity) is stopped with what to do (`RunError::Leak`).
 - **Files** (`simulation_files.rs`): the study's items and settings to and from `.oxysim`;
@@ -390,6 +394,9 @@ type of their own in `format_version` 6, with conduction in the solids.
 - `log`, `foam`, `mesh`, `results`: OpenFOAM's logs, its ASCII files, the mesh with its
   geometry, the fields on it, the goals; `results::label_of_patch` reads a patch's model
   face from its name, so a case folder alone is enough to read results back.
+  `log::stopped_falling` tells residuals that levelled off (the lowest of the last quarter
+  of the iterations within a fifth of the quarter before's, as behind a blunt body whose
+  wake keeps shedding) from residuals still falling, however slowly.
 - `setup`: the mesh of a level, the automatic domain, the point inside a cavity.
 - `plot`: cut planes and wetted surfaces as polygons with values; for a cooling study's
   temperature, the cut goes through the solid too and the surface is the solid's.
@@ -404,11 +411,12 @@ type of their own in `format_version` 6, with conduction in the solids.
 readers (both face formats, compact lists, every kind of patch entry), the geometry of
 faces and cells, the log reader (residuals, convergence, fatal errors, divergence,
 `checkMesh`, the solid's temperature), the run's log following and stopping, the leak
-check, an installation's environment from a fake `etc/bashrc`, the mesh levels, the point
-inside a cavity, cut and surface plots; for cooling, the bodies' zones, the split's patches
-renamed and every region's files. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped
-without it), on a Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run
-and the first cold plate):
+check, an installation's environment from a fake `etc/bashrc` (on Windows a fake
+`setEnvVariables` batch file, which hands the search path back as `Path`), the mesh
+levels, the point inside a cavity, cut and surface plots; for cooling, the bodies' zones,
+the split's patches renamed and every region's files. Then `tests/openfoam.rs`, through
+OpenFOAM v2606 (skipped without it), on a Raspberry Pi 4 in OpenCFD's arm64 image, on one
+core (two for the MPI run and the first cold plate):
 
 | Case | Cells | Iterations | Meshing + solving | Against |
 |---|---|---|---|---|
@@ -429,9 +437,9 @@ and the first cold plate):
   temperatures handed to thermal stress studies.
 - Seeing the mesh before solving, a domain the user sizes, rotating regions, porous media,
   transient flows.
-- To check on Windows and macOS: OpenCFD's MinGW build and openfoam-app found and run
-  (`install.rs`, untested there), Microsoft MPI for parallel runs, a case folder whose path
-  has spaces.
+- To check: on macOS, openfoam-app found and run (`install.rs`, untested there); anywhere,
+  a case folder whose path has spaces. On Windows, OpenCFD's MinGW build v2606 runs every
+  test of `tests/openfoam.rs`, the MPI ones through Microsoft MPI 10.
 
 ## 9. Testing without OpenFOAM installed
 
