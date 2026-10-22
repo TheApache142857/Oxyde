@@ -46,6 +46,14 @@ release yet; the git history has every detail.
   (the velocity or the pressure on a plane through the fluid, square to X, Y or Z, moved
   with a slider, the model faint around it) or the pressure on the faces the fluid wets,
   in colour bands with a legend and the largest value marked.
+- **Flow trajectories** (*Trajectories* in the command bar), as Autodesk Flow Design showed
+  them: particles carried by the flow from a plane upstream of the model (around it) or from
+  the inlets (through it), each with a trail of its recent path coloured by speed, playing in
+  the viewport over the faint model. The panel sets about how many (25 to 400) and pauses
+  them.
+- **Drag coefficient**: around the model, each Force goal shows its Cd = 2 F / (ρ V² A), F
+  along the free stream and A the model's frontal area, its silhouette seen along the stream,
+  shown beside it. Worked out when shown: nothing new in the files.
 - **Files**: flow studies are saved in the `.oxysim` (as `format_version` 5; documents
   without one are written exactly as before), their results in the `.oxyres` with the
   OpenFOAM case folder beside them (`<study file>-<study>.openfoam`, which ParaView opens):
@@ -53,6 +61,17 @@ release yet; the git history has every detail.
 - **Preferences › Simulation** says where OpenFOAM is (otherwise found in its usual places),
   how many processes it runs on, and where to get it. The Windows installer offers to
   download OpenFOAM and install it.
+- **On Windows**, OpenCFD's own build of OpenFOAM runs, on several processes through
+  Microsoft MPI: a run no longer stops at once with *OpenFOAM's blockMesh was not found in
+  the installation* when Oxyde was started from the Start menu, Explorer or a terminal.
+- **Cut plots start through the middle of the model**, for each new result and each axis
+  picked, rather than through the middle of the fluid, which around a model lies far
+  downstream of it and showed only its wake. The slider still moves the plane anywhere
+  across the fluid.
+- **A run that did not converge** no longer says that more iterations may help once its
+  residuals have stopped falling: it says after about how many iterations they did. A flow
+  that never settles, such as a wake shedding eddies behind a blunt body, keeps them
+  swinging however long it runs; a higher *Converged at* ends such a run sooner.
 
 ### Frequency studies (October 2026)
 

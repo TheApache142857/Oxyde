@@ -225,6 +225,48 @@ impl LogState {
     }
 }
 
+/// The fewest iterations [`stopped_falling`] judges.
+const STALL_MIN: usize = 100;
+
+/// After how many iterations a run's residuals stopped falling, when they did: over the
+/// last quarter of `rows` (each iteration's residuals, NaN where an equation was not
+/// solved) the lowest of each iteration's largest residual is within a fifth of the lowest
+/// over the quarter before. A steady solver does this when the flow will not settle, as a
+/// wake shedding eddies behind a blunt body does not: its residuals level off and keep
+/// swinging, and more iterations do not bring them down. The count is that of the
+/// iterations before the largest residual first came within half again of that level.
+/// `None` while they are still falling, or for fewer than [`STALL_MIN`] iterations.
+pub fn stopped_falling(rows: &[Vec<f64>]) -> Option<usize> {
+    let largest: Vec<f64> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .copied()
+                .filter(|r| r.is_finite())
+                .fold(f64::NAN, f64::max)
+        })
+        .collect();
+    let n = largest.len();
+    if n < STALL_MIN {
+        return None;
+    }
+    let quarter = n / 4;
+    let lowest = |from: usize, to: usize| {
+        largest
+            .get(from..to)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .fold(f64::NAN, f64::min)
+    };
+    let recent = lowest(n - quarter, n);
+    let before = lowest(n - 2 * quarter, n - quarter);
+    if !(recent.is_finite() && before.is_finite() && recent > 0.8 * before) {
+        return None;
+    }
+    largest.iter().position(|&r| r <= 1.5 * recent)
+}
+
 /// `smoothSolver:  Solving for Ux, Initial residual = 0.0012, Final residual = …`: the
 /// field and its initial residual.
 fn parse_residual(text: &str) -> Option<(String, f64)> {
@@ -396,5 +438,35 @@ Min/max T:301 {hottest}
         // 10 K over its rise of 19.85 K above the fluid's 293.15 K, then 0.15 K over 20 K.
         assert!((log.history[1].residuals[3].1 - 10.0 / 19.85).abs() < 1e-9);
         assert!((log.history[2].residuals[3].1 - 0.15 / 20.0).abs() < 1e-9);
+    }
+
+    /// Residuals that level off and swing, as behind a blunt body, told from residuals that
+    /// keep falling, however slowly.
+    #[test]
+    fn residuals_that_stopped_falling_are_told_from_slow_ones() {
+        use std::f64::consts::PI;
+        // A thousandfold fall over the first 110 iterations, then swinging between 3.6e-4
+        // and 4.4e-4 every hundred, as a car's wake did; one equation never solved.
+        let swinging: Vec<Vec<f64>> = (0..500)
+            .map(|i| {
+                let i = f64::from(i);
+                let ux = if i < 110.0 {
+                    0.4 * 10f64.powf(-3.0 * i / 110.0)
+                } else {
+                    4.0e-4 + 0.4e-4 * (2.0 * PI * i / 100.0).sin()
+                };
+                vec![ux, 0.6 * ux, f64::NAN]
+            })
+            .collect();
+        // Within half again of the 3.6e-4 it swings down to from the 106th.
+        assert_eq!(stopped_falling(&swinging), Some(106));
+        // Halving every two hundred iterations: slowly, but still falling.
+        let slow: Vec<Vec<f64>> = (0..500)
+            .map(|i| vec![1e-2 * 0.5f64.powf(f64::from(i) / 200.0)])
+            .collect();
+        assert_eq!(stopped_falling(&slow), None);
+        // Too few iterations to judge, and none solved.
+        assert_eq!(stopped_falling(&swinging[..99]), None);
+        assert_eq!(stopped_falling(&vec![vec![f64::NAN]; 200]), None);
     }
 }

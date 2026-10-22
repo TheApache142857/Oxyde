@@ -12,10 +12,11 @@ use std::f64::consts::PI;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use oxyde_flow::trajectory::{self, End, Seeding};
 use oxyde_flow::{
     Condition, ConditionKind, Domain, FlowResults, FlowStudy, FlowType, Fluid, Goal, GoalKind,
     GoalValue, Heat, HeatLoad, HeatLoadKind, Installation, MeshSettings, Solid, SolverSettings,
-    Surface, Turbulence, run, write_case,
+    Surface, Turbulence, drag, run, write_case,
 };
 
 fn openfoam() -> Option<Installation> {
@@ -341,6 +342,8 @@ fn laminar_pipe(install: &Installation, name: &str, processes: u32) {
 /// External flow past a sphere at Re = 20 (air): the drag coefficient of Clift, Grace and
 /// Weber's correlation, Cd = 24/Re (1 + 0.1935 Re^0.6305) = 2.73. The domain reaches five
 /// diameters round the sphere and ten behind it, which still confines the flow a little.
+/// The same Cd comes from the drag module on the mesh's silhouette of the sphere, and the
+/// flow's trajectories from upstream pass round it.
 #[test]
 fn sphere_drag_at_re_20() {
     let Some(install) = openfoam() else { return };
@@ -397,6 +400,65 @@ fn sphere_drag_at_re_20() {
     assert!((cd / expected - 1.0).abs() < 0.15, "Cd {cd}");
     // No sideways force on a symmetric body.
     assert!(total[1].abs() < 0.05 * total[0] && total[2].abs() < 0.05 * total[0]);
+
+    // The application's Cd: on the silhouette of the mesh's faces on the sphere.
+    let velocity = [speed, 0.0, 0.0];
+    let area = drag::frontal_area(&results, velocity).expect("the sphere has a silhouette");
+    let disc = PI * (d / 2.0).powi(2);
+    let cd_shown = drag::drag_coefficient(*total, velocity, fluid.density, area).unwrap();
+    eprintln!(
+        "frontal area {area:.2} mm², πr² {disc:.2} mm² ({:+.2} %); Cd shown {cd_shown:.3}",
+        100.0 * (area / disc - 1.0)
+    );
+    assert!((area / disc - 1.0).abs() < 0.03, "frontal area {area} mm²");
+    assert!((cd_shown / expected - 1.0).abs() < 0.15, "Cd {cd_shown}");
+    assert!((cd_shown * area / (cd * disc) - 1.0).abs() < 1e-9);
+
+    // Trajectories from a plane upstream: round the sphere and out of the domain behind.
+    let started = std::time::Instant::now();
+    let paths = trajectory::trajectories(&results, Seeding::Upstream { velocity }, 100);
+    let count = |end: End| paths.iter().filter(|p| p.end == end).count();
+    eprintln!(
+        "{} trajectories in {:.2} s: {} left, {} on the wall, {} stalled, {} too long, {} lost",
+        paths.len(),
+        started.elapsed().as_secs_f64(),
+        count(End::Left),
+        count(End::Wall),
+        count(End::Stalled),
+        count(End::Length),
+        count(End::Lost)
+    );
+    assert!(paths.len() >= 90, "{} trajectories", paths.len());
+    assert!(count(End::Left) * 10 >= paths.len() * 8);
+    assert!(count(End::Lost) * 20 <= paths.len());
+    let radius = |p: [f64; 3]| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+    let finest = study.mesh.finest();
+    let mut round = 0;
+    for path in &paths {
+        let seed = path.points[0];
+        // Upstream, half a diameter before the sphere.
+        assert!((seed[0] + d).abs() < 0.5, "{seed:?}");
+        for (p, s) in path.points.iter().zip(&path.speeds) {
+            // The mesh's faces lie within a fraction of a cell of the sphere.
+            assert!(
+                radius(*p) > d / 2.0 - 0.5 * finest,
+                "{p:?} inside the sphere"
+            );
+            assert!(s.is_finite() && *s < 2.0 * speed, "{s} m/s");
+        }
+        assert!(path.times.windows(2).all(|w| w[1] >= w[0]));
+        // Seeded in front of the sphere, carried round it to behind.
+        let off_axis = (seed[1] * seed[1] + seed[2] * seed[2]).sqrt();
+        if off_axis < d / 2.0 && path.end == End::Left && path.points.last().unwrap()[0] > d {
+            round += 1;
+        }
+    }
+    let in_front = paths
+        .iter()
+        .filter(|p| (p.points[0][1].powi(2) + p.points[0][2].powi(2)).sqrt() < d / 2.0)
+        .count();
+    eprintln!("{round} of the {in_front} seeded in front of the sphere went round it");
+    assert!(in_front > 0 && round * 2 >= in_front);
     if remove {
         let _ = std::fs::remove_dir_all(&case.dir);
     }

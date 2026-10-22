@@ -236,12 +236,44 @@ pub fn range(polygons: &[Polygon]) -> Option<(f64, f64)> {
 
 /// The box holding the fluid mesh and a cooling study's solids, mm.
 pub fn bounds(r: &FlowResults) -> Option<([f64; 3], [f64; 3])> {
-    let solid = r
-        .solid
+    box_of(r.mesh.points.iter().chain(solid_points(r)))
+}
+
+/// The box holding the mesh's faces on the model and a cooling study's solids, mm.
+pub fn model_bounds(r: &FlowResults) -> Option<([f64; 3], [f64; 3])> {
+    let first = r.mesh.internal_faces();
+    let on_model = r
+        .boundary_labels
+        .iter()
+        .enumerate()
+        .filter(|(_, label)| label.is_some())
+        .flat_map(|(i, _)| r.mesh.face(first + i))
+        .filter_map(|&p| r.mesh.points.get(p as usize));
+    box_of(on_model.chain(solid_points(r)))
+}
+
+/// Where the plane through the middle of the model lies along `axis` (0, 1, 2 for X, Y,
+/// Z), from 0 to 1 across the box of [`bounds`]: where a cut plot starts. The middle of the
+/// fluid is not the model's: an external flow's domain reaches five times the model's size
+/// downstream of it, so a plane there would cut only the far wake.
+pub fn model_middle(r: &FlowResults, axis: usize) -> Option<f64> {
+    let (lo, hi) = bounds(r)?;
+    let (model_lo, model_hi) = model_bounds(r)?;
+    let (lo, hi) = (*lo.get(axis)?, *hi.get(axis)?);
+    let middle = 0.5 * (model_lo.get(axis)? + model_hi.get(axis)?);
+    (hi > lo).then(|| ((middle - lo) / (hi - lo)).clamp(0.0, 1.0))
+}
+
+/// A cooling study's solids' points; none for a flow.
+fn solid_points(r: &FlowResults) -> &[[f64; 3]] {
+    r.solid
         .as_ref()
         .map(|s| s.mesh.points.as_slice())
-        .unwrap_or(&[]);
-    let mut points = r.mesh.points.iter().chain(solid);
+        .unwrap_or(&[])
+}
+
+/// The box holding `points`; `None` for no points.
+fn box_of<'a>(mut points: impl Iterator<Item = &'a [f64; 3]>) -> Option<([f64; 3], [f64; 3])> {
     let first = *points.next()?;
     Some(points.fold((first, first), |(lo, hi), p| {
         (
@@ -367,5 +399,24 @@ mod tests {
         let speeds = surface(&r, Quantity::Speed);
         assert_eq!(speeds[0].value, 2.0);
         assert_eq!(bounds(&r), Some(([0.0; 3], [2000.0, 1000.0, 1000.0])));
+    }
+
+    /// The model as the first cube's faces only: it fills the first half of the fluid, as
+    /// an external flow's model sits upstream in its domain.
+    #[test]
+    fn a_cut_starts_through_the_middle_of_the_model() {
+        let mut r = results();
+        let first = r.mesh.internal_faces();
+        for (i, label) in r.boundary_labels.iter_mut().enumerate() {
+            if r.mesh.owner[first + i] != 0 {
+                *label = None;
+            }
+        }
+        assert_eq!(model_bounds(&r), Some(([0.0; 3], [1000.0; 3])));
+        assert_eq!(model_middle(&r, 0), Some(0.25));
+        assert_eq!(model_middle(&r, 1), Some(0.5));
+        assert_eq!(model_middle(&r, 3), None);
+        r.boundary_labels.fill(None);
+        assert_eq!(model_middle(&r, 0), None);
     }
 }
