@@ -2,8 +2,9 @@
 
 Status: **built** (October 2026): flow and cooling studies in the Simulation tab, run by
 OpenFOAM as a separate program, saved in `.oxysim` and `.oxyres` with their OpenFOAM case
-beside them, and OpenFOAM offered by the Windows installer (§4, §7). `oxyde-flow` is tested
-against closed forms and correlations through OpenFOAM v2606. Next: flow trajectories,
+beside them, and OpenFOAM offered by the Windows installer (§4, §7); animated flow
+trajectories and an external flow's drag coefficient, as Autodesk Flow Design gave them.
+`oxyde-flow` is tested against closed forms and correlations through OpenFOAM v2606. Next:
 radiation, transient flows (§8). §1–§3 are the survey the choice was made from.
 
 The reference is SolidWorks Flow Simulation (and Fusion 360's CFD): a liquid or a gas
@@ -185,7 +186,7 @@ flows first, turbulence well after.
    *Installing*).
 5. Cooling studies, with conduction in the solids (`chtMultiRegionSimpleFoam`): built (§5,
    *Cooling*; §7).
-6. Next: flow trajectories.
+6. Flow trajectories, animated, and an external flow's drag coefficient: built (§7).
 7. Later: rotating parts (a moving reference frame), porous media, transient flows
    (`pimpleFoam`), radiation, the fluid's pressures and the solids' temperatures handed to
    static and thermal stress studies as loads.
@@ -375,6 +376,20 @@ type of their own in `format_version` 6, with conduction in the solids.
   `flow_study` hands `oxyde_flow` a `Heat` with each body's conductivity
   (`Surfaces::conductivities`) and the thermal items as loads; the study and its results
   are saved as `format_version` 6.
+- **Flow trajectories** (*Trajectories* in the command bar, `PlotChoice::FlowTrajectories`),
+  as Autodesk Flow Design animated them: the paths are followed once when the plot is shown
+  (`flow_ui::Particles`, about 25 to 400 of them, set in the panel) and painted over the
+  viewport every frame while they play (`paint_trajectories`), the model drawn faint as for a
+  cut plot. Each seed lets a particle go at a steady rate (five along the median path's time,
+  which plays in eight seconds, the seeds' moments spread so that particles do not move in
+  rows); each particle is drawn with a trail of its recent path, coloured by speed in the
+  legend's bands and fading towards its tail. Painted rather than put in the scene, since
+  they move every frame; a view, so no undo step and no unsaved mark. The panel pauses them.
+- **The drag coefficient** of each Force goal of an external flow, under its value: Cd =
+  2 F / (ρ V² A), F the force along the free stream, A the model's frontal area along it, both
+  shown. The area is worked out when the flow is read (`FlowDone::frontal`) and never saved:
+  nothing new in `.oxysim` or `.oxyres`. It is shown while the study's free stream is the one
+  solved.
 
 ### `oxyde-flow`
 
@@ -393,6 +408,23 @@ type of their own in `format_version` 6, with conduction in the solids.
 - `setup`: the mesh of a level, the automatic domain, the point inside a cavity.
 - `plot`: cut planes and wetted surfaces as polygons with values; for a cooling study's
   temperature, the cut goes through the solid too and the surface is the solid's.
+- `trajectory`: particles followed through the solved flow, as polylines with the time and
+  speed at each point. Seeds: for an external flow, a grid on a plane square to the free
+  stream half the model's size upstream of it, across its frontal extent and a quarter of its
+  size round it; for an internal flow, points spread evenly over the inlets' faces (each
+  face's centre and the points halfway to its corners, the farthest from those taken picked in
+  turn). A particle always knows its cell: each move walks from cell to neighbour across the
+  faces the line crosses (`Tracer::walk`), as OpenFOAM's own tracking does, so no search; only
+  the first seed is found by looking through the cells. Inside a cell the velocity is the
+  cell's plus its Gauss gradient (the faces' values linear between the cells' centres, the
+  boundary's own on boundary faces) times the offset from its centre, kept within the values
+  on its faces. Steps follow the midpoint rule, each 0.3 of the cell's size; a path ends where
+  it leaves through the domain's box or an opening, on a wall of the model, where the flow is
+  a millionth of its fastest, or after three diagonals of the domain. Paths are followed on up
+  to eight threads, each its own share of the seeds, and come back in the seeds' order.
+- `drag`: the frontal area, the silhouette of the mesh's faces on the model projected on the
+  plane square to the stream, rasterised on 1024 pixels across its longer side (parts in front
+  of one another counted once, which a sum of face areas would not), and Cd from a force.
 - `cooling`: a cooling study's case (§5, *Cooling*): the bodies' STL files and zones, the
   `topoSet` and `splitMeshRegions` steps, then [`cooling::finish`] after the split: the
   patches renamed, the leak check, and every region's files (thermophysics, a heat source
@@ -400,13 +432,15 @@ type of their own in `format_version` 6, with conduction in the solids.
   stopped at convergence; `results` reads both regions back (temperatures in °C, pressures
   gauge) and works out the temperature and heat goals.
 
-**Tests.** 49 unit tests that need no OpenFOAM: the case's files, the mesh and field
+**Tests.** 58 unit tests that need no OpenFOAM: the case's files, the mesh and field
 readers (both face formats, compact lists, every kind of patch entry), the geometry of
 faces and cells, the log reader (residuals, convergence, fatal errors, divergence,
 `checkMesh`, the solid's temperature), the run's log following and stopping, the leak
 check, an installation's environment from a fake `etc/bashrc`, the mesh levels, the point
-inside a cavity, cut and surface plots; for cooling, the bodies' zones, the split's patches
-renamed and every region's files. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped
+inside a cavity, cut and surface plots, trajectories (the walk from cell to cell, straight
+paths in a uniform flow, seeds upstream of a model and on an inlet, a sheared flow followed
+across cells, a still one), the frontal area of a box and of a disc, the drag coefficient;
+for cooling, the bodies' zones, the split's patches renamed and every region's files. Then `tests/openfoam.rs`, through OpenFOAM v2606 (skipped
 without it), on a Raspberry Pi 4 in OpenCFD's arm64 image, on one core (two for the MPI run
 and the first cold plate):
 
@@ -414,7 +448,7 @@ and the first cold plate):
 |---|---|---|---|---|
 | Laminar pipe: water, 10 mm bore, 100 mm long, Re 20 | 41 696 | 44 | 37 s + 31 s | Pressure gradient past the entrance −0.6347 Pa/m, Hagen–Poiseuille's −0.6413 (−1.0 %); velocity on the axis twice the mean within 2.5 %; flow out equal to flow in to 1.2 × 10⁻⁷; the wall's friction (5.28 µN) balancing the inlet pressure over the bore (5.37 µN) |
 | The same pipe on two processes (MPI) | 41 696 | 45 | 36 s + 24 s | The same gradient (−1.0 %) |
-| Sphere in air at Re 20, the domain five diameters round it and ten behind | 19 351 | 102 | 13 s + 29 s | Drag coefficient 2.738, Clift, Grace and Weber's correlation 2.735 (+0.1 %); side forces 10⁻⁴ of the drag |
+| Sphere in air at Re 20, the domain five diameters round it and ten behind | 19 351 | 102 | 13 s + 29 s | Drag coefficient 2.738, Clift, Grace and Weber's correlation 2.735 (+0.1 %); side forces 10⁻⁴ of the drag. The frontal area from the mesh's silhouette 77.92 mm² (πr² −0.8 %), so the Cd shown 2.760 (+0.9 %); 100 trajectories from upstream, 98 out of the domain behind, 2 lost, none into the sphere, 30 of the 32 seeded in front of it carried round |
 | Turbulent pipe: water at Re 19 924, k-ω SST, three layers along the wall | 75 296 | 100 | 43 s + 180 s | Inlet pressure 812 Pa, 1.5 times Blasius's 531 Pa for a developed flow over L/D = 10: the entrance adds the rest (a check of order only) |
 | Cold plate (cooling): water at 0.1 m/s through a 4 mm square channel in an aluminium plate of four bars and two plastic lids, a 10 W ceramic chip on top; on two processes | 65 856 | 98 | 71 s + 117 s | Heat into the water through the channel's walls 10.0000 W, carried out by it (ṁ cp ΔT) 9.9989 W; the chip at 37.5 °C |
 | The same plate turbulent: water at 2 m/s (Re 8000, k-ω SST), the 10 W let in through the chip's top face, the bottom face losing heat to 20 °C (50 W/m²·K) | 65 856 | 102 | 71 s + 124 s | Into the water 9.977 W, off the bottom 0.023 W: 10.000 W; stopped once its temperatures settled, the same to four figures as at 120 iterations, where its residuals met the target |
@@ -423,7 +457,8 @@ and the first cold plate):
 
 ## 8. Next
 
-- **Flow trajectories**: lines seeded on inlets and followed through the cells.
+- **Trajectories, further**: seeds the user places (a plane, faces), particles with mass
+  (SolidWorks' particle studies), paths drawn as tubes in the scene, hidden behind the model.
 - **Cooling, further**: radiation between faces and to the surroundings, contact
   resistance between bodies, layers along cooled walls, fans as conditions, and the
   temperatures handed to thermal stress studies.

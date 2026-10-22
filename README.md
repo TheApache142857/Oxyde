@@ -111,7 +111,8 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   exported as STL. **Flow studies** (CFD):
   liquids and gases through or around the model, laminar or turbulent, with inlets, openings
   and goals on faces, solved by [OpenFOAM](https://www.openfoam.com) run as a separate program;
-  forces, flow rates and pressures, cut plots and surface plots; **cooling studies**, the fluid
+  forces (with an external flow's drag coefficient), flow rates and pressures, cut plots,
+  surface plots and animated flow trajectories; **cooling studies**, the fluid
   carrying heat away and the bodies conducting it, with natural convection
   ([docs/CFD.md](docs/CFD.md)).
 - **Generative Design tab:** shapes grown between the bodies to keep and the bodies to stay
