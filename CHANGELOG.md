@@ -5,6 +5,33 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Links to the assembly that hold, and "->" external references (unreleased, October 2026)
+
+- **A part's global variable can be linked to its assembly from the part's Equations
+  window** while it is edited in place: click the variable's field, then a variable of the
+  assembly (or of another part) in the tree's Equations folders. Its name goes in the field
+  (it replaces a lone value such as `300`), and the variable becomes driven by an equation of
+  the assembly: `Depth` = `"linked width@Hackintosh case.Assembly"`. Its equation there can be
+  changed in the same field; a value typed instead takes the link away. Equations of the
+  part's dimensions in that window can be linked the same way. Until now, such a name was
+  refused there and the field went back to its value, as if the link were forgotten.
+- **The assembly's value wins over the part's own**: a variable of the part's linked
+  equations file that the assembly drives is no longer read from the file (it keeps the
+  assembly's value when the part is opened; release it to give it back to the file), and the
+  part's own equation on a dimension the assembly drives goes. Before, the assembly's
+  equation was refused there: finishing an edit in place without saving the part lost the
+  link.
+- **Clicking a variable in the tree** takes it on the press, so it reaches the Equations
+  window's field being typed in as well as a dimension's Modify box; in the Modify box too, it
+  replaces a lone value or name (`= "Depth"` becomes `= "Gap@Case.Assembly"`). In an
+  assembly's tree, a part's variables click into the assembly's Equations window as
+  `"Thickness@Top panel<1>.Part"`.
+- **"->" marks external references**, as in SolidWorks: on a feature or sketch whose
+  dimensions an assembly drives, on the part's name in its tree, on its variables in the
+  Equations folders and window, and on the component in the assembly's tree and in the tree
+  of a part edited in place. It reads "->?" (out of context) when that assembly is not the
+  one the part is edited from; the hover says what drives what.
+
 ### Linking values while editing in place (unreleased, October 2026)
 
 - **A part edited in place keeps the assembly's tree around it**, as SolidWorks' Edit

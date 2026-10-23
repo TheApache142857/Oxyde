@@ -130,10 +130,26 @@ impl InPlaceTree<'_> {
         };
         let expanded = on_path || self.expanded.contains(&node);
         let sub = matches!(loaded, Some(Loaded::Assembly(_)));
+        // "->" for a part this assembly drives, as SolidWorks marks external references.
+        let external = match loaded {
+            Some(Loaded::Part(p)) if !p.part.driven_by().is_empty() => {
+                if p.part
+                    .driven_by()
+                    .iter()
+                    .any(|d| d.assembly_id == doc.document_id)
+                {
+                    " ->"
+                } else {
+                    " ->?"
+                }
+            }
+            _ => "",
+        };
+        let label = format!("{name}{external}");
         let text = if on_path {
-            RichText::new(name)
+            RichText::new(label)
         } else {
-            RichText::new(name).color(dim())
+            RichText::new(label).color(dim())
         };
         let row = ui
             .add_enabled_ui(self.enabled || on_path, |ui| {

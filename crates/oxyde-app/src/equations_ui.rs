@@ -56,6 +56,12 @@ pub struct EquationsWindow {
     pub(crate) target_filter: String,
     /// In an assembly: the mate whose value is being dragged, one undo step for the drag.
     pub(crate) editing_mate: Option<oxyde_assembly::MateId>,
+    /// The field typed in during the last frame, and the one this frame: a click in the
+    /// tree takes the focus away, and its variable goes into that field.
+    pub(crate) focused: Option<Field>,
+    focused_now: Option<Field>,
+    /// A variable's quoted name clicked in the tree, for the field that had the focus.
+    pub(crate) pending_insert: Option<String>,
 }
 
 impl EquationsWindow {
@@ -71,7 +77,21 @@ impl EquationsWindow {
             new_assembly_target: None,
             target_filter: String::new(),
             editing_mate: None,
+            focused: None,
+            focused_now: None,
+            pending_insert: None,
         }
+    }
+
+    /// Before the window is drawn: no field has the focus yet this frame.
+    pub(crate) fn begin_frame(&mut self) {
+        self.focused_now = None;
+    }
+
+    /// After it is drawn: the field with the focus, for the tree's clicks in the next frame.
+    pub(crate) fn end_frame(&mut self) {
+        self.focused = if self.open { self.focused_now } else { None };
+        self.pending_insert = None;
     }
 
     pub fn show(&mut self, tab: EquationsTab) {
@@ -95,11 +115,30 @@ impl EquationsWindow {
             .unwrap_or_else(|| current.to_owned());
         let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(width));
         if response.lost_focus() {
+            // A variable clicked in the tree took the focus: it goes into the field, which
+            // stays open, focused again with the cursor at the end.
+            if self.focused == Some(field)
+                && let Some(name) = self.pending_insert.take()
+            {
+                crate::dimension_equations::insert_name(&mut text, &name);
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                    let end = egui::text::CCursor::new(text.chars().count());
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                    state.store(ui.ctx(), response.id);
+                }
+                response.request_focus();
+                self.editing.insert(field, text);
+                self.focused_now = Some(field);
+                return None;
+            }
             self.editing.remove(&field);
             (text.trim() != current).then(|| text.trim().to_owned())
         } else {
             if response.has_focus() {
                 self.editing.insert(field, text);
+                self.focused_now = Some(field);
             }
             None
         }
@@ -171,12 +210,24 @@ fn unit_of(dimensions: &[Dimension], reference: Option<DimensionRef>) -> Dimensi
 
 impl OxydeApp {
     pub(crate) fn equations_window(&mut self, ctx: &egui::Context) {
+        self.equations.begin_frame();
         if !self.equations.open {
+            self.equations.end_frame();
             return;
         }
         let mut open = true;
         let mut changes = Vec::new();
         let sketching = self.sketch.is_some();
+        // Variables the assembly the part is edited in drives: their equations, as the
+        // part names things, to change here.
+        let links: HashMap<String, String> = self
+            .doc
+            .part
+            .equations()
+            .globals
+            .iter()
+            .filter_map(|g| Some((g.name.clone(), self.assembly_link_text(&g.name)?)))
+            .collect();
         let part = &self.doc.part;
         let folder = self.doc.path.as_deref().and_then(std::path::Path::parent);
         let state = &mut self.equations;
@@ -195,7 +246,9 @@ impl OxydeApp {
                     return;
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| match state.tab {
-                    EquationsTab::Equations => equations_tab(ui, state, part, folder, &mut changes),
+                    EquationsTab::Equations => {
+                        equations_tab(ui, state, part, folder, &links, &mut changes)
+                    }
                     EquationsTab::Dimensions => dimensions_tab(ui, state, part, &mut changes),
                 });
             });
@@ -203,6 +256,7 @@ impl OxydeApp {
             self.equations.open = false;
             self.equations.editing.clear();
         }
+        self.equations.end_frame();
         for change in changes {
             self.apply_equation_change(change);
         }
@@ -211,7 +265,20 @@ impl OxydeApp {
     fn apply_equation_change(&mut self, change: Change) {
         let part = &self.doc.part;
         let parse = |text: &str| part.parse_expression(text);
+        let outside = |text: &str| crate::dimension_equations::reaches_outside(text);
         let outcome: Result<(), ModelError> = match change {
+            Change::SetGlobal(id, text) if outside(&text) => self
+                .link_global_to_assembly(id, &text)
+                .map_err(ModelError::Expression),
+            Change::SetGlobal(id, text) if self.global_linked_to_assembly(id) => self
+                .unlink_global_from_assembly(id, &text)
+                .map_err(ModelError::Expression),
+            Change::SetEquation(index, text) if outside(&text) => self
+                .link_equation_to_assembly(index, &text)
+                .map_err(ModelError::Expression),
+            Change::AddEquation(target, text) if outside(&text) => self
+                .link_dimension_to_assembly(target, &text)
+                .map_err(ModelError::Expression),
             Change::SetDimension(reference, value) => {
                 self.doc.checkpoint_edit(reference.feature);
                 if self.doc.part.set_dimension(reference, value).is_ok() {
@@ -379,6 +446,7 @@ fn equations_tab(
     state: &mut EquationsWindow,
     part: &Part,
     folder: Option<&std::path::Path>,
+    links: &HashMap<String, String>,
     changes: &mut Vec<Change>,
 ) {
     let equations = part.equations();
@@ -420,9 +488,11 @@ fn equations_tab(
                 let linked = global.linked && equations.linked_file.is_some();
                 let driver = part.driver(&global.name);
                 if let Some(d) = driver {
-                    ui.label(format!("Σ {}", global.name))
+                    // "->", as SolidWorks marks external references.
+                    ui.label(format!("{} ->", global.name))
                         .on_hover_text(format!(
-                            "Driven by {} (an assembly equation): release it below to change it",
+                            "Driven by {} (an assembly equation). Edited in place from it, its \
+                         equation is here to change; else release it below",
                             d.assembly_name()
                         ));
                 } else if linked {
@@ -434,8 +504,13 @@ fn equations_tab(
                 {
                     changes.push(Change::RenameGlobal(global.id, name));
                 }
-                let text = part.expression_text(&global.expr);
-                if driver.is_some() {
+                // Driven by the assembly the part is edited in: its equation there, to change
+                // (a value typed instead takes the link away). By another: read only.
+                let link = links.get(&global.name);
+                let text = link
+                    .cloned()
+                    .unwrap_or_else(|| part.expression_text(&global.expr));
+                if driver.is_some() && link.is_none() {
                     ui.label(&text);
                 } else if let Some(text) =
                     state.field(ui, Field::GlobalExpression(global.id), &text, 220.0)
@@ -556,6 +631,15 @@ fn equations_tab(
     }
 
     ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Click a field, then a variable in the tree's Equations folders to put it in. \
+             Edited in place, the assembly's variables (\"Width@Case.Assembly\") and other \
+             parts' (\"Gap@Foot<1>.Part\") make it an equation of the assembly.",
+        )
+        .small()
+        .weak(),
+    );
     ui.label(
         RichText::new(
             "Names go between double quotes: \"Width\", \"D1@Sketch1\". Operators + - * / ^ \

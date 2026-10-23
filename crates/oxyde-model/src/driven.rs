@@ -254,6 +254,13 @@ mod tests {
             part.drive("D1@Boss-Extrude1", 12.0, "asm-a"),
             Ok((12.0, true))
         );
+        // Over the part's own equation, the assembly's value wins: the equation goes.
+        let width = part.find_dimension("D1@Sketch1").unwrap();
+        part.equations
+            .add_equation(width, "D1@Sketch1".to_owned(), Expr::Number(40.0))
+            .unwrap();
+        assert_eq!(part.drive("D1@Sketch1", 40.0, "asm-a"), Ok((40.0, true)));
+        assert!(part.equations().equations.is_empty());
         assert_eq!(part.drive("Thickness", 4.0, "asm-a"), Ok((4.0, true)));
         let refused = part.drive("D1@Boss-Extrude1", 15.0, "asm-b").unwrap_err();
         assert!(
@@ -270,6 +277,30 @@ mod tests {
         // The assembly no longer driving anything leaves no entry.
         assert!(part.set_driven_by("asm-a", "../Case.oxyasm", &BTreeSet::new()));
         assert!(part.driven_by().is_empty());
+    }
+
+    #[test]
+    fn a_linked_variable_an_assembly_drives_is_no_longer_read_from_the_file() {
+        let (mut part, _) = plate();
+        let linked = |value: &str| {
+            [crate::equations::LinkedValue {
+                name: "Depth".to_owned(),
+                expression: value.to_owned(),
+            }]
+        };
+        part.link_equations(Some("Case.txt".to_owned()), &linked("300"))
+            .unwrap();
+        assert_eq!(part.drive("Depth", 320.0, "asm"), Ok((320.0, true)));
+        part.set_driven_by("asm", "Case.oxyasm", &names(&["Depth"]));
+        // The file changes: the variable keeps the assembly's value, not linked any more.
+        part.apply_linked_values(&linked("280")).unwrap();
+        let depth = part.equations().globals.iter().find(|g| g.name == "Depth");
+        assert!(depth.is_some_and(|g| !g.linked && g.expr == Expr::Number(320.0)));
+        // Released, the file gives it again.
+        part.release_driven("Depth").unwrap();
+        part.apply_linked_values(&linked("280")).unwrap();
+        let depth = part.equations().globals.iter().find(|g| g.name == "Depth");
+        assert!(depth.is_some_and(|g| g.linked && g.expr == Expr::Number(280.0)));
     }
 
     #[test]

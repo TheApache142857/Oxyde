@@ -50,6 +50,13 @@ enum SelectMode {
     Range,
 }
 
+/// A feature with dimensions an assembly drives: "->" in its row, "->?" out of context.
+struct External {
+    /// The assembly driving them is the one the part is edited from.
+    in_context: bool,
+    hover: String,
+}
+
 /// Timeline interactions, applied after drawing.
 enum Action {
     SelectPlane(StandardPlane),
@@ -219,9 +226,22 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
 impl OxydeApp {
     pub(crate) fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        // External references, as SolidWorks marks them: "->" for values the assembly the
+        // part is edited from drives, "->?" for another assembly's, out of its context.
+        let external = self.external_references();
+        let in_context = |id: &str| {
+            self.edit_stack
+                .last()
+                .is_some_and(|p| p.asm.document_id == id)
+        };
+        let heading = match self.doc.part.driven_by().first() {
+            Some(d) if in_context(&d.assembly_id) => format!("{} ->", self.doc.display_name()),
+            Some(_) => format!("{} ->?", self.doc.display_name()),
+            None => self.doc.display_name(),
+        };
         ui.horizontal(|ui| {
             icons::small(ui, Icon::Part, 22.0);
-            ui.heading(self.doc.display_name());
+            ui.heading(heading);
         });
         ui.add_space(2.0);
         self.edit_in_place_banner(ui);
@@ -252,7 +272,7 @@ impl OxydeApp {
         let enabled = self.sketch.is_none();
         // While a dimension's value is typed as an equation, variables can be clicked into
         // it, even in sketch mode: the Equations folders stay enabled.
-        let inserting = self.equation_field_open();
+        let inserting = self.variables_clickable();
         // Edited in place: the assembly around the part. Set apart while drawing, since the
         // part's rows borrow the application.
         let stack = std::mem::take(&mut self.edit_stack);
@@ -460,6 +480,7 @@ impl OxydeApp {
                                 under_pointer == Some(entry.id),
                                 0.0,
                                 (!children.is_empty()).then_some(expanded),
+                                external.get(&entry.id),
                                 &mut action,
                             );
                             rows.push((rect, index));
@@ -475,6 +496,7 @@ impl OxydeApp {
                                         under_pointer == Some(child.id),
                                         16.0,
                                         None,
+                                        external.get(&child.id),
                                         &mut action,
                                     );
                                     rows.push((rect, child_index));
@@ -552,6 +574,41 @@ impl OxydeApp {
         if let Some(action) = action {
             self.apply_action(action, &order);
         }
+    }
+
+    /// The features whose dimensions an assembly drives (SolidWorks' external references),
+    /// with what drives them and whether that assembly is the one the part is edited from.
+    fn external_references(&self) -> std::collections::HashMap<FeatureId, External> {
+        let mut out: std::collections::HashMap<FeatureId, External> =
+            std::collections::HashMap::new();
+        if self.doc.part.driven_by().is_empty() {
+            return out;
+        }
+        let context = self.edit_stack.last().map(|p| p.asm.document_id.clone());
+        for d in self.doc.part.dimensions() {
+            let Some(driver) = self.doc.part.driver(&d.full_name) else {
+                continue;
+            };
+            let in_context = context.as_deref() == Some(driver.assembly_id.as_str());
+            let line = if in_context {
+                format!("{} is driven by {}", d.full_name, driver.assembly_name())
+            } else {
+                format!(
+                    "{} is driven by {}, not open here (out of context): edit the part in \
+                     place from it to change it",
+                    d.full_name,
+                    driver.assembly_name()
+                )
+            };
+            let entry = out.entry(d.reference.feature).or_insert_with(|| External {
+                in_context,
+                hover: "External reference (an assembly equation):".to_owned(),
+            });
+            entry.in_context &= in_context;
+            entry.hover.push('\n');
+            entry.hover.push_str(&line);
+        }
+        out
     }
 
     /// The features a command from the timeline applies to: the multi-selection when `id`
@@ -671,6 +728,7 @@ impl OxydeApp {
         hovered: bool,
         indent: f32,
         expander: Option<bool>,
+        external: Option<&External>,
         action: &mut Option<Action>,
     ) -> egui::Rect {
         let feature = self.doc.part.feature(entry.id);
@@ -680,11 +738,14 @@ impl OxydeApp {
             FeatureKind::Combine(c) => c.op == oxyde_model::CombineOp::Cut,
             kind => kind.sweep_op() == Some(ExtrudeOp::Cut),
         });
-        let label = if entry.under_defined {
+        let mut label = if entry.under_defined {
             format!("(-) {}", entry.name)
         } else {
             entry.name.clone()
         };
+        if let Some(external) = external {
+            label.push_str(if external.in_context { " ->" } else { " ->?" });
+        }
         let (mut text, badge) = match &entry.status {
             FeatureStatus::Error(_) => (RichText::new(label).color(error()), Some(Icon::Error)),
             FeatureStatus::Warning(_) => {
@@ -722,6 +783,9 @@ impl OxydeApp {
         response = match &entry.status {
             FeatureStatus::Error(message) | FeatureStatus::Warning(message) => {
                 response.on_hover_text(message.as_str())
+            }
+            _ if external.is_some() => {
+                response.on_hover_text(external.map_or("", |e| e.hover.as_str()))
             }
             _ if entry.under_defined => {
                 response.on_hover_text("Under defined: the sketch can still move")

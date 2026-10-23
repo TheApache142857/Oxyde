@@ -28,7 +28,9 @@ use crate::app::{Overlay, OverlayShape, OxydeApp, PendingAction, overlay_at};
 use crate::assembly::{AsmSelected, AssemblyDoc, Occurrence};
 use crate::dialogs::plane_name;
 use crate::display::Item;
-use crate::equation_tree::{FolderEvent, assembly_contents, equations_folder, part_contents};
+use crate::equation_tree::{
+    FolderEvent, assembly_contents, equations_folder, part_contents, qualified,
+};
 use crate::icons::{self, Icon};
 use crate::property_manager::{box_active, box_fill};
 use crate::timeline::{Row, tree_row};
@@ -210,6 +212,8 @@ enum TreeAction {
     DeleteMate(MateId),
     /// Open or close the Equations folder of the assembly (`None`) or of a part.
     ToggleEquations(Option<ComponentId>),
+    /// A variable's quoted name, for the Equations window's field being typed in.
+    InsertName(String),
     /// Tools › Equations.
     ManageEquations,
 }
@@ -1918,6 +1922,8 @@ impl OxydeApp {
             return;
         };
         let mating = self.mate_dialog.is_some();
+        // A field of the Equations window is being typed in: variables click into it.
+        let inserting = self.variables_clickable();
         let material_names: Vec<String> = self
             .materials
             .materials()
@@ -2009,13 +2015,16 @@ impl OxydeApp {
                 // folder.
                 let contents = assembly_contents(doc, false);
                 if !contents.is_empty() {
-                    let open = self.asm_equations_expanded;
-                    match equations_folder(ui, &contents, 0.0, open, false, true) {
+                    let open = self.asm_equations_expanded || inserting;
+                    match equations_folder(ui, &contents, 0.0, open, inserting, true) {
                         Some(FolderEvent::Toggle) => {
                             action = Some(TreeAction::ToggleEquations(None));
                         }
                         Some(FolderEvent::Manage) => action = Some(TreeAction::ManageEquations),
-                        Some(FolderEvent::Insert(_)) | None => {}
+                        Some(FolderEvent::Insert(name)) => {
+                            action = Some(TreeAction::InsertName(name));
+                        }
+                        None => {}
                     }
                 }
                 ui.add_space(3.0);
@@ -2037,6 +2046,21 @@ impl OxydeApp {
                         ""
                     };
                     let error = doc.load_error(c.id);
+                    // External references, as SolidWorks marks them: "->" for a part this
+                    // assembly drives, "->?" for one another assembly does.
+                    let external = match doc.loaded(c.id) {
+                        Some(crate::assembly::Loaded::Part(p)) => {
+                            let drivers = p.part.driven_by();
+                            if drivers.iter().any(|d| d.assembly_id == doc.document_id) {
+                                " ->"
+                            } else if drivers.is_empty() {
+                                ""
+                            } else {
+                                " ->?"
+                            }
+                        }
+                        _ => "",
+                    };
                     let selected = doc.selection.contains(&AsmSelected::Component(c.id));
                     let expanded = doc.expanded.contains(&c.id);
                     let sub = match doc.loaded(c.id) {
@@ -2052,7 +2076,7 @@ impl OxydeApp {
                                 Icon::Part
                             },
                             cut: false,
-                            text: RichText::new(format!("{prefix}{}", c.name)),
+                            text: RichText::new(format!("{prefix}{}{external}", c.name)),
                             highlighted: selected,
                             hovered: under_pointer == Some(c.id),
                             badge: error.map(|_| Icon::Error),
@@ -2204,14 +2228,21 @@ impl OxydeApp {
                     }
                     if expanded {
                         // The part's own variables and equations, as in its tree.
+                        // Named as the assembly's equations name them, to click into one.
                         if let Some(crate::assembly::Loaded::Part(p)) = doc.loaded(id) {
-                            let contents = part_contents(&p.part, &|name| name.to_owned());
+                            let contents =
+                                part_contents(&p.part, &|name| qualified(doc, &[id], name));
                             if !contents.is_empty() {
                                 let open = self.asm_part_equations_expanded.contains(&id);
-                                if let Some(FolderEvent::Toggle) =
-                                    equations_folder(ui, &contents, 16.0, open, false, false)
+                                match equations_folder(ui, &contents, 16.0, open, inserting, false)
                                 {
-                                    action = Some(TreeAction::ToggleEquations(Some(id)));
+                                    Some(FolderEvent::Toggle) => {
+                                        action = Some(TreeAction::ToggleEquations(Some(id)));
+                                    }
+                                    Some(FolderEvent::Insert(name)) => {
+                                        action = Some(TreeAction::InsertName(name));
+                                    }
+                                    Some(FolderEvent::Manage) | None => {}
                                 }
                             }
                         }
@@ -2362,6 +2393,7 @@ impl OxydeApp {
                 self.equations
                     .show(crate::equations_ui::EquationsTab::Equations);
             }
+            TreeAction::InsertName(name) => self.insert_into_equation_field(&name),
             TreeAction::Hide(ids) => {
                 if let Some(doc) = self.asm.as_mut() {
                     doc.checkpoint();

@@ -66,13 +66,10 @@ pub(crate) fn part_contents(part: &Part, qualify: &dyn Fn(&str) -> String) -> Fo
         .enumerate()
         .map(|(i, g)| {
             let driver = part.driver(&g.name);
-            let mark = if driver.is_some() {
-                "Σ "
-            } else if g.linked && linked_file {
-                "🔗 "
-            } else {
-                ""
-            };
+            // "->" for a variable an assembly drives, as SolidWorks marks external
+            // references.
+            let mark = if g.linked && linked_file { "🔗 " } else { "" };
+            let external = if driver.is_some() { " ->" } else { "" };
             let expression = part.expression_text(&g.expr);
             let mut hover = format!("\"{}\" = {expression}", g.name);
             if let Some(d) = driver {
@@ -81,7 +78,11 @@ pub(crate) fn part_contents(part: &Part, qualify: &dyn Fn(&str) -> String) -> Fo
                 hover.push_str("\nFrom the linked equations file");
             }
             VariableRow {
-                text: format!("{mark}{} = {}", g.name, value_text(results.globals.get(i))),
+                text: format!(
+                    "{mark}{} = {}{external}",
+                    g.name,
+                    value_text(results.globals.get(i))
+                ),
                 insert: format!("\"{}\"", qualify(&g.name)),
                 hover,
             }
@@ -101,7 +102,7 @@ pub(crate) fn part_contents(part: &Part, qualify: &dyn Fn(&str) -> String) -> Fo
     lines.extend(
         part.driven_by()
             .iter()
-            .map(|d| format!("Σ \"{}\" ← {}", d.name, d.assembly_name())),
+            .map(|d| format!("\"{}\" -> {}", d.name, d.assembly_name())),
     );
     FolderContents {
         variables,
@@ -243,8 +244,11 @@ pub(crate) fn equations_folder(
         } else {
             v.hover.clone()
         };
+        // Taken on the press: a field of the Equations window loses the focus to the click,
+        // and only knows to take the name in the frame it loses it.
+        let pressed = row.response.hovered() && ui.input(|i| i.pointer.primary_pressed());
         let response = row.response.on_hover_text(hint);
-        if response.clicked() && inserting {
+        if pressed && inserting {
             event = Some(FolderEvent::Insert(v.insert.clone()));
         } else if response.double_clicked() && manage {
             event = Some(FolderEvent::Manage);
@@ -306,9 +310,9 @@ mod tests {
         part.set_driven_by("id", "../Case.oxyasm", &names);
         let contents = part_contents(&part, &|n| format!("{n}@Plate<1>.Part"));
         let texts: Vec<&str> = contents.variables.iter().map(|v| v.text.as_str()).collect();
-        assert_eq!(texts, ["Gap = …", "Σ Thickness = …", "🔗 Width = …"]);
+        assert_eq!(texts, ["Gap = …", "Thickness = … ->", "🔗 Width = …"]);
         assert_eq!(contents.variables[0].insert, "\"Gap@Plate<1>.Part\"");
         assert!(contents.variables[1].hover.contains("Driven by Case"));
-        assert_eq!(contents.equations, ["Σ \"Thickness\" ← Case"]);
+        assert_eq!(contents.equations, ["\"Thickness\" -> Case"]);
     }
 }

@@ -248,7 +248,7 @@ The equations file is plain UTF-8 text, one variable per line, `"Name" = express
 "Hole X" = "Width" / 2 - 14.5
 ```
 
-When a linked part is opened, the variables of the file replace the `linked` ones of the same name and are added if the part does not have them; a `linked` variable the file no longer lists stays, no longer linked. The part stores a copy of every linked variable, so it opens with the values it was saved with when the file is missing or unreadable, and readers that do not know the link open it as it was saved. Writers change a linked variable in the file (keeping its other lines), not only in the part. The link needs no new `format_version`: a reader that ignores `equations_file` and `linked` loses only the link.
+When a linked part is opened, the variables of the file replace the `linked` ones of the same name and are added if the part does not have them, except a variable an assembly drives (in `driven_by`), which keeps the assembly's value and is no longer `linked`; a `linked` variable the file no longer lists stays, no longer linked. The part stores a copy of every linked variable, so it opens with the values it was saved with when the file is missing or unreadable, and readers that do not know the link open it as it was saved. Writers change a linked variable in the file (keeping its other lines), not only in the part. The link needs no new `format_version`: a reader that ignores `equations_file` and `linked` loses only the link.
 
 ### Values driven by assemblies
 
