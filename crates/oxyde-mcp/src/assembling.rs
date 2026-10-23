@@ -62,11 +62,30 @@ pub(crate) fn open_assembly(session: &mut Session, args: &Value) -> Result<ToolO
             loaded: BTreeMap::new(),
         },
     );
+    // As the application does: the parts may have changed since the assembly was saved (a
+    // linked equations file, a part edited on its own), and the mates move what follows.
+    solve(session)?;
     let mut out = info(session)?;
     if !failures.is_empty() {
         out.set("not_loaded", json!(failures));
     }
     Ok(ToolOutput::json(&out))
+}
+
+/// Solves the mates and moves the components where they say.
+fn solve(session: &mut Session) -> Result<oxyde_assembly::Solution> {
+    let doc = session.assembly.as_mut().ok_or("no assembly is open")?;
+    let mut assembly = std::mem::take(&mut doc.file.assembly);
+    let size = doc.size();
+    let solution =
+        oxyde_assembly::solve_about(&assembly, |r| doc.local(r), |c| doc.center(c), size);
+    for (component, placement) in &solution.placements {
+        if let Some(c) = assembly.component_mut(*component) {
+            c.placement = *placement;
+        }
+    }
+    doc.file.assembly = assembly;
+    Ok(solution)
 }
 
 pub(crate) fn save_assembly(session: &mut Session, args: &Value) -> Result<ToolOutput> {
@@ -229,16 +248,8 @@ pub(crate) fn add_mate(session: &mut Session, args: &Value) -> Result<ToolOutput
     };
     let doc = session.assembly.as_mut().ok_or("no assembly is open")?;
     let id = doc.file.assembly.add_mate(kind, a, b, aligned);
-    let mut assembly = std::mem::take(&mut doc.file.assembly);
-    let size = doc.size();
-    let solution =
-        oxyde_assembly::solve_about(&assembly, |r| doc.local(r), |c| doc.center(c), size);
-    for (component, placement) in &solution.placements {
-        if let Some(c) = assembly.component_mut(*component) {
-            c.placement = *placement;
-        }
-    }
-    doc.file.assembly = assembly;
+    let solution = solve(session)?;
+    let doc = session.assembly.as_ref().ok_or("no assembly is open")?;
     let status = solution
         .status(id)
         .map(|s| format!("{s:?}"))
@@ -299,6 +310,38 @@ fn info(session: &mut Session) -> Result<Value> {
     }))
 }
 
+/// The assembly, with what the mates leave free: `"free"` gives each component that can
+/// still move its degrees of freedom (none listed: fully defined), `"mate_errors"` the mates
+/// that cannot be met.
 pub(crate) fn assembly_info(session: &mut Session) -> Result<ToolOutput> {
-    Ok(ToolOutput::json(&info(session)?))
+    let solution = solve(session)?;
+    let mut out = info(session)?;
+    let doc = doc(session)?;
+    let name = |id: ComponentId| {
+        doc.file
+            .assembly
+            .component(id)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| id.0.to_string())
+    };
+    let free: serde_json::Map<String, Value> = solution
+        .freedom
+        .iter()
+        .filter(|f| f.degrees > 0)
+        .map(|f| (name(f.component), json!(f.degrees)))
+        .collect();
+    out.set("free", Value::Object(free));
+    let errors: Vec<Value> = solution
+        .mates
+        .iter()
+        .filter_map(|(id, status)| match status {
+            oxyde_assembly::MateStatus::Error(e) => {
+                let mate = doc.file.assembly.mate(*id).map(|m| m.name.clone());
+                Some(json!([mate, e]))
+            }
+            oxyde_assembly::MateStatus::Ok => None,
+        })
+        .collect();
+    out.set("mate_errors", json!(errors));
+    Ok(ToolOutput::json(&out))
 }

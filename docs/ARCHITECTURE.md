@@ -195,6 +195,7 @@ The groundwork for equations, SolidWorks-style:
 - A driven dimension is flagged (`Dimension::driven`): read-only in the Dimensions tab, shown with Σ in sketch mode, and not editable from its sketch.
 - In files, expressions are stored as text with names (readable by other tools), see `FORMAT.md`.
 - **Tools › Equations…** opens the window: an *Equations* tab (global variables and equations, with the value each evaluates to or its error) and a *Dimensions* tab (every dimension, rename and edit values).
+- **Linked equations files** (SolidWorks' "Link to external file"): `Equations::linked_file` names a text file of `"Name" = expression` lines that several parts share, and `GlobalVariable::linked` marks the variables copied from it. The model never reads files: `PartDefinition::apply_linked_values` takes the values, and `oxyde-format` reads the file (`equations_file`) when a part is loaded (`load_part`), so every way of opening a part (the application, an assembly's components, the MCP server, background jobs) sees the file as it is now. The part keeps the copy as the file last gave it, so a missing file never breaks a part. Changing a linked variable, in the Equations window or through the MCP server, writes the file first and then reads all of it back; other parts take the change when they are next opened (an assembly reloads them when it opens).
 
 ## 7. Units and tolerances
 

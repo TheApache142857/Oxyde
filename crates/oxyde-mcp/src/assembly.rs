@@ -185,17 +185,6 @@ impl AssemblyDoc {
         Ok(primitive.placed(&placement))
     }
 
-    /// The loaded part of a top-level component.
-    pub fn part_of(&self, id: ComponentId) -> Result<&LoadedPart> {
-        match self.loaded.get(&id) {
-            Some(Loaded::Part(p)) => Ok(p),
-            Some(Loaded::Assembly(_)) => {
-                Err("that component is a sub-assembly: mate it by its planes or origin".to_owned())
-            }
-            None => Err("that component's file is not loaded".to_owned()),
-        }
-    }
-
     /// About the size of the assembly, mm.
     pub fn size(&self) -> f64 {
         let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
@@ -384,8 +373,26 @@ pub(crate) fn placement(args: &Value) -> Result<Placement> {
 
 /// A mate reference from `{"component": …, "face" | "edge": selector}` or
 /// `{"component": …, "plane": "front" | "top" | "right"}`, `"axis": "x"…`, `"origin": true`.
+/// `"path": [names or ids]` reaches into a sub-assembly component: the components of the
+/// sub-assembly, then of its sub-assemblies, down to the part whose geometry is meant;
+/// selectors then work in that part's own coordinates.
 pub(crate) fn mate_ref(doc: &AssemblyDoc, kernel: &OcctKernel, value: &Value) -> Result<MateRef> {
     let component = doc.component(args::get(value, "component")?)?;
+    let mut path = Vec::new();
+    let mut loaded = doc.loaded.get(&component);
+    if let Some(steps) = args::opt(value, "path") {
+        let steps = steps
+            .as_array()
+            .ok_or("\"path\" must be a list of component names or ids")?;
+        for step in steps {
+            let Some(Loaded::Assembly(inner)) = loaded else {
+                return Err("\"path\" goes on past a part".to_owned());
+            };
+            let id = component_in(&inner.file.assembly, step)?;
+            path.push(id);
+            loaded = inner.children.get(&id);
+        }
+    }
     let target = if let Some(plane) = args::opt_str(value, "plane")? {
         MateTarget::Plane(match plane {
             "front" => StandardPlane::Front,
@@ -403,7 +410,17 @@ pub(crate) fn mate_ref(doc: &AssemblyDoc, kernel: &OcctKernel, value: &Value) ->
     } else if args::bool(value, "origin", false)? {
         MateTarget::Origin
     } else {
-        let part = doc.part_of(component)?;
+        let part = match loaded {
+            Some(Loaded::Part(p)) => p,
+            Some(Loaded::Assembly(_)) => {
+                return Err(
+                    "that component is a sub-assembly: give \"path\" down to one of its \
+                     parts, or mate it by its planes or origin"
+                        .to_owned(),
+                );
+            }
+            None => return Err("that component's file is not loaded".to_owned()),
+        };
         let body = part.part.body().ok_or("that part has no solid")?;
         let solids = Solids::of_body(body);
         let scope = crate::select::Scope {
@@ -427,7 +444,39 @@ pub(crate) fn mate_ref(doc: &AssemblyDoc, kernel: &OcctKernel, value: &Value) ->
             );
         }
     };
-    Ok(MateRef::new(component, target))
+    Ok(MateRef {
+        component,
+        path,
+        target,
+    })
+}
+
+/// A component of `assembly` by id or name ("PSU body<1>", or "PSU body" when unique).
+fn component_in(assembly: &oxyde_assembly::Assembly, value: &Value) -> Result<ComponentId> {
+    if let Some(n) = value.as_u64() {
+        return assembly
+            .components
+            .iter()
+            .find(|c| u64::from(c.id.0) == n)
+            .map(|c| c.id)
+            .ok_or_else(|| format!("no component {n} in the sub-assembly"));
+    }
+    let name = value
+        .as_str()
+        .ok_or("a path step is a component name or id")?;
+    let matches: Vec<ComponentId> = assembly
+        .components
+        .iter()
+        .filter(|c| c.name == name || c.name.split('<').next() == Some(name))
+        .map(|c| c.id)
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(*one),
+        [] => Err(format!("no component named \"{name}\" in the sub-assembly")),
+        _ => Err(format!(
+            "several components are called \"{name}\": give \"{name}<1>\""
+        )),
+    }
 }
 
 /// The component path, relative to the assembly's folder when it is inside it.
