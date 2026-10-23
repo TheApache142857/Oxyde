@@ -797,6 +797,38 @@ pub(crate) fn rename_dimension(session: &mut Session, args: &Value) -> Result<To
 pub(crate) fn set_variable(session: &mut Session, args: &Value) -> Result<ToolOutput> {
     let name = args::str(args, "name")?.to_owned();
     let text = args::str(args, "expression")?.to_owned();
+    // A linked variable is changed in its equations file, which every part linked to the
+    // file reads, as SolidWorks writes an edited linked value back to the file.
+    let linked = {
+        let doc = session.doc()?;
+        let equations = doc.part.equations();
+        let is_linked = equations.globals.iter().any(|g| g.name == name && g.linked);
+        match (&equations.linked_file, is_linked) {
+            (Some(file), true) => Some(linked_path(doc.path.as_deref(), file)?),
+            _ => None,
+        }
+    };
+    if let Some(path) = linked {
+        session
+            .doc()?
+            .part
+            .parse_expression(&text)
+            .map_err(|e| e.to_string())?;
+        let value = oxyde_model::LinkedValue {
+            name: name.clone(),
+            expression: text.clone(),
+        };
+        oxyde_format::equations_file::update_equations_file(&path, &[value])
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let values = oxyde_format::equations_file::read_equations_file(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        session.change(|doc| {
+            doc.part
+                .apply_linked_values(&values)
+                .map_err(|e| e.to_string())
+        })?;
+        return equation_report(session);
+    }
     session.change(|doc| {
         let expr = doc
             .part
@@ -845,11 +877,64 @@ pub(crate) fn set_equation(session: &mut Session, args: &Value) -> Result<ToolOu
     equation_report(session)
 }
 
+/// Where the equations file `file` linked to the part saved at `part` is.
+fn linked_path(part: Option<&std::path::Path>, file: &str) -> Result<std::path::PathBuf> {
+    if std::path::Path::new(file).is_absolute() {
+        return Ok(file.into());
+    }
+    let part = part.ok_or("save the part first: its equations file is found next to it")?;
+    Ok(oxyde_format::equations_file::linked_file_path(part, file))
+}
+
+/// Links the part to an equations file shared with other parts, writing `variables` into
+/// the file first; `"file": null` unlinks.
+pub(crate) fn link_equations(session: &mut Session, args: &Value) -> Result<ToolOutput> {
+    let file = match args::get(args, "file")? {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        _ => return Err("\"file\" must be a path or null".to_owned()),
+    };
+    let values = match &file {
+        None => Vec::new(),
+        Some(file) => {
+            let path = linked_path(session.doc()?.path.as_deref(), file)?;
+            let mut values = Vec::new();
+            if let Some(variables) = args::opt(args, "variables") {
+                let variables = variables
+                    .as_object()
+                    .ok_or("\"variables\" must be an object: {\"Width\": \"233\"}")?;
+                for (name, expression) in variables {
+                    let expression = match expression {
+                        Value::String(s) => s.clone(),
+                        Value::Number(n) => n.to_string(),
+                        _ => return Err(format!("\"{name}\": give an expression")),
+                    };
+                    values.push(oxyde_model::LinkedValue {
+                        name: name.clone(),
+                        expression,
+                    });
+                }
+                oxyde_format::equations_file::update_equations_file(&path, &values)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            }
+            oxyde_format::equations_file::read_equations_file(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+        }
+    };
+    session.change(|doc| {
+        doc.part
+            .link_equations(file.clone(), &values)
+            .map_err(|e| e.to_string())
+    })?;
+    equation_report(session)
+}
+
 fn equation_report(session: &Session) -> Result<ToolOutput> {
     let part = &session.doc()?.part;
     let text = part.definition().equations_text();
     let mut out = json!({
-        "variables": text.globals.iter().map(|g| json!([g.name, g.expression])).collect::<Vec<_>>(),
+        "variables": text.globals.iter().map(|g| if g.linked { json!([g.name, g.expression, "linked"]) } else { json!([g.name, g.expression]) }).collect::<Vec<_>>(),
+        "equations_file": text.linked_file,
         "equations": text.equations.iter().map(|e| json!([e.dimension, e.expression])).collect::<Vec<_>>(),
     });
     let problems = status_report(part, &[]);

@@ -24,6 +24,9 @@ pub struct GlobalVariable {
     pub id: GlobalId,
     pub name: String,
     pub expr: Expr,
+    /// Read from the part's linked equations file ([`Equations::linked_file`]): the part
+    /// keeps a copy, refreshed from the file whenever the part is opened.
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +46,9 @@ pub struct Equations {
     pub equations: Vec<Equation>,
     /// Id the next new global variable will get.
     pub next_global_id: u32,
+    /// Path of the linked equations file, relative to the part's folder (SolidWorks' "Link
+    /// to external file"): parts linked to the same file share its variables.
+    pub linked_file: Option<String>,
 }
 
 impl Default for Equations {
@@ -51,13 +57,14 @@ impl Default for Equations {
             globals: Vec::new(),
             equations: Vec::new(),
             next_global_id: 1,
+            linked_file: None,
         }
     }
 }
 
 impl Equations {
     pub fn is_empty(&self) -> bool {
-        self.globals.is_empty() && self.equations.is_empty()
+        self.globals.is_empty() && self.equations.is_empty() && self.linked_file.is_none()
     }
 
     /// Checks names and ids, and raises `next_global_id` above every id in use.
@@ -105,6 +112,7 @@ pub struct GlobalText {
     pub id: u32,
     pub name: String,
     pub expression: String,
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +128,7 @@ pub struct EquationsText {
     pub globals: Vec<GlobalText>,
     pub equations: Vec<EquationText>,
     pub next_global_id: u32,
+    pub linked_file: Option<String>,
 }
 
 /// Current name of a reference, or `None` if it no longer exists.
@@ -174,6 +183,7 @@ impl PartDefinition {
                     id: g.id.0,
                     name: g.name.clone(),
                     expression: print(&g.expr),
+                    linked: g.linked,
                 })
                 .collect(),
             equations: self
@@ -189,6 +199,7 @@ impl PartDefinition {
                 })
                 .collect(),
             next_global_id: self.equations.next_global_id,
+            linked_file: self.equations.linked_file.clone(),
         }
     }
 
@@ -203,6 +214,7 @@ impl PartDefinition {
                 id: GlobalId(g.id),
                 name: g.name.clone(),
                 expr: Expr::Number(0.0),
+                linked: g.linked,
             })
             .collect();
         // Driven flags do not matter for name resolution.
@@ -238,6 +250,7 @@ impl PartDefinition {
             globals,
             equations,
             next_global_id: text.next_global_id,
+            linked_file: text.linked_file.clone(),
         };
         new.validate()?;
         self.equations = new;
@@ -245,7 +258,102 @@ impl PartDefinition {
     }
 }
 
+/// One line of a linked equations file: `"Width" = 233`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkedValue {
+    pub name: String,
+    pub expression: String,
+}
+
+impl PartDefinition {
+    /// Links the part to the equations file `file` (relative to the part's folder) and takes
+    /// its variables, as [`Self::apply_linked_values`] does. `None` unlinks: the variables
+    /// stay, as ordinary ones, with their last values.
+    pub fn link_equations(
+        &mut self,
+        file: Option<String>,
+        values: &[LinkedValue],
+    ) -> Result<(), ModelError> {
+        let mut text = self.equations_text();
+        let linking = file.is_some();
+        text.linked_file = file;
+        if !linking {
+            for g in &mut text.globals {
+                g.linked = false;
+            }
+        }
+        self.set_equations_text(text)?;
+        if linking {
+            self.apply_linked_values(values)?;
+        }
+        Ok(())
+    }
+
+    /// Takes the variables read from the linked equations file: a variable of the same name
+    /// gets the file's expression and becomes linked, one the part does not have yet is
+    /// added. Variables the file no longer lists keep their last values but are no longer
+    /// linked. All of it at once, so the file's variables may refer to each other.
+    pub fn apply_linked_values(&mut self, values: &[LinkedValue]) -> Result<(), ModelError> {
+        let mut text = self.equations_text();
+        for g in &mut text.globals {
+            g.linked = false;
+        }
+        for value in values {
+            let name = value.name.trim().trim_matches('"').trim();
+            match text.globals.iter_mut().find(|g| g.name == name) {
+                Some(g) => {
+                    g.expression = value.expression.clone();
+                    g.linked = true;
+                }
+                None => {
+                    text.globals.push(GlobalText {
+                        id: text.next_global_id,
+                        name: name.to_owned(),
+                        expression: value.expression.clone(),
+                        linked: true,
+                    });
+                    text.next_global_id += 1;
+                }
+            }
+        }
+        self.set_equations_text(text)
+    }
+
+    /// The linked variables, as the equations file writes them.
+    pub fn linked_values(&self) -> Vec<LinkedValue> {
+        self.equations_text()
+            .globals
+            .into_iter()
+            .filter(|g| g.linked)
+            .map(|g| LinkedValue {
+                name: g.name,
+                expression: g.expression,
+            })
+            .collect()
+    }
+}
+
 impl Part {
+    /// [`PartDefinition::link_equations`] on the part; the next rebuild evaluates them.
+    pub fn link_equations(
+        &mut self,
+        file: Option<String>,
+        values: &[LinkedValue],
+    ) -> Result<(), ModelError> {
+        let mut definition = self.definition();
+        definition.link_equations(file, values)?;
+        self.equations = definition.equations;
+        Ok(())
+    }
+
+    /// [`PartDefinition::apply_linked_values`] on the part; the next rebuild evaluates them.
+    pub fn apply_linked_values(&mut self, values: &[LinkedValue]) -> Result<(), ModelError> {
+        let mut definition = self.definition();
+        definition.apply_linked_values(values)?;
+        self.equations = definition.equations;
+        Ok(())
+    }
+
     pub fn equations(&self) -> &Equations {
         &self.equations
     }
@@ -308,6 +416,7 @@ impl Part {
             id,
             name: name.to_owned(),
             expr,
+            linked: false,
         });
         Ok(id)
     }
@@ -582,6 +691,53 @@ mod tests {
         let d1 = part.find_dimension("D1@Sketch1").unwrap();
         assert!(part.is_driven(d1));
         assert!(part.dimension(d1).unwrap().driven);
+    }
+
+    fn linked(name: &str, expression: &str) -> LinkedValue {
+        LinkedValue {
+            name: name.to_owned(),
+            expression: expression.to_owned(),
+        }
+    }
+
+    #[test]
+    fn linked_values_drive_dimensions_and_follow_their_file() {
+        let (mut part, ..) = block();
+        let expr = part.parse_expression("7").unwrap();
+        part.add_global("Own", expr).unwrap();
+        part.link_equations(
+            Some("Case.txt".to_owned()),
+            &[linked("Width", "50"), linked("Half", "\"Width\" / 2")],
+        )
+        .unwrap();
+        equation(&mut part, "D1@Sketch1", "\"Width\"");
+        equation(&mut part, "D2@Sketch1", "\"Half\"");
+        part.evaluate_equations();
+        assert_eq!(value(&part, "D1@Sketch1"), 50.0);
+        assert_eq!(value(&part, "D2@Sketch1"), 25.0);
+        let flags: Vec<_> = part
+            .equations()
+            .globals
+            .iter()
+            .map(|g| (g.name.as_str(), g.linked))
+            .collect();
+        assert_eq!(flags, [("Own", false), ("Width", true), ("Half", true)]);
+
+        // The file changes: its values come in; one it no longer lists stays, unlinked.
+        part.apply_linked_values(&[linked("Width", "80")]).unwrap();
+        part.evaluate_equations();
+        assert_eq!(value(&part, "D1@Sketch1"), 80.0);
+        assert_eq!(value(&part, "D2@Sketch1"), 40.0);
+        let half = part.equations().globals.iter().find(|g| g.name == "Half");
+        assert!(half.is_some_and(|g| !g.linked));
+        assert_eq!(part.definition().linked_values(), [linked("Width", "80")]);
+
+        // Unlinking keeps every variable, with its last value.
+        part.link_equations(None, &[]).unwrap();
+        part.evaluate_equations();
+        assert_eq!(value(&part, "D1@Sketch1"), 80.0);
+        assert!(part.equations().linked_file.is_none());
+        assert!(part.equations().globals.iter().all(|g| !g.linked));
     }
 
     #[test]

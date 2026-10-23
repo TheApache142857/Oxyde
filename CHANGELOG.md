@@ -5,6 +5,25 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Linked equations files (unreleased, October 2026)
+
+- **Parts can share their global variables through an equations file**, as SolidWorks'
+  *Link to external file*. In **Tools › Equations…**, *🔗 Link to file…* picks or creates a
+  text file next to the part (a new one starts with the part's variables); its variables
+  then show with 🔗, and changing one there writes it into the file. Every part linked to
+  the same file reads it when it is opened, and an assembly opened afterwards rebuilds its
+  parts with the new values and moves them by their mates: one `"Width" = 260` resizes a
+  whole case. The file is plain text you can edit by hand, one `"Name" = expression` per
+  line, with `'` comments. A part whose file has gone opens with the values it last read;
+  *Unlink* keeps the variables as the part's own. In files: `equations_file` and `linked`
+  in `model.json` (FORMAT.md §3); older versions of Oxyde open such parts with their saved
+  values, and saving one there drops its link.
+- **The MCP server:** a `link_equations` tool links a part to an equations file and can
+  write variables into it; `set_variable` on a linked variable changes the file. Mates can
+  pick a face or an edge of a part inside a sub-assembly (`"path"`). Opening an assembly
+  solves its mates, as the application does, and `assembly_info` says which components the
+  mates still leave free, by how many degrees of freedom, and which mates cannot be met.
+
 ### Cooling studies: heat carried away by a flow (unreleased, October 2026)
 
 - **New Study › Cooling** computes the temperatures of a model cooled by air or water

@@ -76,6 +76,9 @@ pub(crate) struct PartModel {
     pub equations: Vec<EquationDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_global_id: Option<u32>,
+    /// Linked equations file, relative to the part's folder; absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equations_file: Option<String>,
     /// Colours, transparency and textures; absent = the viewport's default everywhere.
     #[serde(default, skip_serializing_if = "AppearancesDto::is_empty")]
     pub appearances: AppearancesDto,
@@ -404,6 +407,9 @@ pub(crate) struct GlobalDto {
     pub id: u32,
     pub name: String,
     pub expression: String,
+    /// Copied from the linked equations file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -955,6 +961,7 @@ impl PartModel {
             rollback: definition.rollback,
             features: definition.features.iter().map(feature_dto).collect(),
             next_global_id: (text.next_global_id > 1).then_some(text.next_global_id),
+            equations_file: text.linked_file.clone(),
             global_variables: text
                 .globals
                 .into_iter()
@@ -962,6 +969,7 @@ impl PartModel {
                     id: g.id,
                     name: g.name,
                     expression: g.expression,
+                    linked: g.linked,
                 })
                 .collect(),
             equations: text
@@ -1484,6 +1492,7 @@ impl PartModel {
                         id: g.id,
                         name: g.name,
                         expression: g.expression,
+                        linked: g.linked,
                     })
                     .collect(),
                 equations: self
@@ -1495,6 +1504,7 @@ impl PartModel {
                     })
                     .collect(),
                 next_global_id: self.next_global_id.unwrap_or(1),
+                linked_file: self.equations_file,
             })
             .map_err(|e| format!("equations: {e}"))?;
         Ok(definition)
