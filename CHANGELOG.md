@@ -16,6 +16,9 @@ release yet; the git history has every detail.
   yet (a fillet, a revolve, a STEP import) fails with a message in the tree and the body
   stays as it was; simulation meshes with the lattice mesher. The About box and the Debug
   page say which kernel the session uses.
+- With Oxyde's own kernel too, opening a part or an assembly, Reload Parts and coming back
+  from editing in place run off the UI thread, behind the progress window, as they do with
+  OpenCASCADE: the window stays responsive while a part rebuilds.
 - A part saved records the kernel that built it. Opening a part built by the other kernel
   rebuilds it with this session's and says so in the status line (in an assembly, in its
   notes): the two kernels may cut faces differently, so a fillet or a mate on a face or an

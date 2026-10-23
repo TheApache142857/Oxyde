@@ -827,7 +827,7 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
 /// The directions rays are cast in to tell inside from outside: odd, so that they seldom
 /// run along an edge, and tried in turn when one grazes something.
 const RAYS: [(f64, f64, f64); 6] = [
-    (0.577_215_664, 0.271_828_182, 0.770_163_247),
+    (0.583_215_664, 0.271_828_182, 0.770_163_247),
     (-0.314_159_265, 0.881_373_587, 0.353_553_391),
     (0.703_125_917, -0.412_310_562, 0.574_456_264),
     (0.192_847_365, 0.364_271_829, -0.911_154_727),

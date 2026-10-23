@@ -52,6 +52,8 @@ mod triangulate;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use oxyde_geom::{Axis, Path as SweepPath, Plane, Point3, Profile, Transform, Vec3};
 use oxyde_kernel::{
@@ -107,26 +109,46 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, NativeError>) -> Result<T, NativeErr
     oxyde_kernel::catch_panic(f).unwrap_or_else(|message| Err(NativeError::Internal(message)))
 }
 
+/// The shapes of every native kernel in the process, by handle: a kernel opened on another
+/// thread ([`Kernel::open_worker`]) shares them, as OpenCASCADE's sessions share its arena.
+/// A shape never changes once made, so a kernel takes its own reference to one and the
+/// lock is held only to find, add or drop a shape, never while an operation works.
+static SHAPES: LazyLock<RwLock<HashMap<u64, Arc<Shape>>>> = LazyLock::new(Default::default);
+
+/// The last handle issued, by any kernel; 0 is never one.
+static LAST: AtomicU64 = AtomicU64::new(0);
+
+/// The shapes for reading. A panic while the lock was held cannot have left the map half
+/// changed (it is changed by single inserts and removals), so a poisoned lock is used as it
+/// is.
+fn shapes() -> RwLockReadGuard<'static, HashMap<u64, Arc<Shape>>> {
+    SHAPES.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn shapes_mut() -> RwLockWriteGuard<'static, HashMap<u64, Arc<Shape>>> {
+    SHAPES.write().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// A [`Kernel`] written in Rust, with no C++ underneath.
 ///
-/// It owns the shapes it makes, by handle, until they are released. Its shapes stay with
-/// the kernel that made them: it opens no workers yet ([`Kernel::open_worker`]).
+/// Its shapes are kept by handle until they are released, in a store every native kernel
+/// of the process shares: a handle made by one is valid in any other, so a part can be
+/// rebuilt on a worker thread ([`Kernel::open_worker`]) and drawn from the main one.
 #[derive(Debug, Default)]
 pub struct NativeKernel {
-    shapes: HashMap<u64, Shape>,
-    /// The last handle issued; 0 is never one.
-    last: u64,
+    _private: (),
 }
 
 impl NativeKernel {
-    /// A kernel holding no shapes.
+    /// A kernel on the process's shapes.
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn shape(&self, handle: ShapeHandle) -> Result<&Shape, NativeError> {
-        self.shapes
+    fn shape(&self, handle: ShapeHandle) -> Result<Arc<Shape>, NativeError> {
+        shapes()
             .get(&handle.raw())
+            .cloned()
             .ok_or(NativeError::UnknownShape(handle.raw()))
     }
 
@@ -134,9 +156,9 @@ impl NativeKernel {
     /// pass: an inconsistent solid is a bug, reported rather than handed on.
     fn insert(&mut self, shape: Shape) -> Result<ShapeHandle, NativeError> {
         shape.check().map_err(NativeError::Internal)?;
-        self.last += 1;
-        self.shapes.insert(self.last, shape);
-        Ok(ShapeHandle::from_raw(self.last))
+        let handle = LAST.fetch_add(1, Ordering::Relaxed) + 1;
+        shapes_mut().insert(handle, Arc::new(shape));
+        Ok(ShapeHandle::from_raw(handle))
     }
 }
 
@@ -224,8 +246,10 @@ impl Kernel for NativeKernel {
             let tool_shapes = tools
                 .iter()
                 .map(|&tool| self.shape(tool))
-                .collect::<Result<Vec<&Shape>, _>>()?;
-            let (shape, history) = boolean::boolean(op, self.shape(target)?, &tool_shapes)?;
+                .collect::<Result<Vec<Arc<Shape>>, _>>()?;
+            let tool_shapes: Vec<&Shape> = tool_shapes.iter().map(Arc::as_ref).collect();
+            let target = self.shape(target)?;
+            let (shape, history) = boolean::boolean(op, &target, &tool_shapes)?;
             Ok(OpResult {
                 shape: self.insert(shape)?,
                 history,
@@ -265,7 +289,10 @@ impl Kernel for NativeKernel {
 
     /// Planar faces of straight edges exactly; arcs and cylinders within `deflection`.
     fn tessellate(&self, shape: ShapeHandle, deflection: f64) -> Result<Mesh, NativeError> {
-        guarded(|| tessellate::mesh(self.shape(shape)?, deflection).map_err(NativeError::Internal))
+        guarded(|| {
+            let shape = self.shape(shape)?;
+            tessellate::mesh(&shape, deflection).map_err(NativeError::Internal)
+        })
     }
 
     fn volume(&self, shape: ShapeHandle) -> Result<f64, NativeError> {
@@ -316,7 +343,12 @@ impl Kernel for NativeKernel {
     }
 
     fn release(&mut self, shape: ShapeHandle) {
-        self.shapes.remove(&shape.raw());
+        shapes_mut().remove(&shape.raw());
+    }
+
+    /// Every native kernel shares the process's shapes, so a worker is just another one.
+    fn open_worker() -> Option<Self> {
+        Some(NativeKernel::new())
     }
 }
 
