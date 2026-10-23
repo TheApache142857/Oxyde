@@ -2897,7 +2897,7 @@ impl OxydeApp {
     pub(crate) fn show_scene(&mut self, scene: Scene) {
         // Looked at, not picked: the faces are the plot's, not the model's.
         self.viewport.pickable = Some((0, 0));
-        self.viewport.set_scene(scene, false);
+        self.viewport.set_plot(scene);
         // The usual scene is not rebuilt over the plot while the document stays as it is.
         match self.asm.as_ref() {
             Some(asm) => self.asm_scene = Some(asm.revision),

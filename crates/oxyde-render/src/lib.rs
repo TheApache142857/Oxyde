@@ -5,7 +5,9 @@
 //! edge under any pixel is known exactly (picking). Faces can have a [`Material`]: a
 //! colour, an opacity (transparent faces are drawn last, back to front) and a colour
 //! texture mapped automatically along the model's axes. A [`Style`] can ask for the
-//! part's reflection in a floor under it. It needs no GPU, which keeps the first
+//! part's reflection in a floor under it, and sets the [`DisplayStyle`]: shaded with or
+//! without edges, hidden lines removed or visible (dashed, from the depth buffer), or
+//! wireframe. It needs no GPU, which keeps the first
 //! versions of the application simple and fully testable. The application's GPU viewport
 //! draws the same [`Scene`] (see [`Scene::gpu_mesh`]) with the same colours and shading, and
 //! falls back to this renderer when no GPU is available.
@@ -56,4 +58,4 @@ pub use raster::{
     AO_RADIUS, AO_REACH, Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render,
     render_styled,
 };
-pub use style::{Rgb, Style};
+pub use style::{DisplayStyle, EdgePass, HIDDEN_DASH, Rgb, Style};

@@ -2,7 +2,7 @@ use oxyde_kernel::Mesh;
 
 use crate::camera::Camera;
 use crate::material::{Material, Texture, TextureRef};
-use crate::style::Style;
+use crate::style::{EdgePass, HIDDEN_DASH, Rgb, Style};
 use crate::vec3::{V3, add, cross, dot, length, lerp, normalize, scale, sub};
 
 /// What is under a pixel: a face or an edge, by index into the shape's topology.
@@ -183,8 +183,11 @@ impl Scene {
             }
         }
         for (index, edge) in self.edges.iter().enumerate() {
-            for w in edge.windows(2) {
-                mesh.segments.push((f(w[0]), f(w[1]), index as u32));
+            let mut along = 0.0;
+            for (&a, &b) in edge.iter().zip(edge.iter().skip(1)) {
+                mesh.segments.push((f(a), f(b), index as u32));
+                mesh.segment_starts.push(along as f32);
+                along += length(sub(b, a));
             }
         }
         mesh
@@ -289,6 +292,9 @@ pub struct GpuMesh {
     pub indices: Vec<u32>,
     /// Edge segments: start, end, edge index.
     pub segments: Vec<([f32; 3], [f32; 3], u32)>,
+    /// Where each segment starts along its edge, in millimetres: the dashes of hidden
+    /// edges follow it, as in the software renderer.
+    pub segment_starts: Vec<f32>,
     /// Range of `indices` holding each face's triangles.
     pub triangle_ranges: Vec<(u32, u32)>,
     /// Centroid of each face, to sort transparent faces by depth.
@@ -456,6 +462,17 @@ pub fn picks_in_rect(
     picks
 }
 
+/// The highlight colour of a face that is hovered or selected.
+fn face_highlight(face: u32, highlight: &Highlight, style: &Style) -> Option<[f32; 3]> {
+    if highlight.is_hovered(Pick::Face(face)) {
+        Some(rgb(style.face_hovered))
+    } else if highlight.selected.contains(&Pick::Face(face)) {
+        Some(rgb(style.face_selected))
+    } else {
+        None
+    }
+}
+
 /// The colour a face is drawn in, and whether its texture (if any) replaces it:
 /// highlights win over the material, the material over the style.
 fn face_color(
@@ -464,24 +481,22 @@ fn face_color(
     highlight: &Highlight,
     style: &Style,
 ) -> ([f32; 3], bool) {
-    if highlight.is_hovered(Pick::Face(face)) {
-        (rgb(style.face_hovered), false)
-    } else if highlight.selected.contains(&Pick::Face(face)) {
-        (rgb(style.face_selected), false)
-    } else {
-        (rgb(material.color.unwrap_or(style.face)), true)
+    match face_highlight(face, highlight, style) {
+        Some(color) => (color, false),
+        None => (rgb(material.color.unwrap_or(style.face)), true),
     }
 }
 
-/// Colour and width in whole pixels (the software renderer draws square pens).
-fn edge_style(edge: u32, highlight: &Highlight, style: &Style) -> ([u8; 3], i64) {
+/// Colour and width in whole pixels (the software renderer draws square pens), and
+/// whether the edge is highlighted; `normal` is the colour of an edge that is not.
+fn edge_style(edge: u32, highlight: &Highlight, style: &Style, normal: Rgb) -> (Rgb, i64, bool) {
     let px = |w: f32| (w.round() as i64).max(1);
     if highlight.is_hovered(Pick::Edge(edge)) {
-        (style.edge_hovered, px(style.highlight_width))
+        (style.edge_hovered, px(style.highlight_width), true)
     } else if highlight.selected.contains(&Pick::Edge(edge)) {
-        (style.edge_selected, px(style.highlight_width))
+        (style.edge_selected, px(style.highlight_width), true)
     } else {
-        (style.edge, px(style.edge_width))
+        (normal, px(style.edge_width), false)
     }
 }
 
@@ -597,10 +612,20 @@ pub fn render_styled(
         edge_ids: vec![0; n],
     };
 
-    for y in 0..height {
-        let t = y as f32 / (height.max(2) - 1) as f32;
-        let (top, bottom) = (rgb(style.background_top), rgb(style.background_bottom));
-        let c: [u8; 3] = std::array::from_fn(|k| (top[k] + (bottom[k] - top[k]) * t) as u8);
+    // The background gradient, one colour per row.
+    let (top, bottom) = (rgb(style.background_top), rgb(style.background_bottom));
+    let background: Vec<Rgb> = (0..height)
+        .map(|y| {
+            let t = y as f32 / (height.max(2) - 1) as f32;
+            let mix = |a: f32, b: f32| (a + (b - a) * t) as u8;
+            [
+                mix(top[0], bottom[0]),
+                mix(top[1], bottom[1]),
+                mix(top[2], bottom[2]),
+            ]
+        })
+        .collect();
+    for (y, &c) in background.iter().enumerate() {
         for x in 0..width {
             frame.put(y * width + x, c);
         }
@@ -634,7 +659,7 @@ pub fn render_styled(
     // The reflection: the faces mirrored in the floor, faded with height, drawn first so
     // the part itself covers it. Front to back, so each pixel is blended once.
     let floor = scene.bounds().map(|(lo, hi)| Floor::under(lo, hi));
-    if let Some(floor) = floor.filter(|f| style.floor_reflection > 0.0 && f.visible(camera)) {
+    if let Some(floor) = floor.filter(|f| style.reflection() > 0.0 && f.visible(camera)) {
         let mirror = |p: V3| [p[0], 2.0 * floor.y - p[1], p[2]];
         let mut order: Vec<(f64, usize)> = (0..scene.faces.len())
             .map(|i| (depth_of(mirror(scene.faces[i].centroid)), i))
@@ -646,9 +671,10 @@ pub fn render_styled(
             let (base, textured) = face_color(index as u32, &material, highlight, style);
             let paint = Paint {
                 base,
-                alpha: style.floor_reflection.clamp(0.0, 1.0) * material.opacity,
+                alpha: style.reflection() * material.opacity,
                 texture: textured.then(|| scene.texture_of(&material)).flatten(),
                 fade: Some(&floor),
+                background: None,
                 write_depth: true,
                 id: 0,
             };
@@ -657,71 +683,121 @@ pub fn render_styled(
         }
     }
 
+    // How a face is painted: opaque ones write the depth, see-through ones are blended.
+    // In the line styles a face shows only in its highlight colour. Otherwise an opaque
+    // one is painted in the background, so it still hides what is behind it (a
+    // highlighted face too), and a see-through one not at all; both are picked.
+    let shaded = style.display.shades_faces();
+    let face_paint = |index: usize, opaque: bool| {
+        let material = scene.material(index);
+        let alpha = if opaque {
+            1.0
+        } else {
+            material.opacity.clamp(0.0, 1.0)
+        };
+        let (base, alpha, texture, erase) = if shaded {
+            let (base, textured) = face_color(index as u32, &material, highlight, style);
+            let texture = textured.then(|| scene.texture_of(&material)).flatten();
+            (base, alpha, texture, None)
+        } else {
+            match face_highlight(index as u32, highlight, style) {
+                Some(base) => (base, alpha, None, None),
+                None if opaque => ([0.0; 3], 1.0, None, Some(background.as_slice())),
+                None => ([0.0; 3], 0.0, None, None),
+            }
+        };
+        Paint {
+            base,
+            alpha,
+            texture,
+            fade: None,
+            background: erase,
+            write_depth: opaque,
+            id: index as u32 + 1,
+        }
+    };
+
     let mut transparent: Vec<(f64, usize)> = Vec::new();
     for (index, face) in scene.faces.iter().enumerate() {
-        let material = scene.material(index);
-        if material.is_transparent() {
+        if scene.material(index).is_transparent() {
             transparent.push((depth_of(face.centroid), index));
             continue;
         }
-        let (base, textured) = face_color(index as u32, &material, highlight, style);
-        let paint = Paint {
-            base,
-            alpha: 1.0,
-            texture: textured.then(|| scene.texture_of(&material)).flatten(),
-            fade: None,
-            write_depth: true,
-            id: index as u32 + 1,
-        };
-        draw_face(&mut frame, face, &face.positions, false, &paint);
+        draw_face(
+            &mut frame,
+            face,
+            &face.positions,
+            false,
+            &face_paint(index, true),
+        );
     }
 
-    let ao = style.ambient_occlusion.clamp(0.0, 1.0);
+    let ao = style.occlusion();
     if ao > 0.0 && width > 0 && height > 0 {
         let radius_px = (width.min(height) as f64 * AO_RADIUS).max(2.0);
         let radius_mm = radius_px / camera.pixels_per_mm(h);
         ambient_occlusion(&mut frame, ao, radius_px, radius_mm as f32);
     }
 
-    // Edges are drawn over faces they lie on, but hidden behind faces in front of them.
-    let bias = (camera.height * 0.004) as f32;
-    let edges = if style.show_edges {
-        scene.edges.as_slice()
-    } else {
-        &[]
+    // See-through faces, the farthest first, blended over what is behind them. They
+    // leave the depth alone, so what is behind stays visible, but they can be picked.
+    // Over the edges when the faces are shaded; under them in the line styles, where
+    // the edges are what is looked at.
+    transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let see_through = |frame: &mut Frame| {
+        for &(_, index) in &transparent {
+            if let Some(face) = scene.faces.get(index) {
+                draw_face(
+                    frame,
+                    face,
+                    &face.positions,
+                    false,
+                    &face_paint(index, false),
+                );
+            }
+        }
     };
-    for (index, edge) in edges.iter().enumerate() {
-        let (color, thickness) = edge_style(index as u32, highlight, style);
-        let points: Vec<V3> = edge.iter().map(|&p| camera.project(p, w, h)).collect();
-        for segment in points.windows(2) {
-            draw_line(
-                &mut frame,
-                segment[0],
-                segment[1],
-                color,
+    if !shaded {
+        see_through(&mut frame);
+    }
+
+    // Edges are drawn over faces they lie on (the bias brings them nearer), and in one or
+    // two passes by depth as the display style asks: the parts in front of every face,
+    // the parts behind one (dashed), or all of them. In *Shaded* they are only drawn
+    // when highlighted, but picked all the same.
+    let bias = (camera.height * 0.004) as f32;
+    let (line, hidden) = (style.edge_color(), style.hidden_edge_color());
+    for &pass in style.display.edge_passes() {
+        for (index, edge) in scene.edges.iter().enumerate() {
+            let normal = if pass == EdgePass::Hidden {
+                hidden
+            } else {
+                line
+            };
+            let (color, thickness, highlighted) =
+                edge_style(index as u32, highlight, style, normal);
+            let pen = Pen {
+                color: (highlighted || style.display.draws_all_edges()).then_some(color),
                 thickness,
                 bias,
-                index as u32 + 1,
-            );
+                id: index as u32 + 1,
+                pass,
+                pixels_per_mm: camera.pixels_per_mm(h),
+            };
+            let points: Vec<V3> = edge.iter().map(|&p| camera.project(p, w, h)).collect();
+            let segments = points.iter().zip(points.iter().skip(1));
+            let world = edge.iter().zip(edge.iter().skip(1));
+            let mut along = 0.0;
+            for ((&a, &b), (&wa, &wb)) in segments.zip(world) {
+                let piece = length(sub(wb, wa));
+                draw_line(&mut frame, a, b, [along, along + piece], &pen);
+                along += piece;
+            }
         }
     }
 
-    // See-through faces last, the farthest first, blended over what is behind them. They
-    // leave the depth alone, so what is behind stays visible, but they can be picked.
-    transparent.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for (_, index) in transparent {
-        let face = &scene.faces[index];
-        let material = scene.material(index);
-        let (base, textured) = face_color(index as u32, &material, highlight, style);
-        let paint = Paint {
-            base,
-            alpha: material.opacity.clamp(0.0, 1.0),
-            texture: textured.then(|| scene.texture_of(&material)).flatten(),
-            fade: None,
-            write_depth: false,
-            id: index as u32 + 1,
-        };
-        draw_face(&mut frame, face, &face.positions, false, &paint);
+    if shaded {
+        see_through(&mut frame);
     }
     frame
 }
@@ -734,6 +810,9 @@ struct Paint<'a> {
     texture: Option<(&'a Texture, f32)>,
     /// A reflection: fades with the height of the mirrored point above the floor.
     fade: Option<&'a Floor>,
+    /// The background's colour per row, painted instead of the face: a face the line
+    /// styles leave unseen, which still covers what is behind it.
+    background: Option<&'a [Rgb]>,
     write_depth: bool,
     /// Face index + 1, or 0 to leave the id buffer alone.
     id: u32,
@@ -785,6 +864,12 @@ fn raster_triangle(
             }
             if paint.id != 0 {
                 frame.face_ids[index] = paint.id;
+            }
+            if let Some(rows) = paint.background {
+                if let Some(&c) = rows.get(y as usize) {
+                    frame.put(index, c);
+                }
+                continue;
             }
 
             let n = add(
@@ -854,12 +939,30 @@ fn clip(a: V3, b: V3, xmin: f64, xmax: f64, ymin: f64, ymax: f64) -> Option<(V3,
     Some((lerp(a, b, t0), lerp(a, b, t1)))
 }
 
-fn draw_line(frame: &mut Frame, a: V3, b: V3, color: [u8; 3], thickness: i64, bias: f32, id: u32) {
+/// How an edge's segments are drawn.
+struct Pen {
+    /// `None`: into the id buffer only (an edge in *Shaded* that is not highlighted).
+    color: Option<Rgb>,
+    /// Width of the square pen, in pixels.
+    thickness: i64,
+    /// Towards the viewer, in millimetres, so an edge wins over the faces it bounds.
+    bias: f32,
+    /// Edge index + 1.
+    id: u32,
+    /// Which parts of the edge, by depth; the hidden ones are dashed.
+    pass: EdgePass,
+    /// To turn the length along the edge into pixels, for the dashes.
+    pixels_per_mm: f64,
+}
+
+/// Draws the segment from `a` to `b` (screen space), which runs from `along[0]` to
+/// `along[1]` millimetres along its edge.
+fn draw_line(frame: &mut Frame, a: V3, b: V3, along: [f64; 2], pen: &Pen) {
     if a.iter().chain(b.iter()).any(|v| !v.is_finite()) {
         return;
     }
     let margin = 2.0;
-    let Some((a, b)) = clip(
+    let Some((ca, cb)) = clip(
         a,
         b,
         -margin,
@@ -869,19 +972,55 @@ fn draw_line(frame: &mut Frame, a: V3, b: V3, color: [u8; 3], thickness: i64, bi
     ) else {
         return;
     };
-    let steps = (b[0] - a[0]).abs().max((b[1] - a[1]).abs()).ceil().max(1.0) as usize;
-    let offset = thickness / 2;
+    // Where the clipped ends lie along the edge, so the dashes do not move with the
+    // edge of the image.
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len2 = dx * dx + dy * dy;
+    let along_at = |p: V3| {
+        let t = if len2 < 1e-12 {
+            0.0
+        } else {
+            ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2
+        };
+        along[0] + (along[1] - along[0]) * t
+    };
+    let (s0, s1) = (along_at(ca), along_at(cb));
+    let (dash, gap) = (f64::from(HIDDEN_DASH.0), f64::from(HIDDEN_DASH.1));
+    let steps = (cb[0] - ca[0])
+        .abs()
+        .max((cb[1] - ca[1]).abs())
+        .ceil()
+        .max(1.0) as usize;
+    let offset = pen.thickness / 2;
     for i in 0..=steps {
-        let q = lerp(a, b, i as f64 / steps as f64);
+        let t = i as f64 / steps as f64;
+        let q = lerp(ca, cb, t);
         let (cx, cy) = (q[0].floor() as i64, q[1].floor() as i64);
-        let z = q[2] as f32 - bias;
-        for oy in 0..thickness {
-            for ox in 0..thickness {
-                if let Some(index) = frame.index(cx + ox - offset, cy + oy - offset) {
-                    if z <= frame.depth[index] {
-                        frame.put(index, color);
-                        frame.edge_ids[index] = id;
-                    }
+        let z = q[2] as f32 - pen.bias;
+        // Hidden edges are dashed in colour; the gaps still pick the edge.
+        let inked = pen.pass != EdgePass::Hidden
+            || ((s0 + (s1 - s0) * t) * pen.pixels_per_mm).rem_euclid(dash + gap) < dash;
+        for oy in 0..pen.thickness {
+            for ox in 0..pen.thickness {
+                let Some(index) = frame.index(cx + ox - offset, cy + oy - offset) else {
+                    continue;
+                };
+                let Some(&depth) = frame.depth.get(index) else {
+                    continue;
+                };
+                let shown = match pen.pass {
+                    EdgePass::Visible => z <= depth,
+                    EdgePass::Hidden => z > depth,
+                    EdgePass::All => true,
+                };
+                if !shown {
+                    continue;
+                }
+                if let (Some(color), true) = (pen.color, inked) {
+                    frame.put(index, color);
+                }
+                if let Some(id) = frame.edge_ids.get_mut(index) {
+                    *id = pen.id;
                 }
             }
         }
@@ -891,7 +1030,7 @@ fn draw_line(frame: &mut Frame, a: V3, b: V3, color: [u8; 3], thickness: i64, bi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StandardView;
+    use crate::{DisplayStyle, StandardView};
     use oxyde_kernel::FaceMesh;
 
     /// Face 0: a 20 × 20 square at z = 0. Face 1: a larger square behind it, at z = −5.
@@ -1278,12 +1417,167 @@ mod tests {
         assert_eq!(&empty.rgba[0..3], &style.background_top);
         let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
         assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(0)));
-        let plain = Style {
-            show_edges: false,
+        // Shaded: the edges are not drawn, but they are still picked, and one under the
+        // pointer shows.
+        let with_edges = render(&scene, &camera, 100, 100, &Highlight::default());
+        let shaded = Style {
+            display: DisplayStyle::Shaded,
             ..Style::LIGHT
         };
-        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &plain);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &shaded);
+        assert_ne!(pixel(&frame, 25, 50), pixel(&with_edges, 25, 50));
+        assert_eq!(pixel(&frame, 25, 50), pixel(&frame, 30, 50));
+        assert_eq!(frame.edge_ids, with_edges.edge_ids);
+        assert_eq!(frame.pick(27.0, 50.0, 3.0), Some(Pick::Edge(3)));
+        let hovered = Highlight {
+            hovered: Some(Pick::Edge(3)),
+            ..Highlight::default()
+        };
+        let frame = render_styled(&scene, &camera, 100, 100, &hovered, &shaded);
+        assert_eq!(pixel(&frame, 25, 50), Style::LIGHT.edge_hovered);
+        assert_eq!(pixel(&frame, 50, 25), pixel(&frame, 50, 30));
+    }
+
+    fn styled(display: DisplayStyle) -> Style {
+        Style {
+            display,
+            ..Style::LIGHT
+        }
+    }
+
+    #[test]
+    fn faces_are_picked_alike_in_every_display_style() {
+        // Whatever is drawn, the face under the pointer is the same: the nearest one.
+        let scene = Scene::from_mesh(&mesh());
+        for view in [StandardView::Front, StandardView::Back] {
+            let mut camera = front_camera();
+            camera.set_view(view);
+            let shaded = render(&scene, &camera, 100, 100, &Highlight::default());
+            for (display, name) in DisplayStyle::ALL {
+                let frame = render_styled(
+                    &scene,
+                    &camera,
+                    100,
+                    100,
+                    &Highlight::default(),
+                    &styled(display),
+                );
+                assert!(frame.face_ids == shaded.face_ids, "{name}, {view:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_lines_removed_draws_edges_on_the_background() {
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let style = styled(DisplayStyle::HiddenLinesRemoved);
+        let empty = render_styled(
+            &Scene::default(),
+            &camera,
+            100,
+            100,
+            &Highlight::default(),
+            &style,
+        );
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        // The faces leave the background; face 0's outline is drawn and picked.
+        assert_eq!(pixel(&frame, 50, 50), pixel(&empty, 50, 50));
+        assert_eq!(pixel(&frame, 5, 5), pixel(&empty, 5, 5));
+        assert_eq!(pixel(&frame, 25, 50), style.edge_color());
+        assert_eq!(frame.pick(27.0, 50.0, 3.0), Some(Pick::Edge(3)));
+        assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(0)));
+        // A face under the pointer shows in its highlight colour.
+        let hovered = Highlight {
+            hovered: Some(Pick::Face(0)),
+            ..Highlight::default()
+        };
+        let frame = render_styled(&scene, &camera, 100, 100, &hovered, &style);
+        assert_ne!(pixel(&frame, 50, 50), pixel(&empty, 50, 50));
+        assert_eq!(pixel(&frame, 5, 5), pixel(&empty, 5, 5));
+        // From the back the outline is behind face 1: neither drawn nor picked.
+        let mut back = camera;
+        back.set_view(StandardView::Back);
+        let frame = render_styled(&scene, &back, 100, 100, &Highlight::default(), &style);
         assert!(frame.edge_ids.iter().all(|&e| e == 0));
-        assert!(frame.face_ids.iter().any(|&f| f != 0));
+        assert_eq!(frame.rgba, empty.rgba);
+        // So is face 0 under the pointer: the unseen face in front still covers it.
+        let frame = render_styled(&scene, &back, 100, 100, &hovered, &style);
+        assert_eq!(frame.rgba, empty.rgba);
+    }
+
+    #[test]
+    fn hidden_lines_visible_dashes_the_hidden_edges() {
+        // From the back, face 0's outline is behind face 1: dashed, in the hidden-edge
+        // colour, and still picked.
+        let scene = Scene::from_mesh(&mesh());
+        let mut camera = front_camera();
+        camera.set_view(StandardView::Back);
+        let style = styled(DisplayStyle::HiddenLinesVisible);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        // The left edge (x = −10 mm) is at pixel column 75 seen from the back.
+        let inked_at = |f: &Frame, y: usize, color: Rgb| (74..=76).any(|x| pixel(f, x, y) == color);
+        let inked = (30..70)
+            .filter(|&y| inked_at(&frame, y, style.hidden_edge_color()))
+            .count();
+        assert!(inked > 10 && inked < 35, "{inked} of 40 rows inked");
+        assert_eq!(frame.pick(75.5, 50.5, 3.0), Some(Pick::Edge(3)));
+        // From the front the same edges are in front of everything: solid, as in Hidden
+        // Lines Removed.
+        let front = front_camera();
+        let removed = render_styled(
+            &scene,
+            &front,
+            100,
+            100,
+            &Highlight::default(),
+            &styled(DisplayStyle::HiddenLinesRemoved),
+        );
+        let visible = render_styled(&scene, &front, 100, 100, &Highlight::default(), &style);
+        assert_eq!(visible.rgba, removed.rgba);
+        assert_eq!(visible.edge_ids, removed.edge_ids);
+    }
+
+    #[test]
+    fn wireframe_draws_every_edge_solid() {
+        let scene = Scene::from_mesh(&mesh());
+        let mut camera = front_camera();
+        camera.set_view(StandardView::Back);
+        let style = styled(DisplayStyle::Wireframe);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        let color = style.edge_color();
+        assert!((30..70).all(|y| (74..=76).any(|x| pixel(&frame, x, y) == color)));
+        assert_eq!(frame.pick(75.5, 50.5, 3.0), Some(Pick::Edge(3)));
+        // The nearest face is still the one picked away from the edges.
+        assert_eq!(frame.pick(50.5, 50.5, 0.0), Some(Pick::Face(1)));
+    }
+
+    #[test]
+    fn line_styles_show_no_reflection_or_occlusion() {
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let style = styled(DisplayStyle::HiddenLinesRemoved);
+        let effects = Style {
+            floor_reflection: 0.5,
+            ambient_occlusion: 1.0,
+            ..style
+        };
+        let plain = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &style);
+        let frame = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &effects);
+        assert_eq!(frame.rgba, plain.rgba);
+    }
+
+    #[test]
+    fn gpu_segments_know_where_they_start_along_their_edge() {
+        let scene = Scene::from_mesh(&Mesh {
+            faces: Vec::new(),
+            edges: vec![
+                vec![[0.0, 0.0, 0.0], [3.0, 4.0, 0.0], [3.0, 10.0, 0.0]],
+                vec![[1.0, 1.0, 1.0], [2.0, 1.0, 1.0]],
+            ],
+        });
+        let mesh = scene.gpu_mesh();
+        assert_eq!(mesh.segment_starts, vec![0.0, 5.0, 0.0]);
+        assert_eq!(mesh.segments.len(), mesh.segment_starts.len());
     }
 }

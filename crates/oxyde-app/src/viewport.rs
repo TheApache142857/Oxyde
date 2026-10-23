@@ -16,7 +16,9 @@
 
 use eframe::egui;
 use oxyde_geom::{Plane, Point2, Point3};
-use oxyde_render::{Camera, Frame, Highlight, Pick, Scene, StandardView, Style, render_styled};
+use oxyde_render::{
+    Camera, DisplayStyle, Frame, Highlight, Pick, Scene, StandardView, Style, render_styled,
+};
 
 pub use crate::prefs::MouseScheme;
 
@@ -192,6 +194,10 @@ pub struct Viewport {
     /// How many faces and edges of the scene can be picked: the ones after them (the
     /// ghosted context of a component edited in place) are only looked at.
     pub pickable: Option<(u32, u32)>,
+    /// The scene is a plot whose face colours are what is looked at (the Simulation
+    /// tab's results): drawn shaded whatever the display style. Set by `set_plot`, cleared
+    /// by any other scene.
+    plot: bool,
     /// Triangles and edge segments of the scene.
     scene_counts: (usize, usize),
     /// Where a selection box started (screen position), while the left button is down.
@@ -223,6 +229,7 @@ impl Viewport {
             settings: ViewSettings::default(),
             preselect: Vec::new(),
             pickable: None,
+            plot: false,
             scene_counts: (0, 0),
             box_start: None,
         }
@@ -274,9 +281,27 @@ impl Viewport {
         self.scene = scene;
         self.scene_version += 1;
         self.hovered = None;
+        self.plot = false;
         if fit {
             self.fit_pending = true;
         }
+    }
+
+    /// Shows a plot, a scene whose face colours are what is looked at (the Simulation
+    /// tab's results): drawn shaded even in a line style, which would leave the faces
+    /// unpainted.
+    pub fn set_plot(&mut self, scene: Scene) {
+        self.set_scene(scene, false);
+        self.plot = true;
+    }
+
+    /// The style the scene is drawn in: the settings' own, shaded for a plot.
+    pub fn style(&self) -> Style {
+        let mut style = self.settings.style;
+        if self.plot && !style.display.shades_faces() {
+            style.display = DisplayStyle::ShadedWithEdges;
+        }
+        style
     }
 
     /// Changes how the faces look without re-meshing.
@@ -594,7 +619,7 @@ impl Viewport {
                 preselected: std::mem::take(&mut self.preselect),
             },
             scene: self.scene_version,
-            style: self.settings.style,
+            style: self.style(),
         };
         let image_changed = self.rendered.as_ref().is_none_or(|k| {
             k.camera != key.camera
@@ -731,5 +756,27 @@ impl Viewport {
                 color,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plots_are_shaded_whatever_the_display_style() {
+        let mut viewport = Viewport::new();
+        viewport.settings.style.display = DisplayStyle::HiddenLinesRemoved;
+        assert_eq!(viewport.style().display, DisplayStyle::HiddenLinesRemoved);
+        // A Simulation plot's colours must show.
+        viewport.set_plot(Scene::default());
+        assert_eq!(viewport.style().display, DisplayStyle::ShadedWithEdges);
+        // A shaded style is kept as it is.
+        viewport.settings.style.display = DisplayStyle::Shaded;
+        assert_eq!(viewport.style().display, DisplayStyle::Shaded);
+        // The model coming back takes the display style again.
+        viewport.settings.style.display = DisplayStyle::Wireframe;
+        viewport.set_scene(Scene::default(), false);
+        assert_eq!(viewport.style().display, DisplayStyle::Wireframe);
     }
 }

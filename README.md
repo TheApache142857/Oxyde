@@ -97,7 +97,8 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   perpendicular, distance and angle mates with a live preview, components dragged while the mates
   hold, parts edited in place with the rest of the assembly ghosted around them, interference
   detection, and a bill of materials exported as CSV.
-- **Seeing and measuring:** a GPU viewport with section views, appearances (colour,
+- **Seeing and measuring:** a GPU viewport with SolidWorks' display styles (shaded with or
+  without edges, hidden lines removed or visible, wireframe), section views, appearances (colour,
   transparency, textures) and floor reflections; distances between faces and edges, centre
   distances between holes, diameters, and mass properties with the centre of mass.
 - **Render tab:** a path tracer on the GPU or the CPU, with materials, studio or sky light, soft

@@ -271,7 +271,8 @@ impl OxydeApp {
         if let Some((lo, hi)) = scene.bounds() {
             camera.fit(lo, hi, width as f64, height as f64);
         }
-        let style = self.prefs.graphics.style();
+        // The viewport's style, display style included.
+        let style = self.viewport.style();
         let frame = render_styled(scene, &camera, width, height, &Highlight::default(), &style);
         let image = image::RgbaImage::from_raw(width as u32, height as u32, frame.rgba)
             .ok_or_else(|| "the picture could not be assembled".to_owned())?;

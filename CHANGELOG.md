@@ -5,6 +5,28 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Display styles (unreleased, October 2026)
+
+- **View › Display Style**, also on the view toolbar over the viewport (the button shows
+  the style in use and opens the list), as SolidWorks' display styles:
+  - *Shaded With Edges*, as before, the default;
+  - *Shaded*: the faces alone. An edge shows when the pointer is on it or it is
+    selected, so edges can still be picked (with *Show edges* off before, they could
+    not);
+  - *Hidden Lines Removed*: the edges alone, those behind faces left out;
+  - *Hidden Lines Visible*: the same, with the hidden edges dashed and greyed;
+  - *Wireframe*: every edge, nothing hidden.
+- Faces are picked as in the shaded styles: the face under the pointer lights up in its
+  highlight colour, and a selected face shows filled in the selection colour. Selection
+  boxes, Section View, Measure and every command that takes faces or edges work the same.
+- The style is remembered in Tools › Preferences › *Graphics* (*Display style*, which
+  replaces *Show edges*: preferences with edges off open in *Shaded*). The colour presets
+  there no longer turn the edges back on.
+- On a dark background the lines of the line styles take the part's colour, since the
+  dark edge colour would not show. Floor reflections and ambient occlusion apply to the
+  shaded styles only. Simulation plots are always shaded, so their colours show. File ›
+  Export › Image pictures the model in the style in use.
+
 ### Linked equations files (unreleased, October 2026)
 
 - **Parts can share their global variables through an equations file**, as SolidWorks'

@@ -14,12 +14,23 @@
 //! reflection, the faces are drawn once more mirrored in the floor, faded with height,
 //! before everything else.
 //!
+//! The display style (`oxyde_render::DisplayStyle`) changes what is drawn, not what is
+//! picked: in the line styles the faces are drawn in the background colour (but in their
+//! highlight colour) so they still hide what is behind them through the depth buffer, and
+//! the see-through faces go before the edges. The edges are drawn once or twice by depth
+//! as the style's `edge_passes` say: their visible parts (the usual test), their hidden
+//! parts (the test reversed, dashed along their length), or all of them (no test). Hidden
+//! lines come from the depth buffer, not from the kernel's exact hidden-line removal,
+//! which is kept for drawings.
+//!
 //! The projection is computed in the shaders from the camera's frame (target, right, up,
 //! eye), relative to the target, so millimetre coordinates keep their precision.
 
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
-use oxyde_render::{Camera, Floor, GpuMesh, Highlight, Material, Pick, Style, TextureRef};
+use oxyde_render::{
+    Camera, EdgePass, Floor, GpuMesh, HIDDEN_DASH, Highlight, Material, Pick, Style, TextureRef,
+};
 
 /// Anti-aliasing by default: 4× multisampling.
 pub const DEFAULT_SAMPLES: u32 = 4;
@@ -30,10 +41,13 @@ const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const EDGE_BIT: u32 = 0x8000_0000;
 /// Every colour texture is resampled to this size, so they fit one texture array.
 const TEXTURE_SIZE: u32 = 512;
-/// Bytes of the `View` uniform: 17 vec4s.
-const VIEW_BYTES: u64 = 17 * 16;
+/// Bytes of the `View` uniform: 20 vec4s.
+const VIEW_BYTES: u64 = 20 * 16;
 /// The ambient occlusion image: one occlusion value per pixel.
 const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// One edge segment in its vertex buffer: start, end, edge index, millimetres along the
+/// edge where it starts.
+const SEGMENT_BYTES: u64 = 32;
 
 const SHADER: &str = r#"
 struct View {
@@ -48,14 +62,20 @@ struct View {
     // x, y: viewport size in pixels; z: edge width, w: highlighted edge width (pixels).
     viewport: vec4<f32>,
     // sRGB 0..255: background top and bottom, face, selected and hovered face, edge,
-    // selected and hovered edge.
-    colors: array<vec4<f32>, 8>,
+    // selected and hovered edge, hidden edge.
+    colors: array<vec4<f32>, 9>,
     // x: floor height (mm), y: reflection strength, z: fade height (mm), w: 1 when this
     // pass draws the reflection (faces mirrored in the floor).
     floor: vec4<f32>,
     // Ambient occlusion: x: strength 0..1, y: radius in pixels, z: the same radius in
     // depth units (0..1 across the scene).
     ao: vec4<f32>,
+    // The display style: x: 1 when only the hovered and selected edges are drawn
+    // (Shaded); y: 1 when only the hovered and selected faces are painted (the line
+    // styles).
+    lines: vec4<f32>,
+    // Hidden edges: x: dash and y: gap length (pixels), z: pixels per millimetre.
+    dash: vec4<f32>,
 };
 
 struct FaceMaterial {
@@ -109,11 +129,14 @@ fn background_vs(@builtin(vertex_index) i: u32) -> BackgroundOut {
     return out;
 }
 
+// The background gradient, `t` from 0 at the top to 1 at the bottom.
+fn background(t: f32) -> vec3<f32> {
+    return linear(mix(view.colors[0].xyz, view.colors[1].xyz, clamp(t, 0.0, 1.0)));
+}
+
 @fragment
 fn background_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
-    let top = view.colors[0].xyz;
-    let bottom = view.colors[1].xyz;
-    return vec4<f32>(linear(mix(top, bottom, clamp(in.t, 0.0, 1.0))), 1.0);
+    return vec4<f32>(background(in.t), 1.0);
 }
 
 // ---- Faces --------------------------------------------------------------------------------
@@ -163,8 +186,27 @@ fn triplanar(layer: i32, scale: f32, aspect: f32, p: vec3<f32>, n: vec3<f32>) ->
     return (x * w.x + y * w.y + z * w.z) * 255.0;
 }
 
+// The line styles leave an opaque face unseen but in its highlight colour: it takes the
+// background behind it (the same gradient at this pixel), and still hides the edges
+// behind it through the depth.
 @fragment
 fn face_fs(in: FaceOut) -> @location(0) vec4<f32> {
+    if (view.lines.y > 0.5 && face_flags[in.face] == 0u) {
+        return vec4<f32>(background(in.position.y / view.viewport.y), 1.0);
+    }
+    return shade_face(in);
+}
+
+// A see-through face, blended; in the line styles only when highlighted.
+@fragment
+fn face_blend_fs(in: FaceOut) -> @location(0) vec4<f32> {
+    if (view.lines.y > 0.5 && face_flags[in.face] == 0u) {
+        discard;
+    }
+    return shade_face(in);
+}
+
+fn shade_face(in: FaceOut) -> vec4<f32> {
     var n = normalize(in.normal);
     // Seen from outside: face the viewer (also tolerates inconsistent winding).
     if (dot(n, view.eye.xyz) < 0.0) {
@@ -259,6 +301,8 @@ fn ao_blur_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
 struct EdgeOut {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) edge: u32,
+    // Pixels along the edge from its start, for the dashes of hidden edges.
+    @location(1) along: f32,
 };
 
 @vertex
@@ -267,6 +311,8 @@ fn edge_vs(
     @location(0) start: vec3<f32>,
     @location(1) end: vec3<f32>,
     @location(2) edge: u32,
+    // Millimetres along the edge where this segment starts.
+    @location(3) start_along: f32,
 ) -> EdgeOut {
     var corners = array<vec2<f32>, 6>(
         vec2(0.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
@@ -289,19 +335,39 @@ fn edge_vs(
     var out: EdgeOut;
     out.position = vec4<f32>(p.xy + side * corner.y * width * 0.5 / half, p.z, 1.0);
     out.edge = edge;
+    out.along = (start_along + corner.x * length(end - start)) * view.dash.z;
     return out;
+}
+
+// The colour of an edge: its highlight colour, else `normal`.
+fn edge_color(edge: u32, normal: vec3<f32>) -> vec3<f32> {
+    let flags = edge_flags[edge];
+    if ((flags & 1u) != 0u) {
+        return view.colors[7].xyz;
+    } else if ((flags & 2u) != 0u) {
+        return view.colors[6].xyz;
+    }
+    return normal;
 }
 
 @fragment
 fn edge_fs(in: EdgeOut) -> @location(0) vec4<f32> {
-    let flags = edge_flags[in.edge];
-    var color = view.colors[5].xyz;
-    if ((flags & 1u) != 0u) {
-        color = view.colors[7].xyz;
-    } else if ((flags & 2u) != 0u) {
-        color = view.colors[6].xyz;
+    // Shaded: only the hovered and selected edges are drawn; all of them are picked.
+    if (view.lines.x > 0.5 && edge_flags[in.edge] == 0u) {
+        discard;
     }
-    return vec4<f32>(linear(color), 1.0);
+    return vec4<f32>(linear(edge_color(in.edge, view.colors[5].xyz)), 1.0);
+}
+
+// The parts of the edges behind a face: dashed along the edge, as `draw_line` in the
+// software renderer, in the hidden-edge colour unless highlighted.
+@fragment
+fn edge_hidden_fs(in: EdgeOut) -> @location(0) vec4<f32> {
+    let period = view.dash.x + view.dash.y;
+    if (in.along - floor(in.along / period) * period >= view.dash.x) {
+        discard;
+    }
+    return vec4<f32>(linear(edge_color(in.edge, view.colors[8].xyz)), 1.0);
 }
 
 @fragment
@@ -535,9 +601,16 @@ pub struct GpuViewport {
     /// The reflection: its depth first, then its colour blended once per pixel.
     mirror_depth: wgpu::RenderPipeline,
     mirror: wgpu::RenderPipeline,
+    /// The edges' visible parts (depth-tested), their hidden parts (the test reversed,
+    /// dashed) and all of them (no test), for the display styles.
     edges: wgpu::RenderPipeline,
+    edges_hidden: wgpu::RenderPipeline,
+    edges_all: wgpu::RenderPipeline,
     face_ids: wgpu::RenderPipeline,
     edge_ids: wgpu::RenderPipeline,
+    /// Every edge's id, whatever is in front: under the visible ones in Hidden Lines
+    /// Visible, alone in Wireframe.
+    edge_ids_all: wgpu::RenderPipeline,
     /// Ambient occlusion: the opaque faces' depth alone, the occlusion from it, blurred.
     ao_depth_pass: wgpu::RenderPipeline,
     ao: wgpu::RenderPipeline,
@@ -719,9 +792,14 @@ impl GpuViewport {
                 offset: 24,
                 shader_location: 2,
             },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32,
+                offset: 28,
+                shader_location: 3,
+            },
         ];
         let edge_buffers = [wgpu::VertexBufferLayout {
-            array_stride: 28,
+            array_stride: SEGMENT_BYTES,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &edge_attributes,
         }];
@@ -809,7 +887,7 @@ impl GpuViewport {
         let faces_blend = pipeline(
             "transparent faces",
             "face_vs",
-            "face_fs",
+            "face_blend_fs",
             &face_buffers,
             blended.clone(),
             samples,
@@ -842,6 +920,24 @@ impl GpuViewport {
             samples,
             depth(true, less_equal),
         );
+        let edges_hidden = pipeline(
+            "hidden edges",
+            "edge_vs",
+            "edge_hidden_fs",
+            &edge_buffers,
+            opaque(COLOR_FORMAT),
+            samples,
+            depth(false, wgpu::CompareFunction::Greater),
+        );
+        let edges_all = pipeline(
+            "all edges",
+            "edge_vs",
+            "edge_fs",
+            &edge_buffers,
+            opaque(COLOR_FORMAT),
+            samples,
+            depth(false, wgpu::CompareFunction::Always),
+        );
         let face_ids = pipeline(
             "face ids",
             "face_vs",
@@ -859,6 +955,15 @@ impl GpuViewport {
             opaque(ID_FORMAT),
             1,
             depth(true, less_equal),
+        );
+        let edge_ids_all = pipeline(
+            "all edge ids",
+            "edge_vs",
+            "edge_id_fs",
+            &edge_buffers,
+            opaque(ID_FORMAT),
+            1,
+            depth(false, wgpu::CompareFunction::Always),
         );
         let ao_depth_pass = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("occlusion depth"),
@@ -922,8 +1027,11 @@ impl GpuViewport {
             mirror_depth,
             mirror,
             edges,
+            edges_hidden,
+            edges_all,
             face_ids,
             edge_ids,
+            edge_ids_all,
             ao_depth_pass,
             ao,
             ao_blur,
@@ -956,15 +1064,17 @@ impl GpuViewport {
             vertices.extend(bytes_f32(p.iter().chain(n.iter()).copied()));
             vertices.extend(face.to_le_bytes());
         }
-        let mut segments = Vec::with_capacity(mesh.segments.len() * 28);
-        for (a, b, edge) in &mesh.segments {
+        let mut segments = Vec::with_capacity(mesh.segments.len() * SEGMENT_BYTES as usize);
+        for (i, (a, b, edge)) in mesh.segments.iter().enumerate() {
             segments.extend(bytes_f32(a.iter().chain(b.iter()).copied()));
             segments.extend(edge.to_le_bytes());
+            let start = mesh.segment_starts.get(i).copied().unwrap_or(0.0);
+            segments.extend(start.to_le_bytes());
         }
         // Empty buffers are not allowed: pad with a few bytes.
         let pad = |mut v: Vec<u8>| {
             if v.is_empty() {
-                v.resize(28, 0);
+                v.resize(SEGMENT_BYTES as usize, 0);
             }
             v
         };
@@ -1142,7 +1252,8 @@ impl GpuViewport {
         let floor = self
             .bounds
             .map(|(lo, hi)| Floor::under(lo, hi))
-            .filter(|f| style.floor_reflection > 0.0 && f.visible(camera));
+            .filter(|f| style.reflection() > 0.0 && f.visible(camera));
+        let display = style.display;
 
         let v4 = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32, 0.0];
         let mut view: Vec<f32> = Vec::with_capacity(64);
@@ -1169,17 +1280,20 @@ impl GpuViewport {
             style.face,
             style.face_selected,
             style.face_hovered,
-            style.edge,
+            style.edge_color(),
             style.edge_selected,
             style.edge_hovered,
+            style.hidden_edge_color(),
         ] {
             view.extend([f32::from(c[0]), f32::from(c[1]), f32::from(c[2]), 0.0]);
         }
         let (floor_y, fade) = floor.map_or((0.0, 1.0), |f| (f.y as f32, f.fade as f32));
-        view.extend([floor_y, style.floor_reflection.clamp(0.0, 1.0), fade, 0.0]);
+        // `floor.w`, set for the reflection pass.
+        let mirror_flag = view.len() + 3;
+        view.extend([floor_y, style.reflection(), fade, 0.0]);
         // Ambient occlusion: the same reach as the software renderer, in pixels and in
         // depth units (depth is linear: mm × scale.z).
-        let ao_strength = style.ambient_occlusion.clamp(0.0, 1.0);
+        let ao_strength = style.occlusion();
         let radius_px = (f64::from(width.min(height)) * oxyde_render::AO_RADIUS).max(2.0);
         let radius_mm = radius_px / camera.pixels_per_mm(f64::from(height));
         view.extend([
@@ -1188,11 +1302,25 @@ impl GpuViewport {
             (radius_mm / (2.0 * reach)) as f32,
             0.0,
         ]);
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        view.extend([
+            flag(!display.draws_all_edges()),
+            flag(!display.shades_faces()),
+            0.0,
+            0.0,
+        ]);
+        view.extend([
+            HIDDEN_DASH.0,
+            HIDDEN_DASH.1,
+            camera.pixels_per_mm(f64::from(height)) as f32,
+            0.0,
+        ]);
         self.queue
             .write_buffer(&self.uniforms, 0, &bytes_f32(view.clone()));
         // The reflection pass: flagged, and without occlusion.
-        let n = view.len();
-        view[n - 5] = 1.0;
+        if let Some(flag) = view.get_mut(mirror_flag) {
+            *flag = 1.0;
+        }
         self.queue
             .write_buffer(&self.mirror_uniforms, 0, &bytes_f32(view));
 
@@ -1459,16 +1587,30 @@ impl GpuViewport {
                 pass.set_pipeline(&self.faces);
                 pass.set_index_buffer(mesh.opaque.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.opaque_count, 0, 0..1);
-                if style.show_edges {
-                    pass.set_pipeline(&self.edges);
-                    pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                // See-through faces over the edges when the faces are shaded, under them
+                // in the line styles, as in the software renderer.
+                let see_through = |pass: &mut wgpu::RenderPass<'_>| {
+                    if let Some((buffer, count)) = transparent {
+                        pass.set_pipeline(&self.faces_blend);
+                        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                        pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..count, 0, 0..1);
+                    }
+                };
+                if !display.shades_faces() {
+                    see_through(&mut pass);
+                }
+                pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                for edges in display.edge_passes() {
+                    pass.set_pipeline(match edges {
+                        EdgePass::Visible => &self.edges,
+                        EdgePass::Hidden => &self.edges_hidden,
+                        EdgePass::All => &self.edges_all,
+                    });
                     pass.draw(0..6, 0..mesh.segment_count);
                 }
-                if let Some((buffer, count)) = transparent {
-                    pass.set_pipeline(&self.faces_blend);
-                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    pass.set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..count, 0, 0..1);
+                if display.shades_faces() {
+                    see_through(&mut pass);
                 }
             }
         }
@@ -1500,9 +1642,15 @@ impl GpuViewport {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                if style.show_edges {
-                    pass.set_pipeline(&self.edge_ids);
-                    pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                // The edges are picked wherever they are drawn. A hidden pass writes every
+                // edge, as the visible pass after it puts the visible ones back on top:
+                // the same ids as the software renderer's hidden-then-visible passes.
+                pass.set_vertex_buffer(0, mesh.segments.slice(..));
+                for edges in display.edge_passes() {
+                    pass.set_pipeline(match edges {
+                        EdgePass::Visible => &self.edge_ids,
+                        EdgePass::Hidden | EdgePass::All => &self.edge_ids_all,
+                    });
                     pass.draw(0..6, 0..mesh.segment_count);
                 }
             }
@@ -1692,8 +1840,8 @@ mod tests {
     use oxyde_geom::{Point3, Vec3};
     use oxyde_kernel::Kernel;
     use oxyde_render::{
-        Camera, Highlight, Material, Pick, Scene, StandardView, Style, Texture, render,
-        render_styled,
+        Camera, DisplayStyle, Highlight, Material, Pick, Scene, StandardView, Style, Texture,
+        render, render_styled,
     };
 
     use super::GpuViewport;
@@ -1820,6 +1968,95 @@ mod tests {
             at(&cpu.rgba, below[0], below[1]),
             at(&plain.rgba, below[0], below[1])
         );
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn gpu_matches_the_software_renderer_in_every_display_style() {
+        let Some(state) = gpu() else {
+            return;
+        };
+        // Two boxes, the second partly behind the first from the isometric view, so some
+        // edges are hidden by the other box as well as by their own.
+        let mut kernel = oxyde_occt::OcctKernel::new();
+        let a = kernel
+            .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
+            .unwrap();
+        let b = kernel
+            .make_box(
+                Point3::new(-20.0, -10.0, -30.0),
+                Vec3::new(30.0, 15.0, 15.0),
+            )
+            .unwrap();
+        let mut mesh = kernel.tessellate(a, 0.05).unwrap();
+        let more = kernel.tessellate(b, 0.05).unwrap();
+        mesh.faces.extend(more.faces);
+        mesh.edges.extend(more.edges);
+        let scene = Scene::from_mesh(&mesh);
+        let (w, h) = (320usize, 240usize);
+        let mut camera = Camera::default();
+        camera.set_view(StandardView::Isometric);
+        let (lo, hi) = scene.bounds().unwrap();
+        camera.fit(lo, hi, w as f64, h as f64);
+        let mut gpu = GpuViewport::new(&state, super::DEFAULT_SAMPLES);
+        gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
+        // The face under the pointer, the top of the first box, which every style paints
+        // in its highlight colour.
+        let top = camera.project([20.0, 20.0, 5.0], w as f64, h as f64);
+        let hovered =
+            render(&scene, &camera, w, h, &Highlight::default()).pick(top[0], top[1], 0.0);
+        assert!(matches!(hovered, Some(Pick::Face(_))), "{hovered:?}");
+        let highlight = Highlight {
+            hovered,
+            ..Highlight::default()
+        };
+        let empty = render_styled(&Scene::default(), &camera, w, h, &highlight, &Style::LIGHT);
+        let at = ((top[1] as usize) * w + top[0] as usize) * 4;
+        for (display, name) in DisplayStyle::ALL {
+            let style = Style {
+                display,
+                ..Style::LIGHT
+            };
+            gpu.render(&camera, w as u32, h as u32, &highlight, &style);
+            let (gw, gh, gpu_rgba) = gpu.read_image().unwrap();
+            let cpu = render_styled(&scene, &camera, w, h, &highlight, &style);
+            let file = name.to_lowercase().replace(' ', "_");
+            snapshot(&format!("{file}_gpu"), gw, gh, &gpu_rgba);
+            snapshot(&format!("{file}_software"), gw, gh, &cpu.rgba);
+            let mut total = 0u64;
+            for (p, q) in gpu_rgba.chunks(4).zip(cpu.rgba.chunks(4)) {
+                for c in 0..3 {
+                    total += u64::from(p[c].abs_diff(q[c]));
+                }
+            }
+            let mean = total as f64 / (w * h * 3) as f64;
+            assert!(mean < 6.0, "{name}: mean channel difference {mean:.2}");
+            let (g, c) = (&gpu_rgba[at..at + 3], &cpu.rgba[at..at + 3]);
+            assert!(
+                g.iter().zip(c).all(|(a, b)| a.abs_diff(*b) < 24),
+                "{name}: the hovered face is {g:?} on the GPU, {c:?} in software"
+            );
+            assert_ne!(c, &empty.rgba[at..at + 3], "{name}: the hovered face shows");
+            let (mut agree, mut checked, mut edges) = (0, 0, 0);
+            for y in (5..h - 5).step_by(7) {
+                for x in (5..w - 5).step_by(7) {
+                    let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                    let a = gpu.pick(px, py, 3.0);
+                    checked += 1;
+                    if a == cpu.pick(px, py, 3.0) {
+                        agree += 1;
+                    }
+                    if matches!(a, Some(Pick::Edge(_))) {
+                        edges += 1;
+                    }
+                }
+            }
+            assert!(edges > 20, "{name}: {edges} edge picks");
+            assert!(
+                agree * 100 >= checked * 95,
+                "{name}: {agree} of {checked} picks agree"
+            );
+        }
     }
 
     /// A headless GPU, or `None` on machines without one.

@@ -8,6 +8,7 @@
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Response, Sense, Shape, Stroke, Ui, Vec2};
+use oxyde_render::DisplayStyle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
@@ -175,6 +176,13 @@ pub enum Icon {
     ViewIso,
     Fit,
     NormalTo,
+    /// The display styles: a cylinder drawn shaded with its edges, shaded alone, in
+    /// lines with its hidden back edge left out, dashed, or solid.
+    DisplayShadedEdges,
+    DisplayShaded,
+    DisplayHiddenRemoved,
+    DisplayHiddenVisible,
+    DisplayWireframe,
     Undo,
     Redo,
     Eye,
@@ -447,6 +455,39 @@ impl Pen<'_> {
         self.block(4.0, 9.0, 11.0, 11.0, 5.0, faces);
     }
 
+    /// A cylinder in one of the display styles: filled or not, outlined or not, and its
+    /// hidden back edge left out (`None`), dashed (`Some(true)`) or solid.
+    fn display_cylinder(&self, fill: bool, outline: bool, hidden: Option<bool>) {
+        let (cx, rx, ry, top, bottom) = (12.0, 8.0, 3.0, 6.0, 18.0);
+        let front = Pen::arc_points(cx, bottom, rx, ry, 0.0, PI);
+        let back = Pen::arc_points(cx, bottom, rx, ry, PI, TAU);
+        let lid = Pen::arc_points(cx, top, rx, ry, 0.0, TAU);
+        if fill {
+            self.fill(
+                &[
+                    (cx - rx, top),
+                    (cx + rx, top),
+                    (cx + rx, bottom),
+                    (cx - rx, bottom),
+                ],
+                BODY,
+            );
+            self.fill(&front, BODY);
+            self.fill(&lid, BODY_TOP);
+        }
+        match hidden {
+            Some(true) => self.dashed(&back, 1.2, INK, 2.0, 1.6),
+            Some(false) => self.line(&back, 1.2, INK),
+            None => {}
+        }
+        if outline {
+            self.line(&[(cx - rx, top), (cx - rx, bottom)], 1.4, INK);
+            self.line(&[(cx + rx, top), (cx + rx, bottom)], 1.4, INK);
+            self.line(&front, 1.4, INK);
+            self.closed(&lid, 1.4, INK);
+        }
+    }
+
     /// A tilted plane, as in the timeline.
     fn plane(&self, x: f32, y: f32, w: f32, h: f32) {
         let skew = h * 0.75;
@@ -455,6 +496,17 @@ impl Pen<'_> {
             PLANE,
             PLANE_EDGE,
         );
+    }
+}
+
+/// The icon of a display style.
+pub fn display_style(style: DisplayStyle) -> Icon {
+    match style {
+        DisplayStyle::ShadedWithEdges => Icon::DisplayShadedEdges,
+        DisplayStyle::Shaded => Icon::DisplayShaded,
+        DisplayStyle::HiddenLinesRemoved => Icon::DisplayHiddenRemoved,
+        DisplayStyle::HiddenLinesVisible => Icon::DisplayHiddenVisible,
+        DisplayStyle::Wireframe => Icon::DisplayWireframe,
     }
 }
 
@@ -1688,6 +1740,11 @@ fn draw(pen: &Pen, icon: Icon) {
             pen.circle(10.0, 13.0, 1.4, ACCENT, None);
             pen.arrow((15.0, 9.0), (22.0, 2.0), 1.6, ACCENT);
         }
+        DisplayShadedEdges => pen.display_cylinder(true, true, None),
+        DisplayShaded => pen.display_cylinder(true, false, None),
+        DisplayHiddenRemoved => pen.display_cylinder(false, true, None),
+        DisplayHiddenVisible => pen.display_cylinder(false, true, Some(true)),
+        DisplayWireframe => pen.display_cylinder(false, true, Some(false)),
         Eye => {
             let upper = Pen::arc_points(12.0, 17.0, 10.0, 8.0, -0.85 * PI, -0.15 * PI);
             let lower = Pen::arc_points(12.0, 7.0, 10.0, 8.0, 0.15 * PI, 0.85 * PI);
@@ -1858,7 +1915,7 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, size: f32, enabled: bool) -> Respons
 
 /// Every icon, for previewing the set (`icon_sheet` test).
 #[cfg(test)]
-pub const ALL: [Icon; 111] = {
+pub const ALL: [Icon; 116] = {
     use Icon::*;
     [
         Sketch,
@@ -1962,6 +2019,11 @@ pub const ALL: [Icon; 111] = {
         ViewIso,
         Fit,
         NormalTo,
+        DisplayShadedEdges,
+        DisplayShaded,
+        DisplayHiddenRemoved,
+        DisplayHiddenVisible,
+        DisplayWireframe,
         Undo,
         Redo,
         Eye,
