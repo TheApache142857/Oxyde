@@ -786,27 +786,35 @@ impl Part {
         self.equations.add_global(name, expr)
     }
 
-    /// Renames a global variable; the equations using it follow.
+    /// Renames a global variable; the equations using it follow. One an assembly drives is
+    /// refused: the assembly names it.
     pub fn rename_global(&mut self, id: GlobalId, name: &str) -> Result<(), ModelError> {
+        self.check_global_not_driven(id)?;
         self.equations.rename_global(id, name)?;
         self.refresh_equation_names();
         Ok(())
     }
 
+    /// Changes a global variable's expression; one an assembly drives is refused.
     pub fn set_global_expression(&mut self, id: GlobalId, expr: Expr) -> Result<(), ModelError> {
+        self.check_global_not_driven(id)?;
         self.equations.set_global_expression(id, expr)
     }
 
     /// Removes a global variable. Expressions using it keep its name and report an error.
+    /// One an assembly drives is refused.
     pub fn remove_global(&mut self, id: GlobalId) -> Result<(), ModelError> {
+        self.check_global_not_driven(id)?;
         self.equations.remove_global(id)
     }
 
-    /// Adds an equation driving `target`. A dimension can be driven by one equation only.
+    /// Adds an equation driving `target`. A dimension can be driven by one equation only,
+    /// the part's or an assembly's.
     pub fn add_equation(&mut self, target: DimensionRef, expr: Expr) -> Result<usize, ModelError> {
         let dimension = self
             .dimension(target)
             .ok_or_else(|| ModelError::UnknownDimension(format!("{target:?}")))?;
+        self.check_not_driven_by_assembly(&dimension.full_name)?;
         self.equations
             .add_equation(target, dimension.full_name, expr)
     }
@@ -838,16 +846,27 @@ impl Part {
     }
 
     /// Sets a dimension (`D1@Sketch1`) or a global variable (`Width`) to `value`, in display
-    /// units, as an assembly's equation drives it. Returns the value it now has (a count is
-    /// rounded) and whether the part changed: it then needs a rebuild, and saving. A
-    /// dimension the part's own equations drive, and a variable of its linked equations
-    /// file, are refused: the part's own value would win.
-    pub fn drive(&mut self, name: &str, value: f64) -> Result<(f64, bool), String> {
+    /// units, as the equation of the assembly `assembly_id` drives it. Returns the value it
+    /// now has (a count is rounded) and whether the part changed: it then needs a rebuild,
+    /// and saving. A dimension the part's own equations drive, a variable of its linked
+    /// equations file, and a value another assembly drives are refused: one value wins.
+    pub fn drive(
+        &mut self,
+        name: &str,
+        value: f64,
+        assembly_id: &str,
+    ) -> Result<(f64, bool), String> {
         let name = name.trim().trim_matches('"');
         let missing = || format!("\"{name}\" does not exist in the part");
+        if let Some(other) = self.driver(name).filter(|d| d.assembly_id != assembly_id) {
+            return Err(format!(
+                "\"{name}\" is driven by {}: release it in the part first",
+                other.assembly_name()
+            ));
+        }
         if name.contains('@') {
             let reference = self.find_dimension(name).ok_or_else(missing)?;
-            if self.is_driven(reference) {
+            if self.equations.is_driven(&reference) {
                 return Err(format!("\"{name}\" is driven by an equation of the part"));
             }
             let dimension = self.dimension(reference).ok_or_else(missing)?;

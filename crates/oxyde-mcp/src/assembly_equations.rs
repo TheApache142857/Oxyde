@@ -2,12 +2,12 @@
 //! `assembly_equations.rs`): global variables, and equations driving mate values and the
 //! dimensions and variables of its parts. Each instance of a part is loaded on its own
 //! here, so driving one drives every copy of its file; the files changed are saved with the
-//! assembly.
+//! assembly, with what the assembly drives in them (`driven_by`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use oxyde_assembly::{ComponentId, ComponentTree, PartValues};
+use oxyde_assembly::{AsmDimension, ComponentId, ComponentTree, PartValues};
 use oxyde_kernel::Mesh;
 use oxyde_model::LinkedValue;
 use oxyde_occt::OcctKernel;
@@ -73,6 +73,8 @@ impl ComponentTree for LoadedTree<'_> {
 /// The loaded parts, as the equations read and drive them.
 struct LoadedParts<'a> {
     loaded: &'a mut Tree,
+    /// The assembly's document id: the parts know it as the assembly driving them.
+    assembly_id: &'a str,
     /// Files this evaluation changed.
     changed: BTreeSet<PathBuf>,
 }
@@ -95,7 +97,7 @@ impl PartValues for LoadedParts<'_> {
         let mut changed = false;
         each_part(self.loaded, &mut |p| {
             if p.file == file {
-                let result = p.part.drive(name, value);
+                let result = p.part.drive(name, value, self.assembly_id);
                 if let Ok((_, true)) = result {
                     changed = true;
                 }
@@ -142,18 +144,19 @@ impl AssemblyDoc {
             let AssemblyDoc { file, loaded, .. } = self;
             if file.assembly.equations.is_empty() {
                 self.equation_results = Default::default();
-                return;
+                break;
             }
             file.assembly.resolve_equation_names(&LoadedTree(loaded));
             let mut parts = LoadedParts {
                 loaded,
+                assembly_id: &file.document_id,
                 changed: BTreeSet::new(),
             };
             let results = file.assembly.evaluate_equations(&mut parts);
             let changed = parts.changed;
             self.equation_results = results;
             if changed.is_empty() {
-                return;
+                break;
             }
             each_part(&mut self.loaded, &mut |p| {
                 if changed.contains(&p.file) {
@@ -162,9 +165,46 @@ impl AssemblyDoc {
             });
             self.changed_parts.extend(changed);
             if round == MAX_ROUNDS {
-                return;
+                break;
             }
         }
+        self.record_driven();
+    }
+
+    /// Records in every loaded part what the assembly drives in it, as the application
+    /// does; a part whose record changes is saved with the assembly. A value another
+    /// assembly drives is left to it.
+    fn record_driven(&mut self) {
+        let Some(assembly) = self.path.clone() else {
+            return;
+        };
+        let id = self.file.document_id.clone();
+        let mut names: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for equation in &self.file.assembly.equations.equations {
+            let Some(AsmDimension::Part { path, name }) = &equation.target else {
+                continue;
+            };
+            let Some(p) = part_at(&self.loaded, path) else {
+                continue;
+            };
+            if p.part.driver(name).is_some_and(|d| d.assembly_id != id) {
+                continue;
+            }
+            names
+                .entry(p.file.clone())
+                .or_default()
+                .insert(name.clone());
+        }
+        let none = BTreeSet::new();
+        let mut changed = BTreeSet::new();
+        each_part(&mut self.loaded, &mut |p| {
+            let stored = oxyde_assembly::paths::stored(&assembly, p.file.parent());
+            let these = names.get(&p.file).unwrap_or(&none);
+            if p.part.set_driven_by(&id, &stored, these) {
+                changed.insert(p.file.clone());
+            }
+        });
+        self.changed_parts.extend(changed);
     }
 
     /// Gives the parts linked to the equations file `file` its new `values`, rebuilding
@@ -534,6 +574,23 @@ mod tests {
         assert!(text.contains("\"Gap\" = 2"), "{text}");
         call(&mut session, "save_assembly", json!({}));
         assert_eq!(depth(&plate), 3.0);
+
+        // The part records that the assembly drives it, and refuses to change it until the
+        // value is released.
+        let path = plate.display().to_string();
+        call(&mut session, "open_part", json!({ "path": path }));
+        let info = call(&mut session, "part_info", json!({}));
+        assert_eq!(info["driven_by"][0]["name"], "D1@Boss-Extrude1", "{info}");
+        assert_eq!(info["driven_by"][0]["assembly"], "Plates.oxyasm", "{info}");
+        let args = json!({ "name": "D1@Boss-Extrude1", "value": 9 });
+        let refused = crate::tools::call(&mut session, "set_dimension", &args).err();
+        assert!(refused.is_some_and(|e| e.contains("Plates")));
+        call(
+            &mut session,
+            "release_dimension",
+            json!({ "name": "D1@Boss-Extrude1" }),
+        );
+        call(&mut session, "set_dimension", args);
         drop(session);
         std::fs::remove_dir_all(&dir).unwrap();
     }

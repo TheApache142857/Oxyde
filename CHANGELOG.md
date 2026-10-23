@@ -32,17 +32,25 @@ release yet; the git history has every detail.
   in the Hackintosh case's window resizes its panels, and the mates move them. Parts whose
   linked file changed since they were saved are saved with the assembly as well.
 - Sub-assemblies stay rigid: their own equations apply when they are opened on their own.
-- Differences from SolidWorks: a part opened on its own does not know that an assembly drives
-  it (its dimension can be edited there, and the assembly sets it back when it is next opened),
-  and an equation names a part's dimension by its name, so renaming the dimension in the part
-  breaks the equation, shown in red, where SolidWorks follows the rename.
+- **Parts record what an assembly drives in them**, as SolidWorks' external references:
+  opened on its own, a part shows those dimensions and variables with Σ, "driven by Hackintosh
+  case", and refuses to change them (in its sketches, feature panels and Equations window).
+  Its Equations window lists them under *Driven by assemblies* (an assembly whose file is gone
+  shows "not found"); **Release** makes one the part's own again, as SolidWorks' *Break*. One
+  assembly drives a value at a time: another assembly's equation on it is an error until it is
+  released. *Save as* moves what the assembly drives to the new file.
+- Difference from SolidWorks: an equation names a part's dimension by its name, so renaming
+  the dimension in the part breaks the equation, shown in red, where SolidWorks follows the
+  rename.
 - **Files**: `global_variables`, `equations`, `next_global_id` and `equations_file` in
-  `assembly.json`, as in `model.json` (FORMAT.md §6). Assemblies without equations are written
-  as before; older versions of Oxyde open assemblies with equations with their last values and
-  drop the equations when they save them.
+  `assembly.json`, as in `model.json` (FORMAT.md §6), and `driven_by` in `model.json`
+  (FORMAT.md §3). Documents without them are written as before; older versions of Oxyde open
+  them with their last values and drop the equations and the records when they save them.
 - **The MCP server**: `set_variable`, `set_equation` and `link_equations` take
   `"assembly": true` to work on the open assembly; `assembly_info` lists its equations with
   their values; `save_assembly` saves the parts the equations changed (`parts_saved`).
+  `part_info` lists what assemblies drive in the part, `set_dimension` and `set_variable`
+  refuse those values, and `release_dimension` makes one the part's own again.
 
 ### Display styles (unreleased, October 2026)
 

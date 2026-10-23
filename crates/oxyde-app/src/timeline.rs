@@ -914,12 +914,14 @@ impl OxydeApp {
                 feature: id,
                 key: oxyde_model::DimensionKey::Feature(parameter),
             })
-            .map(|d| {
-                if d.driven {
-                    format!("Σ {} (driven by an equation)", d.full_name)
-                } else {
-                    d.full_name
-                }
+            .map(|d| match (&d.driven_by, d.driven) {
+                (Some(assembly), _) => format!(
+                    "Σ {} (driven by {})",
+                    d.full_name,
+                    oxyde_model::DrivenBy::name_of(assembly)
+                ),
+                (None, true) => format!("Σ {} (driven by an equation)", d.full_name),
+                (None, false) => d.full_name,
             })
     }
 

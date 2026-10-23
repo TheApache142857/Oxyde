@@ -88,8 +88,10 @@ pub struct Dimension {
     /// mm, radians for angles, or a count.
     pub value: f64,
     pub unit: DimensionUnit,
-    /// Set by an equation, so not editable by hand.
+    /// Set by an equation, of the part or of an assembly, so not editable by hand.
     pub driven: bool,
+    /// The file of the assembly whose equation drives it, as the part records it.
+    pub driven_by: Option<String>,
 }
 
 impl fmt::Display for Dimension {
@@ -142,6 +144,7 @@ pub(crate) fn list_dimensions(features: &[Feature], equations: &Equations) -> Ve
                         DimensionUnit::Length
                     },
                     driven: driven.contains(&reference),
+                    driven_by: None,
                 });
             }
         }
@@ -158,6 +161,7 @@ pub(crate) fn list_dimensions(features: &[Feature], equations: &Equations) -> Ve
                 value,
                 unit: parameter.unit(),
                 driven: driven.contains(&reference),
+                driven_by: None,
             });
         }
     }
@@ -168,15 +172,23 @@ impl Part {
     /// All dimensions, in timeline order (sketch dimensions in creation order, then the
     /// feature's own).
     pub fn dimensions(&self) -> Vec<Dimension> {
-        list_dimensions(self.features(), self.equations())
+        let mut dimensions = list_dimensions(self.features(), self.equations());
+        for d in &mut dimensions {
+            if let Some(by) = self.driver(&d.full_name) {
+                d.driven = true;
+                d.driven_by = Some(by.assembly.clone());
+            }
+        }
+        dimensions
     }
 
-    /// Whether an equation sets this dimension.
+    /// Whether an equation sets this dimension: one of the part's, or an assembly's.
     pub fn is_driven(&self, reference: DimensionRef) -> bool {
-        self.equations()
-            .equations
-            .iter()
-            .any(|e| e.target == Some(reference))
+        self.equations.is_driven(&reference)
+            || (!self.driven_by.is_empty()
+                && self
+                    .dimension(reference)
+                    .is_some_and(|d| d.driven_by.is_some()))
     }
 
     pub fn dimension(&self, reference: DimensionRef) -> Option<Dimension> {

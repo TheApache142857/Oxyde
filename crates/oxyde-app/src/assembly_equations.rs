@@ -8,8 +8,12 @@
 //!
 //! An assembly linked to an equations file shares its variables with the parts linked to the
 //! same file: changing one in the assembly writes the file, then refreshes those parts.
+//!
+//! Each part records what the assembly drives in it (`driven_by`, SolidWorks' external
+//! references), written when the assembly saves it: opened on its own, the part shows those
+//! values as driven. A value another assembly drives is refused.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use oxyde_assembly::{AsmDimension, ComponentId, ComponentTree, PartValues};
@@ -65,6 +69,8 @@ impl ComponentTree for LoadedTree<'_> {
 struct LoadedParts<'a> {
     docs: &'a mut Docs,
     sources: &'a HashMap<ComponentId, PathBuf>,
+    /// The assembly's document id: the parts know it as the assembly driving them.
+    assembly_id: &'a str,
     /// Files changed by this evaluation, to rebuild.
     changed: Vec<PathBuf>,
 }
@@ -87,7 +93,7 @@ impl PartValues for LoadedParts<'_> {
         let Some(Ok(Loaded::Part(p))) = self.docs.get_mut(&file) else {
             return Err("the component is not a part".to_owned());
         };
-        let (now, changed) = p.part.drive(name, value)?;
+        let (now, changed) = p.part.drive(name, value, self.assembly_id)?;
         if changed && !self.changed.contains(&file) {
             self.changed.push(file);
         }
@@ -115,16 +121,19 @@ impl AssemblyDoc {
             assembly,
             docs,
             sources,
+            document_id,
             ..
         } = self;
         if assembly.equations.is_empty() {
             self.equation_results = Default::default();
+            self.record_driven();
             return;
         }
         assembly.resolve_equation_names(&LoadedTree { docs, sources });
         let mut parts = LoadedParts {
             docs,
             sources,
+            assembly_id: document_id,
             changed: Vec::new(),
         };
         let results = assembly.evaluate_equations(&mut parts);
@@ -135,6 +144,70 @@ impl AssemblyDoc {
             self.changed_parts.insert(file);
             self.modified = true;
         }
+        self.record_driven();
+    }
+
+    /// What the assembly's equations drive in each loaded part file, by name, leaving out
+    /// what another assembly drives (refused).
+    fn driven_names(&self) -> BTreeMap<PathBuf, BTreeSet<String>> {
+        let mut out: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
+        for equation in &self.assembly.equations.equations {
+            let Some(AsmDimension::Part { path, name }) = &equation.target else {
+                continue;
+            };
+            let Some(file) = file_at(&self.docs, &self.sources, path) else {
+                continue;
+            };
+            let Some(Ok(Loaded::Part(p))) = self.docs.get(&file) else {
+                continue;
+            };
+            if p.part
+                .driver(name)
+                .is_some_and(|d| d.assembly_id != self.document_id)
+            {
+                continue;
+            }
+            out.entry(file).or_default().insert(name.clone());
+        }
+        out
+    }
+
+    /// Records in every loaded part what the assembly drives in it, as SolidWorks records
+    /// external references; a part whose record changes is saved with the assembly. An
+    /// assembly not saved yet records nothing: it has no file for the parts to name.
+    pub fn record_driven(&mut self) {
+        let Some(assembly) = self.path.clone() else {
+            return;
+        };
+        let names = self.driven_names();
+        let none = BTreeSet::new();
+        for (file, loaded) in &mut self.docs {
+            let Ok(Loaded::Part(p)) = loaded else {
+                continue;
+            };
+            let stored = oxyde_assembly::paths::stored(&assembly, file.parent());
+            let these = names.get(file).unwrap_or(&none);
+            if p.part.set_driven_by(&self.document_id, &stored, these) {
+                self.changed_parts.insert(file.clone());
+                self.modified = true;
+            }
+        }
+    }
+
+    /// After Save as, the assembly is a new document: what the old one drove in the parts is
+    /// now driven by this one, as SolidWorks moves the external references to the new file.
+    pub fn take_over_driven(&mut self, old_id: &str) {
+        let none = BTreeSet::new();
+        for (file, loaded) in &mut self.docs {
+            let Ok(Loaded::Part(p)) = loaded else {
+                continue;
+            };
+            if p.part.driven_by().iter().any(|d| d.assembly_id == old_id) {
+                p.part.set_driven_by(old_id, "", &none);
+                self.changed_parts.insert(file.clone());
+            }
+        }
+        self.record_driven();
     }
 
     /// Whether parts changed by the equations wait to be rebuilt.
@@ -298,6 +371,13 @@ impl AssemblyDoc {
                                 .map(|g| g.name.clone()),
                         );
                     for name in names {
+                        // Driven by another assembly: refused until released in the part.
+                        if p.part
+                            .driver(&name)
+                            .is_some_and(|d| d.assembly_id != self.document_id)
+                        {
+                            continue;
+                        }
                         let target = AsmDimension::Part {
                             path: path.clone(),
                             name,
@@ -506,6 +586,22 @@ mod tests {
         let reopened =
             Part::from_definition(oxyde_format::load_part(&plate).unwrap().definition).unwrap();
         assert_eq!(depth(&reopened), 5.0);
+        // The part records that the assembly drives it, as SolidWorks' external references.
+        let driver = reopened.driver("D1@Boss-Extrude1").unwrap();
+        assert_eq!(driver.assembly, "Plates.oxyasm");
+        assert_eq!(driver.assembly_id, doc.document_id);
+
+        // Another assembly driving the same dimension is refused.
+        let mut other = AssemblyDoc::from_file(
+            oxyde_format::AssemblyFile::new(),
+            Some(dir.join("Other.oxyasm")),
+        );
+        other.assembly = doc.assembly.clone();
+        other.load_parts(&mut kernel);
+        other.apply_equations(&mut kernel);
+        let refused = other.equation_results.equations[1].as_ref().unwrap_err();
+        assert!(refused.contains("Plates"), "{refused}");
+        other.release(&mut kernel);
 
         // Evaluated again, nothing is left to rebuild or save.
         doc.solve();

@@ -572,7 +572,13 @@ impl OxydeApp {
                 doc.path = Some(path.clone());
                 doc.modified = false;
                 doc.read_only = false;
-                // The parts its equations changed are saved with it, as SolidWorks does.
+                // The parts its equations changed are saved with it, as SolidWorks does,
+                // with what it drives in them; after Save as, by the new file.
+                if doc.document_id != original_id {
+                    doc.take_over_driven(&original_id);
+                } else {
+                    doc.record_driven();
+                }
                 let (saved, notes) = doc.save_changed_parts();
                 self.remember_recent(&path);
                 self.status = format!("Saved {}", path.display());

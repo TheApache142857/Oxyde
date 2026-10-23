@@ -146,7 +146,7 @@ impl PartValues for Loaded<'_> {
             .ok_or("not loaded")?
             .clone();
         let part = self.parts.get_mut(&file).ok_or("not loaded")?;
-        let (now, changed) = part.drive(name, value)?;
+        let (now, changed) = part.drive(name, value, "plates")?;
         if changed && !self.changed.contains(&file) {
             self.changed.push(file);
         }
@@ -220,6 +220,30 @@ fn assembly_equations_drive_mates_and_parts_which_are_saved() {
     // Evaluated again, nothing changes: no part to rebuild.
     file.assembly.evaluate_equations(&mut loaded);
     assert!(loaded.changed.is_empty());
+
+    // Recorded as driven, the part refuses another assembly and its own edits, until the
+    // value is released.
+    let names = ["D1@Boss-Extrude1".to_owned()].into_iter().collect();
+    let part = loaded.parts.get_mut(&plate).unwrap();
+    assert!(part.set_driven_by("plates", "Plates.oxyasm", &names));
+    let mut part_file = oxyde_format::load_part(&plate).unwrap();
+    part_file.definition = part.definition();
+    oxyde_format::save_part(&plate, &part_file).unwrap();
+    let mut reopened =
+        Part::from_definition(oxyde_format::load_part(&plate).unwrap().definition).unwrap();
+    let depth = reopened.find_dimension("D1@Boss-Extrude1").unwrap();
+    assert!(reopened.is_driven(depth));
+    let refused = reopened
+        .drive("D1@Boss-Extrude1", 8.0, "other")
+        .unwrap_err();
+    assert!(refused.contains("Plates"), "{refused}");
+    reopened.release_driven("D1@Boss-Extrude1").unwrap();
+    assert_eq!(
+        reopened.drive("D1@Boss-Extrude1", 8.0, "other"),
+        Ok((8.0, true))
+    );
+    reopened.rebuild(loaded.kernel);
+    reopened.release(loaded.kernel);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

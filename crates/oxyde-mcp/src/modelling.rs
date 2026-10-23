@@ -770,12 +770,31 @@ pub(crate) fn set_dimension(session: &mut Session, args: &Value) -> Result<ToolO
         .map(|d| d.unit)
         .ok_or("no such dimension")?;
     let internal = unit.from_display(value)?;
+    // A dimension an assembly drives is changed there, or released first.
+    if let Some(d) = part.driver(name) {
+        return Err(format!(
+            "\"{}\" is driven by {} (an assembly equation): release_dimension first",
+            d.name,
+            d.assembly_name()
+        ));
+    }
     session.change(|doc| {
         doc.part
             .set_dimension(reference, internal)
             .map_err(|e| e.to_string())
     })?;
     Ok(ToolOutput::json(&report(session, reference.feature)))
+}
+
+/// Makes a value an assembly drives the part's own again, as SolidWorks breaks an external
+/// reference.
+pub(crate) fn release_dimension(session: &mut Session, args: &Value) -> Result<ToolOutput> {
+    let name = args::str(args, "name")?.to_owned();
+    session.change(|doc| doc.part.release_driven(&name).map_err(|e| e.to_string()))?;
+    Ok(ToolOutput::text(format!(
+        "{name} is the part's own again; the assembly drives it again when it is next \
+         opened and saved, unless its equation is deleted there"
+    )))
 }
 
 pub(crate) fn rename_dimension(session: &mut Session, args: &Value) -> Result<ToolOutput> {

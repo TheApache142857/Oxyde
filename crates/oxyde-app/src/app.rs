@@ -771,14 +771,14 @@ impl OxydeApp {
         session.driven = self
             .doc
             .part
-            .equations()
-            .equations
-            .iter()
-            .filter_map(|e| match e.target {
-                Some(oxyde_model::DimensionRef {
+            .dimensions()
+            .into_iter()
+            .filter(|d| d.driven)
+            .filter_map(|d| match d.reference {
+                oxyde_model::DimensionRef {
                     feature,
                     key: oxyde_model::DimensionKey::Sketch(relation),
-                }) if feature == id => Some(relation),
+                } if feature == id => Some(relation),
                 _ => None,
             })
             .collect();

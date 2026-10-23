@@ -41,6 +41,7 @@ mod appearance;
 mod bodies;
 mod configurations;
 mod dimensions;
+mod driven;
 mod equations;
 mod error;
 mod expression;
@@ -58,6 +59,7 @@ pub use configurations::{
 pub use dimensions::{
     Dimension, DimensionKey, DimensionRef, DimensionUnit, full_name, split_full_name,
 };
+pub use driven::DrivenBy;
 pub use equations::{
     Dimensions, Equation, EquationResults, EquationText, Equations, EquationsText, GlobalText,
     GlobalVariable, LinkedValue,

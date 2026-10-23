@@ -22,6 +22,7 @@ use oxyde_sketch::{ConstrainedSketch, ConstraintState, EntityId, Geometry};
 use crate::appearance::{Appearance, Appearances};
 use crate::bodies::{Body, Solid, Working};
 use crate::configurations::Configurations;
+use crate::driven::DrivenBy;
 use crate::equations::{EquationResults, Equations};
 use crate::error::ModelError;
 use crate::feature::{
@@ -253,6 +254,9 @@ pub struct PartDefinition {
     /// Named variants of the part: values of configured dimensions and suppression of
     /// configured features, one of them active.
     pub configurations: Configurations,
+    /// Values of the part that assemblies' equations drive (SolidWorks' external
+    /// references), sorted.
+    pub driven_by: Vec<DrivenBy>,
 }
 
 impl PartDefinition {
@@ -322,6 +326,7 @@ pub struct Part {
     appearances: Appearances,
     material: Option<Material>,
     pub(crate) configurations: Configurations,
+    pub(crate) driven_by: Vec<DrivenBy>,
     results: Vec<FeatureResult>,
     /// Results from this index on are stale.
     dirty_from: usize,
@@ -344,6 +349,7 @@ impl Part {
             appearances: Appearances::default(),
             material: None,
             configurations: Configurations::default(),
+            driven_by: Vec::new(),
             results: Vec::new(),
             dirty_from: 0,
         }
@@ -403,6 +409,7 @@ impl Part {
         }
         definition.equations.validate()?;
         definition.configurations.validate()?;
+        crate::driven::tidy(&mut definition.driven_by);
         let highest = definition
             .features
             .iter()
@@ -418,6 +425,7 @@ impl Part {
             appearances: definition.appearances,
             material: definition.material.map(Material::clamped),
             configurations: definition.configurations,
+            driven_by: definition.driven_by,
             results: Vec::new(),
             dirty_from: 0,
         })
@@ -433,6 +441,7 @@ impl Part {
             appearances: self.appearances.clone(),
             material: self.material.clone(),
             configurations: self.configurations.clone(),
+            driven_by: self.driven_by.clone(),
         }
     }
 
@@ -567,11 +576,14 @@ impl Part {
                 reference,
             });
         }
+        // A dimension an assembly drives keeps its value, as SolidWorks keeps an external
+        // reference: the edit is refused.
+        let held = self.assembly_driven_values(id);
         let feature = &mut self.features[index];
-        feature.kind = kind;
+        let old = std::mem::replace(&mut feature.kind, kind);
         feature.tidy_parameter_names();
         self.mark_dirty(index);
-        Ok(())
+        self.keep_assembly_driven_values(id, old, &held)
     }
 
     /// Renames a feature. Names must be valid and unique in the part; dimension full names

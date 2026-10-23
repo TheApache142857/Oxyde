@@ -1268,6 +1268,33 @@ mod tests {
     }
 
     #[test]
+    fn values_driven_by_assemblies_are_stored_sorted_and_only_when_there_are_some() {
+        let json = |file: &PartFile| -> serde_json::Value {
+            let bytes = write_part(Cursor::new(Vec::new()), file)
+                .unwrap()
+                .into_inner();
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap()
+        };
+        let mut file = sample();
+        assert!(json(&file).get("driven_by").is_none());
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect();
+        file.definition
+            .set_driven_by("b-id", "../B.oxyasm", &names(&["Thick"]));
+        file.definition
+            .set_driven_by("a-id", "../A.oxyasm", &names(&["D1@Sketch1"]));
+        let model = json(&file);
+        assert_eq!(model["driven_by"][0]["name"], "D1@Sketch1");
+        assert_eq!(model["driven_by"][0]["assembly"], "../A.oxyasm");
+        assert_eq!(model["driven_by"][0]["assembly_id"], "a-id");
+        assert_eq!(model["driven_by"][1]["name"], "Thick");
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        assert_eq!(read_part(Cursor::new(bytes)).unwrap(), file);
+    }
+
+    #[test]
     fn equations_are_stored_as_text() {
         let bytes = write_part(Cursor::new(Vec::new()), &sample())
             .unwrap()

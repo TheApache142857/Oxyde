@@ -346,6 +346,14 @@ pub fn list() -> Vec<Value> {
             &["name", "value"],
         ),
         tool(
+            "release_dimension",
+            "Makes a dimension or global variable that an assembly's equation drives the \
+             part's own again (SolidWorks' Break external reference). The assembly drives it \
+             again when it is next opened and saved, unless its equation is deleted there.",
+            json!({ "name": string("Full name (\"D1@Sketch1\") or a variable's name.") }),
+            &["name"],
+        ),
+        tool(
             "rename_dimension",
             "Renames a dimension (\"D1@Sketch1\" to \"Width\").",
             json!({ "name": string("Full name."), "new_name": string("") }),
@@ -681,6 +689,7 @@ fn dispatch(session: &mut Session, name: &str, args: &Value) -> Result<ToolOutpu
         "import_step" => modelling::import_step(session, args),
         "edit_feature" => modelling::edit_feature(session, args),
         "set_dimension" => modelling::set_dimension(session, args),
+        "release_dimension" => modelling::release_dimension(session, args),
         "rename_dimension" => modelling::rename_dimension(session, args),
         "set_variable" if args::bool(args, "assembly", false)? => {
             crate::assembly_equations::set_variable(session, args)
@@ -767,6 +776,18 @@ fn part_info(session: &mut Session, args: &Value) -> Result<ToolOutput> {
         })
         .collect();
     let mut out = json!({ "features": timeline, "body": body_summary(&session.kernel, part) });
+    // What assemblies drive in the part (SolidWorks' external references).
+    if !part.driven_by().is_empty() {
+        out.set(
+            "driven_by",
+            Value::Array(
+                part.driven_by()
+                    .iter()
+                    .map(|d| json!({ "name": d.name, "assembly": d.assembly }))
+                    .collect(),
+            ),
+        );
+    }
     if reference {
         out.set(
             "path",
@@ -791,8 +812,12 @@ fn part_info(session: &mut Session, args: &Value) -> Result<ToolOutput> {
             part.dimensions()
                 .into_iter()
                 .map(|d| {
-                    json!({ "name": d.full_name, "value": args::round(d.unit.to_display(d.value)),
-                        "unit": d.unit.suffix().trim(), "driven": d.driven })
+                    let mut row = json!({ "name": d.full_name, "value": args::round(d.unit.to_display(d.value)),
+                        "unit": d.unit.suffix().trim(), "driven": d.driven });
+                    if let Some(assembly) = &d.driven_by {
+                        row.set("driven_by", json!(assembly));
+                    }
+                    row
                 })
                 .collect(),
         ));
