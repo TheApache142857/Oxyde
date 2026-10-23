@@ -41,6 +41,7 @@ mod appearance;
 mod bodies;
 mod configurations;
 mod dimensions;
+mod driven;
 mod equations;
 mod error;
 mod expression;
@@ -58,12 +59,13 @@ pub use configurations::{
 pub use dimensions::{
     Dimension, DimensionKey, DimensionRef, DimensionUnit, full_name, split_full_name,
 };
+pub use driven::DrivenBy;
 pub use equations::{
-    Equation, EquationResults, EquationText, Equations, EquationsText, GlobalText, GlobalVariable,
-    LinkedValue,
+    Dimensions, Equation, EquationResults, EquationText, Equations, EquationsText, GlobalText,
+    GlobalVariable, LinkedValue,
 };
 pub use error::ModelError;
-pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};
+pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand, ValueOf};
 pub use feature::{
     AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp, CurveRef, EdgeBlend,
     Extrude, ExtrudeExtent, ExtrudeOp, Feature, FeatureId, FeatureKind, FeatureParameter, FileData,

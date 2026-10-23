@@ -57,7 +57,7 @@ pub fn parse(text: &str, quantity: Quantity) -> Option<f64> {
         return None;
     }
     let expression = with_units(&decimal_points(text), quantity)?;
-    let expr = oxyde_model::Expr::parse(&expression, &|_| None).ok()?;
+    let expr: oxyde_model::Expr = oxyde_model::Expr::parse(&expression, &|_| None).ok()?;
     expr.evaluate(&mut |_, _| Err(String::new()))
         .ok()
         .filter(|v| v.is_finite())

@@ -52,6 +52,7 @@
 mod args;
 mod assembling;
 mod assembly;
+mod assembly_equations;
 mod font;
 mod geometry;
 mod inspect;

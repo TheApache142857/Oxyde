@@ -8,12 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 use oxyde_geom::Point2;
 use oxyde_model::{
     Appearance, Appearances, AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp,
-    ConfigurationText, ConfigurationsText, CurveRef, EdgeBlend, EdgeName, EquationText, Equations,
-    EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature, FeatureId,
-    FeatureKind, FeatureParameter, FileData, GlobalText, Hole, HoleKind, Import, LinearPattern,
-    Loft, Material, MaterialSource, Mechanical, Mirror, PartDefinition, PatternDirection, PlaneRef,
-    PointRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch, SketchPlane, StandardAxis,
-    StandardPlane, Sweep, Texture, Thermal, VertexName,
+    ConfigurationText, ConfigurationsText, CurveRef, DrivenBy, EdgeBlend, EdgeName, EquationText,
+    Equations, EquationsText, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey, FaceName, Feature,
+    FeatureId, FeatureKind, FeatureParameter, FileData, GlobalText, Hole, HoleKind, Import,
+    LinearPattern, Loft, Material, MaterialSource, Mechanical, Mirror, PartDefinition,
+    PatternDirection, PlaneRef, PointRef, RefAxis, RefPlane, Revolve, RevolveAxis, Shell, Sketch,
+    SketchPlane, StandardAxis, StandardPlane, Sweep, Texture, Thermal, VertexName,
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
@@ -79,6 +79,9 @@ pub(crate) struct PartModel {
     /// Linked equations file, relative to the part's folder; absent = none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equations_file: Option<String>,
+    /// Values that assemblies' equations drive (external references); absent = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub driven_by: Vec<DrivenByDto>,
     /// Colours, transparency and textures; absent = the viewport's default everywhere.
     #[serde(default, skip_serializing_if = "AppearancesDto::is_empty")]
     pub appearances: AppearancesDto,
@@ -410,6 +413,16 @@ pub(crate) struct GlobalDto {
     /// Copied from the linked equations file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub linked: bool,
+}
+
+/// A value of the part an assembly's equation drives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct DrivenByDto {
+    /// A dimension's full name, or a global variable's name.
+    pub name: String,
+    /// The assembly's file, relative to the part's folder.
+    pub assembly: String,
+    pub assembly_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -962,6 +975,15 @@ impl PartModel {
             features: definition.features.iter().map(feature_dto).collect(),
             next_global_id: (text.next_global_id > 1).then_some(text.next_global_id),
             equations_file: text.linked_file.clone(),
+            driven_by: definition
+                .driven_by
+                .iter()
+                .map(|d| DrivenByDto {
+                    name: d.name.clone(),
+                    assembly: d.assembly.clone(),
+                    assembly_id: d.assembly_id.clone(),
+                })
+                .collect(),
             global_variables: text
                 .globals
                 .into_iter()
@@ -1455,6 +1477,15 @@ impl PartModel {
                 .transpose()
                 .map_err(|e| format!("material: {e}"))?,
             configurations: Default::default(),
+            driven_by: self
+                .driven_by
+                .into_iter()
+                .map(|d| DrivenBy {
+                    name: d.name,
+                    assembly: d.assembly,
+                    assembly_id: d.assembly_id,
+                })
+                .collect(),
         };
         if let Some(configurations) = self.configurations {
             let text = ConfigurationsText {

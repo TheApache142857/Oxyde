@@ -44,6 +44,8 @@ pub(crate) fn new_assembly(session: &mut Session, args: &Value) -> Result<ToolOu
             file,
             dir,
             loaded: BTreeMap::new(),
+            equation_results: Default::default(),
+            changed_parts: Default::default(),
         },
     );
     Ok(ToolOutput::text("new assembly"))
@@ -60,6 +62,8 @@ pub(crate) fn open_assembly(session: &mut Session, args: &Value) -> Result<ToolO
             file,
             dir,
             loaded: BTreeMap::new(),
+            equation_results: Default::default(),
+            changed_parts: Default::default(),
         },
     );
     // As the application does: the parts may have changed since the assembly was saved (a
@@ -72,9 +76,11 @@ pub(crate) fn open_assembly(session: &mut Session, args: &Value) -> Result<ToolO
     Ok(ToolOutput::json(&out))
 }
 
-/// Solves the mates and moves the components where they say.
-fn solve(session: &mut Session) -> Result<oxyde_assembly::Solution> {
+/// Evaluates the assembly's equations (driving mates and parts), then solves the mates and
+/// moves the components where they say.
+pub(crate) fn solve(session: &mut Session) -> Result<oxyde_assembly::Solution> {
     let doc = session.assembly.as_mut().ok_or("no assembly is open")?;
+    doc.evaluate_equations(&mut session.kernel);
     let mut assembly = std::mem::take(&mut doc.file.assembly);
     let size = doc.size();
     let solution =
@@ -96,8 +102,10 @@ pub(crate) fn save_assembly(session: &mut Session, args: &Value) -> Result<ToolO
     };
     write_assembly(&path, &doc.file).map_err(|e| format!("{}: {e}", path.display()))?;
     doc.path = Some(path.clone());
+    // The parts its equations changed are saved with it, as the application does.
+    let parts = doc.save_changed_parts()?;
     Ok(ToolOutput::json(
-        &json!({ "saved": path.display().to_string() }),
+        &json!({ "saved": path.display().to_string(), "parts_saved": parts }),
     ))
 }
 
@@ -343,5 +351,8 @@ pub(crate) fn assembly_info(session: &mut Session) -> Result<ToolOutput> {
         })
         .collect();
     out.set("mate_errors", json!(errors));
+    if !doc.file.assembly.equations.is_empty() {
+        out.set("equations", doc.equations_report());
+    }
     Ok(ToolOutput::json(&out))
 }

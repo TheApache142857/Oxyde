@@ -11,6 +11,10 @@
 //! A part can be linked to an equations file shared with other parts (SolidWorks' "Link to
 //! external file"): its variables show with 🔗, and changing one writes it into the file,
 //! which every part linked to it reads when it is opened.
+//!
+//! In an assembly the same window shows the assembly's own equations
+//! (`assembly_equations_ui.rs`). A part whose values an assembly drives lists them under
+//! *Driven by assemblies*, read-only until released, as SolidWorks' external references.
 
 use std::collections::HashMap;
 
@@ -19,7 +23,7 @@ use oxyde_model::{Dimension, DimensionRef, DimensionUnit, GlobalId, ModelError, 
 
 use crate::app::OxydeApp;
 
-fn error() -> Color32 {
+pub(crate) fn error() -> Color32 {
     crate::theme::tokens().err
 }
 
@@ -31,7 +35,7 @@ pub enum EquationsTab {
 
 /// A text field of the window, while it is being typed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Field {
+pub(crate) enum Field {
     DimensionName(DimensionRef),
     GlobalName(GlobalId),
     GlobalExpression(GlobalId),
@@ -42,11 +46,16 @@ pub struct EquationsWindow {
     pub open: bool,
     pub tab: EquationsTab,
     /// Text of the field being typed in; every other field shows the model.
-    editing: HashMap<Field, String>,
-    new_global_name: String,
-    new_global_expression: String,
+    pub(crate) editing: HashMap<Field, String>,
+    pub(crate) new_global_name: String,
+    pub(crate) new_global_expression: String,
     new_equation_target: Option<DimensionRef>,
-    new_equation_expression: String,
+    pub(crate) new_equation_expression: String,
+    /// In an assembly: what the new equation drives, and the text narrowing the list.
+    pub(crate) new_assembly_target: Option<oxyde_assembly::AsmDimension>,
+    pub(crate) target_filter: String,
+    /// In an assembly: the mate whose value is being dragged, one undo step for the drag.
+    pub(crate) editing_mate: Option<oxyde_assembly::MateId>,
 }
 
 impl EquationsWindow {
@@ -59,6 +68,9 @@ impl EquationsWindow {
             new_global_expression: String::new(),
             new_equation_target: None,
             new_equation_expression: String::new(),
+            new_assembly_target: None,
+            target_filter: String::new(),
+            editing_mate: None,
         }
     }
 
@@ -69,7 +81,7 @@ impl EquationsWindow {
 
     /// A text field that shows `current` unless it is being typed in. Returns the new text
     /// when the user is done (focus lost or Enter) and it differs.
-    fn field(
+    pub(crate) fn field(
         &mut self,
         ui: &mut egui::Ui,
         field: Field,
@@ -109,11 +121,13 @@ enum Change {
     /// Link the part to the equations file the user picks.
     LinkFile,
     Unlink,
+    /// Make a value an assembly drives the part's own again.
+    Release(String),
 }
 
 /// The value an expression evaluates to (with the unit of its dimension, if any), or its
 /// error.
-fn result_label(
+pub(crate) fn result_label(
     ui: &mut egui::Ui,
     result: Option<&Result<f64, String>>,
     unit: Option<DimensionUnit>,
@@ -134,7 +148,7 @@ fn result_label(
     }
 }
 
-fn format_value(value: f64, unit: DimensionUnit) -> String {
+pub(crate) fn format_value(value: f64, unit: DimensionUnit) -> String {
     match unit {
         DimensionUnit::Count => format!("{value:.0}"),
         _ => {
@@ -164,6 +178,7 @@ impl OxydeApp {
         let mut changes = Vec::new();
         let sketching = self.sketch.is_some();
         let part = &self.doc.part;
+        let folder = self.doc.path.as_deref().and_then(std::path::Path::parent);
         let state = &mut self.equations;
         egui::Window::new("Equations, Global Variables and Dimensions")
             .open(&mut open)
@@ -180,7 +195,7 @@ impl OxydeApp {
                     return;
                 }
                 egui::ScrollArea::vertical().show(ui, |ui| match state.tab {
-                    EquationsTab::Equations => equations_tab(ui, state, part, &mut changes),
+                    EquationsTab::Equations => equations_tab(ui, state, part, folder, &mut changes),
                     EquationsTab::Dimensions => dimensions_tab(ui, state, part, &mut changes),
                 });
             });
@@ -226,6 +241,7 @@ impl OxydeApp {
                 None => return,
             },
             Change::Unlink => self.edit_part(|p| p.link_equations(None, &[])),
+            Change::Release(name) => self.edit_part(move |p| p.release_driven(&name)),
             Change::RemoveGlobal(id) => self.edit_part(move |p| p.remove_global(id)),
             Change::AddEquation(target, text) => match parse(&text) {
                 Ok(expr) => {
@@ -362,6 +378,7 @@ fn equations_tab(
     ui: &mut egui::Ui,
     state: &mut EquationsWindow,
     part: &Part,
+    folder: Option<&std::path::Path>,
     changes: &mut Vec<Change>,
 ) {
     let equations = part.equations();
@@ -401,7 +418,14 @@ fn equations_tab(
             ui.end_row();
             for (i, global) in equations.globals.iter().enumerate() {
                 let linked = global.linked && equations.linked_file.is_some();
-                if linked {
+                let driver = part.driver(&global.name);
+                if let Some(d) = driver {
+                    ui.label(format!("Σ {}", global.name))
+                        .on_hover_text(format!(
+                            "Driven by {} (an assembly equation): release it below to change it",
+                            d.assembly_name()
+                        ));
+                } else if linked {
                     // The name is the file's: renaming it here would break the link.
                     ui.label(format!("🔗 {}", global.name))
                         .on_hover_text("From the linked equations file");
@@ -411,13 +435,15 @@ fn equations_tab(
                     changes.push(Change::RenameGlobal(global.id, name));
                 }
                 let text = part.expression_text(&global.expr);
-                if let Some(text) =
+                if driver.is_some() {
+                    ui.label(&text);
+                } else if let Some(text) =
                     state.field(ui, Field::GlobalExpression(global.id), &text, 220.0)
                 {
                     changes.push(Change::SetGlobal(global.id, text));
                 }
                 result_label(ui, results.globals.get(i), None);
-                if linked {
+                if linked || driver.is_some() {
                     ui.label("");
                 } else if ui.small_button("🗑").on_hover_text("Delete").clicked() {
                     changes.push(Change::RemoveGlobal(global.id));
@@ -525,6 +551,10 @@ fn equations_tab(
             ui.end_row();
         });
 
+    if !part.driven_by().is_empty() {
+        driven_by_list(ui, part, &dimensions, folder, changes);
+    }
+
     ui.add_space(6.0);
     ui.label(
         RichText::new(
@@ -535,6 +565,57 @@ fn equations_tab(
         .small()
         .weak(),
     );
+}
+
+/// The values assemblies drive in the part, as SolidWorks lists external references: each
+/// with its assembly, and Release to make it the part's own again.
+fn driven_by_list(
+    ui: &mut egui::Ui,
+    part: &Part,
+    dimensions: &[Dimension],
+    folder: Option<&std::path::Path>,
+    changes: &mut Vec<Change>,
+) {
+    ui.add_space(8.0);
+    ui.strong("Driven by assemblies");
+    egui::Grid::new("driven_by")
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            for d in part.driven_by() {
+                let known = dimensions.iter().any(|x| x.full_name == d.name)
+                    || part.equations().globals.iter().any(|g| g.name == d.name);
+                let name = RichText::new(format!("\"{}\"", d.name));
+                if known {
+                    ui.label(name);
+                } else {
+                    ui.label(name.color(error()))
+                        .on_hover_text("No longer in the part: renamed or deleted");
+                }
+                // A file that is not where the part says (moved, or deleted): SolidWorks' ->?.
+                let missing = folder.is_some_and(|f| {
+                    !oxyde_assembly::paths::absolute(&d.assembly, Some(f)).exists()
+                });
+                let text = if missing {
+                    format!("{} (not found)", d.assembly_name())
+                } else {
+                    d.assembly_name().to_owned()
+                };
+                ui.label(text).on_hover_text(&d.assembly);
+                if ui
+                    .small_button("Release")
+                    .on_hover_text(
+                        "Make it the part's own again, as SolidWorks breaks an external \
+                         reference. The assembly drives it again when it is next opened and \
+                         saved, unless its equation is deleted there.",
+                    )
+                    .clicked()
+                {
+                    changes.push(Change::Release(d.name.clone()));
+                }
+                ui.end_row();
+            }
+        });
 }
 
 fn dimensions_tab(
@@ -580,7 +661,13 @@ fn dimensions_tab(
                         format_value(shown, d.unit),
                         d.unit.suffix()
                     ))
-                    .on_hover_text("Driven by an equation (Equations tab)");
+                    .on_hover_text(match &d.driven_by {
+                        Some(assembly) => format!(
+                            "Driven by an equation of {} (release it in the Equations tab)",
+                            oxyde_model::DrivenBy::name_of(assembly)
+                        ),
+                        None => "Driven by an equation (Equations tab)".to_owned(),
+                    });
                 } else {
                     let mut edited = shown;
                     let max = crate::dialogs::MAX_LENGTH;

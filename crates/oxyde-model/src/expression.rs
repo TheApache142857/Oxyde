@@ -17,11 +17,16 @@ use crate::dimensions::DimensionRef;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlobalId(pub u32);
 
-/// What a quoted name refers to.
+/// Gives [`Expr::evaluate`] the value of a reference in display units, or why it has none.
+pub type ValueOf<'a, D> = dyn FnMut(&Operand<D>, &str) -> Result<f64, String> + 'a;
+
+/// What a quoted name refers to: a global variable, or a dimension of the document. `D` is
+/// what the document's equations drive: a part's [`DimensionRef`], or an assembly's mate
+/// values and part dimensions (`oxyde-assembly`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Operand {
+pub enum Operand<D = DimensionRef> {
     Global(GlobalId),
-    Dimension(DimensionRef),
+    Dimension(D),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,9 +112,10 @@ impl Function {
     }
 }
 
-/// A parsed expression.
+/// A parsed expression, whose names refer to global variables and to dimensions of kind `D`
+/// (see [`Operand`]).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum Expr<D = DimensionRef> {
     Number(f64),
     /// π.
     Pi,
@@ -117,18 +123,21 @@ pub enum Expr {
     /// (e.g. from a file whose dimension was deleted); `name` is the name as last known, so
     /// the expression can still be shown and saved, and is reported as broken.
     Name {
-        operand: Option<Operand>,
+        operand: Option<Operand<D>>,
         name: String,
     },
-    Neg(Box<Expr>),
-    Binary(BinaryOp, Box<Expr>, Box<Expr>),
-    Call(Function, Vec<Expr>),
+    Neg(Box<Expr<D>>),
+    Binary(BinaryOp, Box<Expr<D>>, Box<Expr<D>>),
+    Call(Function, Vec<Expr<D>>),
 }
 
-impl Expr {
+impl<D: Clone> Expr<D> {
     /// Parses `text`, resolving each quoted name with `resolve`. Names that do not resolve
     /// are kept with `operand: None` (see [`Expr::unresolved`]).
-    pub fn parse(text: &str, resolve: &dyn Fn(&str) -> Option<Operand>) -> Result<Expr, String> {
+    pub fn parse(
+        text: &str,
+        resolve: &dyn Fn(&str) -> Option<Operand<D>>,
+    ) -> Result<Expr<D>, String> {
         let tokens = tokenize(text)?;
         let mut parser = Parser {
             tokens,
@@ -159,7 +168,7 @@ impl Expr {
     }
 
     /// Every reference in the expression.
-    pub fn operands(&self) -> Vec<Operand> {
+    pub fn operands(&self) -> Vec<Operand<D>> {
         let mut out = Vec::new();
         self.visit(&mut |e| {
             if let Expr::Name {
@@ -167,7 +176,7 @@ impl Expr {
                 ..
             } = e
             {
-                out.push(*operand);
+                out.push(operand.clone());
             }
         });
         out
@@ -175,32 +184,43 @@ impl Expr {
 
     /// Updates the remembered names (after a rename), with `name_of` returning the current
     /// name of a reference, or `None` if it no longer exists.
-    pub fn refresh_names(&mut self, name_of: &dyn Fn(Operand) -> Option<String>) {
+    pub fn refresh_names(&mut self, name_of: &dyn Fn(&Operand<D>) -> Option<String>) {
         self.visit_mut(&mut |e| {
             if let Expr::Name {
                 operand: Some(operand),
                 name,
             } = e
             {
-                if let Some(current) = name_of(*operand) {
+                if let Some(current) = name_of(operand) {
                     *name = current;
                 }
             }
         });
     }
 
+    /// Resolves again the names that matched nothing when they were read, with `resolve`:
+    /// an assembly's equations name parts that are only known once they are loaded.
+    pub fn resolve_missing(&mut self, resolve: &dyn Fn(&str) -> Option<Operand<D>>) {
+        self.visit_mut(&mut |e| {
+            if let Expr::Name {
+                operand: operand @ None,
+                name,
+            } = e
+            {
+                *operand = resolve(name);
+            }
+        });
+    }
+
     /// Evaluates the expression; `value_of` gives the value of a reference in display units.
-    pub fn evaluate(
-        &self,
-        value_of: &mut dyn FnMut(Operand, &str) -> Result<f64, String>,
-    ) -> Result<f64, String> {
+    pub fn evaluate(&self, value_of: &mut ValueOf<'_, D>) -> Result<f64, String> {
         let value = match self {
             Expr::Number(v) => *v,
             Expr::Pi => std::f64::consts::PI,
             Expr::Name {
                 operand: Some(operand),
                 name,
-            } => value_of(*operand, name)?,
+            } => value_of(operand, name)?,
             Expr::Name {
                 operand: None,
                 name,
@@ -263,7 +283,7 @@ impl Expr {
         }
     }
 
-    fn visit<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+    fn visit<'a>(&'a self, f: &mut dyn FnMut(&'a Expr<D>)) {
         f(self);
         match self {
             Expr::Neg(e) => e.visit(f),
@@ -276,7 +296,7 @@ impl Expr {
         }
     }
 
-    fn visit_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+    fn visit_mut(&mut self, f: &mut dyn FnMut(&mut Expr<D>)) {
         f(self);
         match self {
             Expr::Neg(e) => e.visit_mut(f),
@@ -288,7 +308,9 @@ impl Expr {
             Expr::Number(_) | Expr::Pi | Expr::Name { .. } => {}
         }
     }
+}
 
+impl<D> Expr<D> {
     /// Binding strength, for printing the fewest parentheses.
     fn precedence(&self) -> u8 {
         match self {
@@ -353,7 +375,7 @@ impl Expr {
 
 /// Prints the expression with the names it remembers; call [`Expr::refresh_names`] first
 /// for the current ones.
-impl fmt::Display for Expr {
+impl<D> fmt::Display for Expr<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write(f, 0)
     }
@@ -451,15 +473,15 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
 /// parentheses must be refused, not overflow the stack.
 const MAX_DEPTH: usize = 200;
 
-struct Parser<'a> {
+struct Parser<'a, D> {
     tokens: Vec<Token>,
     position: usize,
     /// Nesting of the `unary` rule being parsed, which every recursion goes through.
     depth: usize,
-    resolve: &'a dyn Fn(&str) -> Option<Operand>,
+    resolve: &'a dyn Fn(&str) -> Option<Operand<D>>,
 }
 
-impl Parser<'_> {
+impl<D: Clone> Parser<'_, D> {
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.position)
     }
@@ -491,7 +513,7 @@ impl Parser<'_> {
     }
 
     /// sum := product (('+' | '-') product)*
-    fn expression(&mut self) -> Result<Expr, String> {
+    fn expression(&mut self) -> Result<Expr<D>, String> {
         let mut left = self.product()?;
         loop {
             let op = if self.eat('+') {
@@ -507,7 +529,7 @@ impl Parser<'_> {
     }
 
     /// product := unary (('*' | '/') unary)*
-    fn product(&mut self) -> Result<Expr, String> {
+    fn product(&mut self) -> Result<Expr<D>, String> {
         let mut left = self.unary()?;
         loop {
             let op = if self.eat('*') {
@@ -523,7 +545,7 @@ impl Parser<'_> {
     }
 
     /// unary := ('-' | '+') unary | power
-    fn unary(&mut self) -> Result<Expr, String> {
+    fn unary(&mut self) -> Result<Expr<D>, String> {
         if self.depth >= MAX_DEPTH {
             return Err("the expression is nested too deeply".to_owned());
         }
@@ -533,7 +555,7 @@ impl Parser<'_> {
         result
     }
 
-    fn signed(&mut self) -> Result<Expr, String> {
+    fn signed(&mut self) -> Result<Expr<D>, String> {
         if self.eat('-') {
             return Ok(Expr::Neg(Box::new(self.unary()?)));
         }
@@ -544,7 +566,7 @@ impl Parser<'_> {
     }
 
     /// power := atom ('^' unary)?
-    fn power(&mut self) -> Result<Expr, String> {
+    fn power(&mut self) -> Result<Expr<D>, String> {
         let base = self.atom()?;
         if self.eat('^') {
             let exponent = self.unary()?;
@@ -557,7 +579,7 @@ impl Parser<'_> {
         Ok(base)
     }
 
-    fn atom(&mut self) -> Result<Expr, String> {
+    fn atom(&mut self) -> Result<Expr<D>, String> {
         match self.next() {
             Some(Token::Number(v)) => Ok(Expr::Number(v)),
             Some(Token::Name(name)) => Ok(Expr::Name {

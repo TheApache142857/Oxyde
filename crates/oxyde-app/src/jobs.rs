@@ -224,7 +224,8 @@ impl OxydeApp {
         self.start_job(&format!("Opening {name}"), move |kernel, progress| {
             let notes = doc.load_parts_with(kernel, Some(progress));
             progress.say("Solving the mates");
-            doc.solve();
+            doc.note_stale_parts();
+            doc.apply_equations(kernel);
             Outcome::AssemblyOpened {
                 doc,
                 notes,
@@ -240,7 +241,9 @@ impl OxydeApp {
         self.start_job(&format!("Back to {name}"), move |kernel, progress| {
             let notes = suspended.asm.reload_changed_with(kernel, Some(progress));
             progress.say("Solving the mates");
-            suspended.asm.solve();
+            suspended.asm.refresh_linked_equations();
+            suspended.asm.note_stale_parts();
+            suspended.asm.apply_equations(kernel);
             suspended.asm.revision = crate::document::next_revision();
             Outcome::AssemblyBack { suspended, notes }
         });
@@ -275,7 +278,9 @@ impl OxydeApp {
             move |kernel, progress| {
                 let notes = doc.reload_parts_with(kernel, Some(progress));
                 progress.say("Solving the mates");
-                doc.solve();
+                doc.refresh_linked_equations();
+                doc.note_stale_parts();
+                doc.apply_equations(kernel);
                 Outcome::AssemblyReloaded { doc, notes }
             },
         );

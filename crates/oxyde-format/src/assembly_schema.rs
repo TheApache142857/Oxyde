@@ -2,16 +2,18 @@
 
 use oxyde_assembly::{
     Assembly, Component, ComponentId, Mate, MateId, MateKind, MateRef, MateTarget, Placement,
+    TopLevelOnly,
 };
 use oxyde_geom::Vec3;
-use oxyde_model::{StandardAxis, StandardPlane};
+use oxyde_model::{EquationText, EquationsText, GlobalText, StandardAxis, StandardPlane};
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 
 use crate::schema::{
-    AppearanceDto, EdgeRefDto, FaceRefDto, StandardAxisDto, StandardPlaneDto, TextureTable,
-    appearance_dto, appearance_from, edge_dto, edge_from, face_dto, face_from,
+    AppearanceDto, EdgeRefDto, EquationDto, FaceRefDto, GlobalDto, StandardAxisDto,
+    StandardPlaneDto, TextureTable, appearance_dto, appearance_from, edge_dto, edge_from, face_dto,
+    face_from,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -21,6 +23,17 @@ pub(crate) struct AssemblyModel {
     pub components: Vec<ComponentDto>,
     #[serde(default)]
     pub mates: Vec<MateDto>,
+    /// `"Gap" = 2`: names are unique, ids never reused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub global_variables: Vec<GlobalDto>,
+    /// `"D1@Distance1" = "Gap" * 2`, `"D1@Sketch1@Top panel<1>.Part" = "Width" - 6`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub equations: Vec<EquationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_global_id: Option<u32>,
+    /// Linked equations file, relative to the assembly's folder; absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equations_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -96,6 +109,8 @@ pub(crate) enum TargetDto {
 
 impl AssemblyModel {
     pub fn from_assembly(assembly: &Assembly, textures: &TextureTable) -> Self {
+        // Names inside sub-assemblies are written as the application last resolved them.
+        let text = assembly.equations_text(&TopLevelOnly);
         AssemblyModel {
             next_component_id: assembly.next_component_id,
             next_mate_id: assembly.next_mate_id,
@@ -136,6 +151,26 @@ impl AssemblyModel {
                     b: ref_dto(&m.b),
                     aligned: m.aligned,
                     suppressed: m.suppressed,
+                })
+                .collect(),
+            next_global_id: (text.next_global_id > 1).then_some(text.next_global_id),
+            equations_file: text.linked_file.clone(),
+            global_variables: text
+                .globals
+                .into_iter()
+                .map(|g| GlobalDto {
+                    id: g.id,
+                    name: g.name,
+                    expression: g.expression,
+                    linked: g.linked,
+                })
+                .collect(),
+            equations: text
+                .equations
+                .into_iter()
+                .map(|e| EquationDto {
+                    dimension: e.dimension,
+                    expression: e.expression,
                 })
                 .collect(),
         }
@@ -239,12 +274,43 @@ impl AssemblyModel {
                 }
             }
         }
-        Ok(Assembly {
+        let mut assembly = Assembly {
             components,
             mates,
             next_component_id: self.next_component_id,
             next_mate_id: self.next_mate_id,
-        })
+            equations: Default::default(),
+        };
+        // Names reaching into sub-assemblies are found once the application has loaded
+        // them (`Assembly::resolve_equation_names`).
+        assembly
+            .set_equations_text(
+                EquationsText {
+                    globals: self
+                        .global_variables
+                        .into_iter()
+                        .map(|g| GlobalText {
+                            id: g.id,
+                            name: g.name,
+                            expression: g.expression,
+                            linked: g.linked,
+                        })
+                        .collect(),
+                    equations: self
+                        .equations
+                        .into_iter()
+                        .map(|e| EquationText {
+                            dimension: e.dimension,
+                            expression: e.expression,
+                        })
+                        .collect(),
+                    next_global_id: self.next_global_id.unwrap_or(1),
+                    linked_file: self.equations_file,
+                },
+                &TopLevelOnly,
+            )
+            .map_err(|e| format!("equations: {e}"))?;
+        Ok(assembly)
     }
 }
 

@@ -28,6 +28,8 @@
 mod app;
 mod appearance_ui;
 mod assembly;
+mod assembly_equations;
+mod assembly_equations_ui;
 mod assembly_ui;
 mod command_bar;
 mod configurations_ui;

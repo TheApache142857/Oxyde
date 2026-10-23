@@ -536,14 +536,22 @@ pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
 /// Loads a part from `path`. A part linked to an equations file takes the file's variables;
 /// if the file cannot be read, the part opens with the values it was saved with.
 pub fn load_part(path: &Path) -> Result<PartFile, FormatError> {
+    load_part_refreshed(path).map(|(part, _)| part)
+}
+
+/// [`load_part`], also saying whether the equations file changed the part: its file then
+/// holds older values than the part now has.
+pub fn load_part_refreshed(path: &Path) -> Result<(PartFile, bool), FormatError> {
     let mut part = read_part(BufReader::new(File::open(path)?))?;
     let mut refreshed = part.definition.clone();
+    let mut changed = false;
     if equations_file::refresh_linked_equations(path, &mut refreshed).is_ok()
         && Part::from_definition(refreshed.clone()).is_ok()
     {
+        changed = refreshed != part.definition;
         part.definition = refreshed;
     }
-    Ok(part)
+    Ok((part, changed))
 }
 
 /// An assembly document as stored on disk.
@@ -642,9 +650,16 @@ pub fn read_assembly<R: Read + Seek>(reader: R) -> Result<AssemblyFile, FormatEr
     })
 }
 
-/// Loads an assembly from `path`.
+/// Loads an assembly from `path`. An assembly linked to an equations file takes the file's
+/// variables; if the file cannot be read, the assembly opens with the values it was saved
+/// with.
 pub fn load_assembly(path: &Path) -> Result<AssemblyFile, FormatError> {
-    read_assembly(BufReader::new(File::open(path)?))
+    let mut file = read_assembly(BufReader::new(File::open(path)?))?;
+    let mut refreshed = file.assembly.clone();
+    if equations_file::refresh_assembly_linked_equations(path, &mut refreshed).is_ok() {
+        file.assembly = refreshed;
+    }
+    Ok(file)
 }
 
 /// Features and persistent names one at a time, in the JSON form `model.json` gives them
@@ -1253,6 +1268,33 @@ mod tests {
     }
 
     #[test]
+    fn values_driven_by_assemblies_are_stored_sorted_and_only_when_there_are_some() {
+        let json = |file: &PartFile| -> serde_json::Value {
+            let bytes = write_part(Cursor::new(Vec::new()), file)
+                .unwrap()
+                .into_inner();
+            let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap()
+        };
+        let mut file = sample();
+        assert!(json(&file).get("driven_by").is_none());
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect();
+        file.definition
+            .set_driven_by("b-id", "../B.oxyasm", &names(&["Thick"]));
+        file.definition
+            .set_driven_by("a-id", "../A.oxyasm", &names(&["D1@Sketch1"]));
+        let model = json(&file);
+        assert_eq!(model["driven_by"][0]["name"], "D1@Sketch1");
+        assert_eq!(model["driven_by"][0]["assembly"], "../A.oxyasm");
+        assert_eq!(model["driven_by"][0]["assembly_id"], "a-id");
+        assert_eq!(model["driven_by"][1]["name"], "Thick");
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        assert_eq!(read_part(Cursor::new(bytes)).unwrap(), file);
+    }
+
+    #[test]
     fn equations_are_stored_as_text() {
         let bytes = write_part(Cursor::new(Vec::new()), &sample())
             .unwrap()
@@ -1581,6 +1623,85 @@ mod tests {
             Err(FormatError::WrongKind { found, .. }) => assert_eq!(found, "assembly"),
             other => panic!("expected the wrong kind, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assembly_equations_are_stored_as_text_and_refreshed_from_their_file() {
+        use oxyde_assembly::TopLevelOnly;
+        // Without equations, none of their keys is written.
+        let file = sample_assembly();
+        let json: serde_json::Value =
+            serde_json::from_slice(&assembly_json(&file).unwrap()).unwrap();
+        for key in [
+            "global_variables",
+            "equations",
+            "next_global_id",
+            "equations_file",
+        ] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
+
+        let dir = std::env::temp_dir().join(format!("oxyde-asm-eq-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Case.txt"), "\"Width\" = 233\n").unwrap();
+        let mut file = sample_assembly();
+        let asm = &mut file.assembly;
+        let values = equations_file::read_equations_file(&dir.join("Case.txt")).unwrap();
+        asm.link_equations(Some("Case.txt".to_owned()), &values, &TopLevelOnly)
+            .unwrap();
+        let gap = asm.parse_expression("2", &TopLevelOnly).unwrap();
+        asm.equations.add_global("Gap", gap).unwrap();
+        for (target, text) in [
+            ("D1@Distance1", "\"Gap\" * 2"),
+            ("D1@Sketch1@Pin<1>.Part", "\"Width\" - 6"),
+        ] {
+            let target = asm.find_dimension(target, &TopLevelOnly).unwrap();
+            let name = asm.dimension_name(&target, &TopLevelOnly).unwrap();
+            let expr = asm.parse_expression(text, &TopLevelOnly).unwrap();
+            asm.equations.add_equation(target, name, expr).unwrap();
+        }
+        // A part inside a sub-assembly, not known until the application loads it.
+        let mut text = asm.equations_text(&TopLevelOnly);
+        text.equations.push(oxyde_model::EquationText {
+            dimension: "D1@Sketch1@SSD<1>.Part@Pin<1>.Assembly".to_owned(),
+            expression: "\"D1@Angle1\" + 1".to_owned(),
+        });
+        asm.set_equations_text(text, &TopLevelOnly).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&assembly_json(&file).unwrap()).unwrap();
+        assert_eq!(json["equations_file"], "Case.txt");
+        assert_eq!(json["global_variables"][0]["name"], "Width");
+        assert_eq!(json["global_variables"][0]["linked"], true);
+        assert_eq!(json["global_variables"][1]["expression"], "2");
+        assert_eq!(json["next_global_id"], 3);
+        assert_eq!(json["equations"][0]["dimension"], "D1@Distance1");
+        assert_eq!(json["equations"][1]["dimension"], "D1@Sketch1@Pin<1>.Part");
+        assert_eq!(json["equations"][1]["expression"], "\"Width\" - 6");
+        assert_eq!(
+            json["equations"][2]["dimension"],
+            "D1@Sketch1@SSD<1>.Part@Pin<1>.Assembly"
+        );
+
+        let path = dir.join("Case.oxyasm");
+        save_assembly(&path, &file).unwrap();
+        assert_eq!(load_assembly(&path).unwrap(), file);
+
+        // The file changed: opening the assembly takes the new value; without the file it
+        // opens with the values it was saved with.
+        std::fs::write(dir.join("Case.txt"), "' Case\n\"Width\" = 260\n").unwrap();
+        let text = load_assembly(&path)
+            .unwrap()
+            .assembly
+            .equations_text(&TopLevelOnly);
+        assert_eq!(text.globals[0].expression, "260");
+        std::fs::remove_file(dir.join("Case.txt")).unwrap();
+        let text = load_assembly(&path)
+            .unwrap()
+            .assembly
+            .equations_text(&TopLevelOnly);
+        assert_eq!(text.globals[0].expression, "233");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

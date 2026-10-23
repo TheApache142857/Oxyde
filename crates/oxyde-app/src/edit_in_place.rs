@@ -136,6 +136,11 @@ impl OxydeApp {
                 return;
             }
         };
+        // A part the assembly's equations changed opens as the assembly shows it.
+        let note = match self.asm.as_mut() {
+            Some(doc) if !read_only => doc.save_changed_part(&path).err(),
+            _ => None,
+        };
         let Some(parent) = self.asm.take() else {
             return;
         };
@@ -160,6 +165,11 @@ impl OxydeApp {
             "Editing {component_name} in place{}: File › Finish editing goes back to {parent_name}",
             if read_only { " (read-only)" } else { "" }
         );
+        if let Some(note) = note {
+            self.status.push_str(&format!(
+                " ({note}: it opens without the assembly's values)"
+            ));
+        }
     }
 
     /// The component being edited in place, if any: its instance name and the name of

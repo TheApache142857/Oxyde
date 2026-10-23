@@ -346,6 +346,14 @@ pub fn list() -> Vec<Value> {
             &["name", "value"],
         ),
         tool(
+            "release_dimension",
+            "Makes a dimension or global variable that an assembly's equation drives the \
+             part's own again (SolidWorks' Break external reference). The assembly drives it \
+             again when it is next opened and saved, unless its equation is deleted there.",
+            json!({ "name": string("Full name (\"D1@Sketch1\") or a variable's name.") }),
+            &["name"],
+        ),
+        tool(
             "rename_dimension",
             "Renames a dimension (\"D1@Sketch1\" to \"Width\").",
             json!({ "name": string("Full name."), "new_name": string("") }),
@@ -353,8 +361,13 @@ pub fn list() -> Vec<Value> {
         ),
         tool(
             "set_variable",
-            "Adds or changes a global variable (\"Width\" = 120).",
-            json!({ "name": string(""), "expression": string("e.g. \"120\" or \"\\\"Depth\\\" / 2\"") }),
+            "Adds or changes a global variable (\"Width\" = 120) of the part, or with \
+             \"assembly\": true of the open assembly.",
+            json!({
+                "name": string(""),
+                "expression": string("e.g. \"120\" or \"\\\"Depth\\\" / 2\""),
+                "assembly": { "type": "boolean", "description": "The open assembly's variable, not the part's." },
+            }),
             &["name", "expression"],
         ),
         tool(
@@ -363,17 +376,30 @@ pub fn list() -> Vec<Value> {
              \"Link to external file\"): a text file of \"Name\" = expression lines, found \
              relative to the part's folder. `variables` are written into the file first; the \
              part then takes every variable of the file, kept up to date when it is opened. \
-             set_variable on a linked variable changes the file. \"file\": null unlinks.",
+             set_variable on a linked variable changes the file. \"file\": null unlinks. \
+             With \"assembly\": true, links the open assembly: changing a linked variable \
+             there also updates its parts linked to the same file.",
             json!({
                 "file": string("e.g. \"Case dimensions.txt\", or null to unlink."),
                 "variables": { "type": "object", "description": "e.g. {\"Width\": \"233\", \"Depth\": \"300\"}" },
+                "assembly": { "type": "boolean", "description": "Link the open assembly, not the part." },
             }),
             &["file"],
         ),
         tool(
             "set_equation",
-            "Drives a dimension by an equation (\"D1@Sketch1\" = \"Width\" * 2).",
-            json!({ "dimension": string("Full name."), "expression": string("") }),
+            "Drives a dimension by an equation (\"D1@Sketch1\" = \"Width\" * 2). With \
+             \"assembly\": true, an equation of the open assembly, as SolidWorks has them: \
+             it drives a Distance or Angle mate (\"D1@Distance1\", mm or degrees) or a \
+             part's dimension or variable (\"D1@Sketch1@Top panel<1>.Part\", through a \
+             sub-assembly \"D1@Sketch1@SSD<1>.Part@SSD holder<1>.Assembly\"), and may read \
+             them. A part driven so changes for every instance of it and is saved with \
+             save_assembly.",
+            json!({
+                "dimension": string("Full name."),
+                "expression": string(""),
+                "assembly": { "type": "boolean", "description": "An equation of the open assembly, not the part." },
+            }),
             &["dimension", "expression"],
         ),
         tool(
@@ -663,7 +689,17 @@ fn dispatch(session: &mut Session, name: &str, args: &Value) -> Result<ToolOutpu
         "import_step" => modelling::import_step(session, args),
         "edit_feature" => modelling::edit_feature(session, args),
         "set_dimension" => modelling::set_dimension(session, args),
+        "release_dimension" => modelling::release_dimension(session, args),
         "rename_dimension" => modelling::rename_dimension(session, args),
+        "set_variable" if args::bool(args, "assembly", false)? => {
+            crate::assembly_equations::set_variable(session, args)
+        }
+        "set_equation" if args::bool(args, "assembly", false)? => {
+            crate::assembly_equations::set_equation(session, args)
+        }
+        "link_equations" if args::bool(args, "assembly", false)? => {
+            crate::assembly_equations::link_equations(session, args)
+        }
         "set_variable" => modelling::set_variable(session, args),
         "set_equation" => modelling::set_equation(session, args),
         "link_equations" => modelling::link_equations(session, args),
@@ -740,6 +776,18 @@ fn part_info(session: &mut Session, args: &Value) -> Result<ToolOutput> {
         })
         .collect();
     let mut out = json!({ "features": timeline, "body": body_summary(&session.kernel, part) });
+    // What assemblies drive in the part (SolidWorks' external references).
+    if !part.driven_by().is_empty() {
+        out.set(
+            "driven_by",
+            Value::Array(
+                part.driven_by()
+                    .iter()
+                    .map(|d| json!({ "name": d.name, "assembly": d.assembly }))
+                    .collect(),
+            ),
+        );
+    }
     if reference {
         out.set(
             "path",
@@ -764,8 +812,12 @@ fn part_info(session: &mut Session, args: &Value) -> Result<ToolOutput> {
             part.dimensions()
                 .into_iter()
                 .map(|d| {
-                    json!({ "name": d.full_name, "value": args::round(d.unit.to_display(d.value)),
-                        "unit": d.unit.suffix().trim(), "driven": d.driven })
+                    let mut row = json!({ "name": d.full_name, "value": args::round(d.unit.to_display(d.value)),
+                        "unit": d.unit.suffix().trim(), "driven": d.driven });
+                    if let Some(assembly) = &d.driven_by {
+                        row.set("driven_by", json!(assembly));
+                    }
+                    row
                 })
                 .collect(),
         ));

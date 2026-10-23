@@ -5,6 +5,53 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Assembly equations (unreleased, October 2026)
+
+- **Tools › Equations… in an assembly** (also *Equations* on the Evaluate tab), as in
+  SolidWorks: the assembly's own global variables, and equations that drive
+  - the value of a Distance or Angle mate: `"D1@Distance1" = "Gap" * 2` (mm, degrees);
+  - a dimension or a global variable of one of its parts, inside sub-assemblies too:
+    `"D1@Sketch1@Top panel<1>.Part" = "Width" - 6`, `"Thickness@Top panel<1>.Part" = 3`,
+    `"D1@Sketch1@SSD<1>.Part@SSD holder<1>.Assembly"`.
+
+  Expressions can read these values too. The list of what a new equation can drive narrows
+  as you type in it. The *Dimensions* tab lists the mates' values.
+- **A part driven by the assembly is rebuilt at once**, and changes for every instance of it,
+  since they share one file: giving two instances different values is an error on the second
+  equation. **Saving the assembly saves the parts it changed**, as SolidWorks saves the
+  modified components with their assembly; the status bar says how many. A part open in
+  another window, or changed on disk since it was read, is left alone and named there. A part
+  opened for editing in place is saved first, so it opens as the assembly shows it.
+- A driven mate's value shows with Σ in the Mate panel and the *Dimensions* tab; it is changed
+  through its equation. A value a mate cannot take (a negative distance, an angle outside
+  0–180°), a part dimension that the part's own equation drives and a variable of the part's
+  linked equations file are errors on the equation, and the value stays as it was.
+- **Linked equations files work in assemblies too**: *🔗 Link to file…* in the assembly's
+  Equations window. Changing a linked variable there writes the file and at once updates the
+  parts of the assembly linked to the same file, saved with the assembly: one `"Width" = 260`
+  in the Hackintosh case's window resizes its panels, and the mates move them. Parts whose
+  linked file changed since they were saved are saved with the assembly as well.
+- Sub-assemblies stay rigid: their own equations apply when they are opened on their own.
+- **Parts record what an assembly drives in them**, as SolidWorks' external references:
+  opened on its own, a part shows those dimensions and variables with Σ, "driven by Hackintosh
+  case", and refuses to change them (in its sketches, feature panels and Equations window).
+  Its Equations window lists them under *Driven by assemblies* (an assembly whose file is gone
+  shows "not found"); **Release** makes one the part's own again, as SolidWorks' *Break*. One
+  assembly drives a value at a time: another assembly's equation on it is an error until it is
+  released. *Save as* moves what the assembly drives to the new file.
+- Difference from SolidWorks: an equation names a part's dimension by its name, so renaming
+  the dimension in the part breaks the equation, shown in red, where SolidWorks follows the
+  rename.
+- **Files**: `global_variables`, `equations`, `next_global_id` and `equations_file` in
+  `assembly.json`, as in `model.json` (FORMAT.md §6), and `driven_by` in `model.json`
+  (FORMAT.md §3). Documents without them are written as before; older versions of Oxyde open
+  them with their last values and drop the equations and the records when they save them.
+- **The MCP server**: `set_variable`, `set_equation` and `link_equations` take
+  `"assembly": true` to work on the open assembly; `assembly_info` lists its equations with
+  their values; `save_assembly` saves the parts the equations changed (`parts_saved`).
+  `part_info` lists what assemblies drive in the part, `set_dimension` and `set_variable`
+  refuse those values, and `release_dimension` makes one the part's own again.
+
 ### Display styles (unreleased, October 2026)
 
 - **View › Display Style**, also on the view toolbar over the viewport (the button shows

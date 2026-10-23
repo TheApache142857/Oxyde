@@ -799,3 +799,250 @@ fn a_part_turns_about_its_own_middle() {
     assert!((after - before).length() < 100.0, "{before:?} -> {after:?}");
     assert!(close(placement.apply_vector(Vec3::Y).cross(Vec3::Z).length(), 0.0));
 }
+
+// ---- Equations -------------------------------------------------------------------------------
+
+/// A distance and an angle mate between the two components of [`two`].
+fn mated() -> (Assembly, ComponentId, ComponentId, MateId, MateId) {
+    let (mut asm, a, b) = two();
+    let front = |c| r(c, MateTarget::Plane(StandardPlane::Front));
+    let top = |c| r(c, MateTarget::Plane(StandardPlane::Top));
+    let distance = asm.add_mate(MateKind::Distance(5.0), front(a), front(b), true);
+    let angle = asm.add_mate(MateKind::Angle(0.5), top(a), top(b), true);
+    (asm, a, b, distance, angle)
+}
+
+fn add_equation(asm: &mut Assembly, target: &str, text: &str) {
+    let target = asm.find_dimension(target, &TopLevelOnly).unwrap();
+    let name = asm.dimension_name(&target, &TopLevelOnly).unwrap();
+    let expr = asm.parse_expression(text, &TopLevelOnly).unwrap();
+    asm.equations.add_equation(target, name, expr).unwrap();
+}
+
+fn mate_value(asm: &Assembly, id: MateId) -> f64 {
+    match asm.mate(id).unwrap().kind {
+        MateKind::Distance(d) => d,
+        MateKind::Angle(a) => a.to_degrees(),
+        _ => panic!("no value"),
+    }
+}
+
+#[test]
+fn equations_drive_mate_values() {
+    let (mut asm, _, _, distance, angle) = mated();
+    let gap = asm.parse_expression("2", &TopLevelOnly).unwrap();
+    asm.equations.add_global("Gap", gap).unwrap();
+    // Listed before the variable it uses: order does not matter.
+    add_equation(&mut asm, "D1@Angle1", "90 - \"D1@Distance1\" * 10");
+    add_equation(&mut asm, "D1@Distance1", "\"Gap\" * 3");
+    let results = asm.evaluate_equations(&mut NoParts);
+    assert_eq!(results.globals, vec![Ok(2.0)]);
+    assert_eq!(results.equations, vec![Ok(30.0), Ok(6.0)]);
+    assert!(close(mate_value(&asm, distance), 6.0));
+    assert!(close(mate_value(&asm, angle), 30.0));
+    assert!(asm.is_mate_driven(distance));
+    let dimensions = asm.mate_dimensions();
+    assert_eq!(dimensions.len(), 2);
+    assert_eq!(dimensions[0].full_name, "D1@Distance1");
+    assert!(dimensions[1].angle && dimensions[1].driven);
+    // Only mates with a value have a dimension, and only D1.
+    assert!(
+        asm.find_dimension("D1@Coincident1", &TopLevelOnly)
+            .is_none()
+    );
+    assert!(asm.find_dimension("D2@Distance1", &TopLevelOnly).is_none());
+}
+
+#[test]
+fn values_a_mate_cannot_take_are_errors() {
+    let (mut asm, _, _, distance, angle) = mated();
+    add_equation(&mut asm, "D1@Distance1", "-4");
+    add_equation(&mut asm, "D1@Angle1", "200");
+    let results = asm.evaluate_equations(&mut NoParts);
+    assert!(
+        results.equations[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("negative")
+    );
+    assert!(results.equations[1].as_ref().unwrap_err().contains("180"));
+    assert!(close(mate_value(&asm, distance), 5.0));
+    assert!(close(mate_value(&asm, angle), 0.5f64.to_degrees()));
+
+    // A deleted mate leaves its equation broken, kept by name.
+    asm.remove_mate(distance);
+    let results = asm.evaluate_equations(&mut NoParts);
+    assert!(
+        results.equations[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("D1@Distance1")
+    );
+    assert_eq!(
+        asm.equations_text(&TopLevelOnly).equations[0].dimension,
+        "D1@Distance1"
+    );
+    // Names that exist nowhere are refused when typed.
+    assert!(
+        asm.parse_expression("\"D1@Distance9\"", &TopLevelOnly)
+            .is_err()
+    );
+}
+
+/// Parts by path and name, as the application's loaded files would give them; each
+/// component its own file unless `files` says otherwise.
+#[derive(Default)]
+struct FakeParts {
+    values: std::collections::HashMap<(Vec<ComponentId>, String), f64>,
+    files: std::collections::HashMap<Vec<ComponentId>, String>,
+}
+
+impl PartValues for FakeParts {
+    fn file(&self, path: &[ComponentId]) -> Option<std::path::PathBuf> {
+        let file = self.files.get(path).cloned();
+        Some(file.unwrap_or_else(|| format!("{path:?}")).into())
+    }
+
+    fn value(&self, path: &[ComponentId], name: &str) -> Option<f64> {
+        self.values.get(&(path.to_vec(), name.to_owned())).copied()
+    }
+
+    fn drive(&mut self, path: &[ComponentId], name: &str, value: f64) -> Result<f64, String> {
+        let slot = self
+            .values
+            .get_mut(&(path.to_vec(), name.to_owned()))
+            .ok_or_else(|| format!("\"{name}\" does not exist"))?;
+        *slot = value;
+        Ok(value)
+    }
+}
+
+/// One sub-assembly, component 1 of the assembly, holding component 4 "SSD<1>".
+struct OneSub;
+
+impl ComponentTree for OneSub {
+    fn components(&self, path: &[ComponentId]) -> Option<Vec<(ComponentId, String)>> {
+        (path == [ComponentId(1)]).then(|| vec![(ComponentId(4), "SSD<1>".to_owned())])
+    }
+}
+
+#[test]
+fn equations_read_and_drive_parts() {
+    let (mut asm, a, b, distance, _) = mated();
+    let mut parts = FakeParts::default();
+    parts.values.insert((vec![a], "Thickness".to_owned()), 3.0);
+    parts
+        .values
+        .insert((vec![b], "D1@Sketch1".to_owned()), 40.0);
+    add_equation(&mut asm, "D1@Distance1", "\"Thickness@Base<1>.Part\" * 2");
+    add_equation(&mut asm, "D1@Sketch1@Pin<1>.Part", "\"D1@Distance1\" + 1");
+    let results = asm.evaluate_equations(&mut parts);
+    assert_eq!(results.equations, vec![Ok(6.0), Ok(7.0)]);
+    assert!(close(mate_value(&asm, distance), 6.0));
+    assert_eq!(parts.value(&[b], "D1@Sketch1"), Some(7.0));
+    assert_eq!(
+        asm.find_dimension("D1@Sketch1@Pin<1>.Part", &TopLevelOnly),
+        Some(AsmDimension::Part {
+            path: vec![b],
+            name: "D1@Sketch1".to_owned()
+        })
+    );
+    // A part that is not loaded is reported.
+    let results = asm.evaluate_equations(&mut NoParts);
+    assert!(results.equations[0].is_err() && results.equations[1].is_err());
+}
+
+#[test]
+fn instances_of_a_part_take_one_value() {
+    let (mut asm, a, b, ..) = mated();
+    let mut parts = FakeParts::default();
+    for c in [a, b] {
+        parts
+            .values
+            .insert((vec![c], "D1@Sketch1".to_owned()), 40.0);
+        parts.files.insert(vec![c], "plate.oxyprt".to_owned());
+    }
+    add_equation(&mut asm, "D1@Sketch1@Base<1>.Part", "50");
+    add_equation(&mut asm, "D1@Sketch1@Pin<1>.Part", "60");
+    let results = asm.evaluate_equations(&mut parts);
+    assert_eq!(results.equations[0], Ok(50.0));
+    assert!(
+        results.equations[1]
+            .as_ref()
+            .unwrap_err()
+            .contains("instance")
+    );
+    // The same value through both is fine.
+    let same = asm.parse_expression("50", &TopLevelOnly).unwrap();
+    asm.equations.set_equation_expression(1, same).unwrap();
+    let results = asm.evaluate_equations(&mut parts);
+    assert_eq!(results.equations, vec![Ok(50.0), Ok(50.0)]);
+}
+
+#[test]
+fn names_inside_sub_assemblies_resolve_once_known() {
+    let (mut asm, a, ..) = mated();
+    let name = "D1@Boss-Extrude1@SSD<1>.Part@Base<1>.Assembly";
+    let expected = AsmDimension::Part {
+        path: vec![a, ComponentId(4)],
+        name: "D1@Boss-Extrude1".to_owned(),
+    };
+    assert_eq!(asm.find_dimension(name, &OneSub), Some(expected.clone()));
+    assert_eq!(
+        asm.dimension_name(&expected, &OneSub).as_deref(),
+        Some(name)
+    );
+    assert!(asm.find_dimension(name, &TopLevelOnly).is_none());
+
+    // Read before the sub-assembly is loaded: kept by name, found afterwards.
+    let text = oxyde_model::EquationsText {
+        equations: vec![oxyde_model::EquationText {
+            dimension: name.to_owned(),
+            expression: "\"D1@Distance1\" * 2".to_owned(),
+        }],
+        next_global_id: 1,
+        ..Default::default()
+    };
+    asm.set_equations_text(text.clone(), &TopLevelOnly).unwrap();
+    assert_eq!(asm.equations.equations[0].target, None);
+    assert_eq!(asm.equations_text(&TopLevelOnly), text);
+    asm.resolve_equation_names(&OneSub);
+    assert_eq!(asm.equations.equations[0].target, Some(expected));
+    assert_eq!(asm.equations_text(&OneSub), text);
+}
+
+#[test]
+fn equations_text_round_trips_and_links_files() {
+    let (mut asm, ..) = mated();
+    let own = asm.parse_expression("7", &TopLevelOnly).unwrap();
+    asm.equations.add_global("Own", own).unwrap();
+    let linked = |name: &str, expression: &str| oxyde_model::LinkedValue {
+        name: name.to_owned(),
+        expression: expression.to_owned(),
+    };
+    asm.link_equations(
+        Some("Case dimensions.txt".to_owned()),
+        &[linked("Width", "233"), linked("Half", "\"Width\" / 2")],
+        &TopLevelOnly,
+    )
+    .unwrap();
+    add_equation(&mut asm, "D1@Distance1", "\"Half\" - 100");
+    let results = asm.evaluate_equations(&mut NoParts);
+    assert_eq!(results.equations, vec![Ok(16.5)]);
+    assert_eq!(
+        asm.linked_values(),
+        [linked("Width", "233"), linked("Half", "\"Width\" / 2")]
+    );
+
+    let text = asm.equations_text(&TopLevelOnly);
+    let mut copy = asm.clone();
+    copy.equations = Default::default();
+    copy.set_equations_text(text, &TopLevelOnly).unwrap();
+    assert_eq!(copy.equations, asm.equations);
+
+    // Unlinking keeps every variable as the assembly's own.
+    asm.link_equations(None, &[], &TopLevelOnly).unwrap();
+    assert!(asm.equations.linked_file.is_none());
+    assert!(asm.equations.globals.iter().all(|g| !g.linked));
+    assert_eq!(asm.equations.globals.len(), 3);
+}
