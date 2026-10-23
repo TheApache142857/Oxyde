@@ -16,6 +16,20 @@ release yet; the git history has every detail.
   build opens the file with the part free to turn again.
 - The MCP server's `add_mate` takes `"lock_rotation": true`, and `assembly_info` lists it.
 
+### Gruvbox and Classic 95 themes (unreleased, October 2026)
+
+- **Three new themes** in Tools › Preferences › Graphics, beside Flux and Light:
+  - **Gruvbox dark**: the warm "retro groove" palette, with cream text on charcoal, tan parts
+    and aqua selection;
+  - **Gruvbox light**: its daylight side, dark brown on cream;
+  - **Classic 95**: Windows 95, with grey panels, white fields, navy accents, square corners
+    and hard shadows, grey parts on the teal desktop, and Microsoft Sans Serif where Windows
+    has it.
+- As before, choosing a theme recolours the viewport too. Each theme's viewport colours are
+  also presets under *Viewport colours*, to mix with another theme.
+- A preferences file naming a theme the build doesn't know (written by a newer one) opens
+  with the default theme, keeping the other preferences.
+
 ### Links to the assembly that hold, and "->" external references (unreleased, October 2026)
 
 - **A part's global variable can be linked to its assembly from the part's Equations
@@ -42,6 +56,11 @@ release yet; the git history has every detail.
   Equations folders and window, and on the component in the assembly's tree and in the tree
   of a part edited in place. It reads "->?" (out of context) when that assembly is not the
   one the part is edited from; the hover says what drives what.
+- The boxes of a **new** variable's and a new equation's expression, in the part's and the
+  assembly's Equations windows, take a variable clicked in the tree too (until now only the
+  existing ones did, so nothing happened when one was clicked while typing a new equation).
+- **Equations** is a command of the **Features** tab in a part and of the **Assembly** tab in
+  an assembly, no longer of the Evaluate tab; Tools › Equations… stays.
 
 ### Linking values while editing in place (unreleased, October 2026)
 
@@ -89,7 +108,7 @@ release yet; the git history has every detail.
 
 ### Assembly equations (unreleased, October 2026)
 
-- **Tools › Equations… in an assembly** (also *Equations* on the Evaluate tab), as in
+- **Tools › Equations… in an assembly** (also *Equations* on the Assembly tab), as in
   SolidWorks: the assembly's own global variables, and equations that drive
   - the value of a Distance or Angle mate: `"D1@Distance1" = "Gap" * 2` (mm, degrees);
   - a dimension or a global variable of one of its parts, inside sub-assemblies too:

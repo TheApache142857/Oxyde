@@ -1894,7 +1894,6 @@ mod tests {
     fn panels_fit_in_the_window() {
         let ctx = egui::Context::default();
         let mut app = OxydeApp::blank(crate::prefs::Preferences::default(), None);
-        crate::theme::load_fonts(&ctx);
         app.apply_preferences(&ctx);
         // Every panel is checked before failing, to name all the panels a change broke.
         let mut problems = Vec::new();
