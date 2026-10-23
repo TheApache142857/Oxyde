@@ -461,8 +461,14 @@ fn meet(s: &Segment, t: &Segment, tol: f64) -> Vec<(P, Met)> {
                 let off = center.sub(foot).length();
                 if off <= radius + tol {
                     let half = (radius * radius - off * off).max(0.0).sqrt();
-                    out.push((foot.add(u.scale(half)), Met::Crossing));
-                    out.push((foot.sub(u.scale(half)), Met::Crossing));
+                    if half <= tol / 2.0 {
+                        // Touching: the root's square root would turn rounding into a
+                        // point off where they touch, and a tangent leaving it skewed.
+                        out.push((foot, Met::Crossing));
+                    } else {
+                        out.push((foot.add(u.scale(half)), Met::Crossing));
+                        out.push((foot.sub(u.scale(half)), Met::Crossing));
+                    }
                 }
             }
         }
@@ -488,8 +494,12 @@ fn meet(s: &Segment, t: &Segment, tol: f64) -> Vec<(P, Met)> {
                 let u = d.scale(1.0 / dist);
                 let mid = c1.add(u.scale(a));
                 let n = P::new(-u.y, u.x);
-                out.push((mid.add(n.scale(h)), Met::Crossing));
-                out.push((mid.sub(n.scale(h)), Met::Crossing));
+                if h <= tol / 2.0 {
+                    out.push((mid, Met::Crossing));
+                } else {
+                    out.push((mid.add(n.scale(h)), Met::Crossing));
+                    out.push((mid.sub(n.scale(h)), Met::Crossing));
+                }
             }
         }
     }
@@ -768,8 +778,10 @@ impl Arrangement {
             }
         }
         for list in &mut around {
+            // Directions this close are one, to rounding where curves touch: then the one
+            // turning least left comes first.
             list.sort_by(|a, b| {
-                if (a.1 - b.1).abs() > 1e-9 {
+                if (a.1 - b.1).abs() > 1e-6 {
                     a.1.total_cmp(&b.1)
                 } else {
                     a.2.total_cmp(&b.2)
@@ -844,10 +856,27 @@ impl Arrangement {
             if *area > tol * tol {
                 continue;
             }
-            let Some(&first) = cycle.first() else {
+            // A point just outside the hole, beside the middle of its longest piece: a corner
+            // of it may be on another region's edge (a circle touching it there).
+            let polygon = self.polygon(cycle);
+            let Some(probe) = polygon
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| (a, polygon[(i + 1) % polygon.len()]))
+                .max_by(|x, y| x.0.distance(x.1).total_cmp(&y.0.distance(y.1)))
+                .and_then(|(a, b)| {
+                    let d = b.sub(a);
+                    let l = d.length();
+                    // The hole runs clockwise: what holds it is on its left.
+                    (l > 0.0).then(|| {
+                        let left = P::new(-d.y / l, d.x / l);
+                        a.add(d.scale(0.5))
+                            .add(left.scale((0.01 * l).min(100.0 * tol)))
+                    })
+                })
+            else {
                 continue;
             };
-            let probe = self.points[self.head(first)];
             let mut best: Option<usize> = None;
             for (r, (_, region_area, polygon)) in regions.iter().enumerate() {
                 // Not the region on the other side of the same edges.

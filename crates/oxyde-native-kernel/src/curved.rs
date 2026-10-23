@@ -14,10 +14,13 @@
 //! piece that reaches a cone's apex or a sphere's pole runs along a degenerate edge there.
 //! A shell left inside a solid with its faces turned inwards is a void of that solid.
 //!
-//! What meets in lines and circles only: planes; cylinders square to the planes they meet
-//! or along them, and parallel to the other cylinders; cones, spheres and tori sharing
-//! their axis with the surfaces of revolution they meet, square to the planes they meet or
-//! holding them along their axis. Anything else answers [`NativeError::Unsupported`].
+//! What meets in lines and circles: planes; cylinders square to the planes they meet or
+//! along them, and parallel to the other cylinders; cones, spheres and tori sharing their
+//! axis with the surfaces of revolution they meet (a sphere shares any axis through its
+//! centre), square to the planes they meet or holding them along their axis. Off the axis,
+//! circles at a slant and sections, followed exactly (docs/NATIVE_KERNEL.md §5). Faces that
+//! only touch, or meet along edges they both end at, are not cut. Anything else answers
+//! [`NativeError::Unsupported`].
 
 // Indices into the points, edges and faces gathered here.
 #![allow(clippy::indexing_slicing)]
@@ -759,6 +762,22 @@ fn prepare_face(solid: &Solid, face: &Face, sources: Vec<Source>) -> Result<Prep
     })
 }
 
+/// A face prepared for telling whether points of its surface lie in it.
+pub(crate) struct FaceTest(Prepared);
+
+impl FaceTest {
+    pub fn new(solid: &Solid, face: &Face) -> Result<FaceTest, NativeError> {
+        Ok(FaceTest(prepare_face(solid, face, Vec::new())?))
+    }
+
+    /// Whether `p`, a point of the face's surface, lies inside the face.
+    pub fn contains(&self, p: Point3) -> bool {
+        let face = &self.0;
+        face.surface.distance(p) <= TOL
+            && on_face(face, p).is_some_and(|q| arrangement::inside(&face.boundary, q, TOL))
+    }
+}
+
 fn edge3(solid: &Solid, u: EdgeUse) -> Edge3 {
     let edge = solid.edges[u.edge as usize];
     let e = Edge3 {
@@ -879,6 +898,9 @@ enum Cut {
     Circle(Circle, Point3),
     /// A whole loop of a section, starting at `start` (at the carrier's angle zero).
     Section(Section, Point3),
+    /// A stretch of a section from `start` to `end`, as its angle grows: where a curve
+    /// that does not go round its carrier (a plane's hyperbola on a cone) crosses a face.
+    SectionArc(Section, Point3, Point3),
     /// The two faces lie on one surface: each is cut along the other's boundary.
     Same,
 }
@@ -921,6 +943,18 @@ fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
         (Surface::Revolution(_), Surface::Plane(_)) => plane_revolution(b, a),
         (Surface::Revolution(r1), Surface::Revolution(r2)) => {
             if let Some(m) = r1.coaxial_meridian(r2, TOL) {
+                return coaxial(a, b, r1, &m);
+            }
+            // A sphere is turned about every line through its centre: one centred on the
+            // other's axis shares it.
+            if let Some(s1) = r1.sphere_about(&r2.axis, TOL)
+                && let Some(m) = s1.coaxial_meridian(r2, TOL)
+            {
+                return coaxial(a, b, &s1, &m);
+            }
+            if let Some(s2) = r2.sphere_about(&r1.axis, TOL)
+                && let Some(m) = r1.coaxial_meridian(&s2, TOL)
+            {
                 return coaxial(a, b, r1, &m);
             }
             match (r1.cylinder_radius(), r2.cylinder_radius()) {
@@ -1170,9 +1204,26 @@ fn plane_section(
             .ok_or(NativeError::Unsupported(
                 "intersect a cone with a plane it meets in a curve that does not go round its axis",
             )),
-        Meridian::Circle { .. } => Err(NativeError::Unsupported(
-            "intersect a torus with a plane that neither holds its axis nor is square to it",
-        )),
+        Meridian::Circle { center, radius } => {
+            // The plane's height above the circle the tube's centre runs round, at its
+            // lowest and highest: a plane no nearer than the tube's radius misses it, or
+            // touches it at a point.
+            let a = r.axis.direction;
+            let n = p.normal;
+            let across = (n - a * n.dot(a)).length();
+            let middle = (r.axis.origin - p.origin).dot(n);
+            let (lowest, highest) = (middle - center * across, middle + center * across);
+            if lowest >= radius - TOL || highest <= -radius + TOL {
+                return Ok(Vec::new());
+            }
+            // The plane may cut the torus beside the faces, and the faces touch at most.
+            if !cross_inside(plane_face, revolution_face) {
+                return Ok(Vec::new());
+            }
+            Err(NativeError::Unsupported(
+                "intersect a torus with a plane that neither holds its axis nor is square to it",
+            ))
+        }
     }
 }
 
@@ -1198,8 +1249,10 @@ fn seam_start(r: &Revolution, circle: &Circle) -> Point3 {
 }
 
 /// The loops where the carrier's straight lines meet `other` all the way round its axis,
-/// each a section, those that come near both faces; `None` when one of them does not go all
-/// the way round (the curve turns back, or touches itself).
+/// each a section, those that come near both faces; and where `other` is a plane that the
+/// lines do not all reach (a hyperbola or a parabola on a cone), the stretches of its one
+/// section that come near the carrier's face. `None` when the curve turns back (two
+/// crossings of each line that come together) or touches itself.
 fn sections(carrier: &Revolution, other: &Surface, a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
     let mut cuts = Vec::new();
     for branch in 0..2u8 {
@@ -1216,7 +1269,18 @@ fn sections(carrier: &Revolution, other: &Surface, a: &Prepared, b: &Prepared) -
             break;
         }
         if reaches < 360 || !s.goes_round() {
-            return None;
+            if !matches!(other, Surface::Plane(_)) {
+                return None;
+            }
+            let face = if matches!(a.surface, Surface::Revolution(r) if r == *carrier) {
+                a
+            } else {
+                b
+            };
+            for (start, end) in stretches(&s, face) {
+                cuts.push(Cut::SectionArc(s, start, end));
+            }
+            continue;
         }
         let start = s.point_at(0.0)?;
         if section_meets(&s, a) && section_meets(&s, b) {
@@ -1224,6 +1288,62 @@ fn sections(carrier: &Revolution, other: &Surface, a: &Prepared, b: &Prepared) -
         }
     }
     Some(cuts)
+}
+
+/// The stretches of a section that does not go round its carrier lying near the
+/// carrier's face: the runs of angles where it has a point within the face's stretch of
+/// `v` (and a little more, so that each runs out across the face's edge), their ends found
+/// by bisection, each from its start to its end as the angle grows.
+fn stretches(s: &Section, face: &Prepared) -> Vec<(Point3, Point3)> {
+    let Chart::Revolution { surface, m, .. } = face.chart else {
+        return Vec::new();
+    };
+    let (vlo, vhi) = (face.lo.y / m, face.hi.y / m);
+    let margin = 0.1 * (vhi - vlo) + 100.0 * TOL;
+    let near = |theta: f64| -> bool {
+        s.point_at(theta).is_some_and(|p| {
+            let v = surface.params(p).1;
+            v > vlo - margin && v < vhi + margin
+        })
+    };
+    let n = 720;
+    let step = TAU / f64::from(n);
+    let inside: Vec<bool> = (0..n).map(|i| near(step * f64::from(i))).collect();
+    if inside.iter().all(|&x| x) || inside.iter().all(|&x| !x) {
+        return Vec::new();
+    }
+    // Where a run starts: the first sample in after one out.
+    let refine = |out: f64, inn: f64| -> f64 {
+        let (mut lo, mut hi) = (out, inn);
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if near(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    };
+    let mut out = Vec::new();
+    for i in 0..n as usize {
+        let prev = (i + n as usize - 1) % n as usize;
+        if !inside[i] || inside[prev] {
+            continue;
+        }
+        let mut j = i;
+        while inside[(j + 1) % n as usize] {
+            j += 1;
+        }
+        let t_start = refine(step * (i as f64 - 1.0), step * i as f64);
+        let t_end = refine(step * (j as f64 + 1.0), step * j as f64);
+        if let (Some(a), Some(b)) = (s.point_at(t_start), s.point_at(t_end))
+            && a.distance(b) > TOL
+        {
+            out.push((a, b));
+        }
+    }
+    out
 }
 
 /// Whether a whole loop of a section comes into a face's box.
@@ -1280,9 +1400,51 @@ fn crossing(
             Vec::new()
         });
     }
+    // Two cylinders of one radius whose axes cross meet in two ellipses, in the two planes
+    // through the crossing that halve the angles between the axes.
+    if let (Some(ra), Some(rb)) = (r1.cylinder_radius(), r2.cylinder_radius())
+        && (ra - rb).abs() <= TOL
+        && let Some(o) = axes_cross(&r1.axis, &r2.axis)
+    {
+        let (d1, d2) = (r1.axis.direction, r2.axis.direction);
+        let mut cuts = Vec::new();
+        for normal in [d1 - d2, d1 + d2] {
+            let Some(normal) = normal.normalized() else {
+                continue;
+            };
+            let s = Section {
+                carrier: *r1,
+                other: Surface::Plane(oxyde_geom::Plane {
+                    origin: o,
+                    x_dir: crate::geometry::perpendicular(normal),
+                    normal,
+                }),
+                branch: 0,
+                ccw: true,
+            };
+            if let Some(start) = s.point_at(0.0)
+                && section_meets(&s, a)
+                && section_meets(&s, b)
+            {
+                cuts.push(Cut::Section(s, start));
+            }
+        }
+        return Ok(cuts);
+    }
     let torus =
         |r: &Revolution| matches!(r.meridian, Meridian::Circle { center, .. } if center > 0.0);
     if torus(r1) || torus(r2) {
+        if !cross_inside(a, b) {
+            return Ok(Vec::new());
+        }
+        // Along a cylinder's or a cone's lines, a torus may be only touched.
+        for (carrier, other) in [(r1, r2), (r2, r1)] {
+            if matches!(carrier.meridian, Meridian::Line { .. })
+                && meets_only_at_edges(carrier, &Surface::Revolution(*other), a, b)
+            {
+                return Ok(Vec::new());
+            }
+        }
         return Err(NativeError::Unsupported(
             "intersect a torus with a surface of revolution on another axis",
         ));
@@ -1292,14 +1454,146 @@ fn crossing(
         .filter(|(c, _)| matches!(c.meridian, Meridian::Line { .. }))
         .collect();
     carriers.sort_by(|p, q| p.0.size().total_cmp(&q.0.size()));
-    for (carrier, other) in carriers {
+    for &(carrier, other) in &carriers {
         if let Some(cuts) = sections(carrier, &Surface::Revolution(*other), a, b) {
             return Ok(cuts);
         }
     }
+    // A curve that turns back may still only touch where both faces are: no cut then.
+    if let Some(&(carrier, other)) = carriers.first()
+        && meets_only_at_edges(carrier, &Surface::Revolution(*other), a, b)
+    {
+        return Ok(Vec::new());
+    }
     Err(NativeError::Unsupported(
         "intersect surfaces of revolution that meet in a curve turning back on itself",
     ))
+}
+
+/// Whether the carrier's straight lines meet `other` in both faces only along their edges:
+/// the surfaces miss each other there, touch at a point, or run into each other along an
+/// edge both faces already end at (two blends meeting at a joint). Nothing to cut then.
+fn meets_only_at_edges(carrier: &Revolution, other: &Surface, a: &Prepared, b: &Prepared) -> bool {
+    let edge = 100.0 * TOL;
+    // How far inside a face `p` is: `None` outside it.
+    let depth = |f: &Prepared, p: Point3| -> Option<f64> {
+        let q = on_face(f, p)?;
+        let d = arrangement::distance_to(&f.boundary, q, TOL);
+        (d <= edge || arrangement::inside(&f.boundary, q, TOL)).then_some(d)
+    };
+    for branch in 0..4u8 {
+        let s = Section {
+            carrier: *carrier,
+            other: *other,
+            branch,
+            ccw: true,
+        };
+        for i in 0..1440 {
+            let Some(p) = s.point_at(TAU * f64::from(i) / 1440.0) else {
+                continue;
+            };
+            if let (Some(da), Some(db)) = (depth(a, p), depth(b, p))
+                && da > edge
+                && db > edge
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// How far `p` is from `surface`, signed: positive on the side its normal points to.
+fn signed_distance(surface: &Surface, p: Point3) -> f64 {
+    match surface {
+        Surface::Plane(plane) => (p - plane.origin).dot(plane.normal),
+        Surface::Revolution(r) => {
+            let (rho, z) = r.rho_z(p);
+            let away = match r.meridian {
+                Meridian::Line { radius, slope } => {
+                    (rho - radius - slope * z) / (1.0 + slope * slope).sqrt()
+                }
+                Meridian::Circle { center, radius } => {
+                    ((rho - center).powi(2) + z * z).sqrt() - radius
+                }
+            };
+            if r.outward { away } else { -away }
+        }
+    }
+}
+
+/// Whether the surfaces of `a` and `b` cross inside both faces, clear of their edges:
+/// over a fine grid of each face's chart, where the other's signed distance changes sign
+/// between two neighbouring points, the crossing found by bisection lies well inside both.
+/// When they do not, the faces miss, touch, or meet along edges they both end at, and
+/// there is nothing to cut.
+fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
+    let edge = 100.0 * TOL;
+    let well_inside = |f: &Prepared, p: Point3| -> bool {
+        on_face(f, p).is_some_and(|q| {
+            arrangement::inside(&f.boundary, q, TOL)
+                && arrangement::distance_to(&f.boundary, q, TOL) > edge
+        })
+    };
+    let n = 96;
+    for (face, other) in [(a, b), (b, a)] {
+        let at = |i: usize, j: usize| {
+            P::new(
+                face.lo.x + (face.hi.x - face.lo.x) * i as f64 / n as f64,
+                face.lo.y + (face.hi.y - face.lo.y) * j as f64 / n as f64,
+            )
+        };
+        let side = |q: P| signed_distance(&other.surface, face.chart.to_world(q));
+        let values: Vec<Vec<f64>> = (0..=n)
+            .map(|i| (0..=n).map(|j| side(at(i, j))).collect())
+            .collect();
+        for i in 0..=n {
+            for j in 0..=n {
+                for (di, dj) in [(1, 0), (0, 1)] {
+                    let (k, l) = (i + di, j + dj);
+                    if k > n || l > n {
+                        continue;
+                    }
+                    let (f0, f1) = (values[i][j], values[k][l]);
+                    if (f0 > 0.0) == (f1 > 0.0) {
+                        continue;
+                    }
+                    let (mut lo, mut hi) = (at(i, j), at(k, l));
+                    let positive = f0 > 0.0;
+                    for _ in 0..40 {
+                        let mid = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+                        if (side(mid) > 0.0) == positive {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    let q = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+                    let p = face.chart.to_world(q);
+                    if well_inside(face, p) && well_inside(other, p) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Where two axes that are not parallel cross, if they do.
+fn axes_cross(a: &oxyde_geom::Axis, b: &oxyde_geom::Axis) -> Option<Point3> {
+    let (d1, d2) = (a.direction, b.direction);
+    let n = d1.cross(d2);
+    let nn = n.dot(n);
+    if nn < 1e-18 {
+        return None;
+    }
+    let w = b.origin - a.origin;
+    // a.origin + s d1 and b.origin + t d2, closest.
+    let s = w.cross(d2).dot(n) / nn;
+    let t = w.cross(d1).dot(n) / nn;
+    let (p, q) = (a.origin + d1 * s, b.origin + d2 * t);
+    (p.distance(q) <= TOL).then(|| p + (q - p) * 0.5)
 }
 
 /// Where the meridian of `r` crosses the height `t` along its axis, as `(ρ, z)` with `ρ > 0`.
@@ -1318,10 +1612,13 @@ fn plane_height_crossings(r: &Revolution, t: f64) -> Vec<(f64, f64)> {
                 return Vec::new();
             }
             let half = (radius * radius - t * t).max(0.0).sqrt();
-            let mut out = vec![(center + half, t)];
-            if half > TOL {
-                out.push((center - half, t));
-            }
+            // Where the plane touches the tube, its root's square root turns rounding into
+            // a circle off the one it touches along.
+            let mut out = if half > TOL {
+                vec![(center + half, t), (center - half, t)]
+            } else {
+                vec![(center, t.signum() * radius)]
+            };
             out.retain(|&(rho, _)| rho > TOL);
             out
         }
@@ -1401,6 +1698,14 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
         }
         (Cut::Section(section, start), _) => {
             laid_copies(face, lay_loop(chart, Curve::Section(*section), *start))
+        }
+        (Cut::SectionArc(section, start, end), _) => {
+            let e = Edge3 {
+                a: *start,
+                b: *end,
+                curve: Curve::Section(*section),
+            };
+            laid_copies(face, lay(chart, &e, chart.to_2d(*start)))
         }
         (Cut::Same, _) => {
             // The other face's boundary, laid out in this face's chart, at each of its

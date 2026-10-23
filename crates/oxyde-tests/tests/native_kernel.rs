@@ -7,15 +7,15 @@
 use oxyde_geom::{Axis, Plane, Point2, Point3, Transform, Vec3};
 use oxyde_kernel::{Kernel, ShapeHandle, SurfaceKind, TopologyCounts};
 use oxyde_model::{
-    AxisRef, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceName, FeatureId, FeatureKind,
-    FeatureStatus, LinearPattern, Part, PatternDirection, Sketch, SketchPlane, StandardAxis,
-    StandardPlane, VertexName,
+    AxisRef, ChamferShape, EdgeBlend, EdgeName, Extrude, ExtrudeExtent, ExtrudeOp, FaceKey,
+    FaceName, FeatureId, FeatureKind, FeatureStatus, LinearPattern, Part, PatternDirection, Sketch,
+    SketchPlane, StandardAxis, StandardPlane, VertexName,
 };
 use oxyde_native_kernel::NativeKernel;
 use oxyde_occt::OcctKernel;
 
 /// What a kernel made of a shape, as the comparisons read it.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Measures {
     volume: f64,
     centre: Point3,
@@ -155,12 +155,40 @@ fn build<K: Kernel>(part: &Part, kernel: &mut K) -> Built {
 
 /// Builds `part` with both kernels and compares everything [`Built`] holds.
 fn assert_same_part(what: &str, part: &Part) {
+    compare_parts(what, part, true);
+}
+
+/// As [`assert_same_part`], but for where OpenCASCADE cuts an edge at a point that is no
+/// corner (only two edges meet there, between the same two faces) and the native kernel
+/// leaves it whole: every face the same, the edges and vertices not counted.
+fn assert_same_faces(what: &str, part: &Part) {
+    compare_parts(what, part, false);
+}
+
+fn compare_parts(what: &str, part: &Part, every_edge: bool) {
     let occt = build(part, &mut OcctKernel::new());
     let native = build(part, &mut NativeKernel::new());
     let tolerance = if occt.fitted { FITTED } else { EXACT };
     assert_eq!(native.solids.len(), occt.solids.len(), "{what}: bodies");
     for (i, (n, o)) in native.solids.iter().zip(&occt.solids).enumerate() {
-        assert_same_measures(&format!("{what}, body {i}"), n, o, tolerance);
+        if every_edge {
+            assert_same_measures(&format!("{what}, body {i}"), n, o, tolerance);
+        } else {
+            let faces_only = |m: &Measures| Measures {
+                counts: TopologyCounts {
+                    edges: 0,
+                    vertices: 0,
+                    ..m.counts
+                },
+                ..*m
+            };
+            assert_same_measures(
+                &format!("{what}, body {i}"),
+                &faces_only(n),
+                &faces_only(o),
+                tolerance,
+            );
+        }
     }
     let names =
         |faces: &[SeenFace]| -> Vec<FaceName> { faces.iter().map(|f| f.name.clone()).collect() };
@@ -169,11 +197,29 @@ fn assert_same_part(what: &str, part: &Part) {
         names(&occt.faces),
         "{what}: face names"
     );
-    assert_eq!(native.edges, occt.edges, "{what}: edge names");
-    assert_eq!(native.vertices, occt.vertices, "{what}: vertex names");
+    if every_edge {
+        assert_eq!(native.edges, occt.edges, "{what}: edge names");
+        assert_eq!(native.vertices, occt.vertices, "{what}: vertex names");
+    }
+    // Where OpenCASCADE fits a B-spline surface to a blend (a bevel between a cylinder and
+    // a cone on one axis), the native kernel makes the exact one, a cone: their areas only
+    // as close as the fit.
+    let tolerance = if occt.faces.iter().any(|f| f.surface == SurfaceKind::BSpline) {
+        FITTED
+    } else {
+        tolerance
+    };
     for (n, o) in native.faces.iter().zip(&occt.faces) {
         let name = &n.name;
-        assert_eq!(n.surface, o.surface, "{what}, surface of {name:?}");
+        let fitted_blend = o.surface == SurfaceKind::BSpline
+            && n.surface != SurfaceKind::Plane
+            && matches!(
+                name.key,
+                FaceKey::FromEdge { .. } | FaceKey::FromVertex { .. }
+            );
+        if !fitted_blend {
+            assert_eq!(n.surface, o.surface, "{what}, surface of {name:?}");
+        }
         assert_close(
             &format!("{what}, area of {name:?}"),
             n.area,
@@ -195,6 +241,32 @@ fn assert_same_part(what: &str, part: &Part) {
             other => panic!("{what}, normal of {name:?}: {other:?}"),
         }
         match (n.axis, o.axis) {
+            // A round's cylinder runs along its edge, each kernel taking its own edge's way,
+            // and a torus the way that cylinder does: the same line, either way along it.
+            // A sphere is the same about any line through its centre.
+            (Some(n), Some(o))
+                if loose_axis(name, n_surface(&native, name))
+                    && n_surface(&native, name) == SurfaceKind::Sphere =>
+            {
+                assert_point_close(
+                    &format!("{what}, centre of {name:?}"),
+                    n.origin,
+                    o.origin,
+                    EXACT,
+                );
+            }
+            (Some(n), Some(o)) if loose_axis(name, n_surface(&native, name)) => {
+                assert!(
+                    n.direction.cross(o.direction).length() < 1e-9,
+                    "{what}, axis of {name:?}: native {n:?}, OpenCASCADE {o:?}"
+                );
+                let off = n.origin - o.origin;
+                let off = off - o.direction * off.dot(o.direction);
+                assert!(
+                    off.length() <= EXACT * o.origin.to_vec().length().max(1.0),
+                    "{what}, axis of {name:?}: native {n:?}, OpenCASCADE {o:?}"
+                );
+            }
             (Some(n), Some(o)) => {
                 assert!(
                     (n.direction - o.direction).length() < 1e-9,
@@ -208,9 +280,31 @@ fn assert_same_part(what: &str, part: &Part) {
                 );
             }
             (None, None) => {}
+            // OpenCASCADE's fitted surface has no axis.
+            (Some(_), None) if fitted_blend => {}
             other => panic!("{what}, axis of {name:?}: {other:?}"),
         }
     }
+}
+
+/// The kind of surface the native kernel gave the face named `name`.
+fn n_surface(built: &Built, name: &FaceName) -> SurfaceKind {
+    built
+        .faces
+        .iter()
+        .find(|f| &f.name == name)
+        .map_or(SurfaceKind::Other, |f| f.surface)
+}
+
+/// Whether a face's axis is compared as a line only: a blend's, whose way along its axis
+/// each kernel takes from the way it runs along its edges (a round's cylinder runs along its
+/// edge, a torus or a cone the way the edge's circle or the cylinder it leaves does, which
+/// may be another blend's); a corner's sphere by its centre only.
+fn loose_axis(name: &FaceName, surface: SurfaceKind) -> bool {
+    matches!(
+        name.key,
+        FaceKey::FromEdge { .. } | FaceKey::FromVertex { .. }
+    ) && surface != SurfaceKind::Plane
 }
 
 /// A closed polygon of lines through `corners`, in the sketch's coordinates.
@@ -982,10 +1076,11 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut sketch = on_top(base);
     sketch.circle(Point2::new(20.0, 15.0), 4.0);
     cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
-    // A hole as wide across it from the side: two cylinders of one size whose axes cross
-    // meet in two ellipses that cross each other, which the native kernel cannot cut yet.
+    // A hole as wide across it from the side, beside the first's axis: it goes only partly
+    // through the first, in a loop that turns back along either one's straight lines,
+    // which the native kernel cannot cut yet.
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
-    sketch.circle(Point2::new(-5.0, 15.0), 4.0);
+    sketch.circle(Point2::new(-5.0, 20.0), 4.0);
     extrude(
         &mut part,
         sketch,
@@ -1434,8 +1529,11 @@ fn balls_tori_and_rods_on_one_axis() {
 
 #[test]
 fn holes_crossing_each_other() {
-    // A hole down through the block, then one across it, through its axis and beside it.
-    for (y, r) in [(15.0, 3.0), (15.5, 3.0), (15.0, 2.0)] {
+    // A hole down through the block, then one across it, through its axis and beside it;
+    // one as wide through its axis meets it in two ellipses that cross each other, which
+    // OpenCASCADE also cuts at the ends of their long axes, where the native kernel has
+    // a corner only where a seam ends.
+    for (y, r) in [(15.0, 3.0), (15.5, 3.0), (15.0, 2.0), (15.0, 4.0)] {
         let mut part = Part::new();
         let base = base_block(&mut part);
         let mut sketch = on_top(base);
@@ -1450,7 +1548,12 @@ fn holes_crossing_each_other() {
             ExtrudeExtent::ThroughAll { both: true },
             false,
         );
-        assert_same_part(&format!("holes crossing at y = {y}, radius {r}"), &part);
+        let what = format!("holes crossing at y = {y}, radius {r}");
+        if r == 4.0 {
+            assert_same_faces(&what, &part);
+        } else {
+            assert_same_part(&what, &part);
+        }
     }
 }
 
@@ -1554,4 +1657,504 @@ fn balls_cut_off_their_axis() {
         false,
     );
     assert_same_part("hole through a ball", &part);
+}
+
+// ---------------------------------------------------------------------------------------
+// Chamfers and fillets.
+
+/// A fillet (or a chamfer) of `size` on `edges`.
+fn blended_by(fillet: bool, edges: Vec<EdgeName>, size: f64) -> FeatureKind {
+    let blend = EdgeBlend {
+        edges,
+        size,
+        chamfer: ChamferShape::Equal,
+    };
+    if fillet {
+        FeatureKind::Fillet(blend)
+    } else {
+        FeatureKind::Chamfer(blend)
+    }
+}
+
+/// The 40 × 30 × 10 block of `base_block`, with its profile's four lines: along y = 0,
+/// x = 40, y = 30 and x = 0.
+fn lined_block(part: &mut Part) -> (FeatureId, [u32; 4]) {
+    let mut sketch = front();
+    let lines = sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 30.0);
+    let block = boss(part, sketch, ExtrudeExtent::Blind { depth: 10.0 }, false);
+    (block, lines)
+}
+
+/// Which edges of `lined_block` (its feature and its profile's lines) to blend.
+type EdgesOf = Box<dyn Fn(FeatureId, [u32; 4]) -> Vec<EdgeName>>;
+
+#[test]
+fn blends_of_a_block_s_edges_and_corners() {
+    for fillet in [false, true] {
+        let kind = if fillet { "fillet" } else { "chamfer" };
+        let cases: Vec<(&str, EdgesOf)> = vec![
+            (
+                "one top edge",
+                Box::new(|b, l| {
+                    vec![EdgeName::between(
+                        FaceName::profile(b, l[0]),
+                        FaceName::end_cap(b),
+                    )]
+                }),
+            ),
+            (
+                "two top edges meeting at a corner",
+                Box::new(|b, l| {
+                    vec![
+                        EdgeName::between(FaceName::profile(b, l[0]), FaceName::end_cap(b)),
+                        EdgeName::between(FaceName::profile(b, l[1]), FaceName::end_cap(b)),
+                    ]
+                }),
+            ),
+            (
+                "a top edge and the upright edge at its end",
+                Box::new(|b, l| {
+                    vec![
+                        EdgeName::between(FaceName::profile(b, l[0]), FaceName::end_cap(b)),
+                        EdgeName::between(FaceName::profile(b, l[0]), FaceName::profile(b, l[1])),
+                    ]
+                }),
+            ),
+            (
+                "the three edges of a corner",
+                Box::new(|b, l| {
+                    vec![
+                        EdgeName::between(FaceName::profile(b, l[0]), FaceName::end_cap(b)),
+                        EdgeName::between(FaceName::profile(b, l[1]), FaceName::end_cap(b)),
+                        EdgeName::between(FaceName::profile(b, l[0]), FaceName::profile(b, l[1])),
+                    ]
+                }),
+            ),
+        ];
+        for (what, edges) in &cases {
+            let mut part = Part::new();
+            let (b, l) = lined_block(&mut part);
+            part.add_feature(blended_by(fillet, edges(b, l), 2.0));
+            assert_same_part(&format!("{kind}: {what}"), &part);
+        }
+    }
+}
+
+#[test]
+fn blends_of_round_edges() {
+    for fillet in [false, true] {
+        let kind = if fillet { "fillet" } else { "chamfer" };
+        // A hole's rim.
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        let circle = sketch.circle(Point2::new(20.0, 15.0), 4.0);
+        let hole = extrude(
+            &mut part,
+            sketch,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::ThroughAll { both: false },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![EdgeName::between(
+                FaceName::profile(hole, circle),
+                FaceName::end_cap(base),
+            )],
+            1.0,
+        ));
+        assert_same_part(&format!("{kind}: a hole's rim"), &part);
+        // A round boss's top and foot.
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        let circle = sketch.circle(Point2::new(20.0, 15.0), 5.0);
+        let post = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 6.0 },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![
+                EdgeName::between(FaceName::profile(post, circle), FaceName::end_cap(post)),
+                EdgeName::between(FaceName::profile(post, circle), FaceName::end_cap(base)),
+            ],
+            1.0,
+        ));
+        assert_same_part(&format!("{kind}: a round boss's top and foot"), &part);
+    }
+}
+
+#[test]
+fn blends_along_a_slot_and_in_an_inner_corner() {
+    for fillet in [false, true] {
+        let kind = if fillet { "fillet" } else { "chamfer" };
+        // One straight top edge of a slot: the blend runs on round its ends.
+        let mut part = Part::new();
+        let mut sketch = front();
+        let bottom = sketch.line(Point2::new(0.0, 0.0), Point2::new(20.0, 0.0));
+        arc(&mut sketch, (20.0, 5.0), (20.0, 0.0), (20.0, 10.0));
+        sketch.line(Point2::new(20.0, 10.0), Point2::new(0.0, 10.0));
+        arc(&mut sketch, (0.0, 5.0), (0.0, 10.0), (0.0, 0.0));
+        let slot = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 4.0 },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![EdgeName::between(
+                FaceName::profile(slot, bottom),
+                FaceName::end_cap(slot),
+            )],
+            1.0,
+        ));
+        assert_same_part(&format!("{kind}: a slot's top edge"), &part);
+        // The inner edge of an L: a valley, filled in.
+        let mut part = Part::new();
+        let mut sketch = front();
+        sketch.rectangle(Point2::new(-40.0, -25.0), 80.0, 50.0);
+        let base = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 10.0 },
+            false,
+        );
+        let mut sketch = on_top(base);
+        let upright = sketch.rectangle(Point2::new(-40.0, -25.0), 15.0, 50.0);
+        let wall = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 30.0 },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![EdgeName::between(
+                FaceName::profile(wall, upright[1]),
+                FaceName::end_cap(base),
+            )],
+            4.0,
+        ));
+        assert_same_part(&format!("{kind}: the inner edge of an L"), &part);
+    }
+}
+
+#[test]
+fn unequal_chamfers() {
+    for shape in [
+        ChamferShape::TwoDistances {
+            distance: 4.0,
+            flip: false,
+        },
+        ChamferShape::TwoDistances {
+            distance: 4.0,
+            flip: true,
+        },
+        ChamferShape::AngleDistance {
+            angle: 30f64.to_radians(),
+            flip: false,
+        },
+    ] {
+        let mut part = Part::new();
+        let (b, l) = lined_block(&mut part);
+        part.add_feature(FeatureKind::Chamfer(EdgeBlend {
+            edges: vec![EdgeName::between(
+                FaceName::profile(b, l[2]),
+                FaceName::end_cap(b),
+            )],
+            size: 2.0,
+            chamfer: shape,
+        }));
+        assert_same_part(&format!("unequal chamfer {shape:?}"), &part);
+    }
+}
+
+#[test]
+fn blends_that_cannot_be_made_say_why() {
+    // A fillet larger than the block is high.
+    let mut part = Part::new();
+    let (b, l) = lined_block(&mut part);
+    let fillet = part.add_feature(blended_by(
+        true,
+        vec![EdgeName::between(
+            FaceName::profile(b, l[0]),
+            FaceName::end_cap(b),
+        )],
+        15.0,
+    ));
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    match part.status(fillet) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("too large"), "{message}")
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+    // A slot's straight side meets its round end smoothly.
+    let mut part = Part::new();
+    let mut sketch = front();
+    let bottom = sketch.line(Point2::new(0.0, 0.0), Point2::new(20.0, 0.0));
+    let end = sketch.geometry.arc(
+        Point2::new(20.0, 5.0),
+        Point2::new(20.0, 0.0),
+        Point2::new(20.0, 10.0),
+    );
+    sketch.line(Point2::new(20.0, 10.0), Point2::new(0.0, 10.0));
+    arc(&mut sketch, (0.0, 5.0), (0.0, 10.0), (0.0, 0.0));
+    let slot = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 5.0 },
+        false,
+    );
+    let fillet = part.add_feature(blended_by(
+        true,
+        vec![EdgeName::between(
+            FaceName::profile(slot, bottom),
+            FaceName::profile(slot, end.0),
+        )],
+        1.0,
+    ));
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    match part.status(fillet) {
+        Some(FeatureStatus::Error(message)) => assert!(message.contains("smooth"), "{message}"),
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
+#[test]
+fn rounds_in_a_pocket_s_corners_then_round_its_rim() {
+    // A pocket through a block, its four inner corners rounded (valleys, filled in), then
+    // its rim round the top rounded along lines and arcs that run on smoothly.
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 60.0, 40.0);
+    let base = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    let mut pocket = on_top(base);
+    let walls = pocket.rectangle(Point2::new(15.0, 10.0), 30.0, 20.0);
+    let hole = extrude(
+        &mut part,
+        pocket,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        false,
+    );
+    let corners: Vec<EdgeName> = (0..4)
+        .map(|i| {
+            EdgeName::between(
+                FaceName::profile(hole, walls[i]),
+                FaceName::profile(hole, walls[(i + 1) % 4]),
+            )
+        })
+        .collect();
+    part.add_feature(blended_by(true, corners, 3.0));
+    assert_same_part("a pocket's corners rounded", &part);
+    // The rim: every edge of the top that a later feature made.
+    let mut kernel = OcctKernel::new();
+    let mut built = Part::from_definition(part.definition()).unwrap();
+    built.rebuild(&mut kernel);
+    let top = FaceName::end_cap(base);
+    let rim: Vec<EdgeName> = built
+        .body()
+        .unwrap()
+        .naming
+        .edges()
+        .iter()
+        .filter(|e| e.faces.contains(&top) && e.faces.iter().any(|f| f.key.feature() != base))
+        .cloned()
+        .collect();
+    built.release(&mut kernel);
+    assert_eq!(rim.len(), 8);
+    for fillet in [true, false] {
+        let mut part = Part::from_definition(part.definition()).unwrap();
+        part.add_feature(blended_by(fillet, rim.clone(), 1.0));
+        assert_same_part(&format!("a pocket's rim, fillet {fillet}"), &part);
+    }
+}
+
+#[test]
+fn every_edge_of_a_block_blended() {
+    for fillet in [false, true] {
+        let mut part = Part::new();
+        let (b, l) = lined_block(&mut part);
+        let mut edges = Vec::new();
+        for i in 0..4 {
+            let side = FaceName::profile(b, l[i]);
+            edges.push(EdgeName::between(side.clone(), FaceName::end_cap(b)));
+            edges.push(EdgeName::between(side.clone(), FaceName::start_cap(b)));
+            edges.push(EdgeName::between(
+                side,
+                FaceName::profile(b, l[(i + 1) % 4]),
+            ));
+        }
+        part.add_feature(blended_by(fillet, edges, 2.0));
+        assert_same_part(&format!("every edge of a block, fillet {fillet}"), &part);
+    }
+}
+
+#[test]
+fn blends_of_a_boss_s_edges_down_to_the_plate_and_a_hole_s_far_rim() {
+    for fillet in [false, true] {
+        // The upright edges of a square boss: they end on the plate, in a valley.
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        let sides = sketch.rectangle(Point2::new(10.0, 10.0), 12.0, 8.0);
+        let post = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 6.0 },
+            false,
+        );
+        let uprights: Vec<EdgeName> = (0..4)
+            .map(|i| {
+                EdgeName::between(
+                    FaceName::profile(post, sides[i]),
+                    FaceName::profile(post, sides[(i + 1) % 4]),
+                )
+            })
+            .collect();
+        part.add_feature(blended_by(fillet, uprights, 2.0));
+        assert_same_part(&format!("a boss's upright edges, fillet {fillet}"), &part);
+        // A hole's rim where it comes out underneath.
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        let circle = sketch.circle(Point2::new(20.0, 15.0), 4.0);
+        let hole = extrude(
+            &mut part,
+            sketch,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::ThroughAll { both: false },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![EdgeName::between(
+                FaceName::profile(hole, circle),
+                FaceName::start_cap(base),
+            )],
+            1.5,
+        ));
+        assert_same_part(&format!("a hole's far rim, fillet {fillet}"), &part);
+    }
+}
+
+#[test]
+fn blends_that_end_on_slanted_faces() {
+    for fillet in [false, true] {
+        // A block whose ends lean: the top edge's blend runs into them at a slant.
+        let mut part = Part::new();
+        let mut sketch = front();
+        let bottom = sketch.line(Point2::new(0.0, 0.0), Point2::new(40.0, 0.0));
+        sketch.line(Point2::new(40.0, 0.0), Point2::new(30.0, 20.0));
+        sketch.line(Point2::new(30.0, 20.0), Point2::new(8.0, 20.0));
+        sketch.line(Point2::new(8.0, 20.0), Point2::new(0.0, 0.0));
+        let block = boss(
+            &mut part,
+            sketch,
+            ExtrudeExtent::Blind { depth: 10.0 },
+            false,
+        );
+        part.add_feature(blended_by(
+            fillet,
+            vec![EdgeName::between(
+                FaceName::profile(block, bottom),
+                FaceName::end_cap(block),
+            )],
+            2.0,
+        ));
+        assert_same_part(
+            &format!("a blend into slanted ends, fillet {fillet}"),
+            &part,
+        );
+    }
+}
+
+#[test]
+fn blends_of_a_turned_shaft_and_the_demo_flange() {
+    for fillet in [false, true] {
+        // A shaft turned from a bar: a collar, a cone down to a neck, the neck's end. Its
+        // round edges are between planes, cylinders and the cone, all on one axis.
+        let mut part = Part::new();
+        let (mut section, axis) = about_y(-5.0, 45.0);
+        let corners = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 20.0),
+            (6.0, 24.0),
+            (6.0, 40.0),
+            (0.0, 40.0),
+        ]
+        .map(|(x, y)| section.geometry.point(Point2::new(x, y)));
+        let mut lines = Vec::new();
+        for i in 0..corners.len() {
+            lines.push(
+                section
+                    .geometry
+                    .line_between(corners[i], corners[(i + 1) % corners.len()]),
+            );
+        }
+        let shaft = revolve(&mut part, section, axis, ExtrudeOp::Boss, WHOLE);
+        let side = |k: usize| FaceName::profile(shaft, lines[k].0);
+        part.add_feature(blended_by(
+            fillet,
+            vec![
+                // The collar's foot, round its bottom.
+                EdgeName::between(side(0), side(1)),
+                // Where the collar meets the cone: a ridge.
+                EdgeName::between(side(1), side(2)),
+                // Where the cone meets the neck: a valley.
+                EdgeName::between(side(2), side(3)),
+                // The neck's end.
+                EdgeName::between(side(3), side(4)),
+            ],
+            1.0,
+        ));
+        assert_same_part(&format!("a turned shaft's edges, fillet {fillet}"), &part);
+        // The demo flange's rim and the foot of its hub.
+        let mut part = Part::new();
+        let (mut section, axis) = about_y(-5.0, 30.0);
+        let corners = [
+            (10.0, 0.0),
+            (40.0, 0.0),
+            (40.0, 6.0),
+            (16.0, 6.0),
+            (16.0, 25.0),
+            (10.0, 25.0),
+        ]
+        .map(|(x, y)| section.geometry.point(Point2::new(x, y)));
+        let mut lines = Vec::new();
+        for i in 0..corners.len() {
+            lines.push(
+                section
+                    .geometry
+                    .line_between(corners[i], corners[(i + 1) % corners.len()]),
+            );
+        }
+        let body = revolve(&mut part, section, axis, ExtrudeOp::Boss, WHOLE);
+        let side = |k: usize| FaceName::profile(body, lines[k].0);
+        part.add_feature(blended_by(
+            fillet,
+            vec![
+                EdgeName::between(side(1), side(2)),
+                EdgeName::between(side(2), side(3)),
+            ],
+            2.0,
+        ));
+        assert_same_part(&format!("the flange's rim and hub, fillet {fillet}"), &part);
+    }
 }

@@ -55,6 +55,9 @@ const NATIVE_BUILDS: &[&str] = &[
     "radial hole",
     "bar cut at a slant",
     "hole through a ball",
+    "bracket (demo)",
+    "fillet",
+    "chamfer",
 ];
 
 // ---------------------------------------------------------------------------------------

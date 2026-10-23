@@ -358,6 +358,35 @@ impl Revolution {
         })
     }
 
+    /// A sphere, if this is one centred on `axis`, turned about `axis` instead: the same
+    /// surface, its normal the same way.
+    pub fn sphere_about(&self, axis: &Axis, tolerance: f64) -> Option<Revolution> {
+        let Meridian::Circle {
+            center: 0.0,
+            radius,
+        } = self.meridian
+        else {
+            return None;
+        };
+        let d = axis.direction.normalized()?;
+        let off = self.axis.origin - axis.origin;
+        if (off - d * off.dot(d)).length() > tolerance {
+            return None;
+        }
+        Some(Revolution {
+            axis: Axis {
+                origin: self.axis.origin,
+                direction: d,
+            },
+            x_dir: perpendicular(d),
+            meridian: Meridian::Circle {
+                center: 0.0,
+                radius,
+            },
+            outward: self.outward,
+        })
+    }
+
     /// Whether the two lie on one surface with their normals the same way.
     pub fn same_as(&self, other: &Revolution, tolerance: f64) -> bool {
         let Some(m) = self.coaxial_meridian(other, tolerance) else {
@@ -421,10 +450,15 @@ impl Revolution {
                 let disc = qb * qb - 4.0 * qa * qc;
                 if disc >= -1e-12 * qb.abs().max(1.0).powi(2) {
                     let root = disc.max(0.0).sqrt();
-                    let mut zs = vec![(-qb - root) / (2.0 * qa)];
-                    if root * root > 1e-18 * qa.max(1.0) {
-                        zs.push((-qb + root) / (2.0 * qa));
-                    }
+                    // Roots closer than the tolerance are the one point where the line
+                    // touches the circle: their square root turns rounding into two points
+                    // off it.
+                    let gap = root / qa * qa.sqrt();
+                    let zs = if gap > tolerance {
+                        vec![(-qb - root) / (2.0 * qa), (-qb + root) / (2.0 * qa)]
+                    } else {
+                        vec![-qb / (2.0 * qa)]
+                    };
                     for z in zs {
                         out.push((radius + slope * z, z));
                     }
@@ -452,9 +486,11 @@ impl Revolution {
                 let half = (r1 * r1 - along * along).max(0.0).sqrt();
                 let (ur, uz) = (dr / d, dz / d);
                 let (br, bz) = (c1 + ur * along, h1 + uz * along);
-                out.push((br - uz * half, bz + ur * half));
                 if half > tolerance {
+                    out.push((br - uz * half, bz + ur * half));
                     out.push((br + uz * half, bz - ur * half));
+                } else {
+                    out.push((br, bz));
                 }
             }
         }

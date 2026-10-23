@@ -12,9 +12,9 @@
 //! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines, circles and
 //! sections, the exact curves where a cylinder or a cone crosses another surface, and
 //! degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored copies,
-//! and booleans (fuse, cut, common) of them where their faces meet in lines, circles and
-//! sections, voids included, with their topology, exact mass properties, bounds and display
-//! meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
+//! booleans (fuse, cut, common) of them where their faces meet in lines, circles and
+//! sections, voids included, and chamfers and fillets of their edges, with their topology,
+//! exact mass properties, bounds and display meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
 //! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
 //! describes how.
 
@@ -43,6 +43,7 @@
 
 mod arrangement;
 mod assemble;
+mod blend;
 mod boolean;
 mod brep;
 mod bsp;
@@ -62,8 +63,8 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock, RwLockReadGuard, RwLockWrite
 
 use oxyde_geom::{Axis, Path as SweepPath, Plane, Point3, Profile, Transform, Vec3};
 use oxyde_kernel::{
-    BooleanOp, FaceSource, Kernel, Mesh, OpHistory, OpResult, ShapeHandle, StepAssembly,
-    StepColors, StepImport, StepMaterial, Topology, TopologyCounts,
+    BooleanOp, ChamferSecond, FaceSource, Kernel, Mesh, OpHistory, OpResult, ShapeHandle,
+    StepAssembly, StepColors, StepImport, StepMaterial, Topology, TopologyCounts,
 };
 
 use brep::Shape;
@@ -278,20 +279,60 @@ impl Kernel for NativeKernel {
 
     fn fillet(
         &mut self,
-        _shape: ShapeHandle,
-        _edges: &[u32],
-        _radius: f64,
+        shape: ShapeHandle,
+        edges: &[u32],
+        radius: f64,
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("fillet"))
+        guarded(|| {
+            let input = self.shape(shape)?;
+            let edges: Vec<(u32, Option<u32>)> = edges.iter().map(|&e| (e, None)).collect();
+            let (shape, history) =
+                blend::blend(&input, &edges, blend::Blend::Fillet { radius }, false)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
     }
 
     fn chamfer(
         &mut self,
-        _shape: ShapeHandle,
-        _edges: &[u32],
-        _distance: f64,
+        shape: ShapeHandle,
+        edges: &[u32],
+        distance: f64,
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("chamfer"))
+        guarded(|| {
+            let input = self.shape(shape)?;
+            let edges: Vec<(u32, Option<u32>)> = edges.iter().map(|&e| (e, None)).collect();
+            let chamfer = blend::Blend::Chamfer {
+                first: distance,
+                second: ChamferSecond::Distance(distance),
+            };
+            let (shape, history) = blend::blend(&input, &edges, chamfer, false)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
+    }
+
+    fn chamfer_with(
+        &mut self,
+        shape: ShapeHandle,
+        edges: &[(u32, u32)],
+        first: f64,
+        second: ChamferSecond,
+    ) -> Result<Option<OpResult>, NativeError> {
+        guarded(|| {
+            let input = self.shape(shape)?;
+            let edges: Vec<(u32, Option<u32>)> = edges.iter().map(|&(e, f)| (e, Some(f))).collect();
+            let chamfer = blend::Blend::Chamfer { first, second };
+            let (shape, history) = blend::blend(&input, &edges, chamfer, true)?;
+            Ok(Some(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            }))
+        })
     }
 
     fn topology(&self, shape: ShapeHandle) -> Result<Topology, NativeError> {
@@ -664,12 +705,21 @@ mod tests {
             },
         }])
         .unwrap();
-        // Two cylinders whose axes cross meet in a curve that is neither a line nor a circle.
+        // Two cylinders on axes that pass each other, the second only partly through the
+        // first: they meet in a loop that turns back along either one's straight lines.
         let along_z = kernel
             .extrude(&Plane::FRONT, &circle, Vec3::new(0.0, 0.0, 4.0))
             .unwrap();
+        let beside = Profile::from_curves(&[ProfileSegment {
+            id: 1,
+            curve: Curve2::Circle {
+                center: Point2::new(-2.0, 1.5),
+                radius: 2.0,
+            },
+        }])
+        .unwrap();
         let along_x = kernel
-            .extrude(&Plane::RIGHT, &circle, Vec3::new(4.0, 0.0, 0.0))
+            .extrude(&Plane::RIGHT, &beside, Vec3::new(4.0, 0.0, 0.0))
             .unwrap();
         let error = kernel
             .boolean(BooleanOp::Cut, along_z.shape, along_x.shape)
@@ -682,9 +732,10 @@ mod tests {
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
             .unwrap();
         assert!(matches!(
-            kernel.fillet(shape, &[0], 1.0),
+            kernel.solid_from_mesh(&[], &[]),
             Err(NativeError::Unsupported(_))
         ));
+        let _ = shape;
         assert!(matches!(
             kernel.make_box(Point3::ORIGIN, Vec3::new(1.0, 0.0, 1.0)),
             Err(NativeError::Failed(_))

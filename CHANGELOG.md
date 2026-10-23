@@ -60,6 +60,16 @@ release yet; the git history has every detail.
   failing with a message: a torus cut by anything off its axis, two holes of the same size
   crossing, a hole that only partly crosses another, a cone cut in a parabola or a
   hyperbola.
+- **Chamfers and fillets** build with it: equal chamfers, two distances, a distance and an
+  angle; fillets of any radius that fits. On straight edges between flat faces (and round
+  ones parallel to them) and on round edges (rims of holes and bosses, edges of turned
+  parts), ridges taken off and valleys filled in; along a slot's or a pocket's rim the blend
+  runs on round the curves, as with OpenCASCADE; where two blended edges meet at a corner
+  they mitre, where three meet a chamfer leaves a triangle and a fillet a piece of a sphere.
+  Faces and names are OpenCASCADE's, so the demo bracket builds with it. A fillet on an edge
+  whose faces meet smoothly, or too large for its faces, fails saying so.
+- It now also cuts two holes of the same size crossing, and a cone where a plane cuts it in
+  a parabola or a hyperbola.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

@@ -165,25 +165,85 @@ never loses volume, a cut or a common never gains any, nothing reaches beyond th
   with the surfaces of revolution they meet, square to the planes they meet or holding them
   along their axis. A face's box on the far side of a plane meets nothing.
 - **Off the axis** (`plane_section`, `crossing`): a plane meets a sphere in a circle at a
-  slant, and two spheres meet in the circle in their radical plane; a whole one has its vertex
-  where it crosses the surface's angle zero, where the seam goes (`seam_start`). A plane
-  slanted to a cylinder or a cone, a plane along a cone's axis but away from it, and a
-  cylinder or a cone with a cylinder, a cone or a sphere on another axis meet in a
-  **section** (`geometry.rs`): the curve traced by where each straight line of the carrier
-  (the cylinder or cone, the narrower of two) meets the other surface, the root of a linear
-  equation on a plane or a quadratic on the others that `branch` picks. It is parametrised by the carrier's angle, so it is exact at every
-  point and its length, extremes and integrals are taken along it. A plane's section of a
-  cylinder is an ellipse, and is reported as one (OpenCASCADE's `Geom_Ellipse`); the others
-  are reported as B-splines, which is what OpenCASCADE fits to them.
-- A section is only taken where it goes all the way round its carrier, each straight line
-  meeting the other surface clearly once on its branch (`goes_round`). So these still answer
-  *not supported yet*, and the feature fails with that message, its body as it was: a torus
-  meeting anything off its axis or a plane slanted to it; curves that turn back on
-  themselves (two cylinders of one radius crossing, whose curves are two ellipses through
-  each other, or a hole that only partly crosses another, whose curve goes round neither); a plane cutting a cone in a parabola or a
-  hyperbola (it does not go round); surfaces that touch along a curve. A ring torus's face is cut at its tube's seam (v zero) as well as at its
-  angle zero, and its pieces are laid out round the tube from a gap between them before they
-  are merged, so that pieces either side of the seam become one face again.
+  slant, and two spheres meet in the circle in their radical plane; a whole one has its
+  vertex where it crosses the surface's angle zero, where the seam goes (`seam_start`). A
+  sphere is turned about every line through its centre, so one centred on another
+  surface's axis is taken as sharing it. A plane slanted to a cylinder or a cone, a plane
+  along a cone's axis but away from it, and a cylinder or a cone with a cylinder, a cone or
+  a sphere on another axis meet in a **section** (`geometry.rs`): the curve traced by where
+  each straight line of the carrier (the cylinder or cone, the narrower of two) meets the
+  other surface, the root of a linear equation on a plane or a quadratic on the others that
+  `branch` picks. It is parametrised by the carrier's angle, so it is exact at every point
+  and its length, extremes and integrals are taken along it. A plane's section of a cylinder
+  is an ellipse, and is reported as one (OpenCASCADE's `Geom_Ellipse`); the others are
+  reported as B-splines, which is what OpenCASCADE fits to them.
+- Two cylinders of one radius whose axes cross meet in two ellipses, in the two planes
+  through the crossing that halve the angles between the axes, crossing each other where
+  the cylinders touch; each is the section of one cylinder by its plane.
+- A section that does not go all the way round its carrier is taken where a plane is the
+  other surface (a parabola or a hyperbola on a cone): the stretches of it near the
+  carrier's face, each run of angles where its point is within the face's stretch of `v`
+  and a little more, its ends found by bisection, laid in as an open arc that the face's
+  edges then cut (`stretches`).
+- Faces whose surfaces meet only along edges both faces end at, or touch at a point, or
+  meet away from both faces, have nothing to cut: over a fine grid of each face's chart,
+  where the other surface's signed distance changes sign the crossing is found by bisection,
+  and only one well inside both faces counts (`cross_inside`; along a carrier's lines for
+  sections, `meets_only_at_edges`). Two blends meeting at a joint, a fillet's torus touching
+  the walls beside it, are such.
+- Where curves touch, rounding is not let through a square root: a line or a circle that
+  touches a circle within the tolerance does so at one point, the foot of the touch
+  (`arrangement::meet`, `meridian_crossings`, `plane_height_crossings`); round a point,
+  directions within a millionth of a radian are one and the curve turning least left comes
+  first; a hole is given to the region holding a point just outside the middle of its
+  longest piece, never a corner a circle may touch.
+- These still answer *not supported yet*, and the feature fails with that message, its body
+  as it was: a torus that a plane or a surface off its axis crosses inside both faces;
+  curves that turn back on themselves (a hole that only partly crosses another, whose curve
+  goes round neither); surfaces that touch along a curve across their faces. A ring torus's
+  face is cut at its tube's seam (v zero) as well as at its angle zero, and its pieces are
+  laid out round the tube from a gap between them before they are merged, so that pieces
+  either side of the seam become one face again.
+
+### Chamfers and fillets
+
+`blend.rs`. A blend is made by booleans with tools built exactly. For each edge, the tool is
+the region its bevel or round takes off (a ridge, cut from the solid) or fills in (a
+valley, fused onto it), swept along the edge: a straight edge between faces that do not
+change along it (planes holding its direction, cylinders whose axes are parallel to it)
+sweeps its cross-section square to it along it, a prism (`build::extrude`); an arc or a
+circle about an axis its faces are turned about (planes square to it; cylinders, cones,
+spheres and tori on it) turns its cross-section in the meridian half-plane about the axis
+(`revolve::revolve`). The cross-section is bounded by the two faces' traces, from the edge to
+where the blend leaves each face, and the bevel's line or the round's arc, tangent to both
+(the round's centre where the traces moved by the radius cross): a bevel is a plane or a
+cone, a round a cylinder or a torus. The tool's faces on the solid's faces cancel with them
+in the boolean, its blend face stays. Its history names the blend face after its edge
+(`InputEdge`), a corner's after its vertex (`InputVertex`), the rest after the faces they
+are part of. What OpenCASCADE builds, observed as a black box, sets the rest:
+
+- A blend runs on along the edges that carry the selected ones on smoothly (the straight
+  sides and round ends of a slot, a pocket's rim round its rounded corners): one face per
+  edge, the tools meeting square to the edges at the joints.
+- Where a blend ends at a corner of three faces, its tool runs into the third face's plane:
+  square to the edge it simply stops there, slanted it is cut by it (a cylinder's ellipse).
+  Where two blended edges meet at a corner whose third edge is not, each runs into the face
+  the other blends, and the two meet in a mitre (two rounds of one radius in an ellipse,
+  §5). Where three meet, chamfers leave a triangle across the corner through the three
+  points where their edges on each face cross, made by a tetrahedron cut away besides; and
+  rounds between three planes a piece of the sphere touching all three, made by the box
+  between the planes and the planes through its centre square to the edges, less the ball,
+  the rounds' tools stopping at those planes.
+- A selected edge whose faces meet smoothly has no corner to blend, and the blend fails
+  saying so, in OpenCASCADE's words; one that would run off its faces (checked along where
+  it leaves each face, as far as its tool goes) fails as too large.
+- A torus's axis runs the way the cylinder it rolls on does when its tube's centre is
+  outside the cylinder, the other way inside; a cone's runs towards its apex; a cylinder's
+  along its edge from its start; a sphere's from where it touches the face the lowest
+  blended edge does not. Blend faces have their angle zero at the edge's start.
+- Not yet: blends where faces other than these meet (a round between two crossing
+  cylinders needs a surface rolled along a curve, a B-spline in OpenCASCADE), a corner of
+  more than three faces, a ridge and a valley meeting at a corner, three valleys' chamfers.
 
 ## 6. Display meshes
 
@@ -202,7 +262,8 @@ without gaps; triangles with two corners at a pole are left out.
 - Unit tests in the crate: integrals against closed forms, quadrature, rays, meridian
   crossings, prisms, booleans of boxes and cylinders, voids, meshes of revolved faces, and
   holes across each other and through a round bar, whose wall areas are checked against the
-  integral of the curve to 1e-7 and volume against the closed form to 1e-9.
+  integral of the curve to 1e-7 and volume against the closed form to 1e-9; a bevel and a
+  round of a box's edge, a pocket's corners rounded, against their closed forms.
 - `crates/oxyde-tests/tests/native_kernel.rs` builds the same parts with both kernels and
   compares volumes, centres of mass, bounds, counts, every face, edge and vertex name, and
   each face's surface, area, centroid and normal or axis: extrusions, round holes and
@@ -212,10 +273,16 @@ without gaps; triangles with two corners at a pole are left out.
   its end and one with a ball cut from it, a torus half sunk into a block, an O-ring's
   groove, a void, holes across each other at every offset, a hole through a round bar,
   round bars, bosses and cones cut at a slant, a ball cut beside its axis and a hole
-  through one beside its centre.
+  through one beside its centre; chamfers and fillets of a block's edge, of two and three
+  edges at a corner, of every edge, of a hole's rims and a round boss's top and foot, of a
+  slot's top edge (run round its ends), of the inner edge of an L, of a pocket's corners and
+  then its rim, of a boss's upright edges down to the plate, of an edge ending on slanted
+  faces, of a turned shaft's collar, cone and neck, of the demo flange; unequal chamfers;
+  and the blends that cannot be made, too large or on a smooth edge.
 - How close is close: 1e-6 relative, except where OpenCASCADE bounds a face by a B-spline it
-  fitted to an intersection, where its areas and volumes are only as good as the fit
-  (`FITTED`, 1e-4; §8).
+  fitted to an intersection, or a B-spline surface to a blend, where its areas and volumes
+  are only as good as the fit (`FITTED`, 1e-4; §8). A blend face's axis is compared as a
+  line (either way along it) and a corner's sphere by its centre (§8).
 - `crates/oxyde-tests/tests/kernel_coverage.rs` is the measure of progress and the
   benchmark: a corpus of parts holding every feature type (the application's demo bracket
   and flange among them) rebuilt by both kernels, feature by feature. It reports what the
@@ -223,11 +290,12 @@ without gaps; triangles with two corners at a pole are left out.
   OpenCASCADE builds, and each kernel's rebuild and meshing time and triangle count
   (`kernel-coverage.md` in Cargo's directory for test files; `OXYDE_CORPUS` adds a folder of
   `.oxyprt` files). It fails when a part listed as built natively stops building or differs
-  from OpenCASCADE's. On the Raspberry Pi, October 2026: 24 of 31 parts, 53 of 61 features.
+  from OpenCASCADE's. On the Raspberry Pi, October 2026: 27 of 31 parts, 57 of 61 features.
   The native kernel rebuilds what meets in lines and circles 5 to 40 times faster than
-  OpenCASCADE, and what meets in sections 1.1 to 3 times faster (two holes crossing:
-  66 ms against 194 ms; a round bar cut at a slant: 21 against 22), where laying the curves
-  out and merging the pieces takes most of the time.
+  OpenCASCADE, what meets in sections 1.1 to 3 times faster (two holes crossing: 66 ms
+  against 194 ms; a round bar cut at a slant: 21 against 22), where laying the curves out
+  and merging the pieces takes most of the time, and its blends 10 to 40 times faster (the
+  demo bracket, a fillet and a chamfer on its plate and upright: 10 ms against 90).
 
 ## 8. Where it differs from OpenCASCADE
 
@@ -237,6 +305,18 @@ without gaps; triangles with two corners at a pole are left out.
   OpenCASCADE fits a B-spline to it, and its areas and volumes are a few millionths off the
   exact ones (a hole across another: 8e-6 of its wall's area); the native kernel's section
   is the exact curve, and its areas match the integral to 1e-9.
+- A bevel between a cylinder and a cone on one axis is a cone; OpenCASCADE fits a B-spline
+  surface to it.
+- Two holes of one radius crossing: OpenCASCADE also cuts each of their two ellipses at the
+  ends of its long axis, where only two edges meet between the same two faces; the native
+  kernel cuts them only where a seam ends on them.
+- The way a blend face's axis runs: a round's cylinder runs along its edge, a torus or a
+  cone the way the edge's circle or the cylinder it leaves runs, and each kernel runs its
+  edges its own way (OpenCASCADE's follow how it made them, the native kernel's how its
+  booleans put them together); where those are a sketch's, an extrusion's or a revolve's,
+  the native kernel's tori and cones run as OpenCASCADE's. A corner's sphere has its poles
+  through one of its three faces, OpenCASCADE choosing by its own numbering of the edges:
+  the same sphere, turned.
 
 ## 9. Steps
 
@@ -248,14 +328,16 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    booleans of what meets in lines and circles across a shared axis; the Revolve and Hole
    features and the demo flange.
 2. **Partly done.** General intersections: circles at a slant, ellipses and sections (a
-   plane slanted to a cylinder or a cone, holes crossing, a hole through a ball or a round
-   bar), laid out as tagged polylines and rebuilt as exact edges, with mass properties by
-   quadrature along them. To do: tori off their axis, curves that turn back on themselves
-   or touch, parabolas and hyperbolas, B-spline curves and surfaces (stored pcurves will be
+   plane slanted to a cylinder or a cone, holes crossing, holes of one size crossing, a hole
+   through a ball or a round bar, a cone's parabolas and hyperbolas), laid out as tagged
+   polylines and rebuilt as exact edges, with mass properties by quadrature along them;
+   faces that only touch or meet along their edges. To do: tori crossed off their axis,
+   curves that turn back on themselves, B-spline curves and surfaces (stored pcurves will be
    needed then), and one boolean engine instead of two.
-3. Chamfers, then fillets (the demo bracket): planes and cones for chamfers; cylinders
-   between planes, tori where a plane meets a cylinder, then chains of tangent edges and the
-   corners where three fillets meet.
+3. **Done.** Chamfers and fillets: equal, two distances, a distance and an angle; along
+   straight edges between planes and parallel cylinders and round edges between surfaces on
+   one axis; runs of edges that carry on smoothly; corners of one, two (a mitre) and three
+   blends (a triangle, a sphere); valleys filled in. The demo bracket.
 4. Shell (an offset of a plane, a cylinder, a cone, a sphere or a torus is one of the same
    kind), then sweep along paths of lines and arcs.
 5. Loft.
