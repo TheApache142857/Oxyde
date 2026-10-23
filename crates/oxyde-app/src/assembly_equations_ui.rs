@@ -48,7 +48,9 @@ fn invalid(message: &str) -> ModelError {
 
 impl OxydeApp {
     pub(crate) fn assembly_equations_window(&mut self, ctx: &egui::Context) {
+        self.equations.begin_frame();
         if !self.equations.open {
+            self.equations.end_frame();
             return;
         }
         let busy = self.busy();
@@ -81,6 +83,7 @@ impl OxydeApp {
             self.equations.open = false;
             self.equations.editing.clear();
         }
+        self.equations.end_frame();
         for change in changes {
             self.apply_assembly_equation_change(change);
         }

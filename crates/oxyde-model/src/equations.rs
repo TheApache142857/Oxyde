@@ -687,10 +687,19 @@ impl PartDefinition {
 
     /// Takes the variables read from the linked equations file (see
     /// [`EquationsText::apply_linked_values`]), all at once, so the file's variables may
-    /// refer to each other.
+    /// refer to each other. A variable an assembly drives (`driven_by`) is left as the
+    /// assembly set it: the assembly's value wins over the file's.
     pub fn apply_linked_values(&mut self, values: &[LinkedValue]) -> Result<(), ModelError> {
+        let values: Vec<LinkedValue> = values
+            .iter()
+            .filter(|v| {
+                let name = v.name.trim().trim_matches('"').trim();
+                !self.driven_by.iter().any(|d| d.name == name)
+            })
+            .cloned()
+            .collect();
         let mut text = self.equations_text();
-        text.apply_linked_values(values);
+        text.apply_linked_values(&values);
         self.set_equations_text(text)
     }
 
@@ -848,8 +857,10 @@ impl Part {
     /// Sets a dimension (`D1@Sketch1`) or a global variable (`Width`) to `value`, in display
     /// units, as the equation of the assembly `assembly_id` drives it. Returns the value it
     /// now has (a count is rounded) and whether the part changed: it then needs a rebuild,
-    /// and saving. A dimension the part's own equations drive, a variable of its linked
-    /// equations file, and a value another assembly drives are refused: one value wins.
+    /// and saving. A value another assembly drives is refused: one assembly at a time. The
+    /// assembly's value wins over the part's own: the part's equation on a dimension goes,
+    /// and a variable of its linked equations file is no longer read from the file, as an
+    /// in-context value wins in SolidWorks.
     pub fn drive(
         &mut self,
         name: &str,
@@ -866,12 +877,20 @@ impl Part {
         }
         if name.contains('@') {
             let reference = self.find_dimension(name).ok_or_else(missing)?;
-            if self.equations.is_driven(&reference) {
-                return Err(format!("\"{name}\" is driven by an equation of the part"));
+            let own = self
+                .equations
+                .equations
+                .iter()
+                .position(|e| e.target == Some(reference));
+            if let Some(index) = own {
+                self.equations
+                    .remove_equation(index)
+                    .map_err(|e| e.to_string())?;
             }
             let dimension = self.dimension(reference).ok_or_else(missing)?;
             let new = dimension.unit.from_display(value)?;
-            let changed = (new - dimension.value).abs() > 1e-12 * new.abs().max(1.0);
+            let changed =
+                own.is_some() || (new - dimension.value).abs() > 1e-12 * new.abs().max(1.0);
             if changed {
                 self.set_dimension(reference, new)
                     .map_err(|e| e.to_string())?;
@@ -881,21 +900,12 @@ impl Part {
         let global = self
             .equations
             .globals
-            .iter()
+            .iter_mut()
             .find(|g| g.name == name)
             .ok_or_else(missing)?;
-        if global.linked && self.equations.linked_file.is_some() {
-            return Err(format!(
-                "\"{name}\" comes from the part's linked equations file: change it there"
-            ));
-        }
-        let changed = global.expr != Expr::Number(value);
-        if changed {
-            let id = global.id;
-            self.equations
-                .set_global_expression(id, Expr::Number(value))
-                .map_err(|e| e.to_string())?;
-        }
+        let changed = global.linked || global.expr != Expr::Number(value);
+        global.linked = false;
+        global.expr = Expr::Number(value);
         Ok((value, changed))
     }
 

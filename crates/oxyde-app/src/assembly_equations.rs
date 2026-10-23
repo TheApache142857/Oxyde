@@ -341,9 +341,9 @@ impl AssemblyDoc {
     }
 
     /// Everything an equation of the assembly can drive, by full name: the mate values,
-    /// then the dimensions and global variables of every part, through sub-assemblies.
-    /// Dimensions the parts' own equations drive and variables of their linked files are
-    /// left out: the part's own value would win.
+    /// then the dimensions and global variables of every part, through sub-assemblies. The
+    /// assembly takes over a value the part's own equation or linked file gave; one another
+    /// assembly drives is left out.
     pub fn equation_targets(&self) -> Vec<(AsmDimension, String)> {
         let mut out: Vec<(AsmDimension, String)> = self
             .assembly
@@ -365,20 +365,14 @@ impl AssemblyDoc {
             };
             match self.docs.get(&file) {
                 Some(Ok(Loaded::Part(p))) => {
-                    let equations = p.part.equations();
+                    // A variable of the part's linked file can be driven: the assembly takes it
+                    // over from the file.
                     let names = p
                         .part
                         .dimensions()
                         .into_iter()
-                        .filter(|d| !d.driven)
                         .map(|d| d.full_name)
-                        .chain(
-                            equations
-                                .globals
-                                .iter()
-                                .filter(|g| !(g.linked && equations.linked_file.is_some()))
-                                .map(|g| g.name.clone()),
-                        );
+                        .chain(p.part.equations().globals.iter().map(|g| g.name.clone()));
                     for name in names {
                         // Driven by another assembly: refused until released in the part.
                         if p.part
