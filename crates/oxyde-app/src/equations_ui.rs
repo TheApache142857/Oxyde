@@ -40,6 +40,9 @@ pub(crate) enum Field {
     GlobalName(GlobalId),
     GlobalExpression(GlobalId),
     EquationExpression(usize),
+    /// The boxes of a new variable's and a new equation's expression.
+    NewGlobalExpression,
+    NewEquationExpression,
 }
 
 pub struct EquationsWindow {
@@ -83,6 +86,65 @@ impl EquationsWindow {
         }
     }
 
+    /// When `field` lost the focus to a click on a variable in the tree: the variable's name
+    /// goes into `text`, and the field gets the focus back with the cursor at the end.
+    fn take_clicked_name(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        field: Field,
+        text: &mut String,
+    ) -> bool {
+        if self.focused != Some(field) {
+            return false;
+        }
+        let Some(name) = self.pending_insert.take() else {
+            return false;
+        };
+        crate::dimension_equations::insert_name(text, &name);
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+            let end = egui::text::CCursor::new(text.chars().count());
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(end)));
+            state.store(ui.ctx(), response.id);
+        }
+        response.request_focus();
+        self.focused_now = Some(field);
+        true
+    }
+
+    /// The box of a new variable's or a new equation's expression, which the window keeps:
+    /// a variable clicked in the tree goes into it as into [`EquationsWindow::field`].
+    pub(crate) fn input(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: Field,
+        hint: &str,
+        width: f32,
+    ) -> egui::Response {
+        let mut text = std::mem::take(self.input_text(field));
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .hint_text(hint)
+                .desired_width(width),
+        );
+        if response.lost_focus() {
+            self.take_clicked_name(ui, &response, field, &mut text);
+        } else if response.has_focus() {
+            self.focused_now = Some(field);
+        }
+        *self.input_text(field) = text;
+        response
+    }
+
+    fn input_text(&mut self, field: Field) -> &mut String {
+        match field {
+            Field::NewEquationExpression => &mut self.new_equation_expression,
+            _ => &mut self.new_global_expression,
+        }
+    }
+
     /// Before the window is drawn: no field has the focus yet this frame.
     pub(crate) fn begin_frame(&mut self) {
         self.focused_now = None;
@@ -117,20 +179,8 @@ impl EquationsWindow {
         if response.lost_focus() {
             // A variable clicked in the tree took the focus: it goes into the field, which
             // stays open, focused again with the cursor at the end.
-            if self.focused == Some(field)
-                && let Some(name) = self.pending_insert.take()
-            {
-                crate::dimension_equations::insert_name(&mut text, &name);
-                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
-                    let end = egui::text::CCursor::new(text.chars().count());
-                    state
-                        .cursor
-                        .set_char_range(Some(egui::text::CCursorRange::one(end)));
-                    state.store(ui.ctx(), response.id);
-                }
-                response.request_focus();
+            if self.take_clicked_name(ui, &response, field, &mut text) {
                 self.editing.insert(field, text);
-                self.focused_now = Some(field);
                 return None;
             }
             self.editing.remove(&field);
@@ -530,11 +580,8 @@ fn equations_tab(
                     .hint_text("New name")
                     .desired_width(110.0),
             );
-            let expression = ui.add(
-                egui::TextEdit::singleline(&mut state.new_global_expression)
-                    .hint_text("Value or expression")
-                    .desired_width(220.0),
-            );
+            let expression =
+                state.input(ui, Field::NewGlobalExpression, "Value or expression", 220.0);
             let entered = expression.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let ready = !state.new_global_name.trim().is_empty()
                 && !state.new_global_expression.trim().is_empty();
@@ -606,10 +653,11 @@ fn equations_tab(
                         );
                     }
                 });
-            let expression = ui.add(
-                egui::TextEdit::singleline(&mut state.new_equation_expression)
-                    .hint_text("e.g. \"Width\" * 2")
-                    .desired_width(220.0),
+            let expression = state.input(
+                ui,
+                Field::NewEquationExpression,
+                "e.g. \"Width\" * 2",
+                220.0,
             );
             let entered = expression.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let ready = state.new_equation_target.is_some()
@@ -787,4 +835,167 @@ fn dimensions_tab(
                 ui.end_row();
             }
         });
+}
+
+/// The click of a variable in a tree's Equations folder into the field of the Equations
+/// window being typed in, with real pointer events through egui, frame by frame, as the
+/// application draws them: the tree first, the window after.
+#[cfg(test)]
+mod click_tests {
+    use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect};
+
+    use super::*;
+    use crate::equation_tree::{FolderContents, FolderEvent, VariableRow, equations_folder};
+
+    struct Harness {
+        ctx: egui::Context,
+        state: EquationsWindow,
+        committed: Option<String>,
+        /// Where the variable's row and the field were drawn, by the last frame.
+        variable: Rect,
+        field: Rect,
+        input: Rect,
+    }
+
+    const NAME: &str = "\"global width@Case.Assembly\"";
+
+    impl Harness {
+        fn new() -> Self {
+            let mut state = EquationsWindow::new();
+            state.open = true;
+            Self {
+                ctx: egui::Context::default(),
+                state,
+                committed: None,
+                variable: Rect::NOTHING,
+                field: Rect::NOTHING,
+                input: Rect::NOTHING,
+            }
+        }
+
+        fn frame(&mut self, events: Vec<Event>) {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                events,
+                ..Default::default()
+            };
+            let contents = FolderContents {
+                variables: vec![VariableRow {
+                    text: "global width = 300".to_owned(),
+                    insert: NAME.to_owned(),
+                    hover: String::new(),
+                }],
+                equations: Vec::new(),
+            };
+            let Self {
+                ctx,
+                state,
+                committed,
+                variable,
+                field,
+                input: input_rect,
+            } = self;
+            let _ = ctx.run(input, |ctx| {
+                egui::SidePanel::left("tree")
+                    .exact_width(250.0)
+                    .show(ctx, |ui| {
+                        // Nested as the application's tree is: a scroll area, an enabled
+                        // scope and an indentation (the assembly's folder when editing in
+                        // place).
+                        let inserting = state.open && state.focused.is_some();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add_enabled_ui(inserting, |ui| {
+                                ui.indent("in_place", |ui| {
+                                    let top = ui.cursor().top();
+                                    let left = ui.cursor().left();
+                                    let event = equations_folder(
+                                        ui, &contents, 0.0, true, inserting, false,
+                                    );
+                                    if let Some(FolderEvent::Insert(name)) = event
+                                        && state.focused.is_some()
+                                    {
+                                        state.pending_insert = Some(name);
+                                    }
+                                    *variable = Rect::from_min_size(
+                                        egui::pos2(left, top + 22.0),
+                                        egui::vec2(180.0, 22.0),
+                                    );
+                                });
+                            });
+                        });
+                    });
+                state.begin_frame();
+                egui::Window::new("Equations")
+                    .fixed_pos(egui::pos2(400.0, 100.0))
+                    .show(ctx, |ui| {
+                        let at = ui.cursor().min;
+                        if let Some(text) =
+                            state.field(ui, Field::GlobalExpression(GlobalId(1)), "300", 200.0)
+                        {
+                            *committed = Some(text);
+                        }
+                        *field = Rect::from_min_size(at, egui::vec2(200.0, 18.0));
+                        let at = ui.cursor().min;
+                        state.input(ui, Field::NewEquationExpression, "e.g.", 200.0);
+                        *input_rect = Rect::from_min_size(at, egui::vec2(200.0, 18.0));
+                    });
+                state.end_frame();
+            });
+        }
+
+        fn click(&mut self, at: Pos2) {
+            self.frame(vec![Event::PointerMoved(at)]);
+            self.frame(vec![Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(vec![Event::PointerButton {
+                pos: at,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(Vec::new());
+        }
+    }
+
+    #[test]
+    fn a_variable_clicked_in_the_tree_goes_into_the_field_being_typed_in() {
+        let mut h = Harness::new();
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        // Into the field, then the variable in the tree.
+        h.click(h.field.center());
+        assert_eq!(
+            h.state.focused,
+            Some(Field::GlobalExpression(GlobalId(1))),
+            "the field has the focus"
+        );
+        h.click(h.variable.center());
+        let typed = h
+            .state
+            .editing
+            .get(&Field::GlobalExpression(GlobalId(1)))
+            .cloned();
+        assert!(
+            typed.as_deref() == Some(NAME) || h.committed.as_deref() == Some(NAME),
+            "typed {typed:?}, committed {:?}",
+            h.committed
+        );
+    }
+
+    #[test]
+    fn a_variable_clicked_in_the_tree_goes_into_a_new_equation_box() {
+        let mut h = Harness::new();
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        h.click(h.input.center());
+        assert_eq!(h.state.focused, Some(Field::NewEquationExpression));
+        h.click(h.variable.center());
+        assert_eq!(h.state.new_equation_expression, NAME);
+        // The box has the focus back: another variable goes after it.
+        assert_eq!(h.state.focused, Some(Field::NewEquationExpression));
+    }
 }

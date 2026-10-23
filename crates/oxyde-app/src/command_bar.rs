@@ -600,6 +600,13 @@ impl OxydeApp {
         {
             self.import_step();
         }
+        group_separator(ui);
+        if command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
+            .on_hover_text("Equations, global variables and dimensions")
+            .clicked()
+        {
+            self.equations.show(EquationsTab::Equations);
+        }
     }
 
     fn sketch_tab(&mut self, ui: &mut egui::Ui) {
@@ -712,12 +719,6 @@ impl OxydeApp {
         }
         self.section_view_button(ui, body);
         group_separator(ui);
-        if command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
-            .on_hover_text("Equations, global variables and dimensions")
-            .clicked()
-        {
-            self.equations.show(EquationsTab::Equations);
-        }
         if command_button(ui, Icon::Rebuild, "Rebuild", true, false)
             .on_hover_text("Rebuild every feature (Ctrl+B)")
             .clicked()

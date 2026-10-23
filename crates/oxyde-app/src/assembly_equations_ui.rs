@@ -344,11 +344,8 @@ fn equations_tab(
                     .hint_text("New name")
                     .desired_width(110.0),
             );
-            let expression = ui.add(
-                egui::TextEdit::singleline(&mut state.new_global_expression)
-                    .hint_text("Value or expression")
-                    .desired_width(240.0),
-            );
+            let expression =
+                state.input(ui, Field::NewGlobalExpression, "Value or expression", 240.0);
             let entered = expression.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let ready = !state.new_global_name.trim().is_empty()
                 && !state.new_global_expression.trim().is_empty();
@@ -458,10 +455,11 @@ fn equations_tab(
                         });
                 },
             );
-            let expression = ui.add(
-                egui::TextEdit::singleline(&mut state.new_equation_expression)
-                    .hint_text("e.g. \"Width\" - 6")
-                    .desired_width(240.0),
+            let expression = state.input(
+                ui,
+                Field::NewEquationExpression,
+                "e.g. \"Width\" - 6",
+                240.0,
             );
             let entered = expression.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let ready = state.new_assembly_target.is_some()
