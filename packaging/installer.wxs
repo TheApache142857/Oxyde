@@ -3,8 +3,8 @@
   WiX Toolset (version 5 or later): the Windows Installer package (.msi), from dist\Oxyde
   (made by bundle.ps1), which builds it with
 
-    wix build packaging\installer.wxs -arch x64 -d Version=0.0.8 -d BundleDir=dist\Oxyde
-        -o dist\Oxyde-0.0.8-windows-x64.msi
+    wix build packaging\installer.wxs -arch x64 -d Version=0.0.9 -d BundleDir=dist\Oxyde
+        -o dist\Oxyde-0.0.9-windows-x64.msi
 
   An alternative to the Inno Setup installer (installer.iss), for IT departments and
   deployment tools that want an .msi: it installs for every user of the machine, into

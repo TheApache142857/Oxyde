@@ -1,0 +1,10 @@
+[package]
+name = "oxyde-flow"
+description = "Flow simulation for Oxyde: OpenFOAM cases written, run as a separate program and read back."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

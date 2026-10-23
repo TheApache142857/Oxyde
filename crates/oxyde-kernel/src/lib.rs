@@ -585,6 +585,18 @@ pub trait Kernel {
         tools: &[ShapeHandle],
     ) -> Result<OpResult, Self::Error>;
 
+    /// A solid from a closed triangle mesh: `points` in mm, `triangles` indices into them,
+    /// counter-clockwise seen from outside, every edge shared by exactly two of them, all
+    /// in one piece. One planar face per triangle, their edges shared, the solid turned the
+    /// right way out; neighbouring triangles that lie exactly in one plane are one face (a
+    /// kernel that cannot merge them may leave them apart). Every face is new: the history
+    /// names no source.
+    fn solid_from_mesh(
+        &mut self,
+        points: &[[f64; 3]],
+        triangles: &[[u32; 3]],
+    ) -> Result<OpResult, Self::Error>;
+
     /// Rounds the given edges (indices into the shape's [`Topology::edges`]).
     fn fillet(
         &mut self,

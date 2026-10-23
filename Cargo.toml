@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/TheApache142857/oxyde"
@@ -20,6 +20,8 @@ oxyde-format = { path = "crates/oxyde-format" }
 oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
 oxyde-sim = { path = "crates/oxyde-sim" }
+oxyde-sim-gpu = { path = "crates/oxyde-sim-gpu" }
+oxyde-flow = { path = "crates/oxyde-flow" }
 
 clap = { version = "4.6", features = ["derive"] }
 cxx = "1.0"
@@ -30,6 +32,9 @@ rfd = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 uuid = { version = "1.10", features = ["v4"] }
+# The version and features eframe brings (no Direct3D 12: eframe leaves it out, and it
+# would add crates), for oxyde-sim-gpu's compute shaders.
+wgpu = { version = "22.1", default-features = false, features = ["wgsl"] }
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # The software renderer is far too slow unoptimized; keep it fast in debug builds.
@@ -38,6 +43,10 @@ opt-level = 3
 
 # The finite element solver too: a study would take minutes unoptimized.
 [profile.dev.package.oxyde-sim]
+opt-level = 3
+
+# And its GPU side, which converts every solve's arrays for the card.
+[profile.dev.package.oxyde-sim-gpu]
 opt-level = 3
 
 # The MCP server's mesh sampling and probing (compare, probe) would take minutes unoptimized.

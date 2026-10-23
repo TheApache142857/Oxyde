@@ -199,19 +199,19 @@ impl Lattice {
 }
 
 /// The surfaces, gathered into one hierarchy.
-struct Surfaces {
-    bvh: Bvh,
+pub(crate) struct Surfaces {
+    pub(crate) bvh: Bvh,
     /// Per triangle of the hierarchy: its solid and its label.
     solid: Vec<u32>,
     label: Vec<u32>,
 }
 
 impl Surfaces {
-    fn new(solids: &[SurfaceMesh]) -> Surfaces {
+    pub(crate) fn new<'a>(solids: impl IntoIterator<Item = &'a SurfaceMesh>) -> Surfaces {
         let mut triangles = Vec::new();
         let mut solid = Vec::new();
         let mut label = Vec::new();
-        for (s, mesh) in solids.iter().enumerate() {
+        for (s, mesh) in solids.into_iter().enumerate() {
             for (k, t) in mesh.triangles.iter().enumerate() {
                 let p = |i: u32| mesh.positions.get(i as usize).copied();
                 let (Some(a), Some(b), Some(c)) = (p(t[0]), p(t[1]), p(t[2])) else {
@@ -234,10 +234,16 @@ impl Surfaces {
         }
     }
 
+    /// The solid and the label of the hierarchy's triangle `triangle`.
+    pub(crate) fn solid_and_label(&self, triangle: u32) -> Option<(u32, u32)> {
+        let t = triangle as usize;
+        Some((*self.solid.get(t)?, *self.label.get(t)?))
+    }
+
     /// The solids containing each point along a line, by the parity of crossings: per
     /// point, the lowest-numbered solid containing it (`NONE` outside). `None` when the
     /// line's crossings do not pair up (a hole in a surface, or a graze).
-    fn along_line(
+    pub(crate) fn along_line(
         &self,
         start: V3,
         step: V3,
@@ -298,14 +304,20 @@ impl Surfaces {
     /// Whether `p` is inside any solid (along +X, and then the other axes if that line
     /// does not pair up).
     fn contains(&self, p: V3, reach: f64, hits: &mut Vec<Hit>) -> bool {
+        self.containing(p, reach, hits) != NONE
+    }
+
+    /// The lowest-numbered solid containing `p`, `u32::MAX` for none (along +X, and then
+    /// the other axes if that line does not pair up).
+    pub(crate) fn containing(&self, p: V3, reach: f64, hits: &mut Vec<Hit>) -> u32 {
         for axis in 0..3 {
             let mut step = [0.0; 3];
             step[axis] = reach;
             if let Some(states) = self.along_line(p, step, 1, hits) {
-                return states.first().is_some_and(|&s| s != NONE);
+                return states.first().copied().unwrap_or(NONE);
             }
         }
-        false
+        NONE
     }
 }
 

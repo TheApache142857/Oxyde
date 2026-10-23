@@ -32,6 +32,8 @@ pub struct PrefsWindow {
     filter: String,
     /// The interface theme in use, to restyle only when it changes.
     applied_theme: Option<crate::theme::UiTheme>,
+    /// What *Check* found of OpenFOAM: the installation, or why there is none.
+    openfoam_check: Option<String>,
 }
 
 /// Timings and counts for the debug overlay.
@@ -514,6 +516,81 @@ impl OxydeApp {
             .small()
             .weak(),
         );
+        ui.add_space(8.0);
+        crate::property_manager::section(ui, "Flow studies (OpenFOAM)");
+        let mut check = false;
+        egui::Grid::new("flow_prefs")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("OpenFOAM folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut p.openfoam_dir)
+                            .hint_text("found by itself")
+                            .desired_width(230.0),
+                    )
+                    .on_hover_text(
+                        "OpenFOAM's folder, openfoam.com's v2606 or later: on Windows \
+                         C:\\Program Files\\ESI-OpenCFD\\OpenFOAM\\v2606, on Linux \
+                         /usr/lib/openfoam/openfoam2606, on a Mac the OpenFOAM app's \
+                         Contents/Resources. Empty: the newest found in those places.",
+                    );
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        p.openfoam_dir = dir.display().to_string();
+                    }
+                });
+                ui.end_row();
+                ui.label("");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button("Check")
+                        .on_hover_text("Find OpenFOAM and set up its environment, as a run does")
+                        .clicked()
+                    {
+                        check = true;
+                    }
+                    if let Some(found) = &self.prefs_window.openfoam_check {
+                        ui.label(RichText::new(found).small());
+                    }
+                });
+                ui.end_row();
+                ui.label("Processes");
+                ui.add(egui::DragValue::new(&mut p.flow_processes).range(0..=256))
+                    .on_hover_text(
+                        "The processes OpenFOAM's solver runs on. 0: one per core (up to eight) \
+                         when OpenFOAM's MPI is installed (Microsoft MPI on Windows), else one",
+                    );
+                ui.end_row();
+            });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(
+                    "Flow studies run OpenFOAM, a separate program (GPL) installed apart; \
+                     Oxyde's Windows installer offers it.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.hyperlink_to(
+                RichText::new("Get OpenFOAM").small(),
+                oxyde_flow::install::DOWNLOAD_PAGE,
+            );
+        });
+        if check {
+            let dir = self.prefs.simulation.openfoam_dir.trim().to_owned();
+            let found = if dir.is_empty() {
+                oxyde_flow::Installation::find()
+            } else {
+                oxyde_flow::Installation::open(std::path::Path::new(&dir))
+            };
+            self.prefs_window.openfoam_check = Some(match found {
+                Ok(i) => format!("OpenFOAM {} in {}", i.version(), i.root().display()),
+                Err(e) => e.to_string(),
+            });
+        }
     }
 
     fn debug_page(&mut self, ui: &mut egui::Ui) {

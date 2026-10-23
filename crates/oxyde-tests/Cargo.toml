@@ -17,4 +17,5 @@ oxyde-format = { workspace = true }
 oxyde-assembly = { workspace = true }
 oxyde-cli = { workspace = true }
 oxyde-sim = { workspace = true }
+oxyde-sim-gpu = { workspace = true }
 serde_json = { workspace = true }

@@ -93,6 +93,19 @@ export OXYDE_NETGEN_DIR="$HOME/netgen"
 
 On Windows the same works from a *Developer PowerShell for VS 2022* with `-G Ninja` (or the Visual Studio generator and `--config Release`), `-DOpenCASCADE_DIR=C:\dev\vcpkg\installed\x64-windows\share\opencascade`, and Netgen's `bin` folder added to `PATH`. Only the vcpkg build has been tested; the macOS one has not been tried yet. Whichever way it is built, `packaging/THIRD-PARTY.txt` must name the exact source and options of the Netgen that is shipped (the LGPL asks for it): update it when the version or the build changes.
 
+### OpenFOAM, the solver of flow studies (at run time, optional)
+
+Flow studies (`docs/CFD.md`) run [OpenFOAM](https://www.openfoam.com), OpenCFD's line, v2606 or later, as a separate program: Oxyde builds without it and never links it (it is GPL-3.0). At run time `oxyde-flow` finds it in Preferences › Simulation, the variable `OXYDE_OPENFOAM_DIR`, or the usual places: `C:\Program Files\ESI-OpenCFD\OpenFOAM\v*` and `%APPDATA%\ESI-OpenCFD\OpenFOAM\v*` on Windows (OpenCFD's MinGW installer; parallel runs also need Microsoft MPI 10), `/usr/lib/openfoam/openfoam*` on Linux (OpenCFD's packages), `/Applications/OpenFOAM-v*.app` on macOS (openfoam-app, Apple silicon). The Foundation's line (openfoam.org) names its solvers differently and is not supported.
+
+`cargo test -p oxyde-flow` runs its unit tests anywhere and its OpenFOAM tests (`tests/openfoam.rs`: a laminar pipe against Hagen–Poiseuille, the same on two processes, a sphere's drag, a turbulent pipe) where OpenFOAM is installed; elsewhere they are skipped with a note. Without OpenFOAM, run them in OpenCFD's image (amd64 and arm64), one at a time:
+
+```sh
+cargo test -p oxyde-flow --test openfoam --no-run      # prints the test binary's path
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/target:$PWD/target:ro" \
+  --entrypoint "$PWD/target/debug/deps/openfoam-<hash>" opencfd/openfoam-run:2606 \
+  --test-threads=1 --nocapture
+```
+
 ## 2. Build and test
 
 ```powershell
@@ -151,7 +164,7 @@ builds the release and writes:
 
 - `dist\Oxyde\`: `Oxyde.exe` with exactly the OpenCASCADE DLLs it needs (and Netgen's, `nglib.dll` and `ngcore.dll`, when the build has it: the script says which) (followed with `dumpbin`; without it, every DLL of OpenCASCADE's `bin` folder), the licences and the README;
 - `dist\Oxyde-<version>-windows-x64.zip`: the same, to unzip and run anywhere;
-- `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed: a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde;
+- `dist\Oxyde-Setup-<version>.exe`, when [Inno Setup 6](https://jrsoftware.org/isinfo.php) (6.1 or later) is installed, for every user or for you alone (the script looks for `ISCC.exe` on `PATH`, in `Program Files (x86)\Inno Setup 6` and in `%LOCALAPPDATA%\Programs\Inno Setup 6`): a per-user installer (no administrator rights) with a Start menu entry, an optional desktop icon, and `.oxyprt` / `.oxyasm` files opening in Oxyde. An optional task, *Download and install OpenFOAM*, downloads OpenCFD's own Windows installer for the version flow studies are written for (`OpenFoamUrl` in `packaging/installer.iss`, checked against its SHA-256) and runs it once Oxyde is installed; OpenFOAM is never inside Oxyde's installer. Moving to another OpenFOAM version means changing its four `#define`s together;
 - `dist\Oxyde-<version>-windows-x64.msi`, when the [WiX Toolset](https://wixtoolset.org) 5 or later is installed (`dotnet tool install --global wix --version 5.0.2`, which needs the .NET SDK 8 or later; WiX 6 asks you to accept its maintenance-fee licence first, `wix eula accept wix6`): a Windows Installer package for every user of the machine, into `Program Files\Oxyde` (Windows asks for administrator rights), with a Start menu entry and the same file types, for IT departments and deployment tools (`msiexec /i Oxyde-<version>-windows-x64.msi /qn` installs it silently). A newer `.msi` replaces an older one; the two installers are alternatives, not meant to be installed side by side. Its definition is `packaging/installer.wxs`, whose `UpgradeCode` must never change.
 
 The script checks the bundle by running `Oxyde.exe --version`, which loads OpenCASCADE: a missing DLL fails the bundle rather than the user. The version comes from the workspace `Cargo.toml`. The icon is drawn by `packaging/make_icon.py` (Pillow); its outputs are committed.
