@@ -31,6 +31,8 @@ mod assembly;
 mod assembly_equations;
 mod assembly_equations_ui;
 mod assembly_ui;
+mod assistant;
+mod assistant_ui;
 mod command_bar;
 mod configurations_ui;
 mod demo;
@@ -151,6 +153,19 @@ fn main() -> eframe::Result<()> {
             oxyde_occt::OcctKernel::occt_version()
         );
         return Ok(());
+    }
+    // `--mcp …`: Oxyde's MCP server instead of the window (`oxyde-mcp`'s command line). The
+    // assistant panel has its agent start `oxyde --mcp --window <address> <token>`, which
+    // passes the agent's messages to the window.
+    if first.as_deref() == Some(std::ffi::OsStr::new("--mcp")) {
+        let args = std::iter::once(std::ffi::OsString::from("oxyde-mcp"))
+            .chain(std::env::args_os().skip(2));
+        std::process::exit(oxyde_mcp::run(
+            args,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+            &mut std::io::stderr().lock(),
+        ));
     }
     let file = first.map(PathBuf::from);
     let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))

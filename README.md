@@ -141,6 +141,9 @@ what changed in each version is in the [changelog](CHANGELOG.md).
 - **MCP server** `oxyde-mcp`: an AI assistant such as Claude models parts and assemblies with
   Oxyde's own features, looks at them and compares them with a STEP file it is remodelling
   (see below).
+- **Assistant panel** (the *MCP* button): a chat with a coding agent installed on the computer
+  (Claude Code or Codex), which models on the open part or assembly through the same tools;
+  each reply is one undo step.
 
 ## Build and run
 
@@ -190,6 +193,16 @@ claude mcp add oxyde -- C:/path/to/Oxyde/target/debug/oxyde-mcp.exe
 
 `oxyde-mcp --tools` prints its tools and their arguments, and `oxyde-mcp --batch calls.jsonl`
 runs tool calls from a file (one `{"tool": ..., "arguments": {...}}` per line) without a client.
+
+In the application, the *MCP* button (after the command tabs) opens the assistant panel: it
+starts a coding agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com),
+signed in with your own account, and lets it model on the document open in the window. Install
+an adapter once (Node.js needed), sign in to the agent, then Connect:
+
+```sh
+npm install -g @agentclientprotocol/claude-agent-acp
+npm install -g @agentclientprotocol/codex-acp
+```
 
 ## Architecture
 
