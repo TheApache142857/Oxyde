@@ -563,18 +563,23 @@ impl SketchSession {
 
     /// Adds a dimension with the given value (mm, or radians for angles).
     pub fn add_dimension(&mut self, relation: Constraint, value: f64) -> bool {
+        self.add_dimension_id(relation, value).is_some()
+    }
+
+    /// [`SketchSession::add_dimension`], giving the new dimension's id.
+    pub fn add_dimension_id(&mut self, relation: Constraint, value: f64) -> Option<RelationId> {
         self.checkpoint();
         let previous = self.history.last().cloned().unwrap_or_default();
         let id = self.sketch.constrain(relation);
         self.sketch.set_dimension(id, value);
         if self.solve() {
-            true
+            Some(id)
         } else {
             self.sketch = previous;
             self.drop_checkpoint();
             self.solve();
             self.message = Some("That dimension conflicts with the existing relations".to_owned());
-            false
+            None
         }
     }
 

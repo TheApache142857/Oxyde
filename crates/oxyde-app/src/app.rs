@@ -213,6 +213,13 @@ pub struct OxydeApp {
     pub(crate) sketch: Option<SketchSession>,
     /// Tools › Equations window (equations, global variables and dimensions).
     pub(crate) equations: EquationsWindow,
+    /// The part's Equations folder is open in its tree.
+    pub(crate) part_equations_expanded: bool,
+    /// The assembly's Equations folder is open in its tree, and those of these components.
+    pub(crate) asm_equations_expanded: bool,
+    pub(crate) asm_part_equations_expanded: std::collections::HashSet<oxyde_assembly::ComponentId>,
+    /// Nodes open in the tree of the assembly a part is edited in (`in_place_tree.rs`).
+    pub(crate) place_expanded: std::collections::HashSet<crate::in_place_tree::Node>,
     pub(crate) status: String,
     pub(crate) tab: CommandTab,
     /// A sketch tool clicked outside sketch mode: picked once the new sketch opens.
@@ -354,6 +361,10 @@ impl OxydeApp {
             dialog: None,
             sketch: None,
             equations: EquationsWindow::new(),
+            part_equations_expanded: false,
+            asm_equations_expanded: false,
+            asm_part_equations_expanded: std::collections::HashSet::new(),
+            place_expanded: std::collections::HashSet::new(),
             status: "Ready".to_owned(),
             tab: CommandTab::Features,
             pending_tool: None,
@@ -1549,20 +1560,31 @@ impl OxydeApp {
         let Some((value, angle)) = sketch_mode::dimension_value(&relation.constraint) else {
             return;
         };
-        if session.driven.contains(&id) {
-            self.status = format!(
-                "{} is driven by an equation (Tools › Equations)",
-                session.dimension_full_name(id).unwrap_or_default()
-            );
-            return;
-        }
+        let label = session
+            .dimension_full_name(id)
+            .unwrap_or_else(|| "Dimension".to_owned());
+        let name = relation.name.clone();
+        // Driven: the box shows its equation, to change or to type a value over.
+        let text = if session.driven.contains(&id) {
+            let reference = oxyde_model::DimensionRef {
+                feature: session.feature,
+                key: oxyde_model::DimensionKey::Sketch(id),
+            };
+            match self.dimension_equation_text(reference) {
+                Ok(text) => text,
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            }
+        } else {
+            crate::dialogs::format_value(value)
+        };
         self.open_dialog(Dialog::Dimension {
             target: DimensionTarget::Existing(id),
-            label: session
-                .dimension_full_name(id)
-                .unwrap_or_else(|| "Dimension".to_owned()),
-            name: relation.name.clone(),
-            text: crate::dialogs::format_value(value),
+            label,
+            name,
+            text,
             angle,
             fresh: true,
         });

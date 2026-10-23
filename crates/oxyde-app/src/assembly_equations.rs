@@ -210,6 +210,15 @@ impl AssemblyDoc {
         self.record_driven();
     }
 
+    /// The value of `name` (a dimension `D1@Sketch1`, or a global variable) in the loaded
+    /// part `path` leads to, in display units.
+    pub(crate) fn part_value(&self, path: &[ComponentId], name: &str) -> Option<f64> {
+        match self.docs.get(&file_at(&self.docs, &self.sources, path)?)? {
+            Ok(Loaded::Part(p)) => p.part.value_of(name),
+            _ => None,
+        }
+    }
+
     /// Whether parts changed by the equations wait to be rebuilt.
     pub fn has_pending_parts(&self) -> bool {
         !self.pending.is_empty()
