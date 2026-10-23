@@ -203,8 +203,25 @@ impl Assembly {
             b,
             aligned,
             suppressed: false,
+            lock_rotation: false,
+            locked_angle: None,
         });
         id
+    }
+
+    /// Moves the components where `solution` puts them, and keeps the turn each locked mate
+    /// held for the next solve ([`Mate::locked_angle`]).
+    pub fn apply_solution(&mut self, solution: &Solution) {
+        for (id, placement) in &solution.placements {
+            if let Some(c) = self.component_mut(*id) {
+                c.placement = *placement;
+            }
+        }
+        for (id, angle) in &solution.locks {
+            if let Some(m) = self.mate_mut(*id) {
+                m.locked_angle = Some(*angle);
+            }
+        }
     }
 
     /// Removes a component and the mates that use it. Returns the removed mates' names.

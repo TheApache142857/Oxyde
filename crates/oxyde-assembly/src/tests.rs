@@ -31,9 +31,7 @@ fn r(component: ComponentId, target: MateTarget) -> MateRef {
 
 fn run(asm: &mut Assembly) -> Solution {
     let solution = solve(asm, |m| resolve(&m.target, None), 100.0);
-    for (id, p) in &solution.placements {
-        asm.component_mut(*id).unwrap().placement = *p;
-    }
+    asm.apply_solution(&solution);
     solution
 }
 
@@ -1045,4 +1043,111 @@ fn equations_text_round_trips_and_links_files() {
     assert!(asm.equations.linked_file.is_none());
     assert!(asm.equations.globals.iter().all(|g| !g.linked));
     assert_eq!(asm.equations.globals.len(), 3);
+}
+
+/// A pin in a hole and its head on the base: Concentric with *Lock rotation* and one
+/// Coincident mate.
+fn locked_pin(lock: bool) -> (Assembly, ComponentId, MateId, MateId) {
+    let (mut asm, a, b) = two();
+    let axis = asm.add_mate(
+        MateKind::Concentric,
+        r(a, MateTarget::Axis(StandardAxis::Z)),
+        r(b, MateTarget::Axis(StandardAxis::Z)),
+        true,
+    );
+    asm.mate_mut(axis).unwrap().lock_rotation = lock;
+    let head = asm.add_mate(
+        MateKind::Coincident,
+        r(a, MateTarget::Plane(StandardPlane::Front)),
+        r(b, MateTarget::Plane(StandardPlane::Front)),
+        true,
+    );
+    (asm, b, axis, head)
+}
+
+/// The two mates leave the pin free to spin, until its concentric mate locks the rotation,
+/// as SolidWorks' *Lock rotation* does: then it is fully defined.
+#[test]
+fn a_locked_concentric_and_a_coincident_hold_a_pin_fully() {
+    for lock in [false, true] {
+        let (mut asm, b, axis, _) = locked_pin(lock);
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+        assert_eq!(
+            solution.degrees(b),
+            Some(if lock { 0 } else { 1 }),
+            "locked: {lock}"
+        );
+        // The turn held is kept for the next solve.
+        assert_eq!(asm.mate(axis).unwrap().locked_angle.is_some(), lock);
+    }
+}
+
+/// A drag turns the pin about its axis, then the mates are solved again: a locked pin turns
+/// back to the turn it held, a free one stays turned.
+#[test]
+fn a_locked_pin_turns_back_after_a_drag() {
+    for lock in [false, true] {
+        let (mut asm, b, axis, _) = locked_pin(lock);
+        run(&mut asm);
+        let before = asm.component(b).unwrap().placement;
+        let held = asm.mate(axis).unwrap().locked_angle;
+        let c = asm.component_mut(b).unwrap();
+        c.placement = c.placement.moved(Vec3::Z * 0.5, Point3::ORIGIN, Vec3::ZERO);
+        let solution = run(&mut asm);
+        assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+        let after = asm.component(b).unwrap().placement;
+        let back = (after.apply_vector(Vec3::X) - before.apply_vector(Vec3::X)).length() < 1e-6;
+        assert_eq!(back, lock, "locked: {lock}, {before:?} then {after:?}");
+        assert_eq!(asm.mate(axis).unwrap().locked_angle, held);
+    }
+}
+
+/// Flipping the head's mate turns the locked pin over, and it keeps its turn about the axis
+/// it shares with the hole as well as the half turn allows: no error, still fully defined.
+#[test]
+fn a_locked_pin_turns_over_when_its_head_is_flipped() {
+    let (mut asm, b, _, head) = locked_pin(true);
+    run(&mut asm);
+    asm.mate_mut(head).unwrap().aligned = false;
+    let solution = run(&mut asm);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    assert_eq!(solution.degrees(b), Some(0));
+    let p = asm.component(b).unwrap().placement;
+    assert!(close(p.apply_vector(Vec3::Z).z, -1.0), "{p:?}");
+}
+
+/// Changing the lock or the geometry takes the turn again from where the parts are: a lock
+/// set on a pin already turned holds that turn.
+#[test]
+fn a_new_lock_holds_the_turn_the_parts_have() {
+    let (mut asm, b, axis, _) = locked_pin(false);
+    run(&mut asm);
+    let c = asm.component_mut(b).unwrap();
+    c.placement = c.placement.moved(Vec3::Z * 0.8, Point3::ORIGIN, Vec3::ZERO);
+    run(&mut asm);
+    let turned = asm.component(b).unwrap().placement;
+    asm.mate_mut(axis).unwrap().lock_rotation = true;
+    run(&mut asm);
+    let c = asm.component_mut(b).unwrap();
+    c.placement = c
+        .placement
+        .moved(Vec3::Z * -0.3, Point3::ORIGIN, Vec3::ZERO);
+    run(&mut asm);
+    let after = asm.component(b).unwrap().placement;
+    assert!(
+        (after.apply_vector(Vec3::X) - turned.apply_vector(Vec3::X)).length() < 1e-6,
+        "{turned:?} then {after:?}"
+    );
+}
+
+/// Lock rotation is a Concentric mate's, between two axes.
+#[test]
+fn only_concentric_between_axes_locks_rotation() {
+    use PrimitiveKind::{Circle, Line, Plane, Point};
+    assert!(MateKind::Concentric.can_lock_rotation(Line, Circle));
+    assert!(MateKind::Concentric.can_lock_rotation(Circle, Circle));
+    assert!(!MateKind::Concentric.can_lock_rotation(Line, Point));
+    assert!(!MateKind::Coincident.can_lock_rotation(Circle, Circle));
+    assert!(!MateKind::Parallel.can_lock_rotation(Plane, Plane));
 }
