@@ -45,6 +45,11 @@ release yet; the git history has every detail.
   Equations folders and window, and on the component in the assembly's tree and in the tree
   of a part edited in place. It reads "->?" (out of context) when that assembly is not the
   one the part is edited from; the hover says what drives what.
+- The boxes of a **new** variable's and a new equation's expression, in the part's and the
+  assembly's Equations windows, take a variable clicked in the tree too (until now only the
+  existing ones did, so nothing happened when one was clicked while typing a new equation).
+- **Equations** is a command of the **Features** tab in a part and of the **Assembly** tab in
+  an assembly, no longer of the Evaluate tab; Tools › Equations… stays.
 
 ### Linking values while editing in place (unreleased, October 2026)
 
@@ -92,7 +97,7 @@ release yet; the git history has every detail.
 
 ### Assembly equations (unreleased, October 2026)
 
-- **Tools › Equations… in an assembly** (also *Equations* on the Evaluate tab), as in
+- **Tools › Equations… in an assembly** (also *Equations* on the Assembly tab), as in
   SolidWorks: the assembly's own global variables, and equations that drive
   - the value of a Distance or Angle mate: `"D1@Distance1" = "Gap" * 2` (mm, degrees);
   - a dimension or a global variable of one of its parts, inside sub-assemblies too:

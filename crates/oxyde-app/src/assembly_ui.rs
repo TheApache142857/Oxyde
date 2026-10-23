@@ -1538,6 +1538,13 @@ impl OxydeApp {
             {
                 self.materials_window.open = !self.materials_window.open;
             }
+            if icons::command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
+                .on_hover_text("Global variables, and equations driving mates and part dimensions")
+                .clicked()
+            {
+                self.equations
+                    .show(crate::equations_ui::EquationsTab::Equations);
+            }
         });
     }
 
@@ -1578,13 +1585,6 @@ impl OxydeApp {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        if icons::command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
-            .on_hover_text("Global variables, and equations driving mates and part dimensions")
-            .clicked()
-        {
-            self.equations
-                .show(crate::equations_ui::EquationsTab::Equations);
-        }
         if icons::command_button(ui, Icon::Rebuild, "Reload\nParts", true, false)
             .on_hover_text("Read the part files again, after editing them (Ctrl+B)")
             .clicked()
