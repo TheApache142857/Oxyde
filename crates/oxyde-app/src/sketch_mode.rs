@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
-use oxyde_geom::{Plane, Point2};
+use oxyde_geom::{LINEAR_TOLERANCE, Plane, Point2};
 use oxyde_model::FeatureId;
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, ConstraintState, Definition, EntityId, Geometry, RelationId,
@@ -2025,7 +2025,8 @@ impl SketchSession {
         let mut labels = Vec::new();
         let mut hovered_label = None;
         for relation in self.sketch.relations() {
-            let Some(graphics) = self.dimension_graphics(&relation.constraint, to_screen) else {
+            let Some(mut graphics) = self.dimension_graphics(&relation.constraint, to_screen)
+            else {
                 continue;
             };
             let stroke = Stroke::new(1.0_f32, ink_dimension());
@@ -2035,10 +2036,11 @@ impl SketchSession {
             for (tip, direction) in &graphics.arrows {
                 arrow_head(painter, *tip, *direction, ink_dimension());
             }
+            let text = std::mem::take(&mut graphics.text);
             let text = if self.driven.contains(&relation.id) {
-                format!("Σ {}", graphics.text)
+                format!("Σ {text}")
             } else {
-                graphics.text
+                text
             };
             let selected = self.selected_dimensions.contains(&relation.id);
             let ink = if selected {
@@ -2047,7 +2049,7 @@ impl SketchSession {
                 ink_fully()
             };
             let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), ink);
-            let rect = Rect::from_center_size(graphics.anchor, galley.size() + Vec2::new(8.0, 4.0));
+            let rect = graphics.label_rect(galley.size() + Vec2::new(8.0, 4.0));
             painter.rect_filled(rect, 3.0, label_background());
             let border = if selected {
                 Stroke::new(2.0_f32, ink_selected())
@@ -2257,10 +2259,12 @@ impl SketchSession {
                 text,
                 lines: Vec::new(),
                 arrows: Vec::new(),
+                outward: Vec2::ZERO,
             };
             if offset.length() > 0.5 {
                 g.lines.push([a, da + offset.normalized() * 3.0]);
                 g.lines.push([b, db + offset.normalized() * 3.0]);
+                g.outward = offset.normalized();
             }
             if along.length() > 1.0 {
                 g.lines.push([da, db]);
@@ -2277,23 +2281,27 @@ impl SketchSession {
                 Vec2::new(0.0, -18.0)
             }
         };
+        // A dimension line drawn away from what it measures: extension lines from each
+        // measured point to the dimension line, which is pushed a little further out on screen.
+        let beyond = |o: Outside, text: String| {
+            let (a, b) = (to_screen(o.to[0]), to_screen(o.to[1]));
+            let towards = to_screen(Point2::new(o.to[0].x + o.out.0, o.to[0].y + o.out.1)) - a;
+            let offset = if towards.length() > 1e-6 {
+                towards.normalized() * 18.0
+            } else {
+                Vec2::new(0.0, -18.0)
+            };
+            let mut g = aligned(a, b, offset, text);
+            g.lines.push([to_screen(o.from[0]), a]);
+            g.lines.push([to_screen(o.from[1]), b]);
+            g
+        };
         match *c {
             Length(line, value) => {
                 let (a, b) = s.endpoints(line)?;
                 let (a, b) = (to_screen(at(a)?), to_screen(at(b)?));
                 // Outside the shape: on the side away from the middle of the sketch.
-                let points: Vec<Pos2> = s
-                    .entities()
-                    .iter()
-                    .filter_map(|e| match e.geometry {
-                        Geometry::Point(p) => Some(to_screen(p)),
-                        _ => None,
-                    })
-                    .collect();
-                let n = points.len().max(1) as f32;
-                let centre = points
-                    .iter()
-                    .fold(Pos2::ZERO, |sum, p| sum + p.to_vec2() / n);
+                let centre = to_screen(sketch_centre(s));
                 let mut offset = side(a, b);
                 let m = middle(a, b);
                 if ((m + offset) - centre).length() < ((m - offset) - centre).length() {
@@ -2302,51 +2310,66 @@ impl SketchSession {
                 Some(aligned(a, b, offset, format_length(value)))
             }
             Distance(p, q, value) => {
-                let (a, b) = (to_screen(at(p)?), to_screen(at(q)?));
-                Some(aligned(a, b, Vec2::ZERO, format_length(value)))
+                let (pa, pb) = (at(p)?, at(q)?);
+                let d = pa.distance(pb);
+                if d < LINEAR_TOLERANCE {
+                    let (a, b) = (to_screen(pa), to_screen(pb));
+                    return Some(aligned(a, b, Vec2::ZERO, format_length(value)));
+                }
+                // Parallel to the two points, pushed sideways away from the shape.
+                let across = ((pa.y - pb.y) / d, (pb.x - pa.x) / d);
+                let o = outside_placement(s, [pa, pa], [pb, pb], across);
+                Some(beyond(o, format_length(value)))
             }
             HorizontalDistance(p, q, value) | VerticalDistance(p, q, value) => {
                 let (pa, pb) = (at(p)?, at(q)?);
-                let horizontal = matches!(c, HorizontalDistance(..));
                 // Measured along the sketch's x (or y) axis, drawn beyond the farther point.
-                let (ea, eb) = if horizontal {
+                let o = if matches!(c, HorizontalDistance(..)) {
                     let y = pa.y.max(pb.y);
-                    (Point2::new(pa.x, y), Point2::new(pb.x, y))
+                    Outside {
+                        from: [pa, pb],
+                        to: [Point2::new(pa.x, y), Point2::new(pb.x, y)],
+                        out: (0.0, 1.0),
+                    }
                 } else {
                     let x = pa.x.max(pb.x);
-                    (Point2::new(x, pa.y), Point2::new(x, pb.y))
+                    Outside {
+                        from: [pa, pb],
+                        to: [Point2::new(x, pa.y), Point2::new(x, pb.y)],
+                        out: (1.0, 0.0),
+                    }
                 };
-                let (a, b) = (to_screen(ea), to_screen(eb));
-                let towards = if horizontal {
-                    to_screen(Point2::new(ea.x, ea.y + 1.0)) - a
-                } else {
-                    to_screen(Point2::new(ea.x + 1.0, ea.y)) - a
-                };
-                let offset = if towards.length() > 1e-6 {
-                    towards.normalized() * 18.0
-                } else {
-                    Vec2::new(0.0, -18.0)
-                };
-                let mut g = aligned(a, b, offset, format_length(value));
-                g.lines.push([to_screen(pa), a]);
-                g.lines.push([to_screen(pb), b]);
-                Some(g)
+                Some(beyond(o, format_length(value)))
             }
             PointLineDistance(p, line, value) => {
                 let point = at(p)?;
                 let (a, b) = s.endpoints(line)?;
-                let foot = perpendicular_foot(point, at(a)?, at(b)?);
-                Some(aligned(
-                    to_screen(point),
-                    to_screen(foot),
-                    Vec2::ZERO,
-                    format_length(value),
-                ))
+                let (a, b) = (at(a)?, at(b)?);
+                let Some(along) = unit(a, b) else {
+                    let (p, a) = (to_screen(point), to_screen(a));
+                    return Some(aligned(p, a, Vec2::ZERO, format_length(value)));
+                };
+                // Across the line, past its end or the point, whichever is away from the shape.
+                let o = outside_placement(s, [point, point], [a, b], along);
+                Some(beyond(o, format_length(value)))
             }
             LineDistance(first, second, value) => {
+                let (a1, a2) = s.endpoints(first)?;
+                let (a1, a2) = (at(a1)?, at(a2)?);
+                let (b1, b2) = s.endpoints(second)?;
+                let (b1, b2) = (at(b1)?, at(b2)?);
+                // Parallel lines: past the end of the two that lies away from the shape, as
+                // SolidWorks has it once the dimension is dragged out of the sketch.
+                let parallel = unit(a1, a2)
+                    .zip(unit(b1, b2))
+                    .filter(|(u, v)| (u.0 * v.1 - u.1 * v.0).abs() < PARALLEL_SINE);
+                if let Some((u, _)) = parallel {
+                    let o = outside_placement(s, [a1, a2], [b1, b2], u);
+                    return Some(beyond(o, format_length(value)));
+                }
+                // Otherwise from the middle of the first line to its foot on the second.
                 let m = s.midpoint_of(first)?;
-                let (a, b) = s.endpoints(second)?;
-                let foot = perpendicular_foot(m, at(a)?, at(b)?);
+                let foot = perpendicular_foot(m, b1, b2);
                 let mut g = aligned(
                     to_screen(m),
                     to_screen(foot),
@@ -2372,6 +2395,7 @@ impl SketchSession {
                     text: format!("Ø{}", format_length(value)),
                     lines: vec![[a, b + out * 12.0]],
                     arrows: vec![(a, -out), (b, out)],
+                    outward: Vec2::ZERO,
                 })
             }
             Radius(round, value) => {
@@ -2387,6 +2411,7 @@ impl SketchSession {
                     text: format!("R{}", format_length(value)),
                     lines: vec![[c, r + out * 12.0]],
                     arrows: vec![(r, out)],
+                    outward: Vec2::ZERO,
                 })
             }
             Angle(first, _, value) => {
@@ -2396,6 +2421,7 @@ impl SketchSession {
                     text: format!("{:.1}°", value.to_degrees().abs()),
                     lines: Vec::new(),
                     arrows: Vec::new(),
+                    outward: Vec2::ZERO,
                 })
             }
             _ => None,
@@ -2410,6 +2436,116 @@ struct DimensionGraphics {
     lines: Vec<[Pos2; 2]>,
     /// Arrow tips and the direction they point.
     arrows: Vec<(Pos2, Vec2)>,
+    /// The side of the dimension line away from what it measures, as a unit vector; zero
+    /// when the label just sits on its anchor.
+    outward: Vec2,
+}
+
+impl DimensionGraphics {
+    /// Where a label of `size` goes. It sits across its dimension line, moved outward by as
+    /// much as it is wider than tall on that side, so a label beside the shape clears it as
+    /// well as one above it does.
+    fn label_rect(&self, size: Vec2) -> Rect {
+        let o = self.outward;
+        let push = ((o.x.abs() * size.x + o.y.abs() * size.y - size.y) / 2.0).max(0.0);
+        Rect::from_center_size(self.anchor + o * push, size)
+    }
+}
+
+/// Lines closer to parallel than this, the sine of the angle between them, are dimensioned
+/// as parallel lines.
+const PARALLEL_SINE: f64 = 0.01;
+
+/// Where a distance dimension goes, in sketch coordinates: an extension line runs from each
+/// measured point in `from` to the matching point in `to`, and the dimension line joins the
+/// two `to` points, pushed a little further along `out` (a unit vector) on screen.
+struct Outside {
+    from: [Point2; 2],
+    to: [Point2; 2],
+    out: (f64, f64),
+}
+
+/// Places a dimension between two features that run along `axis` (a unit vector), each a
+/// segment parallel to it or a point, outside the shape as a SolidWorks user drags it: past
+/// the ends of the two features, on the side where its extension lines are shorter (beside
+/// the point, for a point over a long line) or, when they are as long, past the end that lies
+/// farther from the middle of the sketch, else above, else to the right. It also goes past the
+/// points, circles and arcs of the sketch lying between the two features, so it clears the
+/// corner arcs of a rounded rectangle.
+fn outside_placement(
+    s: &ConstrainedSketch,
+    first: [Point2; 2],
+    second: [Point2; 2],
+    axis: (f64, f64),
+) -> Outside {
+    let along = |p: Point2| p.x * axis.0 + p.y * axis.1;
+    let across = |p: Point2| p.y * axis.0 - p.x * axis.1;
+    let span = |[a, b]: [Point2; 2]| (along(a).min(along(b)), along(a).max(along(b)));
+    let (first_span, second_span) = (span(first), span(second));
+    let (lo, hi) = (
+        first_span.0.min(second_span.0),
+        first_span.1.max(second_span.1),
+    );
+    // How long the extension lines would be on either side.
+    let behind = (first_span.0 - lo) + (second_span.0 - lo);
+    let ahead = (hi - first_span.1) + (hi - second_span.1);
+    let centre = along(sketch_centre(s));
+    let sign = [
+        behind - ahead,
+        (hi - centre) - (centre - lo),
+        axis.1,
+        axis.0,
+    ]
+    .into_iter()
+    .find(|v| v.abs() > LINEAR_TOLERANCE)
+    .map_or(1.0, f64::signum);
+    let out = (axis.0 * sign, axis.1 * sign);
+    let outwards = |p: Point2| along(p) * sign;
+    // Each feature's end on that side, where its extension line starts.
+    let end = |[a, b]: [Point2; 2]| if outwards(a) >= outwards(b) { a } else { b };
+    let from = [end(first), end(second)];
+    let (x, y) = (across(from[0]), across(from[1]));
+    let between = (x.min(y) - LINEAR_TOLERANCE)..=(x.max(y) + LINEAR_TOLERANCE);
+    let level = s
+        .entities()
+        .iter()
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(p) => Some((p, 0.0)),
+            Geometry::Circle { center, radius } => Some((s.position(center)?, radius)),
+            Geometry::Arc { center, .. } => Some((s.position(center)?, s.radius_of(e.id)?)),
+            Geometry::Line { .. } => None,
+        })
+        .filter(|(p, _)| between.contains(&across(*p)))
+        .map(|(p, radius)| outwards(p) + radius)
+        .chain(from.iter().map(|p| outwards(*p)))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let to = from.map(|p| {
+        let shift = level - outwards(p);
+        Point2::new(p.x + out.0 * shift, p.y + out.1 * shift)
+    });
+    Outside { from, to, out }
+}
+
+/// The middle of a sketch: the mean of its points, or the origin when it has none.
+fn sketch_centre(s: &ConstrainedSketch) -> Point2 {
+    let (sum, n) = s
+        .entities()
+        .iter()
+        .filter_map(|e| match e.geometry {
+            Geometry::Point(p) => Some(p),
+            _ => None,
+        })
+        .fold((Point2::ORIGIN, 0.0), |(sum, n), p| {
+            (Point2::new(sum.x + p.x, sum.y + p.y), n + 1.0)
+        });
+    let n = f64::max(n, 1.0);
+    Point2::new(sum.x / n, sum.y / n)
+}
+
+/// The direction from `a` to `b` as a unit vector, if they are apart.
+fn unit(a: Point2, b: Point2) -> Option<(f64, f64)> {
+    let length = a.distance(b);
+    (length > LINEAR_TOLERANCE).then(|| ((b.x - a.x) / length, (b.y - a.y) / length))
 }
 
 /// Dimensions that apply to `selection` (points, lines, circles), with their current
@@ -3044,6 +3180,7 @@ fn plane_segment_distance(p: Point2, a: Point2, b: Point2) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui::{Pos2, Rect, Vec2};
     use oxyde_geom::{Plane, Point2};
     use oxyde_model::FeatureId;
     use oxyde_sketch::{ConstrainedSketch, Constraint, EntityId, Geometry};
@@ -3990,5 +4127,57 @@ mod tests {
         assert_ne!(session.sketch, before);
         assert!(session.undo());
         assert_eq!(session.sketch, before);
+    }
+
+    #[test]
+    fn distances_are_drawn_outside_the_shape() {
+        // The Hackintosh case's top panel: a 233 × 300 rectangle with 8 mm round corners,
+        // centred on the origin and sized by the distances between its opposite sides.
+        let (w, h, r) = (116.5, 150.0, 8.0);
+        let p = Point2::new;
+        let mut s = ConstrainedSketch::new();
+        let bottom = s.line(p(-w + r, -h), p(w - r, -h));
+        let right = s.line(p(w, -h + r), p(w, h - r));
+        let top = s.line(p(w - r, h), p(-w + r, h));
+        let left = s.line(p(-w, h - r), p(-w, -h + r));
+        s.arc(p(-w + r, -h + r), p(-w, -h + r), p(-w + r, -h));
+        s.arc(p(w - r, -h + r), p(w - r, -h), p(w, -h + r));
+        s.arc(p(w - r, h - r), p(w, h - r), p(w - r, h));
+        s.arc(p(-w + r, h - r), p(-w + r, h), p(-w, h - r));
+        let (_, bottom_left) = s.endpoints(left).unwrap();
+        let (bottom_right, _) = s.endpoints(right).unwrap();
+        let mut with_hole = s.clone();
+        let hole = with_hole.point(p(50.0, 100.0));
+        let (panel, with_hole) = (session(s), session(with_hole));
+        // Seen from the front at 2 px per mm, the screen's y pointing down.
+        let to_screen = |q: Point2| Pos2::new(400.0 + 2.0 * q.x as f32, 400.0 - 2.0 * q.y as f32);
+        let plate = Rect::from_two_pos(to_screen(p(-w, -h)), to_screen(p(w, h)));
+        // Where each label goes, as big as "Σ 300" in the 12 px font with its margins.
+        let label = |session: &SketchSession, c: Constraint| {
+            let g = session.dimension_graphics(&c, &to_screen).unwrap();
+            g.label_rect(Vec2::new(42.0, 18.0))
+        };
+
+        let width = label(&panel, Constraint::LineDistance(left, right, 233.0));
+        let height = label(&panel, Constraint::LineDistance(bottom, top, 300.0));
+        assert!(!width.intersects(plate), "{width:?} on {plate:?}");
+        assert!(!height.intersects(plate), "{height:?} on {plate:?}");
+        assert!(!width.intersects(height), "{width:?} on {height:?}");
+        // The width above or below the plate, the height beside it.
+        let (x, y) = (width.center().x, height.center().y);
+        assert!(plate.left() < x && x < plate.right(), "{width:?}");
+        assert!(plate.top() < y && y < plate.bottom(), "{height:?}");
+
+        // From a point to a line, on the point's side, and between two points.
+        let to_top = label(&with_hole, Constraint::PointLineDistance(hole, top, 50.0));
+        assert!(to_top.left() > plate.right(), "beside the hole: {to_top:?}");
+        let corners = label(
+            &panel,
+            Constraint::Distance(bottom_left, bottom_right, 233.0),
+        );
+        assert!(
+            corners.top() > plate.bottom(),
+            "below the plate: {corners:?}"
+        );
     }
 }

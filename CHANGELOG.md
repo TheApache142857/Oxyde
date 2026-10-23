@@ -5,6 +5,21 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Sketch dimensions drawn outside the shape (unreleased, October 2026)
+
+- **Distances between parallel lines, from a point to a line and between two points are
+  drawn outside the shape** in sketch mode, where a SolidWorks user drags them: the
+  dimension line runs past the ends of what it measures, on the side where its extension
+  lines are shorter, or else away from the middle of the sketch (above, or to the right,
+  for a shape centred on the origin), and past the corners and arcs in between. The
+  Hackintosh case's top panel, a 233 × 300 rounded rectangle sized by the distances between
+  its opposite sides, shows its 233 above it and its 300 beside it. Before, both dimension
+  lines crossed its middle and the 300 hid the 233.
+- A label beside the shape moves out by its width, so it stays clear of the shape just as
+  a label above it does. This applies to lengths too.
+- Oxyde still does not save where dimensions sit, so each one is placed again from the
+  geometry. SolidWorks keeps where you dragged it.
+
 ### Assembly equations (unreleased, October 2026)
 
 - **Tools › Equations… in an assembly** (also *Equations* on the Evaluate tab), as in
