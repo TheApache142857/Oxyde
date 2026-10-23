@@ -68,6 +68,13 @@ pub(crate) struct MateDto {
     pub aligned: bool,
     #[serde(default)]
     pub suppressed: bool,
+    /// Concentric only: the components keep their turn about the axis. Written only when on.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lock_rotation: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +158,7 @@ impl AssemblyModel {
                     b: ref_dto(&m.b),
                     aligned: m.aligned,
                     suppressed: m.suppressed,
+                    lock_rotation: m.lock_rotation,
                 })
                 .collect(),
             next_global_id: (text.next_global_id > 1).then_some(text.next_global_id),
@@ -233,6 +241,8 @@ impl AssemblyModel {
                 b: ref_from(m.b),
                 aligned: m.aligned,
                 suppressed: m.suppressed,
+                lock_rotation: m.lock_rotation,
+                locked_angle: None,
             })
             .collect();
 

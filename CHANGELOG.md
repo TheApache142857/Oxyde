@@ -5,6 +5,17 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Lock rotation on Concentric mates (unreleased, October 2026)
+
+- **Lock rotation**, as in SolidWorks: a checkbox on a Concentric mate between two round
+  faces, circular or straight edges or axes, in the Mate panel. The two parts keep the turn
+  they have about the shared axis, so a screw, a pin or a foot is fully defined with two
+  mates (Concentric, locked, and a Coincident face) instead of three. Dragging a locked part
+  no longer spins it.
+- Saved as `lock_rotation` on the mate in `assembly.json` (written only when on); an older
+  build opens the file with the part free to turn again.
+- The MCP server's `add_mate` takes `"lock_rotation": true`, and `assembly_info` lists it.
+
 ### Gruvbox and Classic 95 themes (unreleased, October 2026)
 
 - **Three new themes** in Tools › Preferences › Graphics, beside Flux and Light:

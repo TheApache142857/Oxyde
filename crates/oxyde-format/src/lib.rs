@@ -1625,6 +1625,27 @@ mod tests {
         }
     }
 
+    /// *Lock rotation* is written only when on and read back; the turn it holds is not
+    /// saved, since the placements give it back.
+    #[test]
+    fn lock_rotation_is_written_only_when_on() {
+        let mut file = sample_assembly();
+        let json: serde_json::Value =
+            serde_json::from_slice(&assembly_json(&file).unwrap()).unwrap();
+        assert!(json["mates"][0].get("lock_rotation").is_none());
+        file.assembly.mates[0].lock_rotation = true;
+        file.assembly.mates[0].locked_angle = Some(0.25);
+        let json: serde_json::Value =
+            serde_json::from_slice(&assembly_json(&file).unwrap()).unwrap();
+        assert_eq!(json["mates"][0]["lock_rotation"], true);
+        let bytes = write_assembly(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let read = read_assembly(Cursor::new(bytes)).unwrap();
+        assert!(read.assembly.mates[0].lock_rotation);
+        assert_eq!(read.assembly.mates[0].locked_angle, None);
+    }
+
     #[test]
     fn assembly_equations_are_stored_as_text_and_refreshed_from_their_file() {
         use oxyde_assembly::TopLevelOnly;

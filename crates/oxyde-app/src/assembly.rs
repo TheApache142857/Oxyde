@@ -624,11 +624,7 @@ impl AssemblyDoc {
         };
         let solution =
             oxyde_assembly::solve_about(assembly, |r| self.local(r), center, self.size());
-        for (id, placement) in &solution.placements {
-            if let Some(c) = assembly.component_mut(*id) {
-                c.placement = *placement;
-            }
-        }
+        assembly.apply_solution(&solution);
         solution
     }
 
