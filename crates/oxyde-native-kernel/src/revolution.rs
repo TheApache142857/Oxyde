@@ -501,8 +501,103 @@ impl Revolution {
     }
 }
 
-/// Where an edge starts and ends in a surface's `(θ, v)` plane.
-pub(crate) type ParamSegment = ((f64, f64), (f64, f64));
+/// Where an edge starts and ends in a surface's `(θ, v)` plane, and whether it runs
+/// straight between them there (along a line of constant `θ` or constant `v`) or bends (a
+/// section, a circle that is neither a parallel nor a meridian).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ParamSegment {
+    pub from: (f64, f64),
+    pub to: (f64, f64),
+    pub straight: bool,
+}
+
+/// `raw`, an angle, moved by whole turns to be nearest `near`.
+pub(crate) fn unwrap(near: f64, raw: f64) -> f64 {
+    raw + TAU * ((near - raw) / TAU).round()
+}
+
+/// An edge that bends across a surface of revolution's `(θ, v)` plane, followed there: its
+/// points at even steps along it, `θ` (and a ring torus's `v`) unwrapped from where it
+/// starts.
+#[derive(Debug, Clone)]
+pub(crate) struct ParamPath {
+    points: Vec<(f64, f64)>,
+    sweep: f64,
+}
+
+impl ParamPath {
+    /// The steps a path is followed in.
+    const STEPS: usize = 128;
+
+    pub fn follow(
+        surface: &Revolution,
+        edge: &WalkEdge,
+        from: (f64, f64),
+        near_axis: f64,
+    ) -> Result<ParamPath, String> {
+        let mut points = Vec::with_capacity(Self::STEPS + 1);
+        points.push(from);
+        let (mut theta, mut v) = from;
+        for i in 1..=Self::STEPS {
+            let s = edge.sweep * i as f64 / Self::STEPS as f64;
+            let p = if i == Self::STEPS {
+                edge.b
+            } else {
+                edge.curve
+                    .at(edge.a, edge.b, s)
+                    .ok_or_else(|| "a section followed beyond its reach".to_owned())?
+            };
+            let (t, w) = surface.params(p);
+            if surface.rho_z(p).0 > near_axis {
+                theta = unwrap(theta, t);
+            }
+            v = if surface.v_periodic() {
+                unwrap(v, w)
+            } else {
+                w
+            };
+            points.push((theta, v));
+        }
+        Ok(ParamPath {
+            points,
+            sweep: edge.sweep,
+        })
+    }
+
+    pub fn end(&self) -> (f64, f64) {
+        self.points.last().copied().unwrap_or((0.0, 0.0))
+    }
+
+    /// The path's samples, from its start to its end.
+    pub fn points(&self) -> &[(f64, f64)] {
+        &self.points
+    }
+
+    /// `(θ, v)` of the edge's point `s` along it, unwrapped next to the path there.
+    pub fn at(&self, surface: &Revolution, edge: &WalkEdge, s: f64) -> (f64, f64) {
+        let f = (s / self.sweep * Self::STEPS as f64).clamp(0.0, Self::STEPS as f64);
+        let k = (f.floor() as usize).min(Self::STEPS - 1);
+        let (t0, v0) = self.points[k];
+        let (t1, v1) = self.points[k + 1];
+        let w = f - k as f64;
+        let near = (t0 + (t1 - t0) * w, v0 + (v1 - v0) * w);
+        let Some(p) = edge.curve.at(edge.a, edge.b, s) else {
+            return near;
+        };
+        let (t, v) = surface.params(p);
+        let theta = if surface.rho_z(p).0 > 0.0 {
+            unwrap(near.0, t)
+        } else {
+            near.0
+        };
+        let v = if surface.v_periodic() {
+            unwrap(near.1, v)
+        } else {
+            v
+        };
+        (theta, v)
+    }
+}
 
 /// One edge of a loop as [`walk`] takes it: its curve run the way the loop runs, its ends,
 /// how far it turns (a circle's angle, a degenerate edge's turn), its middle and its
@@ -543,12 +638,20 @@ pub(crate) fn walk(
     let v0 = surface.params(first.a).1;
     let (mut theta, mut v) = (theta0, v0);
     let (x, y, a) = surface.frame();
-    let mut out = vec![((0.0, 0.0), (0.0, 0.0)); n];
+    let mut out = vec![
+        ParamSegment {
+            from: (0.0, 0.0),
+            to: (0.0, 0.0),
+            straight: true,
+        };
+        n
+    ];
     for k in 0..n {
         let index = (start + k) % n;
         let edge = &edges[index];
         let tolerance = 10.0 * edge.tolerance;
         let from = (theta, v);
+        let mut straight = true;
         match edge.curve {
             Curve::Line => {
                 if !matches!(surface.meridian, Meridian::Line { .. }) {
@@ -582,11 +685,13 @@ pub(crate) fn walk(
                     }
                     v += dv;
                 } else {
-                    return Err(
-                        "a circle on a surface of revolution that is neither a parallel nor a meridian"
-                            .to_owned(),
-                    );
+                    (theta, v) = ParamPath::follow(surface, edge, from, near_axis)?.end();
+                    straight = false;
                 }
+            }
+            Curve::Section(_) => {
+                (theta, v) = ParamPath::follow(surface, edge, from, near_axis)?.end();
+                straight = false;
             }
             Curve::Degenerate { axis, turn } => {
                 let mut t = turn;
@@ -596,7 +701,11 @@ pub(crate) fn walk(
                 theta += t;
             }
         }
-        out[index] = (from, (theta, v));
+        out[index] = ParamSegment {
+            from,
+            to: (theta, v),
+            straight,
+        };
     }
     if (theta - theta0).abs() > 1e-6 {
         return Err("a loop winds round its surface's axis".to_owned());
@@ -740,6 +849,15 @@ fn integrate(a: f64, b: f64, piece: f64, g: &impl Fn(f64) -> [f64; 9]) -> [f64; 
     total
 }
 
+/// `∫ f` from `a` to `b`, in pieces no longer than `piece`, by the Gauss–Legendre rule.
+pub(crate) fn quadrature(a: f64, b: f64, piece: f64, f: &impl Fn(f64) -> f64) -> f64 {
+    integrate(a, b, piece, &|x| {
+        let mut out = [0.0; 9];
+        out[0] = f(x);
+        out
+    })[0]
+}
+
 /// Antiderivatives of 1, cos, sin, cos², sin² and cos·sin at `θ`.
 fn trig_antiderivatives(theta: f64) -> [f64; 6] {
     let (s, c) = theta.sin_cos();
@@ -779,28 +897,57 @@ impl RevolutionSums {
         }
     }
 
+    /// The functions of `v` the integrals are made of, at `v`.
+    fn g(&self, surface: &Revolution, v: f64) -> [f64; 9] {
+        let (rho, z) = surface.meridian_at(v);
+        let (dr, dz) = surface.meridian_tangent(v);
+        let l = (dr * dr + dz * dz).sqrt();
+        // n dA = ρ (z' e − ρ' a) dθ dv; (x − r)·n dA = (P (w·e) + Q) dθ dv.
+        let p = rho * dz;
+        let q = rho * (rho * dz - dr * self.wa - dr * z);
+        [
+            rho * l,
+            rho * rho * l,
+            rho * z * l,
+            p,
+            q,
+            rho * p,
+            rho * q,
+            z * p,
+            z * q,
+        ]
+    }
+
+    /// Adds an edge that bends across the `(θ, v)` plane, followed along `path`:
+    /// `∫ F(θ) g(v) dv` along it (`F` the antiderivatives, as for a line of constant `θ`) by
+    /// Gauss–Legendre quadrature in its own parameter, `dv` from its points a hair either
+    /// side.
+    pub fn add_path(&mut self, surface: &Revolution, edge: &WalkEdge, path: &ParamPath) {
+        let h = 1e-6 * edge.sweep.max(1e-9);
+        let pieces = 32;
+        let step = edge.sweep / f64::from(pieces);
+        for k in 0..pieces {
+            let (lo, hi) = (step * f64::from(k), step * f64::from(k + 1));
+            let (mid, half) = ((lo + hi) / 2.0, (hi - lo) / 2.0);
+            for &(x, w) in GAUSS.iter() {
+                let s = mid + half * x;
+                let (theta, v) = path.at(surface, edge, s);
+                let dv =
+                    (path.at(surface, edge, s + h).1 - path.at(surface, edge, s - h).1) / (2.0 * h);
+                let g = self.g(surface, v);
+                let f = trig_antiderivatives(theta);
+                for (row, fi) in self.sums.iter_mut().zip(f) {
+                    for (cell, gj) in row.iter_mut().zip(g) {
+                        *cell += w * half * fi * gj * dv;
+                    }
+                }
+            }
+        }
+    }
+
     /// Adds the boundary line at angle `theta` from `v0` to `v1`.
     pub fn add_line(&mut self, surface: &Revolution, theta: f64, v0: f64, v1: f64) {
-        let wa = self.wa;
-        let g = |v: f64| {
-            let (rho, z) = surface.meridian_at(v);
-            let (dr, dz) = surface.meridian_tangent(v);
-            let l = (dr * dr + dz * dz).sqrt();
-            // n dA = ρ (z' e − ρ' a) dθ dv; (x − r)·n dA = (P (w·e) + Q) dθ dv.
-            let p = rho * dz;
-            let q = rho * (rho * dz - dr * wa - dr * z);
-            [
-                rho * l,
-                rho * rho * l,
-                rho * z * l,
-                p,
-                q,
-                rho * p,
-                rho * q,
-                z * p,
-                z * q,
-            ]
-        };
+        let g = |v: f64| self.g(surface, v);
         let piece = match surface.meridian {
             Meridian::Line { .. } => f64::INFINITY,
             Meridian::Circle { .. } => PI / 8.0,

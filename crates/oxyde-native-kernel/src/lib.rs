@@ -9,10 +9,11 @@
 //! and §10 (Native kernel).
 //!
 //! What it builds so far: boxes, extrusions and revolves of profiles of lines, arcs and
-//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines and circles,
-//! and degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored
-//! copies, and booleans (fuse, cut, common) of them where their faces meet in lines and
-//! circles, voids included, with their topology, exact mass properties, bounds and display
+//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines, circles and
+//! sections, the exact curves where a cylinder or a cone crosses another surface, and
+//! degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored copies,
+//! and booleans (fuse, cut, common) of them where their faces meet in lines, circles and
+//! sections, voids included, with their topology, exact mass properties, bounds and display
 //! meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
 //! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
 //! describes how.
@@ -675,7 +676,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "the native kernel cannot intersect surfaces of revolution on different axes yet"
+            "the native kernel cannot intersect surfaces of revolution that meet in a curve turning back on itself yet"
         );
         let shape = kernel
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))

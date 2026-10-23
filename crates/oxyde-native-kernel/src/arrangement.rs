@@ -14,6 +14,7 @@
 // Indices into the points and edges made here.
 #![allow(clippy::indexing_slicing)]
 
+use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 
 /// A point of the plane.
@@ -74,12 +75,25 @@ pub(crate) enum Geom {
     },
 }
 
+/// What a straight piece of a curve laid out as points stands for: the curve, and its
+/// parameters (an angle about the curve's axis) at the piece's start and end. The booleans
+/// lay out curves no chart makes straight or round this way, and put the pieces of one back
+/// together into the exact curve once the arrangement is traced.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Tag {
+    pub curve: crate::geometry::Curve,
+    pub t0: f64,
+    pub t1: f64,
+}
+
 /// A segment from `a` to `b`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Segment {
     pub a: P,
     pub b: P,
     pub geom: Geom,
+    /// The curve a straight piece stands for, if it does.
+    pub tag: Option<Tag>,
 }
 
 impl Segment {
@@ -88,6 +102,17 @@ impl Segment {
             a,
             b,
             geom: Geom::Line,
+            tag: None,
+        }
+    }
+
+    /// A straight piece of a curve laid out as points.
+    pub fn tagged(a: P, b: P, tag: Tag) -> Self {
+        Self {
+            a,
+            b,
+            geom: Geom::Line,
+            tag: Some(tag),
         }
     }
 
@@ -100,7 +125,23 @@ impl Segment {
                 radius: a.distance(center),
                 ccw,
             },
+            tag: None,
         }
+    }
+
+    /// The tag of the stretch from `u0` to `u1` along it (as [`Segment::extent`] measures).
+    fn tag_between(&self, u0: f64, u1: f64, tol: f64) -> Option<Tag> {
+        let tag = self.tag?;
+        let extent = self.extent(tol);
+        if extent <= 0.0 {
+            return Some(tag);
+        }
+        let at = |u: f64| tag.t0 + (tag.t1 - tag.t0) * (u / extent);
+        Some(Tag {
+            t0: at(u0),
+            t1: at(u1),
+            ..tag
+        })
     }
 
     /// How far it runs: its length for a line, the angle it turns through for an arc
@@ -219,9 +260,32 @@ impl Segment {
         }
     }
 
+    /// A box round it, `pad` wider all round: a line's ends, an arc's whole circle.
+    fn bounds(&self, pad: f64) -> (P, P) {
+        let (lo, hi) = match self.geom {
+            Geom::Line => (
+                P::new(self.a.x.min(self.b.x), self.a.y.min(self.b.y)),
+                P::new(self.a.x.max(self.b.x), self.a.y.max(self.b.y)),
+            ),
+            Geom::Arc { center, radius, .. } => (
+                P::new(center.x - radius, center.y - radius),
+                P::new(center.x + radius, center.y + radius),
+            ),
+        };
+        (
+            P::new(lo.x - pad, lo.y - pad),
+            P::new(hi.x + pad, hi.y + pad),
+        )
+    }
+
     /// The same segment run the other way.
     pub fn reversed(&self) -> Segment {
         Segment {
+            tag: self.tag.map(|t| Tag {
+                t0: t.t1,
+                t1: t.t0,
+                ..t
+            }),
             a: self.b,
             b: self.a,
             geom: match self.geom {
@@ -472,6 +536,10 @@ pub(crate) struct Arrangement {
     pub points: Vec<P>,
     pub edges: Vec<ArrEdge>,
     tol: f64,
+    /// The points by the square of side `tol` they lie in, to weld a new one quickly.
+    grid: HashMap<(i64, i64), Vec<usize>>,
+    /// The edges by their two ends, the smaller first, to find one already there quickly.
+    by_ends: HashMap<(usize, usize), Vec<usize>>,
 }
 
 impl Arrangement {
@@ -481,6 +549,8 @@ impl Arrangement {
             points: Vec::new(),
             edges: Vec::new(),
             tol,
+            grid: HashMap::new(),
+            by_ends: HashMap::new(),
         };
         // Every segment's split points, each with how sure it is: its own ends (0), another
         // segment's end lying on it (1), and where it crosses another, worked out from both (2).
@@ -488,8 +558,25 @@ impl Arrangement {
             .iter()
             .map(|s| vec![(0.0, 0), (s.extent(tol), 0)])
             .collect();
-        for i in 0..segments.len() {
-            for j in i + 1..segments.len() {
+        // Only segments whose boxes overlap can meet: swept along x, in the order of their
+        // left ends.
+        let boxes: Vec<(P, P)> = segments.iter().map(|s| s.bounds(2.0 * tol)).collect();
+        let mut order: Vec<usize> = (0..segments.len()).collect();
+        order.sort_by(|&a, &b| boxes[a].0.x.total_cmp(&boxes[b].0.x).then(a.cmp(&b)));
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for (k, &i) in order.iter().enumerate() {
+            for &j in &order[k + 1..] {
+                if boxes[j].0.x > boxes[i].1.x {
+                    break;
+                }
+                if boxes[j].0.y <= boxes[i].1.y && boxes[i].0.y <= boxes[j].1.y {
+                    pairs.push((i.min(j), i.max(j)));
+                }
+            }
+        }
+        pairs.sort_unstable();
+        for (i, j) in pairs {
+            {
                 for (p, met) in meet(&segments[i], &segments[j], tol) {
                     let (on_i, on_j) = match met {
                         Met::Crossing => (2, 2),
@@ -550,6 +637,7 @@ impl Arrangement {
                     a: arrangement.points[from],
                     b: arrangement.points[to],
                     geom: segment.geom,
+                    tag: segment.tag_between(u0.max(0.0), u1.min(extent), tol),
                 };
                 if from == to && !closed {
                     continue;
@@ -558,49 +646,94 @@ impl Arrangement {
             }
         }
         arrangement.prune();
+        // Pruning renumbered the edges; the map of them is not needed any more.
+        arrangement.by_ends.clear();
         arrangement
     }
 
     /// The index of the point at `p`, welding it to one within the tolerance.
     fn point(&mut self, p: P) -> usize {
-        if let Some(i) = self.points.iter().position(|q| q.distance(p) <= self.tol) {
+        let cell = |p: P| {
+            (
+                (p.x / self.tol).floor() as i64,
+                (p.y / self.tol).floor() as i64,
+            )
+        };
+        let (cx, cy) = cell(p);
+        // The first point made within the tolerance, as a search in order would find.
+        let mut found: Option<usize> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for &i in self.grid.get(&(cx + dx, cy + dy)).into_iter().flatten() {
+                    if self.points[i].distance(p) <= self.tol && found.is_none_or(|f| i < f) {
+                        found = Some(i);
+                    }
+                }
+            }
+        }
+        if let Some(i) = found {
             return i;
         }
         self.points.push(p);
-        self.points.len() - 1
+        let index = self.points.len() - 1;
+        self.grid.entry((cx, cy)).or_default().push(index);
+        index
     }
 
     /// Adds an edge unless the same one, either way round, is there already.
     fn add_edge(&mut self, from: usize, to: usize, segment: Segment) {
         let mid = segment.at(segment.extent(self.tol) / 2.0, self.tol);
-        let same = self.edges.iter().any(|e| {
-            let ends = (e.from == from && e.to == to) || (e.from == to && e.to == from);
-            ends && {
-                let m = e.segment.at(e.segment.extent(self.tol) / 2.0, self.tol);
-                m.distance(mid) <= self.tol
-            }
+        let key = (from.min(to), from.max(to));
+        let same = self.by_ends.get(&key).into_iter().flatten().any(|&e| {
+            let e = &self.edges[e];
+            let m = e.segment.at(e.segment.extent(self.tol) / 2.0, self.tol);
+            m.distance(mid) <= self.tol
         });
         if !same {
             self.edges.push(ArrEdge { from, to, segment });
+            self.by_ends
+                .entry(key)
+                .or_default()
+                .push(self.edges.len() - 1);
         }
     }
 
     /// Edges with an end no other edge reaches: what is left of a curve that only touched
-    /// the face, or ran out short of its boundary by rounding. They enclose nothing.
+    /// the face, or ran out short of its boundary by rounding. They enclose nothing. Peeled
+    /// from their loose ends inwards, each point's count of edges kept up to date.
     fn prune(&mut self) {
-        loop {
-            let mut degree = vec![0usize; self.points.len()];
-            for e in &self.edges {
-                degree[e.from] += 1;
-                degree[e.to] += 1;
-            }
-            let before = self.edges.len();
-            self.edges
-                .retain(|e| e.from == e.to || (degree[e.from] > 1 && degree[e.to] > 1));
-            if self.edges.len() == before {
-                break;
+        let mut degree = vec![0usize; self.points.len()];
+        let mut at: Vec<Vec<usize>> = vec![Vec::new(); self.points.len()];
+        for (i, e) in self.edges.iter().enumerate() {
+            degree[e.from] += 1;
+            degree[e.to] += 1;
+            if e.from != e.to {
+                at[e.from].push(i);
+                at[e.to].push(i);
             }
         }
+        let mut removed = vec![false; self.edges.len()];
+        let mut loose: Vec<usize> = (0..self.points.len()).filter(|&p| degree[p] == 1).collect();
+        while let Some(p) = loose.pop() {
+            for &i in &at[p] {
+                if removed[i] {
+                    continue;
+                }
+                removed[i] = true;
+                let e = &self.edges[i];
+                for q in [e.from, e.to] {
+                    degree[q] -= 1;
+                    if degree[q] == 1 {
+                        loose.push(q);
+                    }
+                }
+            }
+        }
+        let mut k = 0;
+        self.edges.retain(|_| {
+            k += 1;
+            !removed[k - 1]
+        });
     }
 
     /// The segment a half-edge runs along, its way.
@@ -703,6 +836,10 @@ impl Arrangement {
                 )
             })
             .collect();
+        let edge_sets: Vec<std::collections::HashSet<usize>> = regions
+            .iter()
+            .map(|(region, _, _)| region.outer.iter().map(|h| h.edge).collect())
+            .collect();
         for (cycle, area) in &cycles {
             if *area > tol * tol {
                 continue;
@@ -712,13 +849,9 @@ impl Arrangement {
             };
             let probe = self.points[self.head(first)];
             let mut best: Option<usize> = None;
-            for (r, (region, region_area, polygon)) in regions.iter().enumerate() {
+            for (r, (_, region_area, polygon)) in regions.iter().enumerate() {
                 // Not the region on the other side of the same edges.
-                if region
-                    .outer
-                    .iter()
-                    .any(|h| cycle.iter().any(|c| c.edge == h.edge))
-                {
+                if cycle.iter().any(|c| edge_sets[r].contains(&c.edge)) {
                     continue;
                 }
                 if winding(polygon, probe) != 0 && best.is_none_or(|b| *region_area < regions[b].1)

@@ -29,9 +29,9 @@ use oxyde_geom::{LINEAR_TOLERANCE, Point3, Vec3};
 use oxyde_kernel::{BooleanOp, FaceSource, OpHistory};
 
 use crate::NativeError;
-use crate::arrangement::{self, Arrangement, Geom, P, Segment};
+use crate::arrangement::{self, Arrangement, Geom, P, Segment, Tag};
 use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex};
-use crate::geometry::{Circle, Curve, Surface};
+use crate::geometry::{Circle, Curve, Section, Surface};
 use crate::revolution::{Meridian, PlaneCurve, Revolution, WalkEdge, walk};
 
 /// An input face a face of the result is made of: the input's position in the boolean's
@@ -258,7 +258,7 @@ impl Chart {
 }
 
 /// An edge in space, from `a` to `b`: a line, an arc counter-clockwise about its circle's
-/// normal (a whole circle when `a` is `b`), or a degenerate edge at a point.
+/// normal (a whole circle when `a` is `b`), a section, or a degenerate edge at a point.
 #[derive(Debug, Clone, Copy)]
 struct Edge3 {
     a: Point3,
@@ -279,46 +279,29 @@ impl Edge3 {
         self.a.distance(self.b) <= TOL
     }
 
-    /// The angle it turns through (a circle, a degenerate edge), its length (a line).
+    /// The angle it turns through (a circle, a section, a degenerate edge), its length (a
+    /// line).
     fn extent(&self) -> f64 {
-        match self.curve {
-            Curve::Line => self.a.distance(self.b),
-            Curve::Circle(c) => c.sweep(self.a, self.b, self.closed()),
-            Curve::Degenerate { turn, .. } => turn,
-        }
+        self.curve.extent(self.a, self.b, self.closed())
     }
 
     fn midpoint(&self) -> Point3 {
-        match self.curve {
-            Curve::Line => self.a + (self.b - self.a) * 0.5,
-            Curve::Circle(c) => c.point_at(c.angle_of(self.a) + self.extent() / 2.0),
-            Curve::Degenerate { .. } => self.a,
-        }
+        self.curve
+            .at(self.a, self.b, self.extent() / 2.0)
+            .unwrap_or(self.a)
     }
 
     /// Where `p` is along it, strictly between its ends: `None` when it is off it, or at
     /// an end.
     fn inner(&self, p: Point3) -> Option<f64> {
-        if p.distance(self.a) <= TOL || p.distance(self.b) <= TOL {
+        if p.distance(self.a) <= TOL || p.distance(self.b) <= TOL || self.curve.is_degenerate() {
             return None;
         }
-        match self.curve {
-            Curve::Line => {
-                let d = self.b - self.a;
-                let l = d.length();
-                let t = (p - self.a).dot(d) / (l * l);
-                let off = (p - (self.a + d * t)).length();
-                (off <= TOL && t > 0.0 && t < 1.0).then_some(t * l)
-            }
-            Curve::Circle(c) => {
-                if c.distance(p) > TOL {
-                    return None;
-                }
-                let s = (c.angle_of(p) - c.angle_of(self.a)).rem_euclid(TAU);
-                (s > 0.0 && s < self.extent()).then_some(s)
-            }
-            Curve::Degenerate { .. } => None,
+        if self.curve.distance(self.a, self.b, p) > TOL {
+            return None;
         }
+        let s = self.curve.position(self.a, self.b, p);
+        (s > 0.0 && s < self.extent()).then_some(s)
     }
 
     fn walk_edge(&self) -> WalkEdge {
@@ -348,10 +331,15 @@ fn outward_loops(chart: &Chart, loops: Vec<Vec<Edge3>>) -> Vec<Vec<Edge3>> {
 
 /// A face's boundary in its chart, walked as its loops run: on a surface of revolution,
 /// the angle unwrapped as it goes round, so that a face crossing angle zero stays in one
-/// piece and a face going round whole runs a whole period along `x`.
+/// piece and a face going round whole runs a whole period along `x`. An edge the chart makes
+/// neither straight nor round is laid out as points ([`lay`]).
 fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, String> {
-    let mut out = Vec::new();
+    let mut out: Vec<Segment> = Vec::new();
+    // The outer loop's middle: each later loop (a hole) is moved by whole turns to lie
+    // about it.
+    let mut middle: Option<P> = None;
     for edges in loops {
+        let first = out.len();
         match chart {
             Chart::Plane { normal, .. } => {
                 for e in edges {
@@ -364,6 +352,7 @@ fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, Stri
                             chart.to_2d(c.center),
                             c.normal.dot(*normal) > 0.0,
                         )),
+                        Curve::Section(_) => out.extend(lay(chart, e, a)),
                         Curve::Degenerate { .. } => {}
                     }
                 }
@@ -374,16 +363,341 @@ fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, Stri
                     &edges.iter().map(Edge3::walk_edge).collect::<Vec<_>>(),
                     TOL,
                 )?;
-                for ((t0, v0), (t1, v1)) in walked {
-                    out.push(Segment::line(
-                        P::new(t0 * k, v0 * m),
-                        P::new(t1 * k, v1 * m),
-                    ));
+                for (e, w) in edges.iter().zip(walked) {
+                    let from = P::new(w.from.0 * k, w.from.1 * m);
+                    if w.straight {
+                        out.push(Segment::line(from, P::new(w.to.0 * k, w.to.1 * m)));
+                    } else {
+                        out.extend(lay(chart, e, from));
+                    }
+                }
+            }
+        }
+        let (lo, hi) = box_2d(&out[first..]);
+        let mid = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+        match middle {
+            None => middle = Some(mid),
+            Some(outer) => {
+                let turn = |period: Option<f64>, from: f64, to: f64| {
+                    period.map_or(0.0, |p| p * ((to - from) / p).round())
+                };
+                let (dx, dy) = (
+                    turn(chart.period(), mid.x, outer.x),
+                    turn(chart.v_period(), mid.y, outer.y),
+                );
+                if dx != 0.0 || dy != 0.0 {
+                    for s in &mut out[first..] {
+                        *s = shifted(s, dx, dy);
+                    }
                 }
             }
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------------------
+// Curves no chart makes straight or round: laid out as points, put back together exactly.
+
+/// The step between the points a curve is laid out at, in its own angle: the same for every
+/// copy of a curve, so that two layouts of one curve share their points. The layout only
+/// says which piece is where; where pieces meet is found again on the exact curves
+/// ([`meeting_point`]) and their integrals follow the exact curves, so a few hundred points a
+/// turn are enough.
+const LAY_STEP: f64 = TAU / 256.0;
+
+/// How far a meeting point found on the exact curves may be from where the layouts met: a
+/// chord a 256th of a turn round a circle of radius 100 is 0.008 mm off it.
+const REFINE_REACH: f64 = 0.05;
+
+/// A circle or a section in the one form a tag holds whichever way an edge runs on it: a
+/// section followed as its angle grows, a circle about the one of its two normals whose
+/// first component away from zero is positive.
+fn canonical(curve: Curve) -> Curve {
+    match curve {
+        Curve::Section(s) => Curve::Section(Section { ccw: true, ..s }),
+        Curve::Circle(c) => {
+            let n = c.normal;
+            let first = if n.x.abs() > 1e-12 {
+                n.x
+            } else if n.y.abs() > 1e-12 {
+                n.y
+            } else {
+                n.z
+            };
+            Curve::Circle(Circle {
+                normal: if first < 0.0 { -n } else { n },
+                ..c
+            })
+        }
+        other => other,
+    }
+}
+
+/// The angle of `p` on a canonical curve.
+fn param_of(canon: &Curve, p: Point3) -> f64 {
+    match canon {
+        Curve::Section(s) => s.angle_of(p),
+        Curve::Circle(c) => c.angle_of(p),
+        _ => 0.0,
+    }
+}
+
+/// The point at angle `t` on a canonical curve.
+fn point_of(canon: &Curve, t: f64) -> Option<Point3> {
+    match canon {
+        Curve::Section(s) => s.point_at(t),
+        Curve::Circle(c) => Some(c.point_at(t)),
+        _ => None,
+    }
+}
+
+/// Whether an edge on `curve` runs the way its canonical form's angle grows.
+fn runs_up(curve: &Curve) -> bool {
+    match curve {
+        Curve::Section(s) => s.ccw,
+        Curve::Circle(c) => match canonical(*curve) {
+            Curve::Circle(k) => k.normal.dot(c.normal) > 0.0,
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// `p` in `chart`, moved by whole periods to be nearest `near`.
+fn chart_near(chart: &Chart, p: Point3, near: P) -> P {
+    let mut q = chart.to_2d(p);
+    if let Some(period) = chart.period() {
+        q.x += period * ((near.x - q.x) / period).round();
+    }
+    if let Some(period) = chart.v_period() {
+        q.y += period * ((near.y - q.y) / period).round();
+    }
+    q
+}
+
+/// An edge on a circle or a section laid in `chart` as straight pieces from `from` (where
+/// its start lies there), each tagged with the curve and its angles at its ends: at every
+/// multiple of [`LAY_STEP`] of the curve's angle between its ends.
+fn lay(chart: &Chart, e: &Edge3, from: P) -> Vec<Segment> {
+    let canon = canonical(e.curve);
+    let up = runs_up(&e.curve);
+    let ta = param_of(&canon, e.a);
+    let extent = e.extent();
+    let tb = if up { ta + extent } else { ta - extent };
+    let (lo, hi) = (ta.min(tb), ta.max(tb));
+    let mut ts: Vec<f64> = ((lo / LAY_STEP).floor() as i64 + 1..=(hi / LAY_STEP).ceil() as i64)
+        .map(|k| k as f64 * LAY_STEP)
+        .filter(|&t| t > lo + 1e-9 && t < hi - 1e-9)
+        .collect();
+    if !up {
+        ts.reverse();
+    }
+    ts.insert(0, ta);
+    ts.push(tb);
+    let mut points: Vec<(f64, P)> = Vec::with_capacity(ts.len());
+    let mut near = from;
+    for (i, &t) in ts.iter().enumerate() {
+        let p = if i == 0 {
+            e.a
+        } else if i + 1 == ts.len() {
+            e.b
+        } else {
+            match point_of(&canon, t) {
+                Some(p) => p,
+                None => continue,
+            }
+        };
+        let q = if i == 0 {
+            from
+        } else {
+            chart_near(chart, p, near)
+        };
+        near = q;
+        points.push((t, q));
+    }
+    points
+        .windows(2)
+        .map(|w| {
+            Segment::tagged(
+                w[0].1,
+                w[1].1,
+                Tag {
+                    curve: canon,
+                    t0: w[0].0,
+                    t1: w[1].0,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A whole loop on a circle or a section, from `start` round and back, laid in `chart` from
+/// where `start` lies there.
+fn lay_loop(chart: &Chart, curve: Curve, start: Point3) -> Vec<Segment> {
+    let e = Edge3 {
+        a: start,
+        b: start,
+        curve,
+    };
+    lay(chart, &e, chart.to_2d(start))
+}
+
+/// The edges of a traced cycle of the arrangement, its segments in order: an untagged
+/// segment is the curve the chart makes of it; a run of segments tagged with one curve,
+/// their angles following on, is one edge on that curve, its ends where the tags say,
+/// moved onto both curves where it meets another edge.
+fn cycle_edges(chart: &Chart, segments: &[Segment]) -> Result<Vec<Edge3>, String> {
+    let n = segments.len();
+    // Whether segment `k` carries on the tagged run of the one before it.
+    let carries_on = |k: usize| -> bool {
+        let (Some(prev), Some(this)) = (segments[(k + n - 1) % n].tag, segments[k].tag) else {
+            return false;
+        };
+        let gap = (this.t0 - prev.t1).rem_euclid(TAU);
+        prev.curve == this.curve && gap.min(TAU - gap) <= 1e-9
+    };
+    // Start at a run's first segment; round a loop that is one run, where its angles go
+    // back a whole turn: where it was laid from (a section's from its carrier's angle zero),
+    // so that every face sharing the loop starts it at the same vertex.
+    let start = (0..n)
+        .find(|&k| !carries_on(k))
+        .or_else(|| {
+            (0..n).find(|&k| {
+                let (Some(prev), Some(this)) = (segments[(k + n - 1) % n].tag, segments[k].tag)
+                else {
+                    return false;
+                };
+                (this.t0 - prev.t1).abs() > 1e-6
+            })
+        })
+        .unwrap_or(0);
+    let mut edges: Vec<(Edge3, bool)> = Vec::new();
+    let mut k = 0;
+    while k < n {
+        let s = segments[(start + k) % n];
+        match s.tag {
+            None => {
+                edges.push((
+                    Edge3 {
+                        a: chart.to_world(s.a),
+                        b: chart.to_world(s.b),
+                        curve: chart.curve(&s)?,
+                    },
+                    false,
+                ));
+                k += 1;
+            }
+            Some(tag) => {
+                // The whole run, its angles followed on.
+                let t_start = tag.t0;
+                let mut t_end = tag.t1;
+                k += 1;
+                while k < n && carries_on((start + k) % n) {
+                    let next = segments[(start + k) % n].tag.ok_or("a run lost its tag")?;
+                    let shift = TAU * ((t_end - next.t0) / TAU).round();
+                    t_end = next.t1 + shift;
+                    k += 1;
+                }
+                let up = t_end > t_start;
+                let whole = (t_end - t_start).abs() > TAU - 1e-6;
+                let a = point_of(&tag.curve, t_start).ok_or("a run's start is off its curve")?;
+                let b = if whole {
+                    a
+                } else {
+                    point_of(&tag.curve, t_end).ok_or("a run's end is off its curve")?
+                };
+                edges.push((
+                    Edge3 {
+                        a,
+                        b,
+                        curve: if up { tag.curve } else { tag.curve.reversed() },
+                    },
+                    true,
+                ));
+            }
+        }
+    }
+    // Where a run meets another edge, the meeting point on both, exactly.
+    let m = edges.len();
+    if m > 1 {
+        for i in 0..m {
+            let j = (i + 1) % m;
+            let (e, laid) = edges[i];
+            let (f, next_laid) = edges[j];
+            if !(laid || next_laid) || e.curve.is_degenerate() || f.curve.is_degenerate() {
+                continue;
+            }
+            let q = meeting_point(&e, &f, e.b);
+            edges[i].0.b = q;
+            edges[j].0.a = q;
+        }
+    }
+    Ok(edges.into_iter().map(|(e, _)| e).collect())
+}
+
+/// An edge's curve as a function of one parameter, and that parameter at `p`.
+fn parametric(e: &Edge3, p: Point3) -> (f64, impl Fn(f64) -> Option<Point3> + '_) {
+    let d = e.b - e.a;
+    let t = match e.curve {
+        Curve::Line => {
+            let l2 = d.dot(d).max(f64::MIN_POSITIVE);
+            (p - e.a).dot(d) / l2
+        }
+        Curve::Circle(c) => c.angle_of(p),
+        Curve::Section(s) => s.angle_of(p),
+        Curve::Degenerate { .. } => 0.0,
+    };
+    let f = move |t: f64| match e.curve {
+        Curve::Line => Some(e.a + d * t),
+        Curve::Circle(c) => Some(c.point_at(t)),
+        Curve::Section(s) => s.point_at(t),
+        Curve::Degenerate { .. } => Some(e.a),
+    };
+    (t, f)
+}
+
+/// The point where the curves of `e` and `f` meet near `p`, by Gauss–Newton on their two
+/// parameters; `p` itself when they do not meet clearly there.
+fn meeting_point(e: &Edge3, f: &Edge3, p: Point3) -> Point3 {
+    let (mut t, c) = parametric(e, p);
+    let (mut u, d) = parametric(f, p);
+    let h = 1e-7;
+    for _ in 0..40 {
+        let (Some(pc), Some(pd)) = (c(t), d(u)) else {
+            return p;
+        };
+        let r = pc - pd;
+        if r.length() < 1e-13 {
+            break;
+        }
+        let (Some(c1), Some(c0), Some(d1), Some(d0)) = (c(t + h), c(t - h), d(u + h), d(u - h))
+        else {
+            return p;
+        };
+        let jc = (c1 - c0) * (1.0 / (2.0 * h));
+        let jd = (d1 - d0) * (-1.0 / (2.0 * h));
+        // (JᵀJ) Δ = −Jᵀ r for J = [jc jd].
+        let (a11, a12, a22) = (jc.dot(jc), jc.dot(jd), jd.dot(jd));
+        let (b1, b2) = (-jc.dot(r), -jd.dot(r));
+        let det = a11 * a22 - a12 * a12;
+        if det.abs() <= 1e-12 * (a11 * a22).max(f64::MIN_POSITIVE) {
+            return p;
+        }
+        let dt = (b1 * a22 - b2 * a12) / det;
+        let du = (a11 * b2 - a12 * b1) / det;
+        t += dt;
+        u += du;
+        if dt.abs() + du.abs() < 1e-15 {
+            break;
+        }
+    }
+    match (c(t), d(u)) {
+        (Some(a), Some(b)) if a.distance(b) <= TOL && a.distance(p) <= REFINE_REACH => {
+            a + (b - a) * 0.5
+        }
+        _ => p,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -563,6 +877,8 @@ enum Cut {
     /// A whole circle, starting at `start` (on a surface of revolution's parallel, the point
     /// at its angle zero, where its seam will meet it).
     Circle(Circle, Point3),
+    /// A whole loop of a section, starting at `start` (at the carrier's angle zero).
+    Section(Section, Point3),
     /// The two faces lie on one surface: each is cut along the other's boundary.
     Same,
 }
@@ -613,9 +929,7 @@ fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
                 {
                     parallel_cylinders(a, b, r1, r2)
                 }
-                _ => Err(NativeError::Unsupported(
-                    "intersect surfaces of revolution on different axes",
-                )),
+                _ => crossing(a, b, r1, r2),
             }
         }
     }
@@ -738,9 +1052,7 @@ fn plane_revolution(
         return Ok(cuts);
     }
     if along.abs() > 1e-9 {
-        return Err(NativeError::Unsupported(
-            "intersect a surface of revolution with a plane slanted to its axis",
-        ));
+        return plane_section(plane_face, revolution_face, p, r);
     }
     // Along the axis, `d` from it.
     let d = (r.axis.origin - p.origin).dot(p.normal);
@@ -819,10 +1131,175 @@ fn plane_revolution(
             }
             Ok(cuts)
         }
-        None => Err(NativeError::Unsupported(
-            "intersect a cone, a sphere or a torus with a plane along its axis but apart from it",
+        None => plane_section(plane_face, revolution_face, p, r),
+    }
+}
+
+/// Where a plane meets a surface of revolution in a curve no chart makes straight or round:
+/// a sphere's circle, or a section of a cylinder or a cone that goes all the way round it.
+fn plane_section(
+    plane_face: &Prepared,
+    revolution_face: &Prepared,
+    p: &oxyde_geom::Plane,
+    r: &Revolution,
+) -> Result<Vec<Cut>, NativeError> {
+    match r.meridian {
+        Meridian::Circle {
+            center: 0.0,
+            radius,
+        } => {
+            // A sphere: the circle where the plane cuts it, if it does.
+            let d = (r.axis.origin - p.origin).dot(p.normal);
+            if d.abs() >= radius - TOL {
+                return Ok(Vec::new());
+            }
+            let circle = Circle {
+                center: r.axis.origin - p.normal * d,
+                normal: p.normal,
+                radius: (radius * radius - d * d).sqrt(),
+            };
+            Ok(
+                if circle_meets(&circle, plane_face) && circle_meets(&circle, revolution_face) {
+                    vec![Cut::Circle(circle, seam_start(r, &circle))]
+                } else {
+                    Vec::new()
+                },
+            )
+        }
+        Meridian::Line { .. } => sections(r, &Surface::Plane(*p), plane_face, revolution_face)
+            .ok_or(NativeError::Unsupported(
+                "intersect a cone with a plane it meets in a curve that does not go round its axis",
+            )),
+        Meridian::Circle { .. } => Err(NativeError::Unsupported(
+            "intersect a torus with a plane that neither holds its axis nor is square to it",
         )),
     }
+}
+
+/// Where a whole circle on a surface of revolution should start: where it crosses the
+/// surface's angle zero (its seam's half-plane), if it does, else its own angle zero.
+fn seam_start(r: &Revolution, circle: &Circle) -> Point3 {
+    let (x, y, _) = r.frame();
+    let (u, w) = circle.frame();
+    // The circle's point at angle t is in the seam's plane (normal y) where
+    // A cos t + B sin t = -C.
+    let (a, b) = (circle.radius * u.dot(y), circle.radius * w.dot(y));
+    let c = (circle.center - r.axis.origin).dot(y);
+    let reach = (a * a + b * b).sqrt();
+    if reach <= f64::EPSILON || c.abs() > reach {
+        return circle.point_at(0.0);
+    }
+    let (phase, spread) = (b.atan2(a), (-c / reach).acos());
+    [phase + spread, phase - spread]
+        .into_iter()
+        .map(|t| circle.point_at(t))
+        .find(|p| (*p - r.axis.origin).dot(x) >= 0.0)
+        .unwrap_or_else(|| circle.point_at(0.0))
+}
+
+/// The loops where the carrier's straight lines meet `other` all the way round its axis,
+/// each a section, those that come near both faces; `None` when one of them does not go all
+/// the way round (the curve turns back, or touches itself).
+fn sections(carrier: &Revolution, other: &Surface, a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
+    let mut cuts = Vec::new();
+    for branch in 0..2u8 {
+        let s = Section {
+            carrier: *carrier,
+            other: *other,
+            branch,
+            ccw: true,
+        };
+        let reaches = (0..360)
+            .filter(|i| s.point_at(TAU * f64::from(*i) / 360.0).is_some())
+            .count();
+        if reaches == 0 {
+            break;
+        }
+        if reaches < 360 || !s.goes_round() {
+            return None;
+        }
+        let start = s.point_at(0.0)?;
+        if section_meets(&s, a) && section_meets(&s, b) {
+            cuts.push(Cut::Section(s, start));
+        }
+    }
+    Some(cuts)
+}
+
+/// Whether a whole loop of a section comes into a face's box.
+fn section_meets(s: &Section, face: &Prepared) -> bool {
+    let points: Vec<Point3> = (0..128)
+        .filter_map(|i| s.point_at(TAU * f64::from(i) / 128.0))
+        .collect();
+    let (lo, hi) = box_of(points.iter().copied());
+    // Samples a 128th of a turn apart fall short of the loop's extremes by a hair.
+    let pad = 0.01 * (hi - lo).length() + TOL;
+    lo.x <= face.max.x + pad
+        && face.min.x <= hi.x + pad
+        && lo.y <= face.max.y + pad
+        && face.min.y <= hi.y + pad
+        && lo.z <= face.max.z + pad
+        && face.min.z <= hi.z + pad
+}
+
+/// Two surfaces of revolution on different axes, not two parallel cylinders: two spheres
+/// meet in a circle; otherwise the loops where the straight lines of a cylinder or a cone
+/// (the narrower first) meet the other, when they go all the way round.
+fn crossing(
+    a: &Prepared,
+    b: &Prepared,
+    r1: &Revolution,
+    r2: &Revolution,
+) -> Result<Vec<Cut>, NativeError> {
+    if let (
+        Meridian::Circle {
+            center: 0.0,
+            radius: ra,
+        },
+        Meridian::Circle {
+            center: 0.0,
+            radius: rb,
+        },
+    ) = (r1.meridian, r2.meridian)
+    {
+        let d = r2.axis.origin - r1.axis.origin;
+        let dist = d.length();
+        if dist <= TOL || dist >= ra + rb - TOL || dist <= (ra - rb).abs() + TOL {
+            return Ok(Vec::new());
+        }
+        let n = d * (1.0 / dist);
+        let x = (dist * dist + ra * ra - rb * rb) / (2.0 * dist);
+        let circle = Circle {
+            center: r1.axis.origin + n * x,
+            normal: n,
+            radius: (ra * ra - x * x).max(0.0).sqrt(),
+        };
+        return Ok(if circle_meets(&circle, a) && circle_meets(&circle, b) {
+            vec![Cut::Circle(circle, seam_start(r1, &circle))]
+        } else {
+            Vec::new()
+        });
+    }
+    let torus =
+        |r: &Revolution| matches!(r.meridian, Meridian::Circle { center, .. } if center > 0.0);
+    if torus(r1) || torus(r2) {
+        return Err(NativeError::Unsupported(
+            "intersect a torus with a surface of revolution on another axis",
+        ));
+    }
+    let mut carriers: Vec<(&Revolution, &Revolution)> = [(r1, r2), (r2, r1)]
+        .into_iter()
+        .filter(|(c, _)| matches!(c.meridian, Meridian::Line { .. }))
+        .collect();
+    carriers.sort_by(|p, q| p.0.size().total_cmp(&q.0.size()));
+    for (carrier, other) in carriers {
+        if let Some(cuts) = sections(carrier, &Surface::Revolution(*other), a, b) {
+            return Ok(cuts);
+        }
+    }
+    Err(NativeError::Unsupported(
+        "intersect surfaces of revolution that meet in a curve turning back on itself",
+    ))
 }
 
 /// Where the meridian of `r` crosses the height `t` along its axis, as `(ρ, z)` with `ρ > 0`.
@@ -916,11 +1393,14 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
                 }
                 out
             } else {
-                return Err(internal(
-                    "a circle cut on a surface of revolution that is neither a parallel nor a meridian"
-                        .to_owned(),
-                ));
+                laid_copies(
+                    face,
+                    lay_loop(chart, Curve::Circle(*circle), seam_start(surface, circle)),
+                )
             }
+        }
+        (Cut::Section(section, start), _) => {
+            laid_copies(face, lay_loop(chart, Curve::Section(*section), *start))
         }
         (Cut::Same, _) => {
             // The other face's boundary, laid out in this face's chart, at each of its
@@ -939,6 +1419,28 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
             }
         }
     })
+}
+
+/// A curve laid out in a face's chart, at each of its places along the face's unwrapped
+/// range (whole turns along `x`, and round a ring torus's tube along `y`).
+fn laid_copies(face: &Prepared, laid: Vec<Segment>) -> Vec<Segment> {
+    let (lo, hi) = box_2d(&laid);
+    let shifts = |period: Option<f64>, lo: f64, hi: f64, face_lo: f64, face_hi: f64| -> Vec<f64> {
+        match period {
+            None => vec![0.0],
+            Some(p) => (-2..=2)
+                .map(|k| f64::from(k) * p)
+                .filter(|&d| lo + d < face_hi - TOL && hi + d > face_lo + TOL)
+                .collect(),
+        }
+    };
+    let mut out = Vec::new();
+    for dx in shifts(face.chart.period(), lo.x, hi.x, face.lo.x, face.hi.x) {
+        for dy in shifts(face.chart.v_period(), lo.y, hi.y, face.lo.y, face.hi.y) {
+            out.extend(laid.iter().map(|s| shifted(s, dx, dy)));
+        }
+    }
+    out
 }
 
 fn shifted(s: &Segment, dx: f64, dy: f64) -> Segment {
@@ -1084,17 +1586,11 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
             };
             let mut loops = Vec::new();
             for cycle in std::iter::once(&region.outer).chain(&region.holes) {
-                let mut edges = Vec::new();
-                for &half in cycle {
-                    let s = shifted(&arrangement.segment(half), shift, v_shift);
-                    let curve = face.chart.curve(&s).map_err(NativeError::Internal)?;
-                    edges.push(Edge3 {
-                        a: face.chart.to_world(s.a),
-                        b: face.chart.to_world(s.b),
-                        curve,
-                    });
-                }
-                loops.push(edges);
+                let segments: Vec<Segment> = cycle
+                    .iter()
+                    .map(|&half| shifted(&arrangement.segment(half), shift, v_shift))
+                    .collect();
+                loops.push(cycle_edges(&face.chart, &segments).map_err(NativeError::Internal)?);
             }
             let point = face
                 .chart
@@ -1435,18 +1931,32 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             segments.extend(s.iter().copied());
             outlines.push(s);
         }
-        // Edges two pieces share, run once each way, are inside the merged face.
+        // Edges two pieces share, run once each way, are inside the merged face: for each,
+        // the first later one starting near where it ends that runs back along it.
+        let cell = |p: P| ((p.x / TOL).floor() as i64, (p.y / TOL).floor() as i64);
+        let mut by_start: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
+        for (i, seg) in segments.iter().enumerate() {
+            by_start.entry(cell(seg.a)).or_default().push(i);
+        }
         let mut gone = vec![false; segments.len()];
         for i in 0..segments.len() {
             if gone[i] {
                 continue;
             }
-            for j in i + 1..segments.len() {
-                if !gone[j] && opposite(&segments[i], &segments[j]) {
-                    gone[i] = true;
-                    gone[j] = true;
-                    break;
+            let (cx, cy) = cell(segments[i].b);
+            let mut candidates: Vec<usize> = Vec::new();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    candidates.extend(by_start.get(&(cx + dx, cy + dy)).into_iter().flatten());
                 }
+            }
+            candidates.sort_unstable();
+            if let Some(&j) = candidates
+                .iter()
+                .find(|&&j| j > i && !gone[j] && opposite(&segments[i], &segments[j]))
+            {
+                gone[i] = true;
+                gone[j] = true;
             }
         }
         let kept: Vec<Segment> = segments
@@ -1468,16 +1978,11 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             }
             let mut loops = Vec::new();
             for cycle in std::iter::once(&region.outer).chain(&region.holes) {
-                let mut edges = Vec::new();
-                for &half in cycle {
-                    let s = arrangement.segment(half);
-                    edges.push(Edge3 {
-                        a: chart.to_world(s.a),
-                        b: chart.to_world(s.b),
-                        curve: chart.curve(&s).map_err(internal)?,
-                    });
-                }
-                loops.push(edges);
+                let segments: Vec<Segment> = cycle
+                    .iter()
+                    .map(|&half| arrangement.segment(half))
+                    .collect();
+                loops.push(cycle_edges(&chart, &segments).map_err(internal)?);
             }
             out.push(Piece {
                 surface: first.surface,
@@ -1634,12 +2139,9 @@ fn assemble(faces: Vec<Piece>) -> Result<Tagged, NativeError> {
                 }
                 let stored = solid.edges[edge as usize];
                 // Run its own way when it starts where this use starts, and for a closed
-                // circle when it turns the same way.
+                // circle or section when it turns the same way.
                 let reversed = if stored.start == stored.end {
-                    match (stored.curve, e.curve) {
-                        (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) < 0.0,
-                        _ => false,
-                    }
+                    !same_way(&stored.curve, &e.curve)
                 } else {
                     stored.start != i
                 };
@@ -1766,6 +2268,17 @@ fn add_shell(solid: &mut Solid, void: &Solid) {
         .push((f0..f0 + void.faces.len() as u32).collect());
 }
 
+/// Whether two curves of one closed edge (a circle, a section, a degenerate edge) turn the
+/// same way round.
+fn same_way(a: &Curve, b: &Curve) -> bool {
+    match (a, b) {
+        (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) > 0.0,
+        (Curve::Section(s), Curve::Section(t)) => s.ccw == t.ccw,
+        (Curve::Degenerate { axis: s, .. }, Curve::Degenerate { axis: t, .. }) => s.dot(*t) > 0.0,
+        _ => true,
+    }
+}
+
 /// Joins edges that meet at a vertex no other edge reaches, run along one line or circle,
 /// between the same two faces: what is left of an edge cut by a curve that was merged away.
 fn join_edges(solid: &mut Solid) {
@@ -1829,6 +2342,7 @@ fn same_curve(solid: &Solid, a: &Edge, b: &Edge) -> bool {
                 && (c.radius - d.radius).abs() <= TOL
                 && c.normal.cross(d.normal).length() <= 1e-9
         }
+        (Curve::Section(c), Curve::Section(d)) => Section { ccw: d.ccw, ..c } == d,
         _ => false,
     }
 }
@@ -1881,14 +2395,10 @@ fn join(solid: &mut Solid, v: u32, e1: u32, e2: u32) -> bool {
                 let u = uses[k];
                 let reversed = snapshot.start_of(u) != new_edge.start
                     || (new_edge.start == new_edge.end && {
-                        // A closed circle: the way it turns.
-                        match (new_edge.curve, snapshot.edges[u.edge as usize].curve) {
-                            (Curve::Circle(c), Curve::Circle(d)) => {
-                                let d = if u.reversed { -d.normal } else { d.normal };
-                                c.normal.dot(d) < 0.0
-                            }
-                            _ => false,
-                        }
+                        // A closed circle or section: the way it turns.
+                        let d = snapshot.edges[u.edge as usize].curve;
+                        let d = if u.reversed { d.reversed() } else { d };
+                        !same_way(&new_edge.curve, &d)
                     });
                 let replacement = EdgeUse { edge: ne, reversed };
                 if k + 1 < n {
@@ -2048,5 +2558,171 @@ mod tests {
         // Half the ring is in the block, but for the caps its top cuts off.
         let half_ring = std::f64::consts::PI * (144.0 - 64.0) * 4.0 / 2.0;
         assert!(common.volume().unwrap() < half_ring);
+    }
+
+    fn circle_profile(cx: f64, cy: f64, r: f64) -> Profile {
+        Profile::from_curves(&[ProfileSegment {
+            id: 1,
+            curve: Curve2::Circle {
+                center: Point2::new(cx, cy),
+                radius: r,
+            },
+        }])
+        .unwrap()
+    }
+
+    /// `∫ f` from `a` to `b` by the midpoint rule on `n` pieces.
+    fn midpoint_rule(a: f64, b: f64, n: usize, f: impl Fn(f64) -> f64) -> f64 {
+        let h = (b - a) / n as f64;
+        (0..n).map(|i| f(a + h * (i as f64 + 0.5))).sum::<f64>() * h
+    }
+
+    #[test]
+    fn holes_across_each_other_and_through_a_bar_are_exact() {
+        // A 40 × 30 × 10 block with a hole of radius 4 down through it at (20, 15), and one of
+        // radius 3 across it along X through the first's axis, at z = 5.
+        let block = crate::build::extrude(
+            &Plane::FRONT,
+            &polygon(&[(0.0, 0.0), (40.0, 0.0), (40.0, 30.0), (0.0, 30.0)]),
+            Vec3::new(0.0, 0.0, 10.0),
+        )
+        .unwrap()
+        .0;
+        let top = Plane {
+            origin: Point3::new(0.0, 0.0, 10.0),
+            ..Plane::FRONT
+        };
+        let down = crate::build::extrude(
+            &top,
+            &circle_profile(20.0, 15.0, 4.0),
+            Vec3::new(0.0, 0.0, -12.0),
+        )
+        .unwrap()
+        .0;
+        let (drilled, _) = boolean(BooleanOp::Cut, &block, &[&down]).unwrap();
+        let side = Plane {
+            origin: Point3::new(-1.0, 0.0, 0.0),
+            x_dir: Vec3::new(0.0, 0.0, -1.0),
+            normal: Vec3::X,
+        };
+        let across = crate::build::extrude(
+            &side,
+            &circle_profile(-5.0, 15.0, 3.0),
+            Vec3::new(42.0, 0.0, 0.0),
+        )
+        .unwrap()
+        .0;
+        let (both, _) = boolean(BooleanOp::Cut, &drilled, &[&across]).unwrap();
+        both.check().unwrap();
+        let counts = both.counts();
+        assert_eq!((counts.faces, counts.edges), (9, 23), "{counts:?}");
+        // The first hole's wall: its whole less the two ovals the second cuts out of it,
+        // each (with t its angle) 2 sqrt(9 − 16 sin² t) high, 4 dt wide.
+        let oval = midpoint_rule(
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            20_000,
+            |u| {
+                // t = asin(3/4 sin u) takes the root's end away.
+                let t = (0.75 * u.sin()).asin();
+                let dt = 0.75 * u.cos() / (1.0 - (0.75 * u.sin()).powi(2)).sqrt();
+                8.0 * (9.0 - 16.0 * t.sin().powi(2)).max(0.0).sqrt() * dt
+            },
+        );
+        let wall = std::f64::consts::TAU * 4.0 * 10.0 - 2.0 * oval;
+        let topology = both.topology().unwrap();
+        let area = topology
+            .faces
+            .iter()
+            .find(|f| {
+                f.axis
+                    .is_some_and(|a| a.direction.cross(Vec3::Z).length() < 1e-9)
+            })
+            .unwrap()
+            .area;
+        assert!((area - wall).abs() < 1e-7 * wall, "{area} {wall}");
+
+        // A round bar of radius 10 and length 30 along Z, a hole of radius 3 through it along
+        // X at half its length: what goes is ∫ 2 √(100 − y²) · 2 √(9 − y²) dy.
+        let bar = crate::build::extrude(
+            &Plane::FRONT,
+            &circle_profile(0.0, 0.0, 10.0),
+            Vec3::new(0.0, 0.0, 30.0),
+        )
+        .unwrap()
+        .0;
+        let side = Plane {
+            origin: Point3::new(-15.0, 0.0, 0.0),
+            x_dir: Vec3::new(0.0, 0.0, -1.0),
+            normal: Vec3::X,
+        };
+        let hole = crate::build::extrude(
+            &side,
+            &circle_profile(-15.0, 0.0, 3.0),
+            Vec3::new(30.0, 0.0, 0.0),
+        )
+        .unwrap()
+        .0;
+        let (drilled, _) = boolean(BooleanOp::Cut, &bar, &[&hole]).unwrap();
+        drilled.check().unwrap();
+        let gone = midpoint_rule(
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            20_000,
+            |u| {
+                let y = 3.0 * u.sin();
+                4.0 * (100.0 - y * y).sqrt() * 9.0 * u.cos() * u.cos()
+            },
+        );
+        let expected = std::f64::consts::PI * 100.0 * 30.0 - gone;
+        let volume = drilled.volume().unwrap();
+        assert!(
+            (volume - expected).abs() < 1e-9 * expected,
+            "{volume} {expected}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn time_a_radial_hole() {
+        let t = std::time::Instant::now();
+        let bar = crate::build::extrude(
+            &Plane::FRONT,
+            &circle_profile(0.0, 0.0, 10.0),
+            Vec3::new(0.0, 0.0, 30.0),
+        )
+        .unwrap()
+        .0;
+        let side = Plane {
+            origin: Point3::new(-15.0, 0.0, 0.0),
+            x_dir: Vec3::new(0.0, 0.0, -1.0),
+            normal: Vec3::X,
+        };
+        let hole = crate::build::extrude(
+            &side,
+            &circle_profile(-15.0, 0.0, 3.0),
+            Vec3::new(30.0, 0.0, 0.0),
+        )
+        .unwrap()
+        .0;
+        println!("build {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let (drilled, _) = boolean(BooleanOp::Cut, &bar, &[&hole]).unwrap();
+        println!("boolean {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        drilled.check().unwrap();
+        println!("check {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = drilled.topology().unwrap();
+        println!("topology {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = drilled.volume().unwrap();
+        println!("volume {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = drilled.bounds().unwrap();
+        println!("bounds {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let _ = crate::tessellate::mesh(&drilled, 0.03).unwrap();
+        println!("mesh {:?}", t.elapsed());
     }
 }

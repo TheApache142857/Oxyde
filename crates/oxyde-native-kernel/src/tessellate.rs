@@ -20,8 +20,8 @@ use oxyde_geom::{Point2, Point3};
 use oxyde_kernel::{FaceMesh, Mesh};
 
 use crate::brep::{EdgeUse, Face, ParamUse, Shape, Solid};
-use crate::geometry::{Curve, Surface};
-use crate::revolution::{Meridian, Revolution};
+use crate::geometry::Surface;
+use crate::revolution::{Meridian, Revolution, unwrap};
 use crate::triangulate;
 
 /// The largest angle a chord of an arc may span, whatever the deflection.
@@ -70,28 +70,12 @@ fn angular_step(radius: f64, deflection: f64) -> f64 {
 /// The points of an edge from its start to its end, both included: a degenerate edge's
 /// one point.
 fn edge_polyline(solid: &Solid, edge: &crate::brep::Edge, deflection: f64) -> Vec<Point3> {
-    let (a, b) = (solid.point(edge.start), solid.point(edge.end));
-    match edge.curve {
-        Curve::Line => vec![a, b],
-        Curve::Degenerate { .. } => vec![a],
-        Curve::Circle(circle) => {
-            let sweep = solid.sweep(edge);
-            let step = angular_step(circle.radius, deflection);
-            let n = ((sweep / step).ceil() as usize).max(if edge.is_closed() { 3 } else { 1 });
-            let start = circle.angle_of(a);
-            let mut points: Vec<Point3> = (0..n)
-                .map(|i| {
-                    if i == 0 {
-                        a
-                    } else {
-                        circle.point_at(start + sweep * i as f64 / n as f64)
-                    }
-                })
-                .collect();
-            points.push(b);
-            points
-        }
-    }
+    edge.curve.polyline(
+        solid.point(edge.start),
+        solid.point(edge.end),
+        edge.is_closed(),
+        deflection,
+    )
 }
 
 /// An edge's polyline the way a loop runs along it.
@@ -256,7 +240,34 @@ fn revolution_mesh(
             rho_max = rho_max.max(surface.rho_z(*p).0);
         }
         let n = line.len().saturating_sub(1).max(1);
+        // A straight use's points are evenly along it in (θ, v); a bending one's are where
+        // they are, unwrapped from its start.
+        let bent: Vec<(f64, f64)> = if u.straight {
+            Vec::new()
+        } else {
+            let mut near = u.from;
+            line.iter()
+                .map(|&p| {
+                    let (t, v) = surface.params(p);
+                    let theta = if surface.rho_z(p).0 > 1e-9 {
+                        unwrap(near.0, t)
+                    } else {
+                        near.0
+                    };
+                    let v = if surface.v_periodic() {
+                        unwrap(near.1, v)
+                    } else {
+                        v
+                    };
+                    near = (theta, v);
+                    near
+                })
+                .collect()
+        };
         let param = |i: usize| -> (f64, f64) {
+            if let Some(&p) = bent.get(i) {
+                return p;
+            }
             let t = i as f64 / n as f64;
             (
                 u.from.0 + (u.to.0 - u.from.0) * t,

@@ -51,6 +51,10 @@ const NATIVE_BUILDS: &[&str] = &[
     "blind holes",
     "counterbored holes",
     "countersunk holes",
+    "crossing holes",
+    "radial hole",
+    "bar cut at a slant",
+    "hole through a ball",
 ];
 
 // ---------------------------------------------------------------------------------------
@@ -384,6 +388,37 @@ fn corpus() -> Vec<(String, Part)> {
     ));
     parts.push(("crossing holes", part));
 
+    let mut part = Part::new();
+    let mut bar = sketch_on(StandardPlane::Front);
+    bar.circle(Point2::ORIGIN, 10.0);
+    let bar = part.add_feature(FeatureKind::Sketch(bar));
+    part.add_feature(blind(bar, ExtrudeOp::Boss, 30.0));
+    let mut hole = sketch_on(StandardPlane::Right);
+    hole.circle(Point2::new(-15.0, 0.0), 3.0);
+    let hole = part.add_feature(FeatureKind::Sketch(hole));
+    part.add_feature(extrude(
+        hole,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+    ));
+    parts.push(("radial hole", part));
+
+    let mut part = Part::new();
+    let mut bar = sketch_on(StandardPlane::Front);
+    bar.circle(Point2::ORIGIN, 5.0);
+    let bar = part.add_feature(FeatureKind::Sketch(bar));
+    part.add_feature(blind(bar, ExtrudeOp::Boss, 30.0));
+    let mut wedge = sketch_on(StandardPlane::Right);
+    // The Right plane's x runs along -Z: a wedge above the line from z = 30 to z = 20.
+    polygon(&mut wedge, &[(-30.0, -6.0), (-20.0, 6.0), (-40.0, 46.0)]);
+    let wedge = part.add_feature(FeatureKind::Sketch(wedge));
+    part.add_feature(extrude(
+        wedge,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+    ));
+    parts.push(("bar cut at a slant", part));
+
     parts.push(("bracket (demo)", bracket()));
     parts.push(("flange (demo)", flange()));
     parts.push((
@@ -418,7 +453,20 @@ fn corpus() -> Vec<(String, Part)> {
     g.line_between(north, south);
     let s = part.add_feature(FeatureKind::Sketch(s));
     part.add_feature(revolve(s, ExtrudeOp::Boss, axis, TAU));
-    parts.push(("revolved ball", part));
+    parts.push((
+        "revolved ball",
+        Part::from_definition(part.definition()).expect("a valid part"),
+    ));
+
+    let mut hole = sketch_on(StandardPlane::Right);
+    hole.circle(Point2::new(-1.0, 1.0), 2.0);
+    let hole = part.add_feature(FeatureKind::Sketch(hole));
+    part.add_feature(extrude(
+        hole,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+    ));
+    parts.push(("hole through a ball", part));
 
     let mut part = Part::new();
     let (mut s, axis) = about_y();
@@ -583,6 +631,9 @@ struct Run {
     mesh: Duration,
     triangles: usize,
     solids: Vec<Measures>,
+    /// Whether some edge is a B-spline: a curve the kernel fitted to where two surfaces
+    /// cross, which its areas and volumes are only as close to as the fit.
+    fitted: bool,
 }
 
 impl Run {
@@ -616,6 +667,12 @@ fn run<K: Kernel>(definition: &PartDefinition, kernel: &mut K) -> Run {
     let mut solids = Vec::new();
     let mut mesh = Duration::ZERO;
     let mut triangles = 0;
+    let fitted = part.body().is_some_and(|body| {
+        body.topology
+            .edges
+            .iter()
+            .any(|e| e.curve == oxyde_kernel::CurveKind::BSpline)
+    });
     if let Some(body) = part.body() {
         for solid in &body.solids {
             let shape = solid.shape;
@@ -648,16 +705,20 @@ fn run<K: Kernel>(definition: &PartDefinition, kernel: &mut K) -> Run {
         mesh,
         triangles,
         solids,
+        fitted,
     }
 }
 
-/// How the native kernel's body differs from OpenCASCADE's, if it does.
-fn difference(native: &[Measures], occt: &[Measures]) -> Option<String> {
+/// How the native kernel's body differs from OpenCASCADE's, if it does: to a millionth,
+/// or a ten-thousandth where OpenCASCADE fitted B-splines to where surfaces cross (the
+/// native kernel follows those curves exactly; OpenCASCADE's fit is a few millionths off).
+fn difference(native: &[Measures], occt: &[Measures], fitted: bool) -> Option<String> {
     if native.len() != occt.len() {
         return Some(format!("{} solids, not {}", native.len(), occt.len()));
     }
-    let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * b.abs().max(1.0);
-    let near = |a: Point3, b: Point3| a.distance(b) <= 1e-6 * b.to_vec().length().max(1.0);
+    let tolerance = if fitted { 1e-4 } else { 1e-6 };
+    let close = |a: f64, b: f64| (a - b).abs() <= tolerance * b.abs().max(1.0);
+    let near = |a: Point3, b: Point3| a.distance(b) <= tolerance * b.to_vec().length().max(1.0);
     for (i, (n, o)) in native.iter().zip(occt).enumerate() {
         if !close(n.volume, o.volume) {
             return Some(format!("solid {i}: volume {} not {}", n.volume, o.volume));
@@ -730,7 +791,7 @@ fn what_the_native_kernel_builds_so_far() {
             format!("{failed} of {} fail", native.features.len())
         };
         if native.built_whole() && occt.built_whole() {
-            match difference(&native.solids, &occt.solids) {
+            match difference(&native.solids, &occt.solids, occt.fitted) {
                 Some(why) => {
                     verdict = format!("**differs**: {why}");
                     problems.push(format!("{name}: {why}"));

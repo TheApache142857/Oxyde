@@ -32,36 +32,52 @@ fn measures<K: Kernel>(kernel: &K, shape: ShapeHandle) -> Measures {
     }
 }
 
-fn assert_close(what: &str, native: f64, occt: f64) {
+/// How close the two kernels' numbers must be: OpenCASCADE's are exact to about 1e-9 where
+/// its faces are bounded by lines, circles and ellipses. Where it bounds them by B-splines
+/// it fitted to where two surfaces cross, its areas and volumes are only as close as the
+/// fit, a few parts in a million (a hole across another: 8e-6 off the exact area, which the
+/// native kernel gets, `oxyde-native-kernel`'s tests check that against the integral).
+const EXACT: f64 = 1e-6;
+const FITTED: f64 = 1e-4;
+
+fn assert_close(what: &str, native: f64, occt: f64, tolerance: f64) {
     assert!(
-        (native - occt).abs() <= 1e-6 * occt.abs().max(1.0),
+        (native - occt).abs() <= tolerance * occt.abs().max(1.0),
         "{what}: native {native}, OpenCASCADE {occt}"
     );
 }
 
-fn assert_point_close(what: &str, native: Point3, occt: Point3) {
+fn assert_point_close(what: &str, native: Point3, occt: Point3, tolerance: f64) {
     assert!(
-        native.distance(occt) <= 1e-6 * occt.to_vec().length().max(1.0),
+        native.distance(occt) <= tolerance * occt.to_vec().length().max(1.0),
         "{what}: native {native:?}, OpenCASCADE {occt:?}"
     );
 }
 
-fn assert_same_measures(what: &str, native: &Measures, occt: &Measures) {
-    assert_close(&format!("{what}, volume"), native.volume, occt.volume);
+fn assert_same_measures(what: &str, native: &Measures, occt: &Measures, tolerance: f64) {
+    assert_close(
+        &format!("{what}, volume"),
+        native.volume,
+        occt.volume,
+        tolerance,
+    );
     assert_point_close(
         &format!("{what}, centre of mass"),
         native.centre,
         occt.centre,
+        tolerance,
     );
     assert_point_close(
         &format!("{what}, lower bound"),
         native.bounds.0,
         occt.bounds.0,
+        tolerance,
     );
     assert_point_close(
         &format!("{what}, upper bound"),
         native.bounds.1,
         occt.bounds.1,
+        tolerance,
     );
     assert_eq!(native.counts, occt.counts, "{what}, topology counts");
 }
@@ -82,6 +98,9 @@ struct SeenFace {
 /// each face's surface, area, centroid and normal or axis, sorted by name.
 #[derive(Debug)]
 struct Built {
+    /// Whether some edge is a B-spline: a curve the kernel fitted to where two surfaces
+    /// cross.
+    fitted: bool,
     solids: Vec<Measures>,
     faces: Vec<SeenFace>,
     edges: Vec<EdgeName>,
@@ -119,8 +138,14 @@ fn build<K: Kernel>(part: &Part, kernel: &mut K) -> Built {
     edges.sort();
     let mut vertices = body.naming.vertices().to_vec();
     vertices.sort();
+    let fitted = body
+        .topology
+        .edges
+        .iter()
+        .any(|e| e.curve == oxyde_kernel::CurveKind::BSpline);
     part.release(kernel);
     Built {
+        fitted,
         solids,
         faces,
         edges,
@@ -132,9 +157,10 @@ fn build<K: Kernel>(part: &Part, kernel: &mut K) -> Built {
 fn assert_same_part(what: &str, part: &Part) {
     let occt = build(part, &mut OcctKernel::new());
     let native = build(part, &mut NativeKernel::new());
+    let tolerance = if occt.fitted { FITTED } else { EXACT };
     assert_eq!(native.solids.len(), occt.solids.len(), "{what}: bodies");
     for (i, (n, o)) in native.solids.iter().zip(&occt.solids).enumerate() {
-        assert_same_measures(&format!("{what}, body {i}"), n, o);
+        assert_same_measures(&format!("{what}, body {i}"), n, o, tolerance);
     }
     let names =
         |faces: &[SeenFace]| -> Vec<FaceName> { faces.iter().map(|f| f.name.clone()).collect() };
@@ -148,11 +174,17 @@ fn assert_same_part(what: &str, part: &Part) {
     for (n, o) in native.faces.iter().zip(&occt.faces) {
         let name = &n.name;
         assert_eq!(n.surface, o.surface, "{what}, surface of {name:?}");
-        assert_close(&format!("{what}, area of {name:?}"), n.area, o.area);
+        assert_close(
+            &format!("{what}, area of {name:?}"),
+            n.area,
+            o.area,
+            tolerance,
+        );
         assert_point_close(
             &format!("{what}, centroid of {name:?}"),
             n.centroid,
             o.centroid,
+            tolerance,
         );
         match (n.normal, o.normal) {
             (Some(n), Some(o)) => assert!(
@@ -168,7 +200,12 @@ fn assert_same_part(what: &str, part: &Part) {
                     (n.direction - o.direction).length() < 1e-9,
                     "{what}, axis of {name:?}: native {n:?}, OpenCASCADE {o:?}"
                 );
-                assert_point_close(&format!("{what}, axis of {name:?}"), n.origin, o.origin);
+                assert_point_close(
+                    &format!("{what}, axis of {name:?}"),
+                    n.origin,
+                    o.origin,
+                    EXACT,
+                );
             }
             (None, None) => {}
             other => panic!("{what}, axis of {name:?}: {other:?}"),
@@ -719,7 +756,7 @@ fn boxes_moved_and_mirrored() {
     let (corner, size) = (Point3::new(-3.0, 2.0, 7.0), Vec3::new(12.0, 5.0, 3.5));
     let o = occt.make_box(corner, size).unwrap();
     let n = native.make_box(corner, size).unwrap();
-    assert_same_measures("box", &measures(&native, n), &measures(&occt, o));
+    assert_same_measures("box", &measures(&native, n), &measures(&occt, o), EXACT);
 
     let axis = Axis::new(Point3::new(1.0, -2.0, 0.5), Vec3::new(1.0, 2.0, 3.0)).unwrap();
     let motions = [
@@ -737,6 +774,7 @@ fn boxes_moved_and_mirrored() {
             what,
             &measures(&native, moved_n.shape),
             &measures(&occt, moved_o.shape),
+            EXACT,
         );
         assert_eq!(
             moved_n.history.faces.len(),
@@ -944,10 +982,10 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut sketch = on_top(base);
     sketch.circle(Point2::new(20.0, 15.0), 4.0);
     cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
-    // A hole across it from the side: two cylinders whose axes cross meet in a curve that
-    // is neither a line nor a circle, which the native kernel cannot cut yet.
+    // A hole as wide across it from the side: two cylinders of one size whose axes cross
+    // meet in two ellipses that cross each other, which the native kernel cannot cut yet.
     let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
-    sketch.circle(Point2::new(-5.0, 15.0), 3.0);
+    sketch.circle(Point2::new(-5.0, 15.0), 4.0);
     extrude(
         &mut part,
         sketch,
@@ -963,10 +1001,7 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     assert_eq!(statuses[3], FeatureStatus::Ok);
     match &statuses[5] {
         FeatureStatus::Error(message) => {
-            assert!(
-                message.contains("surfaces of revolution on different axes"),
-                "{message}"
-            )
+            assert!(message.contains("turning back on itself"), "{message}")
         }
         other => panic!("the crossing hole should fail, not {other:?}"),
     }
@@ -1391,4 +1426,132 @@ fn balls_tori_and_rods_on_one_axis() {
     ring.circle(Point2::new(10.0, 15.0), 2.0);
     revolve(&mut part, ring, axis, ExtrudeOp::Cut, WHOLE);
     assert_same_part("o-ring groove", &part);
+}
+
+// ---------------------------------------------------------------------------------------
+// Curves no chart makes straight or round: sections of cylinders and cones, and circles on
+// spheres that are neither parallels nor meridians.
+
+#[test]
+fn holes_crossing_each_other() {
+    // A hole down through the block, then one across it, through its axis and beside it.
+    for (y, r) in [(15.0, 3.0), (15.5, 3.0), (15.0, 2.0)] {
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        sketch.circle(Point2::new(20.0, 15.0), 4.0);
+        cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+        let mut side = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+        side.circle(Point2::new(-5.0, y), r);
+        extrude(
+            &mut part,
+            side,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::ThroughAll { both: true },
+            false,
+        );
+        assert_same_part(&format!("holes crossing at y = {y}, radius {r}"), &part);
+    }
+}
+
+#[test]
+fn a_hole_through_a_round_bar() {
+    let mut part = Part::new();
+    let mut bar = front();
+    bar.circle(Point2::new(0.0, 0.0), 10.0);
+    boss(&mut part, bar, ExtrudeExtent::Blind { depth: 30.0 }, false);
+    let mut hole = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    hole.circle(Point2::new(-15.0, 0.0), 3.0);
+    extrude(
+        &mut part,
+        hole,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("radial hole", &part);
+}
+
+/// A wedge cut through everything from the Right plane (its x along -Z, its y along Y),
+/// above the line from (z0, y0) to (z1, y1).
+fn slant_cut(part: &mut Part, (z0, y0): (f64, f64), (z1, y1): (f64, f64)) {
+    let mut wedge = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    polygon(&mut wedge, &[(-z0, y0), (-z1, y1), (-z1 - 20.0, y1 + 40.0)]);
+    extrude(
+        part,
+        wedge,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+}
+
+#[test]
+fn round_bars_and_cones_cut_at_a_slant() {
+    // A round bar along Z: an ellipse.
+    let mut part = Part::new();
+    let mut bar = front();
+    bar.circle(Point2::new(0.0, 0.0), 5.0);
+    boss(&mut part, bar, ExtrudeExtent::Blind { depth: 30.0 }, false);
+    slant_cut(&mut part, (30.0, -6.0), (20.0, 6.0));
+    assert_same_part("bar cut at a slant", &part);
+    // A round boss on a block, cut at a slant: the ellipse ends on the block's top.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 5.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 15.0 },
+        false,
+    );
+    slant_cut(&mut part, (25.0, 0.0), (15.0, 30.0));
+    assert_same_part("boss cut at a slant", &part);
+    // A cone about Y, cut at a slant across its axis: an ellipse on the cone.
+    let mut part = revolved_polygon(&[(0.0, 0.0), (8.0, 0.0), (0.0, 16.0)], true, WHOLE);
+    let mut cutter = front();
+    polygon(
+        &mut cutter,
+        &[(-20.0, 6.0), (20.0, 10.0), (20.0, 30.0), (-20.0, 30.0)],
+    );
+    extrude(
+        &mut part,
+        cutter,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("cone cut at a slant", &part);
+}
+
+#[test]
+fn balls_cut_off_their_axis() {
+    // A ball about Y cut by a box whose face, x = 2, runs along the axis beside it: a circle
+    // on the sphere that is neither a parallel nor a meridian.
+    let mut part = Part::new();
+    ball(&mut part, 0.0, 5.0, ExtrudeOp::Boss);
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(2.0, -20.0), 20.0, 40.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::MidPlane { depth: 40.0 },
+        false,
+    );
+    assert_same_part("ball cut beside its axis", &part);
+    // A hole through a ball, beside its centre: a cylinder's sections through a sphere.
+    let mut part = Part::new();
+    ball(&mut part, 0.0, 5.0, ExtrudeOp::Boss);
+    let mut hole = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    hole.circle(Point2::new(-1.0, 1.0), 2.0);
+    extrude(
+        &mut part,
+        hole,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("hole through a ball", &part);
 }

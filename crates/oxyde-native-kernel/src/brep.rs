@@ -31,7 +31,7 @@ use oxyde_kernel::{
 };
 
 use crate::geometry::{Curve, FaceIntegrals, PlaneSums, Surface};
-use crate::revolution::{Meridian, Revolution, RevolutionSums, WalkEdge, walk};
+use crate::revolution::{Meridian, ParamPath, Revolution, RevolutionSums, WalkEdge, walk};
 
 /// The least tolerance of a vertex or an edge: what exact constructions are held to.
 pub(crate) const BASE_TOLERANCE: f64 = LINEAR_TOLERANCE;
@@ -153,19 +153,25 @@ pub(crate) struct ParamUse {
     pub edge_use: EdgeUse,
     pub from: (f64, f64),
     pub to: (f64, f64),
+    /// Whether it runs straight from `from` to `to` (along a line of constant `θ` or `v`)
+    /// rather than bending there.
+    pub straight: bool,
 }
 
 impl ParamUse {
     /// Whether it runs along a line of constant `θ`.
     pub fn is_vertical(&self) -> bool {
-        (self.to.0 - self.from.0).abs() <= 1e-12
+        self.straight && (self.to.0 - self.from.0).abs() <= 1e-12
     }
 
     /// Whether it runs along a line of constant `v`.
     pub fn is_horizontal(&self) -> bool {
-        (self.to.1 - self.from.1).abs() <= 1e-12
+        self.straight && (self.to.1 - self.from.1).abs() <= 1e-12
     }
 }
+
+/// Points this close to a surface's axis have no angle about it.
+const NEAR_AXIS: f64 = 10.0 * BASE_TOLERANCE;
 
 impl Solid {
     /// A solid of one shell.
@@ -206,45 +212,59 @@ impl Solid {
             && self.shells.len() <= 1
     }
 
-    /// The angle a circle edge turns through, `2π` for a closed one; a degenerate edge's
-    /// turn; 0 for a line.
+    /// The angle a circle's or a section's edge turns through, `2π` for a closed one; a
+    /// degenerate edge's turn; 0 for a line.
     pub fn sweep(&self, edge: &Edge) -> f64 {
         match edge.curve {
             Curve::Line => 0.0,
-            Curve::Circle(circle) => circle.sweep(
+            curve => curve.extent(
                 self.point(edge.start),
                 self.point(edge.end),
                 edge.is_closed(),
             ),
-            Curve::Degenerate { turn, .. } => turn,
         }
+    }
+
+    /// How far an edge runs: its length for a line, its sweep otherwise.
+    fn extent(&self, edge: &Edge) -> f64 {
+        edge.curve.extent(
+            self.point(edge.start),
+            self.point(edge.end),
+            edge.is_closed(),
+        )
+    }
+
+    /// The point `s` along an edge (as [`Curve::extent`] measures it).
+    pub fn edge_point(&self, edge: &Edge, s: f64) -> Point3 {
+        let (a, b) = (self.point(edge.start), self.point(edge.end));
+        edge.curve.at(a, b, s).unwrap_or(a)
     }
 
     /// The point halfway along an edge.
     pub fn midpoint(&self, edge: &Edge) -> Point3 {
-        let (a, b) = (self.point(edge.start), self.point(edge.end));
-        match edge.curve {
-            Curve::Line => a + (b - a) * 0.5,
-            Curve::Circle(circle) => circle.point_at(circle.angle_of(a) + self.sweep(edge) / 2.0),
-            Curve::Degenerate { .. } => a,
-        }
+        self.edge_point(edge, self.extent(edge) / 2.0)
     }
 
     /// How far `p` lies off an edge's curve (its point, for a degenerate edge).
     fn off_curve(&self, edge: &Edge, p: Point3) -> f64 {
-        match edge.curve {
-            Curve::Line => {
-                let (a, b) = (self.point(edge.start), self.point(edge.end));
-                let d = b - a;
-                let l2 = d.dot(d);
-                if l2 == 0.0 {
-                    return p.distance(a);
-                }
-                let t = ((p - a).dot(d) / l2).clamp(0.0, 1.0);
-                p.distance(a + d * t)
-            }
-            Curve::Circle(circle) => circle.distance(p),
-            Curve::Degenerate { .. } => p.distance(self.point(edge.start)),
+        edge.curve
+            .distance(self.point(edge.start), self.point(edge.end), p)
+    }
+
+    /// An edge use as the walk round a face of revolution takes it.
+    pub fn walk_edge(&self, u: EdgeUse) -> WalkEdge {
+        let edge = &self.edges[u.edge as usize];
+        WalkEdge {
+            curve: if u.reversed {
+                edge.curve.reversed()
+            } else {
+                edge.curve
+            },
+            a: self.point(self.start_of(u)),
+            b: self.point(self.end_of(u)),
+            sweep: self.sweep(edge),
+            mid: self.midpoint(edge),
+            tolerance: edge.tolerance.max(BASE_TOLERANCE),
         }
     }
 
@@ -255,44 +275,55 @@ impl Solid {
         uses: &[EdgeUse],
         surface: &Revolution,
     ) -> Result<Vec<ParamUse>, String> {
-        let edges: Vec<WalkEdge> = uses
-            .iter()
-            .map(|&u| {
-                let edge = &self.edges[u.edge as usize];
-                WalkEdge {
-                    curve: if u.reversed {
-                        edge.curve.reversed()
-                    } else {
-                        edge.curve
-                    },
-                    a: self.point(self.start_of(u)),
-                    b: self.point(self.end_of(u)),
-                    sweep: self.sweep(edge),
-                    mid: self.midpoint(edge),
-                    tolerance: edge.tolerance.max(BASE_TOLERANCE),
-                }
-            })
-            .collect();
-        let walked = walk(surface, &edges, 10.0 * BASE_TOLERANCE)?;
+        let edges: Vec<WalkEdge> = uses.iter().map(|&u| self.walk_edge(u)).collect();
+        let walked = walk(surface, &edges, NEAR_AXIS)?;
         Ok(uses
             .iter()
             .zip(walked)
-            .map(|(&edge_use, (from, to))| ParamUse { edge_use, from, to })
+            .map(|(&edge_use, w)| ParamUse {
+                edge_use,
+                from: w.from,
+                to: w.to,
+                straight: w.straight,
+            })
             .collect())
     }
 
-    /// Every loop of a face on a surface of revolution, laid out in its `(θ, v)` plane.
+    /// Every loop of a face on a surface of revolution, laid out in its `(θ, v)` plane, each
+    /// after the first (the holes) moved by whole turns to lie about the first.
     pub fn param_loops(
         &self,
         face: &Face,
         surface: &Revolution,
     ) -> Result<Vec<Vec<ParamUse>>, String> {
-        face.loops
-            .iter()
-            .map(|uses| self.param_loop(uses, surface))
-            .collect()
+        let tau = std::f64::consts::TAU;
+        let middle = |uses: &[ParamUse]| {
+            let n = uses.len().max(1) as f64;
+            let t = uses.iter().map(|u| u.from.0).sum::<f64>() / n;
+            let v = uses.iter().map(|u| u.from.1).sum::<f64>() / n;
+            (t, v)
+        };
+        let mut out: Vec<Vec<ParamUse>> = Vec::with_capacity(face.loops.len());
+        for uses in &face.loops {
+            let mut walked = self.param_loop(uses, surface)?;
+            if let Some(outer) = out.first() {
+                let (ot, ov) = middle(outer);
+                let (t, v) = middle(&walked);
+                let dt = tau * ((ot - t) / tau).round();
+                let dv = if surface.v_periodic() {
+                    tau * ((ov - v) / tau).round()
+                } else {
+                    0.0
+                };
+                for u in &mut walked {
+                    u.from = (u.from.0 + dt, u.from.1 + dv);
+                    u.to = (u.to.0 + dt, u.to.1 + dv);
+                }
+            }
+            out.push(walked);
+        }
+        Ok(out)
     }
-
     /// The face's area and mass integrals about `reference` ([`FaceIntegrals`]).
     pub fn face_integrals(&self, face: &Face, reference: Point3) -> Result<FaceIntegrals, String> {
         match &face.surface {
@@ -326,6 +357,12 @@ impl Solid {
                             sums.add_arc(c, circle.radius, t0, t0 + turn);
                         }
                         Curve::Degenerate { .. } => {}
+                        Curve::Section(_) => {
+                            let w = self.walk_edge(*edge_use);
+                            sums.add_path(w.sweep, &|s| {
+                                local(w.curve.at(w.a, w.b, s).unwrap_or(w.a))
+                            });
+                        }
                     }
                 }
                 let (area, mx, my) = sums.area_and_moment();
@@ -336,7 +373,11 @@ impl Solid {
                 let mut sums = RevolutionSums::new(surface, reference);
                 for uses in self.param_loops(face, surface)? {
                     for u in uses {
-                        if u.is_vertical() {
+                        if !u.straight {
+                            let w = self.walk_edge(u.edge_use);
+                            let path = ParamPath::follow(surface, &w, u.from, NEAR_AXIS)?;
+                            sums.add_path(surface, &w, &path);
+                        } else if u.is_vertical() {
                             sums.add_line(surface, u.from.0, u.from.1, u.to.1);
                         } else if !u.is_horizontal() {
                             return Err(
@@ -380,22 +421,10 @@ impl Solid {
                     let t = &mut vertex_tolerances[v as usize];
                     *t = t.max(off);
                 }
-                let samples: Vec<Point3> = match edge.curve {
-                    Curve::Line => {
-                        let (a, b) = (self.point(edge.start), self.point(edge.end));
-                        (0..=4)
-                            .map(|i| a + (b - a) * (f64::from(i) / 4.0))
-                            .collect()
-                    }
-                    Curve::Circle(circle) => {
-                        let start = circle.angle_of(self.point(edge.start));
-                        let sweep = self.sweep(edge);
-                        (0..=8)
-                            .map(|i| circle.point_at(start + sweep * f64::from(i) / 8.0))
-                            .collect()
-                    }
-                    Curve::Degenerate { .. } => vec![self.point(edge.start)],
-                };
+                let extent = self.extent(edge);
+                let samples: Vec<Point3> = (0..=8)
+                    .map(|i| self.edge_point(edge, extent * f64::from(i) / 8.0))
+                    .collect();
                 let off = samples
                     .iter()
                     .map(|&p| face.surface.distance(p))
@@ -467,6 +496,14 @@ impl Solid {
                         let off = circle.distance(self.point(v));
                         if off > within(v, edge.tolerance) {
                             return Err(format!("edge {e}: an end lies {off} mm off its circle"));
+                        }
+                    }
+                }
+                Curve::Section(section) => {
+                    for v in [edge.start, edge.end] {
+                        let off = section.distance(self.point(v));
+                        if off > within(v, edge.tolerance) {
+                            return Err(format!("edge {e}: an end lies {off} mm off its curve"));
                         }
                     }
                 }
@@ -653,6 +690,31 @@ impl Solid {
         }
     }
 
+    /// The loops of a face on a surface of revolution as closed polygons of its `(θ, v)`
+    /// plane: each straight use's start, and the points a bending one is followed along.
+    pub fn param_polygons(
+        &self,
+        face: &Face,
+        surface: &Revolution,
+    ) -> Result<Vec<Vec<(f64, f64)>>, String> {
+        let mut out = Vec::new();
+        for uses in self.param_loops(face, surface)? {
+            let mut polygon = Vec::new();
+            for u in uses {
+                if u.straight {
+                    polygon.push(u.from);
+                } else {
+                    let w = self.walk_edge(u.edge_use);
+                    let path = ParamPath::follow(surface, &w, u.from, NEAR_AXIS)?;
+                    let points = path.points();
+                    polygon.extend_from_slice(&points[..points.len() - 1]);
+                }
+            }
+            out.push(polygon);
+        }
+        Ok(out)
+    }
+
     /// Points of the face, inside it, where its surface reaches furthest along a model axis
     /// between its edges: a sphere's or a torus's bulge, which its edges may not reach.
     pub fn bulges(&self, face: &Face) -> Vec<Point3> {
@@ -662,7 +724,7 @@ impl Solid {
         if !matches!(surface.meridian, Meridian::Circle { .. }) {
             return Vec::new();
         }
-        let Ok(loops) = self.param_loops(face, surface) else {
+        let Ok(loops) = self.param_polygons(face, surface) else {
             return Vec::new();
         };
         let (x, y, a) = surface.frame();
@@ -697,10 +759,17 @@ impl Solid {
     }
 }
 
+/// The edges of closed polygons, each from a corner to the next.
+fn polygon_edges(
+    polygons: &[Vec<(f64, f64)>],
+) -> impl Iterator<Item = ((f64, f64), (f64, f64))> + '_ {
+    polygons.iter().flat_map(|p| cyclic_pairs(p))
+}
+
 /// Whether `(θ, v)` (or a copy of it a whole turn away, round the axis or, with
-/// `v_periodic`, round the meridian circle) is inside the loops, by the parity of their
+/// `v_periodic`, round the meridian circle) is inside the polygons, by the parity of their
 /// crossings of a line from it along `θ`.
-fn param_inside(loops: &[Vec<ParamUse>], theta: f64, v: f64, v_periodic: bool) -> bool {
+fn param_inside(polygons: &[Vec<(f64, f64)>], theta: f64, v: f64, v_periodic: bool) -> bool {
     let tau = std::f64::consts::TAU;
     let v_shifts: &[f64] = if v_periodic {
         &[-1.0, 0.0, 1.0]
@@ -711,8 +780,7 @@ fn param_inside(loops: &[Vec<ParamUse>], theta: f64, v: f64, v_periodic: bool) -
         for &kv in v_shifts {
             let (t, w) = (theta + f64::from(kt) * tau, v + kv * tau);
             let mut crossings = 0;
-            for u in loops.iter().flatten() {
-                let ((t0, v0), (t1, v1)) = (u.from, u.to);
+            for ((t0, v0), (t1, v1)) in polygon_edges(polygons) {
                 if (v0 > w) != (v1 > w) {
                     let at = t0 + (w - v0) / (v1 - v0) * (t1 - t0);
                     if at > t {
@@ -728,8 +796,8 @@ fn param_inside(loops: &[Vec<ParamUse>], theta: f64, v: f64, v_periodic: bool) -
     false
 }
 
-/// An angle where the line of constant `v` runs inside the loops, if it does.
-fn param_row(loops: &[Vec<ParamUse>], v: f64, v_periodic: bool) -> Option<f64> {
+/// An angle where the line of constant `v` runs inside the polygons, if it does.
+fn param_row(polygons: &[Vec<(f64, f64)>], v: f64, v_periodic: bool) -> Option<f64> {
     let tau = std::f64::consts::TAU;
     let v_shifts: &[f64] = if v_periodic {
         &[-1.0, 0.0, 1.0]
@@ -738,11 +806,9 @@ fn param_row(loops: &[Vec<ParamUse>], v: f64, v_periodic: bool) -> Option<f64> {
     };
     for &kv in v_shifts {
         let w = v + kv * tau;
-        let mut at: Vec<f64> = loops
-            .iter()
-            .flatten()
-            .filter(|u| (u.from.1 > w) != (u.to.1 > w))
-            .map(|u| u.from.0 + (w - u.from.1) / (u.to.1 - u.from.1) * (u.to.0 - u.from.0))
+        let mut at: Vec<f64> = polygon_edges(polygons)
+            .filter(|((_, v0), (_, v1))| (*v0 > w) != (*v1 > w))
+            .map(|((t0, v0), (t1, v1))| t0 + (w - v0) / (v1 - v0) * (t1 - t0))
             .collect();
         at.sort_by(f64::total_cmp);
         if let [a, b, ..] = at.as_slice() {
@@ -830,6 +896,18 @@ impl Shape {
                         vertices,
                         faces,
                     },
+                    Curve::Section(section) => EdgeInfo {
+                        curve: if section.is_ellipse() {
+                            CurveKind::Ellipse
+                        } else {
+                            CurveKind::BSpline
+                        },
+                        length: section.length(a, solid.sweep(edge)),
+                        midpoint: solid.midpoint(edge),
+                        axis: None,
+                        vertices,
+                        faces,
+                    },
                 });
             }
             topology
@@ -858,9 +936,15 @@ impl Shape {
         for solid in &self.solids {
             points.extend(solid.vertices.iter().map(|v| v.point));
             for edge in &solid.edges {
-                if let Curve::Circle(circle) = edge.curve {
-                    let start = circle.angle_of(solid.point(edge.start));
-                    points.extend(circle.extremes(start, solid.sweep(edge)));
+                match edge.curve {
+                    Curve::Circle(circle) => {
+                        let start = circle.angle_of(solid.point(edge.start));
+                        points.extend(circle.extremes(start, solid.sweep(edge)));
+                    }
+                    Curve::Section(section) => {
+                        points.extend(section.extremes(solid.point(edge.start), solid.sweep(edge)));
+                    }
+                    _ => {}
                 }
             }
             for face in &solid.faces {

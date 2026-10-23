@@ -52,6 +52,14 @@ release yet; the git history has every detail.
   block) keeps it as a void, as OpenCASCADE does. Where two surfaces meet in a curve that is
   neither a line nor a circle (two holes crossing, a cone cut along but away from its axis),
   the feature still fails with a message.
+- It now cuts where surfaces meet in other curves too: holes across each other, through
+  their axes or beside them; a hole into a round bar from the side; round bars, bosses and
+  cones cut at a slant (ellipses); a ball cut beside its axis, and a hole through a ball off
+  its centre. Faces, edges and names are OpenCASCADE's, and areas and volumes are exact,
+  where OpenCASCADE's, which fits B-splines to these curves, are a few millionths off. Still
+  failing with a message: a torus cut by anything off its axis, two holes of the same size
+  crossing, a hole that only partly crosses another, a cone cut in a parabola or a
+  hyperbola.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is
