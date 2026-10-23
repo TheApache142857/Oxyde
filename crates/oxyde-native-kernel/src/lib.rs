@@ -8,12 +8,14 @@
 //! `crates/oxyde-tests/tests/` compare what both kernels build. See `docs/ARCHITECTURE.md` §2
 //! and §10 (Native kernel).
 //!
-//! What it builds so far: boxes, extrusions of profiles of lines, arcs and circles (faces on
-//! planes and cylinders, edges on lines and circles), their moved or mirrored copies, and
-//! booleans (fuse, cut, common) of them where their faces meet in lines and circles, with
-//! their topology, exact mass properties, bounds and display meshes. Every other operation answers
-//! [`NativeError::Unsupported`] until it is written, so a caller sees a failing feature with
-//! a message, never a crash.
+//! What it builds so far: boxes, extrusions and revolves of profiles of lines, arcs and
+//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines and circles,
+//! and degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored
+//! copies, and booleans (fuse, cut, common) of them where their faces meet in lines and
+//! circles, voids included, with their topology, exact mass properties, bounds and display
+//! meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
+//! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
+//! describes how.
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -46,6 +48,8 @@ mod bsp;
 mod build;
 mod curved;
 mod geometry;
+mod revolution;
+mod revolve;
 mod tessellate;
 mod triangulate;
 
@@ -189,12 +193,18 @@ impl Kernel for NativeKernel {
 
     fn revolve(
         &mut self,
-        _plane: &Plane,
-        _profile: &Profile,
-        _axis: &Axis,
-        _angle: f64,
+        plane: &Plane,
+        profile: &Profile,
+        axis: &Axis,
+        angle: f64,
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("revolve"))
+        guarded(|| {
+            let (shape, history) = revolve::revolve(plane, profile, axis, angle)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
     }
 
     fn sweep(
@@ -665,7 +675,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "the native kernel cannot intersect cylinders whose axes are not parallel yet"
+            "the native kernel cannot intersect surfaces of revolution on different axes yet"
         );
         let shape = kernel
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
@@ -678,5 +688,137 @@ mod tests {
             kernel.make_box(Point3::ORIGIN, Vec3::new(1.0, 0.0, 1.0)),
             Err(NativeError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn a_solid_cut_from_inside_another_leaves_a_void() {
+        let mut kernel = NativeKernel::new();
+        let outer = kernel
+            .make_box(Point3::ORIGIN, Vec3::new(10.0, 10.0, 10.0))
+            .unwrap();
+        let inner = kernel
+            .make_box(Point3::new(4.0, 4.0, 4.0), Vec3::new(2.0, 2.0, 2.0))
+            .unwrap();
+        let hollow = kernel.boolean(BooleanOp::Cut, outer, inner).unwrap();
+        assert!((kernel.volume(hollow.shape).unwrap() - 992.0).abs() < 1e-9);
+        let counts = kernel.topology_counts(hollow.shape).unwrap();
+        assert_eq!(
+            (counts.solids, counts.shells, counts.faces),
+            (1, 2, 12),
+            "{counts:?}"
+        );
+        let c = kernel.centre_of_mass(hollow.shape).unwrap();
+        assert!(c.distance(Point3::new(5.0, 5.0, 5.0)) < 1e-9, "{c:?}");
+        // A ball inside the box, cut from it: a round void.
+        let ball = Profile::from_curves(&[
+            ProfileSegment {
+                id: 1,
+                curve: Curve2::Arc {
+                    start: Point2::new(5.0, 2.0),
+                    mid: Point2::new(8.0, 5.0),
+                    end: Point2::new(5.0, 8.0),
+                },
+            },
+            line(2, (5.0, 8.0), (5.0, 2.0)),
+        ])
+        .unwrap();
+        let axis = oxyde_geom::Axis::new(Point3::new(5.0, 5.0, 5.0), Vec3::Y).unwrap();
+        let front_at_5 = Plane {
+            origin: Point3::new(0.0, 0.0, 5.0),
+            ..Plane::FRONT
+        };
+        let sphere = kernel
+            .revolve(&front_at_5, &ball, &axis, std::f64::consts::TAU)
+            .unwrap();
+        let hollow = kernel.boolean(BooleanOp::Cut, outer, sphere.shape).unwrap();
+        let expected = 1000.0 - 4.0 / 3.0 * std::f64::consts::PI * 27.0;
+        assert!((kernel.volume(hollow.shape).unwrap() - expected).abs() < 1e-9);
+        assert_eq!(kernel.topology_counts(hollow.shape).unwrap().shells, 2);
+        // Fused, the ball disappears into the box.
+        let fused = kernel
+            .boolean(BooleanOp::Fuse, outer, sphere.shape)
+            .unwrap();
+        assert!((kernel.volume(fused.shape).unwrap() - 1000.0).abs() < 1e-9);
+        assert_eq!(kernel.topology_counts(fused.shape).unwrap().faces, 6);
+    }
+
+    #[test]
+    fn display_meshes_of_revolved_faces_face_out_and_cover_them() {
+        let mut kernel = NativeKernel::new();
+        let axis = oxyde_geom::Axis::new(Point3::ORIGIN, Vec3::Y).unwrap();
+        let ball = Profile::from_curves(&[
+            ProfileSegment {
+                id: 1,
+                curve: Curve2::Arc {
+                    start: Point2::new(0.0, -5.0),
+                    mid: Point2::new(5.0, 0.0),
+                    end: Point2::new(0.0, 5.0),
+                },
+            },
+            line(2, (0.0, 5.0), (0.0, -5.0)),
+        ])
+        .unwrap();
+        let torus = Profile::from_curves(&[ProfileSegment {
+            id: 1,
+            curve: Curve2::Circle {
+                center: Point2::new(10.0, 2.0),
+                radius: 3.0,
+            },
+        }])
+        .unwrap();
+        let cone = Profile::from_curves(&[
+            line(1, (0.0, 0.0), (5.0, 0.0)),
+            line(2, (5.0, 0.0), (0.0, 10.0)),
+            line(3, (0.0, 10.0), (0.0, 0.0)),
+        ])
+        .unwrap();
+        for (name, profile, angle) in [
+            ("ball", &ball, std::f64::consts::TAU),
+            ("quarter ball", &ball, std::f64::consts::FRAC_PI_2),
+            ("torus", &torus, std::f64::consts::TAU),
+            ("cone", &cone, std::f64::consts::TAU),
+            ("cone sector", &cone, 2.0),
+        ] {
+            let solid = kernel
+                .revolve(&Plane::FRONT, profile, &axis, angle)
+                .unwrap();
+            let topology = kernel.topology(solid.shape).unwrap();
+            let deflection = 0.01;
+            let mesh = kernel.tessellate(solid.shape, deflection).unwrap();
+            assert_eq!(mesh.faces.len(), topology.faces.len(), "{name}");
+            let centre = kernel.centre_of_mass(solid.shape).unwrap();
+            for (f, (face, info)) in mesh.faces.iter().zip(&topology.faces).enumerate() {
+                let mut area = 0.0;
+                for t in &face.triangles {
+                    let p = |k: u32| {
+                        let [x, y, z] = face.positions[k as usize];
+                        Point3::new(f64::from(x), f64::from(y), f64::from(z))
+                    };
+                    let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
+                    let twice = (b - a).cross(c - a);
+                    // Every one of these solids is convex: its faces look away from its centre.
+                    let middle = Point3::new(
+                        (a.x + b.x + c.x) / 3.0,
+                        (a.y + b.y + c.y) / 3.0,
+                        (a.z + b.z + c.z) / 3.0,
+                    );
+                    if name != "torus" {
+                        assert!(
+                            twice.dot(middle - centre) > -1e-9,
+                            "{name}, face {f}: a triangle faces inwards"
+                        );
+                    }
+                    area += twice.length() / 2.0;
+                }
+                // Chords a deflection off the surface both ways round a sphere or a torus
+                // lose a share of the area of about twice what they lose round a cylinder.
+                assert!(
+                    (area - info.area).abs() <= 5e-3 * info.area,
+                    "{name}, face {f}: the mesh covers {area} mm², the face {}",
+                    info.area
+                );
+            }
+            kernel.release(solid.shape);
+        }
     }
 }

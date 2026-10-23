@@ -19,9 +19,13 @@ use oxyde_geom::{Plane, Point2, Point3, Vec3};
 use oxyde_kernel::{FaceSource, OpHistory};
 
 use crate::NativeError;
-use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, cyclic_pairs};
+use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex, cyclic_pairs};
 use crate::bsp::{Plane3, Polygon, Source};
 use crate::geometry::Surface;
+
+/// What the BSP assembly answers for a result with a void inside a solid, which it does not
+/// make: the booleans then make it the other way ([`crate::curved`]).
+pub(crate) const VOID: &str = "leave a void inside a solid";
 
 /// Points closer than `tolerance` are one vertex, found through a grid of cells.
 struct Welder {
@@ -477,12 +481,12 @@ fn merge_straight_edges(faces: &mut [FaceBuild], points: &[Point3], tolerance: f
 /// The vertex of `solid` for welded point `v`, added the first time it is met.
 fn local_vertex(
     map: &mut HashMap<u32, u32>,
-    vertices: &mut Vec<Point3>,
+    vertices: &mut Vec<Vertex>,
     points: &[Point3],
     v: u32,
 ) -> u32 {
     *map.entry(v).or_insert_with(|| {
-        vertices.push(points[v as usize]);
+        vertices.push(Vertex::new(points[v as usize]));
         vertices.len() as u32 - 1
     })
 }
@@ -608,12 +612,13 @@ fn solids(faces: &[FaceBuild], points: &[Point3]) -> Result<(Shape, OpHistory), 
                     .collect(),
             );
         }
+        solid.settle_tolerances().map_err(NativeError::Internal)?;
         let piece = Shape {
             solids: vec![solid],
         };
         // A shell facing inwards bounds a void inside another solid.
         if piece.volume().map_err(NativeError::Internal)? < 0.0 {
-            return Err(NativeError::Unsupported("leave a void inside a solid"));
+            return Err(NativeError::Unsupported(VOID));
         }
         shape.solids.extend(piece.solids);
         history.faces.extend(sources);

@@ -1,10 +1,19 @@
 //! The boundary representation the native kernel builds and answers questions about.
 //!
-//! Faces lie on planes or cylinders ([`Surface`]) and edges run along lines or circles
-//! ([`Curve`]): boxes, extrusions of profiles of lines and arcs, their moved or mirrored
-//! copies, and booleans of the straight-sided ones. A closed circle is one edge with one
-//! vertex; a whole cylinder's face is cut open along a seam, an edge it runs along once
-//! each way, as OpenCASCADE has it.
+//! Faces lie on planes or on surfaces of revolution (cylinders, cones, spheres, tori:
+//! [`Surface`]) and edges run along lines or circles ([`Curve`]), or stand at a point where
+//! a surface of revolution meets its axis (a degenerate edge, at a cone's apex or a
+//! sphere's pole). A closed circle is one edge with one vertex; a face that goes round its
+//! axis whole is cut open along a seam, an edge it runs along once each way, as OpenCASCADE
+//! has it.
+//!
+//! Every vertex and every edge carries a tolerance, as OpenCASCADE's do: how far the
+//! geometry meeting there may be from the vertex's point or the edge's curve. A result's
+//! tolerances are measured ([`Solid::settle_tolerances`]): the largest distance between a
+//! vertex and the surfaces and curves meeting at it, between an edge and the surfaces of its
+//! faces, never less than [`BASE_TOLERANCE`].
+//!
+//! A solid is bounded by its outer shell and the shells of the voids inside it.
 //!
 //! Faces, edges and vertices are numbered solid by solid, in the order an operation made
 //! them, so the same operation on the same input gives the same numbering every time.
@@ -14,12 +23,22 @@
 // boundary (lib.rs) and reported as an internal error.
 #![allow(clippy::indexing_slicing)]
 
+use std::f64::consts::PI;
+
 use oxyde_geom::{Axis, LINEAR_TOLERANCE, Point3, Transform, Vec3};
 use oxyde_kernel::{
     CurveKind, EdgeInfo, FaceInfo, SurfaceKind, Topology, TopologyCounts, VertexInfo,
 };
 
-use crate::geometry::{AngleHeightSums, Curve, FaceIntegrals, PlaneSums, Surface};
+use crate::geometry::{Curve, FaceIntegrals, PlaneSums, Surface};
+use crate::revolution::{Meridian, Revolution, RevolutionSums, WalkEdge, walk};
+
+/// The least tolerance of a vertex or an edge: what exact constructions are held to.
+pub(crate) const BASE_TOLERANCE: f64 = LINEAR_TOLERANCE;
+
+/// The largest tolerance a result may need: geometry further apart than this was not meant
+/// to meet, and the operation that made it is refused as a bug.
+pub(crate) const MAX_TOLERANCE: f64 = 1e-3;
 
 /// What an operation makes: its solids, in order. Several solids (the regions of one
 /// profile, extruded) make one shape, as a compound does in OpenCASCADE.
@@ -28,30 +47,55 @@ pub(crate) struct Shape {
     pub solids: Vec<Solid>,
 }
 
-/// One closed, connected solid, bounded by a single shell (solids with voids come later).
+/// One solid: its vertices, edges and faces, and its shells.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Solid {
-    pub vertices: Vec<Point3>,
+    pub vertices: Vec<Vertex>,
     pub edges: Vec<Edge>,
     pub faces: Vec<Face>,
+    /// The faces of each shell, the outer one first, then each void's (a closed shell whose
+    /// normals point into the void). Empty for a solid of one shell, every face in it.
+    pub shells: Vec<Vec<u32>>,
 }
 
-/// An edge from vertex `start` to vertex `end` along `curve`; a closed circle starts and
-/// ends at the same vertex.
+/// A vertex: its point and its tolerance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Vertex {
+    pub point: Point3,
+    pub tolerance: f64,
+}
+
+impl Vertex {
+    pub fn new(point: Point3) -> Self {
+        Self {
+            point,
+            tolerance: BASE_TOLERANCE,
+        }
+    }
+}
+
+/// An edge from vertex `start` to vertex `end` along `curve`; a closed circle and a
+/// degenerate edge start and end at the same vertex.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Edge {
     pub start: u32,
     pub end: u32,
     pub curve: Curve,
+    pub tolerance: f64,
 }
 
 impl Edge {
-    pub fn line(start: u32, end: u32) -> Self {
+    pub fn new(start: u32, end: u32, curve: Curve) -> Self {
         Self {
             start,
             end,
-            curve: Curve::Line,
+            curve,
+            tolerance: BASE_TOLERANCE,
         }
+    }
+
+    pub fn line(start: u32, end: u32) -> Self {
+        Self::new(start, end, Curve::Line)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -81,7 +125,7 @@ impl EdgeUse {
         }
     }
 
-    fn flipped(self) -> Self {
+    pub fn flipped(self) -> Self {
         Self {
             edge: self.edge,
             reversed: !self.reversed,
@@ -89,18 +133,51 @@ impl EdgeUse {
     }
 }
 
-/// A face: its surface (a plane's normal pointing out of the solid; a cylinder saying
-/// which way its normal points) and its boundary loops: the outer one first,
-/// counter-clockwise seen from outside, then its holes, clockwise. A whole cylinder's
-/// single loop runs along one circle, up its seam, back along the other circle and down
-/// the seam.
+/// A face: its surface (its normal pointing out of the solid) and its boundary loops: the
+/// outer one first, counter-clockwise seen from outside, then its holes, clockwise. A face
+/// that goes round its axis whole has a single loop: along one circle, up its seam, back
+/// along the other circle (or a degenerate edge at a pole or an apex) and down the seam.
 #[derive(Debug, Clone)]
 pub(crate) struct Face {
     pub surface: Surface,
     pub loops: Vec<Vec<EdgeUse>>,
 }
 
+/// One edge use of a face on a surface of revolution, laid out in the surface's `(θ, v)`
+/// plane: from `from` to `to`, `θ` unwrapped as the loop goes round. What the kernel builds
+/// so far meets its surfaces of revolution in lines of constant `θ` (meridians, a cone's or a
+/// cylinder's straight lines) and lines of constant `v` (parallels, poles), so each use is a
+/// straight segment there.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamUse {
+    pub edge_use: EdgeUse,
+    pub from: (f64, f64),
+    pub to: (f64, f64),
+}
+
+impl ParamUse {
+    /// Whether it runs along a line of constant `θ`.
+    pub fn is_vertical(&self) -> bool {
+        (self.to.0 - self.from.0).abs() <= 1e-12
+    }
+
+    /// Whether it runs along a line of constant `v`.
+    pub fn is_horizontal(&self) -> bool {
+        (self.to.1 - self.from.1).abs() <= 1e-12
+    }
+}
+
 impl Solid {
+    /// A solid of one shell.
+    pub fn closed(vertices: Vec<Vertex>, edges: Vec<Edge>, faces: Vec<Face>) -> Self {
+        Self {
+            vertices,
+            edges,
+            faces,
+            shells: Vec::new(),
+        }
+    }
+
     /// The vertex a loop leaves from when it runs along `edge_use`.
     pub fn start_of(&self, edge_use: EdgeUse) -> u32 {
         let edge = self.edges[edge_use.edge as usize];
@@ -117,7 +194,7 @@ impl Solid {
     }
 
     pub fn point(&self, vertex: u32) -> Point3 {
-        self.vertices[vertex as usize]
+        self.vertices[vertex as usize].point
     }
 
     /// Whether every face is a plane and every edge a line: what the BSP booleans take.
@@ -126,9 +203,11 @@ impl Solid {
             .iter()
             .all(|f| matches!(f.surface, Surface::Plane(_)))
             && self.edges.iter().all(|e| e.curve == Curve::Line)
+            && self.shells.len() <= 1
     }
 
-    /// The angle a circle edge turns through, `2π` for a closed one; 0 for a line.
+    /// The angle a circle edge turns through, `2π` for a closed one; a degenerate edge's
+    /// turn; 0 for a line.
     pub fn sweep(&self, edge: &Edge) -> f64 {
         match edge.curve {
             Curve::Line => 0.0,
@@ -137,7 +216,81 @@ impl Solid {
                 self.point(edge.end),
                 edge.is_closed(),
             ),
+            Curve::Degenerate { turn, .. } => turn,
         }
+    }
+
+    /// The point halfway along an edge.
+    pub fn midpoint(&self, edge: &Edge) -> Point3 {
+        let (a, b) = (self.point(edge.start), self.point(edge.end));
+        match edge.curve {
+            Curve::Line => a + (b - a) * 0.5,
+            Curve::Circle(circle) => circle.point_at(circle.angle_of(a) + self.sweep(edge) / 2.0),
+            Curve::Degenerate { .. } => a,
+        }
+    }
+
+    /// How far `p` lies off an edge's curve (its point, for a degenerate edge).
+    fn off_curve(&self, edge: &Edge, p: Point3) -> f64 {
+        match edge.curve {
+            Curve::Line => {
+                let (a, b) = (self.point(edge.start), self.point(edge.end));
+                let d = b - a;
+                let l2 = d.dot(d);
+                if l2 == 0.0 {
+                    return p.distance(a);
+                }
+                let t = ((p - a).dot(d) / l2).clamp(0.0, 1.0);
+                p.distance(a + d * t)
+            }
+            Curve::Circle(circle) => circle.distance(p),
+            Curve::Degenerate { .. } => p.distance(self.point(edge.start)),
+        }
+    }
+
+    /// A loop of a face on a surface of revolution laid out in the surface's `(θ, v)` plane
+    /// ([`crate::revolution::walk`]), each use a segment from where the previous one ended.
+    pub fn param_loop(
+        &self,
+        uses: &[EdgeUse],
+        surface: &Revolution,
+    ) -> Result<Vec<ParamUse>, String> {
+        let edges: Vec<WalkEdge> = uses
+            .iter()
+            .map(|&u| {
+                let edge = &self.edges[u.edge as usize];
+                WalkEdge {
+                    curve: if u.reversed {
+                        edge.curve.reversed()
+                    } else {
+                        edge.curve
+                    },
+                    a: self.point(self.start_of(u)),
+                    b: self.point(self.end_of(u)),
+                    sweep: self.sweep(edge),
+                    mid: self.midpoint(edge),
+                    tolerance: edge.tolerance.max(BASE_TOLERANCE),
+                }
+            })
+            .collect();
+        let walked = walk(surface, &edges, 10.0 * BASE_TOLERANCE)?;
+        Ok(uses
+            .iter()
+            .zip(walked)
+            .map(|(&edge_use, (from, to))| ParamUse { edge_use, from, to })
+            .collect())
+    }
+
+    /// Every loop of a face on a surface of revolution, laid out in its `(θ, v)` plane.
+    pub fn param_loops(
+        &self,
+        face: &Face,
+        surface: &Revolution,
+    ) -> Result<Vec<Vec<ParamUse>>, String> {
+        face.loops
+            .iter()
+            .map(|uses| self.param_loop(uses, surface))
+            .collect()
     }
 
     /// The face's area and mass integrals about `reference` ([`FaceIntegrals`]).
@@ -172,68 +325,34 @@ impl Solid {
                             }
                             sums.add_arc(c, circle.radius, t0, t0 + turn);
                         }
+                        Curve::Degenerate { .. } => {}
                     }
                 }
                 let (area, mx, my) = sums.area_and_moment();
                 let first = plane.origin.to_vec() * area + x * mx + y * my;
                 Ok(FaceIntegrals::of_plane(plane, area, first, reference))
             }
-            Surface::Cylinder(cylinder) => {
-                let mut sums = AngleHeightSums::default();
-                let tolerance = 10.0 * LINEAR_TOLERANCE * self.scale().max(1.0);
-                for edges in &face.loops {
-                    let Some(&first) = edges.first() else {
-                        continue;
-                    };
-                    let (start_angle, mut height) =
-                        cylinder.coordinates(self.point(self.start_of(first)));
-                    let mut angle = start_angle;
-                    for &edge_use in edges {
-                        let edge = &self.edges[edge_use.edge as usize];
-                        let end = self.point(self.end_of(edge_use));
-                        let (end_angle, end_height) = cylinder.coordinates(end);
-                        match edge.curve {
-                            Curve::Line => {
-                                // Along the axis: the angle stays, up to a whole turn.
-                                let off = (end_angle - angle).rem_euclid(std::f64::consts::TAU);
-                                let off = off.min(std::f64::consts::TAU - off);
-                                if off * cylinder.radius > tolerance {
-                                    return Err(
-                                        "a straight edge on a cylinder is not along its axis"
-                                            .to_owned(),
-                                    );
-                                }
-                                sums.add_line(angle, height, end_height);
-                                height = end_height;
-                            }
-                            Curve::Circle(circle) => {
-                                if !cylinder.holds_circle(&circle) {
-                                    return Err(
-                                        "a circle on a cylinder is not across its axis".to_owned()
-                                    );
-                                }
-                                let mut turn = self.sweep(edge);
-                                if circle.normal.dot(cylinder.axis.direction) < 0.0 {
-                                    turn = -turn;
-                                }
-                                if edge_use.reversed {
-                                    turn = -turn;
-                                }
-                                angle += turn;
-                            }
+            Surface::Revolution(surface) => {
+                let mut sums = RevolutionSums::new(surface, reference);
+                for uses in self.param_loops(face, surface)? {
+                    for u in uses {
+                        if u.is_vertical() {
+                            sums.add_line(surface, u.from.0, u.from.1, u.to.1);
+                        } else if !u.is_horizontal() {
+                            return Err(
+                                "an edge across a surface of revolution that is neither a meridian nor a parallel"
+                                    .to_owned(),
+                            );
                         }
                     }
-                    if (angle - start_angle).abs() > 1e-6 {
-                        return Err("a loop winds round a cylinder".to_owned());
-                    }
                 }
-                Ok(FaceIntegrals::of_cylinder(cylinder, &sums, reference))
+                Ok(sums.integrals(surface))
             }
         }
     }
 
     /// Volume and first moment of the solid about `reference`, by the divergence theorem.
-    /// Positive for a solid whose faces point outward.
+    /// Positive for a solid whose faces point outward; a void's shell counts negative.
     fn mass_about(&self, reference: Point3) -> Result<(f64, Vec3), String> {
         let mut volume = 0.0;
         let mut moment = Vec3::ZERO;
@@ -245,10 +364,81 @@ impl Solid {
         Ok((volume, moment))
     }
 
+    /// The vertices and edges of a solid given the tolerances they need: for a vertex, the
+    /// furthest the surfaces of the faces round it and the curves of the edges at it are
+    /// from its point; for an edge, the furthest the surfaces of its faces are from its
+    /// curve, at its ends and a few points between. Never less than [`BASE_TOLERANCE`];
+    /// more than [`MAX_TOLERANCE`] is an error, a sign of geometry that does not meet.
+    pub fn settle_tolerances(&mut self) -> Result<(), String> {
+        let mut vertex_tolerances = vec![BASE_TOLERANCE; self.vertices.len()];
+        let mut edge_tolerances = vec![BASE_TOLERANCE; self.edges.len()];
+        for face in &self.faces {
+            for &u in face.loops.iter().flatten() {
+                let edge = &self.edges[u.edge as usize];
+                for v in [edge.start, edge.end] {
+                    let off = face.surface.distance(self.point(v));
+                    let t = &mut vertex_tolerances[v as usize];
+                    *t = t.max(off);
+                }
+                let samples: Vec<Point3> = match edge.curve {
+                    Curve::Line => {
+                        let (a, b) = (self.point(edge.start), self.point(edge.end));
+                        (0..=4)
+                            .map(|i| a + (b - a) * (f64::from(i) / 4.0))
+                            .collect()
+                    }
+                    Curve::Circle(circle) => {
+                        let start = circle.angle_of(self.point(edge.start));
+                        let sweep = self.sweep(edge);
+                        (0..=8)
+                            .map(|i| circle.point_at(start + sweep * f64::from(i) / 8.0))
+                            .collect()
+                    }
+                    Curve::Degenerate { .. } => vec![self.point(edge.start)],
+                };
+                let off = samples
+                    .iter()
+                    .map(|&p| face.surface.distance(p))
+                    .fold(0.0, f64::max);
+                let t = &mut edge_tolerances[u.edge as usize];
+                *t = t.max(off);
+            }
+        }
+        for edge in &self.edges {
+            for v in [edge.start, edge.end] {
+                let off = self.off_curve(edge, self.point(v));
+                let t = &mut vertex_tolerances[v as usize];
+                *t = t.max(off);
+            }
+        }
+        if let Some((v, t)) = vertex_tolerances
+            .iter()
+            .enumerate()
+            .find(|(_, t)| **t > MAX_TOLERANCE)
+        {
+            return Err(format!("vertex {v} lies {t} mm off what meets there"));
+        }
+        if let Some((e, t)) = edge_tolerances
+            .iter()
+            .enumerate()
+            .find(|(_, t)| **t > MAX_TOLERANCE)
+        {
+            return Err(format!("edge {e} lies {t} mm off its faces"));
+        }
+        for (vertex, t) in self.vertices.iter_mut().zip(vertex_tolerances) {
+            vertex.tolerance = t;
+        }
+        for (edge, t) in self.edges.iter_mut().zip(edge_tolerances) {
+            edge.tolerance = t;
+        }
+        Ok(())
+    }
+
     /// Whether the solid is a closed, consistent boundary: every loop closes, every edge is
-    /// run along exactly once each way, every face's corners lie on its surface, every
-    /// circle edge's ends on its circle, and every normal has unit length. What a result
-    /// must be before it is used.
+    /// run along exactly once each way (a degenerate edge once), every face's corners lie
+    /// on its surface and every edge's ends on its curve within their tolerances, every
+    /// normal has unit length, every shell is closed on its own. What a result must be
+    /// before it is used.
     pub fn check(&self) -> Result<(), String> {
         let vertices = self.vertices.len() as u32;
         if let Some(e) = self
@@ -258,8 +448,9 @@ impl Solid {
         {
             return Err(format!("edge {e} ends at a vertex that does not exist"));
         }
-        // Corners welded by a boolean may sit up to its welding tolerance off a surface.
-        let tolerance = 10.0 * LINEAR_TOLERANCE * self.scale().max(1.0);
+        // Rounding in coordinates this large.
+        let slack = 1e-9 * self.scale().max(1.0);
+        let within = |v: u32, extra: f64| self.vertices[v as usize].tolerance + extra + slack;
         for (e, edge) in self.edges.iter().enumerate() {
             match edge.curve {
                 Curve::Line if edge.is_closed() => {
@@ -273,13 +464,20 @@ impl Solid {
                         ));
                     }
                     for v in [edge.start, edge.end] {
-                        let d = self.point(v) - circle.center;
-                        let off = d.dot(circle.normal).abs()
-                            + ((d - circle.normal * d.dot(circle.normal)).length() - circle.radius)
-                                .abs();
-                        if off > tolerance {
+                        let off = circle.distance(self.point(v));
+                        if off > within(v, edge.tolerance) {
                             return Err(format!("edge {e}: an end lies {off} mm off its circle"));
                         }
+                    }
+                }
+                Curve::Degenerate { axis, turn } => {
+                    if !edge.is_closed() {
+                        return Err(format!("edge {e} is degenerate but has two ends"));
+                    }
+                    if (axis.length() - 1.0).abs() > 1e-9
+                        || !(turn > 0.0 && turn <= std::f64::consts::TAU + 1e-9)
+                    {
+                        return Err(format!("edge {e}: a degenerate edge with no proper turn"));
                     }
                 }
             }
@@ -292,15 +490,23 @@ impl Solid {
                         return Err(format!("face {f}: the normal is not a unit vector"));
                     }
                 }
-                Surface::Cylinder(cylinder) => {
-                    let (x, _, a) = cylinder.frame();
+                Surface::Revolution(surface) => {
+                    let (x, _, a) = surface.frame();
+                    let proper = match surface.meridian {
+                        Meridian::Line { radius, slope } => {
+                            radius.is_finite()
+                                && slope.is_finite()
+                                && (slope != 0.0 || radius > 0.0)
+                        }
+                        Meridian::Circle { center, radius } => center >= 0.0 && radius > 0.0,
+                    };
                     if (a.length() - 1.0).abs() > 1e-9
                         || (x.length() - 1.0).abs() > 1e-9
                         || x.dot(a).abs() > 1e-9
-                        || cylinder.radius <= 0.0
+                        || !proper
                     {
                         return Err(format!(
-                            "face {f}: its cylinder has no proper frame or radius"
+                            "face {f}: its surface of revolution has no proper frame or meridian"
                         ));
                     }
                 }
@@ -327,8 +533,9 @@ impl Solid {
                     } else {
                         count.0 += 1;
                     }
-                    let off = face.surface.distance(self.point(self.start_of(a)));
-                    if off > tolerance {
+                    let v = self.start_of(a);
+                    let off = face.surface.distance(self.point(v));
+                    if off > within(v, 0.0) {
                         return Err(format!(
                             "face {f}: a corner lies {off} mm off the face's surface"
                         ));
@@ -337,7 +544,12 @@ impl Solid {
             }
         }
         for (e, count) in uses.iter().enumerate() {
-            if *count != (1, 1) {
+            let once = if self.edges[e].curve.is_degenerate() {
+                count.0 + count.1 == 1
+            } else {
+                *count == (1, 1)
+            };
+            if !once {
                 return Err(format!(
                     "edge {e} is run along {} times its own way and {} times the other",
                     count.0, count.1
@@ -352,8 +564,37 @@ impl Solid {
         if let Some(v) = used.iter().position(|u| !u) {
             return Err(format!("vertex {v} is on no edge"));
         }
-        // Every face's integrals can be taken (a cylinder's boundary along its axis and
-        // across it, no loop winding round it).
+        // Every face in one shell, and no edge between two shells.
+        if !self.shells.is_empty() {
+            let mut shell_of = vec![usize::MAX; self.faces.len()];
+            for (s, faces) in self.shells.iter().enumerate() {
+                for &f in faces {
+                    let Some(slot) = shell_of.get_mut(f as usize) else {
+                        return Err(format!("shell {s} holds a face that does not exist"));
+                    };
+                    if *slot != usize::MAX {
+                        return Err(format!("face {f} is in two shells"));
+                    }
+                    *slot = s;
+                }
+            }
+            if let Some(f) = shell_of.iter().position(|&s| s == usize::MAX) {
+                return Err(format!("face {f} is in no shell"));
+            }
+            let mut shell_of_edge: Vec<Option<usize>> = vec![None; self.edges.len()];
+            for (f, face) in self.faces.iter().enumerate() {
+                for u in face.loops.iter().flatten() {
+                    match shell_of_edge[u.edge as usize] {
+                        Some(s) if s != shell_of[f] => {
+                            return Err(format!("edge {} joins two shells", u.edge));
+                        }
+                        _ => shell_of_edge[u.edge as usize] = Some(shell_of[f]),
+                    }
+                }
+            }
+        }
+        // Every face's integrals can be taken (a surface of revolution's boundary along its
+        // meridians and parallels, no loop winding round it).
         for (f, face) in self.faces.iter().enumerate() {
             self.face_integrals(face, Point3::ORIGIN)
                 .map_err(|e| format!("face {f}: {e}"))?;
@@ -361,34 +602,33 @@ impl Solid {
         Ok(())
     }
 
-    /// The largest coordinate in absolute value: the size tolerances are scaled by.
+    /// The largest coordinate in absolute value: the size rounding is scaled by.
     fn scale(&self) -> f64 {
         self.vertices
             .iter()
-            .map(|p| p.x.abs().max(p.y.abs()).max(p.z.abs()))
+            .map(|v| v.point.x.abs().max(v.point.y.abs()).max(v.point.z.abs()))
             .fold(0.0, f64::max)
     }
 
     /// The solid moved by `transform`. A mirror turns every loop around, so that the
     /// faces still run counter-clockwise about their (mirrored, still outward) normals.
-    fn transformed(&self, transform: &Transform) -> Solid {
+    pub fn transformed(&self, transform: &Transform) -> Solid {
         let mirror = transform.is_mirror();
         Solid {
             vertices: self
                 .vertices
                 .iter()
-                .map(|&p| transform.apply_point(p))
+                .map(|v| Vertex {
+                    point: transform.apply_point(v.point),
+                    tolerance: v.tolerance,
+                })
                 .collect(),
             edges: self
                 .edges
                 .iter()
                 .map(|edge| Edge {
-                    start: edge.start,
-                    end: edge.end,
-                    curve: match edge.curve {
-                        Curve::Line => Curve::Line,
-                        Curve::Circle(circle) => Curve::Circle(circle.transformed(transform)),
-                    },
+                    curve: edge.curve.transformed(transform),
+                    ..*edge
                 })
                 .collect(),
             faces: self
@@ -409,8 +649,107 @@ impl Solid {
                         .collect(),
                 })
                 .collect(),
+            shells: self.shells.clone(),
         }
     }
+
+    /// Points of the face, inside it, where its surface reaches furthest along a model axis
+    /// between its edges: a sphere's or a torus's bulge, which its edges may not reach.
+    pub fn bulges(&self, face: &Face) -> Vec<Point3> {
+        let Surface::Revolution(surface) = &face.surface else {
+            return Vec::new();
+        };
+        if !matches!(surface.meridian, Meridian::Circle { .. }) {
+            return Vec::new();
+        }
+        let Ok(loops) = self.param_loops(face, surface) else {
+            return Vec::new();
+        };
+        let (x, y, a) = surface.frame();
+        let mut out = Vec::new();
+        for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+            let (dx, dy, dz) = (d.dot(x), d.dot(y), d.dot(a));
+            let h = (dx * dx + dy * dy).sqrt();
+            if h > 1e-12 {
+                // Along the meridian at θ the height along d is h (center + radius cos v) +
+                // dz radius sin v, at its extremes where tan v = dz / h.
+                let theta = dy.atan2(dx);
+                for (t, hh) in [(theta, h), (theta + PI, -h)] {
+                    let v = dz.atan2(hh);
+                    for v in [v, v + PI] {
+                        // Any turn of v round the meridian circle is the same point.
+                        if param_inside(&loops, t, v, true) {
+                            out.push(surface.point(t, v));
+                        }
+                    }
+                }
+            } else {
+                // Along the axis: the top and the bottom of the meridian circle, the same
+                // height all round.
+                for v in [PI / 2.0, -PI / 2.0] {
+                    if let Some(t) = param_row(&loops, v, true) {
+                        out.push(surface.point(t, v));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Whether `(θ, v)` (or a copy of it a whole turn away, round the axis or, with
+/// `v_periodic`, round the meridian circle) is inside the loops, by the parity of their
+/// crossings of a line from it along `θ`.
+fn param_inside(loops: &[Vec<ParamUse>], theta: f64, v: f64, v_periodic: bool) -> bool {
+    let tau = std::f64::consts::TAU;
+    let v_shifts: &[f64] = if v_periodic {
+        &[-1.0, 0.0, 1.0]
+    } else {
+        &[0.0]
+    };
+    for kt in -2..=2 {
+        for &kv in v_shifts {
+            let (t, w) = (theta + f64::from(kt) * tau, v + kv * tau);
+            let mut crossings = 0;
+            for u in loops.iter().flatten() {
+                let ((t0, v0), (t1, v1)) = (u.from, u.to);
+                if (v0 > w) != (v1 > w) {
+                    let at = t0 + (w - v0) / (v1 - v0) * (t1 - t0);
+                    if at > t {
+                        crossings += 1;
+                    }
+                }
+            }
+            if crossings % 2 == 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// An angle where the line of constant `v` runs inside the loops, if it does.
+fn param_row(loops: &[Vec<ParamUse>], v: f64, v_periodic: bool) -> Option<f64> {
+    let tau = std::f64::consts::TAU;
+    let v_shifts: &[f64] = if v_periodic {
+        &[-1.0, 0.0, 1.0]
+    } else {
+        &[0.0]
+    };
+    for &kv in v_shifts {
+        let w = v + kv * tau;
+        let mut at: Vec<f64> = loops
+            .iter()
+            .flatten()
+            .filter(|u| (u.from.1 > w) != (u.to.1 > w))
+            .map(|u| u.from.0 + (w - u.from.1) / (u.to.1 - u.from.1) * (u.to.0 - u.from.0))
+            .collect();
+        at.sort_by(f64::total_cmp);
+        if let [a, b, ..] = at.as_slice() {
+            return Some((a + b) / 2.0);
+        }
+    }
+    None
 }
 
 impl Shape {
@@ -445,12 +784,10 @@ impl Shape {
                     }
                 }
                 let integrals = solid.face_integrals(face, Point3::ORIGIN)?;
-                let fallback = solid.vertices.first().copied().unwrap_or(Point3::ORIGIN);
+                let fallback = solid.vertices.first().map_or(Point3::ORIGIN, |v| v.point);
                 let (surface, normal, axis) = match &face.surface {
                     Surface::Plane(plane) => (SurfaceKind::Plane, Some(plane.normal), None),
-                    Surface::Cylinder(cylinder) => {
-                        (SurfaceKind::Cylinder, None, Some(cylinder.axis))
-                    }
+                    Surface::Revolution(r) => (r.kind(), None, Some(r.axis)),
                 };
                 topology.faces.push(FaceInfo {
                     surface,
@@ -477,22 +814,27 @@ impl Shape {
                         vertices,
                         faces,
                     },
-                    Curve::Circle(circle) => {
-                        let sweep = solid.sweep(edge);
-                        EdgeInfo {
-                            curve: CurveKind::Circle,
-                            length: circle.radius * sweep,
-                            midpoint: circle.point_at(circle.angle_of(a) + sweep / 2.0),
-                            axis: Axis::new(circle.center, circle.normal),
-                            vertices,
-                            faces,
-                        }
-                    }
+                    Curve::Circle(circle) => EdgeInfo {
+                        curve: CurveKind::Circle,
+                        length: circle.radius * solid.sweep(edge),
+                        midpoint: solid.midpoint(edge),
+                        axis: Axis::new(circle.center, circle.normal),
+                        vertices,
+                        faces,
+                    },
+                    Curve::Degenerate { .. } => EdgeInfo {
+                        curve: CurveKind::Degenerate,
+                        length: 0.0,
+                        midpoint: a,
+                        axis: None,
+                        vertices,
+                        faces,
+                    },
                 });
             }
             topology
                 .vertices
-                .extend(solid.vertices.iter().map(|&point| VertexInfo { point }));
+                .extend(solid.vertices.iter().map(|v| VertexInfo { point: v.point }));
         }
         Ok(topology)
     }
@@ -500,26 +842,29 @@ impl Shape {
     pub fn counts(&self) -> TopologyCounts {
         TopologyCounts {
             solids: self.solids.len(),
-            shells: self.solids.len(),
+            shells: self.solids.iter().map(|s| s.shells.len().max(1)).sum(),
             faces: self.face_count(),
             edges: self.solids.iter().map(|s| s.edges.len()).sum(),
             vertices: self.solids.iter().map(|s| s.vertices.len()).sum(),
         }
     }
 
-    /// The smallest box along the model axes holding the shape: its vertices and the
-    /// furthest points its arcs reach between them, which bound a face of a plane or a
-    /// cylinder too (along a cylinder's axis it is straight). `None` for a shape with no
-    /// vertex.
+    /// The smallest box along the model axes holding the shape: its vertices, the furthest
+    /// points its arcs reach between them, and where a sphere's or a torus's face bulges
+    /// out between its edges (a plane, a cylinder or a cone reaches its extremes on its
+    /// edges). `None` for a shape with no vertex.
     pub fn bounds(&self) -> Option<(Point3, Point3)> {
         let mut points: Vec<Point3> = Vec::new();
         for solid in &self.solids {
-            points.extend(solid.vertices.iter().copied());
+            points.extend(solid.vertices.iter().map(|v| v.point));
             for edge in &solid.edges {
                 if let Curve::Circle(circle) = edge.curve {
                     let start = circle.angle_of(solid.point(edge.start));
                     points.extend(circle.extremes(start, solid.sweep(edge)));
                 }
+            }
+            for face in &solid.faces {
+                points.extend(solid.bulges(face));
             }
         }
         let mut points = points.into_iter();
@@ -535,7 +880,9 @@ impl Shape {
     /// A point of the shape the mass integrals are taken about: near the geometry, so that
     /// large coordinates do not eat into their precision.
     fn reference(&self) -> Option<Point3> {
-        self.solids.iter().find_map(|s| s.vertices.first().copied())
+        self.solids
+            .iter()
+            .find_map(|s| s.vertices.first().map(|v| v.point))
     }
 
     /// The volume of every solid together, and its first moment about the reference point.

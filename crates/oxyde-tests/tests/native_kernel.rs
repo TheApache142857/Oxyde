@@ -964,7 +964,7 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     match &statuses[5] {
         FeatureStatus::Error(message) => {
             assert!(
-                message.contains("cylinders whose axes are not parallel"),
+                message.contains("surfaces of revolution on different axes"),
                 "{message}"
             )
         }
@@ -980,4 +980,415 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let expected = 12_000.0 - std::f64::consts::PI * 16.0 * 10.0;
     assert!((volume - expected).abs() < 1e-6, "{volume}");
     part.release(&mut kernel);
+}
+
+// ---------------------------------------------------------------------------------------
+// Revolves: planes, cylinders, cones, spheres and tori, and the booleans of them that meet
+// in circles across their axis.
+
+/// A sketch on the Front plane with a construction line along the Y axis, drawn from
+/// `from` to `to` (its direction is the revolve's axis), and the line's id.
+fn about_y(from: f64, to: f64) -> (Sketch, u32) {
+    let mut sketch = front();
+    let axis = sketch
+        .geometry
+        .line(Point2::new(0.0, from), Point2::new(0.0, to));
+    sketch.geometry.set_construction(axis, true);
+    (sketch, axis.0)
+}
+
+fn revolve(part: &mut Part, sketch: Sketch, axis: u32, op: ExtrudeOp, angle: f64) -> FeatureId {
+    let s = part.add_feature(FeatureKind::Sketch(sketch));
+    part.add_feature(FeatureKind::Revolve(oxyde_model::Revolve {
+        sketch: s,
+        op,
+        axis: oxyde_model::RevolveAxis::SketchLine(axis),
+        angle,
+        mid_plane: false,
+        reverse: false,
+        bodies: Vec::new(),
+    }))
+}
+
+/// A part of one revolve of `corners` (a polygon) about the Y axis, drawn up or down.
+fn revolved_polygon(corners: &[(f64, f64)], up: bool, angle: f64) -> Part {
+    let mut part = Part::new();
+    let (mut sketch, axis) = if up {
+        about_y(-20.0, 40.0)
+    } else {
+        about_y(40.0, -20.0)
+    };
+    polygon(&mut sketch, corners);
+    revolve(&mut part, sketch, axis, ExtrudeOp::Boss, angle);
+    part
+}
+
+const QUARTER: f64 = std::f64::consts::FRAC_PI_2;
+const WHOLE: f64 = std::f64::consts::TAU;
+
+#[test]
+fn revolved_rings_rods_and_cones() {
+    let ring = [(10.0, 0.0), (20.0, 0.0), (20.0, 5.0), (10.0, 5.0)];
+    let rod = [(0.0, 0.0), (5.0, 0.0), (5.0, 10.0), (0.0, 10.0)];
+    let cone = [(0.0, 0.0), (5.0, 0.0), (0.0, 10.0)];
+    let apex_first = [(0.0, 0.0), (0.0, 10.0), (5.0, 0.0)];
+    let frustum = [(2.0, 0.0), (6.0, 0.0), (3.0, 10.0), (2.0, 10.0)];
+    let left = [(-10.0, 0.0), (-20.0, 0.0), (-20.0, 5.0), (-10.0, 5.0)];
+    for (name, corners) in [
+        ("ring", &ring[..]),
+        ("rod", &rod[..]),
+        ("cone", &cone[..]),
+        ("cone drawn from its apex", &apex_first[..]),
+        ("frustum off the axis", &frustum[..]),
+        ("ring left of the axis", &left[..]),
+    ] {
+        for up in [true, false] {
+            for angle in [WHOLE, QUARTER, 2.0] {
+                let what = format!(
+                    "{name}, axis {}, {angle} rad",
+                    if up { "up" } else { "down" }
+                );
+                assert_same_part(&what, &revolved_polygon(corners, up, angle));
+            }
+        }
+    }
+}
+
+/// A part of one revolve about the Y axis of a sketch `draw` makes.
+fn revolved_with(draw: impl Fn(&mut Sketch), up: bool, angle: f64) -> Part {
+    let mut part = Part::new();
+    let (mut sketch, axis) = if up {
+        about_y(-20.0, 40.0)
+    } else {
+        about_y(40.0, -20.0)
+    };
+    draw(&mut sketch);
+    revolve(&mut part, sketch, axis, ExtrudeOp::Boss, angle);
+    part
+}
+
+#[test]
+fn revolved_balls_caps_and_tori() {
+    // A half disc on the axis: a ball. Its arc counter-clockwise from the south pole.
+    let ball = |s: &mut Sketch| {
+        let g = &mut s.geometry;
+        let (south, north, centre) = (
+            g.point(Point2::new(0.0, -5.0)),
+            g.point(Point2::new(0.0, 5.0)),
+            g.point(Point2::new(0.0, 0.0)),
+        );
+        g.arc_between(centre, south, north);
+        g.line_between(north, south);
+    };
+    // A ball cut flat at both ends: a sphere's zone and two discs.
+    let cap = |s: &mut Sketch| {
+        let g = &mut s.geometry;
+        let (top, bottom, centre) = (
+            g.point(Point2::new(3.0, 4.0)),
+            g.point(Point2::new(3.0, -4.0)),
+            g.point(Point2::new(0.0, 0.0)),
+        );
+        let (axis_bottom, axis_top) = (
+            g.point(Point2::new(0.0, -4.0)),
+            g.point(Point2::new(0.0, 4.0)),
+        );
+        g.arc_between(centre, bottom, top);
+        g.line_between(top, axis_top);
+        g.line_between(axis_top, axis_bottom);
+        g.line_between(axis_bottom, bottom);
+    };
+    // A circle off the axis: a torus.
+    let torus = |s: &mut Sketch| {
+        s.circle(Point2::new(10.0, 2.0), 3.0);
+    };
+    // Half a circle off the axis and its diameter: half a torus's tube and a cylinder.
+    let half_torus = |s: &mut Sketch| {
+        arc(s, (10.0, 0.0), (10.0, -3.0), (10.0, 3.0));
+        s.line(Point2::new(10.0, 3.0), Point2::new(10.0, -3.0));
+    };
+    let inner_half_torus = |s: &mut Sketch| {
+        arc(s, (10.0, 0.0), (10.0, 3.0), (10.0, -3.0));
+        s.line(Point2::new(10.0, -3.0), Point2::new(10.0, 3.0));
+    };
+    for up in [true, false] {
+        for angle in [WHOLE, QUARTER] {
+            let axis = if up { "up" } else { "down" };
+            assert_same_part(
+                &format!("ball, axis {axis}, {angle}"),
+                &revolved_with(ball, up, angle),
+            );
+            assert_same_part(
+                &format!("cap, axis {axis}, {angle}"),
+                &revolved_with(cap, up, angle),
+            );
+            assert_same_part(
+                &format!("torus, axis {axis}, {angle}"),
+                &revolved_with(torus, up, angle),
+            );
+            assert_same_part(
+                &format!("half torus, axis {axis}, {angle}"),
+                &revolved_with(half_torus, up, angle),
+            );
+            assert_same_part(
+                &format!("inner half torus, axis {axis}, {angle}"),
+                &revolved_with(inner_half_torus, up, angle),
+            );
+        }
+    }
+}
+
+#[test]
+fn a_revolved_groove_and_a_revolved_cut_through_a_block() {
+    // A rod with a groove turned into it.
+    let mut part = revolved_polygon(
+        &[(0.0, 0.0), (20.0, 0.0), (20.0, 30.0), (0.0, 30.0)],
+        true,
+        WHOLE,
+    );
+    let (mut groove, axis) = about_y(-20.0, 40.0);
+    polygon(
+        &mut groove,
+        &[(17.0, 12.0), (25.0, 12.0), (25.0, 18.0), (17.0, 18.0)],
+    );
+    revolve(&mut part, groove, axis, ExtrudeOp::Cut, WHOLE);
+    assert_same_part("groove", &part);
+    // A ring turned about the block's middle line, cutting a round channel through it.
+    let mut part = Part::new();
+    let mut base = front();
+    base.rectangle(Point2::new(-20.0, -15.0), 40.0, 30.0);
+    boss(&mut part, base, ExtrudeExtent::Blind { depth: 10.0 }, false);
+    let (mut ring, axis) = about_y(-20.0, 40.0);
+    polygon(
+        &mut ring,
+        &[(8.0, 2.0), (12.0, 2.0), (12.0, 6.0), (8.0, 6.0)],
+    );
+    revolve(&mut part, ring, axis, ExtrudeOp::Cut, WHOLE);
+    assert_same_part("channel", &part);
+}
+
+/// A 40 × 20 × 10 block with a sketch on its top holding two points, and a hole of `kind`
+/// at each.
+fn holes(kind: oxyde_model::HoleKind, depth: Option<f64>) -> Part {
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 20.0);
+    let base = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    let mut spots = on_top(base);
+    spots.geometry.point(Point2::new(10.0, 10.0));
+    spots.geometry.point(Point2::new(30.0, 10.0));
+    let spots = part.add_feature(FeatureKind::Sketch(spots));
+    part.add_feature(FeatureKind::Hole(oxyde_model::Hole {
+        sketch: spots,
+        kind,
+        diameter: 6.0,
+        depth,
+        reverse: false,
+        bodies: Vec::new(),
+    }));
+    part
+}
+
+#[test]
+fn holes_of_every_kind() {
+    use oxyde_model::HoleKind;
+    assert_same_part("simple holes", &holes(HoleKind::Simple, None));
+    assert_same_part("blind holes", &holes(HoleKind::Simple, Some(6.0)));
+    let counterbore = HoleKind::Counterbore {
+        diameter: 10.0,
+        depth: 3.0,
+    };
+    assert_same_part("counterbored holes", &holes(counterbore, None));
+    assert_same_part("blind counterbored holes", &holes(counterbore, Some(7.0)));
+    let countersink = HoleKind::Countersink {
+        diameter: 10.0,
+        angle: QUARTER,
+    };
+    assert_same_part("countersunk holes", &holes(countersink, None));
+    assert_same_part("blind countersunk holes", &holes(countersink, Some(7.0)));
+}
+
+#[test]
+fn the_demo_flange() {
+    let mut part = Part::new();
+    let (mut section, axis) = about_y(-5.0, 30.0);
+    let corners = [
+        (10.0, 0.0),
+        (40.0, 0.0),
+        (40.0, 6.0),
+        (16.0, 6.0),
+        (16.0, 25.0),
+        (10.0, 25.0),
+    ]
+    .map(|(x, y)| section.geometry.point(Point2::new(x, y)));
+    let mut lines = Vec::new();
+    for i in 0..corners.len() {
+        lines.push(
+            section
+                .geometry
+                .line_between(corners[i], corners[(i + 1) % corners.len()]),
+        );
+    }
+    let body = revolve(&mut part, section, axis, ExtrudeOp::Boss, WHOLE);
+    let mut hole = Sketch::new(SketchPlane::Face(FaceName::profile(body, lines[2].0)));
+    hole.circle(Point2::new(28.0, 0.0), 3.0);
+    let s = part.add_feature(FeatureKind::Sketch(hole));
+    let hole = part.add_feature(FeatureKind::Extrude(Extrude::blind(s, ExtrudeOp::Cut, 6.0)));
+    part.add_feature(FeatureKind::CircularPattern(oxyde_model::CircularPattern {
+        seeds: vec![hole],
+        axis: AxisRef::Standard(StandardAxis::Y),
+        angle: WHOLE,
+        count: 6,
+        equal_spacing: true,
+        reverse: false,
+        skip: Vec::new(),
+    }));
+    assert_same_part("flange", &part);
+}
+
+#[test]
+fn a_ball_on_a_block_and_a_ball_cut_from_it() {
+    // A ball whose centre is on the block's top: half of it stands out, half is in.
+    for op in [ExtrudeOp::Boss, ExtrudeOp::Cut] {
+        let mut part = Part::new();
+        let mut base = front();
+        base.rectangle(Point2::new(-20.0, -15.0), 40.0, 30.0);
+        boss(&mut part, base, ExtrudeExtent::Blind { depth: 10.0 }, false);
+        // About the Z axis this time, on the Right plane: the ball's centre at z = 10.
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+        // The Right plane's x runs along -Z and its y along Y.
+        let axis = sketch
+            .geometry
+            .line(Point2::new(20.0, 0.0), Point2::new(-30.0, 0.0));
+        sketch.geometry.set_construction(axis, true);
+        let g = &mut sketch.geometry;
+        let (a, b, centre) = (
+            g.point(Point2::new(-4.0, 0.0)),
+            g.point(Point2::new(-16.0, 0.0)),
+            g.point(Point2::new(-10.0, 0.0)),
+        );
+        g.arc_between(centre, a, b);
+        g.line_between(b, a);
+        revolve(&mut part, sketch, axis.0, op, WHOLE);
+        assert_same_part(&format!("ball {op:?}"), &part);
+    }
+}
+
+#[test]
+fn a_pocket_inside_the_block_is_a_void() {
+    // A round pocket cut blind from a plane in the middle of the block, inside it: a void.
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mid = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Offset {
+        base: oxyde_model::PlaneRef::Standard(StandardPlane::Front),
+        offset: 3.0,
+        flip: false,
+    }));
+    let mut sketch = Sketch::new(SketchPlane::Reference(mid));
+    sketch.circle(Point2::new(20.0, 15.0), 5.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::Blind { depth: 4.0 },
+        true,
+    );
+    assert_same_part("void", &part);
+}
+
+/// A revolve about the Y axis of the half disc of radius `r` centred at height `y`.
+fn ball(part: &mut Part, y: f64, r: f64, op: ExtrudeOp) {
+    let (mut sketch, axis) = about_y(-40.0, 60.0);
+    let g = &mut sketch.geometry;
+    let (south, north, centre) = (
+        g.point(Point2::new(0.0, y - r)),
+        g.point(Point2::new(0.0, y + r)),
+        g.point(Point2::new(0.0, y)),
+    );
+    g.arc_between(centre, south, north);
+    g.line_between(north, south);
+    revolve(part, sketch, axis, op, WHOLE);
+}
+
+#[test]
+fn revolved_solids_cut_in_half_along_their_axis() {
+    // The boxes cover x > 0 (and more), from z = -20 to 20: their face x = 0 holds the axis.
+    let half_box = |part: &mut Part| {
+        let mut sketch = front();
+        sketch.rectangle(Point2::new(0.0, -30.0), 30.0, 60.0);
+        extrude(
+            part,
+            sketch,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::MidPlane { depth: 40.0 },
+            false,
+        );
+    };
+    // A ball: a great circle through its poles.
+    let mut part = Part::new();
+    ball(&mut part, 0.0, 5.0, ExtrudeOp::Boss);
+    half_box(&mut part);
+    assert_same_part("half ball", &part);
+    // A cone: two straight lines from its apex.
+    let mut part = revolved_polygon(&[(0.0, 0.0), (5.0, 0.0), (0.0, 10.0)], true, WHOLE);
+    half_box(&mut part);
+    assert_same_part("half cone", &part);
+    // A torus: two of its meridian circles.
+    let mut part = Part::new();
+    let (mut sketch, axis) = about_y(-20.0, 40.0);
+    sketch.circle(Point2::new(10.0, 2.0), 3.0);
+    revolve(&mut part, sketch, axis, ExtrudeOp::Boss, WHOLE);
+    half_box(&mut part);
+    assert_same_part("half torus", &part);
+}
+
+#[test]
+fn balls_tori_and_rods_on_one_axis() {
+    // A rod with a ball at its end, the ball's centre on the rod's end: the cylinder meets
+    // the sphere in a circle, and the ball's lower half is inside the rod's end.
+    let mut part = revolved_polygon(
+        &[(0.0, 0.0), (3.0, 0.0), (3.0, 20.0), (0.0, 20.0)],
+        true,
+        WHOLE,
+    );
+    ball(&mut part, 20.0, 5.0, ExtrudeOp::Boss);
+    assert_same_part("rod and ball", &part);
+    // A thinner ball, the rod's end standing out of it.
+    let mut part = revolved_polygon(
+        &[(0.0, 0.0), (3.0, 0.0), (3.0, 20.0), (0.0, 20.0)],
+        true,
+        WHOLE,
+    );
+    ball(&mut part, 18.0, 4.0, ExtrudeOp::Cut);
+    assert_same_part("rod with a ball cut from its end", &part);
+    // A torus half sunk into a block, its axis square to the block's top.
+    let mut part = Part::new();
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    // The Top plane's sketch y runs along -Z.
+    sketch.rectangle(Point2::new(-20.0, -20.0), 40.0, 40.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Boss,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        true,
+    );
+    let (mut ring, axis) = about_y(-20.0, 40.0);
+    ring.circle(Point2::new(10.0, 0.0), 3.0);
+    revolve(&mut part, ring, axis, ExtrudeOp::Boss, WHOLE);
+    assert_same_part("torus on a block", &part);
+    // An O-ring's groove: a circle turned about a rod's axis, half into it.
+    let mut part = revolved_polygon(
+        &[(0.0, 0.0), (10.0, 0.0), (10.0, 30.0), (0.0, 30.0)],
+        true,
+        WHOLE,
+    );
+    let (mut ring, axis) = about_y(-20.0, 40.0);
+    ring.circle(Point2::new(10.0, 15.0), 2.0);
+    revolve(&mut part, ring, axis, ExtrudeOp::Cut, WHOLE);
+    assert_same_part("o-ring groove", &part);
 }

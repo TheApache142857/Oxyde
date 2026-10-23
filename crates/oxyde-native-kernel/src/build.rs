@@ -10,8 +10,9 @@ use oxyde_geom::{Axis, Curve2, LINEAR_TOLERANCE, Loop, Plane, Point2, Point3, Pr
 use oxyde_kernel::{FaceSource, OpHistory};
 
 use crate::NativeError;
-use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, cyclic_pairs};
-use crate::geometry::{Circle, Curve, Cylinder, Surface};
+use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex, cyclic_pairs};
+use crate::geometry::{Circle, Curve, Surface};
+use crate::revolution::Revolution;
 
 /// How a segment of a [`PlanarLoop`] runs from its corner to the next one.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,13 +51,13 @@ fn circumcentre(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
     ))
 }
 
-fn distance2(a: Point2, b: Point2) -> f64 {
+pub(crate) fn distance2(a: Point2, b: Point2) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
 }
 
 /// The angle from `a` to `b` about `center`, turning counter-clockwise when `ccw`, in
 /// `(0, 2π]`: a whole turn from a point back to itself.
-fn turn(center: Point2, a: Point2, b: Point2, ccw: bool) -> f64 {
+pub(crate) fn turn(center: Point2, a: Point2, b: Point2, ccw: bool) -> f64 {
     let angle = |p: Point2| (p.y - center.y).atan2(p.x - center.x);
     let raw = if ccw {
         angle(b) - angle(a)
@@ -69,7 +70,7 @@ fn turn(center: Point2, a: Point2, b: Point2, ccw: bool) -> f64 {
 
 impl PlanarLoop {
     /// The contour of a profile loop.
-    fn of(contour: &Loop) -> Result<PlanarLoop, NativeError> {
+    pub(crate) fn of(contour: &Loop) -> Result<PlanarLoop, NativeError> {
         let corners = contour
             .segments
             .iter()
@@ -104,7 +105,7 @@ impl PlanarLoop {
 
     /// Enclosed area, positive when the contour runs counter-clockwise: the polygon of its
     /// corners and, for each arc, the circular segment between it and its chord.
-    fn signed_area(&self) -> f64 {
+    pub(crate) fn signed_area(&self) -> f64 {
         cyclic_pairs(&self.corners)
             .map(|((a, _, run), (b, _, _))| {
                 let chord = (a.x * b.y - b.x * a.y) / 2.0;
@@ -281,8 +282,8 @@ fn prism(
         let n = contour.corners.len() as u32;
         for &(p, _, _) in &contour.corners {
             let bottom = plane.to_world(p);
-            solid.vertices.push(bottom);
-            solid.vertices.push(bottom + vector);
+            solid.vertices.push(Vertex::new(bottom));
+            solid.vertices.push(Vertex::new(bottom + vector));
         }
         for (k, &(p, _, run)) in (0..n).zip(&contour.corners) {
             let next = (k + 1) % n;
@@ -295,16 +296,8 @@ fn prism(
                     Curve::Circle(circle_of(p, center, ccw, vector)),
                 ),
             };
-            solid.edges.push(Edge {
-                start: b,
-                end: b_next,
-                curve: bottom,
-            });
-            solid.edges.push(Edge {
-                start: t,
-                end: t_next,
-                curve: top,
-            });
+            solid.edges.push(Edge::new(b, b_next, bottom));
+            solid.edges.push(Edge::new(t, t_next, top));
             solid.edges.push(Edge::line(b, t));
         }
     }
@@ -316,8 +309,8 @@ fn prism(
             let next = (k + 1) % n;
             let (bottom, top) = (e0 + 3 * k, e0 + 3 * k + 1);
             let (across, across_next) = (e0 + 3 * k + 2, e0 + 3 * next + 2);
-            let a = solid.vertices[(v0 + 2 * k) as usize];
-            let b = solid.vertices[(v0 + 2 * next) as usize];
+            let a = solid.point(v0 + 2 * k);
+            let b = solid.point(v0 + 2 * next);
             let surface = match run {
                 Run::Line => {
                     let along_edge = (b - a)
@@ -345,15 +338,15 @@ fn prism(
                     if radius <= LINEAR_TOLERANCE {
                         return Err(failed("an arc of the profile has no radius"));
                     }
-                    Surface::Cylinder(Cylinder {
-                        axis: Axis {
+                    Surface::Revolution(Revolution::cylinder(
+                        Axis {
                             origin: plane.to_world(center),
                             direction: -sweep_dir,
                         },
-                        x_dir: plane.x_dir,
+                        plane.x_dir,
                         radius,
-                        outward: ccw_about_up,
-                    })
+                        ccw_about_up,
+                    ))
                 }
             };
             solid.faces.push(Face {

@@ -1,19 +1,23 @@
-//! Booleans of solids with planar and cylindrical faces, by cutting faces along the curves
-//! where they meet.
+//! Booleans of solids with planar faces and faces on surfaces of revolution, by cutting
+//! faces along the curves where they meet.
 //!
-//! Each face is laid out flat in its own chart (a plane's coordinates, or a cylinder's
-//! `(radius × angle, height)`, where everything the kernel meets is straight), cut along the
-//! curves it shares with the other solid's faces ([`crate::arrangement`]), and every piece
-//! is kept or dropped by where a point inside it lies: inside the other solid, outside it,
-//! or on one of its faces facing the same way or the other. The pieces kept are welded at
-//! their corners, the pieces lying on one surface merged back into faces (a cylinder's face
-//! that goes round whole cut open along its seam at its angle zero, one that does not left
-//! whole), and edges along one line or circle between the same two faces joined, as
-//! OpenCASCADE's `SimplifyResult` leaves them.
+//! Each face is laid out flat in its own chart (a plane's coordinates, or a surface of
+//! revolution's `(k θ, m v)`: its angle about the axis and its parameter along its
+//! meridian, scaled to lengths, where everything the kernel meets on it so far is
+//! straight), cut along the curves it shares with the other solid's faces
+//! ([`crate::arrangement`]), and every piece is kept or dropped by where a point inside it
+//! lies: inside the other solid, outside it, or on one of its faces facing the same way or
+//! the other. The pieces kept are welded at their corners, the pieces lying on one surface
+//! merged back into faces (a face that goes round its axis whole cut open along its seam at
+//! its angle zero, one that does not left whole), and edges along one line or circle
+//! between the same two faces joined, as OpenCASCADE's `SimplifyResult` leaves them. A
+//! piece that reaches a cone's apex or a sphere's pole runs along a degenerate edge there.
+//! A shell left inside a solid with its faces turned inwards is a void of that solid.
 //!
-//! What it meets in lines and circles only: planes, and cylinders whose axes are square to
-//! the planes they meet or along them, and parallel to the other cylinders. Anything else
-//! answers [`NativeError::Unsupported`].
+//! What meets in lines and circles only: planes; cylinders square to the planes they meet
+//! or along them, and parallel to the other cylinders; cones, spheres and tori sharing
+//! their axis with the surfaces of revolution they meet, square to the planes they meet or
+//! holding them along their axis. Anything else answers [`NativeError::Unsupported`].
 
 // Indices into the points, edges and faces gathered here.
 #![allow(clippy::indexing_slicing)]
@@ -26,8 +30,9 @@ use oxyde_kernel::{BooleanOp, FaceSource, OpHistory};
 
 use crate::NativeError;
 use crate::arrangement::{self, Arrangement, Geom, P, Segment};
-use crate::brep::{Edge, EdgeUse, Face, Shape, Solid};
-use crate::geometry::{Circle, Curve, Cylinder, Surface};
+use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex};
+use crate::geometry::{Circle, Curve, Surface};
+use crate::revolution::{Meridian, PlaneCurve, Revolution, WalkEdge, walk};
 
 /// An input face a face of the result is made of: the input's position in the boolean's
 /// arguments and the face's index in it.
@@ -99,8 +104,10 @@ pub(crate) fn boolean(
 // ---------------------------------------------------------------------------------------
 // Charts: a face laid out flat.
 
-/// A surface's flat coordinates: a plane's own, or a cylinder's `x = radius × angle`
-/// (counter-clockwise about its axis from its angle zero) and `y = height` along its axis.
+/// A surface's flat coordinates: a plane's own, or a surface of revolution's
+/// `x = k θ` (counter-clockwise about its axis from its angle zero) and `y = m v`, `k` a
+/// radius of the surface and `m` its meridian circle's radius (1 for a straight meridian,
+/// whose `v` is already a length), so that lengths in the chart are about lengths in space.
 #[derive(Debug, Clone, Copy)]
 enum Chart {
     Plane {
@@ -109,7 +116,11 @@ enum Chart {
         y: Vec3,
         normal: Vec3,
     },
-    Cylinder(Cylinder),
+    Revolution {
+        surface: Revolution,
+        k: f64,
+        m: f64,
+    },
 }
 
 impl Chart {
@@ -121,35 +132,51 @@ impl Chart {
                 y: plane.normal.cross(plane.x_dir),
                 normal: plane.normal,
             },
-            Surface::Cylinder(cylinder) => Chart::Cylinder(*cylinder),
+            Surface::Revolution(r) => Chart::revolution(*r),
         }
+    }
+
+    fn revolution(surface: Revolution) -> Chart {
+        let (k, m) = match surface.meridian {
+            Meridian::Line { radius, .. } => (radius.abs().max(1.0), 1.0),
+            Meridian::Circle { center, radius } => ((center + radius).max(1e-9), radius),
+        };
+        Chart::Revolution { surface, k, m }
     }
 
     /// The length a whole turn takes along `x`: none for a plane.
     fn period(&self) -> Option<f64> {
         match self {
             Chart::Plane { .. } => None,
-            Chart::Cylinder(c) => Some(TAU * c.radius),
+            Chart::Revolution { k, .. } => Some(TAU * k),
+        }
+    }
+
+    /// The length a whole turn round a ring torus's tube takes along `y`.
+    fn v_period(&self) -> Option<f64> {
+        match self {
+            Chart::Revolution { surface, m, .. } if surface.v_periodic() => Some(TAU * m),
+            _ => None,
         }
     }
 
     fn to_world(self, p: P) -> Point3 {
         match self {
             Chart::Plane { origin, x, y, .. } => origin + x * p.x + y * p.y,
-            Chart::Cylinder(c) => c.point(p.x / c.radius, p.y),
+            Chart::Revolution { surface, k, m } => surface.point(p.x / k, p.y / m),
         }
     }
 
-    /// `p` in the chart: for a cylinder, its angle taken in `[0, 2π)`.
+    /// `p` in the chart: on a surface of revolution, its angle taken in `[0, 2π)`.
     fn to_2d(self, p: Point3) -> P {
         match self {
             Chart::Plane { origin, x, y, .. } => {
                 let d = p - origin;
                 P::new(d.dot(x), d.dot(y))
             }
-            Chart::Cylinder(c) => {
-                let (angle, height) = c.coordinates(p);
-                P::new(angle.rem_euclid(TAU) * c.radius, height)
+            Chart::Revolution { surface, k, m } => {
+                let (theta, v) = surface.params(p);
+                P::new(theta.rem_euclid(TAU) * k, v * m)
             }
         }
     }
@@ -170,22 +197,53 @@ impl Chart {
                 normal: if ccw { *normal } else { -*normal },
                 radius,
             })),
-            (Chart::Cylinder(c), Geom::Line) => {
+            (Chart::Revolution { surface, k, m }, Geom::Line) => {
+                let a = surface.axis.direction;
                 if (s.a.x - s.b.x).abs() <= TOL {
-                    Ok(Curve::Line)
+                    // Along the meridian at its angle.
+                    let theta = s.a.x / k;
+                    match surface.meridian {
+                        Meridian::Line { .. } => Ok(Curve::Line),
+                        Meridian::Circle { .. } => {
+                            let circle = surface
+                                .meridian_circle(theta)
+                                .ok_or_else(|| "no meridian circle".to_owned())?;
+                            Ok(Curve::Circle(if s.b.y > s.a.y {
+                                circle
+                            } else {
+                                Circle {
+                                    normal: -circle.normal,
+                                    ..circle
+                                }
+                            }))
+                        }
+                    }
                 } else if (s.a.y - s.b.y).abs() <= TOL {
-                    let a = c.axis.direction;
+                    // Round the axis at its height: a parallel, or a pole.
+                    let v = s.a.y / m;
+                    let up = s.b.x > s.a.x;
+                    if surface.is_pole(v) {
+                        return Ok(Curve::Degenerate {
+                            axis: if up { a } else { -a },
+                            turn: (s.b.x - s.a.x).abs() / k,
+                        });
+                    }
+                    let circle = surface
+                        .parallel(v)
+                        .ok_or_else(|| "no parallel".to_owned())?;
                     Ok(Curve::Circle(Circle {
-                        center: c.axis.origin + a * s.a.y,
-                        normal: if s.b.x > s.a.x { a } else { -a },
-                        radius: c.radius,
+                        normal: if up { a } else { -a },
+                        ..circle
                     }))
                 } else {
-                    Err("a cut across a cylinder that is neither along nor round it".to_owned())
+                    Err(
+                        "a cut across a surface of revolution that is neither along nor round it"
+                            .to_owned(),
+                    )
                 }
             }
-            (Chart::Cylinder(_), Geom::Arc { .. }) => {
-                Err("an arc in a cylinder's chart".to_owned())
+            (Chart::Revolution { .. }, Geom::Arc { .. }) => {
+                Err("an arc in a surface of revolution's chart".to_owned())
             }
         }
     }
@@ -194,16 +252,13 @@ impl Chart {
     fn normal_at(&self, p: Point3) -> Vec3 {
         match self {
             Chart::Plane { normal, .. } => *normal,
-            Chart::Cylinder(c) => {
-                let r = c.radial(p).normalized().unwrap_or(c.x_dir);
-                if c.outward { r } else { -r }
-            }
+            Chart::Revolution { surface, .. } => surface.normal_at(p),
         }
     }
 }
 
-/// An edge in space, from `a` to `b`: a line, or an arc counter-clockwise about its
-/// circle's normal (a whole circle when `a` is `b`).
+/// An edge in space, from `a` to `b`: a line, an arc counter-clockwise about its circle's
+/// normal (a whole circle when `a` is `b`), or a degenerate edge at a point.
 #[derive(Debug, Clone, Copy)]
 struct Edge3 {
     a: Point3,
@@ -216,13 +271,7 @@ impl Edge3 {
         Edge3 {
             a: self.b,
             b: self.a,
-            curve: match self.curve {
-                Curve::Line => Curve::Line,
-                Curve::Circle(c) => Curve::Circle(Circle {
-                    normal: -c.normal,
-                    ..c
-                }),
-            },
+            curve: self.curve.reversed(),
         }
     }
 
@@ -230,11 +279,12 @@ impl Edge3 {
         self.a.distance(self.b) <= TOL
     }
 
-    /// The angle it turns through (a circle), its length (a line).
+    /// The angle it turns through (a circle, a degenerate edge), its length (a line).
     fn extent(&self) -> f64 {
         match self.curve {
             Curve::Line => self.a.distance(self.b),
             Curve::Circle(c) => c.sweep(self.a, self.b, self.closed()),
+            Curve::Degenerate { turn, .. } => turn,
         }
     }
 
@@ -242,6 +292,7 @@ impl Edge3 {
         match self.curve {
             Curve::Line => self.a + (self.b - self.a) * 0.5,
             Curve::Circle(c) => c.point_at(c.angle_of(self.a) + self.extent() / 2.0),
+            Curve::Degenerate { .. } => self.a,
         }
     }
 
@@ -260,25 +311,34 @@ impl Edge3 {
                 (off <= TOL && t > 0.0 && t < 1.0).then_some(t * l)
             }
             Curve::Circle(c) => {
-                let d = p - c.center;
-                let along = d.dot(c.normal);
-                let r = (d - c.normal * along).length();
-                if along.abs() > TOL || (r - c.radius).abs() > TOL {
+                if c.distance(p) > TOL {
                     return None;
                 }
                 let s = (c.angle_of(p) - c.angle_of(self.a)).rem_euclid(TAU);
                 (s > 0.0 && s < self.extent()).then_some(s)
             }
+            Curve::Degenerate { .. } => None,
+        }
+    }
+
+    fn walk_edge(&self) -> WalkEdge {
+        WalkEdge {
+            curve: self.curve,
+            a: self.a,
+            b: self.b,
+            sweep: self.extent(),
+            mid: self.midpoint(),
+            tolerance: TOL,
         }
     }
 }
 
 /// The arrangement's regions run counter-clockwise in a chart, which is outward for a plane
-/// and for a cylinder whose normal points away from its axis; a cylinder whose normal points
-/// towards it (a hole's wall) runs the other way.
+/// and for a surface of revolution whose normal is its own; one whose normal is the other
+/// way (a hole's wall) runs the other way.
 fn outward_loops(chart: &Chart, loops: Vec<Vec<Edge3>>) -> Vec<Vec<Edge3>> {
     match chart {
-        Chart::Cylinder(c) if !c.outward => loops
+        Chart::Revolution { surface, .. } if !surface.outward => loops
             .into_iter()
             .map(|l| l.iter().rev().map(Edge3::reversed).collect())
             .collect(),
@@ -286,9 +346,9 @@ fn outward_loops(chart: &Chart, loops: Vec<Vec<Edge3>>) -> Vec<Vec<Edge3>> {
     }
 }
 
-/// A face's boundary in its chart, walked as its loops run: for a cylinder, the angle
-/// unwrapped as it goes round, so that a face crossing angle zero stays in one piece and a
-/// whole cylinder's face runs a whole period along `x`.
+/// A face's boundary in its chart, walked as its loops run: on a surface of revolution,
+/// the angle unwrapped as it goes round, so that a face crossing angle zero stays in one
+/// piece and a face going round whole runs a whole period along `x`.
 fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, String> {
     let mut out = Vec::new();
     for edges in loops {
@@ -296,34 +356,29 @@ fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, Stri
             Chart::Plane { normal, .. } => {
                 for e in edges {
                     let (a, b) = (chart.to_2d(e.a), chart.to_2d(e.b));
-                    out.push(match e.curve {
-                        Curve::Line => Segment::line(a, b),
-                        Curve::Circle(c) => {
-                            Segment::arc(a, b, chart.to_2d(c.center), c.normal.dot(*normal) > 0.0)
-                        }
-                    });
+                    match e.curve {
+                        Curve::Line => out.push(Segment::line(a, b)),
+                        Curve::Circle(c) => out.push(Segment::arc(
+                            a,
+                            b,
+                            chart.to_2d(c.center),
+                            c.normal.dot(*normal) > 0.0,
+                        )),
+                        Curve::Degenerate { .. } => {}
+                    }
                 }
             }
-            Chart::Cylinder(c) => {
-                let Some(first) = edges.first() else {
-                    continue;
-                };
-                let mut x = chart.to_2d(first.a).x;
-                for e in edges {
-                    let ya = (e.a - c.axis.origin).dot(c.axis.direction);
-                    let yb = (e.b - c.axis.origin).dot(c.axis.direction);
-                    match e.curve {
-                        Curve::Line => out.push(Segment::line(P::new(x, ya), P::new(x, yb))),
-                        Curve::Circle(circle) => {
-                            let mut turn = e.extent();
-                            if circle.normal.dot(c.axis.direction) < 0.0 {
-                                turn = -turn;
-                            }
-                            let to = x + turn * c.radius;
-                            out.push(Segment::line(P::new(x, ya), P::new(to, ya)));
-                            x = to;
-                        }
-                    }
+            Chart::Revolution { surface, k, m } => {
+                let walked = walk(
+                    surface,
+                    &edges.iter().map(Edge3::walk_edge).collect::<Vec<_>>(),
+                    TOL,
+                )?;
+                for ((t0, v0), (t1, v1)) in walked {
+                    out.push(Segment::line(
+                        P::new(t0 * k, v0 * m),
+                        P::new(t1 * k, v1 * m),
+                    ));
                 }
             }
         }
@@ -352,35 +407,42 @@ struct Prepared {
 }
 
 fn prepare(tagged: &Tagged) -> Result<Vec<Prepared>, NativeError> {
-    let internal = NativeError::Internal;
     let mut out = Vec::new();
     let mut index = 0;
     for solid in &tagged.shape.solids {
         for face in &solid.faces {
-            let loops: Vec<Vec<Edge3>> = face
-                .loops
-                .iter()
-                .map(|uses| uses.iter().map(|&u| edge3(solid, u)).collect())
-                .collect();
-            let chart = Chart::of(&face.surface);
-            let boundary = boundary_2d(&chart, &loops).map_err(internal)?;
-            let (lo, hi) = box_2d(&boundary);
-            let (min, max) = box_3d(&loops);
-            out.push(Prepared {
-                surface: face.surface,
-                chart,
-                loops,
-                boundary,
-                lo,
-                hi,
-                min,
-                max,
-                sources: tagged.sources.get(index).cloned().unwrap_or_default(),
-            });
+            out.push(prepare_face(
+                solid,
+                face,
+                tagged.sources.get(index).cloned().unwrap_or_default(),
+            )?);
             index += 1;
         }
     }
     Ok(out)
+}
+
+fn prepare_face(solid: &Solid, face: &Face, sources: Vec<Source>) -> Result<Prepared, NativeError> {
+    let loops: Vec<Vec<Edge3>> = face
+        .loops
+        .iter()
+        .map(|uses| uses.iter().map(|&u| edge3(solid, u)).collect())
+        .collect();
+    let chart = Chart::of(&face.surface);
+    let boundary = boundary_2d(&chart, &loops).map_err(NativeError::Internal)?;
+    let (lo, hi) = box_2d(&boundary);
+    let (min, max) = face_box(solid, face, &loops);
+    Ok(Prepared {
+        surface: face.surface,
+        chart,
+        loops,
+        boundary,
+        lo,
+        hi,
+        min,
+        max,
+        sources,
+    })
 }
 
 fn edge3(solid: &Solid, u: EdgeUse) -> Edge3 {
@@ -411,14 +473,7 @@ fn box_2d(segments: &[Segment]) -> (P, P) {
     (lo, hi)
 }
 
-fn box_3d(loops: &[Vec<Edge3>]) -> (Point3, Point3) {
-    let mut points = Vec::new();
-    for e in loops.iter().flatten() {
-        points.push(e.a);
-        if let Curve::Circle(c) = e.curve {
-            points.extend(c.extremes(c.angle_of(e.a), e.extent()));
-        }
-    }
+fn box_of(points: impl IntoIterator<Item = Point3>) -> (Point3, Point3) {
     let mut min = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
     let mut max = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
     for p in points {
@@ -428,6 +483,24 @@ fn box_3d(loops: &[Vec<Edge3>]) -> (Point3, Point3) {
     (min, max)
 }
 
+fn edges_box(loops: &[Vec<Edge3>]) -> (Point3, Point3) {
+    let mut points = Vec::new();
+    for e in loops.iter().flatten() {
+        points.push(e.a);
+        if let Curve::Circle(c) = e.curve {
+            points.extend(c.extremes(c.angle_of(e.a), e.extent()));
+        }
+    }
+    box_of(points)
+}
+
+/// A face's box: its edges', and where a sphere's or a torus's face bulges out between
+/// them.
+fn face_box(solid: &Solid, face: &Face, loops: &[Vec<Edge3>]) -> (Point3, Point3) {
+    let (min, max) = edges_box(loops);
+    box_of([min, max].into_iter().chain(solid.bulges(face)))
+}
+
 fn boxes_meet(a: &Prepared, b: &Prepared) -> bool {
     a.min.x <= b.max.x + TOL
         && b.min.x <= a.max.x + TOL
@@ -435,6 +508,25 @@ fn boxes_meet(a: &Prepared, b: &Prepared) -> bool {
         && b.min.y <= a.max.y + TOL
         && a.min.z <= b.max.z + TOL
         && b.min.z <= a.max.z + TOL
+}
+
+/// Whether a face's box lies wholly on one side of a plane, so that the face cannot meet
+/// it.
+fn beside(plane: &oxyde_geom::Plane, min: Point3, max: Point3) -> bool {
+    let corners = (0..8).map(|i| {
+        Point3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        )
+    });
+    let (mut below, mut above) = (false, false);
+    for c in corners {
+        let d = (c - plane.origin).dot(plane.normal);
+        below |= d < TOL;
+        above |= d > -TOL;
+    }
+    !(below && above)
 }
 
 /// The parameter range of the line `p + t d` (`d` unit) inside a box: exactly, so that a
@@ -468,8 +560,8 @@ fn clip_line(p: Point3, d: Vec3, min: Point3, max: Point3, range: (f64, f64)) ->
 enum Cut {
     /// A segment of a line.
     Line(Point3, Point3),
-    /// A whole circle, starting at `start` (the point at the cylinder's angle zero, where
-    /// its seam will meet it).
+    /// A whole circle, starting at `start` (on a surface of revolution's parallel, the point
+    /// at its angle zero, where its seam will meet it).
     Circle(Circle, Point3),
     /// The two faces lie on one surface: each is cut along the other's boundary.
     Same,
@@ -477,7 +569,6 @@ enum Cut {
 
 /// The curves where faces `a` and `b` meet, within their boxes.
 fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
-    let slanted = |what: &'static str| Err(NativeError::Unsupported(what));
     match (&a.surface, &b.surface) {
         (Surface::Plane(p), Surface::Plane(q)) => {
             let u = p.normal.cross(q.normal);
@@ -510,123 +601,262 @@ fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
                 Vec::new()
             })
         }
-        (Surface::Plane(_), Surface::Cylinder(_)) => plane_cylinder(a, b),
-        (Surface::Cylinder(_), Surface::Plane(_)) => plane_cylinder(b, a),
-        (Surface::Cylinder(c1), Surface::Cylinder(c2)) => {
-            let (a1, a2) = (c1.axis.direction, c2.axis.direction);
-            if a1.cross(a2).length() > 1e-9 {
-                return slanted("intersect cylinders whose axes are not parallel");
+        (Surface::Plane(_), Surface::Revolution(_)) => plane_revolution(a, b),
+        (Surface::Revolution(_), Surface::Plane(_)) => plane_revolution(b, a),
+        (Surface::Revolution(r1), Surface::Revolution(r2)) => {
+            if let Some(m) = r1.coaxial_meridian(r2, TOL) {
+                return coaxial(a, b, r1, &m);
             }
-            let offset = c1.radial(c2.axis.origin);
-            let dist = offset.length();
-            if dist <= TOL {
-                return Ok(if (c1.radius - c2.radius).abs() <= TOL {
-                    vec![Cut::Same]
-                } else {
-                    Vec::new()
-                });
-            }
-            let (r1, r2) = (c1.radius, c2.radius);
-            if dist > r1 + r2 + TOL || dist < (r1 - r2).abs() - TOL {
-                return Ok(Vec::new());
-            }
-            // The circles across the axes, in the plane square to them through c1's origin.
-            let along = (r1 * r1 - r2 * r2 + dist * dist) / (2.0 * dist);
-            let half = (r1 * r1 - along * along).max(0.0).sqrt();
-            let u = offset * (1.0 / dist);
-            let n = a1.cross(u);
-            let mut cuts = Vec::new();
-            for side in if half <= TOL {
-                vec![0.0]
-            } else {
-                vec![half, -half]
-            } {
-                let base = c1.axis.origin + u * along + n * side;
-                let range = clip_line(base, a1, a.min, a.max, (f64::NEG_INFINITY, f64::INFINITY));
-                let (t0, t1) = clip_line(base, a1, b.min, b.max, range);
-                if t1 - t0 > TOL {
-                    cuts.push(Cut::Line(base + a1 * t0, base + a1 * t1));
+            match (r1.cylinder_radius(), r2.cylinder_radius()) {
+                (Some(_), Some(_))
+                    if r1.axis.direction.cross(r2.axis.direction).length() <= 1e-9 =>
+                {
+                    parallel_cylinders(a, b, r1, r2)
                 }
+                _ => Err(NativeError::Unsupported(
+                    "intersect surfaces of revolution on different axes",
+                )),
             }
-            Ok(cuts)
         }
     }
 }
 
-fn plane_cylinder(
-    plane_face: &Prepared,
-    cylinder_face: &Prepared,
+/// Two cylinders whose axes are parallel but apart: the lines along both where their
+/// circles across the axes cross.
+fn parallel_cylinders(
+    a: &Prepared,
+    b: &Prepared,
+    c1: &Revolution,
+    c2: &Revolution,
 ) -> Result<Vec<Cut>, NativeError> {
-    let (Surface::Plane(p), Surface::Cylinder(c)) = (&plane_face.surface, &cylinder_face.surface)
-    else {
+    let (Some(r1), Some(r2)) = (c1.cylinder_radius(), c2.cylinder_radius()) else {
         return Ok(Vec::new());
     };
-    let a = c.axis.direction;
-    let along = p.normal.dot(a);
-    if along.abs() > 1.0 - 1e-9 {
-        // Square to the axis: a circle.
-        let t = (p.origin - c.axis.origin).dot(p.normal) / along;
-        let (lo, hi) = (cylinder_face.lo.y, cylinder_face.hi.y);
-        if t < lo - TOL || t > hi + TOL {
-            return Ok(Vec::new());
-        }
-        let circle = Circle {
-            center: c.axis.origin + a * t,
-            normal: a,
-            radius: c.radius,
-        };
-        let (cmin, cmax) = box_3d(&[vec![Edge3 {
-            a: c.point(0.0, t),
-            b: c.point(0.0, t),
-            curve: Curve::Circle(circle),
-        }]]);
-        let touches = cmin.x <= plane_face.max.x + TOL
-            && plane_face.min.x <= cmax.x + TOL
-            && cmin.y <= plane_face.max.y + TOL
-            && plane_face.min.y <= cmax.y + TOL
-            && cmin.z <= plane_face.max.z + TOL
-            && plane_face.min.z <= cmax.z + TOL;
-        return Ok(if touches {
-            vec![Cut::Circle(circle, c.point(0.0, t))]
-        } else {
-            Vec::new()
-        });
-    }
-    if along.abs() > 1e-9 {
-        return Err(NativeError::Unsupported(
-            "intersect a cylinder with a plane slanted to its axis",
-        ));
-    }
-    // Along the axis: lines where the plane crosses the cylinder.
-    let d = (c.axis.origin - p.origin).dot(p.normal);
-    if d.abs() > c.radius + TOL {
+    let a1 = c1.axis.direction;
+    let d = c2.axis.origin - c1.axis.origin;
+    let offset = d - a1 * d.dot(a1);
+    let dist = offset.length();
+    if dist > r1 + r2 + TOL || dist < (r1 - r2).abs() - TOL {
         return Ok(Vec::new());
     }
-    let (x, y, _) = c.frame();
-    let phi = p.normal.dot(y).atan2(p.normal.dot(x));
-    let delta = (-d / c.radius).clamp(-1.0, 1.0).acos();
-    let angles = if delta <= 1e-9 || (std::f64::consts::PI - delta) <= 1e-9 {
-        vec![phi + delta]
-    } else {
-        vec![phi + delta, phi - delta]
-    };
+    // The circles across the axes, in the plane square to them through c1's origin.
+    let along = (r1 * r1 - r2 * r2 + dist * dist) / (2.0 * dist);
+    let half = (r1 * r1 - along * along).max(0.0).sqrt();
+    let u = offset * (1.0 / dist);
+    let n = a1.cross(u);
     let mut cuts = Vec::new();
-    for angle in angles {
-        let base = c.point(angle, 0.0);
-        let range = (cylinder_face.lo.y, cylinder_face.hi.y);
-        let (t0, t1) = clip_line(base, a, plane_face.min, plane_face.max, range);
+    for side in if half <= TOL {
+        vec![0.0]
+    } else {
+        vec![half, -half]
+    } {
+        let base = c1.axis.origin + u * along + n * side;
+        let range = clip_line(base, a1, a.min, a.max, (f64::NEG_INFINITY, f64::INFINITY));
+        let (t0, t1) = clip_line(base, a1, b.min, b.max, range);
         if t1 - t0 > TOL {
-            cuts.push(Cut::Line(base + a * t0, base + a * t1));
+            cuts.push(Cut::Line(base + a1 * t0, base + a1 * t1));
         }
     }
     Ok(cuts)
 }
 
-/// A cut as segments of `face`'s chart (several for a cylinder's face that runs round
-/// more than once along its unwrapped `x`).
-fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Vec<Segment> {
+/// Two surfaces of revolution on one axis: they meet in circles across it, one where their
+/// meridians cross.
+fn coaxial(
+    a: &Prepared,
+    b: &Prepared,
+    r1: &Revolution,
+    other: &PlaneCurve,
+) -> Result<Vec<Cut>, NativeError> {
+    let Some(crossings) = r1.meridian_crossings(other, TOL) else {
+        return Ok(vec![Cut::Same]);
+    };
+    let ax = r1.axis.direction;
+    let mut cuts = Vec::new();
+    for (rho, z) in crossings {
+        let circle = Circle {
+            center: r1.axis.origin + ax * z,
+            normal: ax,
+            radius: rho,
+        };
+        if circle_meets(&circle, a) && circle_meets(&circle, b) {
+            let v = r1.v_of(rho, z);
+            cuts.push(Cut::Circle(circle, r1.point(0.0, v)));
+        }
+    }
+    Ok(cuts)
+}
+
+/// Whether a whole circle's box meets a face's box.
+fn circle_meets(circle: &Circle, face: &Prepared) -> bool {
+    let start = circle.point_at(0.0);
+    let (cmin, cmax) = edges_box(&[vec![Edge3 {
+        a: start,
+        b: start,
+        curve: Curve::Circle(*circle),
+    }]]);
+    cmin.x <= face.max.x + TOL
+        && face.min.x <= cmax.x + TOL
+        && cmin.y <= face.max.y + TOL
+        && face.min.y <= cmax.y + TOL
+        && cmin.z <= face.max.z + TOL
+        && face.min.z <= cmax.z + TOL
+}
+
+/// A plane and a surface of revolution: circles across the axis where the plane is square
+/// to it, the meridians where it holds the axis, a cylinder's lines where it runs along the
+/// axis.
+fn plane_revolution(
+    plane_face: &Prepared,
+    revolution_face: &Prepared,
+) -> Result<Vec<Cut>, NativeError> {
+    let (Surface::Plane(p), Surface::Revolution(r)) =
+        (&plane_face.surface, &revolution_face.surface)
+    else {
+        return Ok(Vec::new());
+    };
+    if beside(p, revolution_face.min, revolution_face.max) {
+        return Ok(Vec::new());
+    }
+    let a = r.axis.direction;
+    let along = p.normal.dot(a);
+    if along.abs() > 1.0 - 1e-9 {
+        // Square to the axis: circles where the plane's height crosses the meridian.
+        let t = (p.origin - r.axis.origin).dot(p.normal) / along;
+        let mut cuts = Vec::new();
+        for (rho, z) in plane_height_crossings(r, t) {
+            let circle = Circle {
+                center: r.axis.origin + a * z,
+                normal: a,
+                radius: rho,
+            };
+            if circle_meets(&circle, plane_face) && circle_meets(&circle, revolution_face) {
+                let v = r.v_of(rho, z);
+                cuts.push(Cut::Circle(circle, r.point(0.0, v)));
+            }
+        }
+        return Ok(cuts);
+    }
+    if along.abs() > 1e-9 {
+        return Err(NativeError::Unsupported(
+            "intersect a surface of revolution with a plane slanted to its axis",
+        ));
+    }
+    // Along the axis, `d` from it.
+    let d = (r.axis.origin - p.origin).dot(p.normal);
+    let (x, y, _) = r.frame();
+    if d.abs() <= TOL {
+        // The plane holds the axis: it meets the surface along its meridians at the two
+        // angles square to the plane's normal.
+        let w = p.normal.cross(a);
+        let theta = w.dot(y).atan2(w.dot(x));
+        let mut cuts = Vec::new();
+        match r.meridian {
+            Meridian::Line { radius, slope } => {
+                for t in [theta, theta + std::f64::consts::PI] {
+                    let e = x * t.cos() + y * t.sin();
+                    // The straight line ρ = radius + slope v, along e at height v.
+                    let base = r.axis.origin + e * radius;
+                    let dir = (e * slope + a).normalized().unwrap_or(a);
+                    let scale = (1.0 + slope * slope).sqrt();
+                    // Within the face's own stretch of v, and the boxes.
+                    let range = (revolution_face.lo.y * scale, revolution_face.hi.y * scale);
+                    let range = clip_line(base, dir, plane_face.min, plane_face.max, range);
+                    let (t0, t1) =
+                        clip_line(base, dir, revolution_face.min, revolution_face.max, range);
+                    if t1 - t0 > TOL {
+                        cuts.push(Cut::Line(base + dir * t0, base + dir * t1));
+                    }
+                }
+            }
+            Meridian::Circle {
+                center: 0.0,
+                radius,
+            } => {
+                // A sphere: a great circle through both poles, starting at one.
+                let circle = Circle {
+                    center: r.axis.origin,
+                    normal: p.normal,
+                    radius,
+                };
+                if circle_meets(&circle, plane_face) {
+                    cuts.push(Cut::Circle(circle, r.axis.origin + a * radius));
+                }
+            }
+            Meridian::Circle { .. } => {
+                for t in [theta, theta + std::f64::consts::PI] {
+                    if let Some(circle) = r.meridian_circle(t)
+                        && circle_meets(&circle, plane_face)
+                    {
+                        cuts.push(Cut::Circle(circle, r.point(t, 0.0)));
+                    }
+                }
+            }
+        }
+        return Ok(cuts);
+    }
+    match r.cylinder_radius() {
+        Some(radius) => {
+            // Lines where the plane crosses the cylinder.
+            if d.abs() > radius + TOL {
+                return Ok(Vec::new());
+            }
+            let phi = p.normal.dot(y).atan2(p.normal.dot(x));
+            let delta = (-d / radius).clamp(-1.0, 1.0).acos();
+            let angles = if delta <= 1e-9 || (std::f64::consts::PI - delta) <= 1e-9 {
+                vec![phi + delta]
+            } else {
+                vec![phi + delta, phi - delta]
+            };
+            let mut cuts = Vec::new();
+            for angle in angles {
+                let base = r.point(angle, 0.0);
+                let range = (revolution_face.lo.y, revolution_face.hi.y);
+                let (t0, t1) = clip_line(base, a, plane_face.min, plane_face.max, range);
+                if t1 - t0 > TOL {
+                    cuts.push(Cut::Line(base + a * t0, base + a * t1));
+                }
+            }
+            Ok(cuts)
+        }
+        None => Err(NativeError::Unsupported(
+            "intersect a cone, a sphere or a torus with a plane along its axis but apart from it",
+        )),
+    }
+}
+
+/// Where the meridian of `r` crosses the height `t` along its axis, as `(ρ, z)` with `ρ > 0`.
+fn plane_height_crossings(r: &Revolution, t: f64) -> Vec<(f64, f64)> {
+    match r.meridian {
+        Meridian::Line { radius, slope } => {
+            let rho = radius + slope * t;
+            if rho > TOL {
+                vec![(rho, t)]
+            } else {
+                Vec::new()
+            }
+        }
+        Meridian::Circle { center, radius } => {
+            if t.abs() > radius + TOL {
+                return Vec::new();
+            }
+            let half = (radius * radius - t * t).max(0.0).sqrt();
+            let mut out = vec![(center + half, t)];
+            if half > TOL {
+                out.push((center - half, t));
+            }
+            out.retain(|&(rho, _)| rho > TOL);
+            out
+        }
+    }
+}
+
+/// A cut as segments of `face`'s chart (several for a face that runs round more than once
+/// along its unwrapped `x`).
+fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>, NativeError> {
     let chart = &face.chart;
-    match (cut, chart) {
+    let internal = NativeError::Internal;
+    Ok(match (cut, chart) {
         (Cut::Line(p, q), Chart::Plane { .. }) => {
             vec![Segment::line(chart.to_2d(*p), chart.to_2d(*q))]
         }
@@ -639,50 +869,100 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Vec<Segment> {
                 circle.normal.dot(*normal) > 0.0,
             )]
         }
-        (Cut::Line(p, q), Chart::Cylinder(_)) => {
-            let (a, b) = (chart.to_2d(*p), chart.to_2d(*q));
-            copies(face, a.x)
+        (Cut::Line(p, q), Chart::Revolution { surface, k, .. }) => {
+            // Along a straight line of the surface, at the angle of its middle (an end may
+            // be the apex, where the angle is none).
+            let mid = *p + (*q - *p) * 0.5;
+            let x = surface.params(mid).0.rem_euclid(TAU) * k;
+            let (ya, yb) = (chart.to_2d(*p).y, chart.to_2d(*q).y);
+            copies(face, x)
                 .into_iter()
-                .map(|x| Segment::line(P::new(x, a.y), P::new(x, b.y)))
+                .map(|x| Segment::line(P::new(x, ya), P::new(x, yb)))
                 .collect()
         }
-        (Cut::Circle(_, start), Chart::Cylinder(_)) => {
-            let y = chart.to_2d(*start).y;
-            vec![Segment::line(P::new(face.lo.x, y), P::new(face.hi.x, y))]
+        (Cut::Circle(circle, _), Chart::Revolution { surface, k, m }) => {
+            if let Some(v) = surface.parallel_v(circle, TOL) {
+                let y = v * m;
+                v_copies(face, y)
+                    .into_iter()
+                    .map(|y| Segment::line(P::new(face.lo.x, y), P::new(face.hi.x, y)))
+                    .collect()
+            } else if let Some(theta) = surface.meridian_theta(circle, TOL) {
+                let Meridian::Circle { center, .. } = surface.meridian else {
+                    return Err(internal(
+                        "a meridian circle on a straight meridian".to_owned(),
+                    ));
+                };
+                // A torus's meridian circle goes round its tube whole; a sphere's great circle
+                // is two half meridians from pole to pole, half a turn apart.
+                let thetas = if center > 0.0 {
+                    vec![theta]
+                } else {
+                    vec![theta, theta + std::f64::consts::PI]
+                };
+                let (ylo, yhi) = if center > 0.0 {
+                    (face.lo.y, face.hi.y)
+                } else {
+                    (
+                        -std::f64::consts::FRAC_PI_2 * m,
+                        std::f64::consts::FRAC_PI_2 * m,
+                    )
+                };
+                let mut out = Vec::new();
+                for t in thetas {
+                    for x in copies(face, t.rem_euclid(TAU) * k) {
+                        out.push(Segment::line(P::new(x, ylo), P::new(x, yhi)));
+                    }
+                }
+                out
+            } else {
+                return Err(internal(
+                    "a circle cut on a surface of revolution that is neither a parallel nor a meridian"
+                        .to_owned(),
+                ));
+            }
         }
         (Cut::Same, _) => {
-            // The other face's boundary, laid out in this face's chart.
-            match chart {
-                Chart::Plane { .. } => boundary_2d(chart, &other.loops).unwrap_or_default(),
-                Chart::Cylinder(c) => {
+            // The other face's boundary, laid out in this face's chart, at each of its
+            // places along this face's unwrapped `x`.
+            let segments = boundary_2d(chart, &other.loops).map_err(internal)?;
+            match chart.period() {
+                None => segments,
+                Some(_) => {
+                    let (lo, _) = box_2d(&segments);
                     let mut out = Vec::new();
-                    for e in other.loops.iter().flatten() {
-                        let (a, b) = (chart.to_2d(e.a), chart.to_2d(e.b));
-                        match e.curve {
-                            Curve::Line => {
-                                for x in copies(face, a.x) {
-                                    out.push(Segment::line(P::new(x, a.y), P::new(x, b.y)));
-                                }
-                            }
-                            Curve::Circle(circle) => {
-                                let mut turn = e.extent() * c.radius;
-                                if circle.normal.dot(c.axis.direction) < 0.0 {
-                                    turn = -turn;
-                                }
-                                for x in copies(face, a.x) {
-                                    out.push(Segment::line(P::new(x, a.y), P::new(x + turn, a.y)));
-                                }
-                            }
-                        }
+                    for x in copies(face, lo.x) {
+                        out.extend(segments.iter().map(|s| shifted(s, x - lo.x, 0.0)));
                     }
                     out
                 }
             }
         }
-    }
+    })
 }
 
-/// The places `x` (taken within one period) falls along a cylinder face's unwrapped range.
+fn shifted(s: &Segment, dx: f64, dy: f64) -> Segment {
+    let mut s = *s;
+    s.a.x += dx;
+    s.a.y += dy;
+    s.b.x += dx;
+    s.b.y += dy;
+    if let Geom::Arc {
+        center,
+        radius,
+        ccw,
+    } = s.geom
+    {
+        s.geom = Geom::Arc {
+            center: P::new(center.x + dx, center.y + dy),
+            radius,
+            ccw,
+        };
+    }
+    s
+}
+
+/// The places `x` (taken within one period) falls along a face's unwrapped range.
 fn copies(face: &Prepared, x: f64) -> Vec<f64> {
     let Some(period) = face.chart.period() else {
         return vec![x];
@@ -692,6 +972,22 @@ fn copies(face: &Prepared, x: f64) -> Vec<f64> {
     for k in k0..k0 + 4 {
         let v = x + k as f64 * period;
         if v >= face.lo.x - TOL && v <= face.hi.x + TOL {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// The places `y` falls along a ring torus's face's unwrapped range round its tube.
+fn v_copies(face: &Prepared, y: f64) -> Vec<f64> {
+    let Some(period) = face.chart.v_period() else {
+        return vec![y];
+    };
+    let mut out = Vec::new();
+    let k0 = ((face.lo.y - y) / period).floor() as i64 - 1;
+    for k in k0..k0 + 4 {
+        let v = y + k as f64 * period;
+        if v >= face.lo.y - TOL && v <= face.hi.y + TOL {
             out.push(v);
         }
     }
@@ -723,16 +1019,7 @@ struct Piece {
 impl Piece {
     fn reversed(&self) -> Piece {
         Piece {
-            surface: match self.surface {
-                Surface::Plane(p) => Surface::Plane(oxyde_geom::Plane {
-                    normal: -p.normal,
-                    ..p
-                }),
-                Surface::Cylinder(c) => Surface::Cylinder(Cylinder {
-                    outward: !c.outward,
-                    ..c
-                }),
-            },
+            surface: self.surface.reversed(),
             loops: self
                 .loops
                 .iter()
@@ -753,17 +1040,27 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
             if !boxes_meet(face, other) {
                 continue;
             }
-            for cut in meet(face, other)? {
-                segments.extend(cut_into(face, &cut, other));
+            for c in meet(face, other)? {
+                segments.extend(cut_into(face, &c, other)?);
             }
         }
-        // A cylinder's face is cut at its angle zero too, every period.
+        // A face of revolution is cut at its angle zero too, every period, and a ring
+        // torus's round its tube at its v zero.
         if let Some(period) = face.chart.period() {
             let k0 = (face.lo.x / period).floor() as i64;
             for k in k0..=k0 + 2 {
                 let x = k as f64 * period;
                 if x > face.lo.x - TOL && x < face.hi.x + TOL {
                     segments.push(Segment::line(P::new(x, face.lo.y), P::new(x, face.hi.y)));
+                }
+            }
+        }
+        if let Some(period) = face.chart.v_period() {
+            let k0 = (face.lo.y / period).floor() as i64;
+            for k in k0..=k0 + 2 {
+                let y = k as f64 * period;
+                if y > face.lo.y - TOL && y < face.hi.y + TOL {
+                    segments.push(Segment::line(P::new(face.lo.x, y), P::new(face.hi.x, y)));
                 }
             }
         }
@@ -775,30 +1072,21 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
             if !arrangement::inside(&face.boundary, inner, TOL) {
                 continue;
             }
-            // A cylinder's piece is taken within one period from angle zero.
+            // A piece is taken within one period from angle zero (and v zero round a ring
+            // torus's tube).
             let shift = match face.chart.period() {
                 Some(period) => -(inner.x / period).floor() * period,
+                None => 0.0,
+            };
+            let v_shift = match face.chart.v_period() {
+                Some(period) => -(inner.y / period).floor() * period,
                 None => 0.0,
             };
             let mut loops = Vec::new();
             for cycle in std::iter::once(&region.outer).chain(&region.holes) {
                 let mut edges = Vec::new();
                 for &half in cycle {
-                    let mut s = arrangement.segment(half);
-                    s.a.x += shift;
-                    s.b.x += shift;
-                    if let Geom::Arc {
-                        center,
-                        radius,
-                        ccw,
-                    } = s.geom
-                    {
-                        s.geom = Geom::Arc {
-                            center: P::new(center.x + shift, center.y),
-                            radius,
-                            ccw,
-                        };
-                    }
+                    let s = shifted(&arrangement.segment(half), shift, v_shift);
                     let curve = face.chart.curve(&s).map_err(NativeError::Internal)?;
                     edges.push(Edge3 {
                         a: face.chart.to_world(s.a),
@@ -808,7 +1096,9 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
                 }
                 loops.push(edges);
             }
-            let point = face.chart.to_world(P::new(inner.x + shift, inner.y));
+            let point = face
+                .chart
+                .to_world(P::new(inner.x + shift, inner.y + v_shift));
             let normal = face.chart.normal_at(point);
             let place = classify(point, normal, others)?;
             out.push((
@@ -889,18 +1179,18 @@ fn classify(point: Point3, normal: Vec3, faces: &[Prepared]) -> Result<Where, Na
     ))
 }
 
-/// `p`, a point of the face's surface, in its chart, its `x` taken within the face's
-/// unwrapped range when it can be; `None` when it falls outside that range altogether.
+/// `p`, a point of the face's surface, in its chart, its `x` (and a ring torus's `y`) taken
+/// within the face's unwrapped range when it can be; `None` when it falls outside that range
+/// altogether.
 fn on_face(face: &Prepared, p: Point3) -> Option<P> {
     let q = face.chart.to_2d(p);
-    match face.chart.period() {
-        None => Some(q),
-        Some(_) => copies(face, q.x).first().map(|&x| P::new(x, q.y)),
-    }
+    let x = *copies(face, q.x).first()?;
+    let y = *v_copies(face, q.y).first()?;
+    Some(P::new(x, y))
 }
 
 /// Where the ray `point + t dir` meets a surface: each `Some(t)`, or `None` when it grazes
-/// it (runs along a plane in it, touches a cylinder).
+/// a plane (runs along it).
 fn ray_hits(surface: &Surface, point: Point3, dir: Vec3) -> Vec<Option<f64>> {
     match surface {
         Surface::Plane(p) => {
@@ -910,29 +1200,7 @@ fn ray_hits(surface: &Surface, point: Point3, dir: Vec3) -> Vec<Option<f64>> {
             }
             vec![Some((p.origin - point).dot(p.normal) / denom)]
         }
-        Surface::Cylinder(c) => {
-            let a = c.axis.direction;
-            let o = point - c.axis.origin;
-            let (oo, dd) = (o - a * o.dot(a), dir - a * dir.dot(a));
-            let qa = dd.dot(dd);
-            if qa < 1e-12 {
-                return Vec::new();
-            }
-            let qb = 2.0 * oo.dot(dd);
-            let qc = oo.dot(oo) - c.radius * c.radius;
-            let disc = qb * qb - 4.0 * qa * qc;
-            if disc < 0.0 {
-                return Vec::new();
-            }
-            let root = disc.sqrt();
-            if root < 1e-9 * (qb.abs() + 1.0) {
-                return vec![None];
-            }
-            vec![
-                Some((-qb - root) / (2.0 * qa)),
-                Some((-qb + root) / (2.0 * qa)),
-            ]
-        }
+        Surface::Revolution(r) => r.ray_hits(point, dir).into_iter().map(Some).collect(),
     }
 }
 
@@ -1022,18 +1290,14 @@ fn same_surface(a: &Surface, b: &Surface) -> bool {
         (Surface::Plane(p), Surface::Plane(q)) => {
             p.normal.dot(q.normal) > 1.0 - 1e-9 && (q.origin - p.origin).dot(p.normal).abs() <= TOL
         }
-        (Surface::Cylinder(c), Surface::Cylinder(d)) => {
-            c.outward == d.outward
-                && c.axis.direction.cross(d.axis.direction).length() <= 1e-9
-                && c.radial(d.axis.origin).length() <= TOL
-                && (c.radius - d.radius).abs() <= TOL
-        }
+        (Surface::Revolution(c), Surface::Revolution(d)) => c.same_as(d, TOL),
         _ => false,
     }
 }
 
 /// Edges between welded points, told apart by their middles: the same edge, whichever
-/// way it is run, gets the same number.
+/// way it is run, gets the same number. A degenerate edge is never shared: each face
+/// reaching a pole has its own there, as OpenCASCADE's faces do.
 #[derive(Debug, Default)]
 struct Edges {
     by_ends: HashMap<(u32, u32), Vec<(Point3, u32)>>,
@@ -1043,6 +1307,10 @@ struct Edges {
 impl Edges {
     /// The edge's number, and whether it is new.
     fn index(&mut self, points: &mut Points, e: &Edge3) -> (u32, bool) {
+        if e.curve.is_degenerate() {
+            self.count += 1;
+            return (self.count - 1, true);
+        }
         let (i, j) = (points.index(e.a), points.index(e.b));
         let mid = e.midpoint();
         let list = self.by_ends.entry((i.min(j), i.max(j))).or_default();
@@ -1056,8 +1324,9 @@ impl Edges {
 }
 
 /// The kept pieces merged into faces: pieces on one surface that share an edge become one
-/// face, the edges between them gone, in a chart where they lie in one piece (for a
-/// cylinder, cut open at angle zero when they go round whole, elsewhere when they do not).
+/// face, the edges between them gone, in a chart where they lie in one piece (on a surface
+/// of revolution, cut open at angle zero when they go round whole, elsewhere when they do
+/// not).
 fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
     let internal = NativeError::Internal;
     // Weld the corners and split edges at corners other pieces have along them.
@@ -1088,6 +1357,9 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
     let mut owners: Vec<Vec<usize>> = Vec::new();
     for (i, piece) in pieces.iter().enumerate() {
         for e in piece.loops.iter().flatten() {
+            if e.curve.is_degenerate() {
+                continue;
+            }
             let (k, _) = table.index(&mut points, e);
             if owners.len() <= k as usize {
                 owners.resize(k as usize + 1, Vec::new());
@@ -1127,7 +1399,7 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             .collect();
         sources.sort();
         sources.dedup();
-        if group.len() == 1 && !matches!(first.surface, Surface::Cylinder(_)) {
+        if group.len() == 1 && !matches!(first.surface, Surface::Revolution(_)) {
             out.push(Piece {
                 sources,
                 ..first.clone()
@@ -1136,19 +1408,32 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
         }
         let chart = group_chart(&first.surface, group.iter().map(|&i| &pieces[i]));
         // Every piece's boundary in the group's chart, each walked from a start taken in
-        // the chart's period, then moved by whole periods to lie within it.
-        let mut segments: Vec<Segment> = Vec::new();
+        // the chart's period, then moved by whole periods to lie within it (round a ring
+        // torus's tube, within a period that starts in a gap between the pieces if they
+        // leave one, so that pieces either side of its v zero come together).
+        let mut walked: Vec<Vec<Segment>> = Vec::new();
         for &i in &group {
             let mut s = boundary_2d(&chart, &pieces[i].loops).map_err(internal)?;
             if let Some(period) = chart.period() {
                 let (lo, _) = box_2d(&s);
                 let shift = -((lo.x + TOL) / period).floor() * period;
-                for seg in &mut s {
-                    seg.a.x += shift;
-                    seg.b.x += shift;
-                }
+                s = s.iter().map(|seg| shifted(seg, shift, 0.0)).collect();
             }
-            segments.extend(s);
+            walked.push(s);
+        }
+        if let Some(period) = chart.v_period() {
+            let start = window_start(walked.iter().map(|s| box_2d(s)), period);
+            for s in &mut walked {
+                let (lo, _) = box_2d(s);
+                let shift = -((lo.y + TOL - start) / period).floor() * period;
+                *s = s.iter().map(|seg| shifted(seg, 0.0, shift)).collect();
+            }
+        }
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut outlines: Vec<Vec<Segment>> = Vec::new();
+        for s in walked {
+            segments.extend(s.iter().copied());
+            outlines.push(s);
         }
         // Edges two pieces share, run once each way, are inside the merged face.
         let mut gone = vec![false; segments.len()];
@@ -1172,6 +1457,15 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             .collect();
         let arrangement = Arrangement::new(&kept, TOL);
         for region in arrangement.regions() {
+            // The merged faces only: not what their holes enclose.
+            let covered = arrangement.inside_point(&region).is_some_and(|(p, _)| {
+                outlines
+                    .iter()
+                    .any(|outline| arrangement::inside(outline, p, TOL))
+            });
+            if !covered {
+                continue;
+            }
             let mut loops = Vec::new();
             for cycle in std::iter::once(&region.outer).chain(&region.holes) {
                 let mut edges = Vec::new();
@@ -1195,6 +1489,42 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
     Ok(out)
 }
 
+/// Where a window of one `period` along `y` should start so that none of the stretches
+/// `boxes` cover (each taken within one period) is split by its ends: in the middle of the
+/// widest gap between them, or at 0 when they leave none.
+fn window_start(boxes: impl Iterator<Item = (P, P)>, period: f64) -> f64 {
+    let mut spans: Vec<(f64, f64)> = boxes
+        .map(|(lo, hi)| {
+            let shift = -((lo.y + TOL) / period).floor() * period;
+            (lo.y + shift, hi.y + shift)
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (lo, hi) in spans {
+        if let Some(last) = merged.last_mut()
+            && lo <= last.1 + TOL
+        {
+            last.1 = last.1.max(hi);
+            continue;
+        }
+        merged.push((lo, hi));
+    }
+    let mut best: Option<(f64, f64)> = None;
+    for (i, &(lo, _)) in merged.iter().enumerate() {
+        let prev_end = if i == 0 {
+            merged.last().map_or(lo, |l| l.1 - period)
+        } else {
+            merged[i - 1].1
+        };
+        let gap = lo - prev_end;
+        if gap > TOL && best.is_none_or(|b| gap > b.1 - b.0) {
+            best = Some((prev_end, lo));
+        }
+    }
+    best.map_or(0.0, |(from, to)| (from + to) / 2.0)
+}
+
 /// Whether two segments are the same, run opposite ways.
 fn opposite(s: &Segment, t: &Segment) -> bool {
     if s.a.distance(t.b) > TOL || s.b.distance(t.a) > TOL {
@@ -1208,15 +1538,17 @@ fn opposite(s: &Segment, t: &Segment) -> bool {
 }
 
 /// The chart a group of pieces on one surface is merged in: the surface's own, and for a
-/// cylinder turned so that its angle zero falls in a gap between the pieces when they leave
-/// one (so that a face crossing angle zero is not cut there), at the cylinder's own angle
-/// zero when they go round whole (where its seam goes).
+/// surface of revolution turned so that its angle zero falls in a gap between the pieces
+/// when they leave one (so that a face crossing angle zero is not cut there), at the
+/// surface's own angle zero when they go round whole (where its seam goes).
 fn group_chart<'a>(surface: &Surface, group: impl Iterator<Item = &'a Piece>) -> Chart {
-    let Surface::Cylinder(c) = surface else {
+    let Surface::Revolution(r) = surface else {
         return Chart::of(surface);
     };
-    let chart = Chart::Cylinder(*c);
-    let period = TAU * c.radius;
+    let chart = Chart::revolution(*r);
+    let (Some(period), Chart::Revolution { k, .. }) = (chart.period(), chart) else {
+        return chart;
+    };
     // The stretches of angle the pieces cover, each within [0, period).
     let mut spans: Vec<(f64, f64)> = Vec::new();
     for piece in group {
@@ -1254,11 +1586,11 @@ fn group_chart<'a>(surface: &Surface, group: impl Iterator<Item = &'a Piece>) ->
     match best {
         // Turned so the middle of the gap is the chart's angle zero.
         Some((from, to)) => {
-            let turn = ((from + to) / 2.0) / c.radius;
-            let (x, y, _) = c.frame();
-            Chart::Cylinder(Cylinder {
+            let turn = ((from + to) / 2.0) / k;
+            let (x, y, _) = r.frame();
+            Chart::revolution(Revolution {
                 x_dir: x * turn.cos() + y * turn.sin(),
-                ..*c
+                ..*r
             })
         }
         None => chart,
@@ -1266,7 +1598,8 @@ fn group_chart<'a>(surface: &Surface, group: impl Iterator<Item = &'a Piece>) ->
 }
 
 /// The faces welded into solids: corners and edges shared, edges along one line or circle
-/// between the same two faces joined, and each connected set of faces a solid.
+/// between the same two faces joined, each connected set of faces a shell, and each shell
+/// facing inwards a void of the solid it lies in.
 fn assemble(faces: Vec<Piece>) -> Result<Tagged, NativeError> {
     let internal = |m: &str| NativeError::Internal(m.to_owned());
     let mut points = Points::default();
@@ -1294,11 +1627,10 @@ fn assemble(faces: Vec<Piece>) -> Result<Tagged, NativeError> {
                 let (i, j) = (points.index(e.a), points.index(e.b));
                 let (edge, new) = table.index(&mut points, e);
                 if new {
-                    solid.edges.push(Edge {
-                        start: i,
-                        end: j,
-                        curve: e.curve,
-                    });
+                    if solid.edges.len() != edge as usize {
+                        return Err(internal("the edges were numbered out of order"));
+                    }
+                    solid.edges.push(Edge::new(i, j, e.curve));
                 }
                 let stored = solid.edges[edge as usize];
                 // Run its own way when it starts where this use starts, and for a closed
@@ -1321,23 +1653,117 @@ fn assemble(faces: Vec<Piece>) -> Result<Tagged, NativeError> {
         });
         sources.push(face.sources.clone());
     }
-    solid.vertices = points.points;
+    solid.vertices = points.points.into_iter().map(Vertex::new).collect();
     join_edges(&mut solid);
-    let (solids, solid_sources) = split_solids(solid, sources).map_err(|e| internal(&e))?;
-    let shape = Shape { solids };
-    // A shell facing inwards bounds a void inside another solid.
-    for s in &shape.solids {
-        let piece = Shape {
-            solids: vec![s.clone()],
-        };
-        if piece.volume().map_err(NativeError::Internal)? < 0.0 {
-            return Err(NativeError::Unsupported("leave a void inside a solid"));
-        }
+    let (shells, shell_sources) = split_solids(solid, sources).map_err(|e| internal(&e))?;
+    let (solids, solid_sources) = place_voids(shells, shell_sources)?;
+    let mut shape = Shape { solids };
+    for s in &mut shape.solids {
+        s.settle_tolerances().map_err(NativeError::Internal)?;
     }
     Ok(Tagged {
         shape,
         sources: solid_sources,
     })
+}
+
+/// The shells of a result made solids: each shell facing outwards a solid, each facing
+/// inwards (a negative volume) a void of the smallest solid holding it. The faces' sources
+/// follow their faces.
+fn place_voids(
+    shells: Vec<Solid>,
+    sources: Vec<Vec<Source>>,
+) -> Result<(Vec<Solid>, Vec<Vec<Source>>), NativeError> {
+    let internal = NativeError::Internal;
+    let mut offset = 0;
+    let mut parts: Vec<(Solid, Vec<Vec<Source>>, f64)> = Vec::new();
+    for shell in shells {
+        let n = shell.faces.len();
+        let volume = Shape {
+            solids: vec![shell.clone()],
+        }
+        .volume()
+        .map_err(internal)?;
+        parts.push((shell, sources[offset..offset + n].to_vec(), volume));
+        offset += n;
+    }
+    let (solids, voids): (Vec<_>, Vec<_>) = parts.into_iter().partition(|(_, _, v)| *v >= 0.0);
+    let mut solids: Vec<(Solid, Vec<Vec<Source>>, f64)> = solids;
+    for (void, void_sources, _) in voids {
+        let probe = void
+            .vertices
+            .first()
+            .map(|v| v.point)
+            .ok_or_else(|| internal("a void with no vertex".to_owned()))?;
+        // The smallest solid the void's corner is inside.
+        let mut holder: Option<usize> = None;
+        for (i, (solid, _, volume)) in solids.iter().enumerate() {
+            let faces = prepare(&Tagged {
+                shape: Shape {
+                    solids: vec![solid.clone()],
+                },
+                sources: Vec::new(),
+            })?;
+            if classify(probe, Vec3::Z, &faces)? == Where::Inside
+                && holder.is_none_or(|h| *volume < solids[h].2)
+            {
+                holder = Some(i);
+            }
+        }
+        let Some(h) = holder else {
+            return Err(internal(
+                "a shell facing inwards lies in no solid".to_owned(),
+            ));
+        };
+        let (solid, solid_sources, _) = &mut solids[h];
+        add_shell(solid, &void);
+        solid_sources.extend(void_sources);
+    }
+    let mut out = Vec::new();
+    let mut out_sources = Vec::new();
+    for (solid, s, _) in solids {
+        out.push(solid);
+        out_sources.extend(s);
+    }
+    Ok((out, out_sources))
+}
+
+/// Adds `void`'s faces, edges and vertices to `solid` as a shell of its own.
+fn add_shell(solid: &mut Solid, void: &Solid) {
+    let (v0, e0, f0) = (
+        solid.vertices.len() as u32,
+        solid.edges.len() as u32,
+        solid.faces.len() as u32,
+    );
+    if solid.shells.is_empty() {
+        solid.shells.push((0..f0).collect());
+    }
+    solid.vertices.extend(void.vertices.iter().copied());
+    solid.edges.extend(void.edges.iter().map(|e| Edge {
+        start: e.start + v0,
+        end: e.end + v0,
+        ..*e
+    }));
+    solid.faces.extend(void.faces.iter().map(|f| {
+        Face {
+            surface: f.surface,
+            loops: f
+                .loops
+                .iter()
+                .map(|l| {
+                    l.iter()
+                        .map(|u| EdgeUse {
+                            edge: u.edge + e0,
+                            reversed: u.reversed,
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }));
+    solid
+        .shells
+        .push((f0..f0 + void.faces.len() as u32).collect());
 }
 
 /// Joins edges that meet at a vertex no other edge reaches, run along one line or circle,
@@ -1420,18 +1846,9 @@ fn join(solid: &mut Solid, v: u32, e1: u32, e2: u32) -> bool {
                 if pair && solid.end_of(u) == v {
                     let start = solid.start_of(u);
                     let end = solid.end_of(w);
-                    let curve = match solid.edges[u.edge as usize].curve {
-                        Curve::Line => Curve::Line,
-                        Curve::Circle(c) => Curve::Circle(if u.reversed {
-                            Circle {
-                                normal: -c.normal,
-                                ..c
-                            }
-                        } else {
-                            c
-                        }),
-                    };
-                    new_edge = Some(Edge { start, end, curve });
+                    let curve = solid.edges[u.edge as usize].curve;
+                    let curve = if u.reversed { curve.reversed() } else { curve };
+                    new_edge = Some(Edge::new(start, end, curve));
                     break;
                 }
             }
@@ -1526,7 +1943,7 @@ fn compact(solid: &mut Solid) {
     solid.vertices = vertices;
 }
 
-/// Each set of faces joined by edges, a solid of its own, renumbered; the faces' sources
+/// Each set of faces joined by edges, a shell of its own, renumbered; the faces' sources
 /// in the same order.
 fn split_solids(
     solid: Solid,
@@ -1567,17 +1984,69 @@ fn split_solids(
     let mut solids = Vec::new();
     let mut out_sources = Vec::new();
     for r in order {
-        let mut part = Solid {
-            vertices: solid.vertices.clone(),
-            edges: solid.edges.clone(),
-            faces: members[&r]
+        let mut part = Solid::closed(
+            solid.vertices.clone(),
+            solid.edges.clone(),
+            members[&r]
                 .iter()
                 .map(|&f| solid.faces[f].clone())
                 .collect(),
-        };
+        );
         compact(&mut part);
         out_sources.extend(members[&r].iter().map(|&f| sources[f].clone()));
         solids.push(part);
     }
     Ok((solids, out_sources))
+}
+
+#[cfg(test)]
+mod tests {
+    use oxyde_geom::{Axis, Curve2, Plane, Point2, Profile, ProfileSegment, Vec3};
+
+    use super::*;
+
+    fn polygon(corners: &[(f64, f64)]) -> Profile {
+        let n = corners.len();
+        let segments: Vec<ProfileSegment> = (0..n)
+            .map(|i| ProfileSegment {
+                id: i as u32 + 1,
+                curve: Curve2::Line {
+                    start: Point2::new(corners[i].0, corners[i].1),
+                    end: Point2::new(corners[(i + 1) % n].0, corners[(i + 1) % n].1),
+                },
+            })
+            .collect();
+        Profile::from_curves(&segments).unwrap()
+    }
+
+    #[test]
+    fn a_ring_turned_through_a_block_cuts_a_channel_out_of_it() {
+        // A ring about the Y axis, which lies on the block's bottom, its seams there too,
+        // and wide enough to come out of the block's top.
+        let block = crate::build::extrude(
+            &Plane::FRONT,
+            &polygon(&[(-20.0, -15.0), (20.0, -15.0), (20.0, 15.0), (-20.0, 15.0)]),
+            Vec3::new(0.0, 0.0, 10.0),
+        )
+        .unwrap()
+        .0;
+        let ring = crate::revolve::revolve(
+            &Plane::FRONT,
+            &polygon(&[(8.0, 2.0), (12.0, 2.0), (12.0, 6.0), (8.0, 6.0)]),
+            &Axis::new(Point3::ORIGIN, Vec3::Y).unwrap(),
+            TAU,
+        )
+        .unwrap()
+        .0;
+        let (cut, _) = boolean(BooleanOp::Cut, &block, &[&ring]).unwrap();
+        cut.check().unwrap();
+        let (common, _) = boolean(BooleanOp::Common, &block, &[&ring]).unwrap();
+        common.check().unwrap();
+        // What the cut takes away is what the two share.
+        let total = cut.volume().unwrap() + common.volume().unwrap();
+        assert!((total - 12_000.0).abs() < 1e-9, "{total}");
+        // Half the ring is in the block, but for the caps its top cuts off.
+        let half_ring = std::f64::consts::PI * (144.0 - 64.0) * 4.0 / 2.0;
+        assert!(common.volume().unwrap() < half_ring);
+    }
 }

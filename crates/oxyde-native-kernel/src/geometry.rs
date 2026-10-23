@@ -1,15 +1,18 @@
-//! The curves and surfaces of the native kernel: lines and circles, planes and cylinders.
+//! The curves and surfaces of the native kernel: lines, circles and the points that stand
+//! for an edge at a cone's apex or a sphere's pole; planes and surfaces of revolution
+//! (cylinders, cones, spheres and tori, [`crate::revolution`]).
 //!
 //! An edge on a circle runs counter-clockwise about the circle's normal, from its start
-//! vertex to its end vertex; a closed circle starts and ends at one vertex. A cylinder has
-//! an angle-zero direction across its axis, so that a point of it has an angle about the
-//! axis and a height along it: its faces are regions of that `(angle, height)` plane,
-//! bounded (in what the kernel builds so far) by lines along the axis and circles across
-//! it, so that their area, centroid and mass integrals have closed forms.
+//! vertex to its end vertex; a closed circle starts and ends at one vertex. A face on a
+//! surface of revolution is a region of the surface's `(θ, v)` plane, bounded (in what the
+//! kernel builds so far) by lines of constant `θ` and lines of constant `v`, so that its area
+//! and mass integrals come from its boundary alone.
 
 use std::f64::consts::TAU;
 
-use oxyde_geom::{Axis, LINEAR_TOLERANCE, Plane, Point3, Transform, Vec3};
+use oxyde_geom::{Plane, Point3, Transform, Vec3};
+
+use crate::revolution::Revolution;
 
 /// A unit vector square to `normal`, the same for the same normal: the angle-zero direction
 /// of a circle that has none of its own.
@@ -32,6 +35,54 @@ pub(crate) enum Curve {
     /// Straight from its start vertex to its end vertex.
     Line,
     Circle(Circle),
+    /// No curve at all: an edge of no length at a point where a surface of revolution meets
+    /// its axis (a cone's apex, a sphere's pole), which its face's boundary runs along in the
+    /// face's `(θ, v)` plane as it turns about the axis there, as OpenCASCADE's degenerate
+    /// edges do. It turns `turn` radians (in `(0, 2π]`) counter-clockwise about `axis`
+    /// from its start to its end, which are one vertex.
+    Degenerate {
+        axis: Vec3,
+        turn: f64,
+    },
+}
+
+impl Curve {
+    /// The curve moved by `transform`. A mirror turns the way round, so a circle's normal
+    /// and a degenerate edge's axis are reversed to keep an edge running from the same start
+    /// to the same end.
+    pub fn transformed(&self, transform: &Transform) -> Curve {
+        match self {
+            Curve::Line => Curve::Line,
+            Curve::Circle(circle) => Curve::Circle(circle.transformed(transform)),
+            Curve::Degenerate { axis, turn } => {
+                let axis = transform.apply_vector(*axis);
+                Curve::Degenerate {
+                    axis: if transform.is_mirror() { -axis } else { axis },
+                    turn: *turn,
+                }
+            }
+        }
+    }
+
+    /// The same curve run the other way: a line as it is, a circle about its reversed
+    /// normal, a degenerate edge about its reversed axis.
+    pub fn reversed(&self) -> Curve {
+        match self {
+            Curve::Line => Curve::Line,
+            Curve::Circle(c) => Curve::Circle(Circle {
+                normal: -c.normal,
+                ..*c
+            }),
+            Curve::Degenerate { axis, turn } => Curve::Degenerate {
+                axis: -*axis,
+                turn: *turn,
+            },
+        }
+    }
+
+    pub fn is_degenerate(&self) -> bool {
+        matches!(self, Curve::Degenerate { .. })
+    }
 }
 
 /// A circle in space: its centre, its unit normal (an edge on it runs counter-clockwise
@@ -87,6 +138,14 @@ impl Circle {
         }
     }
 
+    /// How far `p` lies off the circle.
+    pub fn distance(&self, p: Point3) -> f64 {
+        let d = p - self.center;
+        let along = d.dot(self.normal);
+        let radial = (d - self.normal * along).length();
+        (along * along + (radial - self.radius).powi(2)).sqrt()
+    }
+
     /// Along each model axis, the extremes the arc from angle `start` turning `sweep`
     /// reaches between its ends (its ends excepted: they are vertices).
     pub fn extremes(&self, start: f64, sweep: f64) -> Vec<Point3> {
@@ -110,7 +169,7 @@ impl Circle {
     }
 }
 
-fn component(v: Vec3, k: usize) -> f64 {
+pub(crate) fn component(v: Vec3, k: usize) -> f64 {
     match k {
         0 => v.x,
         1 => v.y,
@@ -123,14 +182,15 @@ fn component(v: Vec3, k: usize) -> f64 {
 pub(crate) enum Surface {
     /// Its normal points out of the solid.
     Plane(Plane),
-    Cylinder(Cylinder),
+    /// A cylinder, a cone, a sphere or a torus, saying which way its normal points.
+    Revolution(Revolution),
 }
 
 impl Surface {
     pub fn plane(&self) -> Option<&Plane> {
         match self {
             Surface::Plane(plane) => Some(plane),
-            Surface::Cylinder(_) => None,
+            Surface::Revolution(_) => None,
         }
     }
 
@@ -141,7 +201,21 @@ impl Surface {
                 x_dir: transform.apply_vector(plane.x_dir),
                 normal: transform.apply_vector(plane.normal),
             }),
-            Surface::Cylinder(cylinder) => Surface::Cylinder(cylinder.transformed(transform)),
+            Surface::Revolution(r) => Surface::Revolution(r.transformed(transform)),
+        }
+    }
+
+    /// The same surface with its normal the other way.
+    pub fn reversed(&self) -> Surface {
+        match self {
+            Surface::Plane(p) => Surface::Plane(Plane {
+                normal: -p.normal,
+                ..*p
+            }),
+            Surface::Revolution(r) => Surface::Revolution(Revolution {
+                outward: !r.outward,
+                ..*r
+            }),
         }
     }
 
@@ -149,118 +223,9 @@ impl Surface {
     pub fn distance(&self, p: Point3) -> f64 {
         match self {
             Surface::Plane(plane) => (p - plane.origin).dot(plane.normal).abs(),
-            Surface::Cylinder(cylinder) => (cylinder.radial(p).length() - cylinder.radius).abs(),
+            Surface::Revolution(r) => r.distance(p),
         }
     }
-}
-
-/// A circular cylinder. `axis.direction` is unit; `x_dir`, square to it, is angle zero, and
-/// angles turn counter-clockwise about the axis. `outward`: the face's normal points away
-/// from the axis (a boss) rather than towards it (a hole).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Cylinder {
-    pub axis: Axis,
-    pub x_dir: Vec3,
-    pub radius: f64,
-    pub outward: bool,
-}
-
-impl Cylinder {
-    /// The frame `(x, y, axis)`, right-handed.
-    pub fn frame(&self) -> (Vec3, Vec3, Vec3) {
-        let a = self.axis.direction;
-        (self.x_dir, a.cross(self.x_dir), a)
-    }
-
-    /// `p`'s offset from the axis, square to it.
-    pub fn radial(&self, p: Point3) -> Vec3 {
-        let d = p - self.axis.origin;
-        d - self.axis.direction * d.dot(self.axis.direction)
-    }
-
-    /// `p`'s angle about the axis, in `(-π, π]`, and its height along it.
-    pub fn coordinates(&self, p: Point3) -> (f64, f64) {
-        let (x, y, a) = self.frame();
-        let d = p - self.axis.origin;
-        (d.dot(y).atan2(d.dot(x)), d.dot(a))
-    }
-
-    pub fn point(&self, angle: f64, height: f64) -> Point3 {
-        let (x, y, a) = self.frame();
-        self.axis.origin + a * height + (x * angle.cos() + y * angle.sin()) * self.radius
-    }
-
-    pub fn transformed(&self, transform: &Transform) -> Cylinder {
-        Cylinder {
-            axis: Axis {
-                origin: transform.apply_point(self.axis.origin),
-                direction: transform.apply_vector(self.axis.direction),
-            },
-            x_dir: transform.apply_vector(self.x_dir),
-            radius: self.radius,
-            outward: self.outward,
-        }
-    }
-
-    /// Whether `circle` lies across this cylinder: centred on its axis, square to it and of
-    /// its radius, so an edge on it is a line of constant height on the cylinder.
-    pub fn holds_circle(&self, circle: &Circle) -> bool {
-        let tolerance = 10.0 * LINEAR_TOLERANCE;
-        self.radial(circle.center).length() <= tolerance
-            && circle.normal.cross(self.axis.direction).length() <= 1e-9
-            && (circle.radius - self.radius).abs() <= tolerance
-    }
-}
-
-/// Integrals over a region of a cylinder's `(angle, height)` plane bounded by lines of
-/// constant angle and constant height, from its boundary alone (Green's theorem: the
-/// integral of `f(θ) g(h)` over the region is `∮ F(θ) g(h) dh`, `F' = f`, which only the
-/// lines of constant angle contribute to). Each sum is signed by the way the boundary
-/// turns: positive counter-clockwise in the plane.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct AngleHeightSums {
-    /// `∫∫ f(θ) g(h)` for f in 1, cos, sin, cos², sin², cos·sin (rows) and g in 1, h
-    /// (columns).
-    pub sums: [[f64; 2]; 6],
-}
-
-impl AngleHeightSums {
-    /// Adds the boundary line at angle `angle` from height `from` to height `to`.
-    pub fn add_line(&mut self, angle: f64, from: f64, to: f64) {
-        let (s, c) = angle.sin_cos();
-        let antiderivatives = [
-            angle,
-            s,
-            -c,
-            angle / 2.0 + (2.0 * angle).sin() / 4.0,
-            angle / 2.0 - (2.0 * angle).sin() / 4.0,
-            s * s / 2.0,
-        ];
-        let g = [to - from, (to * to - from * from) / 2.0];
-        for (row, f) in self.sums.iter_mut().zip(antiderivatives) {
-            row[0] += f * g[0];
-            row[1] += f * g[1];
-        }
-    }
-
-    pub fn get(&self, f: Trig, h: bool) -> f64 {
-        self.sums
-            .get(f as usize)
-            .and_then(|row| row.get(usize::from(h)))
-            .copied()
-            .unwrap_or(0.0)
-    }
-}
-
-/// The functions of the angle [`AngleHeightSums`] integrates.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Trig {
-    One = 0,
-    Cos = 1,
-    Sin = 2,
-    Cos2 = 3,
-    Sin2 = 4,
-    CosSin = 5,
 }
 
 /// The area and mass integrals of one face: its area, `∫ x dA`, and, about a reference
@@ -283,46 +248,6 @@ impl FaceIntegrals {
             Point3::new(c.x, c.y, c.z)
         } else {
             fallback
-        }
-    }
-
-    /// Of a cylinder's face whose boundary, walked as the face's loops run, gave `sums`
-    /// (counter-clockwise from outside is counter-clockwise in the `(angle, height)` plane
-    /// for an outward face, clockwise for an inward one), about `reference`.
-    pub fn of_cylinder(cylinder: &Cylinder, sums: &AngleHeightSums, reference: Point3) -> Self {
-        let (x, y, a) = cylinder.frame();
-        let r = cylinder.radius;
-        // The region's own integrals are the boundary's for an outward face and their
-        // opposite for an inward one; the normal (±radial) brings the same sign back, so
-        // the flux integrals take the boundary's sums as they are.
-        let sign = if cylinder.outward { 1.0 } else { -1.0 };
-        let s = |f: Trig, h: bool| sums.get(f, h);
-        let area = sign * r * s(Trig::One, false);
-        let first = (cylinder.axis.origin.to_vec() * s(Trig::One, false)
-            + a * s(Trig::One, true)
-            + (x * s(Trig::Cos, false) + y * s(Trig::Sin, false)) * r)
-            * (sign * r);
-        let w = cylinder.axis.origin - reference;
-        let (wc, ws) = (w.dot(x), w.dot(y));
-        let flux =
-            r * (wc * s(Trig::Cos, false) + ws * s(Trig::Sin, false) + r * s(Trig::One, false));
-        let flux_moment = (w
-            * (wc * s(Trig::Cos, false) + ws * s(Trig::Sin, false) + r * s(Trig::One, false))
-            + a * (wc * s(Trig::Cos, true) + ws * s(Trig::Sin, true) + r * s(Trig::One, true))
-            + x * (r
-                * (wc * s(Trig::Cos2, false)
-                    + ws * s(Trig::CosSin, false)
-                    + r * s(Trig::Cos, false)))
-            + y * (r
-                * (wc * s(Trig::CosSin, false)
-                    + ws * s(Trig::Sin2, false)
-                    + r * s(Trig::Sin, false))))
-            * r;
-        FaceIntegrals {
-            area,
-            first,
-            flux,
-            flux_moment,
         }
     }
 
@@ -409,53 +334,6 @@ mod tests {
         back.add_line((1.0, 0.0), (-1.0, 0.0));
         back.add_arc((0.0, 0.0), 1.0, PI, 0.0);
         assert!((back.area_and_moment().0 + PI / 2.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn a_whole_cylinder_has_its_area_volume_and_centroid() {
-        let cylinder = Cylinder {
-            axis: Axis {
-                origin: Point3::new(1.0, 2.0, 3.0),
-                direction: Vec3::Z,
-            },
-            x_dir: Vec3::X,
-            radius: 2.0,
-            outward: true,
-        };
-        // Its region, counter-clockwise: along the bottom (angle up), up the seam at 2π,
-        // back along the top, down the seam at 0. Only the seam lines count.
-        let mut sums = AngleHeightSums::default();
-        sums.add_line(TAU, 0.0, 5.0);
-        sums.add_line(0.0, 5.0, 0.0);
-        let reference = Point3::new(-4.0, 1.0, 0.5);
-        let side = FaceIntegrals::of_cylinder(&cylinder, &sums, reference);
-        assert!((side.area - 2.0 * PI * 2.0 * 5.0).abs() < 1e-9);
-        let c = side.centroid(Point3::ORIGIN);
-        assert!(c.distance(Point3::new(1.0, 2.0, 5.5)) < 1e-9);
-        // The two discs closing it, and the volume by the divergence theorem.
-        let bottom = Plane {
-            origin: Point3::new(1.0, 2.0, 3.0),
-            x_dir: Vec3::X,
-            normal: -Vec3::Z,
-        };
-        let top = Plane {
-            origin: Point3::new(1.0, 2.0, 8.0),
-            x_dir: Vec3::X,
-            normal: Vec3::Z,
-        };
-        let disc = 4.0 * PI;
-        let caps = [
-            FaceIntegrals::of_plane(&bottom, disc, bottom.origin.to_vec() * disc, reference),
-            FaceIntegrals::of_plane(&top, disc, top.origin.to_vec() * disc, reference),
-        ];
-        let volume = (side.flux + caps.iter().map(|c| c.flux).sum::<f64>()) / 3.0;
-        assert!((volume - 4.0 * PI * 5.0).abs() < 1e-9, "{volume}");
-        let moment = (caps.iter().fold(side.flux_moment, |m, c| m + c.flux_moment)) * 0.25;
-        let centre = reference + moment * (1.0 / volume);
-        assert!(
-            centre.distance(Point3::new(1.0, 2.0, 5.5)) < 1e-9,
-            "{centre:?}"
-        );
     }
 
     #[test]

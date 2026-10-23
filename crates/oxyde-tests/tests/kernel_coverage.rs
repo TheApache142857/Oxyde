@@ -39,6 +39,18 @@ const NATIVE_BUILDS: &[&str] = &[
     "pattern of holes",
     "mirrored boss",
     "two bodies combined",
+    "flange (demo)",
+    "revolved ring",
+    "revolved quarter ring",
+    "revolved rod",
+    "revolved cone",
+    "revolved ball",
+    "revolved torus",
+    "revolved groove",
+    "simple holes",
+    "blind holes",
+    "counterbored holes",
+    "countersunk holes",
 ];
 
 // ---------------------------------------------------------------------------------------

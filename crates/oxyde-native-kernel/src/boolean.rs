@@ -16,7 +16,7 @@ use oxyde_geom::{LINEAR_TOLERANCE, Point3};
 use oxyde_kernel::{BooleanOp, OpHistory};
 
 use crate::NativeError;
-use crate::assemble;
+use crate::assemble::{self, VOID};
 use crate::brep::Shape;
 use crate::bsp::{self, Plane3, Polygon};
 use crate::curved;
@@ -61,7 +61,11 @@ pub(crate) fn boolean(
             bsp::intersect(target_polygons, tools, eps)
         }
     };
-    let (shape, history) = assemble::assemble(kept, eps)?;
+    let (shape, history) = match assemble::assemble(kept, eps) {
+        // A void inside a solid is left to the curved booleans, which keep one.
+        Err(NativeError::Unsupported(VOID)) => curved::boolean(op, target, tools)?,
+        other => other?,
+    };
     check(op, target, tools, &shape)?;
     Ok((shape, history))
 }
@@ -83,10 +87,7 @@ fn polygons(shape: &Shape, input: u32) -> Result<Vec<Polygon>, NativeError> {
             let plane = Plane3::through(plane.origin, plane.normal);
             for triangle in triangles {
                 out.push(Polygon {
-                    points: triangle
-                        .iter()
-                        .map(|&k| solid.vertices[corners[k] as usize])
-                        .collect(),
+                    points: triangle.iter().map(|&k| solid.point(corners[k])).collect(),
                     plane,
                     source: (input, index),
                 });

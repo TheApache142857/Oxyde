@@ -13,7 +13,7 @@ release yet; the git history has every detail.
 - **Preferences › Debug › Kernel** chooses the kernel parts are built with, from the next
   start: OpenCASCADE or Oxyde's own (experimental); `--kernel occt` or `--kernel native` on
   the command line chooses it for one session. With Oxyde's own, a feature it cannot build
-  yet (a fillet, a revolve, a STEP import) fails with a message in the tree and the body
+  yet (a fillet, a shell, a STEP import) fails with a message in the tree and the body
   stays as it was; simulation meshes with the lattice mesher. The About box and the Debug
   page say which kernel the session uses.
 - With Oxyde's own kernel too, opening a part or an assembly, Reload Parts and coming back
@@ -39,6 +39,19 @@ release yet; the git history has every detail.
   cut in two, with the same names as OpenCASCADE gives. What would meet in a curve that is
   neither a line nor a circle (two holes crossing, a cylinder at a slant to a face) fails
   with a message, and the body stays as it was.
+- It now revolves too: rings, rods, discs, cones, balls, ball caps and tori, for a whole
+  turn or less, about an axis drawn either way, on either side of it, with the faces, edges
+  and names OpenCASCADE gives them (a sphere's poles and a cone's apex as OpenCASCADE's
+  degenerate edges, a ring torus with its two seams). So the **Hole** feature builds with it,
+  every kind (simple, blind with a drill point, counterbored, countersunk), and the demo
+  flange, and revolved cuts: grooves turned into a rod, channels into a block.
+- Its booleans join, cut and intersect cones, spheres and tori with what shares their axis
+  and with planes square to it or holding it (a ball on a block or sunk into it, a
+  countersink in a face, an O-ring's groove turned into a rod, a ball cut in half), and a
+  cut that leaves a closed space inside a body (a pocket cut from a plane in the middle of a
+  block) keeps it as a void, as OpenCASCADE does. Where two surfaces meet in a curve that is
+  neither a line nor a circle (two holes crossing, a cone cut along but away from its axis),
+  the feature still fails with a message.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is
