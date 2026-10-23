@@ -175,7 +175,7 @@ impl OxydeApp {
     fn graphics_page(&mut self, ui: &mut egui::Ui) {
         let g = &mut self.prefs.graphics;
         crate::property_manager::section(ui, "Interface");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (theme, label) in crate::theme::UiTheme::ALL {
                 if ui.radio(g.ui_theme == theme, label).clicked() && g.ui_theme != theme {
                     g.ui_theme = theme;
@@ -202,9 +202,9 @@ impl OxydeApp {
 
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Viewport colours");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Preset");
-            let presets = [("Flux", crate::theme::FLUX_VIEWPORT)]
+            let presets = crate::theme::VIEWPORT_PRESETS
                 .into_iter()
                 .chain(Style::PRESETS);
             for (name, style) in presets {
