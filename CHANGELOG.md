@@ -41,6 +41,47 @@ release yet; the git history has every detail.
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is
   unchanged.
 
+### Display styles (unreleased, October 2026)
+
+- **View › Display Style**, also on the view toolbar over the viewport (the button shows
+  the style in use and opens the list), as SolidWorks' display styles:
+  - *Shaded With Edges*, as before, the default;
+  - *Shaded*: the faces alone. An edge shows when the pointer is on it or it is
+    selected, so edges can still be picked (with *Show edges* off before, they could
+    not);
+  - *Hidden Lines Removed*: the edges alone, those behind faces left out;
+  - *Hidden Lines Visible*: the same, with the hidden edges dashed and greyed;
+  - *Wireframe*: every edge, nothing hidden.
+- Faces are picked as in the shaded styles: the face under the pointer lights up in its
+  highlight colour, and a selected face shows filled in the selection colour. Selection
+  boxes, Section View, Measure and every command that takes faces or edges work the same.
+- The style is remembered in Tools › Preferences › *Graphics* (*Display style*, which
+  replaces *Show edges*: preferences with edges off open in *Shaded*). The colour presets
+  there no longer turn the edges back on.
+- On a dark background the lines of the line styles take the part's colour, since the
+  dark edge colour would not show. Floor reflections and ambient occlusion apply to the
+  shaded styles only. Simulation plots are always shaded, so their colours show. File ›
+  Export › Image pictures the model in the style in use.
+
+### Linked equations files (unreleased, October 2026)
+
+- **Parts can share their global variables through an equations file**, as SolidWorks'
+  *Link to external file*. In **Tools › Equations…**, *🔗 Link to file…* picks or creates a
+  text file next to the part (a new one starts with the part's variables); its variables
+  then show with 🔗, and changing one there writes it into the file. Every part linked to
+  the same file reads it when it is opened, and an assembly opened afterwards rebuilds its
+  parts with the new values and moves them by their mates: one `"Width" = 260` resizes a
+  whole case. The file is plain text you can edit by hand, one `"Name" = expression` per
+  line, with `'` comments. A part whose file has gone opens with the values it last read;
+  *Unlink* keeps the variables as the part's own. In files: `equations_file` and `linked`
+  in `model.json` (FORMAT.md §3); older versions of Oxyde open such parts with their saved
+  values, and saving one there drops its link.
+- **The MCP server:** a `link_equations` tool links a part to an equations file and can
+  write variables into it; `set_variable` on a linked variable changes the file. Mates can
+  pick a face or an edge of a part inside a sub-assembly (`"path"`). Opening an assembly
+  solves its mates, as the application does, and `assembly_info` says which components the
+  mates still leave free, by how many degrees of freedom, and which mates cannot be met.
+
 ### Cooling studies: heat carried away by a flow (unreleased, October 2026)
 
 - **New Study › Cooling** computes the temperatures of a model cooled by air or water
@@ -82,6 +123,14 @@ release yet; the git history has every detail.
   (the velocity or the pressure on a plane through the fluid, square to X, Y or Z, moved
   with a slider, the model faint around it) or the pressure on the faces the fluid wets,
   in colour bands with a legend and the largest value marked.
+- **Flow trajectories** (*Trajectories* in the command bar), as Autodesk Flow Design showed
+  them: particles carried by the flow from a plane upstream of the model (around it) or from
+  the inlets (through it), each with a trail of its recent path coloured by speed, playing in
+  the viewport over the faint model. The panel sets about how many (25 to 400) and pauses
+  them.
+- **Drag coefficient**: around the model, each Force goal shows its Cd = 2 F / (ρ V² A), F
+  along the free stream and A the model's frontal area, its silhouette seen along the stream,
+  shown beside it. Worked out when shown: nothing new in the files.
 - **Files**: flow studies are saved in the `.oxysim` (as `format_version` 5; documents
   without one are written exactly as before), their results in the `.oxyres` with the
   OpenFOAM case folder beside them (`<study file>-<study>.openfoam`, which ParaView opens):
@@ -89,6 +138,17 @@ release yet; the git history has every detail.
 - **Preferences › Simulation** says where OpenFOAM is (otherwise found in its usual places),
   how many processes it runs on, and where to get it. The Windows installer offers to
   download OpenFOAM and install it.
+- **On Windows**, OpenCFD's own build of OpenFOAM runs, on several processes through
+  Microsoft MPI: a run no longer stops at once with *OpenFOAM's blockMesh was not found in
+  the installation* when Oxyde was started from the Start menu, Explorer or a terminal.
+- **Cut plots start through the middle of the model**, for each new result and each axis
+  picked, rather than through the middle of the fluid, which around a model lies far
+  downstream of it and showed only its wake. The slider still moves the plane anywhere
+  across the fluid.
+- **A run that did not converge** no longer says that more iterations may help once its
+  residuals have stopped falling: it says after about how many iterations they did. A flow
+  that never settles, such as a wake shedding eddies behind a blunt body, keeps them
+  swinging however long it runs; a higher *Converged at* ends such a run sooner.
 
 ### Frequency studies (October 2026)
 

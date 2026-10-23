@@ -22,6 +22,10 @@
 //!   [`foam`]) and works out the goals: forces, flow rates and mean pressures.
 //! - [`plot`] cuts planes through the fluid and gathers the model's wetted faces, with the
 //!   pressure or speed on them, for the application to draw in colour bands.
+//! - [`trajectory`] follows particles through the solved flow from seeds upstream of the
+//!   model or on its inlets: flow trajectories, which the application animates.
+//! - [`drag`] gives an external flow's drag coefficient: the force on the model over the
+//!   dynamic pressure on its frontal area, the silhouette seen along the stream.
 //! - [`setup`] works out what a study leaves to Oxyde: the mesh from a level 1 to 7, the
 //!   computational domain, a point inside an internal flow's cavity.
 //! - [`cooling`] writes a *Cooling* study (a flow with [`Heat`]): the fluid and the solids
@@ -62,6 +66,7 @@
 pub mod case;
 pub mod cooling;
 mod dict;
+pub mod drag;
 pub mod foam;
 pub mod install;
 pub mod log;
@@ -71,6 +76,7 @@ pub mod results;
 pub mod run;
 pub mod setup;
 pub mod study;
+pub mod trajectory;
 
 pub use case::{Case, CaseError, FacePatch, Role, write_case};
 pub use install::{InstallError, Installation};

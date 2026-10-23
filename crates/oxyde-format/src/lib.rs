@@ -35,6 +35,7 @@
 
 mod assembly_schema;
 pub mod drawing;
+pub mod equations_file;
 pub mod gltf;
 pub mod material_library;
 pub mod obj;
@@ -556,7 +557,7 @@ pub fn save_assembly(path: &Path, assembly: &AssemblyFile) -> Result<(), FormatE
 
 /// Writes `bytes` to `path` through a temporary file in the same folder, synced to disk
 /// before it replaces the previous version.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".tmp");
     let temporary = std::path::PathBuf::from(temporary);
@@ -576,9 +577,17 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), FormatError> {
     result
 }
 
-/// Loads a part from `path`.
+/// Loads a part from `path`. A part linked to an equations file takes the file's variables;
+/// if the file cannot be read, the part opens with the values it was saved with.
 pub fn load_part(path: &Path) -> Result<PartFile, FormatError> {
-    read_part(BufReader::new(File::open(path)?))
+    let mut part = read_part(BufReader::new(File::open(path)?))?;
+    let mut refreshed = part.definition.clone();
+    if equations_file::refresh_linked_equations(path, &mut refreshed).is_ok()
+        && Part::from_definition(refreshed.clone()).is_ok()
+    {
+        part.definition = refreshed;
+    }
+    Ok(part)
 }
 
 /// An assembly document as stored on disk.
@@ -1283,6 +1292,39 @@ mod tests {
             .collect();
         assert_eq!(names, ["D1@Sketch1", "D1@Boss-Extrude1"]);
         assert_eq!(part.properties, Properties::default());
+    }
+
+    #[test]
+    fn linked_equations_are_saved_and_refreshed_from_their_file() {
+        let dir = std::env::temp_dir().join(format!("oxyde-linked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Case.txt"), "\"Thick\" = 12\n").unwrap();
+        let mut file = sample();
+        let values = equations_file::read_equations_file(&dir.join("Case.txt")).unwrap();
+        file.definition
+            .link_equations(Some("Case.txt".to_owned()), &values)
+            .unwrap();
+        let path = dir.join("Linked.oxyprt");
+        save_part(&path, &file).unwrap();
+
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let model: serde_json::Value =
+            serde_json::from_slice(&read_entry(&mut archive, MODEL).unwrap()).unwrap();
+        assert_eq!(model["equations_file"], "Case.txt");
+        assert_eq!(model["global_variables"][0]["linked"], true);
+        drop(archive);
+
+        // Another part changed the file: opening the part takes the new value.
+        std::fs::write(dir.join("Case.txt"), "' The case\n\"Thick\" = 20\n").unwrap();
+        let text = load_part(&path).unwrap().definition.equations_text();
+        assert_eq!(text.globals[0].expression, "20");
+        assert!(text.globals[0].linked);
+
+        // Without its file, the part opens with the values it was saved with.
+        std::fs::remove_file(dir.join("Case.txt")).unwrap();
+        let text = load_part(&path).unwrap().definition.equations_text();
+        assert_eq!(text.globals[0].expression, "12");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

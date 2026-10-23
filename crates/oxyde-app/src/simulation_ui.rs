@@ -119,10 +119,13 @@ pub enum PlotChoice {
     CoolingCutTemperature,
     /// °C, a cooling study's temperature on the model's faces.
     CoolingSurfaceTemperature,
+    /// m/s, a flow study's trajectories: particles carried by the flow, animated, coloured
+    /// by speed.
+    FlowTrajectories,
 }
 
 impl PlotChoice {
-    pub(crate) const ALL: [PlotChoice; 14] = [
+    pub(crate) const ALL: [PlotChoice; 15] = [
         PlotChoice::Temperature,
         PlotChoice::HeatFlux,
         PlotChoice::VonMises,
@@ -137,6 +140,7 @@ impl PlotChoice {
         PlotChoice::FlowCutVelocity,
         PlotChoice::FlowCutPressure,
         PlotChoice::FlowSurfacePressure,
+        PlotChoice::FlowTrajectories,
     ];
 
     /// Whether it plots a thermal study's results.
@@ -153,6 +157,7 @@ impl PlotChoice {
                 | PlotChoice::FlowCutPressure
                 | PlotChoice::CoolingCutTemperature
                 | PlotChoice::CoolingSurfaceTemperature
+                | PlotChoice::FlowTrajectories
         )
     }
 
@@ -200,7 +205,8 @@ impl PlotChoice {
             | PlotChoice::FlowCutVelocity
             | PlotChoice::FlowCutPressure
             | PlotChoice::CoolingCutTemperature
-            | PlotChoice::CoolingSurfaceTemperature => None,
+            | PlotChoice::CoolingSurfaceTemperature
+            | PlotChoice::FlowTrajectories => None,
         }
     }
 
@@ -216,6 +222,7 @@ impl PlotChoice {
             PlotChoice::FlowCutPressure => "Pressure (cut plot)",
             PlotChoice::CoolingCutTemperature => "Temperature (cut plot)",
             PlotChoice::CoolingSurfaceTemperature => "Surface temperature",
+            PlotChoice::FlowTrajectories => "Flow trajectories",
             other => other.quantity().map_or("", Quantity::label),
         }
     }
@@ -228,7 +235,7 @@ impl PlotChoice {
             // A mode's size is arbitrary: its shape is relative to its largest motion.
             PlotChoice::Shape | PlotChoice::ModeShape => "",
             PlotChoice::FlowSurfacePressure | PlotChoice::FlowCutPressure => "Pa",
-            PlotChoice::FlowCutVelocity => "m/s",
+            PlotChoice::FlowCutVelocity | PlotChoice::FlowTrajectories => "m/s",
             PlotChoice::CoolingCutTemperature | PlotChoice::CoolingSurfaceTemperature => "°C",
             other => other.quantity().map_or("", Quantity::unit),
         }
@@ -291,6 +298,8 @@ pub struct SimulationPrefs {
     pub cut_axis: CutAxis,
     /// Where the plane is along the fluid, 0 to 1.
     pub cut_position: f64,
+    /// About how many paths a flow trajectories plot follows.
+    pub trajectories: u32,
 }
 
 /// The axis a cut plot's plane is square to.
@@ -340,6 +349,7 @@ impl Default for SimulationPrefs {
             flow_processes: 0,
             cut_axis: CutAxis::Z,
             cut_position: 0.5,
+            trajectories: 100,
         }
     }
 }
@@ -1331,6 +1341,9 @@ pub struct SimulationView {
     /// The plot (or the mesh) is shown over the model; off while setting up.
     pub(crate) show_plot: bool,
     pub(crate) shown: Option<PlotKey>,
+    /// The flow result (its `Done` id) and axis the cut plane was last put through the
+    /// middle of the model for: a new result or axis starts it there again.
+    pub(crate) cut_centred: Option<(u64, CutAxis)>,
     pub(crate) legend: Option<Legend>,
     pub(crate) error: Option<String>,
     pub(crate) prefs_dirty: bool,
@@ -1353,6 +1366,8 @@ pub struct SimulationView {
     pub(crate) mode: usize,
     /// While the frames play: when the last one was shown.
     pub(crate) playing: Option<Instant>,
+    /// A flow's trajectories, as the viewport animates them.
+    pub(crate) particles: Option<crate::flow_ui::Particles>,
     /// The open study's new name, while it is being renamed.
     pub(crate) renaming: Option<String>,
     /// The share of the mesh's volume the topology shape shown holds.
@@ -1589,6 +1604,7 @@ impl OxydeApp {
         self.poll_simulation(ctx);
         self.generative_housekeeping(ctx);
         self.advance_playback(ctx);
+        self.advance_particles(ctx);
         if self.simulation.shown.is_some() && !self.plot_wanted() {
             self.restore_simulation_scene();
             ctx.request_repaint();
@@ -2883,7 +2899,7 @@ impl OxydeApp {
     pub(crate) fn show_scene(&mut self, scene: Scene) {
         // Looked at, not picked: the faces are the plot's, not the model's.
         self.viewport.pickable = Some((0, 0));
-        self.viewport.set_scene(scene, false);
+        self.viewport.set_plot(scene);
         // The usual scene is not rebuilt over the plot while the document stays as it is.
         match self.asm.as_ref() {
             Some(asm) => self.asm_scene = Some(asm.revision),
@@ -2963,6 +2979,7 @@ impl OxydeApp {
         }
         let painter = ui.painter_at(output.rect);
         if self.simulation.shown.is_some() {
+            self.paint_trajectories(&painter, output);
             if let Some(legend) = &self.simulation.legend {
                 self.paint_legend(&painter, output, legend);
             }

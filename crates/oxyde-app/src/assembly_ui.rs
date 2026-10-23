@@ -1285,6 +1285,11 @@ impl OxydeApp {
                 ui.separator();
                 self.constrained_orbit_item(ui);
                 ui.separator();
+                ui.menu_button("Display Style", |ui| {
+                    if self.display_style_items(ui) {
+                        ui.close_menu();
+                    }
+                });
                 self.floor_reflections_item(ui);
                 self.ambient_occlusion_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));

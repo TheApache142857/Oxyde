@@ -124,14 +124,19 @@ Write-Host "Wrote $Zip"
 # Get-Item a file, which has none.
 $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) {
-    $default = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-    if (Test-Path $default) { $iscc = $default }
+    # Inno Setup's own installer puts it in Program Files when installed for every user,
+    # and in the user's programs folder when installed for the current user only.
+    $iscc = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 if ($iscc) {
     & $iscc "/DAppVersion=$Version" packaging\installer.iss
     if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
 } else {
-    Write-Warning "Inno Setup (iscc) not found: no .exe installer"
+    Write-Warning ("Inno Setup (iscc) not found on PATH, in Program Files or in " +
+        "$env:LOCALAPPDATA\Programs: no .exe installer")
 }
 
 # ---- Windows Installer package (.msi) -------------------------------------------------------

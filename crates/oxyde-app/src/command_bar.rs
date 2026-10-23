@@ -2,7 +2,7 @@
 //! Generative Design — SolidWorks' CommandManager) and the heads-up view toolbar over the viewport.
 
 use eframe::egui;
-use oxyde_render::StandardView;
+use oxyde_render::{DisplayStyle, StandardView};
 
 use crate::app::{Command, CommandTab, OxydeApp, PendingAction};
 use crate::dialogs::Dialog;
@@ -218,6 +218,11 @@ impl OxydeApp {
                 ui.separator();
                 self.constrained_orbit_item(ui);
                 ui.separator();
+                ui.menu_button("Display Style", |ui| {
+                    if self.display_style_items(ui) {
+                        ui.close_menu();
+                    }
+                });
                 self.floor_reflections_item(ui);
                 self.ambient_occlusion_item(ui);
                 ui.menu_button("Hide/Show", |ui| self.visibility_menu(ui));
@@ -723,6 +728,34 @@ impl OxydeApp {
         }
     }
 
+    /// View › Display Style, and the heads-up toolbar's flyout: the five styles, the
+    /// current one marked. Whether one was clicked, to close the menu.
+    pub(crate) fn display_style_items(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut clicked = None;
+        for (style, label) in DisplayStyle::ALL {
+            let current = self.prefs.graphics.display_style == style;
+            let response = ui
+                .horizontal(|ui| {
+                    icons::small(ui, icons::display_style(style), 16.0);
+                    ui.selectable_label(current, label)
+                })
+                .inner;
+            if response.clicked() {
+                clicked = Some(style);
+            }
+        }
+        let Some(style) = clicked else {
+            return false;
+        };
+        if self.prefs.graphics.display_style != style {
+            self.prefs.graphics.display_style = style;
+            let ctx = ui.ctx().clone();
+            self.apply_preferences(&ctx);
+            self.save_preferences();
+        }
+        true
+    }
+
     /// View › Floor reflections: the part mirrored in a floor under it.
     pub(crate) fn floor_reflections_item(&mut self, ui: &mut egui::Ui) {
         if ui
@@ -731,7 +764,8 @@ impl OxydeApp {
                 "Floor reflections",
             )
             .on_hover_text(
-                "The part mirrored in a floor just under it. Strength: Preferences › Graphics.",
+                "The part mirrored in a floor just under it, in the shaded display styles. \
+                 Strength: Preferences › Graphics.",
             )
             .changed()
         {
@@ -773,7 +807,8 @@ impl OxydeApp {
             )
             .on_hover_text(
                 "Creases, inner corners and the foot of walls darkened, as less ambient \
-                 light reaches them. Strength: Preferences › Graphics.",
+                 light reaches them, in the shaded display styles. Strength: Preferences › \
+                 Graphics.",
             )
             .changed()
         {
@@ -800,7 +835,8 @@ impl OxydeApp {
         );
     }
 
-    /// Standard views, zoom to fit and Normal To, floating at the top of the viewport.
+    /// Standard views, zoom to fit, the display style, Hide/Show and Normal To, floating
+    /// at the top of the viewport.
     pub(crate) fn heads_up_toolbar(&mut self, ctx: &egui::Context, viewport: egui::Rect) {
         // Middle, like windows: a window opened over the viewport covers the toolbar.
         egui::Area::new(egui::Id::new("heads_up_toolbar"))
@@ -829,6 +865,26 @@ impl OxydeApp {
                                 self.viewport.request_fit();
                             }
                             ui.separator();
+                            let current = self.prefs.graphics.display_style;
+                            let style =
+                                icons::icon_button(ui, icons::display_style(current), 26.0, true)
+                                    .on_hover_text(format!("Display Style: {}", current.label()));
+                            let popup = ui.make_persistent_id("display_style_menu");
+                            if style.clicked() {
+                                ui.memory_mut(|m| m.toggle_popup(popup));
+                            }
+                            egui::popup::popup_below_widget(
+                                ui,
+                                popup,
+                                &style,
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(190.0);
+                                    if self.display_style_items(ui) {
+                                        ui.memory_mut(|m| m.close_popup());
+                                    }
+                                },
+                            );
                             let eye = icons::icon_button(ui, Icon::Eye, 26.0, true)
                                 .on_hover_text("Hide/Show planes, axes, sketches, origins");
                             let popup = ui.make_persistent_id("hide_show_menu");

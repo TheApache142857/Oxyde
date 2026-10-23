@@ -237,9 +237,20 @@ References to geometry are never indices; they are the persistent names describe
 
 Optional, default empty, SolidWorks style:
 
-- `global_variables`: `id` (unique, never reused), `name` (unique, see *Names*) and `expression`.
+- `global_variables`: `id` (unique, never reused), `name` (unique, see *Names*) and `expression`; `linked: true` (absent = false) marks a variable copied from the linked equations file.
 - `equations`: `dimension`, the full name of the dimension the equation drives (each dimension at most once), and `expression`.
 - `next_global_id`: id the next new global variable will get (default 1; readers raise it above every id).
+- `equations_file` (optional): the part's **linked equations file**, as SolidWorks' "Link to external file": a path, relative to the folder of the part (with `/`) unless absolute. Parts linked to the same file share its variables.
+
+The equations file is plain UTF-8 text, one variable per line, `"Name" = expression` with the expression syntax below; lines starting with `'` are comments and blank lines are ignored, as in SolidWorks. A name given twice takes its last value.
+
+```text
+' Outer dimensions of the case
+"Width" = 233
+"Hole X" = "Width" / 2 - 14.5
+```
+
+When a linked part is opened, the variables of the file replace the `linked` ones of the same name and are added if the part does not have them; a `linked` variable the file no longer lists stays, no longer linked. The part stores a copy of every linked variable, so it opens with the values it was saved with when the file is missing or unreadable, and readers that do not know the link open it as it was saved. Writers change a linked variable in the file (keeping its other lines), not only in the part. The link needs no new `format_version`: a reader that ignores `equations_file` and `linked` loses only the link.
 
 Expressions are text: numbers, names between double quotes (`"Width"` for a global variable, `"D1@Sketch1"` for a dimension), `+ - * / ^`, parentheses, `pi`, and the functions `sin cos tan asin acos atan` (in degrees), `sqrt abs exp log` (natural) `log10 int round sgn` (one argument) and `min max` (two). Values are in mm, angles in **degrees** (unlike the rest of the file, as in SolidWorks), instance counts are rounded. Names are written as they are at save time. A name that matches nothing on load is kept and reported as an error when the equations are evaluated (a broken equation, not a broken file); a syntax error refuses the file.
 
