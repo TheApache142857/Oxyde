@@ -60,6 +60,7 @@ pub use dimensions::{
 };
 pub use equations::{
     Equation, EquationResults, EquationText, Equations, EquationsText, GlobalText, GlobalVariable,
+    LinkedValue,
 };
 pub use error::ModelError;
 pub use expression::{BinaryOp, Expr, Function, GlobalId, Operand};

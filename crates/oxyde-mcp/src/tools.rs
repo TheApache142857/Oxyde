@@ -358,6 +358,19 @@ pub fn list() -> Vec<Value> {
             &["name", "expression"],
         ),
         tool(
+            "link_equations",
+            "Links the part to an equations file shared with other parts (SolidWorks' \
+             \"Link to external file\"): a text file of \"Name\" = expression lines, found \
+             relative to the part's folder. `variables` are written into the file first; the \
+             part then takes every variable of the file, kept up to date when it is opened. \
+             set_variable on a linked variable changes the file. \"file\": null unlinks.",
+            json!({
+                "file": string("e.g. \"Case dimensions.txt\", or null to unlink."),
+                "variables": { "type": "object", "description": "e.g. {\"Width\": \"233\", \"Depth\": \"300\"}" },
+            }),
+            &["file"],
+        ),
+        tool(
             "set_equation",
             "Drives a dimension by an equation (\"D1@Sketch1\" = \"Width\" * 2).",
             json!({ "dimension": string("Full name."), "expression": string("") }),
@@ -503,7 +516,8 @@ pub fn list() -> Vec<Value> {
             "Mates two components and solves: coincident, concentric, parallel, perpendicular, \
             distance (mm), angle (degrees). A side is {\"component\", \"face\" | \"edge\": selector in the part's \
             coordinates} or {\"component\", \"plane\" | \"axis\" | \"origin\"}; component 0 or \"assembly\" is the \
-            assembly's own planes.",
+            assembly's own planes. On a sub-assembly component, \"path\": [component names or ids inside it] \
+            reaches the part whose face or edge is meant.",
             json!({ "kind": json!({ "type": "string", "enum": ["coincident", "concentric", "parallel", "perpendicular", "distance", "angle"] }),
                 "a": any(""), "b": any(""), "value": number("mm or degrees"), "aligned": boolean("Normals the same way (default: as they are).") }),
             &["kind", "a", "b"],
@@ -652,6 +666,7 @@ fn dispatch(session: &mut Session, name: &str, args: &Value) -> Result<ToolOutpu
         "rename_dimension" => modelling::rename_dimension(session, args),
         "set_variable" => modelling::set_variable(session, args),
         "set_equation" => modelling::set_equation(session, args),
+        "link_equations" => modelling::link_equations(session, args),
         "delete_feature" => modelling::delete_feature(session, args),
         "suppress_feature" => modelling::suppress_feature(session, args),
         "rename_feature" => modelling::rename_feature(session, args),
