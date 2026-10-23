@@ -254,17 +254,14 @@ impl Pen<'_> {
         points.iter().map(|&(x, y)| self.p(x, y)).collect()
     }
 
-    /// Greyed out when the command is not available. On a dark theme the outlines and
-    /// sketch blue turn light, so the icons stand out from the panel.
+    /// Greyed out when the command is not available. The outlines and the sketch blue are
+    /// the theme's (light on a dark theme), so the icons stand out from the panel.
     fn c(&self, color: Color32) -> Color32 {
-        let color = if crate::theme::ui_dark() {
-            match color {
-                INK => Color32::from_rgb(196, 210, 224),
-                SKETCH => Color32::from_rgb(79, 195, 247),
-                _ => color,
-            }
-        } else {
-            color
+        let theme = crate::theme::tokens();
+        let color = match color {
+            INK => theme.icon_ink,
+            SKETCH => theme.icon_sketch,
+            _ => color,
         };
         if self.enabled {
             color

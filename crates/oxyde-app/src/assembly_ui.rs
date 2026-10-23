@@ -110,6 +110,8 @@ pub struct MateDialog {
     pub aligned: bool,
     /// The user flipped the alignment: it no longer follows the geometry.
     pub aligned_set: bool,
+    /// *Lock rotation*, for a Concentric mate between two axes.
+    pub lock_rotation: bool,
     /// Mates collected in this command, applied together on OK.
     pub pending: Vec<Draft>,
     /// Move the parts as mates are added, rather than on OK.
@@ -137,6 +139,7 @@ impl MateDialog {
         self.second = false;
         self.choice_set = false;
         self.aligned_set = false;
+        self.lock_rotation = false;
         Some(draft)
     }
 
@@ -158,6 +161,8 @@ impl MateDialog {
             a: self.a.clone()?,
             b: self.b.clone()?,
             aligned: self.aligned,
+            // Only Concentric keeps it; the panel shows it only where it applies.
+            lock_rotation: self.lock_rotation && self.choice == MateChoice::Concentric,
         })
     }
 }
@@ -169,6 +174,32 @@ pub struct Draft {
     a: MateRef,
     b: MateRef,
     aligned: bool,
+    lock_rotation: bool,
+}
+
+impl Draft {
+    /// Makes `mate` this draft. A locked turn is taken again when the lock or the geometry
+    /// changes.
+    fn apply_to(&self, mate: &mut oxyde_assembly::Mate) {
+        let same = mate.a == self.a && mate.b == self.b && mate.lock_rotation == self.lock_rotation;
+        mate.kind = self.kind;
+        mate.a = self.a.clone();
+        mate.b = self.b.clone();
+        mate.aligned = self.aligned;
+        mate.lock_rotation = self.lock_rotation;
+        if !same {
+            mate.locked_angle = None;
+        }
+    }
+
+    /// Adds this draft to `assembly` as a new mate.
+    fn add_to(&self, assembly: &mut Assembly) -> MateId {
+        let id = assembly.add_mate(self.kind, self.a.clone(), self.b.clone(), self.aligned);
+        if let Some(m) = assembly.mate_mut(id) {
+            m.lock_rotation = self.lock_rotation;
+        }
+        id
+    }
 }
 
 /// The assembly as it would be with the mates being made, shown while the command is open
@@ -388,10 +419,15 @@ fn describe_ref(doc: &AssemblyDoc, r: &MateRef) -> String {
 /// "Coincident: Face of A<1> — Top Plane of B<1>", for the list of mates to add.
 fn describe_draft(doc: &AssemblyDoc, d: &Draft) -> String {
     format!(
-        "{}: {} — {}",
+        "{}: {} — {}{}",
         d.kind.label(),
         describe_ref(doc, &d.a),
-        describe_ref(doc, &d.b)
+        describe_ref(doc, &d.b),
+        if d.lock_rotation {
+            ", rotation locked"
+        } else {
+            ""
+        }
     )
 }
 
@@ -714,6 +750,7 @@ impl OxydeApp {
             angle: 90.0,
             aligned: true,
             aligned_set: false,
+            lock_rotation: false,
             pending: Vec::new(),
             preview: self.prefs.previews.mates,
         };
@@ -755,6 +792,7 @@ impl OxydeApp {
             angle,
             aligned: mate.aligned,
             aligned_set: true,
+            lock_rotation: mate.lock_rotation,
             pending: Vec::new(),
             preview: true,
         });
@@ -836,16 +874,11 @@ impl OxydeApp {
             let id = match d.editing {
                 Some(id) => {
                     if let Some(m) = doc.assembly.mate_mut(id) {
-                        m.kind = draft.kind;
-                        m.a = draft.a;
-                        m.b = draft.b;
-                        m.aligned = draft.aligned;
+                        draft.apply_to(m);
                     }
                     id
                 }
-                None => doc
-                    .assembly
-                    .add_mate(draft.kind, draft.a, draft.b, draft.aligned),
+                None => draft.add_to(&mut doc.assembly),
             };
             ids.push(id);
         }
@@ -910,14 +943,9 @@ impl OxydeApp {
         let mut assembly = doc.assembly.clone();
         for draft in &drafts {
             match editing.and_then(|id| assembly.mate_mut(id)) {
-                Some(m) => {
-                    m.kind = draft.kind;
-                    m.a = draft.a.clone();
-                    m.b = draft.b.clone();
-                    m.aligned = draft.aligned;
-                }
+                Some(m) => draft.apply_to(m),
                 None => {
-                    assembly.add_mate(draft.kind, draft.a.clone(), draft.b.clone(), draft.aligned);
+                    draft.add_to(&mut assembly);
                 }
             }
         }
@@ -1539,6 +1567,13 @@ impl OxydeApp {
             {
                 self.materials_window.open = !self.materials_window.open;
             }
+            if icons::command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
+                .on_hover_text("Global variables, and equations driving mates and part dimensions")
+                .clicked()
+            {
+                self.equations
+                    .show(crate::equations_ui::EquationsTab::Equations);
+            }
         });
     }
 
@@ -1579,13 +1614,6 @@ impl OxydeApp {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
-        if icons::command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
-            .on_hover_text("Global variables, and equations driving mates and part dimensions")
-            .clicked()
-        {
-            self.equations
-                .show(crate::equations_ui::EquationsTab::Equations);
-        }
         if icons::command_button(ui, Icon::Rebuild, "Reload\nParts", true, false)
             .on_hover_text("Read the part files again, after editing them (Ctrl+B)")
             .clicked()
@@ -1803,6 +1831,14 @@ impl OxydeApp {
                                 d.aligned_set = true;
                             }
                         });
+                    }
+                    if d.kind().can_lock_rotation(a, b) {
+                        ui.checkbox(&mut d.lock_rotation, "Lock rotation")
+                            .on_hover_text(
+                                "Keeps the parts from turning about the shared axis, as they \
+                                 are now: a screw or a foot is then held by this and one \
+                                 Coincident mate",
+                            );
                     }
                 }
                 if d.editing.is_none() {

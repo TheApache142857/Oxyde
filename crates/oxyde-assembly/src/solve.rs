@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use oxyde_geom::{Point3, Vec3};
 
-use crate::mate::{closest_alignment, residuals};
+use crate::mate::{
+    Lock, closest_alignment, lock_angle, lock_directions, lock_residuals, residuals,
+};
 use crate::{Assembly, ComponentId, MateId, MateRef, Placement, Primitive};
 
 /// Whether a mate holds after solving.
@@ -22,11 +24,15 @@ pub struct ComponentFreedom {
 }
 
 /// The result of [`solve`]: new placements, and how each mate and component fared.
+/// [`Assembly::apply_solution`] puts it in the assembly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Solution {
     pub placements: Vec<(ComponentId, Placement)>,
     pub mates: Vec<(MateId, MateStatus)>,
     pub freedom: Vec<ComponentFreedom>,
+    /// The turn each mate with *Lock rotation* held ([`crate::Mate::locked_angle`]), to
+    /// keep for the next solve.
+    pub locks: Vec<(MateId, f64)>,
 }
 
 impl Solution {
@@ -62,6 +68,8 @@ struct Active {
     fold: bool,
     a: (ComponentId, Primitive),
     b: (ComponentId, Primitive),
+    /// *Lock rotation*, on a Concentric mate between two axes.
+    lock: Option<Lock>,
 }
 
 /// Largest acceptable error of a held mate (mm, or mm-equivalents for directions).
@@ -121,13 +129,24 @@ pub fn solve_about(
         }
         match (local(&mate.a), local(&mate.b)) {
             (Ok(a), Ok(b)) => {
-                let placed = |c: ComponentId, p: &Primitive| {
-                    p.placed(&assembly.placement_of(c).unwrap_or_default())
-                };
-                let fold = closest_alignment(
-                    &placed(mate.a.component, &a),
-                    &placed(mate.b.component, &b),
-                );
+                let pa = assembly.placement_of(mate.a.component).unwrap_or_default();
+                let pb = assembly.placement_of(mate.b.component).unwrap_or_default();
+                let fold = closest_alignment(&a.placed(&pa), &b.placed(&pb));
+                // The turn held is the one kept from before, else where the parts are now.
+                let lock = (mate.lock_rotation && mate.kind.can_lock_rotation(a.kind(), b.kind()))
+                    .then(|| lock_directions(&a, &b))
+                    .flatten()
+                    .and_then(|across| {
+                        let angle = match mate.locked_angle {
+                            Some(angle) => angle,
+                            None => lock_angle(&a.placed(&pa), across, &pa, &pb)?,
+                        };
+                        Some(Lock {
+                            a: across.0,
+                            b: across.1,
+                            angle,
+                        })
+                    });
                 active.push(Active {
                     id: mate.id,
                     kind: mate.kind,
@@ -135,6 +154,7 @@ pub fn solve_about(
                     fold,
                     a: (mate.a.component, a),
                     b: (mate.b.component, b),
+                    lock,
                 })
             }
             (Err(e), _) | (_, Err(e)) => statuses.push((mate.id, MateStatus::Error(e))),
@@ -152,6 +172,11 @@ pub fn solve_about(
             }
         }
     });
+
+    let locks = active
+        .iter()
+        .filter_map(|m| m.lock.map(|lock| (m.id, lock.angle)))
+        .collect();
 
     // Groups of mates tied together through components that may move (fixed components tie
     // nothing): each group is solved on its own, which costs far less than one system for
@@ -220,6 +245,7 @@ pub fn solve_about(
         placements,
         mates: statuses,
         freedom,
+        locks,
     }
 }
 
@@ -287,6 +313,13 @@ fn solve_group(
             let b = m.b.1.placed(&placed[&m.b.0]);
             // Errors were ruled out when the mate was accepted.
             let _ = residuals(m.kind, m.aligned, m.fold, &a, &b, size, &mut r);
+            if let Some(lock) = &m.lock {
+                match (placed.get(&m.a.0), placed.get(&m.b.0)) {
+                    (Some(pa), Some(pb)) => lock_residuals(lock, &a, pa, pb, size, &mut r),
+                    // Never: both sides are placed. The lock's three rows stay.
+                    _ => r.extend([0.0; 3]),
+                }
+            }
             spans.push((start, r.len()));
         }
         (r, spans)
@@ -431,6 +464,11 @@ fn half_turns(
             let (a, b) = placed(m, base);
             let fold = closest_alignment(&a, &b);
             let _ = residuals(m.kind, m.aligned, fold, &a, &b, size, &mut r);
+            // The turn that keeps a lock is the better one.
+            if let (Some(lock), Some(pa), Some(pb)) = (&m.lock, base.get(&m.a.0), base.get(&m.b.0))
+            {
+                lock_residuals(lock, &a, pa, pb, size, &mut r);
+            }
         }
         cost(&r)
     };

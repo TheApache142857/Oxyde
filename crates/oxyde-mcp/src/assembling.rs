@@ -85,11 +85,7 @@ pub(crate) fn solve(session: &mut Session) -> Result<oxyde_assembly::Solution> {
     let size = doc.size();
     let solution =
         oxyde_assembly::solve_about(&assembly, |r| doc.local(r), |c| doc.center(c), size);
-    for (component, placement) in &solution.placements {
-        if let Some(c) = assembly.component_mut(*component) {
-            c.placement = *placement;
-        }
-    }
+    assembly.apply_solution(&solution);
     doc.file.assembly = assembly;
     Ok(solution)
 }
@@ -254,8 +250,30 @@ pub(crate) fn add_mate(session: &mut Session, args: &Value) -> Result<ToolOutput
             }
         }
     };
+    let lock_rotation = match args::opt(args, "lock_rotation") {
+        Some(v) => v
+            .as_bool()
+            .ok_or("\"lock_rotation\" must be true or false")?,
+        None => false,
+    };
+    if lock_rotation {
+        let kinds = (doc_ref.local(&a), doc_ref.local(&b));
+        let (Ok(pa), Ok(pb)) = kinds else {
+            return Err("\"lock_rotation\" needs both sides' geometry".to_owned());
+        };
+        if !kind.can_lock_rotation(pa.kind(), pb.kind()) {
+            return Err(
+                "\"lock_rotation\" is for a concentric mate between two axes (round faces, \
+                 circular or straight edges, axes)"
+                    .to_owned(),
+            );
+        }
+    }
     let doc = session.assembly.as_mut().ok_or("no assembly is open")?;
     let id = doc.file.assembly.add_mate(kind, a, b, aligned);
+    if let Some(m) = doc.file.assembly.mate_mut(id) {
+        m.lock_rotation = lock_rotation;
+    }
     let solution = solve(session)?;
     let doc = session.assembly.as_ref().ok_or("no assembly is open")?;
     let status = solution
@@ -294,7 +312,13 @@ fn info(session: &mut Session) -> Result<Value> {
         .assembly
         .mates
         .iter()
-        .map(|m| json!({ "name": m.name, "kind": format!("{:?}", m.kind), "a": m.a.component.0, "b": m.b.component.0 }))
+        .map(|m| {
+            let mut mate = json!({ "name": m.name, "kind": format!("{:?}", m.kind), "a": m.a.component.0, "b": m.b.component.0 });
+            if let (true, Some(fields)) = (m.lock_rotation, mate.as_object_mut()) {
+                fields.insert("lock_rotation".to_owned(), json!(true));
+            }
+            mate
+        })
         .collect();
     let mut volume = 0.0;
     for (part, placement, _, _) in doc.leaves() {

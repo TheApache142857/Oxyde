@@ -56,6 +56,14 @@ impl MateKind {
         }
     }
 
+    /// Whether *Lock rotation* applies: a Concentric mate between two axes (round faces,
+    /// circular edges, straight edges or axes), which leaves the components free to turn
+    /// about the axis they share. As in SolidWorks, only Concentric has it.
+    pub fn can_lock_rotation(&self, a: PrimitiveKind, b: PrimitiveKind) -> bool {
+        let axial = |k: PrimitiveKind| matches!(k, PrimitiveKind::Line | PrimitiveKind::Circle);
+        matches!(self, MateKind::Concentric) && axial(a) && axial(b)
+    }
+
     /// Whether the mate's alignment (aligned / anti-aligned) matters.
     pub fn has_alignment(&self, a: PrimitiveKind, b: PrimitiveKind) -> bool {
         use PrimitiveKind::{Circle, Plane};
@@ -116,6 +124,15 @@ pub struct Mate {
     /// Normals (or axes) pointing the same way rather than facing each other.
     pub aligned: bool,
     pub suppressed: bool,
+    /// *Lock rotation*, on a Concentric mate between two axes
+    /// ([`MateKind::can_lock_rotation`]): the components keep their turn about the axis they
+    /// share, so a screw is held by this and one Coincident mate.
+    pub lock_rotation: bool,
+    /// The turn a locked mate holds (radians, from the first side's direction across the
+    /// axis to the second's): taken by the first solve after the lock is set or the
+    /// assembly is read, and kept from then on, so that dragging the part cannot turn it.
+    /// Not saved: the placements saved with the assembly give it back.
+    pub locked_angle: Option<f64>,
 }
 
 /// Geometry a mate works on, in a component's own coordinates or in the assembly's.
@@ -202,6 +219,82 @@ impl Primitive {
             Primitive::Circle { center, normal } => Some((center, normal)),
             _ => None,
         }
+    }
+}
+
+/// What a mate with *Lock rotation* holds: a direction across the axis on each side, in
+/// its component's own coordinates, and the turn from the first to the second about the
+/// first side's axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Lock {
+    pub a: Vec3,
+    pub b: Vec3,
+    pub angle: f64,
+}
+
+/// The directions across their axes a lock compares, from the two sides' geometry in
+/// their components' own coordinates: `None` unless both sides have an axis.
+pub(crate) fn lock_directions(a: &Primitive, b: &Primitive) -> Option<(Vec3, Vec3)> {
+    let across = |p: &Primitive| {
+        let axis = p.axis()?.1.normalized()?;
+        // The component's own axis most across it, laid square to it.
+        let pick = [Vec3::X, Vec3::Y, Vec3::Z]
+            .into_iter()
+            .min_by(|u, v| u.dot(axis).abs().total_cmp(&v.dot(axis).abs()))?;
+        (pick - axis * pick.dot(axis)).normalized()
+    };
+    Some((across(a)?, across(b)?))
+}
+
+/// The first side's axis and the two directions across it, in the assembly, laid flat on
+/// the plane square to that axis. `a` is the first side placed in the assembly.
+fn locked_directions(
+    a: &Primitive,
+    across: (Vec3, Vec3),
+    pa: &Placement,
+    pb: &Placement,
+) -> Option<(Vec3, Vec3, Vec3)> {
+    let axis = a.axis()?.1.normalized()?;
+    let flat = |v: Vec3| {
+        let w = v - axis * v.dot(axis);
+        w.normalized().unwrap_or(w)
+    };
+    Some((
+        axis,
+        flat(pa.apply_vector(across.0)),
+        flat(pb.apply_vector(across.1)),
+    ))
+}
+
+/// The turn a lock would hold with the components where they are now: the angle from the
+/// first side's direction across the axis to the second's.
+pub(crate) fn lock_angle(
+    a: &Primitive,
+    across: (Vec3, Vec3),
+    pa: &Placement,
+    pb: &Placement,
+) -> Option<f64> {
+    let (axis, u, v) = locked_directions(a, across, pa, pb)?;
+    Some(axis.dot(u.cross(v)).atan2(u.dot(v)))
+}
+
+/// The equations of a lock, zero when the second side's direction across the axis is the
+/// first's turned by the locked angle: three of them, always, as the solver counts them.
+pub(crate) fn lock_residuals(
+    lock: &Lock,
+    a: &Primitive,
+    pa: &Placement,
+    pb: &Placement,
+    size: f64,
+    out: &mut Vec<f64>,
+) {
+    match locked_directions(a, (lock.a, lock.b), pa, pb) {
+        Some((axis, u, v)) => {
+            // Rather than the difference of angles, which jumps from π to −π.
+            let turned = u * lock.angle.cos() + axis.cross(u) * lock.angle.sin();
+            push3(out, v - turned, size);
+        }
+        None => out.extend([0.0; 3]),
     }
 }
 

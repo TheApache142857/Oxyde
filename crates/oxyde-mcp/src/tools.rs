@@ -545,7 +545,8 @@ pub fn list() -> Vec<Value> {
             assembly's own planes. On a sub-assembly component, \"path\": [component names or ids inside it] \
             reaches the part whose face or edge is meant.",
             json!({ "kind": json!({ "type": "string", "enum": ["coincident", "concentric", "parallel", "perpendicular", "distance", "angle"] }),
-                "a": any(""), "b": any(""), "value": number("mm or degrees"), "aligned": boolean("Normals the same way (default: as they are).") }),
+                "a": any(""), "b": any(""), "value": number("mm or degrees"), "aligned": boolean("Normals the same way (default: as they are)."),
+                "lock_rotation": boolean("Concentric between two axes only: the parts keep their turn about the axis, so a screw needs this and one coincident mate (default false).") }),
             &["kind", "a", "b"],
         ),
         tool(

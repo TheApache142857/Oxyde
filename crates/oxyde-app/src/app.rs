@@ -319,7 +319,6 @@ pub struct OxydeApp {
 
 impl OxydeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
-        crate::theme::load_fonts(&cc.egui_ctx);
         let mut app = Self::blank(crate::prefs::Preferences::load(), file);
         let (materials, problem) = crate::materials::load();
         app.materials = materials;
