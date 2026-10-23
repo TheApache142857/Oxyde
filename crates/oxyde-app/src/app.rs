@@ -2234,6 +2234,7 @@ impl OxydeApp {
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| self.assembly_viewport(ui));
             self.bom_window(ctx);
+            self.assembly_equations_window(ctx);
             self.evaluate_windows(ctx);
             self.interference_window(ctx);
             self.mesh_export_window(ctx);

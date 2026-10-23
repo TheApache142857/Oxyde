@@ -572,8 +572,18 @@ impl OxydeApp {
                 doc.path = Some(path.clone());
                 doc.modified = false;
                 doc.read_only = false;
+                // The parts its equations changed are saved with it, as SolidWorks does.
+                let (saved, notes) = doc.save_changed_parts();
                 self.remember_recent(&path);
                 self.status = format!("Saved {}", path.display());
+                if saved > 0 {
+                    let plural = if saved == 1 { "" } else { "s" };
+                    self.status.push_str(&format!(" and {saved} part{plural}"));
+                }
+                if !notes.is_empty() {
+                    self.status
+                        .push_str(&format!("; not saved: {}", notes.join("; ")));
+                }
                 true
             }
             Err(e) => {
@@ -1305,6 +1315,18 @@ impl OxydeApp {
                 }
                 ui.separator();
                 if ui
+                    .button("Equations…")
+                    .on_hover_text(
+                        "Global variables, and equations driving mates and part dimensions",
+                    )
+                    .clicked()
+                {
+                    ui.close_menu();
+                    self.equations
+                        .show(crate::equations_ui::EquationsTab::Equations);
+                }
+                ui.separator();
+                if ui
                     .button("Materials…")
                     .on_hover_text(
                         "The material library; editing a material changes every part made of it",
@@ -1541,6 +1563,13 @@ impl OxydeApp {
         ui.add_space(2.0);
         ui.separator();
         ui.add_space(2.0);
+        if icons::command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
+            .on_hover_text("Global variables, and equations driving mates and part dimensions")
+            .clicked()
+        {
+            self.equations
+                .show(crate::equations_ui::EquationsTab::Equations);
+        }
         if icons::command_button(ui, Icon::Rebuild, "Reload\nParts", true, false)
             .on_hover_text("Read the part files again, after editing them (Ctrl+B)")
             .clicked()
@@ -1603,6 +1632,7 @@ impl OxydeApp {
             _ => None,
         };
         let ready = d.a.is_some() && d.b.is_some();
+        let driven = d.editing.is_some_and(|id| doc.assembly.is_mate_driven(id));
         let text_a = d.a.as_ref().map(|r| describe_ref(doc, r));
         let text_b = d.b.as_ref().map(|r| describe_ref(doc, r));
         // What the preview says about the mates being made: the edited one, else the
@@ -1706,6 +1736,20 @@ impl OxydeApp {
                     }
                 });
                 match d.choice {
+                    // A value an equation drives is changed in Tools › Equations.
+                    MateChoice::Distance | MateChoice::Angle if driven => {
+                        ui.horizontal(|ui| {
+                            let (label, text) = if d.choice == MateChoice::Distance {
+                                ("Distance", format!("Σ {} mm", d.distance))
+                            } else {
+                                ("Angle", format!("Σ {}°", d.angle))
+                            };
+                            ui.label(label);
+                            ui.label(text).on_hover_text(
+                                "Driven by an equation of the assembly (Tools › Equations)",
+                            );
+                        });
+                    }
                     MateChoice::Distance => {
                         ui.horizontal(|ui| {
                             ui.label("Distance");
@@ -2823,6 +2867,11 @@ impl OxydeApp {
         let Some(doc) = self.asm.as_mut() else {
             return;
         };
+        // Parts the assembly's equations changed (on undo, a mate edited…) are rebuilt
+        // before they are drawn.
+        if doc.has_pending_parts() {
+            doc.settle(&mut self.kernel);
+        }
         if self.asm_scene == Some(doc.revision) {
             return;
         }

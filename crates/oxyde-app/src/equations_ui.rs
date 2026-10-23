@@ -11,6 +11,9 @@
 //! A part can be linked to an equations file shared with other parts (SolidWorks' "Link to
 //! external file"): its variables show with 🔗, and changing one writes it into the file,
 //! which every part linked to it reads when it is opened.
+//!
+//! In an assembly the same window shows the assembly's own equations
+//! (`assembly_equations_ui.rs`).
 
 use std::collections::HashMap;
 
@@ -19,7 +22,7 @@ use oxyde_model::{Dimension, DimensionRef, DimensionUnit, GlobalId, ModelError, 
 
 use crate::app::OxydeApp;
 
-fn error() -> Color32 {
+pub(crate) fn error() -> Color32 {
     crate::theme::tokens().err
 }
 
@@ -31,7 +34,7 @@ pub enum EquationsTab {
 
 /// A text field of the window, while it is being typed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Field {
+pub(crate) enum Field {
     DimensionName(DimensionRef),
     GlobalName(GlobalId),
     GlobalExpression(GlobalId),
@@ -42,11 +45,16 @@ pub struct EquationsWindow {
     pub open: bool,
     pub tab: EquationsTab,
     /// Text of the field being typed in; every other field shows the model.
-    editing: HashMap<Field, String>,
-    new_global_name: String,
-    new_global_expression: String,
+    pub(crate) editing: HashMap<Field, String>,
+    pub(crate) new_global_name: String,
+    pub(crate) new_global_expression: String,
     new_equation_target: Option<DimensionRef>,
-    new_equation_expression: String,
+    pub(crate) new_equation_expression: String,
+    /// In an assembly: what the new equation drives, and the text narrowing the list.
+    pub(crate) new_assembly_target: Option<oxyde_assembly::AsmDimension>,
+    pub(crate) target_filter: String,
+    /// In an assembly: the mate whose value is being dragged, one undo step for the drag.
+    pub(crate) editing_mate: Option<oxyde_assembly::MateId>,
 }
 
 impl EquationsWindow {
@@ -59,6 +67,9 @@ impl EquationsWindow {
             new_global_expression: String::new(),
             new_equation_target: None,
             new_equation_expression: String::new(),
+            new_assembly_target: None,
+            target_filter: String::new(),
+            editing_mate: None,
         }
     }
 
@@ -69,7 +80,7 @@ impl EquationsWindow {
 
     /// A text field that shows `current` unless it is being typed in. Returns the new text
     /// when the user is done (focus lost or Enter) and it differs.
-    fn field(
+    pub(crate) fn field(
         &mut self,
         ui: &mut egui::Ui,
         field: Field,
@@ -113,7 +124,7 @@ enum Change {
 
 /// The value an expression evaluates to (with the unit of its dimension, if any), or its
 /// error.
-fn result_label(
+pub(crate) fn result_label(
     ui: &mut egui::Ui,
     result: Option<&Result<f64, String>>,
     unit: Option<DimensionUnit>,
@@ -134,7 +145,7 @@ fn result_label(
     }
 }
 
-fn format_value(value: f64, unit: DimensionUnit) -> String {
+pub(crate) fn format_value(value: f64, unit: DimensionUnit) -> String {
     match unit {
         DimensionUnit::Count => format!("{value:.0}"),
         _ => {

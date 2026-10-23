@@ -1,7 +1,7 @@
 //! The assembly being put together: its file, and its components' parts and
 //! sub-assemblies loaded (rebuilt and meshed) for pictures, mates and measures.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use oxyde_assembly::{ComponentId, MateRef, MateTarget, Placement, Primitive};
@@ -17,6 +17,8 @@ use crate::geometry::Solids;
 
 /// A part file rebuilt and meshed.
 pub(crate) struct LoadedPart {
+    /// The part file: instances of a part are loaded one by one, and share it.
+    pub file: PathBuf,
     pub part: Part,
     pub mesh: Mesh,
     pub bounds: Option<(Point3, Point3)>,
@@ -59,6 +61,10 @@ pub(crate) struct AssemblyDoc {
     /// The folder component paths are relative to.
     pub dir: PathBuf,
     pub loaded: BTreeMap<ComponentId, Loaded>,
+    /// The last evaluation of the assembly's equations.
+    pub equation_results: oxyde_model::EquationResults,
+    /// Part files the assembly's equations changed, saved with it.
+    pub changed_parts: BTreeSet<PathBuf>,
 }
 
 /// Sub-assemblies nest at most this deep, so a file that contains itself is refused.
@@ -276,7 +282,12 @@ pub(crate) fn load(kernel: &mut OcctKernel, path: &Path, depth: usize) -> Result
                 }
                 None => (Mesh::default(), None),
             };
-            Ok(Loaded::Part(Box::new(LoadedPart { part, mesh, bounds })))
+            Ok(Loaded::Part(Box::new(LoadedPart {
+                file: path.to_path_buf(),
+                part,
+                mesh,
+                bounds,
+            })))
         }
         DocumentKind::Assembly => {
             let file = load_assembly(path).map_err(|e| format!("{}: {e}", path.display()))?;

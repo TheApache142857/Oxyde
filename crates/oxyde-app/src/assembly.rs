@@ -5,7 +5,7 @@
 //! Sub-assemblies are rigid: their components sit where their own file put them. Only the
 //! top-level components move when the mates are solved.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use oxyde_assembly::scene::{self, MeshRange};
@@ -16,7 +16,7 @@ use oxyde_assembly::{
 use oxyde_format::{AssemblyFile, Properties};
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{Kernel, Mesh};
-use oxyde_model::{Appearance, EdgeName, FaceName, Part};
+use oxyde_model::{Appearance, EdgeName, EquationResults, FaceName, Part};
 use oxyde_render::Pick;
 
 use crate::jobs::Progress;
@@ -31,6 +31,9 @@ pub struct LoadedPart {
     pub mesh: Option<Mesh>,
     /// Corners of the part's bounding box, in its own coordinates.
     pub bounds: Option<(Point3, Point3)>,
+    /// Its file holds older values of its linked equations file than the part now has:
+    /// saving the assembly saves it too.
+    pub stale: bool,
 }
 
 /// A sub-assembly file used by the assembly.
@@ -145,7 +148,14 @@ pub struct AssemblyDoc {
     pub volumes: HashMap<PathBuf, Option<f64>>,
     /// When each file in `docs` was last changed on disk as it was read, to read again
     /// only what changed ([`AssemblyDoc::reload_changed_with`]).
-    stamps: HashMap<PathBuf, Option<std::time::SystemTime>>,
+    pub(crate) stamps: HashMap<PathBuf, Option<std::time::SystemTime>>,
+    /// The last evaluation of the assembly's equations.
+    pub equation_results: EquationResults,
+    /// Part files the equations changed, waiting to be rebuilt and meshed again.
+    pub(crate) pending: BTreeSet<PathBuf>,
+    /// Part files the assembly changed (driven by its equations, or refreshed from a
+    /// linked equations file), saved with it.
+    pub changed_parts: BTreeSet<PathBuf>,
     undo: Vec<Assembly>,
     redo: Vec<Assembly>,
 }
@@ -177,6 +187,9 @@ impl AssemblyDoc {
             last_solve: None,
             volumes: HashMap::new(),
             stamps: HashMap::new(),
+            equation_results: EquationResults::default(),
+            pending: BTreeSet::new(),
+            changed_parts: BTreeSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -619,8 +632,15 @@ impl AssemblyDoc {
         solution
     }
 
-    /// Solves the document's own mates.
+    /// Evaluates the assembly's equations and solves its mates. Parts the equations drive
+    /// change at once and are rebuilt by [`AssemblyDoc::settle`].
     pub fn solve(&mut self) {
+        self.evaluate_equations();
+        self.solve_mates();
+    }
+
+    /// Solves the document's own mates.
+    pub(crate) fn solve_mates(&mut self) {
         let start = std::time::Instant::now();
         let mut assembly = std::mem::take(&mut self.assembly);
         let solution = self.solve_assembly(&mut assembly);
@@ -952,7 +972,7 @@ fn locate(component: &Component, folder: Option<&Path>) -> (PathBuf, Option<Path
 /// the whole tree is known; the part files met are only listed, to be loaded together
 /// afterwards ([`load_many`]).
 /// When a file was last changed, as the file system tells it.
-fn modified(path: &Path) -> Option<std::time::SystemTime> {
+pub(crate) fn modified(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
@@ -1167,24 +1187,35 @@ fn load_many<K: Kernel>(
 
 /// Opens and rebuilds a part file, and meshes it.
 pub fn load<K: Kernel>(path: &Path, kernel: &mut K, fraction: f64) -> Result<LoadedPart, String> {
-    let file = oxyde_format::load_part(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (file, stale) =
+        oxyde_format::load_part_refreshed(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut part = Part::from_definition(file.definition).map_err(|e| e.to_string())?;
     part.rebuild(kernel);
-    let (mesh, bounds) = match part.body() {
-        Some(body) => {
-            let mesh = crate::app::tessellate_bodies(kernel, body, fraction).ok();
-            let bounds = mesh.as_ref().and_then(mesh_bounds);
-            (mesh, bounds)
-        }
-        None => (None, None),
-    };
+    let (mesh, bounds) = mesh_part(&part, kernel, fraction);
     Ok(LoadedPart {
         document_id: file.document_id,
         properties: file.properties,
         part,
         mesh,
         bounds,
+        stale,
     })
+}
+
+/// A rebuilt part's mesh, and its bounds in its own coordinates.
+pub(crate) fn mesh_part<K: Kernel>(
+    part: &Part,
+    kernel: &mut K,
+    fraction: f64,
+) -> (Option<Mesh>, Option<(Point3, Point3)>) {
+    match part.body() {
+        Some(body) => {
+            let mesh = crate::app::tessellate_bodies(kernel, body, fraction).ok();
+            let bounds = mesh.as_ref().and_then(mesh_bounds);
+            (mesh, bounds)
+        }
+        None => (None, None),
+    }
 }
 
 fn mesh_bounds(mesh: &Mesh) -> Option<(Point3, Point3)> {

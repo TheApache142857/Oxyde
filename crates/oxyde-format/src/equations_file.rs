@@ -9,12 +9,13 @@
 //! ```
 //!
 //! Lines starting with `'` are comments, as in SolidWorks; blank lines are ignored. A part
-//! linked to the file (its `equations_file` in `model.json`) keeps a copy of the variables
-//! and refreshes them from the file when it is opened, so a part whose file has gone still
-//! opens with the values it last read.
+//! or an assembly linked to the file (its `equations_file` in `model.json` or
+//! `assembly.json`) keeps a copy of the variables and refreshes them from the file when it
+//! is opened, so a document whose file has gone still opens with the values it last read.
 
 use std::path::{Path, PathBuf};
 
+use oxyde_assembly::{Assembly, TopLevelOnly};
 use oxyde_model::{LinkedValue, PartDefinition};
 
 use crate::FormatError;
@@ -112,7 +113,8 @@ pub fn update_equations_file(path: &Path, values: &[LinkedValue]) -> Result<(), 
     crate::write_file(path, text.as_bytes())
 }
 
-/// Where the equations file linked to the part saved at `part_path` is.
+/// Where the equations file linked to the document (part or assembly) saved at
+/// `part_path` is.
 pub fn linked_file_path(part_path: &Path, linked_file: &str) -> PathBuf {
     let file = Path::new(linked_file);
     if file.is_absolute() {
@@ -138,6 +140,22 @@ pub fn refresh_linked_equations(
     let values = read_equations_file(&linked_file_path(part_path, &file))?;
     definition
         .apply_linked_values(&values)
+        .map_err(FormatError::InvalidModel)?;
+    Ok(true)
+}
+
+/// Refreshes the linked variables of the assembly saved at `assembly_path` from its
+/// equations file, as [`refresh_linked_equations`] does for a part.
+pub fn refresh_assembly_linked_equations(
+    assembly_path: &Path,
+    assembly: &mut Assembly,
+) -> Result<bool, FormatError> {
+    let Some(file) = assembly.equations.linked_file.clone() else {
+        return Ok(false);
+    };
+    let values = read_equations_file(&linked_file_path(assembly_path, &file))?;
+    assembly
+        .apply_linked_values(&values, &TopLevelOnly)
         .map_err(FormatError::InvalidModel)?;
     Ok(true)
 }

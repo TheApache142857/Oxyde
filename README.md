@@ -91,8 +91,10 @@ what changed in each version is in the [changelog](CHANGELOG.md).
   sketch on a face stays where it was when an earlier dimension changes. Dimensions have names
   too (`D1@Sketch1`).
 - **Parameters and configurations:** global variables, equations
-  (`"D1@Sketch1" = "Width" * 2`) and named variants of a part with their own dimensions and
-  suppressed features. Every value field takes arithmetic with units: `80/2`, `3/8 in`, `45deg`.
+  (`"D1@Sketch1" = "Width" * 2`), shared between parts and assemblies through a linked
+  equations file, and named variants of a part with their own dimensions and suppressed
+  features. Assemblies have equations of their own, driving mate values and the dimensions of
+  their parts (`"D1@Sketch1@Top panel<1>.Part" = "Width" - 6`). Every value field takes arithmetic with units: `80/2`, `3/8 in`, `45deg`.
 - **Assemblies** (`.oxyasm`): parts and sub-assemblies, coincident, concentric, parallel,
   perpendicular, distance and angle mates with a live preview, components dragged while the mates
   hold, parts edited in place with the rest of the assembly ghosted around them, interference

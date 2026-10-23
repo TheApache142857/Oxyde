@@ -396,12 +396,23 @@ An assembly stores no geometry and no copy of its parts: it refers to part files
     { "id": 2, "name": "Distance1", "type": "distance", "value": 5, "aligned": false,
       "a": { "component": 1, "plane": "top" },
       "b": { "component": 2, "face": { "key": { "type": "end_cap", "feature": 2 } } } }
-  ]
+  ],
+  "global_variables": [
+    { "id": 1, "name": "Width", "expression": "233", "linked": true },
+    { "id": 2, "name": "Gap", "expression": "2.5" }
+  ],
+  "equations": [
+    { "dimension": "D1@Distance1", "expression": "\"Gap\" * 2" },
+    { "dimension": "D1@Boss-Extrude1@Base<1>.Part", "expression": "\"Width\" - 6" }
+  ],
+  "next_global_id": 3,
+  "equations_file": "Case dimensions.txt"
 }
 ```
 
 - **Components** are instances of part files or of other assemblies (sub-assemblies; the file's manifest says which). `path` is relative to the assembly's folder, with `/` separators. When the file is not there, Oxyde looks in the assembly's folder for a part with the same `document_id`, so a moved or renamed part is still found. `name` is unique in the assembly (`Stem<n>`, as in SolidWorks). A component's placement maps part coordinates to assembly coordinates: `p' = rotation · p + translation` (rotation rows, an orthonormal matrix with determinant +1; lengths in mm). `fixed` components never move when mates are solved; `hidden` is display only. An optional `appearance` (same shape as a part's, see §3 *Appearances*; its texture images go under `textures/` in the assembly file) is drawn instead of the part's own appearances for that component, as in SolidWorks. Through sub-assemblies, the outermost component appearance on the way to a part wins: the top assembly's component, else the sub-assembly's, else the part's own.
 - **Mates**: `type` is `coincident`, `concentric`, `parallel`, `perpendicular`, `distance` (`value` in mm) or `angle` (`value` in radians, 0 to π; an angle with a line is read as at most π/2, and between a line and a plane it is measured from the plane). `a` and `b` name a component, an optional `path` and one of: `face` or `edge` (persistent names, as in a part's `model.json`, resolved in that part's rebuilt body), `plane` (`front`, `top`, `right`: the part's standard planes), `axis` (`x`, `y`, `z`) or `origin` (`true`). `aligned`: normals or axes point the same way (otherwise they face each other). `suppressed` mates are kept but not solved. When the component is a sub-assembly, `path` lists component ids inside it, level by level, down to the part holding the face or edge (`"path": [3, 1]`: component 3 of the sub-assembly, then component 1 of that one); without `path`, `plane`, `axis` and `origin` are the sub-assembly's own.
+- **Equations** (optional; absent = none), as SolidWorks assemblies have them, with the keys and rules of `model.json`'s (§3 *Equations*): `global_variables`, `equations`, `next_global_id`, and `equations_file`, the assembly's linked equations file, relative to the assembly's folder. An equation's `dimension` is either a mate's value, `D1@` and the mate's `name` (a `distance` in mm, an `angle` in degrees), or a dimension or global variable of a part of the assembly, written as SolidWorks does: its name in the part, then the component's `name` followed by `.Part`, then, for a part inside sub-assemblies, each sub-assembly component holding it, outwards, followed by `.Assembly` (`D1@Sketch1@Base<1>.Part`, `Thickness@Base<1>.Part`, `D1@Sketch1@SSD<1>.Part@SSD holder<1>.Assembly`). Expressions may name the same things. A name that matches nothing is kept and reported, as in parts. A mate's `value` is the last value its equation gave it, and a part driven by an equation has that value saved in its own file, so a reader that ignores the equations sees the assembly as it was solved; the part's file says nothing of being driven. Every instance of a part shares its file, so the equations give each of its values one value. The keys are additive and need no new `format_version`.
 - Placements are the solved result, saved so that a reader without a solver sees the assembly as it was. Oxyde re-solves on open, starting from them.
 - Readers check that component and mate ids are unique and below the `next_…` counters, that component names are unique, and that mates refer to existing components. Component `0` in a mate is the assembly itself: its own `plane`, `axis` or `origin`, fixed at the identity (components are numbered from 1).
 

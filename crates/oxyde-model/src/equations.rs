@@ -11,8 +11,13 @@
 //!
 //! Evaluation follows dependencies, whatever the order of the lists; a circular reference is
 //! an error on every equation involved.
+//!
+//! [`Equations`] is generic over what its equations drive: a part's dimensions here, an
+//! assembly's mate values and part dimensions in `oxyde-assembly`. The lists, their text
+//! form, linked equations files and the evaluation are the same for both.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 
 use crate::dimensions::{Dimension, DimensionRef, DimensionUnit, list_dimensions};
 use crate::error::ModelError;
@@ -20,38 +25,38 @@ use crate::expression::{Expr, GlobalId, Operand};
 use crate::part::{Part, PartDefinition};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GlobalVariable {
+pub struct GlobalVariable<D = DimensionRef> {
     pub id: GlobalId,
     pub name: String,
-    pub expr: Expr,
-    /// Read from the part's linked equations file ([`Equations::linked_file`]): the part
-    /// keeps a copy, refreshed from the file whenever the part is opened.
+    pub expr: Expr<D>,
+    /// Read from the document's linked equations file ([`Equations::linked_file`]): the
+    /// document keeps a copy, refreshed from the file whenever it is opened.
     pub linked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Equation {
+pub struct Equation<D = DimensionRef> {
     /// The driven dimension; `None` if its name matched nothing when the equation was read
     /// from a file.
-    pub target: Option<DimensionRef>,
+    pub target: Option<D>,
     /// Full name of the target as last known ("D1@Sketch1").
     pub target_name: String,
-    pub expr: Expr,
+    pub expr: Expr<D>,
 }
 
-/// Every global variable and equation of a part.
+/// Every global variable and equation of a part, or, with another `D`, of an assembly.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Equations {
-    pub globals: Vec<GlobalVariable>,
-    pub equations: Vec<Equation>,
+pub struct Equations<D = DimensionRef> {
+    pub globals: Vec<GlobalVariable<D>>,
+    pub equations: Vec<Equation<D>>,
     /// Id the next new global variable will get.
     pub next_global_id: u32,
-    /// Path of the linked equations file, relative to the part's folder (SolidWorks' "Link
-    /// to external file"): parts linked to the same file share its variables.
+    /// Path of the linked equations file, relative to the document's folder (SolidWorks'
+    /// "Link to external file"): documents linked to the same file share its variables.
     pub linked_file: Option<String>,
 }
 
-impl Default for Equations {
+impl<D> Default for Equations<D> {
     fn default() -> Self {
         Self {
             globals: Vec::new(),
@@ -62,13 +67,51 @@ impl Default for Equations {
     }
 }
 
-impl Equations {
+/// The dimensions a set of equations reads and drives, in display units: millimetres,
+/// degrees and counts.
+pub trait Dimensions<D> {
+    /// The current value of `dimension`, or `None` if it does not exist.
+    fn value(&self, dimension: &D) -> Option<f64>;
+
+    /// Sets `dimension` to `value`, as an equation drives it. Returns the value it now has
+    /// (a count is rounded), or why it cannot take that value.
+    fn drive(&mut self, dimension: &D, value: f64) -> Result<f64, String>;
+}
+
+/// Values found by the last evaluation, in the order of [`Equations`]' lists (in display
+/// units), or why each could not be evaluated.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EquationResults {
+    pub globals: Vec<Result<f64, String>>,
+    pub equations: Vec<Result<f64, String>>,
+}
+
+impl<D> Equations<D> {
     pub fn is_empty(&self) -> bool {
         self.globals.is_empty() && self.equations.is_empty() && self.linked_file.is_none()
     }
+}
 
+/// What a quoted name refers to: a dimension (found by `dimension`) when it contains '@', as
+/// every dimension's full name does, else a global variable.
+fn resolve_name<D>(
+    name: &str,
+    globals: &[GlobalVariable<D>],
+    dimension: &dyn Fn(&str) -> Option<D>,
+) -> Option<Operand<D>> {
+    if name.contains('@') {
+        dimension(name).map(Operand::Dimension)
+    } else {
+        globals
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| Operand::Global(g.id))
+    }
+}
+
+impl<D: Clone + Eq + Hash> Equations<D> {
     /// Checks names and ids, and raises `next_global_id` above every id in use.
-    pub(crate) fn validate(&mut self) -> Result<(), ModelError> {
+    pub fn validate(&mut self) -> Result<(), ModelError> {
         let invalid = |reason: String| Err(ModelError::InvalidDefinition(reason));
         let mut ids = HashSet::new();
         let mut names = HashSet::new();
@@ -85,24 +128,419 @@ impl Equations {
         }
         let mut targets = HashSet::new();
         for equation in &self.equations {
-            if let Some(target) = equation.target {
-                if !targets.insert(target) {
-                    return invalid(format!("two equations drive {}", equation.target_name));
-                }
+            if equation.target.as_ref().is_some_and(|t| !targets.insert(t)) {
+                return invalid(format!("two equations drive {}", equation.target_name));
             }
         }
         let highest = self.globals.iter().map(|g| g.id.0).max().unwrap_or(0);
         self.next_global_id = self.next_global_id.max(highest + 1);
         Ok(())
     }
-}
 
-/// Values found by the last evaluation, in the order of [`Equations`]' lists (in display
-/// units), or why each could not be evaluated.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct EquationResults {
-    pub globals: Vec<Result<f64, String>>,
-    pub equations: Vec<Result<f64, String>>,
+    /// The current name of a reference, or `None` if it no longer exists.
+    fn name_of(
+        &self,
+        operand: &Operand<D>,
+        dimension_name: &dyn Fn(&D) -> Option<String>,
+    ) -> Option<String> {
+        match operand {
+            Operand::Global(id) => self
+                .globals
+                .iter()
+                .find(|g| g.id == *id)
+                .map(|g| g.name.clone()),
+            Operand::Dimension(d) => dimension_name(d),
+        }
+    }
+
+    /// Parses an expression typed by the user; every name must exist. `dimension` finds a
+    /// dimension by its full name.
+    pub fn parse(
+        &self,
+        text: &str,
+        dimension: &dyn Fn(&str) -> Option<D>,
+    ) -> Result<Expr<D>, ModelError> {
+        let expr = Expr::parse(text, &|name| resolve_name(name, &self.globals, dimension))
+            .map_err(ModelError::Expression)?;
+        if let Some(name) = expr.unresolved().first() {
+            return Err(ModelError::Expression(format!(
+                "\"{name}\" is neither a global variable nor a dimension"
+            )));
+        }
+        Ok(expr)
+    }
+
+    /// An expression written with the current names.
+    pub fn expression_text(
+        &self,
+        expr: &Expr<D>,
+        dimension_name: &dyn Fn(&D) -> Option<String>,
+    ) -> String {
+        let mut expr = expr.clone();
+        expr.refresh_names(&|operand| self.name_of(operand, dimension_name));
+        expr.to_string()
+    }
+
+    /// Updates the names remembered by expressions and equation targets, after a rename.
+    pub fn refresh_names(&mut self, dimension_name: &dyn Fn(&D) -> Option<String>) {
+        let names: Vec<(GlobalId, String)> = self
+            .globals
+            .iter()
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+        let name_of = |operand: &Operand<D>| match operand {
+            Operand::Global(id) => names
+                .iter()
+                .find(|(g, _)| g == id)
+                .map(|(_, name)| name.clone()),
+            Operand::Dimension(d) => dimension_name(d),
+        };
+        for global in &mut self.globals {
+            global.expr.refresh_names(&name_of);
+        }
+        for equation in &mut self.equations {
+            equation.expr.refresh_names(&name_of);
+            if let Some(name) = equation.target.as_ref().and_then(dimension_name) {
+                equation.target_name = name;
+            }
+        }
+    }
+
+    /// Resolves again the names that matched nothing when they were read: an assembly's
+    /// equations name parts that are only known once they are loaded.
+    pub fn resolve_missing(&mut self, dimension: &dyn Fn(&str) -> Option<D>) {
+        let globals = self.globals.clone();
+        let resolve = |name: &str| resolve_name(name, &globals, dimension);
+        for global in &mut self.globals {
+            global.expr.resolve_missing(&resolve);
+        }
+        let mut targets: HashSet<D> = self
+            .equations
+            .iter()
+            .filter_map(|e| e.target.clone())
+            .collect();
+        for equation in &mut self.equations {
+            equation.expr.resolve_missing(&resolve);
+            if equation.target.is_none() {
+                // A dimension is driven by one equation at most: a second one found for it
+                // stays unresolved, and reported.
+                equation.target =
+                    dimension(&equation.target_name).filter(|t| targets.insert(t.clone()));
+            }
+        }
+    }
+
+    /// The equations written with names, as stored in files.
+    pub fn to_text(&self, dimension_name: &dyn Fn(&D) -> Option<String>) -> EquationsText {
+        EquationsText {
+            globals: self
+                .globals
+                .iter()
+                .map(|g| GlobalText {
+                    id: g.id.0,
+                    name: g.name.clone(),
+                    expression: self.expression_text(&g.expr, dimension_name),
+                    linked: g.linked,
+                })
+                .collect(),
+            equations: self
+                .equations
+                .iter()
+                .map(|e| EquationText {
+                    dimension: e
+                        .target
+                        .as_ref()
+                        .and_then(dimension_name)
+                        .unwrap_or_else(|| e.target_name.clone()),
+                    expression: self.expression_text(&e.expr, dimension_name),
+                })
+                .collect(),
+            next_global_id: self.next_global_id,
+            linked_file: self.linked_file.clone(),
+        }
+    }
+
+    /// Equations read from text (e.g. from a file), `dimension` finding dimensions by full
+    /// name. Names that match nothing are kept, and reported when the equations are
+    /// evaluated; syntax errors and invalid variable names are refused.
+    pub fn from_text(
+        text: &EquationsText,
+        dimension: &dyn Fn(&str) -> Option<D>,
+    ) -> Result<Self, ModelError> {
+        let mut globals: Vec<GlobalVariable<D>> = text
+            .globals
+            .iter()
+            .map(|g| GlobalVariable {
+                id: GlobalId(g.id),
+                name: g.name.clone(),
+                expr: Expr::Number(0.0),
+                linked: g.linked,
+            })
+            .collect();
+        let resolve = |name: &str| resolve_name(name, &globals, dimension);
+        let mut exprs = Vec::with_capacity(text.globals.len());
+        for g in &text.globals {
+            exprs.push(
+                Expr::parse(&g.expression, &resolve)
+                    .map_err(|e| ModelError::Expression(format!("\"{}\": {e}", g.name)))?,
+            );
+        }
+        let mut equations = Vec::with_capacity(text.equations.len());
+        for e in &text.equations {
+            let name = e.dimension.trim().trim_matches('"').to_owned();
+            let target = match resolve(&name) {
+                Some(Operand::Dimension(reference)) => Some(reference),
+                _ => None,
+            };
+            let expr = Expr::parse(&e.expression, &resolve)
+                .map_err(|err| ModelError::Expression(format!("\"{name}\": {err}")))?;
+            equations.push(Equation {
+                target,
+                target_name: name,
+                expr,
+            });
+        }
+        for (global, expr) in globals.iter_mut().zip(exprs) {
+            global.expr = expr;
+        }
+        let mut new = Equations {
+            globals,
+            equations,
+            next_global_id: text.next_global_id,
+            linked_file: text.linked_file.clone(),
+        };
+        new.validate()?;
+        Ok(new)
+    }
+
+    fn check_global_name(&self, id: Option<GlobalId>, name: &str) -> Result<(), ModelError> {
+        if !oxyde_sketch::is_valid_name(name) {
+            return Err(ModelError::InvalidName(name.to_owned()));
+        }
+        if self
+            .globals
+            .iter()
+            .any(|g| Some(g.id) != id && g.name == name)
+        {
+            return Err(ModelError::DuplicateName(name.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Adds a global variable, e.g. `"Width" = 50`.
+    pub fn add_global(&mut self, name: &str, expr: Expr<D>) -> Result<GlobalId, ModelError> {
+        self.check_global_name(None, name)?;
+        let id = GlobalId(self.next_global_id);
+        self.next_global_id += 1;
+        self.globals.push(GlobalVariable {
+            id,
+            name: name.to_owned(),
+            expr,
+            linked: false,
+        });
+        Ok(id)
+    }
+
+    /// Renames a global variable. The names remembered by expressions follow on the next
+    /// [`Equations::refresh_names`].
+    pub fn rename_global(&mut self, id: GlobalId, name: &str) -> Result<(), ModelError> {
+        self.check_global_name(Some(id), name)?;
+        self.global_mut(id)?.name = name.to_owned();
+        Ok(())
+    }
+
+    pub fn set_global_expression(&mut self, id: GlobalId, expr: Expr<D>) -> Result<(), ModelError> {
+        self.global_mut(id)?.expr = expr;
+        Ok(())
+    }
+
+    /// Removes a global variable. Expressions using it keep its name and report an error.
+    pub fn remove_global(&mut self, id: GlobalId) -> Result<(), ModelError> {
+        let index = self
+            .globals
+            .iter()
+            .position(|g| g.id == id)
+            .ok_or_else(|| ModelError::Expression(format!("no global variable {}", id.0)))?;
+        self.globals.remove(index);
+        Ok(())
+    }
+
+    fn global_mut(&mut self, id: GlobalId) -> Result<&mut GlobalVariable<D>, ModelError> {
+        self.globals
+            .iter_mut()
+            .find(|g| g.id == id)
+            .ok_or_else(|| ModelError::Expression(format!("no global variable {}", id.0)))
+    }
+
+    /// Whether an equation drives `target`.
+    pub fn is_driven(&self, target: &D) -> bool {
+        self.equations
+            .iter()
+            .any(|e| e.target.as_ref() == Some(target))
+    }
+
+    /// Adds an equation driving `target`, whose full name is `target_name`. A dimension can
+    /// be driven by one equation only.
+    pub fn add_equation(
+        &mut self,
+        target: D,
+        target_name: String,
+        expr: Expr<D>,
+    ) -> Result<usize, ModelError> {
+        if self.is_driven(&target) {
+            return Err(ModelError::Expression(format!(
+                "\"{target_name}\" is already driven by an equation"
+            )));
+        }
+        self.equations.push(Equation {
+            target: Some(target),
+            target_name,
+            expr,
+        });
+        Ok(self.equations.len() - 1)
+    }
+
+    pub fn set_equation_expression(
+        &mut self,
+        index: usize,
+        expr: Expr<D>,
+    ) -> Result<(), ModelError> {
+        let equation = self
+            .equations
+            .get_mut(index)
+            .ok_or_else(|| ModelError::Expression(format!("no equation {}", index + 1)))?;
+        equation.expr = expr;
+        Ok(())
+    }
+
+    /// Removes an equation; its dimension keeps its last value and becomes editable again.
+    pub fn remove_equation(&mut self, index: usize) -> Result<(), ModelError> {
+        if index >= self.equations.len() {
+            return Err(ModelError::Expression(format!("no equation {}", index + 1)));
+        }
+        self.equations.remove(index);
+        Ok(())
+    }
+
+    /// Evaluates every global variable and equation, in dependency order whatever the order
+    /// of the lists, and drives the dimensions of the equations through `dimensions`.
+    pub fn evaluate(&self, dimensions: &mut dyn Dimensions<D>) -> EquationResults {
+        // Nodes: the global variables, then the equations.
+        let global_count = self.globals.len();
+        let global_node: HashMap<GlobalId, usize> = self
+            .globals
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (g.id, i))
+            .collect();
+        let mut driven_node: HashMap<&D, usize> = HashMap::new();
+        for (j, equation) in self.equations.iter().enumerate() {
+            if let Some(target) = &equation.target {
+                driven_node.entry(target).or_insert(global_count + j);
+            }
+        }
+        let exprs: Vec<&Expr<D>> = self
+            .globals
+            .iter()
+            .map(|g| &g.expr)
+            .chain(self.equations.iter().map(|e| &e.expr))
+            .collect();
+        let count = exprs.len();
+        let mut indegree = vec![0usize; count];
+        let mut users: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (node, expr) in exprs.iter().enumerate() {
+            for operand in expr.operands() {
+                let dependency = match &operand {
+                    Operand::Global(id) => global_node.get(id).copied(),
+                    Operand::Dimension(d) => driven_node.get(d).copied(),
+                };
+                if let Some(list) = dependency.and_then(|d| users.get_mut(d)) {
+                    list.push(node);
+                    if let Some(n) = indegree.get_mut(node) {
+                        *n += 1;
+                    }
+                }
+            }
+        }
+        let mut queue: VecDeque<usize> = (0..count)
+            .filter(|&i| indegree.get(i) == Some(&0))
+            .collect();
+        let mut order = Vec::with_capacity(count);
+        while let Some(node) = queue.pop_front() {
+            order.push(node);
+            for &user in users.get(node).map_or(&[][..], Vec::as_slice) {
+                if let Some(n) = indegree.get_mut(user) {
+                    *n -= 1;
+                    if *n == 0 {
+                        queue.push_back(user);
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<Option<Result<f64, String>>> = vec![None; count];
+        let mut global_values: HashMap<GlobalId, Result<f64, String>> = HashMap::new();
+        // Dimensions driven so far, with the value each now has.
+        let mut driven: HashMap<D, f64> = HashMap::new();
+        let mut failed: HashSet<D> = HashSet::new();
+        for node in order {
+            let Some(expr) = exprs.get(node) else {
+                continue;
+            };
+            let value = {
+                let reader: &dyn Dimensions<D> = dimensions;
+                expr.evaluate(&mut |operand, name| match operand {
+                    Operand::Global(id) => match global_values.get(id) {
+                        Some(Ok(v)) => Ok(*v),
+                        Some(Err(_)) => Err(format!("\"{name}\" has an error")),
+                        None => Err(format!("\"{name}\" does not exist")),
+                    },
+                    Operand::Dimension(d) => {
+                        if failed.contains(d) {
+                            return Err(format!("\"{name}\" has an error"));
+                        }
+                        driven
+                            .get(d)
+                            .copied()
+                            .or_else(|| reader.value(d))
+                            .ok_or_else(|| format!("\"{name}\" does not exist"))
+                    }
+                })
+            };
+            if let Some(global) = self.globals.get(node) {
+                global_values.insert(global.id, value.clone());
+                if let Some(slot) = results.get_mut(node) {
+                    *slot = Some(value);
+                }
+                continue;
+            }
+            let Some(equation) = self.equations.get(node - global_count) else {
+                continue;
+            };
+            let outcome = value.and_then(|shown| {
+                let missing = || format!("\"{}\" does not exist", equation.target_name);
+                let target = equation.target.as_ref().ok_or_else(missing)?;
+                dimensions.value(target).ok_or_else(missing)?;
+                let now = dimensions.drive(target, shown)?;
+                driven.insert(target.clone(), now);
+                Ok(shown)
+            });
+            if let (Err(_), Some(target)) = (&outcome, &equation.target) {
+                failed.insert(target.clone());
+            }
+            if let Some(slot) = results.get_mut(node) {
+                *slot = Some(outcome);
+            }
+        }
+
+        let mut results = results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err("circular reference (or depends on one)".to_owned())));
+        EquationResults {
+            globals: results.by_ref().take(global_count).collect(),
+            equations: results.collect(),
+        }
+    }
 }
 
 // ---- Text form, for files ------------------------------------------------------------------
@@ -131,133 +569,6 @@ pub struct EquationsText {
     pub linked_file: Option<String>,
 }
 
-/// Current name of a reference, or `None` if it no longer exists.
-fn name_of<'a>(
-    dimensions: &'a [Dimension],
-    globals: &'a [GlobalVariable],
-) -> impl Fn(Operand) -> Option<String> + 'a {
-    move |operand: Operand| match operand {
-        Operand::Global(id) => globals.iter().find(|g| g.id == id).map(|g| g.name.clone()),
-        Operand::Dimension(r) => dimensions
-            .iter()
-            .find(|d| d.reference == r)
-            .map(|d| d.full_name.clone()),
-    }
-}
-
-/// What a quoted name refers to: a dimension when it contains '@', else a global variable.
-fn resolver<'a>(
-    dimensions: &'a [Dimension],
-    globals: &'a [GlobalVariable],
-) -> impl Fn(&str) -> Option<Operand> + 'a {
-    move |name: &str| {
-        if name.contains('@') {
-            dimensions
-                .iter()
-                .find(|d| d.full_name == name)
-                .map(|d| Operand::Dimension(d.reference))
-        } else {
-            globals
-                .iter()
-                .find(|g| g.name == name)
-                .map(|g| Operand::Global(g.id))
-        }
-    }
-}
-
-impl PartDefinition {
-    /// The equations written with the current names, e.g. for saving.
-    pub fn equations_text(&self) -> EquationsText {
-        let dimensions = list_dimensions(&self.features, &self.equations);
-        let globals = &self.equations.globals;
-        let name_of = name_of(&dimensions, globals);
-        let print = |expr: &Expr| {
-            let mut expr = expr.clone();
-            expr.refresh_names(&name_of);
-            expr.to_string()
-        };
-        EquationsText {
-            globals: globals
-                .iter()
-                .map(|g| GlobalText {
-                    id: g.id.0,
-                    name: g.name.clone(),
-                    expression: print(&g.expr),
-                    linked: g.linked,
-                })
-                .collect(),
-            equations: self
-                .equations
-                .equations
-                .iter()
-                .map(|e| EquationText {
-                    dimension: e
-                        .target
-                        .and_then(|t| name_of(Operand::Dimension(t)))
-                        .unwrap_or_else(|| e.target_name.clone()),
-                    expression: print(&e.expr),
-                })
-                .collect(),
-            next_global_id: self.equations.next_global_id,
-            linked_file: self.equations.linked_file.clone(),
-        }
-    }
-
-    /// Replaces the equations with ones read from text (e.g. from a file). Names that match
-    /// nothing are kept, and reported when the equations are evaluated; syntax errors and
-    /// invalid variable names are refused.
-    pub fn set_equations_text(&mut self, text: EquationsText) -> Result<(), ModelError> {
-        let mut globals: Vec<GlobalVariable> = text
-            .globals
-            .iter()
-            .map(|g| GlobalVariable {
-                id: GlobalId(g.id),
-                name: g.name.clone(),
-                expr: Expr::Number(0.0),
-                linked: g.linked,
-            })
-            .collect();
-        // Driven flags do not matter for name resolution.
-        let dimensions = list_dimensions(&self.features, &Equations::default());
-        let resolve = resolver(&dimensions, &globals);
-        let mut exprs = Vec::with_capacity(text.globals.len());
-        for g in &text.globals {
-            exprs.push(
-                Expr::parse(&g.expression, &resolve)
-                    .map_err(|e| ModelError::Expression(format!("\"{}\": {e}", g.name)))?,
-            );
-        }
-        let mut equations = Vec::with_capacity(text.equations.len());
-        for e in &text.equations {
-            let name = e.dimension.trim().trim_matches('"').to_owned();
-            let target = match resolve(&name) {
-                Some(Operand::Dimension(reference)) => Some(reference),
-                _ => None,
-            };
-            let expr = Expr::parse(&e.expression, &resolve)
-                .map_err(|err| ModelError::Expression(format!("\"{name}\": {err}")))?;
-            equations.push(Equation {
-                target,
-                target_name: name,
-                expr,
-            });
-        }
-        drop(resolve);
-        for (global, expr) in globals.iter_mut().zip(exprs) {
-            global.expr = expr;
-        }
-        let mut new = Equations {
-            globals,
-            equations,
-            next_global_id: text.next_global_id,
-            linked_file: text.linked_file.clone(),
-        };
-        new.validate()?;
-        self.equations = new;
-        Ok(())
-    }
-}
-
 /// One line of a linked equations file: `"Width" = 233`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkedValue {
@@ -265,7 +576,97 @@ pub struct LinkedValue {
     pub expression: String,
 }
 
+impl EquationsText {
+    /// Links to the equations file `file`, or unlinks with `None`: the variables then stay,
+    /// as ordinary ones, with their last values.
+    pub fn link(&mut self, file: Option<String>) {
+        if file.is_none() {
+            for g in &mut self.globals {
+                g.linked = false;
+            }
+        }
+        self.linked_file = file;
+    }
+
+    /// Takes the variables read from the linked equations file: a variable of the same name
+    /// gets the file's expression and becomes linked, one not there yet is added. Variables
+    /// the file no longer lists keep their last values but are no longer linked.
+    pub fn apply_linked_values(&mut self, values: &[LinkedValue]) {
+        for g in &mut self.globals {
+            g.linked = false;
+        }
+        for value in values {
+            let name = value.name.trim().trim_matches('"').trim();
+            match self.globals.iter_mut().find(|g| g.name == name) {
+                Some(g) => {
+                    g.expression = value.expression.clone();
+                    g.linked = true;
+                }
+                None => {
+                    self.globals.push(GlobalText {
+                        id: self.next_global_id,
+                        name: name.to_owned(),
+                        expression: value.expression.clone(),
+                        linked: true,
+                    });
+                    self.next_global_id += 1;
+                }
+            }
+        }
+    }
+
+    /// The linked variables, as the equations file writes them.
+    pub fn linked_values(&self) -> Vec<LinkedValue> {
+        self.globals
+            .iter()
+            .filter(|g| g.linked)
+            .map(|g| LinkedValue {
+                name: g.name.clone(),
+                expression: g.expression.clone(),
+            })
+            .collect()
+    }
+}
+
+// ---- Parts ---------------------------------------------------------------------------------
+
+/// Full name of a part dimension, from the list of the part's dimensions.
+fn dimension_name(dimensions: &[Dimension]) -> impl Fn(&DimensionRef) -> Option<String> + '_ {
+    move |reference| {
+        dimensions
+            .iter()
+            .find(|d| d.reference == *reference)
+            .map(|d| d.full_name.clone())
+    }
+}
+
+/// A part dimension by full name.
+fn dimension_named(dimensions: &[Dimension]) -> impl Fn(&str) -> Option<DimensionRef> + '_ {
+    move |name| {
+        dimensions
+            .iter()
+            .find(|d| d.full_name == name)
+            .map(|d| d.reference)
+    }
+}
+
 impl PartDefinition {
+    /// The equations written with the current names, e.g. for saving.
+    pub fn equations_text(&self) -> EquationsText {
+        let dimensions = list_dimensions(&self.features, &self.equations);
+        self.equations.to_text(&dimension_name(&dimensions))
+    }
+
+    /// Replaces the equations with ones read from text (e.g. from a file). Names that match
+    /// nothing are kept, and reported when the equations are evaluated; syntax errors and
+    /// invalid variable names are refused.
+    pub fn set_equations_text(&mut self, text: EquationsText) -> Result<(), ModelError> {
+        // Driven flags do not matter for name resolution.
+        let dimensions = list_dimensions(&self.features, &Equations::default());
+        self.equations = Equations::from_text(&text, &dimension_named(&dimensions))?;
+        Ok(())
+    }
+
     /// Links the part to the equations file `file` (relative to the part's folder) and takes
     /// its variables, as [`Self::apply_linked_values`] does. `None` unlinks: the variables
     /// stay, as ordinary ones, with their last values.
@@ -276,12 +677,7 @@ impl PartDefinition {
     ) -> Result<(), ModelError> {
         let mut text = self.equations_text();
         let linking = file.is_some();
-        text.linked_file = file;
-        if !linking {
-            for g in &mut text.globals {
-                g.linked = false;
-            }
-        }
+        text.link(file);
         self.set_equations_text(text)?;
         if linking {
             self.apply_linked_values(values)?;
@@ -289,47 +685,48 @@ impl PartDefinition {
         Ok(())
     }
 
-    /// Takes the variables read from the linked equations file: a variable of the same name
-    /// gets the file's expression and becomes linked, one the part does not have yet is
-    /// added. Variables the file no longer lists keep their last values but are no longer
-    /// linked. All of it at once, so the file's variables may refer to each other.
+    /// Takes the variables read from the linked equations file (see
+    /// [`EquationsText::apply_linked_values`]), all at once, so the file's variables may
+    /// refer to each other.
     pub fn apply_linked_values(&mut self, values: &[LinkedValue]) -> Result<(), ModelError> {
         let mut text = self.equations_text();
-        for g in &mut text.globals {
-            g.linked = false;
-        }
-        for value in values {
-            let name = value.name.trim().trim_matches('"').trim();
-            match text.globals.iter_mut().find(|g| g.name == name) {
-                Some(g) => {
-                    g.expression = value.expression.clone();
-                    g.linked = true;
-                }
-                None => {
-                    text.globals.push(GlobalText {
-                        id: text.next_global_id,
-                        name: name.to_owned(),
-                        expression: value.expression.clone(),
-                        linked: true,
-                    });
-                    text.next_global_id += 1;
-                }
-            }
-        }
+        text.apply_linked_values(values);
         self.set_equations_text(text)
     }
 
     /// The linked variables, as the equations file writes them.
     pub fn linked_values(&self) -> Vec<LinkedValue> {
-        self.equations_text()
-            .globals
-            .into_iter()
-            .filter(|g| g.linked)
-            .map(|g| LinkedValue {
-                name: g.name,
-                expression: g.expression,
-            })
-            .collect()
+        self.equations_text().linked_values()
+    }
+}
+
+/// A part's dimensions as its equations read and drive them.
+struct PartDimensions<'a> {
+    part: &'a mut Part,
+    /// Every dimension's value (internal units) and unit, as it is now.
+    values: HashMap<DimensionRef, (f64, DimensionUnit)>,
+}
+
+impl Dimensions<DimensionRef> for PartDimensions<'_> {
+    fn value(&self, dimension: &DimensionRef) -> Option<f64> {
+        self.values
+            .get(dimension)
+            .map(|(value, unit)| unit.to_display(*value))
+    }
+
+    fn drive(&mut self, dimension: &DimensionRef, shown: f64) -> Result<f64, String> {
+        let &(current, unit) = self
+            .values
+            .get(dimension)
+            .ok_or_else(|| "the dimension does not exist".to_owned())?;
+        let value = unit.from_display(shown)?;
+        if (value - current).abs() > 1e-12 * value.abs().max(1.0) {
+            self.part
+                .set_dimension(*dimension, value)
+                .map_err(|e| e.to_string())?;
+            self.values.insert(*dimension, (value, unit));
+        }
+        Ok(unit.to_display(value))
     }
 }
 
@@ -366,22 +763,14 @@ impl Part {
     /// Parses an expression typed by the user; every name must exist.
     pub fn parse_expression(&self, text: &str) -> Result<Expr, ModelError> {
         let dimensions = self.dimensions();
-        let expr = Expr::parse(text, &resolver(&dimensions, &self.equations.globals))
-            .map_err(ModelError::Expression)?;
-        if let Some(name) = expr.unresolved().first() {
-            return Err(ModelError::Expression(format!(
-                "\"{name}\" is neither a global variable nor a dimension"
-            )));
-        }
-        Ok(expr)
+        self.equations.parse(text, &dimension_named(&dimensions))
     }
 
     /// An expression written with the current names.
     pub fn expression_text(&self, expr: &Expr) -> String {
         let dimensions = self.dimensions();
-        let mut expr = expr.clone();
-        expr.refresh_names(&name_of(&dimensions, &self.equations.globals));
-        expr.to_string()
+        self.equations
+            .expression_text(expr, &dimension_name(&dimensions))
     }
 
     /// Current full name of an equation's driven dimension.
@@ -392,67 +781,25 @@ impl Part {
             .map_or_else(|| equation.target_name.clone(), |d| d.full_name)
     }
 
-    fn check_global_name(&self, id: Option<GlobalId>, name: &str) -> Result<(), ModelError> {
-        if !oxyde_sketch::is_valid_name(name) {
-            return Err(ModelError::InvalidName(name.to_owned()));
-        }
-        if self
-            .equations
-            .globals
-            .iter()
-            .any(|g| Some(g.id) != id && g.name == name)
-        {
-            return Err(ModelError::DuplicateName(name.to_owned()));
-        }
-        Ok(())
-    }
-
     /// Adds a global variable, e.g. `"Width" = 50`.
     pub fn add_global(&mut self, name: &str, expr: Expr) -> Result<GlobalId, ModelError> {
-        self.check_global_name(None, name)?;
-        let id = GlobalId(self.equations.next_global_id);
-        self.equations.next_global_id += 1;
-        self.equations.globals.push(GlobalVariable {
-            id,
-            name: name.to_owned(),
-            expr,
-            linked: false,
-        });
-        Ok(id)
+        self.equations.add_global(name, expr)
     }
 
     /// Renames a global variable; the equations using it follow.
     pub fn rename_global(&mut self, id: GlobalId, name: &str) -> Result<(), ModelError> {
-        self.check_global_name(Some(id), name)?;
-        let global = self.global_mut(id)?;
-        global.name = name.to_owned();
+        self.equations.rename_global(id, name)?;
         self.refresh_equation_names();
         Ok(())
     }
 
     pub fn set_global_expression(&mut self, id: GlobalId, expr: Expr) -> Result<(), ModelError> {
-        self.global_mut(id)?.expr = expr;
-        Ok(())
+        self.equations.set_global_expression(id, expr)
     }
 
     /// Removes a global variable. Expressions using it keep its name and report an error.
     pub fn remove_global(&mut self, id: GlobalId) -> Result<(), ModelError> {
-        let index = self
-            .equations
-            .globals
-            .iter()
-            .position(|g| g.id == id)
-            .ok_or_else(|| ModelError::Expression(format!("no global variable {}", id.0)))?;
-        self.equations.globals.remove(index);
-        Ok(())
-    }
-
-    fn global_mut(&mut self, id: GlobalId) -> Result<&mut GlobalVariable, ModelError> {
-        self.equations
-            .globals
-            .iter_mut()
-            .find(|g| g.id == id)
-            .ok_or_else(|| ModelError::Expression(format!("no global variable {}", id.0)))
+        self.equations.remove_global(id)
     }
 
     /// Adds an equation driving `target`. A dimension can be driven by one equation only.
@@ -460,37 +807,77 @@ impl Part {
         let dimension = self
             .dimension(target)
             .ok_or_else(|| ModelError::UnknownDimension(format!("{target:?}")))?;
-        if self.is_driven(target) {
-            return Err(ModelError::Expression(format!(
-                "\"{}\" is already driven by an equation",
-                dimension.full_name
-            )));
-        }
-        self.equations.equations.push(Equation {
-            target: Some(target),
-            target_name: dimension.full_name,
-            expr,
-        });
-        Ok(self.equations.equations.len() - 1)
+        self.equations
+            .add_equation(target, dimension.full_name, expr)
     }
 
     pub fn set_equation_expression(&mut self, index: usize, expr: Expr) -> Result<(), ModelError> {
-        let equation = self
-            .equations
-            .equations
-            .get_mut(index)
-            .ok_or_else(|| ModelError::Expression(format!("no equation {}", index + 1)))?;
-        equation.expr = expr;
-        Ok(())
+        self.equations.set_equation_expression(index, expr)
     }
 
     /// Removes an equation; its dimension keeps its last value and becomes editable again.
     pub fn remove_equation(&mut self, index: usize) -> Result<(), ModelError> {
-        if index >= self.equations.equations.len() {
-            return Err(ModelError::Expression(format!("no equation {}", index + 1)));
+        self.equations.remove_equation(index)
+    }
+
+    /// The value of a dimension (`D1@Sketch1`) or a global variable (`Width`) in display
+    /// units, as an assembly's equations read it: as of the last rebuild.
+    pub fn value_of(&self, name: &str) -> Option<f64> {
+        let name = name.trim().trim_matches('"');
+        if name.contains('@') {
+            let dimension = self.dimension(self.find_dimension(name)?)?;
+            return Some(dimension.unit.to_display(dimension.value));
         }
-        self.equations.equations.remove(index);
-        Ok(())
+        let index = self.equations.globals.iter().position(|g| g.name == name)?;
+        self.equation_results
+            .globals
+            .get(index)?
+            .as_ref()
+            .ok()
+            .copied()
+    }
+
+    /// Sets a dimension (`D1@Sketch1`) or a global variable (`Width`) to `value`, in display
+    /// units, as an assembly's equation drives it. Returns the value it now has (a count is
+    /// rounded) and whether the part changed: it then needs a rebuild, and saving. A
+    /// dimension the part's own equations drive, and a variable of its linked equations
+    /// file, are refused: the part's own value would win.
+    pub fn drive(&mut self, name: &str, value: f64) -> Result<(f64, bool), String> {
+        let name = name.trim().trim_matches('"');
+        let missing = || format!("\"{name}\" does not exist in the part");
+        if name.contains('@') {
+            let reference = self.find_dimension(name).ok_or_else(missing)?;
+            if self.is_driven(reference) {
+                return Err(format!("\"{name}\" is driven by an equation of the part"));
+            }
+            let dimension = self.dimension(reference).ok_or_else(missing)?;
+            let new = dimension.unit.from_display(value)?;
+            let changed = (new - dimension.value).abs() > 1e-12 * new.abs().max(1.0);
+            if changed {
+                self.set_dimension(reference, new)
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok((dimension.unit.to_display(new), changed));
+        }
+        let global = self
+            .equations
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .ok_or_else(missing)?;
+        if global.linked && self.equations.linked_file.is_some() {
+            return Err(format!(
+                "\"{name}\" comes from the part's linked equations file: change it there"
+            ));
+        }
+        let changed = global.expr != Expr::Number(value);
+        if changed {
+            let id = global.id;
+            self.equations
+                .set_global_expression(id, Expr::Number(value))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok((value, changed))
     }
 
     /// Updates the names remembered by expressions, after a rename.
@@ -499,17 +886,7 @@ impl Part {
             return;
         }
         let dimensions = self.dimensions();
-        let globals = self.equations.globals.clone();
-        let name_of = name_of(&dimensions, &globals);
-        for global in &mut self.equations.globals {
-            global.expr.refresh_names(&name_of);
-        }
-        for equation in &mut self.equations.equations {
-            equation.expr.refresh_names(&name_of);
-            if let Some(name) = equation.target.and_then(|t| name_of(Operand::Dimension(t))) {
-                equation.target_name = name;
-            }
-        }
+        self.equations.refresh_names(&dimension_name(&dimensions));
     }
 
     /// Evaluates every global variable and equation, in dependency order, and sets the
@@ -520,109 +897,14 @@ impl Part {
             return;
         }
         self.refresh_equation_names();
-        let mut values: HashMap<DimensionRef, (f64, DimensionUnit)> = self
+        let values = self
             .dimensions()
             .iter()
             .map(|d| (d.reference, (d.value, d.unit)))
             .collect();
-        let globals = self.equations.globals.clone();
-        let equations = self.equations.equations.clone();
-
-        // Nodes: the global variables, then the equations.
-        let global_count = globals.len();
-        let global_node: HashMap<GlobalId, usize> =
-            globals.iter().enumerate().map(|(i, g)| (g.id, i)).collect();
-        let mut driven_node: HashMap<DimensionRef, usize> = HashMap::new();
-        for (j, equation) in equations.iter().enumerate() {
-            if let Some(target) = equation.target {
-                driven_node.entry(target).or_insert(global_count + j);
-            }
-        }
-        let exprs: Vec<&Expr> = globals
-            .iter()
-            .map(|g| &g.expr)
-            .chain(equations.iter().map(|e| &e.expr))
-            .collect();
-        let count = exprs.len();
-        let mut indegree = vec![0usize; count];
-        let mut users: Vec<Vec<usize>> = vec![Vec::new(); count];
-        for (node, expr) in exprs.iter().enumerate() {
-            for operand in expr.operands() {
-                let dependency = match operand {
-                    Operand::Global(id) => global_node.get(&id).copied(),
-                    Operand::Dimension(r) => driven_node.get(&r).copied(),
-                };
-                if let Some(dependency) = dependency {
-                    indegree[node] += 1;
-                    users[dependency].push(node);
-                }
-            }
-        }
-        let mut queue: VecDeque<usize> = (0..count).filter(|&i| indegree[i] == 0).collect();
-        let mut order = Vec::with_capacity(count);
-        while let Some(node) = queue.pop_front() {
-            order.push(node);
-            for &user in &users[node] {
-                indegree[user] -= 1;
-                if indegree[user] == 0 {
-                    queue.push_back(user);
-                }
-            }
-        }
-
-        let mut results: Vec<Option<Result<f64, String>>> = vec![None; count];
-        let mut global_values: HashMap<GlobalId, Result<f64, String>> = HashMap::new();
-        let mut failed: HashSet<DimensionRef> = HashSet::new();
-        for node in order {
-            let value = exprs[node].evaluate(&mut |operand, name| match operand {
-                Operand::Global(id) => match global_values.get(&id) {
-                    Some(Ok(v)) => Ok(*v),
-                    Some(Err(_)) => Err(format!("\"{name}\" has an error")),
-                    None => Err(format!("\"{name}\" does not exist")),
-                },
-                Operand::Dimension(r) => {
-                    if failed.contains(&r) {
-                        return Err(format!("\"{name}\" has an error"));
-                    }
-                    values
-                        .get(&r)
-                        .map(|(v, unit)| unit.to_display(*v))
-                        .ok_or_else(|| format!("\"{name}\" does not exist"))
-                }
-            });
-            if node < global_count {
-                global_values.insert(globals[node].id, value.clone());
-                results[node] = Some(value);
-                continue;
-            }
-            let equation = &equations[node - global_count];
-            let outcome = value.and_then(|shown| {
-                let missing = || format!("\"{}\" does not exist", equation.target_name);
-                let target = equation.target.ok_or_else(missing)?;
-                let &(current, unit) = values.get(&target).ok_or_else(missing)?;
-                let value = unit.from_display(shown)?;
-                if (value - current).abs() > 1e-12 * value.abs().max(1.0) {
-                    self.set_dimension(target, value)
-                        .map_err(|e| e.to_string())?;
-                    values.insert(target, (value, unit));
-                }
-                Ok(shown)
-            });
-            if outcome.is_err() {
-                if let Some(target) = equation.target {
-                    failed.insert(target);
-                }
-            }
-            results[node] = Some(outcome);
-        }
-
-        let mut results = results
-            .into_iter()
-            .map(|r| r.unwrap_or_else(|| Err("circular reference (or depends on one)".to_owned())));
-        self.equation_results = EquationResults {
-            globals: results.by_ref().take(global_count).collect(),
-            equations: results.collect(),
-        };
+        let equations = self.equations.clone();
+        let results = equations.evaluate(&mut PartDimensions { part: self, values });
+        self.equation_results = results;
     }
 }
 

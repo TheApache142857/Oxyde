@@ -7,6 +7,9 @@
 //!   which mates cannot be met and which components can still move.
 //! - Components can be sub-assemblies: rigid inside their parent, with mates reaching the
 //!   faces of the parts inside them through [`MateRef::path`].
+//! - The assembly's own global variables and equations ([`AsmDimension`]) drive the
+//!   values of its Distance and Angle mates and the dimensions of its parts, as in
+//!   SolidWorks; parts are reached through [`PartValues`].
 //! - [`bom`] counts the parts for a bill of materials, [`scene`] puts the parts' meshes
 //!   together for display and maps picks back to components, [`paths`] stores part paths
 //!   relative to the assembly.
@@ -38,12 +41,16 @@
 )]
 
 pub mod bom;
+mod equations;
 mod mate;
 pub mod paths;
 mod placement;
 pub mod scene;
 mod solve;
 
+pub use equations::{
+    AsmDimension, ComponentTree, MateDimension, NoParts, PartValues, TopLevelOnly,
+};
 pub use mate::{Mate, MateKind, MateRef, MateTarget, Primitive, PrimitiveKind, resolve};
 pub use oxyde_model::Appearance;
 pub use placement::Placement;
@@ -92,6 +99,8 @@ pub struct Assembly {
     pub mates: Vec<Mate>,
     pub next_component_id: u32,
     pub next_mate_id: u32,
+    /// Global variables, and equations driving mate values and part dimensions.
+    pub equations: oxyde_model::Equations<AsmDimension>,
 }
 
 impl Assembly {
