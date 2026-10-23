@@ -64,6 +64,7 @@ mod session;
 mod sketch;
 mod stdio;
 pub mod tools;
+pub mod window;
 
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
@@ -145,6 +146,24 @@ where
             let path = args.get(1).map(PathBuf::from).unwrap_or_default();
             batch(&path, output, err)
         }
+        ["--window", address, token] => {
+            // The window's answers go out from the bridge's second thread, on a duplicate of
+            // the standard output: the caller holds the standard output's lock (`main`
+            // passes it locked), which that thread would wait for forever.
+            let bridged = match stdio::protocol_channel() {
+                Some(mut channel) => window::bridge(address, token, input, &mut channel),
+                None => Err(std::io::Error::other(
+                    "the standard output cannot be duplicated",
+                )),
+            };
+            match bridged {
+                Ok(()) => 0,
+                Err(e) => {
+                    let _ = writeln!(err, "oxyde-mcp: the Oxyde window at {address}: {e}");
+                    2
+                }
+            }
+        }
         ["--help" | "-h"] => {
             let _ = writeln!(output, "{USAGE}");
             0
@@ -163,7 +182,10 @@ usage:
   oxyde-mcp --batch <file>  run the tool calls of a file, one JSON object per line:
                             {\"tool\": \"<name>\", \"arguments\": {...}}; lines starting
                             with // are skipped
-  oxyde-mcp --tools         print the tools and their input schemas as JSON";
+  oxyde-mcp --tools         print the tools and their input schemas as JSON
+  oxyde-mcp --window <address> <token>
+                            pass MCP messages to an Oxyde window's assistant panel, which
+                            answers them on its open document (the panel starts this)";
 
 /// Serves MCP on `input` and `output` until the input ends.
 pub fn serve(input: &mut dyn BufRead, output: &mut dyn Write) -> std::io::Result<()> {
@@ -206,9 +228,9 @@ pub fn handle(session: &mut Session, message: Value) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
-        "initialize" => Ok(initialize(&params)),
+        "initialize" => Ok(initialize(&params, session.window)),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tools::list() })),
+        "tools/list" => Ok(json!({ "tools": tools::list_for(session) })),
         "tools/call" => tools_call(session, &params),
         "resources/list" => Ok(json!({ "resources": [] })),
         "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
@@ -226,7 +248,8 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn initialize(params: &Value) -> Value {
+/// The answer to `initialize`; a session in an Oxyde window says how it works there.
+fn initialize(params: &Value, window: bool) -> Value {
     let asked = params
         .get("protocolVersion")
         .and_then(Value::as_str)
@@ -240,7 +263,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "oxyde", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": INSTRUCTIONS,
+        "instructions": if window { window::WINDOW_INSTRUCTIONS } else { INSTRUCTIONS },
     })
 }
 

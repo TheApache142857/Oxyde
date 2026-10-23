@@ -19,6 +19,7 @@ oxyde-assembly = { path = "crates/oxyde-assembly" }
 oxyde-format = { path = "crates/oxyde-format" }
 oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
+oxyde-mcp = { path = "crates/oxyde-mcp" }
 oxyde-sim = { path = "crates/oxyde-sim" }
 oxyde-sim-gpu = { path = "crates/oxyde-sim-gpu" }
 oxyde-flow = { path = "crates/oxyde-flow" }

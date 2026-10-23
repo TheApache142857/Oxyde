@@ -309,6 +309,8 @@ pub struct OxydeApp {
     pub(crate) confirm: Option<crate::materials_ui::Confirm>,
     /// Work going on off the UI thread, with its progress window.
     pub(crate) job: Option<crate::jobs::Job>,
+    /// The assistant panel (the *MCP* button): an agent modelling on this document.
+    pub(crate) assistant: crate::assistant::Assistant,
     /// A bug caught (a panic in a rebuild or in a frame), shown until dismissed.
     pub(crate) internal_error: Option<crate::dialogs::InternalErrorReport>,
     /// Frames in a row that ended in a caught panic.
@@ -417,6 +419,7 @@ impl OxydeApp {
             materials_window: Default::default(),
             confirm: None,
             job: None,
+            assistant: Default::default(),
             internal_error: None,
             failed_frames: 0,
         }
@@ -2238,6 +2241,7 @@ impl OxydeApp {
         self.sync_locks();
         self.render_housekeeping(ctx);
         self.simulation_housekeeping(ctx);
+        self.serve_assistant();
         let busy = self.busy();
         if self.asm.is_some() {
             self.clear_preview();
@@ -2252,6 +2256,7 @@ impl OxydeApp {
                 .default_width(290.0)
                 .min_width(220.0)
                 .show(ctx, |ui| self.assembly_panel(ui));
+            self.assistant_panel(ctx);
             egui::CentralPanel::default()
                 .frame(egui::Frame::none())
                 .show(ctx, |ui| self.assembly_viewport(ui));
@@ -2301,6 +2306,7 @@ impl OxydeApp {
                     crate::configurations_ui::LeftTab::Configurations => self.configurations_ui(ui),
                 }
             });
+        self.assistant_panel(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| self.viewport_ui(ui));

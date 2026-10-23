@@ -5,6 +5,27 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Assistant panel: an agent modelling in the window (unreleased, October 2026)
+
+- **MCP** button after the command tabs (beside *Generative Design*), in parts and assemblies:
+  a panel on the right where you chat with a coding agent installed on your computer:
+  - **Claude Code** or **Codex**, through their Agent Client Protocol adapters
+    (`npm install -g @agentclientprotocol/claude-agent-acp`, or `.../codex-acp`), found on
+    their own;
+  - or any other ACP agent, by its command.
+
+  The agent runs under your own account with it: Oxyde needs no key and sells no model.
+- **The agent works on the document open in the window**, through Oxyde's MCP tools
+  (sketches, features, mates, measures, pictures...). Changes show as they are made, and
+  **each reply is one undo step**.
+- **The document stays yours:** the agent can't create, open or save documents. Its tools wait
+  while you are in a sketch, a command or a long job.
+- **The panel shows:**
+  - the agent's text as it writes;
+  - the tools it calls and how they went;
+  - its questions before acting, with its own choices to answer;
+  - *Stop*, *New chat*, and the commands to install an agent when none is found.
+
 ### Links to the assembly that hold, and "->" external references (unreleased, October 2026)
 
 - **A part's global variable can be linked to its assembly from the part's Equations

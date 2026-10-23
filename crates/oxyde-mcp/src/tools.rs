@@ -568,9 +568,26 @@ pub fn exists(name: &str) -> bool {
     list().iter().any(|t| t["name"] == name)
 }
 
+/// The tools a session offers: in an Oxyde window, all but those that choose or save the
+/// document ([`crate::window::DOCUMENT_TOOLS`]).
+pub fn list_for(session: &Session) -> Vec<Value> {
+    let mut tools = list();
+    if session.window {
+        tools.retain(|t| {
+            !crate::window::DOCUMENT_TOOLS
+                .iter()
+                .any(|name| t["name"] == *name)
+        });
+    }
+    tools
+}
+
 /// Runs tool `name` with `args`. A panic in the engine is caught and reported as the tool's
 /// error, so the session survives it.
 pub fn call(session: &mut Session, name: &str, args: &Value) -> Result<ToolOutput> {
+    if session.window && crate::window::DOCUMENT_TOOLS.contains(&name) {
+        return Err(crate::window::DOCUMENT_TOOL_REFUSED.to_owned());
+    }
     match oxyde_kernel::catch_panic(|| dispatch(session, name, args)) {
         Ok(result) => result,
         Err(panic) => Err(format!("internal error: {panic}")),

@@ -1405,6 +1405,7 @@ impl OxydeApp {
                     }
                 }
             }
+            self.assistant_toggle(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (undo, redo) = self
                     .asm

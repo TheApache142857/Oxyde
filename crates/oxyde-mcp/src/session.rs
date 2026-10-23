@@ -61,6 +61,10 @@ pub struct Session {
     /// Where pictures go when a tool is given no path.
     pub(crate) out_dir: PathBuf,
     pub(crate) pictures: u32,
+    /// Working on an Oxyde window's document ([`Session::for_window`]).
+    pub(crate) window: bool,
+    /// The window's part as last given back, while lent part by part.
+    pub(crate) window_part: Option<crate::window::WindowState>,
 }
 
 impl Default for Session {
@@ -78,6 +82,8 @@ impl Session {
             assembly: None,
             out_dir: std::env::temp_dir().join("oxyde-mcp"),
             pictures: 0,
+            window: false,
+            window_part: None,
         }
     }
 

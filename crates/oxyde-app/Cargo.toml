@@ -23,6 +23,7 @@ oxyde-render = { workspace = true }
 oxyde-sim = { workspace = true }
 oxyde-sim-gpu = { workspace = true }
 oxyde-flow = { workspace = true }
+oxyde-mcp = { workspace = true }
 eframe = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = { workspace = true }
