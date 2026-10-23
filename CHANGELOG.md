@@ -5,6 +5,20 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Gruvbox and Classic 95 themes (unreleased, October 2026)
+
+- **Three new themes** in Tools › Preferences › Graphics, beside Flux and Light:
+  - **Gruvbox dark**: the warm "retro groove" palette, with cream text on charcoal, tan parts
+    and aqua selection;
+  - **Gruvbox light**: its daylight side, dark brown on cream;
+  - **Classic 95**: Windows 95, with grey panels, white fields, navy accents, square corners
+    and hard shadows, grey parts on the teal desktop, and Microsoft Sans Serif where Windows
+    has it.
+- As before, choosing a theme recolours the viewport too. Each theme's viewport colours are
+  also presets under *Viewport colours*, to mix with another theme.
+- A preferences file naming a theme the build doesn't know (written by a newer one) opens
+  with the default theme, keeping the other preferences.
+
 ### Links to the assembly that hold, and "->" external references (unreleased, October 2026)
 
 - **A part's global variable can be linked to its assembly from the part's Equations
