@@ -5,6 +5,35 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Linking values while editing in place (unreleased, October 2026)
+
+- **A part edited in place keeps the assembly's tree around it**, as SolidWorks' Edit
+  Component shows it: the assembly at the top, its components below, the part being edited
+  highlighted with its own features under it, every other component greyed. Those open to
+  show what they hold, and right-click › *Edit part in place* finishes the current part
+  (asking about unsaved changes) and opens that one.
+- **Equations folders in the trees**, as SolidWorks' Equations folder: in a part's tree, in
+  an assembly's tree (for the assembly, and under each part component when it is expanded)
+  and in the tree of a part edited in place. Each lists the global variables with their
+  values, 🔗 for those from a linked equations file and Σ for those an assembly drives, then
+  the equations. A double-click, or right-click › *Manage Equations…*, opens Tools ›
+  Equations.
+- **"=" in a sketch dimension's Modify box** types its value as an equation, as in
+  SolidWorks: `= "Width" - 6`. The box shows what it evaluates to, lists the variables it can
+  name (typing a quote narrows the list), and while it is open the variables of the tree's
+  Equations folders can be clicked into it, even in sketch mode.
+  - An equation naming only the part's own values is the part's.
+  - While the part is edited in place, an equation naming the assembly's variables
+    (`"Width@Hackintosh case.Assembly"`) or another part's (`"Gap@Foot<1>.Part"`) becomes an
+    equation of the assembly on that dimension: the value is set in the part at once, the
+    part records that the assembly drives it, and the assembly keeps the equation (it is left
+    unsaved: save it after *Finish editing*). The part's own equation on that dimension, if
+    any, gives way.
+- A driven sketch dimension opens its Modify box with its equation, to change it; a value
+  typed over it removes the equation (the part's, or the assembly's when edited in place
+  from it) and makes the value the part's own again. A dimension another assembly drives
+  says so and stays as it is.
+
 ### Assembly equations (unreleased, October 2026)
 
 - **Tools › Equations… in an assembly** (also *Equations* on the Evaluate tab), as in

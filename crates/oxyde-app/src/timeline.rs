@@ -8,7 +8,11 @@
 //! a handle that can be dragged between features.
 //!
 //! Above the features, the Material row says what the part is made of; a click on it
-//! lists the library's materials (SolidWorks' `Material <not specified>` row).
+//! lists the library's materials (SolidWorks' `Material <not specified>` row). The
+//! Equations folder lists the part's global variables and equations (`equation_tree.rs`).
+//!
+//! A part edited in place hangs under its component in the tree of the assembly it is
+//! edited in, as SolidWorks' Edit Component shows it (`in_place_tree.rs`).
 
 use eframe::egui::{self, Color32, CursorIcon, RichText, Sense, Stroke};
 use oxyde_model::{
@@ -19,6 +23,7 @@ use oxyde_model::{
 use crate::app::OxydeApp;
 use crate::dialogs::{Dialog, plane_name};
 use crate::display::Item;
+use crate::equation_tree::FolderEvent;
 use crate::features_ui::PatternKind;
 use crate::icons::{self, Icon};
 use crate::property_manager::PanelPick;
@@ -70,6 +75,12 @@ enum Action {
     MaterialPage,
     /// The part's material in the Materials window.
     EditMaterial,
+    /// Open or close the Equations folder.
+    ToggleEquations,
+    /// A variable's quoted name, for the equation being typed in a Modify box.
+    InsertName(String),
+    /// Tools › Equations.
+    ManageEquations,
 }
 
 pub fn feature_icon(kind: &FeatureKind) -> Icon {
@@ -239,241 +250,267 @@ impl OxydeApp {
             .map(|m| m.name.clone())
             .collect();
         let enabled = self.sketch.is_none();
-        ui.add_enabled_ui(enabled, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    for plane in [
-                        StandardPlane::Front,
-                        StandardPlane::Top,
-                        StandardPlane::Right,
-                    ] {
-                        let item = Item::Plane(plane);
-                        let row = tree_row(
-                            ui,
-                            Row {
-                                icon: Icon::Plane,
-                                cut: false,
-                                text: RichText::new(format!("{} Plane", plane_name(plane))),
-                                highlighted: self.selected_plane == Some(plane),
-                                hovered: false,
-                                badge: None,
-                                indent: 0.0,
-                                expander: None,
-                                eye: Some(self.item_shown(item)),
-                            },
-                        );
-                        if row.eye_clicked {
-                            action = Some(Action::ToggleItem(item));
-                        } else if row.response.clicked() {
-                            action = Some(Action::SelectPlane(plane));
+        // While a dimension's value is typed as an equation, variables can be clicked into
+        // it, even in sketch mode: the Equations folders stay enabled.
+        let inserting = self.equation_field_open();
+        // Edited in place: the assembly around the part. Set apart while drawing, since the
+        // part's rows borrow the application.
+        let stack = std::mem::take(&mut self.edit_stack);
+        let place_expanded = std::mem::take(&mut self.place_expanded);
+        let mut place_action = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let mut body = |ui: &mut egui::Ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        for plane in [
+                            StandardPlane::Front,
+                            StandardPlane::Top,
+                            StandardPlane::Right,
+                        ] {
+                            let item = Item::Plane(plane);
+                            let row = tree_row(
+                                ui,
+                                Row {
+                                    icon: Icon::Plane,
+                                    cut: false,
+                                    text: RichText::new(format!("{} Plane", plane_name(plane))),
+                                    highlighted: self.selected_plane == Some(plane),
+                                    hovered: false,
+                                    badge: None,
+                                    indent: 0.0,
+                                    expander: None,
+                                    eye: Some(self.item_shown(item)),
+                                },
+                            );
+                            if row.eye_clicked {
+                                action = Some(Action::ToggleItem(item));
+                            } else if row.response.clicked() {
+                                action = Some(Action::SelectPlane(plane));
+                            }
                         }
-                    }
-                    let origin = tree_row(
-                        ui,
-                        Row {
-                            icon: Icon::Origin,
-                            cut: false,
-                            text: RichText::new("Origin"),
-                            highlighted: false,
-                            hovered: false,
-                            badge: None,
-                            indent: 0.0,
-                            expander: None,
-                            eye: Some(self.item_shown(Item::Origin)),
-                        },
-                    );
-                    if origin.eye_clicked {
-                        action = Some(Action::ToggleItem(Item::Origin));
-                    }
-                    // Solid Bodies, when there is more than the one.
-                    if let Some(body) = self.doc.part.body().filter(|b| b.solids.len() > 1) {
-                        let folder = tree_row(
+                        let origin = tree_row(
                             ui,
                             Row {
-                                icon: Icon::Bodies,
+                                icon: Icon::Origin,
                                 cut: false,
-                                text: RichText::new(format!(
-                                    "Solid Bodies ({})",
-                                    body.solids.len()
-                                )),
+                                text: RichText::new("Origin"),
                                 highlighted: false,
                                 hovered: false,
                                 badge: None,
                                 indent: 0.0,
-                                expander: Some(self.bodies_expanded),
-                                eye: None,
+                                expander: None,
+                                eye: Some(self.item_shown(Item::Origin)),
                             },
                         );
-                        if folder.response.clicked() {
-                            action = Some(Action::ToggleBodies);
+                        if origin.eye_clicked {
+                            action = Some(Action::ToggleItem(Item::Origin));
                         }
-                        if self.bodies_expanded {
-                            let mut ids: Vec<oxyde_model::BodyId> =
-                                body.solids.iter().map(|s| s.id).collect();
-                            ids.sort_by_key(|b| (self.doc.part.index_of(b.feature), b.index));
-                            for id in ids {
-                                let maker = self
-                                    .doc
-                                    .part
-                                    .feature(id.feature)
-                                    .map_or_else(String::new, |f| f.name().to_owned());
-                                let row = tree_row(
-                                    ui,
-                                    Row {
-                                        icon: Icon::Part,
-                                        cut: false,
-                                        text: RichText::new(self.body_label(id)),
-                                        highlighted: self.selected_body == Some(id),
-                                        hovered: false,
-                                        badge: None,
-                                        indent: 16.0,
-                                        expander: None,
-                                        eye: None,
-                                    },
-                                );
-                                if row.response.hovered() {
-                                    hover_body = Some(id);
-                                }
-                                let response =
-                                    row.response.on_hover_text(format!("Made by {maker}"));
-                                if response.clicked() {
-                                    action = Some(Action::SelectBody(id));
-                                }
-                                response.context_menu(|ui| {
-                                    if ui.button("Appearance…").clicked() {
-                                        action = Some(Action::BodyAppearance(id));
-                                        ui.close_menu();
+                        // Solid Bodies, when there is more than the one.
+                        if let Some(body) = self.doc.part.body().filter(|b| b.solids.len() > 1) {
+                            let folder = tree_row(
+                                ui,
+                                Row {
+                                    icon: Icon::Bodies,
+                                    cut: false,
+                                    text: RichText::new(format!(
+                                        "Solid Bodies ({})",
+                                        body.solids.len()
+                                    )),
+                                    highlighted: false,
+                                    hovered: false,
+                                    badge: None,
+                                    indent: 0.0,
+                                    expander: Some(self.bodies_expanded),
+                                    eye: None,
+                                },
+                            );
+                            if folder.response.clicked() {
+                                action = Some(Action::ToggleBodies);
+                            }
+                            if self.bodies_expanded {
+                                let mut ids: Vec<oxyde_model::BodyId> =
+                                    body.solids.iter().map(|s| s.id).collect();
+                                ids.sort_by_key(|b| (self.doc.part.index_of(b.feature), b.index));
+                                for id in ids {
+                                    let maker = self
+                                        .doc
+                                        .part
+                                        .feature(id.feature)
+                                        .map_or_else(String::new, |f| f.name().to_owned());
+                                    let row = tree_row(
+                                        ui,
+                                        Row {
+                                            icon: Icon::Part,
+                                            cut: false,
+                                            text: RichText::new(self.body_label(id)),
+                                            highlighted: self.selected_body == Some(id),
+                                            hovered: false,
+                                            badge: None,
+                                            indent: 16.0,
+                                            expander: None,
+                                            eye: None,
+                                        },
+                                    );
+                                    if row.response.hovered() {
+                                        hover_body = Some(id);
                                     }
-                                });
+                                    let response =
+                                        row.response.on_hover_text(format!("Made by {maker}"));
+                                    if response.clicked() {
+                                        action = Some(Action::SelectBody(id));
+                                    }
+                                    response.context_menu(|ui| {
+                                        if ui.button("Appearance…").clicked() {
+                                            action = Some(Action::BodyAppearance(id));
+                                            ui.close_menu();
+                                        }
+                                    });
+                                }
                             }
                         }
-                    }
-                    // What the part is made of, a click away from changing.
-                    let material = self.doc.part.material();
-                    let row = crate::assembly_ui::material_row(ui, material, 0.0);
-                    if let Some(choice) =
-                        crate::assembly_ui::material_popup(ui, &row.response, &material_names)
-                    {
-                        action = Some(Action::Material(choice));
-                    }
-                    if row.response.double_clicked() {
-                        action = Some(Action::MaterialPage);
-                    }
-                    row.response.context_menu(|ui| {
-                        ui.menu_button("Change material", |ui| {
-                            if let Some(choice) =
-                                crate::assembly_ui::material_menu(ui, &material_names)
+                        // What the part is made of, a click away from changing.
+                        let material = self.doc.part.material();
+                        let row = crate::assembly_ui::material_row(ui, material, 0.0);
+                        if let Some(choice) =
+                            crate::assembly_ui::material_popup(ui, &row.response, &material_names)
+                        {
+                            action = Some(Action::Material(choice));
+                        }
+                        if row.response.double_clicked() {
+                            action = Some(Action::MaterialPage);
+                        }
+                        row.response.context_menu(|ui| {
+                            ui.menu_button("Change material", |ui| {
+                                if let Some(choice) =
+                                    crate::assembly_ui::material_menu(ui, &material_names)
+                                {
+                                    action = Some(Action::Material(choice));
+                                }
+                            });
+                            if ui
+                                .button("Material…")
+                                .on_hover_text("The Material page: the part's look and its density")
+                                .clicked()
                             {
-                                action = Some(Action::Material(choice));
+                                action = Some(Action::MaterialPage);
+                                ui.close_menu();
+                            }
+                            if material.is_some()
+                                && ui.button("Edit in the Materials window…").clicked()
+                            {
+                                action = Some(Action::EditMaterial);
+                                ui.close_menu();
                             }
                         });
-                        if ui
-                            .button("Material…")
-                            .on_hover_text("The Material page: the part's look and its density")
-                            .clicked()
-                        {
-                            action = Some(Action::MaterialPage);
-                            ui.close_menu();
-                        }
-                        if material.is_some()
-                            && ui.button("Edit in the Materials window…").clicked()
-                        {
-                            action = Some(Action::EditMaterial);
-                            ui.close_menu();
+                    });
+                    ui.add_enabled_ui(enabled || inserting, |ui| {
+                        match self.part_equations_folder(ui, inserting) {
+                            Some(FolderEvent::Toggle) => action = Some(Action::ToggleEquations),
+                            Some(FolderEvent::Insert(name)) => {
+                                action = Some(Action::InsertName(name))
+                            }
+                            Some(FolderEvent::Manage) => action = Some(Action::ManageEquations),
+                            None => {}
                         }
                     });
-                    ui.add_space(3.0);
-                    ui.separator();
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.add_space(3.0);
+                        ui.separator();
 
-                    let entries = self.doc.part.timeline();
-                    let active = self
-                        .doc
-                        .part
-                        .rollback_position()
-                        .unwrap_or(entries.len())
-                        .min(entries.len());
-                    let absorbed = self.absorbed_sketches();
-                    let index_of = |id: FeatureId| entries.iter().position(|e| e.id == id);
-                    let highlighted = |id: FeatureId| {
-                        self.selected_feature == Some(id)
-                            || self.selected_features.contains(&id)
-                            || creator == Some(id)
-                            || referenced.contains(&id)
-                    };
-                    // Rows in display order, with the timeline index of their feature.
-                    let mut rows: Vec<(egui::Rect, usize)> = Vec::with_capacity(entries.len());
-                    let mut bar = None;
-                    for (index, entry) in entries.iter().enumerate() {
-                        if absorbed.contains_key(&entry.id) {
-                            continue; // shown under the feature that uses it
-                        }
-                        if bar.is_none() && index >= active {
-                            bar = Some(rollback_bar(ui));
-                        }
-                        // The sketches the feature absorbs (a sweep has two: its
-                        // profile and its path), in timeline order.
-                        let mut children: Vec<usize> = absorbed
-                            .iter()
-                            .filter(|(_, parent)| **parent == entry.id)
-                            .filter_map(|(sketch, _)| index_of(*sketch))
-                            .collect();
-                        children.sort_unstable();
-                        let expanded = self.expanded.contains(&entry.id);
-                        let rect = self.timeline_row(
-                            ui,
-                            entry,
-                            highlighted(entry.id),
-                            under_pointer == Some(entry.id),
-                            0.0,
-                            (!children.is_empty()).then_some(expanded),
-                            &mut action,
-                        );
-                        rows.push((rect, index));
-                        if expanded {
-                            for child_index in children {
-                                let Some(child) = entries.get(child_index) else {
-                                    continue;
-                                };
-                                let rect = self.timeline_row(
-                                    ui,
-                                    child,
-                                    highlighted(child.id),
-                                    under_pointer == Some(child.id),
-                                    16.0,
-                                    None,
-                                    &mut action,
-                                );
-                                rows.push((rect, child_index));
+                        let entries = self.doc.part.timeline();
+                        let active = self
+                            .doc
+                            .part
+                            .rollback_position()
+                            .unwrap_or(entries.len())
+                            .min(entries.len());
+                        let absorbed = self.absorbed_sketches();
+                        let index_of = |id: FeatureId| entries.iter().position(|e| e.id == id);
+                        let highlighted = |id: FeatureId| {
+                            self.selected_feature == Some(id)
+                                || self.selected_features.contains(&id)
+                                || creator == Some(id)
+                                || referenced.contains(&id)
+                        };
+                        // Rows in display order, with the timeline index of their feature.
+                        let mut rows: Vec<(egui::Rect, usize)> = Vec::with_capacity(entries.len());
+                        let mut bar = None;
+                        for (index, entry) in entries.iter().enumerate() {
+                            if absorbed.contains_key(&entry.id) {
+                                continue; // shown under the feature that uses it
+                            }
+                            if bar.is_none() && index >= active {
+                                bar = Some(rollback_bar(ui));
+                            }
+                            // The sketches the feature absorbs (a sweep has two: its
+                            // profile and its path), in timeline order.
+                            let mut children: Vec<usize> = absorbed
+                                .iter()
+                                .filter(|(_, parent)| **parent == entry.id)
+                                .filter_map(|(sketch, _)| index_of(*sketch))
+                                .collect();
+                            children.sort_unstable();
+                            let expanded = self.expanded.contains(&entry.id);
+                            let rect = self.timeline_row(
+                                ui,
+                                entry,
+                                highlighted(entry.id),
+                                under_pointer == Some(entry.id),
+                                0.0,
+                                (!children.is_empty()).then_some(expanded),
+                                &mut action,
+                            );
+                            rows.push((rect, index));
+                            if expanded {
+                                for child_index in children {
+                                    let Some(child) = entries.get(child_index) else {
+                                        continue;
+                                    };
+                                    let rect = self.timeline_row(
+                                        ui,
+                                        child,
+                                        highlighted(child.id),
+                                        under_pointer == Some(child.id),
+                                        16.0,
+                                        None,
+                                        &mut action,
+                                    );
+                                    rows.push((rect, child_index));
+                                }
                             }
                         }
-                    }
-                    order = rows.iter().map(|(_, i)| entries[*i].id).collect();
-                    // The feature under the pointer lights up what it made in the viewport.
-                    hover_feature = ui
-                        .ctx()
-                        .pointer_hover_pos()
-                        .and_then(|p| rows.iter().find(|(r, _)| r.contains(p)))
-                        .map(|(_, i)| entries[*i].id);
-                    if bar.is_none() {
-                        bar = Some(rollback_bar(ui));
-                    }
+                        order = rows
+                            .iter()
+                            .filter_map(|(_, i)| entries.get(*i).map(|e| e.id))
+                            .collect();
+                        // The feature under the pointer lights up what it made in the viewport.
+                        hover_feature = ui
+                            .ctx()
+                            .pointer_hover_pos()
+                            .and_then(|p| rows.iter().find(|(r, _)| r.contains(p)))
+                            .and_then(|(_, i)| entries.get(*i))
+                            .map(|e| e.id);
+                        if bar.is_none() {
+                            bar = Some(rollback_bar(ui));
+                        }
 
-                    // Dragging the bar: show where it will land, move it on release.
-                    if let Some(bar) = bar {
-                        let pointer = ui.input(|i| i.pointer.interact_pos());
-                        if bar.dragged() {
-                            if let Some(pos) = pointer {
+                        // Dragging the bar: show where it will land, move it on release.
+                        if let Some(bar) = bar {
+                            let pointer = ui.input(|i| i.pointer.interact_pos());
+                            if bar.dragged()
+                                && let Some(pos) = pointer
+                            {
                                 ui.painter().hline(
                                     bar.rect.x_range(),
                                     pos.y,
                                     Stroke::new(2.0_f32, rollback().gamma_multiply(0.5)),
                                 );
                             }
-                        }
-                        if bar.drag_stopped() {
-                            if let Some(pos) = pointer {
+                            if bar.drag_stopped()
+                                && let Some(pos) = pointer
+                            {
                                 let target = rows
                                     .iter()
                                     .find(|(r, _)| r.center().y > pos.y)
@@ -483,9 +520,26 @@ impl OxydeApp {
                                 }
                             }
                         }
+                    });
+                };
+                match stack.last() {
+                    Some(parent) => crate::in_place_tree::InPlaceTree {
+                        parent,
+                        expanded: &place_expanded,
+                        action: &mut place_action,
+                        enabled,
+                        inserting,
                     }
-                });
-        });
+                    .show(ui, &mut body),
+                    None => body(ui),
+                }
+            });
+        self.edit_stack = stack;
+        self.place_expanded = place_expanded;
+        if let Some(a) = place_action {
+            let ctx = ui.ctx().clone();
+            self.apply_place_action(a, &ctx);
+        }
 
         if let Some(id) = hover_feature {
             self.viewport.preselect = self.feature_picks(id);
@@ -828,6 +882,14 @@ impl OxydeApp {
                 Some(m) => self.edit_material(m),
                 None => self.open_materials_window(),
             },
+            Action::ToggleEquations => {
+                self.part_equations_expanded = !self.part_equations_expanded;
+            }
+            Action::InsertName(name) => self.insert_into_equation_field(&name),
+            Action::ManageEquations => {
+                self.equations
+                    .show(crate::equations_ui::EquationsTab::Equations);
+            }
             Action::Edit(id) => self.edit_feature(id),
             Action::Rename(feature) => {
                 let name = self

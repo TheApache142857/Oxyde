@@ -395,11 +395,67 @@ pub(crate) fn format_value(value: f64) -> String {
 
 /// The text field of a value. On its first frame it takes the focus with its text
 /// selected, so typing replaces it.
+/// Under a value typed as an equation: what it evaluates to or why it cannot, and the
+/// variables it can name, narrowed to the one begun with a quote. A click on one goes in
+/// `insert`.
+fn equation_help(
+    ui: &mut egui::Ui,
+    result: &Result<f64, String>,
+    suffix: &str,
+    text: &str,
+    variables: &[String],
+    insert: &mut Option<String>,
+) {
+    match result {
+        Ok(value) => {
+            ui.label(egui::RichText::new(format!("= {} {suffix}", format_value(*value))).small());
+        }
+        Err(e) => {
+            ui.label(
+                egui::RichText::new(e)
+                    .small()
+                    .color(crate::theme::tokens().err),
+            );
+        }
+    }
+    // A name begun with a quote narrows the list.
+    let partial = (text.matches('"').count() % 2 == 1)
+        .then(|| text.rsplit('"').next().unwrap_or_default().to_lowercase());
+    let shown: Vec<&String> = variables
+        .iter()
+        .filter(|v| {
+            partial
+                .as_deref()
+                .is_none_or(|p| v.trim_matches('"').to_lowercase().starts_with(p))
+        })
+        .collect();
+    if shown.is_empty() {
+        return;
+    }
+    ui.label(
+        egui::RichText::new("Variables (or click one in the tree's Equations folders):")
+            .small()
+            .weak(),
+    );
+    ui.horizontal_wrapped(|ui| {
+        for v in shown {
+            if ui.small_button(v.as_str()).clicked() {
+                *insert = Some(v.clone());
+            }
+        }
+    });
+}
+
 fn value_field(ui: &mut egui::Ui, text: &mut String, fresh: &mut bool) {
     let id = ui.make_persistent_id("dimension_value");
+    let width = if crate::dimension_equations::equation_body(text).is_some() {
+        280.0
+    } else {
+        110.0
+    };
     let output = egui::TextEdit::singleline(text)
         .id(id)
-        .desired_width(110.0)
+        .desired_width(width)
         .show(ui);
     if *fresh {
         output.response.request_focus();
@@ -540,6 +596,19 @@ impl OxydeApp {
                 fresh,
             } => {
                 let mut answer = Answer::Open;
+                // "= …": the value is an equation (`dimension_equations.rs`).
+                let equation = crate::dimension_equations::equation_body(text).is_some();
+                let evaluated = equation.then(|| self.evaluate_dimension_equation(text));
+                let variables = if equation {
+                    self.equation_variables()
+                } else {
+                    Vec::new()
+                };
+                let typed = match &evaluated {
+                    Some(result) => result.as_ref().ok().copied(),
+                    None => parse_value(text, *angle),
+                };
+                let mut insert = None;
                 let sketch = &mut self.sketch;
                 window(label).show(ctx, |ui| {
                     let suffix = if *angle { "°" } else { "mm" };
@@ -559,8 +628,11 @@ impl OxydeApp {
                                 ui.end_row();
                             }
                         });
+                    if let Some(result) = &evaluated {
+                        equation_help(ui, result, suffix, text, &variables, &mut insert);
+                    }
                     // The sketch as the value would make it, drawn dashed over it.
-                    let met = match (parse_value(text, *angle), sketch.as_mut()) {
+                    let met = match (typed, sketch.as_mut()) {
                         (Some(typed), Some(session)) => {
                             let before = session.value_preview().to_vec();
                             let met = match target {
@@ -590,7 +662,9 @@ impl OxydeApp {
                             true
                         }
                     };
-                    if parse_value(text, *angle).is_none() {
+                    if typed.is_none() && evaluated.is_some() {
+                        // The equation's own message is above.
+                    } else if typed.is_none() {
                         ui.label(
                             egui::RichText::new(if *angle {
                                 "Type an angle: 30, 90/4, 1.2rad"
@@ -608,10 +682,13 @@ impl OxydeApp {
                         );
                     }
                     answer = ok_cancel(ui, "OK");
-                    if matches!(answer, Answer::Ok) && parse_value(text, *angle).is_none() {
+                    if matches!(answer, Answer::Ok) && typed.is_none() {
                         answer = Answer::Open;
                     }
                 });
+                if let Some(name) = insert {
+                    crate::dimension_equations::insert_name(text, &name);
+                }
                 answer
             }
             Dialog::Rename { name, .. } => {
@@ -737,9 +814,21 @@ impl OxydeApp {
                 angle,
                 ..
             } => {
+                if crate::dimension_equations::equation_body(&text).is_some() {
+                    self.apply_dimension_equation(target, name, &text);
+                    return;
+                }
                 let Some(typed) = parse_value(&text, angle) else {
                     return;
                 };
+                // A value typed over a driven dimension takes the equation away.
+                if let DimensionTarget::Existing(id) = target
+                    && self.sketch.as_ref().is_some_and(|s| s.driven.contains(&id))
+                    && let Err(e) = self.unlink_dimension(id)
+                {
+                    self.status = e;
+                    return;
+                }
                 if let Some(session) = self.sketch.as_mut() {
                     match target {
                         DimensionTarget::New(relation) => {

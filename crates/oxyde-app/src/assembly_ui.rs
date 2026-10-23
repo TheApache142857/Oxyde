@@ -28,6 +28,7 @@ use crate::app::{Overlay, OverlayShape, OxydeApp, PendingAction, overlay_at};
 use crate::assembly::{AsmSelected, AssemblyDoc, Occurrence};
 use crate::dialogs::plane_name;
 use crate::display::Item;
+use crate::equation_tree::{FolderEvent, assembly_contents, equations_folder, part_contents};
 use crate::icons::{self, Icon};
 use crate::property_manager::{box_active, box_fill};
 use crate::timeline::{Row, tree_row};
@@ -207,6 +208,10 @@ enum TreeAction {
     FlipMate(MateId),
     SuppressMate(MateId, bool),
     DeleteMate(MateId),
+    /// Open or close the Equations folder of the assembly (`None`) or of a part.
+    ToggleEquations(Option<ComponentId>),
+    /// Tools › Equations.
+    ManageEquations,
 }
 
 /// The row under a part saying what it is made of: `Material: Acier (STEP)`, or none.
@@ -2000,6 +2005,19 @@ impl OxydeApp {
                         MateTarget::Origin,
                     )));
                 }
+                // The assembly's global variables and equations, as SolidWorks' Equations
+                // folder.
+                let contents = assembly_contents(doc, false);
+                if !contents.is_empty() {
+                    let open = self.asm_equations_expanded;
+                    match equations_folder(ui, &contents, 0.0, open, false, true) {
+                        Some(FolderEvent::Toggle) => {
+                            action = Some(TreeAction::ToggleEquations(None));
+                        }
+                        Some(FolderEvent::Manage) => action = Some(TreeAction::ManageEquations),
+                        Some(FolderEvent::Insert(_)) | None => {}
+                    }
+                }
                 ui.add_space(3.0);
                 ui.separator();
                 if doc.assembly.components.is_empty() {
@@ -2185,6 +2203,18 @@ impl OxydeApp {
                         });
                     }
                     if expanded {
+                        // The part's own variables and equations, as in its tree.
+                        if let Some(crate::assembly::Loaded::Part(p)) = doc.loaded(id) {
+                            let contents = part_contents(&p.part, &|name| name.to_owned());
+                            if !contents.is_empty() {
+                                let open = self.asm_part_equations_expanded.contains(&id);
+                                if let Some(FolderEvent::Toggle) =
+                                    equations_folder(ui, &contents, 16.0, open, false, false)
+                                {
+                                    action = Some(TreeAction::ToggleEquations(Some(id)));
+                                }
+                            }
+                        }
                         for (target, label, icon) in standard_targets() {
                             let row = tree_row(
                                 ui,
@@ -2319,6 +2349,18 @@ impl OxydeApp {
                         doc.expanded.insert(id);
                     }
                 }
+            }
+            TreeAction::ToggleEquations(None) => {
+                self.asm_equations_expanded = !self.asm_equations_expanded;
+            }
+            TreeAction::ToggleEquations(Some(id)) => {
+                if !self.asm_part_equations_expanded.remove(&id) {
+                    self.asm_part_equations_expanded.insert(id);
+                }
+            }
+            TreeAction::ManageEquations => {
+                self.equations
+                    .show(crate::equations_ui::EquationsTab::Equations);
             }
             TreeAction::Hide(ids) => {
                 if let Some(doc) = self.asm.as_mut() {
