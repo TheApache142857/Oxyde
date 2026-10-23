@@ -35,7 +35,7 @@ pub(crate) struct PlanarLoop {
 }
 
 /// The centre of the circle through three points, `None` when they are in line.
-fn circumcentre(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
+pub(crate) fn circumcentre(a: Point2, b: Point2, c: Point2) -> Option<Point2> {
     let d = 2.0 * (a.x * (b.y - c.y) + b.x * (c.y - a.y) + c.x * (a.y - b.y));
     if d.abs() <= f64::EPSILON {
         return None;

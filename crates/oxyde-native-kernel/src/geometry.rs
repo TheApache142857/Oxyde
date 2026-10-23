@@ -10,7 +10,7 @@
 
 use std::f64::consts::TAU;
 
-use oxyde_geom::{Plane, Point3, Transform, Vec3};
+use oxyde_geom::{Axis, Plane, Point3, Transform, Vec3};
 
 use crate::revolution::{Meridian, Revolution};
 
@@ -550,6 +550,69 @@ impl Surface {
     }
 
     /// Where the line `point + t dir` meets the surface: each `t`, in increasing order.
+    /// How far `p` is from the surface, signed: positive on the side its normal points to
+    /// (out of the solid). Near the surface it grows as fast as `p` moves away along the
+    /// normal.
+    pub fn signed_distance(&self, p: Point3) -> f64 {
+        match self {
+            Surface::Plane(plane) => (p - plane.origin).dot(plane.normal),
+            Surface::Revolution(r) => {
+                let (rho, z) = r.rho_z(p);
+                let away = match r.meridian {
+                    Meridian::Line { radius, slope } => {
+                        (rho - radius - slope * z) / (1.0 + slope * slope).sqrt()
+                    }
+                    Meridian::Circle { center, radius } => {
+                        ((rho - center).powi(2) + z * z).sqrt() - radius
+                    }
+                };
+                if r.outward { away } else { -away }
+            }
+        }
+    }
+
+    /// The surface moved `d` along its normal (out of the solid for a positive `d`), its
+    /// normal the same way: `None` when a cylinder, a sphere or a torus would shrink to
+    /// nothing.
+    pub fn offset(&self, d: f64) -> Option<Surface> {
+        match *self {
+            Surface::Plane(plane) => Some(Surface::Plane(Plane {
+                origin: plane.origin + plane.normal * d,
+                ..plane
+            })),
+            Surface::Revolution(r) => {
+                let d = if r.outward { d } else { -d };
+                match r.meridian {
+                    Meridian::Line { radius, slope } => {
+                        // The meridian's point at the origin moved square to the meridian,
+                        // as OpenCASCADE moves a cone's: up or down the axis, and out.
+                        let k = (1.0 + slope * slope).sqrt();
+                        let radius = radius + d / k;
+                        if slope == 0.0 && radius <= 0.0 {
+                            return None;
+                        }
+                        let origin = r.axis.origin + r.axis.direction * (-d * slope / k);
+                        Some(Surface::Revolution(Revolution {
+                            axis: Axis {
+                                origin,
+                                direction: r.axis.direction,
+                            },
+                            meridian: Meridian::Line { radius, slope },
+                            ..r
+                        }))
+                    }
+                    Meridian::Circle { center, radius } => {
+                        let radius = radius + d;
+                        (radius > 0.0).then_some(Surface::Revolution(Revolution {
+                            meridian: Meridian::Circle { center, radius },
+                            ..r
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
     pub fn line_hits(&self, point: Point3, dir: Vec3) -> Vec<f64> {
         match self {
             Surface::Plane(p) => {

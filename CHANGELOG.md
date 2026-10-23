@@ -70,6 +70,12 @@ release yet; the git history has every detail.
   whose faces meet smoothly, or too large for its faces, fails saying so.
 - It now also cuts two holes of the same size crossing, and a cone where a plane cuts it in
   a parabola or a hyperbola.
+- **Shell** and **Sweep** build with it: shells inwards or outwards, opened at any faces or
+  closed round a void, of parts with flat, round, conical, spherical and toroidal faces
+  (holes, fillets, turned profiles), named as OpenCASCADE names them; walls too thick for
+  the part fail saying so. Sweeps of any profile along a path of lines and arcs that turns
+  smoothly, open or closed (a ring), boss or cut. A path with a sharp corner fails with a
+  message, where OpenCASCADE builds a solid with no volume after the corner.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

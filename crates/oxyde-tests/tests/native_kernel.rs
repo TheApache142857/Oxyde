@@ -2158,3 +2158,271 @@ fn blends_of_a_turned_shaft_and_the_demo_flange() {
         assert_same_part(&format!("the flange's rim and hub, fillet {fillet}"), &part);
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Shells.
+
+fn shelled(faces: Vec<FaceName>, thickness: f64, outward: bool) -> FeatureKind {
+    FeatureKind::Shell(oxyde_model::Shell {
+        faces,
+        thickness,
+        outward,
+    })
+}
+
+#[test]
+fn shells_of_a_block_and_a_round_bar() {
+    for outward in [false, true] {
+        // A block opened at the top, and one hollowed whole.
+        for open in [true, false] {
+            let mut part = Part::new();
+            let base = base_block(&mut part);
+            let faces = if open {
+                vec![FaceName::end_cap(base)]
+            } else {
+                Vec::new()
+            };
+            part.add_feature(shelled(faces, 2.0, outward));
+            assert_same_part(
+                &format!("a block's shell, open {open}, outward {outward}"),
+                &part,
+            );
+        }
+        // A round bar, opened at its end and at both ends.
+        for ends in [1, 2] {
+            let mut part = Part::new();
+            let mut sketch = front();
+            sketch.circle(Point2::new(0.0, 0.0), 10.0);
+            let bar = boss(
+                &mut part,
+                sketch,
+                ExtrudeExtent::Blind { depth: 20.0 },
+                false,
+            );
+            let mut faces = vec![FaceName::end_cap(bar)];
+            if ends == 2 {
+                faces.push(FaceName::start_cap(bar));
+            }
+            part.add_feature(shelled(faces, 1.0, outward));
+            assert_same_part(
+                &format!("a round bar's shell, {ends} ends open, outward {outward}"),
+                &part,
+            );
+        }
+    }
+}
+
+#[test]
+fn shells_of_holed_rounded_and_turned_parts() {
+    for outward in [false, true] {
+        // A block with a hole down through it, opened at the top: the hole's wall grows.
+        // Off the block's middle, so that its rim's centroid is not the outer rim's, which
+        // tells the two apart.
+        let mut part = Part::new();
+        let base = base_block(&mut part);
+        let mut sketch = on_top(base);
+        sketch.circle(Point2::new(12.0, 15.0), 4.0);
+        cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+        part.add_feature(shelled(vec![FaceName::end_cap(base)], 1.5, outward));
+        assert_same_part(&format!("a holed block's shell, outward {outward}"), &part);
+        // A block with its upright edges rounded, opened at the top.
+        let mut part = Part::new();
+        let (b, l) = lined_block(&mut part);
+        let edges = (0..4)
+            .map(|i| {
+                EdgeName::between(
+                    FaceName::profile(b, l[i]),
+                    FaceName::profile(b, l[(i + 1) % 4]),
+                )
+            })
+            .collect();
+        part.add_feature(blended_by(true, edges, 4.0));
+        part.add_feature(shelled(vec![FaceName::end_cap(b)], 1.0, outward));
+        assert_same_part(
+            &format!("a rounded block's shell, outward {outward}"),
+            &part,
+        );
+        // A cup turned from a profile with a cone, opened at its rim.
+        let mut part = Part::new();
+        let (mut section, axis) = about_y(-5.0, 45.0);
+        let corners = [
+            (0.0, 0.0),
+            (12.0, 0.0),
+            (12.0, 10.0),
+            (16.0, 25.0),
+            (0.0, 25.0),
+        ]
+        .map(|(x, y)| section.geometry.point(Point2::new(x, y)));
+        let mut lines = Vec::new();
+        for i in 0..corners.len() {
+            lines.push(
+                section
+                    .geometry
+                    .line_between(corners[i], corners[(i + 1) % corners.len()]),
+            );
+        }
+        let cup = revolve(&mut part, section, axis, ExtrudeOp::Boss, WHOLE);
+        part.add_feature(shelled(
+            vec![FaceName::profile(cup, lines[3].0)],
+            1.0,
+            outward,
+        ));
+        assert_same_part(&format!("a turned cup's shell, outward {outward}"), &part);
+    }
+}
+
+#[test]
+fn a_shell_thicker_than_the_part_fails() {
+    // 12 mm walls in a bar of 10 mm radius.
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.circle(Point2::new(0.0, 0.0), 10.0);
+    let bar = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 20.0 },
+        false,
+    );
+    let shell = part.add_feature(shelled(vec![FaceName::end_cap(bar)], 12.0, false));
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    match part.status(shell) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("too thick"), "{message}")
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
+// ---------------------------------------------------------------------------------------
+// Sweeps.
+
+fn top() -> Sketch {
+    Sketch::new(SketchPlane::Standard(StandardPlane::Top))
+}
+
+fn swept(part: &mut Part, profile: Sketch, path: Sketch, op: ExtrudeOp) -> FeatureId {
+    let profile = part.add_feature(FeatureKind::Sketch(profile));
+    let path = part.add_feature(FeatureKind::Sketch(path));
+    part.add_feature(FeatureKind::Sweep(oxyde_model::Sweep {
+        profile,
+        path,
+        op,
+        bodies: Vec::new(),
+    }))
+}
+
+#[test]
+fn sweeps_along_lines_arcs_and_circles() {
+    // The Top plane's sketch y runs along -Z.
+    let circle_at = |x: f64, r: f64| {
+        let mut s = front();
+        s.circle(Point2::new(x, 0.0), r);
+        s
+    };
+    // Along a line.
+    let mut part = Part::new();
+    let mut path = top();
+    path.geometry
+        .line(Point2::new(0.0, 0.0), Point2::new(0.0, -30.0));
+    swept(&mut part, circle_at(0.0, 5.0), path, ExtrudeOp::Boss);
+    assert_same_part("a circle swept along a line", &part);
+    // Along a quarter turn.
+    let mut part = Part::new();
+    let mut path = top();
+    path.geometry.arc(
+        Point2::new(20.0, 0.0),
+        Point2::new(0.0, 0.0),
+        Point2::new(20.0, -20.0),
+    );
+    swept(&mut part, circle_at(0.0, 5.0), path, ExtrudeOp::Boss);
+    assert_same_part("a circle swept along an arc", &part);
+    // Round a whole circle: a ring.
+    let mut part = Part::new();
+    let mut path = top();
+    path.circle(Point2::ORIGIN, 20.0);
+    swept(&mut part, circle_at(20.0, 5.0), path, ExtrudeOp::Boss);
+    assert_same_part("a circle swept round a circle", &part);
+    // Along a line, then a quarter turn that carries it on.
+    let mut part = Part::new();
+    let mut path = top();
+    let a = path.geometry.point(Point2::new(0.0, 0.0));
+    let b = path.geometry.point(Point2::new(0.0, -20.0));
+    path.geometry.line_between(a, b);
+    let c = path.geometry.point(Point2::new(10.0, -20.0));
+    let d = path.geometry.point(Point2::new(10.0, -30.0));
+    path.geometry.arc_between(c, b, d);
+    swept(&mut part, circle_at(0.0, 3.0), path, ExtrudeOp::Boss);
+    assert_same_part("a circle swept along a line and an arc", &part);
+    // A square along an arc.
+    let mut part = Part::new();
+    let mut square = front();
+    square.rectangle(Point2::new(-2.0, -2.0), 4.0, 4.0);
+    let mut path = top();
+    path.geometry.arc(
+        Point2::new(20.0, 0.0),
+        Point2::new(0.0, 0.0),
+        Point2::new(20.0, -20.0),
+    );
+    swept(&mut part, square, path, ExtrudeOp::Boss);
+    assert_same_part("a square swept along an arc", &part);
+    // A slot along an arc and on along a line: its round ends sweep tori, then
+    // cylinders.
+    let mut part = Part::new();
+    let mut slot = front();
+    slot.line(Point2::new(-2.0, -1.0), Point2::new(2.0, -1.0));
+    arc(&mut slot, (2.0, 0.0), (2.0, -1.0), (2.0, 1.0));
+    slot.line(Point2::new(2.0, 1.0), Point2::new(-2.0, 1.0));
+    arc(&mut slot, (-2.0, 0.0), (-2.0, 1.0), (-2.0, -1.0));
+    let mut path = top();
+    let a = path.geometry.point(Point2::new(0.0, 0.0));
+    let b = path.geometry.point(Point2::new(20.0, -20.0));
+    let c = path.geometry.point(Point2::new(20.0, 0.0));
+    path.geometry.arc_between(c, a, b);
+    path.geometry
+        .line(Point2::new(20.0, -20.0), Point2::new(40.0, -20.0));
+    swept(&mut part, slot, path, ExtrudeOp::Boss);
+    assert_same_part("a slot swept along an arc and a line", &part);
+}
+
+#[test]
+fn a_cut_sweep_and_a_sweep_round_a_corner() {
+    // A groove swept down into a block.
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 40.0);
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    let mut profile = front();
+    profile.circle(Point2::new(10.0, 20.0), 2.0);
+    let mut path = top();
+    path.geometry
+        .line(Point2::new(10.0, 0.0), Point2::new(10.0, -10.0));
+    swept(&mut part, profile, path, ExtrudeOp::Cut);
+    assert_same_part("a cut swept into a block", &part);
+    // Two lines meeting at a corner: refused, saying why.
+    let mut part = Part::new();
+    let mut profile = front();
+    profile.circle(Point2::new(0.0, 0.0), 3.0);
+    let mut path = top();
+    let a = path.geometry.point(Point2::new(0.0, 0.0));
+    let b = path.geometry.point(Point2::new(0.0, -20.0));
+    let c = path.geometry.point(Point2::new(15.0, -20.0));
+    path.geometry.line_between(a, b);
+    path.geometry.line_between(b, c);
+    let sweep = swept(&mut part, profile, path, ExtrudeOp::Boss);
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    match part.status(sweep) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("turns sharply"), "{message}")
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}

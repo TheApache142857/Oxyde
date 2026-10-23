@@ -1499,7 +1499,7 @@ fn edge_tool(solid: &Solid, run: &Run, span: &Span) -> Result<Tool, NativeError>
                 if *role == Role::Blend(run.edge)
                     && let Surface::Revolution(r) = &mut face.surface
                 {
-                    *r = reframe(r, &surface);
+                    *r = r.reframed(&surface);
                 }
             }
         }
@@ -1613,44 +1613,6 @@ fn blend_surface(solid: &Solid, run: &Run) -> Option<Revolution> {
             })
         }
         (Along::Straight { .. }, None) => None,
-    }
-}
-
-/// `r` given the frame of `wanted` (its axis origin and direction, its angle zero): the
-/// same surface, its normal the same way. For a sphere or a torus `wanted`'s origin is its
-/// centre; for a cylinder or a cone any point of the axis.
-fn reframe(r: &Revolution, wanted: &Revolution) -> Revolution {
-    let a = r.axis.direction;
-    let d = wanted.axis.direction.normalized().unwrap_or(a);
-    if a.cross(d).length() > 1e-9 {
-        return *r;
-    }
-    let sigma = a.dot(d).signum();
-    let shift = (wanted.axis.origin - r.axis.origin).dot(a);
-    let meridian = match r.meridian {
-        Meridian::Line { radius, slope } => Meridian::Line {
-            radius: radius + slope * shift,
-            slope: slope * sigma,
-        },
-        Meridian::Circle { center, radius } => {
-            if shift.abs() > TOL {
-                return *r;
-            }
-            Meridian::Circle { center, radius }
-        }
-    };
-    let origin = r.axis.origin + a * shift;
-    let x_dir = (wanted.x_dir - d * wanted.x_dir.dot(d))
-        .normalized()
-        .unwrap_or(r.x_dir);
-    Revolution {
-        axis: Axis {
-            origin,
-            direction: d,
-        },
-        x_dir,
-        meridian,
-        outward: r.outward,
     }
 }
 
@@ -1957,7 +1919,7 @@ fn ball(center: Point3, axis: Vec3, radius: f64) -> Result<Shape, NativeError> {
     for solid in &mut shape.solids {
         for face in &mut solid.faces {
             if let Surface::Revolution(r) = &mut face.surface {
-                *r = reframe(r, &wanted);
+                *r = r.reframed(&wanted);
             }
         }
     }

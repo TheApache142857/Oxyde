@@ -127,6 +127,33 @@ run along as a segment of constant `v`, a bent edge as 128 of its points, each m
     centre (an arc), and its angle zero points from the axis to the profile;
   - faces come in the profile's order, then for less than a whole turn the start cap (facing
     against the turn) and the end cap.
+- `sweep` (`sweep.rs`): the profile carried along a path of lines and arcs, keeping its angle
+  to the path (OpenCASCADE's corrected Frenet frame), which on a plane path is the path's own
+  turn: each line of the path an extrusion of the profile where the line starts, its
+  cylinders' axes the way the path runs (an extrusion's run against it), each arc a revolve
+  about the arc's axis, its tori about that axis the way the path turns. The pieces are
+  glued where one ends and the next begins (the profile's faces there dropped, their edges
+  and corners shared, each piece's faces as they are: one per segment of the profile and of
+  the path, as OpenCASCADE's); a closed path makes a ring. A path that turns sharply where
+  two curves meet is refused (OpenCASCADE's frame jumps there), and so is a profile not in a
+  plane holding an arc's axis where the arc starts.
+- `shell` (`offset.rs`): a boolean of the solid with an offset of it. An offset keeps the
+  solid's topology: each face's surface moved along its normal (a plane; a cylinder's or a
+  cone's meridian line square to itself, its point at the origin moved with it as
+  OpenCASCADE moves a cone's; a sphere's or a torus's tube radius), each vertex where its
+  faces' moved surfaces meet again (Gauss–Newton from where their tangent planes put it;
+  surfaces meeting smoothly there are one; two surfaces meet in a curve, along which the
+  vertex keeps its place across; an apex or a pole where the moved surface has it), each
+  edge on the curve its faces' moved surfaces meet in (a line, a parallel at its vertex's
+  height, a meridian circle, a plane's circle on a sphere, a section of the moved
+  surfaces). Faces meet as their surfaces extended do, never rounded. A surface shrunk to
+  nothing, a face turned inside out, an edge run backwards: walls too thick for the part,
+  refused in OpenCASCADE's words. Inwards the shell is the solid less its offset by the
+  thickness inside, each face to open moved out instead so that the cut runs through it;
+  outwards the solid grown by the thickness (the faces to open where they are) less the
+  solid (those moved out). Names as OpenCASCADE's: the solid's faces keep theirs, the walls
+  are named after the faces they are offset from, and so is the rim left round an opening
+  (`OffsetFace`); with nothing to open, a void inside or a skin round the solid.
 
 ## 5. Booleans
 
@@ -278,7 +305,11 @@ without gaps; triangles with two corners at a pole are left out.
   slot's top edge (run round its ends), of the inner edge of an L, of a pocket's corners and
   then its rim, of a boss's upright edges down to the plate, of an edge ending on slanted
   faces, of a turned shaft's collar, cone and neck, of the demo flange; unequal chamfers;
-  and the blends that cannot be made, too large or on a smooth edge.
+  and the blends that cannot be made, too large or on a smooth edge; shells of a block and
+  a round bar, opened at one face, two or none, inwards and outwards, of a block with a
+  hole, of one with rounded edges, of a turned cup with a cone, and one too thick; sweeps of
+  a circle along a line, an arc, round a circle and along a line and an arc, of a square and
+  a slot along arcs and lines, one cut into a block, and one round a sharp corner, refused.
 - How close is close: 1e-6 relative, except where OpenCASCADE bounds a face by a B-spline it
   fitted to an intersection, or a B-spline surface to a blend, where its areas and volumes
   are only as good as the fit (`FITTED`, 1e-4; §8). A blend face's axis is compared as a
@@ -290,12 +321,14 @@ without gaps; triangles with two corners at a pole are left out.
   OpenCASCADE builds, and each kernel's rebuild and meshing time and triangle count
   (`kernel-coverage.md` in Cargo's directory for test files; `OXYDE_CORPUS` adds a folder of
   `.oxyprt` files). It fails when a part listed as built natively stops building or differs
-  from OpenCASCADE's. On the Raspberry Pi, October 2026: 27 of 31 parts, 57 of 61 features.
+  from OpenCASCADE's. On the Raspberry Pi, October 2026: 29 of 31 parts, 59 of 61 features,
+  what is left a loft and a STEP import.
   The native kernel rebuilds what meets in lines and circles 5 to 40 times faster than
   OpenCASCADE, what meets in sections 1.1 to 3 times faster (two holes crossing: 66 ms
   against 194 ms; a round bar cut at a slant: 21 against 22), where laying the curves out
   and merging the pieces takes most of the time, and its blends 10 to 40 times faster (the
-  demo bracket, a fillet and a chamfer on its plate and upright: 10 ms against 90).
+  demo bracket, a fillet and a chamfer on its plate and upright: 10 ms against 90), and its
+  shells and sweeps 25 to 40 times (a block's shell: 1.5 ms against 58).
 
 ## 8. Where it differs from OpenCASCADE
 
@@ -317,6 +350,8 @@ without gaps; triangles with two corners at a pole are left out.
   the native kernel's tori and cones run as OpenCASCADE's. A corner's sphere has its poles
   through one of its three faces, OpenCASCADE choosing by its own numbering of the edges:
   the same sphere, turned.
+- A sweep along a path that turns sharply where two of its curves meet: OpenCASCADE builds
+  a solid whose part after the corner has no volume; the native kernel refuses it.
 
 ## 9. Steps
 
@@ -338,8 +373,9 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    straight edges between planes and parallel cylinders and round edges between surfaces on
    one axis; runs of edges that carry on smoothly; corners of one, two (a mitre) and three
    blends (a triangle, a sphere); valleys filled in. The demo bracket.
-4. Shell (an offset of a plane, a cylinder, a cone, a sphere or a torus is one of the same
-   kind), then sweep along paths of lines and arcs.
+4. **Done.** Shell, inwards and outwards, opened or closed, by offsets that keep the
+   topology (planes, cylinders, cones, spheres, tori moved along their normals); sweep along
+   paths of lines and arcs that turn smoothly, glued piece by piece.
 5. Loft.
 6. STEP: writing first, then reading (SolidCraft's Part 21 parser is a start).
 7. Measure, planes normal to a curve, hidden-line drawings, a volume mesher.

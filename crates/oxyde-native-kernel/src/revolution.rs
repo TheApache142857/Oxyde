@@ -387,6 +387,44 @@ impl Revolution {
         })
     }
 
+    /// This surface in the frame of `wanted` (its axis origin and direction, its angle
+    /// zero): the same surface, its normal the same way. For a sphere or a torus `wanted`'s
+    /// origin is its centre; for a cylinder or a cone any point of the axis. Itself when
+    /// `wanted`'s axis is not along its own.
+    pub fn reframed(&self, wanted: &Revolution) -> Revolution {
+        let a = self.axis.direction;
+        let d = wanted.axis.direction.normalized().unwrap_or(a);
+        if a.cross(d).length() > 1e-9 {
+            return *self;
+        }
+        let sigma = a.dot(d).signum();
+        let shift = (wanted.axis.origin - self.axis.origin).dot(a);
+        let meridian = match self.meridian {
+            Meridian::Line { radius, slope } => Meridian::Line {
+                radius: radius + slope * shift,
+                slope: slope * sigma,
+            },
+            Meridian::Circle { center, radius } => {
+                if shift.abs() > 1e-6 {
+                    return *self;
+                }
+                Meridian::Circle { center, radius }
+            }
+        };
+        let x_dir = (wanted.x_dir - d * wanted.x_dir.dot(d))
+            .normalized()
+            .unwrap_or(self.x_dir);
+        Revolution {
+            axis: Axis {
+                origin: self.axis.origin + a * shift,
+                direction: d,
+            },
+            x_dir,
+            meridian,
+            outward: self.outward,
+        }
+    }
+
     /// Whether the two lie on one surface with their normals the same way.
     pub fn same_as(&self, other: &Revolution, tolerance: f64) -> bool {
         let Some(m) = self.coaxial_meridian(other, tolerance) else {

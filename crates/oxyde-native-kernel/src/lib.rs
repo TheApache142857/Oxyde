@@ -13,8 +13,9 @@
 //! sections, the exact curves where a cylinder or a cone crosses another surface, and
 //! degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored copies,
 //! booleans (fuse, cut, common) of them where their faces meet in lines, circles and
-//! sections, voids included, and chamfers and fillets of their edges, with their topology,
-//! exact mass properties, bounds and display meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
+//! sections, voids included, chamfers and fillets of their edges, shells of them, and
+//! sweeps of profiles along paths of lines and arcs, with their topology, exact mass
+//! properties, bounds and display meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
 //! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
 //! describes how.
 
@@ -50,8 +51,10 @@ mod bsp;
 mod build;
 mod curved;
 mod geometry;
+mod offset;
 mod revolution;
 mod revolve;
+mod sweep;
 mod tessellate;
 mod triangulate;
 
@@ -211,21 +214,34 @@ impl Kernel for NativeKernel {
 
     fn sweep(
         &mut self,
-        _plane: &Plane,
-        _profile: &Profile,
-        _path_plane: &Plane,
-        _path: &SweepPath,
+        plane: &Plane,
+        profile: &Profile,
+        path_plane: &Plane,
+        path: &SweepPath,
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("sweep"))
+        guarded(|| {
+            let (shape, history) = sweep::sweep(plane, profile, path_plane, path)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
     }
 
     fn shell(
         &mut self,
-        _shape: ShapeHandle,
-        _removed_faces: &[u32],
-        _offset: f64,
+        shape: ShapeHandle,
+        removed_faces: &[u32],
+        offset: f64,
     ) -> Result<OpResult, NativeError> {
-        Err(NativeError::Unsupported("shell"))
+        guarded(|| {
+            let input = self.shape(shape)?;
+            let (shape, history) = offset::shell(&input, removed_faces, offset)?;
+            Ok(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            })
+        })
     }
 
     fn transform(

@@ -58,6 +58,8 @@ const NATIVE_BUILDS: &[&str] = &[
     "bracket (demo)",
     "fillet",
     "chamfer",
+    "shell",
+    "sweep along an arc",
 ];
 
 // ---------------------------------------------------------------------------------------

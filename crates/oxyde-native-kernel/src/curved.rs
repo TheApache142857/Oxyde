@@ -1503,25 +1503,6 @@ fn meets_only_at_edges(carrier: &Revolution, other: &Surface, a: &Prepared, b: &
     true
 }
 
-/// How far `p` is from `surface`, signed: positive on the side its normal points to.
-fn signed_distance(surface: &Surface, p: Point3) -> f64 {
-    match surface {
-        Surface::Plane(plane) => (p - plane.origin).dot(plane.normal),
-        Surface::Revolution(r) => {
-            let (rho, z) = r.rho_z(p);
-            let away = match r.meridian {
-                Meridian::Line { radius, slope } => {
-                    (rho - radius - slope * z) / (1.0 + slope * slope).sqrt()
-                }
-                Meridian::Circle { center, radius } => {
-                    ((rho - center).powi(2) + z * z).sqrt() - radius
-                }
-            };
-            if r.outward { away } else { -away }
-        }
-    }
-}
-
 /// Whether the surfaces of `a` and `b` cross inside both faces, clear of their edges:
 /// over a fine grid of each face's chart, where the other's signed distance changes sign
 /// between two neighbouring points, the crossing found by bisection lies well inside both.
@@ -1543,7 +1524,7 @@ fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
                 face.lo.y + (face.hi.y - face.lo.y) * j as f64 / n as f64,
             )
         };
-        let side = |q: P| signed_distance(&other.surface, face.chart.to_world(q));
+        let side = |q: P| other.surface.signed_distance(face.chart.to_world(q));
         let values: Vec<Vec<f64>> = (0..=n)
             .map(|i| (0..=n).map(|j| side(at(i, j))).collect())
             .collect();
