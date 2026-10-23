@@ -87,13 +87,16 @@ pub fn update_equations_file(path: &Path, values: &[LinkedValue]) -> Result<(), 
             .strip_prefix('"')
             .and_then(|rest| rest.split_once('"'))
             .map(|(name, _)| name);
-        match name.and_then(|n| values.iter().position(|v| v.name == n)) {
-            Some(i) => {
-                text.push_str(&format!(
-                    "\"{}\" = {}\n",
-                    values[i].name, values[i].expression
-                ));
-                written[i] = true;
+        let found = name.and_then(|n| {
+            values
+                .iter()
+                .zip(written.iter_mut())
+                .find(|(v, _)| v.name == n)
+        });
+        match found {
+            Some((v, done)) => {
+                text.push_str(&format!("\"{}\" = {}\n", v.name, v.expression));
+                *done = true;
             }
             None => {
                 text.push_str(line);
