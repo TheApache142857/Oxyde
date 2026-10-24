@@ -70,25 +70,11 @@ pub(crate) fn boolean(
         .enumerate()
         .map(|(i, t)| tag(t, i as u32 + 1))
         .collect();
-    let result = match op {
-        BooleanOp::Fuse | BooleanOp::Cut => {
-            let mut acc = target;
-            for tool in &tools {
-                acc = pairwise(op, &acc, tool)?;
-            }
-            acc
-        }
-        BooleanOp::Common => {
-            let Some((first, rest)) = tools.split_first() else {
-                return Err(NativeError::Failed("a boolean needs a tool".to_owned()));
-            };
-            let mut union = first.clone();
-            for tool in rest {
-                union = pairwise(BooleanOp::Fuse, &union, tool)?;
-            }
-            pairwise(BooleanOp::Common, &target, &union)?
-        }
-    };
+    if tools.is_empty() {
+        return Err(NativeError::Failed("a boolean needs a tool".to_owned()));
+    }
+    // A fuse with, a cut by or the common with every tool is the same with their union.
+    let result = pairwise(op, &target, &combined(&tools)?)?;
     let history = OpHistory {
         faces: result
             .sources
@@ -102,6 +88,79 @@ pub(crate) fn boolean(
             .collect(),
     };
     Ok((result.shape, history))
+}
+
+/// The union of a boolean's tools as one shape: tools whose boxes meet are fused first, the
+/// others put side by side as solids of their own. The target is then cut once by all of
+/// them, each of its faces by the curves of every tool meeting it in one arrangement, rather
+/// than once a tool: a pattern of holes cut hole after hole took time growing with the
+/// square of their number, every cut laying out all the holes before it again. Inside and
+/// outside are told by rays against all the tools' faces at once, which holds while the
+/// solids put side by side do not overlap, so only tools whose boxes are apart are.
+fn combined(tools: &[Tagged]) -> Result<Tagged, NativeError> {
+    if let [one] = tools {
+        return Ok(one.clone());
+    }
+    let pad = 10.0 * TOL;
+    let boxes: Vec<Option<(Point3, Point3)>> = tools.iter().map(|t| t.shape.bounds()).collect();
+    let meet = |a: (Point3, Point3), b: (Point3, Point3)| {
+        a.0.x <= b.1.x + pad
+            && b.0.x <= a.1.x + pad
+            && a.0.y <= b.1.y + pad
+            && b.0.y <= a.1.y + pad
+            && a.0.z <= b.1.z + pad
+            && b.0.z <= a.1.z + pad
+    };
+    // Tools whose boxes meet, grouped: swept along x, each against those still reaching it.
+    let mut parent: Vec<usize> = (0..tools.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut order: Vec<(usize, (Point3, Point3))> = boxes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, b)| b.map(|b| (i, b)))
+        .collect();
+    order.sort_by(|p, q| p.1.0.x.total_cmp(&q.1.0.x).then(p.0.cmp(&q.0)));
+    let mut active: Vec<(usize, (Point3, Point3))> = Vec::new();
+    for &(i, b) in &order {
+        active.retain(|(_, a)| a.1.x + pad >= b.0.x);
+        for &(j, a) in &active {
+            if meet(a, b) {
+                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                parent[ri.max(rj)] = ri.min(rj);
+            }
+        }
+        active.push((i, b));
+    }
+    // Each group fused in the tools' order, the groups in the order of their first tool.
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<usize, usize> = HashMap::new();
+    for i in 0..tools.len() {
+        let r = root(&mut parent, i);
+        let g = *group_of.entry(r).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    let mut out = Tagged {
+        shape: Shape { solids: Vec::new() },
+        sources: Vec::new(),
+    };
+    for group in groups {
+        let mut acc = tools[group[0]].clone();
+        for &k in &group[1..] {
+            acc = pairwise(BooleanOp::Fuse, &acc, &tools[k])?;
+        }
+        out.shape.solids.extend(acc.shape.solids);
+        out.sources.extend(acc.sources);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1044,18 +1103,26 @@ fn box_of(points: impl IntoIterator<Item = Point3>) -> (Point3, Point3) {
 }
 
 fn edges_box(loops: &[Vec<Edge3>]) -> (Point3, Point3) {
-    let mut points = Vec::new();
-    for e in loops.iter().flatten() {
-        points.push(e.a);
-        match e.curve {
-            Curve::Circle(c) => points.extend(c.extremes(c.angle_of(e.a), e.extent())),
-            Curve::Section(c) => points.extend(c.extremes(e.a, e.extent())),
-            Curve::Traced(c) => points.extend(c.extremes(e.a, e.extent())),
-            Curve::Spline(c) => points.extend(c.extremes(e.a, e.extent())),
-            Curve::Line | Curve::Degenerate { .. } => {}
-        }
+    // A loop's edges end where the next ones start.
+    box_of(loops.iter().flatten().flat_map(start_and_extremes))
+}
+
+/// One edge's box, its end with it.
+fn edge_box(e: &Edge3) -> (Point3, Point3) {
+    box_of(start_and_extremes(e).into_iter().chain([e.b]))
+}
+
+/// An edge's start and the furthest points it reaches along each axis between its ends.
+fn start_and_extremes(e: &Edge3) -> Vec<Point3> {
+    let mut points = vec![e.a];
+    match e.curve {
+        Curve::Circle(c) => points.extend(c.extremes(c.angle_of(e.a), e.extent())),
+        Curve::Section(c) => points.extend(c.extremes(e.a, e.extent())),
+        Curve::Traced(c) => points.extend(c.extremes(e.a, e.extent())),
+        Curve::Spline(c) => points.extend(c.extremes(e.a, e.extent())),
+        Curve::Line | Curve::Degenerate { .. } => {}
     }
-    box_of(points)
+    points
 }
 
 /// A face's box: its edges', and where a sphere's or a torus's face bulges out between
@@ -2134,9 +2201,11 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
         ),
         (Cut::Same, _) => {
             // The other face's boundary, laid out in this face's chart, at each of its
-            // places along this face's unwrapped `x`.
+            // places along this face's unwrapped `x`: only what reaches this face's box,
+            // all that can cut it (each hole's cap on a panel's face met every hole of the
+            // face, hundreds of them).
             let segments = boundary_2d(chart, &other.loops).map_err(internal)?;
-            match chart.period() {
+            let laid = match chart.period() {
                 None => segments,
                 Some(_) => {
                     let (lo, _) = box_2d(&segments);
@@ -2146,7 +2215,13 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
                     }
                     out
                 }
-            }
+            };
+            laid.into_iter()
+                .filter(|s| {
+                    let (lo, hi) = s.bounds(2.0 * TOL);
+                    lo.x <= face.hi.x && hi.x >= face.lo.x && lo.y <= face.hi.y && hi.y >= face.lo.y
+                })
+                .collect()
         }
     })
 }
@@ -2520,7 +2595,7 @@ const RAYS: [(f64, f64, f64); 6] = [
 fn classify(point: Point3, normal: Vec3, faces: &[Prepared]) -> Result<Where, NativeError> {
     // On one of its faces?
     for face in faces {
-        if face.surface.distance(point) > TOL {
+        if !within_box(face, point) || face.surface.distance(point) > TOL {
             continue;
         }
         if let Some(p) = on_face(face, point)
@@ -2539,6 +2614,10 @@ fn classify(point: Point3, normal: Vec3, faces: &[Prepared]) -> Result<Where, Na
         };
         let mut count = 0usize;
         for face in faces {
+            // A ray missing a face's box misses the face.
+            if !ray_meets_box(face, point, dir) {
+                continue;
+            }
             for t in ray_hits(&face.surface, point, dir) {
                 let Some(t) = t else {
                     continue 'rays;
@@ -2567,6 +2646,43 @@ fn classify(point: Point3, normal: Vec3, faces: &[Prepared]) -> Result<Where, Na
     Err(NativeError::Internal(
         "every ray cast to tell inside from outside grazed an edge".to_owned(),
     ))
+}
+
+/// Whether `p` lies within a face's box, give or take the tolerance.
+fn within_box(face: &Prepared, p: Point3) -> bool {
+    let pad = 2.0 * TOL;
+    p.x >= face.min.x - pad
+        && p.x <= face.max.x + pad
+        && p.y >= face.min.y - pad
+        && p.y <= face.max.y + pad
+        && p.z >= face.min.z - pad
+        && p.z <= face.max.z + pad
+}
+
+/// Whether the ray `point + t dir`, `t >= 0`, passes through a face's box, give or take the
+/// tolerance (slabs along each axis).
+fn ray_meets_box(face: &Prepared, point: Point3, dir: Vec3) -> bool {
+    let pad = 2.0 * TOL;
+    let (mut near, mut far) = (0.0f64, f64::INFINITY);
+    for (o, d, lo, hi) in [
+        (point.x, dir.x, face.min.x - pad, face.max.x + pad),
+        (point.y, dir.y, face.min.y - pad, face.max.y + pad),
+        (point.z, dir.z, face.min.z - pad, face.max.z + pad),
+    ] {
+        if d.abs() < 1e-300 {
+            if o < lo || o > hi {
+                return false;
+            }
+            continue;
+        }
+        let (a, b) = ((lo - o) / d, (hi - o) / d);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return false;
+        }
+    }
+    true
 }
 
 /// `p`, a point of the face's surface, in its chart, its `x` (and a ring torus's `y`) taken
@@ -2628,32 +2744,105 @@ fn pairwise(op: BooleanOp, a: &Tagged, b: &Tagged) -> Result<Tagged, NativeError
 // ---------------------------------------------------------------------------------------
 // Welding pieces into faces and solids.
 
-/// Points welded within the tolerance.
+/// Points welded within the tolerance: a point is the first one within it, found among the
+/// points of its cell of a grid as wide as the tolerance and of the cells about it (a search
+/// of every point made welding the thousands of corners of a panel's holes take seconds).
 #[derive(Debug, Default)]
 struct Points {
     points: Vec<Point3>,
+    cells: HashMap<(i64, i64, i64), Vec<u32>>,
 }
 
 impl Points {
     fn index(&mut self, p: Point3) -> u32 {
-        if let Some(i) = self.points.iter().position(|q| q.distance(p) <= TOL) {
-            return i as u32;
+        let cell = |x: f64| (x / TOL).floor() as i64;
+        let (cx, cy, cz) = (cell(p.x), cell(p.y), cell(p.z));
+        let mut first: Option<u32> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &i in self
+                        .cells
+                        .get(&(cx + dx, cy + dy, cz + dz))
+                        .into_iter()
+                        .flatten()
+                    {
+                        if self.points[i as usize].distance(p) <= TOL && first.is_none_or(|f| i < f)
+                        {
+                            first = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(i) = first {
+            return i;
         }
         self.points.push(p);
-        self.points.len() as u32 - 1
+        let i = self.points.len() as u32 - 1;
+        self.cells.entry((cx, cy, cz)).or_default().push(i);
+        i
     }
 }
 
-/// Every edge of `loops` split at the points of `points` that lie along it.
-fn split_at(loops: &[Vec<Edge3>], points: &[Point3]) -> Vec<Vec<Edge3>> {
+/// Points sorted into a grid, to find those within a box: about a point a cell over their
+/// box.
+struct PointGrid<'a> {
+    points: &'a [Point3],
+    cell: f64,
+    cells: HashMap<(i64, i64, i64), Vec<u32>>,
+}
+
+impl<'a> PointGrid<'a> {
+    fn new(points: &'a [Point3]) -> PointGrid<'a> {
+        let (lo, hi) = box_of(points.iter().copied());
+        let cell = (lo.distance(hi) / (points.len().max(1) as f64).sqrt()).max(100.0 * TOL);
+        let mut grid = PointGrid {
+            points,
+            cell,
+            cells: HashMap::new(),
+        };
+        for (i, &p) in points.iter().enumerate() {
+            let key = grid.key(p);
+            grid.cells.entry(key).or_default().push(i as u32);
+        }
+        grid
+    }
+
+    fn key(&self, p: Point3) -> (i64, i64, i64) {
+        let cell = |x: f64| (x / self.cell).floor() as i64;
+        (cell(p.x), cell(p.y), cell(p.z))
+    }
+
+    /// The points within the box from `lo` to `hi` and a little beyond, in their order.
+    fn within(&self, lo: Point3, hi: Point3) -> Vec<Point3> {
+        let (a, b) = (self.key(lo), self.key(hi));
+        let mut found: Vec<u32> = Vec::new();
+        for x in a.0..=b.0 {
+            for y in a.1..=b.1 {
+                for z in a.2..=b.2 {
+                    found.extend(self.cells.get(&(x, y, z)).into_iter().flatten());
+                }
+            }
+        }
+        found.sort_unstable();
+        found.into_iter().map(|i| self.points[i as usize]).collect()
+    }
+}
+
+/// Every edge of `loops` split at the points of `grid` that lie along it.
+fn split_at(loops: &[Vec<Edge3>], grid: &PointGrid) -> Vec<Vec<Edge3>> {
+    let pad = Vec3::new(2.0 * TOL, 2.0 * TOL, 2.0 * TOL);
     loops
         .iter()
         .map(|edges| {
             let mut out = Vec::new();
             for e in edges {
-                let mut at: Vec<(f64, Point3)> = points
-                    .iter()
-                    .filter_map(|&p| e.inner(p).map(|s| (s, p)))
+                let (lo, hi) = edge_box(e);
+                let mut at: Vec<(f64, Point3)> = grid
+                    .within(lo - pad, hi + pad)
+                    .into_iter()
+                    .filter_map(|p| e.inner(p).map(|s| (s, p)))
                     .collect();
                 at.sort_by(|x, y| x.0.total_cmp(&y.0));
                 let mut start = e.a;
@@ -2729,10 +2918,11 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
         points.index(e.b);
     }
     let all = points.points.clone();
+    let grid = PointGrid::new(&all);
     let pieces: Vec<Piece> = pieces
         .into_iter()
         .map(|p| Piece {
-            loops: split_at(&p.loops, &all),
+            loops: split_at(&p.loops, &grid),
             ..p
         })
         .collect();
@@ -3035,10 +3225,11 @@ fn assemble(faces: Vec<Piece>) -> Result<Tagged, NativeError> {
         points.index(e.b);
     }
     let all = points.points.clone();
+    let grid = PointGrid::new(&all);
     let faces: Vec<Piece> = faces
         .into_iter()
         .map(|p| Piece {
-            loops: split_at(&p.loops, &all),
+            loops: split_at(&p.loops, &grid),
             ..p
         })
         .collect();
@@ -3205,50 +3396,66 @@ fn same_way(a: &Curve, b: &Curve) -> bool {
 
 /// Joins edges that meet at a vertex no other edge reaches, run along one line or circle,
 /// between the same two faces: what is left of an edge cut by a curve that was merged away.
+///
+/// The lowest vertex where two edges can be joined is joined first, as a scan from the first
+/// vertex after every join would find it; the faces along each edge and the edges reaching
+/// each vertex are kept up to date as edges are joined rather than gathered again, and a
+/// vertex is looked at again only when a join changes the edges reaching it (gathering them
+/// again after every join took seconds on a panel of hundreds of holes).
 fn join_edges(solid: &mut Solid) {
-    loop {
-        let mut incident: Vec<Vec<u32>> = vec![Vec::new(); solid.vertices.len()];
-        let mut faces_of: Vec<Vec<usize>> = vec![Vec::new(); solid.edges.len()];
-        for (f, face) in solid.faces.iter().enumerate() {
-            for u in face.loops.iter().flatten() {
-                if !faces_of[u.edge as usize].contains(&f) {
-                    faces_of[u.edge as usize].push(f);
-                }
+    let mut faces_of: Vec<Vec<usize>> = vec![Vec::new(); solid.edges.len()];
+    for (f, face) in solid.faces.iter().enumerate() {
+        for u in face.loops.iter().flatten() {
+            if !faces_of[u.edge as usize].contains(&f) {
+                faces_of[u.edge as usize].push(f);
             }
         }
-        for (e, edge) in solid.edges.iter().enumerate() {
-            if faces_of[e].is_empty() {
-                continue;
-            }
-            for v in [edge.start, edge.end] {
-                if !incident[v as usize].contains(&(e as u32)) {
-                    incident[v as usize].push(e as u32);
-                }
+    }
+    let mut incident: Vec<Vec<u32>> = vec![Vec::new(); solid.vertices.len()];
+    for (e, edge) in solid.edges.iter().enumerate() {
+        if faces_of[e].is_empty() {
+            continue;
+        }
+        for v in [edge.start, edge.end] {
+            if !incident[v as usize].contains(&(e as u32)) {
+                incident[v as usize].push(e as u32);
             }
         }
-        let mut joined = false;
-        for (v, edges) in incident.iter().enumerate() {
-            let [e1, e2] = edges.as_slice() else {
-                continue;
-            };
-            let (a, b) = (solid.edges[*e1 as usize], solid.edges[*e2 as usize]);
-            if a.start == a.end || b.start == b.end {
-                continue;
-            }
-            let mut fa = faces_of[*e1 as usize].clone();
-            let mut fb = faces_of[*e2 as usize].clone();
-            fa.sort_unstable();
-            fb.sort_unstable();
-            if fa != fb || !same_curve(solid, &a, &b) {
-                continue;
-            }
-            if join(solid, v as u32, *e1, *e2) {
-                joined = true;
-                break;
-            }
+    }
+    let mut pending: std::collections::BTreeSet<u32> = (0..solid.vertices.len() as u32).collect();
+    while let Some(v) = pending.pop_first() {
+        let &[e1, e2] = incident[v as usize].as_slice() else {
+            continue;
+        };
+        let (a, b) = (solid.edges[e1 as usize], solid.edges[e2 as usize]);
+        if a.start == a.end || b.start == b.end {
+            continue;
         }
-        if !joined {
-            break;
+        let mut fa = faces_of[e1 as usize].clone();
+        let mut fb = faces_of[e2 as usize].clone();
+        fa.sort_unstable();
+        fb.sort_unstable();
+        if fa != fb || !same_curve(solid, &a, &b) {
+            continue;
+        }
+        let Some(joined) = join(solid, v, e1, e2, &fa) else {
+            continue;
+        };
+        // The two edges are gone; the joined one runs along the same faces and reaches
+        // their far ends, which are looked at again.
+        faces_of[e1 as usize].clear();
+        faces_of[e2 as usize].clear();
+        faces_of.resize(solid.edges.len(), Vec::new());
+        faces_of[joined as usize] = fa;
+        incident[v as usize].clear();
+        let edge = solid.edges[joined as usize];
+        for w in [edge.start, edge.end] {
+            let list = &mut incident[w as usize];
+            list.retain(|&e| e != e1 && e != e2);
+            if !list.contains(&joined) {
+                list.push(joined);
+            }
+            pending.insert(w);
         }
     }
     compact(solid);
@@ -3272,56 +3479,53 @@ fn same_curve(solid: &Solid, a: &Edge, b: &Edge) -> bool {
     }
 }
 
-/// Replaces `e1` and `e2`, meeting at `v`, by one edge in every loop that runs along them.
-fn join(solid: &mut Solid, v: u32, e1: u32, e2: u32) -> bool {
-    // The joined edge, run as the first loop that uses both runs them.
-    let mut new_edge: Option<Edge> = None;
-    for face in &solid.faces {
-        for uses in &face.loops {
-            let n = uses.len();
-            for k in 0..n {
-                let (u, w) = (uses[k], uses[(k + 1) % n]);
-                let pair = (u.edge == e1 && w.edge == e2) || (u.edge == e2 && w.edge == e1);
-                if pair && solid.end_of(u) == v {
-                    let start = solid.start_of(u);
-                    let end = solid.end_of(w);
-                    let curve = solid.edges[u.edge as usize].curve;
-                    let curve = if u.reversed { curve.reversed() } else { curve };
-                    new_edge = Some(Edge::new(start, end, curve));
-                    break;
-                }
-            }
-            if new_edge.is_some() {
-                break;
-            }
+/// Replaces `e1` and `e2`, meeting at `v`, by one edge in every loop that runs along them
+/// (all in `faces`, the faces along both, in order); the joined edge's number, or `None`
+/// when no loop runs from one to the other through `v`.
+fn join(solid: &mut Solid, v: u32, e1: u32, e2: u32, faces: &[usize]) -> Option<u32> {
+    let (edge1, edge2) = (solid.edges[e1 as usize], solid.edges[e2 as usize]);
+    let edge_of = |u: EdgeUse| if u.edge == e1 { edge1 } else { edge2 };
+    // A use's start and end, of one of the two edges.
+    let ends = |u: EdgeUse| {
+        let e = edge_of(u);
+        if u.reversed {
+            (e.end, e.start)
+        } else {
+            (e.start, e.end)
         }
-        if new_edge.is_some() {
-            break;
-        }
-    }
-    let Some(new_edge) = new_edge else {
-        return false;
     };
+    let pair = |u: EdgeUse, w: EdgeUse| {
+        ((u.edge == e1 && w.edge == e2) || (u.edge == e2 && w.edge == e1)) && ends(u).1 == v
+    };
+    // The joined edge, run as the first loop that uses both runs them.
+    let new_edge = faces.iter().find_map(|&f| {
+        solid.faces[f].loops.iter().find_map(|uses| {
+            let n = uses.len();
+            (0..n).find_map(|k| {
+                let (u, w) = (uses[k], uses[(k + 1) % n]);
+                pair(u, w).then(|| {
+                    let curve = edge_of(u).curve;
+                    let curve = if u.reversed { curve.reversed() } else { curve };
+                    Edge::new(ends(u).0, ends(w).1, curve)
+                })
+            })
+        })
+    })?;
     solid.edges.push(new_edge);
     let ne = solid.edges.len() as u32 - 1;
-    let snapshot = solid.clone();
     // A seam runs along its face's loop twice, once each way: every run is replaced.
-    for face in &mut solid.faces {
-        for uses in &mut face.loops {
+    for &f in faces {
+        for uses in &mut solid.faces[f].loops {
             loop {
                 let n = uses.len();
-                let Some(k) = (0..n).find(|&k| {
-                    let (u, w) = (uses[k], uses[(k + 1) % n]);
-                    ((u.edge == e1 && w.edge == e2) || (u.edge == e2 && w.edge == e1))
-                        && snapshot.end_of(u) == v
-                }) else {
+                let Some(k) = (0..n).find(|&k| pair(uses[k], uses[(k + 1) % n])) else {
                     break;
                 };
                 let u = uses[k];
-                let reversed = snapshot.start_of(u) != new_edge.start
+                let reversed = ends(u).0 != new_edge.start
                     || (new_edge.start == new_edge.end && {
                         // A closed circle or section: the way it turns.
-                        let d = snapshot.edges[u.edge as usize].curve;
+                        let d = edge_of(u).curve;
                         let d = if u.reversed { d.reversed() } else { d };
                         !same_way(&new_edge.curve, &d)
                     });
@@ -3335,7 +3539,7 @@ fn join(solid: &mut Solid, v: u32, e1: u32, e2: u32) -> bool {
             }
         }
     }
-    true
+    Some(ne)
 }
 
 /// Drops edges and vertices nothing uses any more, renumbering the rest in order.

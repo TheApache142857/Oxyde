@@ -108,6 +108,10 @@ release yet; the git history has every detail.
   needs). Curved faces bounded by curves of many pieces, as CATIA, SolidWorks and Creo
   write rounded edges, are meshed with the triangles they need and no more: a CATIA part
   shows 25,000 triangles instead of 615,000 and meshes four times faster.
+- **Patterns of many holes** are fast with it: a pattern's cuts (or bosses) are made in one
+  operation instead of one after the other. A panel of 400 hexagonal holes rebuilds in under
+  a second, where it took over half an hour, and one of 1,024 in 3 s against OpenCASCADE's
+  20.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

@@ -261,7 +261,7 @@ impl Segment {
     }
 
     /// A box round it, `pad` wider all round: a line's ends, an arc's whole circle.
-    fn bounds(&self, pad: f64) -> (P, P) {
+    pub(crate) fn bounds(&self, pad: f64) -> (P, P) {
         let (lo, hi) = match self.geom {
             Geom::Line => (
                 P::new(self.a.x.min(self.b.x), self.a.y.min(self.b.y)),

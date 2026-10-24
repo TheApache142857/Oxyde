@@ -1064,6 +1064,84 @@ fn a_pattern_of_pockets() {
     assert_same_part("pattern of pockets", &part);
 }
 
+/// A linear pattern of `seed` along x (`count` × `spacing`) and, given, along y.
+fn pattern(part: &mut Part, seed: FeatureId, x: (u32, f64), y: Option<(u32, f64)>) {
+    let along = |axis, (count, spacing): (u32, f64)| PatternDirection {
+        axis: AxisRef::Standard(axis),
+        spacing,
+        count,
+        reverse: false,
+    };
+    part.add_feature(FeatureKind::LinearPattern(LinearPattern {
+        seeds: vec![seed],
+        first: along(StandardAxis::X, x),
+        second: y.map(|y| along(StandardAxis::Y, y)),
+        skip: Vec::new(),
+    }));
+}
+
+#[test]
+fn staggered_patterns_of_hexagonal_holes() {
+    // Two grids of hexagonal holes through the block, the second between the first's, as
+    // the hackintosh case's panels are: each pattern one boolean with all its holes as tools.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    for (ox, oy) in [(7.0, 6.0), (11.0, 9.5)] {
+        let mut sketch = on_top(base);
+        let corners: Vec<(f64, f64)> = (0..6)
+            .map(|k| {
+                let a = std::f64::consts::FRAC_PI_6 + f64::from(k) * std::f64::consts::FRAC_PI_3;
+                (ox + 2.5 * a.cos(), oy + 2.5 * a.sin())
+            })
+            .collect();
+        polygon(&mut sketch, &corners);
+        let hole = extrude(
+            &mut part,
+            sketch,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::ThroughAll { both: false },
+            false,
+        );
+        pattern(&mut part, hole, (4, 8.0), Some((3, 7.0)));
+    }
+    assert_same_part("staggered hexagonal holes", &part);
+}
+
+#[test]
+fn a_pattern_of_holes_running_into_each_other() {
+    // Holes closer than their diameter: tools that overlap are joined before the cut.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(8.0, 15.0), 3.0);
+    let hole = extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        false,
+    );
+    pattern(&mut part, hole, (5, 4.5), None);
+    assert_same_part("pattern of overlapping holes", &part);
+}
+
+#[test]
+fn a_pattern_of_round_bosses() {
+    // A fuse with many tools apart from each other.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(6.0, 6.0), 2.0);
+    let peg = boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 3.0 },
+        false,
+    );
+    pattern(&mut part, peg, (5, 7.0), Some((3, 9.0)));
+    assert_same_part("pattern of round bosses", &part);
+}
+
 #[test]
 fn an_intersection_keeps_what_both_share() {
     let mut part = Part::new();

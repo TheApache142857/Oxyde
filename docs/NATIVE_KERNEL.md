@@ -297,6 +297,18 @@ parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
 `boolean.rs` dispatches and checks: a result must be closed (checked when kept), a fuse
 never loses volume, a cut or a common never gains any, nothing reaches beyond the inputs.
 
+- **Many tools at once** (a pattern's instances, a sketch's several profiles): the tools
+  whose boxes meet are fused first, the others put side by side as solids of one shape, and
+  the target is cut once by all of them, each of its faces by the curves of every tool
+  meeting it in one arrangement; inside and outside are told by rays against all the tools'
+  faces, which holds since the solids side by side do not overlap. Nothing in a pass grows
+  with the square of the faces: corners are welded and edges split where other corners lie
+  through grids of the points, edges are joined lowest vertex first with the edges reaching
+  each vertex kept up to date, a face takes only the stretch of a coplanar face's boundary
+  that reaches its box (each hole's cap met every hole of the panel's face), and rays skip
+  the faces whose boxes they miss. A panel of 1,024 hexagonal holes: 2.9 s, against
+  OpenCASCADE's 20.6 (§10).
+
 - **Every solid** (`curved.rs`), flat-faced or curved, is cut face by face: one engine for
   all (a BSP-tree one for flat-faced solids was dropped once this one was as good, and
   still 10 to 30 times faster than OpenCASCADE's on them). Each face is laid out flat in its
@@ -481,7 +493,9 @@ where none does, never cutting the boundary, so that it meets its neighbours all
 - `crates/oxyde-tests/tests/native_kernel.rs` builds the same parts with both kernels and
   compares volumes, centres of mass, bounds, counts, every face, edge and vertex name, and
   each face's surface, area, centroid and normal or axis: extrusions, round holes and
-  bosses, slots, patterns, revolves of every kind of profile each way about the axis for a
+  bosses, slots, patterns (two staggered grids of hexagonal holes, holes running into each
+  other, round bosses: one boolean with many tools), revolves of every kind of profile each
+  way about the axis for a
   whole turn and less, grooves and channels, every kind of hole, the demo flange, balls on
   and in blocks, balls, cones and tori cut in half along their axis, a rod with a ball on
   its end and one with a ball cut from it, a torus half sunk into a block, an O-ring's
@@ -547,6 +561,9 @@ where none does, never cutting the boundary, so that it meets its neighbours all
   line (either way along it) and a corner's sphere by its centre (§8). A loft, whose
   B-splines the native kernel makes as OpenCASCADE does, is held to 1e-6 but for its
   B-spline faces' areas and centroids (1e-3: OpenCASCADE's own are off, §8).
+- `crates/oxyde-tests/tests/hole_panels.rs` (ignored, run by hand) times both kernels on
+  panels of two staggered patterns of hexagonal holes, 36 to 1,024 of them
+  (`OXYDE_PANEL_HOLES`), with their volumes and face counts (§10).
 - `crates/oxyde-tests/tests/kernel_coverage.rs` is the measure of progress and the
   benchmark: a corpus of parts holding every feature type (the application's demo bracket
   and flange among them) rebuilt by both kernels, feature by feature. It reports what the
@@ -639,8 +656,9 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    AP214, AP242, assemblies, units, colours, materials, every surface and curve of the
    corpus; faces settled to the kernel's (seams, poles, exact B-splines). The cart's STEP
    import in `kernel_coverage.rs`: 6.9 ms against OpenCASCADE's 259.
-7. Booleans with many tools in one pass, measure, planes normal to a curve, hidden-line
-   drawings, a volume mesher: what opening files like the hackintosh case needs (§10).
+7. Booleans with many tools in one pass (done), measure, planes normal to a curve,
+   hidden-line drawings, a volume mesher: what opening files like the hackintosh case needs
+   (§10).
 8. The native kernel as the default, once every feature test of `oxyde-tests` passes on it.
 
 ## 10. Opening files like the hackintosh case
@@ -669,17 +687,25 @@ case's (a probe, October 2026, on the Raspberry Pi), each built by both kernels:
 Every one of them is the same solid with either kernel (volume and faces), and the native
 kernel meshes each 10 to 50 times faster. What is missing, most needed first:
 
-1. **Booleans with many tools.** A pattern's cuts are one boolean with every instance as
-   a tool, which the native kernel takes as that many booleans in turn (`curved::boolean`),
-   each cutting the whole solid again, its faces holding every hole cut so far: the time
-   grows with the square of the holes or faster, so a panel of the case's would take an
-   hour. Wanted: one pass for all the tools, each face of the target meeting only the
-   tools whose boxes meet it, its curves from all of them laid out in one arrangement, its
-   pieces kept or dropped against all the tools at once (a tree of the tools' boxes), tools
-   that do not meet each other never compared; and the arrangement of one face with many
-   curves made faster on its own (the 40 glyphs: twice OpenCASCADE's time). The goal: the
-   time linear in the tools, and the panels faster than OpenCASCADE, as the kernel's other
-   operations are.
+1. **Booleans with many tools. Done** (October 2026). A pattern's cuts are one boolean with
+   every instance as a tool, which the native kernel took as that many booleans in turn,
+   each cutting the whole solid again. They are cut in one pass now, and what made a pass
+   grow with the square of the faces is gone (§5). The panels above, on the owner's PC
+   (`hole_panels.rs`, the same solids from both kernels):
+
+   | Holes | OpenCASCADE | Native kernel before | Native kernel now |
+   |---|---|---|---|
+   | 36 | 0.18 s | 0.94 s | 0.06 s |
+   | 100 | 0.53 s | 16.7 s | 0.18 s |
+   | 400 | 3.97 s | over 35 min (the Pi) | 0.84 s |
+   | 1,024 | 20.6 s | | 2.9 s |
+
+   The glyphs and the slots of the table above were probes not kept in the repository and
+   are not measured again; the arrangement of one face with many curves (the glyphs) may
+   still be slower than OpenCASCADE's. SolidCraft (`tangency-labs/solidcraft`, on truck)
+   decides a plate and tools that are prisms along one direction in 2D, from their
+   sections, before meshing anything (`prism.rs` there): a faster path still for stepped
+   extrusions, should the general one fall short.
 2. **The case itself, tried.** `oxyde-cli` rebuilds with OpenCASCADE only: give it
    `--kernel native`, and a command that rebuilds a part, an assembly or a STEP file with
    both kernels and reports each feature's status and time and how far the results differ
