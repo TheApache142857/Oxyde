@@ -19,7 +19,7 @@ use oxyde_model::{DimensionUnit, GlobalId, LinkedValue, ModelError};
 use crate::app::OxydeApp;
 use crate::assembly::AssemblyDoc;
 use crate::equations_ui::{
-    EquationsTab, EquationsWindow, Field, error, format_value, result_label,
+    EquationsTab, EquationsWindow, Field, error, format_value, result_label, sized_field,
 };
 
 /// Entries of the list of what a new equation drives, at most, before the filter narrows it.
@@ -305,6 +305,15 @@ fn equations_tab(
     });
     ui.add_space(4.0);
     ui.strong("Global variables");
+    let name_width = state.name_width(
+        ui,
+        equations
+            .globals
+            .iter()
+            .map(|g| g.name.as_str())
+            .chain([state.new_global_name.as_str()]),
+        |f| matches!(f, Field::GlobalName(_)),
+    );
     egui::Grid::new("assembly_globals")
         .num_columns(4)
         .striped(true)
@@ -321,7 +330,7 @@ fn equations_tab(
                     ui.label(format!("🔗 {}", global.name))
                         .on_hover_text("From the linked equations file");
                 } else if let Some(name) =
-                    state.field(ui, Field::GlobalName(global.id), &global.name, 110.0)
+                    state.field(ui, Field::GlobalName(global.id), &global.name, name_width)
                 {
                     changes.push(Change::RenameGlobal(global.id, name));
                 }
@@ -339,10 +348,10 @@ fn equations_tab(
                 }
                 ui.end_row();
             }
-            ui.add(
-                egui::TextEdit::singleline(&mut state.new_global_name)
-                    .hint_text("New name")
-                    .desired_width(110.0),
+            sized_field(
+                ui,
+                egui::TextEdit::singleline(&mut state.new_global_name).hint_text("New name"),
+                name_width,
             );
             let expression =
                 state.input(ui, Field::NewGlobalExpression, "Value or expression", 240.0);

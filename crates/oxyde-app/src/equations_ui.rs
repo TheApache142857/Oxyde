@@ -124,10 +124,10 @@ impl EquationsWindow {
         width: f32,
     ) -> egui::Response {
         let mut text = std::mem::take(self.input_text(field));
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut text)
-                .hint_text(hint)
-                .desired_width(width),
+        let response = sized_field(
+            ui,
+            egui::TextEdit::singleline(&mut text).hint_text(hint),
+            width,
         );
         if response.lost_focus() {
             self.take_clicked_name(ui, &response, field, &mut text);
@@ -175,7 +175,7 @@ impl EquationsWindow {
             .get(&field)
             .cloned()
             .unwrap_or_else(|| current.to_owned());
-        let response = ui.add(egui::TextEdit::singleline(&mut text).desired_width(width));
+        let response = sized_field(ui, egui::TextEdit::singleline(&mut text), width);
         if response.lost_focus() {
             // A variable clicked in the tree took the focus: it goes into the field, which
             // stays open, focused again with the cursor at the end.
@@ -193,6 +193,50 @@ impl EquationsWindow {
             None
         }
     }
+
+    /// How wide a column of name fields is: the longest of `names` fits, and so does the
+    /// text typed in the field `of` picks, if one is being typed in. A short name leaves
+    /// room to type.
+    pub(crate) fn name_width<'a>(
+        &self,
+        ui: &egui::Ui,
+        names: impl IntoIterator<Item = &'a str>,
+        of: fn(&Field) -> bool,
+    ) -> f32 {
+        let font = egui::FontSelection::Default.resolve(ui.style());
+        let width = |text: &str| {
+            ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER))
+                .size()
+                .x
+        };
+        let typed = self
+            .editing
+            .iter()
+            .filter(|(field, _)| of(field))
+            .map(|(_, text)| width(text));
+        let widest = names
+            .into_iter()
+            .map(&width)
+            .chain(typed)
+            .fold(0.0, f32::max);
+        // The field's margins and its cursor.
+        (widest + 16.0).clamp(110.0, 320.0)
+    }
+}
+
+/// Adds a text field `width` wide. In a grid, egui gives a field no more room than its
+/// column had in the last frame (the width of the column's header, at first), so the cell
+/// is widened before the field goes in.
+pub(crate) fn sized_field(
+    ui: &mut egui::Ui,
+    edit: egui::TextEdit<'_>,
+    width: f32,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.set_min_width(width);
+        ui.add(edit.desired_width(width))
+    })
+    .inner
 }
 
 /// A change requested in the window, applied once it is drawn.
@@ -525,6 +569,15 @@ fn equations_tab(
     });
     ui.add_space(4.0);
     ui.strong("Global variables");
+    let name_width = state.name_width(
+        ui,
+        equations
+            .globals
+            .iter()
+            .map(|g| g.name.as_str())
+            .chain([state.new_global_name.as_str()]),
+        |f| matches!(f, Field::GlobalName(_)),
+    );
     egui::Grid::new("globals")
         .num_columns(4)
         .striped(true)
@@ -550,7 +603,7 @@ fn equations_tab(
                     ui.label(format!("🔗 {}", global.name))
                         .on_hover_text("From the linked equations file");
                 } else if let Some(name) =
-                    state.field(ui, Field::GlobalName(global.id), &global.name, 110.0)
+                    state.field(ui, Field::GlobalName(global.id), &global.name, name_width)
                 {
                     changes.push(Change::RenameGlobal(global.id, name));
                 }
@@ -575,10 +628,10 @@ fn equations_tab(
                 }
                 ui.end_row();
             }
-            ui.add(
-                egui::TextEdit::singleline(&mut state.new_global_name)
-                    .hint_text("New name")
-                    .desired_width(110.0),
+            sized_field(
+                ui,
+                egui::TextEdit::singleline(&mut state.new_global_name).hint_text("New name"),
+                name_width,
             );
             let expression =
                 state.input(ui, Field::NewGlobalExpression, "Value or expression", 220.0);
@@ -766,6 +819,9 @@ fn dimensions_tab(
             .small()
             .weak(),
     );
+    let name_width = state.name_width(ui, dimensions.iter().map(|d| d.name.as_str()), |f| {
+        matches!(f, Field::DimensionName(_))
+    });
     egui::Grid::new("dimensions")
         .num_columns(3)
         .striped(true)
@@ -776,7 +832,7 @@ fn dimensions_tab(
             ui.end_row();
             for d in &dimensions {
                 if let Some(name) =
-                    state.field(ui, Field::DimensionName(d.reference), &d.name, 90.0)
+                    state.field(ui, Field::DimensionName(d.reference), &d.name, name_width)
                 {
                     changes.push(Change::RenameDimension(d.reference, name));
                 }
@@ -855,6 +911,8 @@ mod click_tests {
         variable: Rect,
         field: Rect,
         input: Rect,
+        /// The tree is longer than its panel, as the application's usually is.
+        scrolls: bool,
     }
 
     const NAME: &str = "\"global width@Case.Assembly\"";
@@ -870,6 +928,7 @@ mod click_tests {
                 variable: Rect::NOTHING,
                 field: Rect::NOTHING,
                 input: Rect::NOTHING,
+                scrolls: false,
             }
         }
 
@@ -879,12 +938,20 @@ mod click_tests {
                 events,
                 ..Default::default()
             };
+            // Enough rows after it that the tree scrolls: its scroll area then takes a press
+            // for itself (drag to scroll), and no row is hovered in the frame of the press.
+            let mut variables = vec![VariableRow {
+                text: "global width = 300".to_owned(),
+                insert: NAME.to_owned(),
+                hover: String::new(),
+            }];
+            variables.extend((0..40).map(|i| VariableRow {
+                text: format!("Gap{i} = {i}"),
+                insert: format!("\"Gap{i}\""),
+                hover: String::new(),
+            }));
             let contents = FolderContents {
-                variables: vec![VariableRow {
-                    text: "global width = 300".to_owned(),
-                    insert: NAME.to_owned(),
-                    hover: String::new(),
-                }],
+                variables,
                 equations: Vec::new(),
             };
             let Self {
@@ -894,6 +961,7 @@ mod click_tests {
                 variable,
                 field,
                 input: input_rect,
+                scrolls,
             } = self;
             let _ = ctx.run(input, |ctx| {
                 egui::SidePanel::left("tree")
@@ -903,7 +971,7 @@ mod click_tests {
                         // scope and an indentation (the assembly's folder when editing in
                         // place).
                         let inserting = state.open && state.focused.is_some();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        let scroll = egui::ScrollArea::vertical().show(ui, |ui| {
                             ui.add_enabled_ui(inserting, |ui| {
                                 ui.indent("in_place", |ui| {
                                     let top = ui.cursor().top();
@@ -923,6 +991,7 @@ mod click_tests {
                                 });
                             });
                         });
+                        *scrolls = scroll.content_size.y > scroll.inner_rect.height();
                     });
                 state.begin_frame();
                 egui::Window::new("Equations")
@@ -966,6 +1035,7 @@ mod click_tests {
         let mut h = Harness::new();
         h.frame(Vec::new());
         h.frame(Vec::new());
+        assert!(h.scrolls, "the tree scrolls");
         // Into the field, then the variable in the tree.
         h.click(h.field.center());
         assert_eq!(
@@ -991,11 +1061,61 @@ mod click_tests {
         let mut h = Harness::new();
         h.frame(Vec::new());
         h.frame(Vec::new());
+        assert!(h.scrolls, "the tree scrolls");
         h.click(h.input.center());
         assert_eq!(h.state.focused, Some(Field::NewEquationExpression));
         h.click(h.variable.center());
         assert_eq!(h.state.new_equation_expression, NAME);
         // The box has the focus back: another variable goes after it.
         assert_eq!(h.state.focused, Some(Field::NewEquationExpression));
+    }
+}
+
+/// The name fields of the window's tables, drawn in a grid as the window draws them.
+#[cfg(test)]
+mod width_tests {
+    use eframe::egui::{self, Pos2, RawInput, Rect};
+
+    use super::*;
+
+    #[test]
+    fn a_name_field_in_a_grid_is_as_wide_as_the_longest_name() {
+        const LONG: &str = "global width of the case";
+        let ctx = egui::Context::default();
+        let state = EquationsWindow::new();
+        let mut text = LONG.to_owned();
+        let (mut field, mut needed) = (Rect::NOTHING, 0.0);
+        for _ in 0..3 {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1000.0, 700.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let width =
+                        state.name_width(ui, ["Gap", LONG], |f| matches!(f, Field::GlobalName(_)));
+                    let font = egui::FontSelection::Default.resolve(ui.style());
+                    needed = ui
+                        .fonts(|f| f.layout_no_wrap(LONG.to_owned(), font, Color32::PLACEHOLDER))
+                        .size()
+                        .x;
+                    egui::Grid::new("globals").num_columns(2).show(ui, |ui| {
+                        // A header narrower than the names, as "Name" is.
+                        ui.label("Name");
+                        ui.label("Value");
+                        ui.end_row();
+                        field = sized_field(ui, egui::TextEdit::singleline(&mut text), width).rect;
+                        ui.label("300");
+                        ui.end_row();
+                    });
+                });
+            });
+        }
+        // The text and the field's margins (4 px each side).
+        assert!(
+            field.width() >= needed + 8.0,
+            "the field is {} wide for a name {needed} wide",
+            field.width()
+        );
     }
 }
