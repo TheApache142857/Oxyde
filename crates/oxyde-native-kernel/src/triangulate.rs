@@ -109,13 +109,16 @@ fn bridge(
     }
     let m = points[hole[m_at]];
 
-    // The nearest edge of the ring that a ray from M to the right meets. Horizontal edges
-    // are left out: where the ray runs along one, it meets the edges at its ends too.
+    // The nearest edge of the ring that a ray from M to the right meets. Only edges running
+    // upwards: the ring turns counter-clockwise, so the first one met from inside it has the
+    // inside on its left. That leaves out the half of an earlier bridge running down, which
+    // lies on the half running up. Horizontal edges are left out too: where the ray runs
+    // along one, it meets the edges at its ends.
     let n = ring.len();
     let mut nearest: Option<(f64, usize)> = None;
     for (k, (ia, ib)) in cyclic_pairs(ring.as_slice()).enumerate() {
         let (a, b) = (points[ia], points[ib]);
-        if a.y == b.y || (a.y > m.y && b.y > m.y) || (a.y < m.y && b.y < m.y) {
+        if !(a.y < b.y && a.y <= m.y && m.y <= b.y) {
             continue;
         }
         let x = a.x + (m.y - a.y) * (b.x - a.x) / (b.y - a.y);
@@ -170,6 +173,16 @@ fn bridge(
             at = j;
         }
     }
+    // A corner at the end of an earlier bridge is in the ring twice, once on each side of
+    // it: M joins the one whose corner opens towards it, or the ring would cross itself.
+    if !opens_towards(points, ring, at, m) {
+        let corner_index = ring[at];
+        if let Some(j) =
+            (0..n).find(|&j| ring[j] == corner_index && opens_towards(points, ring, j, m))
+        {
+            at = j;
+        }
+    }
 
     // ..., P, M, the hole round to M again, M, P, ...
     let mut joined = Vec::with_capacity(n + hole.len() + 2);
@@ -180,6 +193,24 @@ fn bridge(
     joined.extend_from_slice(&ring[at + 1..]);
     *ring = joined;
     Ok(())
+}
+
+/// Whether `m` lies inside the corner of `ring` (counter-clockwise) at position `j`: between
+/// its two sides, on the ring's inside, strictly.
+fn opens_towards(points: &[Point2], ring: &[usize], j: usize, m: Point2) -> bool {
+    let n = ring.len();
+    let (p, v, q) = (
+        points[ring[(j + n - 1) % n]],
+        points[ring[j]],
+        points[ring[(j + 1) % n]],
+    );
+    if cross(v, q, p) > 0.0 {
+        // A convex corner: inside both sides.
+        cross(v, q, m) > 0.0 && cross(v, m, p) > 0.0
+    } else {
+        // A reflex one: anywhere but between the two sides' outsides.
+        !(cross(v, p, m) >= 0.0 && cross(v, m, q) >= 0.0)
+    }
 }
 
 /// Twice the signed area of the corner of `ring` at position `i` with its neighbours.
@@ -295,6 +326,58 @@ mod tests {
         assert!((area(&points, &t) - (60.0 - 4.0 - 2.0)).abs() < 1e-9);
         // At most n - 2 + 2h triangles: the corner in line may go without one of its own.
         assert!(t.len() <= 13 - 2 + 2 * 2, "{} triangles", t.len());
+    }
+
+    #[test]
+    fn a_bridge_to_the_corner_an_earlier_one_reached_takes_its_inner_side() {
+        // Two holes reaching as far right, one above the other: the lower one's bridge runs
+        // to the plate's top right corner, and the upper one's ray meets that bridge, so it
+        // joins the corner where the ring passes it a second time, coming back from the
+        // lower hole. Joined where the ring first passes it, the ring crossed itself and the
+        // triangles overlapped.
+        let points = [
+            p(0.0, 0.0),
+            p(10.0, 0.0),
+            p(10.0, 6.0),
+            p(0.0, 6.0),
+            p(7.0, 1.0),
+            p(8.0, 1.0),
+            p(8.0, 2.0),
+            p(7.0, 2.0),
+            p(7.0, 4.0),
+            p(8.0, 4.0),
+            p(8.0, 5.0),
+            p(7.0, 5.0),
+        ];
+        let loops = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
+        let t = polygon_with_holes(&points, &loops).unwrap();
+        assert!((area(&points, &t) - (60.0 - 1.0 - 1.0)).abs() < 1e-9);
+        assert_eq!(t.len(), 12 - 2 + 2 * 2);
+    }
+
+    #[test]
+    fn a_ray_through_the_corner_an_earlier_bridge_reached_joins_its_inner_side() {
+        // As above, the plate's right side with a corner at (10, 3), where the lower hole's
+        // bridge runs: the upper hole's ray meets that corner itself, as the end of the
+        // side below it, where the ring passes it first, on the bridge's outer side.
+        let points = [
+            p(0.0, 0.0),
+            p(10.0, 0.0),
+            p(10.0, 3.0),
+            p(10.0, 6.0),
+            p(0.0, 6.0),
+            p(7.0, 1.0),
+            p(8.0, 1.0),
+            p(8.0, 2.0),
+            p(7.0, 2.0),
+            p(7.0, 3.0),
+            p(8.0, 3.0),
+            p(8.0, 4.0),
+            p(7.0, 4.0),
+        ];
+        let loops = vec![vec![0, 1, 2, 3, 4], vec![5, 6, 7, 8], vec![9, 10, 11, 12]];
+        let t = polygon_with_holes(&points, &loops).unwrap();
+        assert!((area(&points, &t) - (60.0 - 1.0 - 1.0)).abs() < 1e-9);
     }
 
     #[test]
