@@ -245,8 +245,12 @@ pub(crate) fn equations_folder(
             v.hover.clone()
         };
         // Taken on the press: a field of the Equations window loses the focus to the click,
-        // and only knows to take the name in the frame it loses it.
-        let pressed = row.response.hovered() && ui.input(|i| i.pointer.primary_pressed());
+        // and only knows to take the name in the frame it loses it. Not by `hovered`: when
+        // the tree scrolls, its scroll area takes the press (to drag it) and is the only
+        // thing hovered in that frame, but the row still holds the pointer.
+        let pressed = row.response.enabled()
+            && row.response.contains_pointer()
+            && ui.input(|i| i.pointer.primary_pressed());
         let response = row.response.on_hover_text(hint);
         if pressed && inserting {
             event = Some(FolderEvent::Insert(v.insert.clone()));

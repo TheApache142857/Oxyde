@@ -5,6 +5,18 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Equations: clicking variables in a long tree, and name fields that fit (unreleased, October 2026)
+
+- **Clicking a variable in the tree's Equations folders now works when the tree is long
+  enough to scroll**, as it is with a part edited in place in a big assembly. Its name goes
+  into the dimension's Modify box (`= …`) or into the Equations window's field being typed
+  in. Before, the click only took the focus away from the field and nothing went in.
+- **The name fields of the Equations window are as wide as the longest name**, in parts and
+  assemblies (global variables, and dimensions on the Dimensions tab), from 110 px up to
+  320 px; they widen as a longer name is typed. They used to be cut to the width of the
+  *Name* header, so `global width` showed as `globa`. The value and equation fields get their
+  full width too.
+
 ### Assistant panel: an agent modelling in the window (unreleased, October 2026)
 
 - **MCP** button after the command tabs (beside *Generative Design*), in parts and assemblies:
