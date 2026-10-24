@@ -7,10 +7,12 @@ R2 = math.sqrt(0.5)
 
 
 class Step:
-    def __init__(self, units="mm"):
+    def __init__(self, units="mm", accuracy=None):
         self.lines = []
         self.n = 0
         self.units = units
+        # The accuracy the file states for its geometry, in its length unit: 1e-6 unless given.
+        self.accuracy = "1.E-06" if accuracy is None else repr(float(accuracy))
 
     def add(self, text):
         self.n += 1
@@ -67,7 +69,9 @@ class Step:
             length = self.add("( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.) )")
             angle = self.add("( NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.) )")
         solid_angle = self.add("( NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT() )")
-        u = self.add(f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-06),{length},'distance_accuracy_value','')")
+        u = self.add(
+            f"UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE({self.accuracy}),{length},'distance_accuracy_value','')"
+        )
         return self.add(
             f"( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT(({u})) "
             f"GLOBAL_UNIT_ASSIGNED_CONTEXT(({length},{angle},{solid_angle})) REPRESENTATION_CONTEXT('',''))"
@@ -143,6 +147,39 @@ def pointed_pin():
     f1 = s.face([s.bound(s.loop([(c1, True)]), True)], top)
     s.part_file("pin", [side, point, f1])
     return s.text("pointed pin")
+
+
+def loose_half_cylinder():
+    """A half cylinder of radius 5 and height 10 (x >= 0), written as loosely as the file's
+    stated accuracy of 0.01 mm allows, as Fusion 360 writes some faces: the top arc's centre
+    5 microns off the axis (its own sweep a little more than the half turn about the axis,
+    and 5e-3 off the cylinder, beyond the 1e-3 a reader takes untold), and one corner of the
+    bottom arc 2e-5 above the other, the side's loop starting along a straight edge."""
+    s = Step(accuracy=0.01)
+    a = s.vertex((0, -5, 2e-5))
+    b = s.vertex((0, 5, 0))
+    c = s.vertex((0, 5, 10))
+    d = s.vertex((0, -5, 10))
+    bottom_arc = s.edge(a, b, s.circle((0, 0, 0), 5))
+    top_arc = s.edge(d, c, s.circle((0.004, 0.003, 10), 5))
+    right = s.edge(b, c, s.line((0, 5, 0), (0, 5, 10)))
+    left = s.edge(a, d, s.line((0, -5, 0), (0, -5, 10)))
+    bottom_flat = s.edge(b, a, s.line((0, 5, 0), (0, -5, 0)))
+    top_flat = s.edge(c, d, s.line((0, 5, 10), (0, -5, 10)))
+    cyl = s.add(f"CYLINDRICAL_SURFACE('',{s.place((0, 0, 0))},5.)")
+    flat = s.add(f"PLANE('',{s.place((0, 0, 0), (-1, 0, 0), (0, 1, 0))})")
+    bottom = s.add(f"PLANE('',{s.place((0, 0, 0), (0, 0, -1))})")
+    top = s.add(f"PLANE('',{s.place((0, 0, 10))})")
+    side = s.face(
+        [s.bound(s.loop([(right, True), (top_arc, False), (left, False), (bottom_arc, True)]), True)], cyl
+    )
+    back = s.face(
+        [s.bound(s.loop([(bottom_flat, True), (left, True), (top_flat, False), (right, False)]), True)], flat
+    )
+    f0 = s.face([s.bound(s.loop([(bottom_arc, False), (bottom_flat, False)]), True)], bottom)
+    f1 = s.face([s.bound(s.loop([(top_arc, True), (top_flat, True)]), True)], top)
+    s.part_file("half cylinder", [side, back, f0, f1])
+    return s.text("loose half cylinder")
 
 
 def hemisphere_across():
@@ -299,6 +336,7 @@ for name, make in [
     ("seamless_cylinder", seamless_cylinder),
     ("pointed_pin", pointed_pin),
     ("hemisphere_across", hemisphere_across),
+    ("loose_half_cylinder", loose_half_cylinder),
     ("spline_dome", spline_dome),
     ("assembly", assembly),
 ]:

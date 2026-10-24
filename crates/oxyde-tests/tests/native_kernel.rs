@@ -3260,6 +3260,54 @@ fn step_files_other_systems_write_read_in_the_native_kernel() {
 }
 
 #[test]
+fn step_files_written_loosely_read_in_the_native_kernel() {
+    use oxyde_kernel::StepNodeContent;
+    // tests/data/step/make.py: a half cylinder written as loosely as its stated accuracy of
+    // 0.01 mm allows, as Fusion 360 writes some faces: an arc about a centre off the axis,
+    // 5e-3 off the cylinder, and a corner 2e-5 above its arc's other end.
+    let bytes = step_data("step/loose_half_cylinder.step");
+    let half = std::f64::consts::PI * 25.0 * 10.0 / 2.0;
+    let mut native = NativeKernel::new();
+    let read = native
+        .import_step(&bytes)
+        .unwrap_or_else(|e| panic!("the half cylinder: {e}"));
+    let volume = native.volume(read.shape).unwrap();
+    // As close as its loose top allows: 5e-3 mm off a radius of 5.
+    assert_close("the half cylinder's volume", volume, half, 1e-3);
+    native.release(read.shape);
+    // OpenCASCADE integrates along the file's curves in the surface's parameters, the native
+    // kernel along the curves themselves (§8 of docs/NATIVE_KERNEL.md): 1.7e-4 apart here.
+    let mut occt = OcctKernel::new();
+    let reference = occt.import_step(&bytes).unwrap();
+    assert_close(
+        "the half cylinder's volume against OpenCASCADE's",
+        volume,
+        occt.volume(reference.shape).unwrap(),
+        1e-3,
+    );
+    occt.release(reference.shape);
+    // Opening it reads its part from a file of its own the native kernel writes: stating
+    // the accuracy the part's edges need, it reads back.
+    let tree = native.read_step_assembly(&bytes).unwrap();
+    let [node] = tree.nodes.as_slice() else {
+        panic!("one part, not {} nodes", tree.nodes.len());
+    };
+    let StepNodeContent::Part { step, .. } = &node.content else {
+        panic!("a part");
+    };
+    let part = native
+        .import_step(step)
+        .unwrap_or_else(|e| panic!("the part's own file: {e}"));
+    assert_close(
+        "the part's volume",
+        native.volume(part.shape).unwrap(),
+        volume,
+        1e-9,
+    );
+    native.release(part.shape);
+}
+
+#[test]
 fn step_files_the_native_kernel_writes_read_back_in_it() {
     use oxyde_kernel::{StepColor, StepColors, StepMaterial};
     let ball = |s: &mut Sketch| {

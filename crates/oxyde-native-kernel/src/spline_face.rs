@@ -932,16 +932,16 @@ pub(crate) fn bulges(solid: &Solid, face: &Face, surface: &SplineSurface) -> Vec
 }
 
 /// Steps along `u` and `v` fine enough for chords within `deflection` of the surface over
-/// the range given: from the largest second derivatives over a grid of it.
+/// the range given: from the largest second derivatives over a grid of it, and from how
+/// fast its lines turn there (second over first derivative at the same point).
 pub(crate) fn steps(
     surface: &SplineSurface,
     (ulo, uhi): (f64, f64),
     (vlo, vhi): (f64, f64),
     deflection: f64,
 ) -> (f64, f64) {
-    let n = 8;
-    let (mut suu, mut svv) = (0.0f64, 0.0f64);
-    let (mut su_min, mut sv_min) = (f64::INFINITY, f64::INFINITY);
+    let n = 8u32;
+    let mut samples = Vec::with_capacity(((n + 1) * (n + 1)) as usize);
     for i in 0..=n {
         for j in 0..=n {
             let u = wrap(
@@ -954,25 +954,37 @@ pub(crate) fn steps(
                 surface.domain(1),
                 surface.data.closed[1],
             );
+            // Along `u` and along `v`: the first derivative's length and the second's.
             let d = surface.derivatives(u, v, 2);
-            suu = suu.max(d[2][0].length());
-            svv = svv.max(d[0][2].length());
-            su_min = su_min.min(d[1][0].length());
-            sv_min = sv_min.min(d[0][1].length());
+            samples.push([
+                (d[1][0].length(), d[2][0].length()),
+                (d[0][1].length(), d[0][2].length()),
+            ]);
         }
     }
     let d = deflection.max(1e-6);
     // Within the deflection, and turning no more than a twelfth of a turn a step, as an
-    // arc's chords do.
-    let step = |second: f64, speed: f64, range: f64| {
-        let s = if second > 1e-300 {
-            (8.0 * d / second)
-                .sqrt()
-                .min(std::f64::consts::TAU / 12.0 * speed / second)
-        } else {
-            range
-        };
+    // arc's chords do. The turn is taken where the line has a length: where it is drawn
+    // to a point (a pole, a corner's blend) it turns fast over no distance, and taking
+    // the slowest speed of one place against the sharpest bend of another cut a small
+    // face into hundreds of strips.
+    let step = |along: usize, range: f64| {
+        let fastest = samples.iter().map(|s| s[along].0).fold(0.0, f64::max);
+        let (mut second, mut turn) = (0.0f64, 0.0f64);
+        for (speed, curve) in samples.iter().map(|s| s[along]) {
+            second = second.max(curve);
+            if speed > 1e-3 * fastest {
+                turn = turn.max(curve / speed);
+            }
+        }
+        let mut s = range;
+        if second > 1e-300 {
+            s = s.min((8.0 * d / second).sqrt());
+        }
+        if turn > 1e-300 {
+            s = s.min(std::f64::consts::TAU / 12.0 / turn);
+        }
         s.clamp(range / 256.0, range.max(1e-300) / 2.0)
     };
-    (step(suu, su_min, uhi - ulo), step(svv, sv_min, vhi - vlo))
+    (step(0, uhi - ulo), step(1, vhi - vlo))
 }

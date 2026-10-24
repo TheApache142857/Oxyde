@@ -99,6 +99,15 @@ release yet; the git history has every detail.
   cylinders, spheres and tori they are), rounded corners: all of these read, and faster
   than with OpenCASCADE (the test cart: 7 ms against 259). IGES export still fails with a
   message.
+- **STEP files written loosely** read with it too: faces bounded by arcs a few microns off
+  their surface, or by a corner a little above its arc's other end, within the accuracy the
+  file states (Fusion 360 writes some so), no longer fail with "a loop winds round its
+  surface's meridian" or "a straight edge on a surface of revolution is not along it".
+  Opening such a file, or a Creo or Fusion 360 assembly, no longer fails on some of its
+  parts (each part is read from a file of its own, which now states the accuracy the part
+  needs). Curved faces bounded by curves of many pieces, as CATIA, SolidWorks and Creo
+  write rounded edges, are meshed with the triangles they need and no more: a CATIA part
+  shows 25,000 triangles instead of 615,000 and meshes four times faster.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

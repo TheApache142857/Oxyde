@@ -1329,8 +1329,10 @@ impl SplineCurve {
     }
 
     /// Points from `start` along `extent` to `end`, both ends included, each chord within
-    /// `deflection` of the curve: steps of at most a sixteenth of each span, halved until
-    /// each middle is close enough to its chord.
+    /// `deflection` of the curve: steps of at most half a span (and a sixteenth of the
+    /// whole), halved until the curve's middle and quarters are close enough to the chord.
+    /// A curve of many spans that is nearly straight gets few points, as an exporter's
+    /// curves of hundreds of spans along a rounded edge are.
     pub fn polyline(
         &self,
         start: Point3,
@@ -1339,7 +1341,7 @@ impl SplineCurve {
         deflection: f64,
     ) -> Vec<Point3> {
         let spans = self.data.curve.breaks().len().saturating_sub(1).max(1);
-        let n = (16 * spans).max(2);
+        let n = (2 * spans).max(16);
         let at = |s: f64| self.along(start, s);
         let mut out = vec![start];
         let mut stack: Vec<(f64, f64)> = (0..n)
@@ -1352,9 +1354,12 @@ impl SplineCurve {
             })
             .collect();
         while let Some((s0, s1)) = stack.pop() {
-            let (p0, p1, pm) = (at(s0), at(s1), at((s0 + s1) / 2.0));
-            let chord = p0 + (p1 - p0) * 0.5;
-            if pm.distance(chord) > deflection && s1 - s0 > 1e-9 * extent.max(1e-12) {
+            let (p0, p1) = (at(s0), at(s1));
+            let off = [0.25, 0.5, 0.75]
+                .iter()
+                .map(|&f| off_chord(at(s0 + (s1 - s0) * f), p0, p1))
+                .fold(0.0, f64::max);
+            if off > deflection && s1 - s0 > 1e-9 * extent.max(1e-12) {
                 stack.push(((s0 + s1) / 2.0, s1));
                 stack.push((s0, (s0 + s1) / 2.0));
             } else if s1 < extent {
@@ -1416,6 +1421,18 @@ impl SplineCurve {
 thread_local! {
     /// Where the last search for a nearest point ended, and on which surface.
     static LAST: std::cell::Cell<Option<(usize, (f64, f64))>> = const { std::cell::Cell::new(None) };
+}
+
+/// How far `p` lies from the chord from `a` to `b`.
+fn off_chord(p: Point3, a: Point3, b: Point3) -> f64 {
+    let ab = b - a;
+    let len2 = ab.dot(ab);
+    let t = if len2 > 0.0 {
+        ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    p.distance(a + ab * t)
 }
 
 /// Whether two B-spline curves through the same points run the same way: the same curve
@@ -2017,6 +2034,32 @@ mod tests {
                 .distance(Point3::new(2.0f64.sqrt(), 2.0f64.sqrt(), 0.0))
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn a_curve_of_many_spans_gets_points_where_it_bends() {
+        // A straight line written as a cubic B-spline of 160 spans, as exporters fit edges:
+        // two points a span at most, where sixteen a span made boards of hundreds of
+        // thousands of triangles.
+        let spans = 160u32;
+        let poles: Vec<Point3> = (0..spans + 3)
+            .map(|i| Point3::new(f64::from(i), 0.0, 0.0))
+            .collect();
+        let mut knots = vec![0.0; 4];
+        knots.extend((1..spans).map(f64::from));
+        knots.extend([f64::from(spans); 4]);
+        let line = SplineCurve::new(BSplineCurve::new(3, knots, poles, None).unwrap());
+        let (a, b) = line.domain();
+        let points = line.polyline(line.point_at(a), line.point_at(b), b - a, 0.01);
+        assert!(points.len() <= 2 * spans as usize + 1, "{}", points.len());
+        // A bend is still followed within the deflection: a quarter circle of radius 2.
+        let arc = SplineCurve::new(quarter());
+        let (a, b) = arc.domain();
+        let points = arc.polyline(arc.point_at(a), arc.point_at(b), b - a, 1e-4);
+        for w in points.windows(2) {
+            let middle = (w[0].to_vec() + w[1].to_vec()) * 0.5;
+            assert!(2.0 - middle.length() <= 1e-4 + 1e-12, "{w:?}");
+        }
     }
 
     #[test]

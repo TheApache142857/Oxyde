@@ -222,7 +222,10 @@ parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
 
 - **Writing** (`export_step`, `write.rs`) as OpenCASCADE writes, from its files read as a
   black box: AP214, a product for each shape, its solids `MANIFOLD_SOLID_BREP` (or
-  `BREP_WITH_VOIDS`) in millimetres, uncertainty 1e-7; every face an `ADVANCED_FACE` along
+  `BREP_WITH_VOIDS`) in millimetres, uncertainty 1e-7 (or a solid's largest tolerance where
+  that is beyond the kernel's own 1e-3 mm, a solid read from a file of coarser accuracy, so
+  that its file reads back: an assembly's parts are written so and read again when it is
+  opened); every face an `ADVANCED_FACE` along
   its surface's normal or not; degenerate edges left out (a cone's apex, a sphere's poles; a
   whole sphere bounded by a `VERTEX_LOOP`). Planes, cylinders, cones (the axis turned where
   the slope is negative), spheres, tori (a spindle torus a `DEGENERATE_TOROIDAL_SURFACE`) and
@@ -274,7 +277,11 @@ parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
   - **Tolerances**: each vertex's and edge's measured as for every solid
     (`settle_tolerances_within`), up to four times the accuracy the file states for its
     geometry (`GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT`; Creo says 1.5e-3 mm), and at least the
-    kernel's own 1e-3 mm; then the solid is checked as every result is.
+    kernel's own 1e-3 mm; then the solid is checked as every result is. Laid out in a
+    surface of revolution's `(θ, v)` plane, a loop closes within its edges' tolerances in
+    `v` as in `θ` (a corner 2e-5 above its arc's other end), and an arc within tolerance of
+    a parallel but about a centre of its own ends at its end's own angle, not after its own
+    sweep (Fusion 360 bounds some faces by arcs microns off their surface).
   - **Assemblies**: each product once; a part's solids written as a STEP file of their own
     in its own coordinates, with its colours and material; an assembly its children placed;
     a mirrored occurrence a part of its own, the mirror applied; a product with solids and
@@ -451,7 +458,14 @@ vertex on an edge is a point of that edge's polyline or of one of its chords, so
 without gaps; triangles with two corners at a pole are left out. A face on a B-spline surface
 is meshed the same way in its `(u, v)` plane, its edges' points taken onto the surface, its
 strips and rows at steps within the deflection by the surface's second derivatives, and
-turning no more than a twelfth of a turn each. A face the strips cannot mesh (some faces of
+turning no more than a twelfth of a turn each (second over first derivative at the same
+point, where the surface's line has a length: not at a pole). An edge along one `u` within
+a thousandth of a step is a side of the face at that `u`, with the ends of the edges meeting
+it, rather than a strip at each of its points (an edge along a side of the domain projects
+onto it only within its tolerance). A B-spline edge's polyline is two steps a span at least,
+halved while its middle or its quarters stand further than the deflection off the chord:
+exporters write rounded edges as curves of hundreds of spans, and sixteen points a span gave
+a CATIA part's 5 mm² face 269,315 triangles. A face the strips cannot mesh (some faces of
 STEP files, bounded by curves their writer fitted) is triangulated in its parameter plane
 from its boundary's points (ear clipping), its triangles' sides inside the face halved
 where they stand further than the deflection off the surface, a triangle at its centroid
@@ -497,8 +511,22 @@ where none does, never cutting the boundary, so that it meets its neighbours all
   `make.py` the ways other systems write such solids (a cylinder without a seam, a pin in
   inches and degrees with a point bounded by a vertex loop, a hemisphere whose sphere's
   axis runs through its edge, a dome of a rational B-spline, an assembly of a part used
-  twice with colours and a material), against OpenCASCADE and their closed forms; the
-  assembly's tree against OpenCASCADE's. Beside the tests, in October 2026, the 98 STEP
+  twice with colours and a material, a half cylinder written as loosely as its stated
+  accuracy of 0.01 mm allows, read whole and through its part's own file), against
+  OpenCASCADE and their closed forms; the assembly's tree against OpenCASCADE's.
+  `step_corpus.rs` (ignored, run by hand) opens any STEP file with one kernel as the
+  application does (the tree, each part's own file, the whole file measured, meshed at a
+  thousandth of its size, the mesh's open sides and volume) and prints each stage as a JSON
+  line, one process a file and kernel, for a script to compare. On the owner's PC, October
+  2026, 30 files (Fusion 360, SolidWorks 2007 to 2019, CATIA V5, Creo, KiCad, FreeCAD,
+  ASCON, OpenCASCADE): of the 29 with solids OpenCASCADE reads all and the native kernel 27,
+  with the same solids and faces, 21 within 1e-5 of OpenCASCADE's volume and 26 within
+  1e-4 (a Fusion 360 connector's rational B-splines 5e-4, §8), 5 times faster (median); not
+  read: a Fusion 360 body written with a vertex 0.57 mm off a face (OpenCASCADE takes up to
+  1 mm) and the hackintosh case (§10). Its meshes are half OpenCASCADE's on prismatic
+  parts and up to 5.3 times on B-spline ones; on several files they hold a volume 10 to
+  200 percent off the solid's, where OpenCASCADE's are within 2e-3 (curved faces' meshes,
+  not planar ones: to be found). Beside the tests, in October 2026, the 98 STEP
   files found on the Raspberry Pi (not in the repository: KiCad's libraries and board
   exports, EasyEDA's parts, Creo's assemblies, SolidWorks' and other systems' parts) were
   each read and meshed by the native kernel and read by OpenCASCADE: every one read and
@@ -662,7 +690,13 @@ kernel meshes each 10 to 50 times faster. What is missing, most needed first:
    top panel's solid holds an island twice, overlapping itself, which the kernel's check of
    every solid may refuse where OpenCASCADE reads it (then a solid read from a file would
    need a gentler check, or the copy dropped); its CPU block carries lettering on a B-spline
-   surface (OpenCASCADE's boolean of it never finished).
+   surface (OpenCASCADE's boolean of it never finished). Its original STEP file, opened by
+   `step_corpus.rs` (October 2026): OpenCASCADE reads its 466 solids in 80 s (141 s as the
+   application opens it, part by part); the native kernel, past the loose arcs it refused
+   at first, stops at an edge 0.0449 mm off its faces where the file's accuracy (0.01 mm)
+   lets the reader take 0.04, and, with that limit at OpenCASCADE's 1 mm, at a face round
+   a pole of a B-spline surface it cannot read yet. Which of the two to take on (a gentler
+   limit for files, or such faces) is the owner's call.
 3. **Blends the native kernel still refuses**, each with its message: an edge ending where
    more than three faces meet, a ridge and a valley meeting at a corner, more than three
    edges meeting, corners where curved edges or curved faces meet, a blend ending on a

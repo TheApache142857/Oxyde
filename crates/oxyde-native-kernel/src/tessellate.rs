@@ -167,6 +167,13 @@ struct Side {
     points: Vec<(f64, Point3)>,
 }
 
+/// An edge use of a B-spline face: its polyline, each point's `(u, v)`, the loop it is in.
+struct UvUse {
+    in_loop: usize,
+    line: Vec<Point3>,
+    params: Vec<(f64, f64)>,
+}
+
 /// The mesh vertices of one face, each once.
 #[derive(Default)]
 struct Vertices {
@@ -373,32 +380,36 @@ fn strip_mesh(
                 let (v_lo, p_lo) = lo.at(theta);
                 let (v_hi, p_hi) = hi.at(theta);
                 let mut out = vec![(v_lo, vertices.at(p_lo))];
-                // A boundary edge along this angle, over the stretch between the chords.
-                let side = sides.iter().find(|s| {
-                    let (s_lo, s_hi) = s
-                        .points
-                        .iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(v, _)| {
-                            (a.min(v), b.max(v))
-                        });
-                    (s.theta - theta).abs() <= 1e-12 && s_lo < v_hi - 1e-12 && s_hi > v_lo + 1e-12
-                });
-                match side {
-                    Some(side) => {
-                        let mut inner: Vec<(f64, Point3)> = side
+                // The boundary edges along this angle, over the stretch between the chords:
+                // one, or several end to end (a side split by a vertex).
+                let along: Vec<&Side> = sides
+                    .iter()
+                    .filter(|s| {
+                        let (s_lo, s_hi) = s
                             .points
                             .iter()
-                            .copied()
-                            .filter(|&(v, _)| v > v_lo + 1e-12 && v < v_hi - 1e-12)
-                            .collect();
-                        inner.sort_by(|p, q| p.0.total_cmp(&q.0));
-                        out.extend(inner.into_iter().map(|(v, p)| (v, vertices.at(p))));
+                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(v, _)| {
+                                (a.min(v), b.max(v))
+                            });
+                        (s.theta - theta).abs() <= 1e-12
+                            && s_lo < v_hi - 1e-12
+                            && s_hi > v_lo + 1e-12
+                    })
+                    .collect();
+                if along.is_empty() {
+                    for &v in rows.iter().filter(|&&v| v > v_lo + 1e-9 && v < v_hi - 1e-9) {
+                        out.push((v, vertices.at(point(theta, v))));
                     }
-                    None => {
-                        for &v in rows.iter().filter(|&&v| v > v_lo + 1e-9 && v < v_hi - 1e-9) {
-                            out.push((v, vertices.at(point(theta, v))));
-                        }
-                    }
+                } else {
+                    let mut inner: Vec<(f64, Point3)> = along
+                        .iter()
+                        .flat_map(|s| s.points.iter().copied())
+                        .filter(|&(v, _)| v > v_lo + 1e-12 && v < v_hi - 1e-12)
+                        .collect();
+                    inner.sort_by(|p, q| p.0.total_cmp(&q.0));
+                    // Where two of them meet, their shared end once.
+                    inner.dedup_by(|p, q| p.1 == q.1);
+                    out.extend(inner.into_iter().map(|(v, p)| (v, vertices.at(p))));
                 }
                 out.push((v_hi, vertices.at(p_hi)));
                 out
@@ -435,15 +446,12 @@ fn spline_mesh(
         f64::NEG_INFINITY,
     );
     let (ua, ub) = surface.domain(0);
-    let mut polygons: Vec<Vec<((f64, f64), Point3)>> = Vec::with_capacity(loops.len());
+    let mut uses: Vec<UvUse> = Vec::new();
     for (k, u) in loops
         .iter()
         .enumerate()
         .flat_map(|(k, l)| l.iter().map(move |u| (k, u)))
     {
-        if polygons.len() <= k {
-            polygons.push(Vec::new());
-        }
         let line = use_polyline(u.edge_use, polylines);
         let mut near = u.samples.first().map_or((0.0, 0.0), |s| (s.1, s.2));
         let params: Vec<(f64, f64)> = line
@@ -453,24 +461,100 @@ fn spline_mesh(
                 near
             })
             .collect();
-        polygons[k].extend(
-            params
-                .iter()
-                .zip(&line)
-                .take(line.len().saturating_sub(1))
-                .map(|(&a, &b)| (a, b)),
-        );
         for &(pu, pv) in &params {
             ulo = ulo.min(pu);
             uhi = uhi.max(pu);
             vlo = vlo.min(pv);
             vhi = vhi.max(pv);
         }
-        let u0 = params.first().map_or(0.0, |p| p.0);
-        if params.iter().all(|p| (p.0 - u0).abs() <= 1e-12 * (ub - ua)) {
+        uses.push(UvUse {
+            in_loop: k,
+            line,
+            params,
+        });
+    }
+    if !(uhi > ulo && vhi > vlo) {
+        return Err("a B-spline face with no extent".to_owned());
+    }
+    let (du, dv) = crate::spline_face::steps(surface, (ulo, uhi), (vlo, vhi), deflection);
+    // A polyline along one `u` within a thousandth of a step is a side of the face, at that
+    // one `u`, and so are the ends of the polylines that meet it: an edge along a side of
+    // the surface's domain projects onto it only within the edge's tolerance, and a side
+    // taken point by point as chords cut the face into a strip at every point.
+    let along = 1e-3 * du;
+    let mut ends: Vec<(Point3, f64)> = Vec::new();
+    let mut is_side = vec![false; uses.len()];
+    for (side, UvUse { line, params, .. }) in is_side.iter_mut().zip(&mut uses) {
+        let (lo, hi) = params
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| {
+                (a.min(p.0), b.max(p.0))
+            });
+        if hi - lo <= along {
+            // At the `u` of a side it continues (one side of the domain in several edges).
+            let u0 = [line.first(), line.last()]
+                .into_iter()
+                .flatten()
+                .find_map(|q| {
+                    ends.iter()
+                        .find(|(p, u)| p == q && *u >= lo - along && *u <= hi + along)
+                })
+                .map(|&(_, u)| u)
+                .unwrap_or(0.5 * (lo + hi));
+            for p in params.iter_mut() {
+                p.0 = u0;
+            }
+            ends.extend(
+                [line.first(), line.last()]
+                    .into_iter()
+                    .flatten()
+                    .map(|&q| (q, u0)),
+            );
+            *side = true;
+        }
+    }
+    for UvUse { line, params, .. } in uses
+        .iter_mut()
+        .zip(&is_side)
+        .filter(|(_, side)| !**side)
+        .map(|(u, _)| u)
+    {
+        // Only the end lying at that side: on a surface closed along `u`, a curve round it
+        // ends at the seam a turn from where it began.
+        for i in [0, line.len().saturating_sub(1)] {
+            let u = params[i].0;
+            if let Some(&(_, u0)) = ends
+                .iter()
+                .find(|(q, u0)| *q == line[i] && (u - u0).abs() <= along)
+            {
+                params[i].0 = u0;
+            }
+        }
+    }
+    let mut polygons: Vec<Vec<((f64, f64), Point3)>> = Vec::with_capacity(loops.len());
+    for (
+        UvUse {
+            in_loop,
+            line,
+            params,
+        },
+        &side,
+    ) in uses.iter().zip(&is_side)
+    {
+        if polygons.len() <= *in_loop {
+            polygons.push(Vec::new());
+        }
+        polygons[*in_loop].extend(
+            params
+                .iter()
+                .zip(line)
+                .take(line.len().saturating_sub(1))
+                .map(|(&a, &b)| (a, b)),
+        );
+        if side {
             sides.push(Side {
-                theta: u0,
-                points: params.iter().zip(&line).map(|(p, &q)| (p.1, q)).collect(),
+                theta: params.first().map_or(0.0, |p| p.0),
+                points: params.iter().zip(line).map(|(p, &q)| (p.1, q)).collect(),
             });
         } else {
             for i in 0..line.len().saturating_sub(1) {
@@ -485,10 +569,6 @@ fn spline_mesh(
             }
         }
     }
-    if !(uhi > ulo && vhi > vlo) {
-        return Err("a B-spline face with no extent".to_owned());
-    }
-    let (du, dv) = crate::spline_face::steps(surface, (ulo, uhi), (vlo, vhi), deflection);
     let mut us: Vec<f64> = chords
         .iter()
         .flat_map(|c| [c.a.0, c.b.0])

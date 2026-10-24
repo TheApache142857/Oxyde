@@ -18,13 +18,34 @@ use oxyde_kernel::{StepColor, StepColors, StepMaterial};
 
 use super::p21::{Param, Writer};
 use crate::NativeError;
-use crate::brep::{Edge, Shape, Solid};
+use crate::brep::{Edge, MAX_TOLERANCE, Shape, Solid};
 use crate::geometry::{Curve, Section, SplineCurve, SplineSurface, Surface, perpendicular};
 use crate::nurbs::{BSplineCurve, BSplineSurface};
 use crate::revolution::{Meridian, Revolution};
 
 /// How close a curve STEP cannot carry exactly is written to it.
 const FIT: f64 = 1e-7;
+
+/// The accuracy a file of `shapes` states: 1e-7 mm, as OpenCASCADE writes, unless a vertex
+/// or an edge needs a tolerance beyond what a reader takes without being told
+/// ([`MAX_TOLERANCE`]), as a solid read from a file of coarser accuracy may (Creo states
+/// 1.5e-3 mm). Then their largest tolerance, so that the file reads back: the parts of an
+/// assembly are written as files of their own and read again when it is opened.
+fn accuracy(shapes: &[&Shape]) -> f64 {
+    let largest = shapes
+        .iter()
+        .flat_map(|s| &s.solids)
+        .flat_map(|s| {
+            let vertices = s.vertices.iter().map(|v| v.tolerance);
+            vertices.chain(s.edges.iter().map(|e| e.tolerance))
+        })
+        .fold(0.0, f64::max);
+    if largest > MAX_TOLERANCE {
+        largest
+    } else {
+        1e-7
+    }
+}
 
 fn point(w: &mut Writer, p: Point3) -> u64 {
     w.add(
@@ -594,7 +615,9 @@ pub(crate) fn write(
             Param::str("design"),
         ],
     );
-    // Millimetres, radians, steradians; 1e-7 mm apart is one point.
+    // Millimetres, radians, steradians; 1e-7 mm apart is one point, unless the solids are
+    // further apart than that (one read from a file of coarser accuracy).
+    let accuracy = accuracy(shapes);
     let mm = w.add_complex(vec![
         ("LENGTH_UNIT", vec![]),
         ("NAMED_UNIT", vec![Param::Derived]),
@@ -619,7 +642,7 @@ pub(crate) fn write(
     let uncertainty = w.add(
         "UNCERTAINTY_MEASURE_WITH_UNIT",
         vec![
-            Param::Typed("LENGTH_MEASURE".to_owned(), Box::new(Param::Real(1e-7))),
+            Param::Typed("LENGTH_MEASURE".to_owned(), Box::new(Param::Real(accuracy))),
             Param::Ref(mm),
             Param::str("distance_accuracy_value"),
             Param::str("confusion accuracy"),

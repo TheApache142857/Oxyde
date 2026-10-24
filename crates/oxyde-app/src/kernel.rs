@@ -525,8 +525,19 @@ mod tests {
             .unwrap();
         assert!((kernel.volume(shape).unwrap() - 24.0).abs() < 1e-9);
         // What it cannot build yet is an error with the native kernel's message.
-        let error = kernel.fillet(shape, &[0], 0.5).unwrap_err();
-        assert_eq!(error.to_string(), "the native kernel cannot fillet yet");
+        let tetrahedron = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let error = kernel
+            .solid_from_mesh(&tetrahedron, &[[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the native kernel cannot make a solid from a mesh yet"
+        );
         assert!(!kernel.has_volume_mesher());
         kernel.release(shape);
     }

@@ -750,6 +750,16 @@ pub(crate) fn walk(
                         turn = -turn;
                     }
                     theta += turn;
+                    // A circle within its tolerance of the parallel but about a centre of
+                    // its own (some systems bound a face by arcs a few microns off its
+                    // surface) turns about that centre a little more or less than about the
+                    // axis: its end's own angle, as many turns round as it makes. Only
+                    // then: the booleans' layouts depend on a parallel's angles to the
+                    // last digit.
+                    let centred = surface.rho_z(circle.center).0 <= 1e-9 * surface.size().max(1.0);
+                    if !centred && off_axis(edge.b) {
+                        theta = unwrap(theta, surface.params(edge.b).0);
+                    }
                 } else if surface.meridian_theta(&circle, tolerance).is_some() {
                     // `v` grows counter-clockwise about e(θ) × a.
                     let e = x * theta.cos() + y * theta.sin();
@@ -797,7 +807,14 @@ pub(crate) fn walk(
     if (theta - theta0).abs() > slack.max(1e-6) {
         return Err("a loop winds round its surface's axis".to_owned());
     }
-    if (v - v0).abs() > 1e-6 * surface.size().max(1.0) {
+    // So does each parallel keep its `v`, and the corners' own are left over the same way:
+    // a length along the axis for a straight meridian, an angle round a round one's circle,
+    // kept well short of a turn so that a loop round a torus's tube is still told.
+    let v_slack = match surface.meridian {
+        Meridian::Line { .. } => 10.0 * tolerance * n as f64,
+        Meridian::Circle { radius, .. } => (10.0 * tolerance * n as f64 / radius.abs()).min(0.1),
+    };
+    if (v - v0).abs() > v_slack.max(1e-6 * surface.size().max(1.0)) {
         return Err("a loop winds round its surface's meridian".to_owned());
     }
     Ok(out)
