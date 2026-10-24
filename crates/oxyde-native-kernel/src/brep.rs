@@ -203,15 +203,6 @@ impl Solid {
         self.vertices[vertex as usize].point
     }
 
-    /// Whether every face is a plane and every edge a line: what the BSP booleans take.
-    pub fn is_straight(&self) -> bool {
-        self.faces
-            .iter()
-            .all(|f| matches!(f.surface, Surface::Plane(_)))
-            && self.edges.iter().all(|e| e.curve == Curve::Line)
-            && self.shells.len() <= 1
-    }
-
     /// The angle a circle's or a section's edge turns through, `2π` for a closed one; a
     /// degenerate edge's turn; 0 for a line.
     pub fn sweep(&self, edge: &Edge) -> f64 {
@@ -357,7 +348,7 @@ impl Solid {
                             sums.add_arc(c, circle.radius, t0, t0 + turn);
                         }
                         Curve::Degenerate { .. } => {}
-                        Curve::Section(_) => {
+                        Curve::Section(_) | Curve::Traced(_) => {
                             let w = self.walk_edge(*edge_use);
                             sums.add_path(w.sweep, &|s| {
                                 local(w.curve.at(w.a, w.b, s).unwrap_or(w.a))
@@ -499,9 +490,13 @@ impl Solid {
                         }
                     }
                 }
-                Curve::Section(section) => {
+                Curve::Section(_) | Curve::Traced(_) => {
                     for v in [edge.start, edge.end] {
-                        let off = section.distance(self.point(v));
+                        let off = edge.curve.distance(
+                            self.point(edge.start),
+                            self.point(edge.end),
+                            self.point(v),
+                        );
                         if off > within(v, edge.tolerance) {
                             return Err(format!("edge {e}: an end lies {off} mm off its curve"));
                         }
@@ -823,11 +818,6 @@ impl Shape {
         self.solids.iter().map(|s| s.faces.len()).sum()
     }
 
-    /// Whether every solid is [`Solid::is_straight`].
-    pub fn is_straight(&self) -> bool {
-        self.solids.iter().all(Solid::is_straight)
-    }
-
     /// Faces, edges and vertices with their adjacency, numbered solid after solid.
     pub fn topology(&self) -> Result<Topology, String> {
         let mut topology = Topology::default();
@@ -908,6 +898,14 @@ impl Shape {
                         vertices,
                         faces,
                     },
+                    Curve::Traced(trace) => EdgeInfo {
+                        curve: CurveKind::BSpline,
+                        length: trace.length_from(a, solid.sweep(edge)),
+                        midpoint: solid.midpoint(edge),
+                        axis: None,
+                        vertices,
+                        faces,
+                    },
                 });
             }
             topology
@@ -943,6 +941,9 @@ impl Shape {
                     }
                     Curve::Section(section) => {
                         points.extend(section.extremes(solid.point(edge.start), solid.sweep(edge)));
+                    }
+                    Curve::Traced(trace) => {
+                        points.extend(trace.extremes(solid.point(edge.start), solid.sweep(edge)));
                     }
                     _ => {}
                 }

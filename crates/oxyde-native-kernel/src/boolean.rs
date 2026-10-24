@@ -1,26 +1,19 @@
 //! Booleans: fuse, cut and common of a target with tools.
 //!
-//! Solids with curved faces are cut face by face along where they meet ([`crate::curved`]).
-//! Straight-sided solids go through BSP trees: each input's faces are triangulated into convex pieces that remember their face, the
-//! pieces are combined by BSP trees ([`crate::bsp`]) and glued back into faces and solids
-//! ([`crate::assemble`]). A result is then held to what the operation can do at all before
-//! it is used, the checks SolidCraft's kernel makes of its booleans (`boolean_guard.rs`
-//! there): it is closed (checked when the kernel keeps it), a fuse never loses volume, a cut
-//! or a common never gains any, and nothing reaches beyond the inputs. A result that fails
-//! is refused with an error: a wrong result that looks right is worse.
-
-// Indices into the solids' own vertices and the corners their faces were triangulated on.
-#![allow(clippy::indexing_slicing)]
+//! Every solid is cut face by face along where the faces meet ([`crate::curved`]), planes
+//! as much as curved faces: one engine for all. A result is then held to what the
+//! operation can do at all before it is used, the checks SolidCraft's kernel makes of its
+//! booleans (`boolean_guard.rs` there): it is closed (checked when the kernel keeps it), a
+//! fuse never loses volume, a cut or a common never gains any, and nothing reaches beyond
+//! the inputs. A result that fails is refused with an error: a wrong result that looks right
+//! is worse.
 
 use oxyde_geom::{LINEAR_TOLERANCE, Point3};
 use oxyde_kernel::{BooleanOp, OpHistory};
 
 use crate::NativeError;
-use crate::assemble::{self, VOID};
 use crate::brep::Shape;
-use crate::bsp::{self, Plane3, Polygon};
 use crate::curved;
-use crate::tessellate;
 
 /// `target` (input 0) fused with, cut by or in common with `tools` (inputs 1, 2…): a fuse
 /// joins them all, a cut removes them all, a common keeps what the target shares with any
@@ -33,69 +26,9 @@ pub(crate) fn boolean(
     if tools.is_empty() {
         return Err(NativeError::Failed("a boolean needs a tool".to_owned()));
     }
-    // Curved faces are cut along where they meet ([`curved`]); straight-sided solids go
-    // through BSP trees.
-    if !target.is_straight() || tools.iter().any(|t| !t.is_straight()) {
-        let (shape, history) = curved::boolean(op, target, tools)?;
-        check(op, target, tools, &shape)?;
-        return Ok((shape, history));
-    }
-    let eps = LINEAR_TOLERANCE;
-    let mut tool_polygons = Vec::with_capacity(tools.len());
-    for (i, tool) in tools.iter().enumerate() {
-        tool_polygons.push(polygons(tool, i as u32 + 1)?);
-    }
-    let target_polygons = polygons(target, 0)?;
-    let kept = match op {
-        BooleanOp::Fuse => tool_polygons
-            .into_iter()
-            .fold(target_polygons, |acc, tool| bsp::union(acc, tool, eps)),
-        BooleanOp::Cut => tool_polygons
-            .into_iter()
-            .fold(target_polygons, |acc, tool| bsp::subtract(acc, tool, eps)),
-        BooleanOp::Common => {
-            let tools = tool_polygons
-                .into_iter()
-                .reduce(|acc, tool| bsp::union(acc, tool, eps))
-                .unwrap_or_default();
-            bsp::intersect(target_polygons, tools, eps)
-        }
-    };
-    let (shape, history) = match assemble::assemble(kept, eps) {
-        // A void inside a solid is left to the curved booleans, which keep one.
-        Err(NativeError::Unsupported(VOID)) => curved::boolean(op, target, tools)?,
-        other => other?,
-    };
+    let (shape, history) = curved::boolean(op, target, tools)?;
     check(op, target, tools, &shape)?;
     Ok((shape, history))
-}
-
-/// The faces of `shape` as convex pieces, each tagged with `input` and the face's index in
-/// the shape's topology.
-fn polygons(shape: &Shape, input: u32) -> Result<Vec<Polygon>, NativeError> {
-    let mut out = Vec::new();
-    let mut index = 0;
-    for solid in &shape.solids {
-        for face in &solid.faces {
-            let (corners, triangles) =
-                tessellate::triangulate_face(solid, face).map_err(NativeError::Internal)?;
-            let Some(plane) = face.surface.plane() else {
-                return Err(NativeError::Unsupported(
-                    "join, cut or intersect curved faces",
-                ));
-            };
-            let plane = Plane3::through(plane.origin, plane.normal);
-            for triangle in triangles {
-                out.push(Polygon {
-                    points: triangle.iter().map(|&k| solid.point(corners[k])).collect(),
-                    plane,
-                    source: (input, index),
-                });
-            }
-            index += 1;
-        }
-    }
-    Ok(out)
 }
 
 /// What a boolean can make of its inputs, checked on its result.

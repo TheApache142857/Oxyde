@@ -185,7 +185,7 @@ impl Segment {
 
     /// Where `p`, a point on it or near it, is along it: `None` when off it by more than
     /// `tol` or beyond its ends.
-    fn locate(&self, p: P, tol: f64) -> Option<f64> {
+    pub(crate) fn locate(&self, p: P, tol: f64) -> Option<f64> {
         let extent = self.extent(tol);
         let s = match self.geom {
             Geom::Line => {
@@ -436,6 +436,11 @@ enum Met {
 }
 
 /// The points where two segments meet (crossing, touching, or the ends of an overlap).
+pub(crate) fn meeting(s: &Segment, t: &Segment, tol: f64) -> Vec<P> {
+    meet(s, t, tol).into_iter().map(|(p, _)| p).collect()
+}
+
+/// The points where two segments meet, and how.
 fn meet(s: &Segment, t: &Segment, tol: f64) -> Vec<(P, Met)> {
     let mut out: Vec<(P, Met)> = Vec::new();
     match (s.geom, t.geom) {
@@ -670,12 +675,14 @@ impl Arrangement {
             )
         };
         let (cx, cy) = cell(p);
-        // The first point made within the tolerance, as a search in order would find.
+        // The first point made within twice the tolerance, as a search in order would find:
+        // as far as split points along a segment are taken as one, so that where a crossing
+        // moves a segment's end, the end of the segment it follows on from is moved with it.
         let mut found: Option<usize> = None;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
+        for dx in -2..=2 {
+            for dy in -2..=2 {
                 for &i in self.grid.get(&(cx + dx, cy + dy)).into_iter().flatten() {
-                    if self.points[i].distance(p) <= self.tol && found.is_none_or(|f| i < f) {
+                    if self.points[i].distance(p) <= 2.0 * self.tol && found.is_none_or(|f| i < f) {
                         found = Some(i);
                     }
                 }

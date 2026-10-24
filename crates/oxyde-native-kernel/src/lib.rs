@@ -9,11 +9,11 @@
 //! and §10 (Native kernel).
 //!
 //! What it builds so far: boxes, extrusions and revolves of profiles of lines, arcs and
-//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines, circles and
-//! sections, the exact curves where a cylinder or a cone crosses another surface, and
-//! degenerate edges at a cone's apex or a sphere's pole), their moved or mirrored copies,
-//! booleans (fuse, cut, common) of them where their faces meet in lines, circles and
-//! sections, voids included, chamfers and fillets of their edges, shells of them, and
+//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines, circles,
+//! sections, the exact curves where a cylinder or a cone crosses another surface, traced
+//! curves where other surfaces cross, and degenerate edges at a cone's apex or a sphere's
+//! pole), their moved or mirrored copies, booleans (fuse, cut, common) of them, voids
+//! included, chamfers and fillets of their edges, shells of them, and
 //! sweeps of profiles along paths of lines and arcs, with their topology, exact mass
 //! properties, bounds and display meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
 //! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
@@ -43,11 +43,9 @@
 )]
 
 mod arrangement;
-mod assemble;
 mod blend;
 mod boolean;
 mod brep;
-mod bsp;
 mod build;
 mod curved;
 mod geometry;
@@ -56,6 +54,7 @@ mod revolution;
 mod revolve;
 mod sweep;
 mod tessellate;
+mod trace;
 mod triangulate;
 
 use std::collections::HashMap;
@@ -713,37 +712,6 @@ mod tests {
     #[test]
     fn what_is_not_written_yet_fails_with_a_message() {
         let mut kernel = NativeKernel::new();
-        let circle = Profile::from_curves(&[ProfileSegment {
-            id: 1,
-            curve: Curve2::Circle {
-                center: Point2::new(0.0, 0.0),
-                radius: 2.0,
-            },
-        }])
-        .unwrap();
-        // Two cylinders on axes that pass each other, the second only partly through the
-        // first: they meet in a loop that turns back along either one's straight lines.
-        let along_z = kernel
-            .extrude(&Plane::FRONT, &circle, Vec3::new(0.0, 0.0, 4.0))
-            .unwrap();
-        let beside = Profile::from_curves(&[ProfileSegment {
-            id: 1,
-            curve: Curve2::Circle {
-                center: Point2::new(-2.0, 1.5),
-                radius: 2.0,
-            },
-        }])
-        .unwrap();
-        let along_x = kernel
-            .extrude(&Plane::RIGHT, &beside, Vec3::new(4.0, 0.0, 0.0))
-            .unwrap();
-        let error = kernel
-            .boolean(BooleanOp::Cut, along_z.shape, along_x.shape)
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "the native kernel cannot intersect surfaces of revolution that meet in a curve turning back on itself yet"
-        );
         let shape = kernel
             .make_box(Point3::ORIGIN, Vec3::new(1.0, 1.0, 1.0))
             .unwrap();

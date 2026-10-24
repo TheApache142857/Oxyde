@@ -98,48 +98,6 @@ fn loop_points(edges: &[EdgeUse], polylines: &[Vec<Point3>]) -> Vec<Point3> {
     out
 }
 
-/// The face's corners, each once (vertices of the solid), and triangles over them (indices
-/// into the corners), triangulated in the face's plane: for the booleans, which take
-/// planar faces of straight edges. The plane's frame is right-handed about the outward
-/// normal, so triangles counter-clockwise in it are counter-clockwise seen from outside.
-pub(crate) fn triangulate_face(
-    solid: &Solid,
-    face: &Face,
-) -> Result<(Vec<u32>, Vec<[usize; 3]>), String> {
-    let plane = face
-        .surface
-        .plane()
-        .ok_or_else(|| "a curved face cannot be cut into polygons".to_owned())?;
-    let mut corners: Vec<u32> = Vec::new();
-    let mut loops: Vec<Vec<usize>> = Vec::with_capacity(face.loops.len());
-    for edges in &face.loops {
-        let mut ring = Vec::with_capacity(edges.len());
-        for &edge_use in edges {
-            let vertex = solid.start_of(edge_use);
-            let local = match corners.iter().position(|&v| v == vertex) {
-                Some(local) => local,
-                None => {
-                    corners.push(vertex);
-                    corners.len() - 1
-                }
-            };
-            ring.push(local);
-        }
-        loops.push(ring);
-    }
-    let (origin, x) = (plane.origin, plane.x_dir);
-    let y = plane.normal.cross(x);
-    let flat: Vec<Point2> = corners
-        .iter()
-        .map(|&v| {
-            let d = solid.point(v) - origin;
-            Point2::new(d.dot(x), d.dot(y))
-        })
-        .collect();
-    let triangles = triangulate::polygon_with_holes(&flat, &loops)?;
-    Ok((corners, triangles))
-}
-
 fn planar_mesh(face: &Face, polylines: &[Vec<Point3>]) -> Result<FaceMesh, String> {
     let plane = face
         .surface

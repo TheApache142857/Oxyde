@@ -1076,31 +1076,37 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut sketch = on_top(base);
     sketch.circle(Point2::new(20.0, 15.0), 4.0);
     cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
-    // A hole as wide across it from the side, beside the first's axis: it goes only partly
-    // through the first, in a loop that turns back along either one's straight lines,
-    // which the native kernel cannot cut yet.
-    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
-    sketch.circle(Point2::new(-5.0, 20.0), 4.0);
-    extrude(
-        &mut part,
-        sketch,
-        ExtrudeOp::Cut,
-        ExtrudeExtent::ThroughAll { both: true },
-        false,
-    );
+    // A loft from a circle on the top to a square above it, which it cannot make yet.
+    let mut round = on_top(base);
+    round.circle(Point2::new(20.0, 15.0), 8.0);
+    let round = part.add_feature(FeatureKind::Sketch(round));
+    let up = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Offset {
+        base: oxyde_model::PlaneRef::Standard(StandardPlane::Front),
+        offset: 25.0,
+        flip: false,
+    }));
+    let mut square = Sketch::new(SketchPlane::Reference(up));
+    square.rectangle(Point2::new(14.0, 9.0), 12.0, 12.0);
+    let square = part.add_feature(FeatureKind::Sketch(square));
+    let loft = part.add_feature(FeatureKind::Loft(oxyde_model::Loft {
+        profiles: vec![round, square],
+        op: ExtrudeOp::Boss,
+        ruled: false,
+        bodies: Vec::new(),
+    }));
 
     let mut kernel = NativeKernel::new();
     part.rebuild(&mut kernel);
     let statuses: Vec<FeatureStatus> = part.timeline().into_iter().map(|e| e.status).collect();
     assert_eq!(statuses[1], FeatureStatus::Ok);
     assert_eq!(statuses[3], FeatureStatus::Ok);
-    match &statuses[5] {
-        FeatureStatus::Error(message) => {
-            assert!(message.contains("turning back on itself"), "{message}")
+    match part.status(loft) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("loft"), "{message}")
         }
-        other => panic!("the crossing hole should fail, not {other:?}"),
+        other => panic!("the loft should fail, not {other:?}"),
     }
-    // The block with its first hole is still there, whole.
+    // The block with its hole is still there, whole.
     let body = part.body().expect("a body");
     let volume: f64 = body
         .solids
@@ -1533,7 +1539,15 @@ fn holes_crossing_each_other() {
     // one as wide through its axis meets it in two ellipses that cross each other, which
     // OpenCASCADE also cuts at the ends of their long axes, where the native kernel has
     // a corner only where a seam ends.
-    for (y, r) in [(15.0, 3.0), (15.5, 3.0), (15.0, 2.0), (15.0, 4.0)] {
+    // One beside it, only partly through it, meets it in a loop that turns back along
+    // either one's lines: a traced curve.
+    for (y, r) in [
+        (15.0, 3.0),
+        (15.5, 3.0),
+        (15.0, 2.0),
+        (15.0, 4.0),
+        (20.0, 4.0),
+    ] {
         let mut part = Part::new();
         let base = base_block(&mut part);
         let mut sketch = on_top(base);
@@ -2421,6 +2435,137 @@ fn a_cut_sweep_and_a_sweep_round_a_corner() {
     match part.status(sweep) {
         Some(FeatureStatus::Error(message)) => {
             assert!(message.contains("turns sharply"), "{message}")
+        }
+        other => panic!("expected an error, got {other:?}"),
+    }
+    part.release(&mut kernel);
+}
+
+#[test]
+fn tori_cut_beside_their_axis() {
+    // A ring turned about Y, its tube 4 round a circle of radius 12.
+    let ring = || {
+        let mut part = Part::new();
+        let (mut section, axis) = about_y(-20.0, 20.0);
+        section.circle(Point2::new(12.0, 0.0), 4.0);
+        let ring = revolve(&mut part, section, axis, ExtrudeOp::Boss, WHOLE);
+        (part, ring)
+    };
+    // Cut by a block whose face runs along the axis, through the tube.
+    let (mut part, _) = ring();
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    sketch.rectangle(Point2::new(-30.0, -30.0), 60.0, 60.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::Blind { depth: 10.0 },
+        false,
+    );
+    assert_same_part("a ring cut along its axis beside it", &part);
+    // A hole down through the tube.
+    let (mut part, _) = ring();
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+    sketch.circle(Point2::new(12.0, 0.0), 2.0);
+    extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    assert_same_part("a hole down through a ring's tube", &part);
+}
+
+#[test]
+fn a_hole_across_a_rounded_rim() {
+    // A hole's rim rounded, then a hole across from the side through the round.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    let circle = sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    let hole = extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        false,
+    );
+    part.add_feature(blended_by(
+        true,
+        vec![EdgeName::between(
+            FaceName::profile(hole, circle),
+            FaceName::end_cap(base),
+        )],
+        2.0,
+    ));
+    for (z, r, what) in [
+        // Through the round only.
+        (9.0, 0.8, "a hole across a rounded rim"),
+        (
+            8.0,
+            1.4,
+            "a hole across a rounded rim and the wall below it, thinner",
+        ),
+        // Through the round and the hole's wall below it, across where they meet.
+        (
+            8.0,
+            1.5,
+            "a hole across a rounded rim and the wall below it",
+        ),
+    ] {
+        let mut part = Part::from_definition(part.definition()).unwrap();
+        let mut side = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+        side.circle(Point2::new(-z, if r == 1.4 { 15.3 } else { 15.0 }), r);
+        extrude(
+            &mut part,
+            side,
+            ExtrudeOp::Cut,
+            ExtrudeExtent::ThroughAll { both: true },
+            false,
+        );
+        assert_same_part(what, &part);
+    }
+}
+
+#[test]
+fn a_hole_touching_a_round_where_it_crosses_it_fails_saying_so() {
+    // A hole's rim rounded, then a hole from the side whose top touches the round's torus
+    // where the torus touches the block's top: the curve they cross in runs through a
+    // point where they touch, which the native kernel does not follow yet.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    let circle = sketch.circle(Point2::new(20.0, 15.0), 6.0);
+    let hole = extrude(
+        &mut part,
+        sketch,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: false },
+        false,
+    );
+    part.add_feature(blended_by(
+        true,
+        vec![EdgeName::between(
+            FaceName::profile(hole, circle),
+            FaceName::end_cap(base),
+        )],
+        2.0,
+    ));
+    let mut side = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    side.circle(Point2::new(-8.5, 15.0), 1.5);
+    let across = extrude(
+        &mut part,
+        side,
+        ExtrudeOp::Cut,
+        ExtrudeExtent::ThroughAll { both: true },
+        false,
+    );
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    match part.status(across) {
+        Some(FeatureStatus::Error(message)) => {
+            assert!(message.contains("touch"), "{message}")
         }
         other => panic!("expected an error, got {other:?}"),
     }

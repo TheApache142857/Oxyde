@@ -13,6 +13,7 @@ use std::f64::consts::TAU;
 use oxyde_geom::{Axis, Plane, Point3, Transform, Vec3};
 
 use crate::revolution::{Meridian, Revolution};
+pub(crate) use crate::trace::Trace;
 
 /// A unit vector square to `normal`, the same for the same normal: the angle-zero direction
 /// of a circle that has none of its own.
@@ -47,6 +48,8 @@ pub(crate) enum Curve {
     /// Where a cylinder or a cone meets another surface, followed about the cylinder's or
     /// the cone's axis ([`Section`]).
     Section(Section),
+    /// Where two surfaces cross, traced along ([`Trace`]).
+    Traced(Trace),
 }
 
 impl Curve {
@@ -65,6 +68,7 @@ impl Curve {
                 }
             }
             Curve::Section(section) => Curve::Section(section.transformed(transform)),
+            Curve::Traced(trace) => Curve::Traced(trace.transformed(transform)),
         }
     }
 
@@ -85,6 +89,10 @@ impl Curve {
                 ccw: !section.ccw,
                 ..*section
             }),
+            Curve::Traced(trace) => Curve::Traced(Trace {
+                up: !trace.up,
+                ..*trace
+            }),
         }
     }
 
@@ -100,6 +108,7 @@ impl Curve {
             Curve::Line => start.distance(end),
             Curve::Circle(c) => c.sweep(start, end, closed),
             Curve::Section(s) => s.sweep(start, end, closed),
+            Curve::Traced(t) => t.sweep(start, end, closed),
             Curve::Degenerate { turn, .. } => *turn,
         }
     }
@@ -115,6 +124,7 @@ impl Curve {
             }
             Curve::Circle(c) => Some(c.point_at(c.angle_of(start) + s)),
             Curve::Section(sec) => sec.along(start, s),
+            Curve::Traced(t) => t.along(start, s),
             Curve::Degenerate { .. } => Some(start),
         }
     }
@@ -130,6 +140,7 @@ impl Curve {
             }
             Curve::Circle(c) => (c.angle_of(p) - c.angle_of(start)).rem_euclid(TAU),
             Curve::Section(sec) => sec.turned(start, p),
+            Curve::Traced(t) => t.turned(start, p),
             Curve::Degenerate { .. } => 0.0,
         }
     }
@@ -149,6 +160,7 @@ impl Curve {
             }
             Curve::Circle(c) => c.distance(p),
             Curve::Section(s) => s.distance(p),
+            Curve::Traced(t) => t.distance(p),
             Curve::Degenerate { .. } => p.distance(start),
         }
     }
@@ -189,6 +201,7 @@ impl Curve {
                 points
             }
             Curve::Section(sec) => sec.polyline(start, end, extent, d),
+            Curve::Traced(t) => t.polyline(start, end, extent, d),
         }
     }
 }

@@ -371,6 +371,7 @@ fn same_way(a: &Curve, b: &Curve) -> bool {
     match (a, b) {
         (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) > 0.0,
         (Curve::Section(s), Curve::Section(t)) => s.ccw == t.ccw,
+        (Curve::Traced(s), Curve::Traced(t)) => s.up == t.up,
         _ => true,
     }
 }

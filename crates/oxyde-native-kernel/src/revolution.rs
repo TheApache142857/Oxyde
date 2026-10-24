@@ -763,7 +763,7 @@ pub(crate) fn walk(
                     straight = false;
                 }
             }
-            Curve::Section(_) => {
+            Curve::Section(_) | Curve::Traced(_) => {
                 (theta, v) = ParamPath::follow(surface, edge, from, near_axis)?.end();
                 straight = false;
             }

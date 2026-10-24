@@ -76,6 +76,10 @@ release yet; the git history has every detail.
   the part fail saying so. Sweeps of any profile along a path of lines and arcs that turns
   smoothly, open or closed (a ring), boss or cut. A path with a sharp corner fails with a
   message, where OpenCASCADE builds a solid with no volume after the corner.
+- It now also cuts a torus beside its axis (a ring cut by a plane off its axis, a hole
+  through a ring's side), a hole that only partly crosses another, and a hole across a
+  fillet or a rounded rim, tracing the curves where the surfaces cross exactly. A hole whose
+  wall touches the round just where it crosses it still fails with a message.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

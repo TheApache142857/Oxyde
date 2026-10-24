@@ -35,7 +35,9 @@ normals point into the void (`shells` empty means one shell of every face).
   its axis (§5), or **degenerate**: an edge of no length at the point where a surface of
   revolution meets its axis (a cone's apex, a sphere's pole), which its face's boundary runs
   along as it turns about the axis there, as OpenCASCADE's degenerate edges do. It carries
-  its turn and the axis it turns about, belongs to one face and is run along once.
+  its turn and the axis it turns about, belongs to one face and is run along once; or
+  **traced**, where two surfaces cross in a curve no closed form or single angle follows
+  (§5).
 - A **face** lies on a surface, a plane (its normal out of the solid) or a surface of
   revolution, and is bounded by loops of edge uses: the outer one counter-clockwise seen
   from outside, then its holes, clockwise. A face that goes round its axis whole has a seam,
@@ -160,13 +162,9 @@ run along as a segment of constant `v`, a bent edge as 128 of its points, each m
 `boolean.rs` dispatches and checks: a result must be closed (checked when kept), a fuse
 never loses volume, a cut or a common never gains any, nothing reaches beyond the inputs.
 
-- **Straight-sided solids** go through BSP trees (`bsp.rs`, Thibault & Naylor 1987 in the
-  form csg.js made known: a polygon in a splitting plane counts as outside when it faces the
-  same way and inside when it faces the other, so faces in contact cancel), the pieces glued
-  back into faces plane by plane (`assemble.rs`), coplanar touching faces merged and edges in
-  line joined, as OpenCASCADE's `SimplifyResult` leaves them. A result with a void is made the
-  other way.
-- **Everything else** (`curved.rs`) is cut face by face. Each face is laid out flat in its
+- **Every solid** (`curved.rs`), flat-faced or curved, is cut face by face: one engine for
+  all (a BSP-tree one for flat-faced solids was dropped once this one was as good, and
+  still 10 to 30 times faster than OpenCASCADE's on them). Each face is laid out flat in its
   chart: a plane's coordinates, or a surface of revolution's `(k θ, m v)`, scaled to lengths,
   where lines and the circles it shares an axis with are straight or arcs. It is cut along
   the curves it shares with the other solid's faces in a planar arrangement of segments and
@@ -224,13 +222,41 @@ never loses volume, a cut or a common never gains any, nothing reaches beyond th
   directions within a millionth of a radian are one and the curve turning least left comes
   first; a hole is given to the region holding a point just outside the middle of its
   longest piece, never a corner a circle may touch.
+- **Traced curves** (`trace.rs`). Where none of these follows the curve (a torus a plane
+  or a surface off its axis crosses, a hole that only partly crosses another, whose curve
+  turns back along either one's lines and goes round neither, a hole across a fillet), it
+  is traced. A traced curve is held by what makes it: the two surfaces, the point it
+  starts at, the way it runs from there (along the cross product of the normals or
+  against it), its length, whether it closes; so it is a small value that copies, and two
+  copies of it are one curve. Its points are marched from the start, a step along the
+  tangent and Newton's method back onto both surfaces in the plane square to it, the steps
+  shortened where it bends, and kept in a cache that the curve itself can always fill
+  again, the same every time. Its parameter is the length along those points; a point at
+  any parameter is the cubic between the two marched points about it moved onto both
+  surfaces again, exact to rounding as a section's points are, and lengths, extremes and
+  integrals are taken along it. Where to start is found over a grid of each face's chart:
+  where the other surface's signed distance changes sign, by bisection. Each curve is
+  traced both ways from the first such point not already on one, to where it closes or
+  leaves a box round both faces; the curves found for two surfaces are kept for the rest
+  of the boolean, so that every pair of faces on them cuts along the same ones. OpenCASCADE
+  fits B-splines to these curves, and they are reported as B-splines.
+- A curve of two faces is laid into each only where it lies inside the other, each stretch
+  ending exactly where it crosses the other face's edges (`clipped_into`, Gauss–Newton on
+  the two curves; a face's seam is no edge to cross), so that where the other face meets a
+  face beside it smoothly (a fillet and its wall), the curves on the two end at one point,
+  not both running on side by side; a stretch is inside or out whole, told at a few of its
+  points. Points closer than twice the tolerance are one, in the arrangement as where the
+  cuts are found.
+- What is left of a ring torus's face that went round its axis but no longer does, while
+  it still goes round its tube, keeps an edge at its angle zero, cut there in two, as
+  OpenCASCADE leaves it; a piece round neither, or of any other surface, stays whole. A ring
+  torus's face is laid out round its tube from a gap between its pieces before they are
+  merged, so that pieces either side of the tube's seam become one face again.
 - These still answer *not supported yet*, and the feature fails with that message, its body
-  as it was: a torus that a plane or a surface off its axis crosses inside both faces;
-  curves that turn back on themselves (a hole that only partly crosses another, whose curve
-  goes round neither); surfaces that touch along a curve across their faces. A ring torus's
-  face is cut at its tube's seam (v zero) as well as at its angle zero, and its pieces are
-  laid out round the tube from a gap between them before they are merged, so that pieces
-  either side of the seam become one face again.
+  as it was: surfaces that touch where they cross (a hole whose wall touches a fillet just
+  where it crosses it, the curve through the touching point: the tracing stops where the
+  normals are within a thousandth of a radian), surfaces that touch along a curve across
+  their faces, and B-spline curves and surfaces.
 
 ### Chamfers and fillets
 
@@ -300,7 +326,9 @@ without gaps; triangles with two corners at a pole are left out.
   its end and one with a ball cut from it, a torus half sunk into a block, an O-ring's
   groove, a void, holes across each other at every offset, a hole through a round bar,
   round bars, bosses and cones cut at a slant, a ball cut beside its axis and a hole
-  through one beside its centre; chamfers and fillets of a block's edge, of two and three
+  through one beside its centre; tori cut by planes beside their axis and holes through
+  their side; holes across a rounded rim, and one touching the round where it crosses it,
+  refused; chamfers and fillets of a block's edge, of two and three
   edges at a corner, of every edge, of a hole's rims and a round boss's top and foot, of a
   slot's top edge (run round its ends), of the inner edge of an L, of a pocket's corners and
   then its rim, of a boss's upright edges down to the plate, of an edge ending on slanted
@@ -337,7 +365,7 @@ without gaps; triangles with two corners at a pole are left out.
 - Where two surfaces meet in a curve that is not a line, a circle or an ellipse,
   OpenCASCADE fits a B-spline to it, and its areas and volumes are a few millionths off the
   exact ones (a hole across another: 8e-6 of its wall's area); the native kernel's section
-  is the exact curve, and its areas match the integral to 1e-9.
+  or traced curve is the exact curve, and its areas match the integral to 1e-9.
 - A bevel between a cylinder and a cone on one axis is a cone; OpenCASCADE fits a B-spline
   surface to it.
 - Two holes of one radius crossing: OpenCASCADE also cuts each of their two ellipses at the
@@ -366,9 +394,10 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    plane slanted to a cylinder or a cone, holes crossing, holes of one size crossing, a hole
    through a ball or a round bar, a cone's parabolas and hyperbolas), laid out as tagged
    polylines and rebuilt as exact edges, with mass properties by quadrature along them;
-   faces that only touch or meet along their edges. To do: tori crossed off their axis,
-   curves that turn back on themselves, B-spline curves and surfaces (stored pcurves will be
-   needed then), and one boolean engine instead of two.
+   faces that only touch or meet along their edges; one boolean engine for every solid;
+   traced curves: tori crossed off their axis (a plane beside it, a hole through a torus's
+   side), curves that turn back on themselves (holes partly crossing), holes across fillets.
+   To do: B-spline curves and surfaces, curves through points where the surfaces touch.
 3. **Done.** Chamfers and fillets: equal, two distances, a distance and an angle; along
    straight edges between planes and parallel cylinders and round edges between surfaces on
    one axis; runs of edges that carry on smoothly; corners of one, two (a mitre) and three

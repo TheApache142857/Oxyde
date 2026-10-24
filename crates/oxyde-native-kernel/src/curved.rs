@@ -34,7 +34,7 @@ use oxyde_kernel::{BooleanOp, FaceSource, OpHistory};
 use crate::NativeError;
 use crate::arrangement::{self, Arrangement, Geom, P, Segment, Tag};
 use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex};
-use crate::geometry::{Circle, Curve, Section, Surface};
+use crate::geometry::{Circle, Curve, Section, Surface, Trace};
 use crate::revolution::{Meridian, PlaneCurve, Revolution, WalkEdge, walk};
 
 /// An input face a face of the result is made of: the input's position in the boolean's
@@ -51,8 +51,8 @@ struct Tagged {
     sources: Vec<Vec<Source>>,
 }
 
-/// `target` (input 0) fused with, cut by or in common with `tools` (inputs 1, 2…), as
-/// [`crate::boolean::boolean`] does for straight-sided solids.
+/// `target` (input 0) fused with, cut by or in common with `tools` (inputs 1, 2…): the
+/// boolean of [`crate::boolean::boolean`].
 pub(crate) fn boolean(
     op: BooleanOp,
     target: &Shape,
@@ -202,7 +202,8 @@ impl Chart {
             })),
             (Chart::Revolution { surface, k, m }, Geom::Line) => {
                 let a = surface.axis.direction;
-                if (s.a.x - s.b.x).abs() <= TOL {
+                // Within what the arrangement welds points at.
+                if (s.a.x - s.b.x).abs() <= 2.0 * TOL {
                     // Along the meridian at its angle.
                     let theta = s.a.x / k;
                     match surface.meridian {
@@ -221,7 +222,7 @@ impl Chart {
                             }))
                         }
                     }
-                } else if (s.a.y - s.b.y).abs() <= TOL {
+                } else if (s.a.y - s.b.y).abs() <= 2.0 * TOL {
                     // Round the axis at its height: a parallel, or a pole.
                     let v = s.a.y / m;
                     let up = s.b.x > s.a.x;
@@ -355,7 +356,7 @@ fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, Stri
                             chart.to_2d(c.center),
                             c.normal.dot(*normal) > 0.0,
                         )),
-                        Curve::Section(_) => out.extend(lay(chart, e, a)),
+                        Curve::Section(_) | Curve::Traced(_) => out.extend(lay(chart, e, a)),
                         Curve::Degenerate { .. } => {}
                     }
                 }
@@ -419,6 +420,7 @@ const REFINE_REACH: f64 = 0.05;
 fn canonical(curve: Curve) -> Curve {
     match curve {
         Curve::Section(s) => Curve::Section(Section { ccw: true, ..s }),
+        Curve::Traced(t) => Curve::Traced(Trace { up: true, ..t }),
         Curve::Circle(c) => {
             let n = c.normal;
             let first = if n.x.abs() > 1e-12 {
@@ -437,11 +439,31 @@ fn canonical(curve: Curve) -> Curve {
     }
 }
 
+/// How far a canonical curve's parameter goes round before it comes back: a turn for a
+/// circle or a section, a closed trace's length; none for an open trace.
+fn period(canon: &Curve) -> f64 {
+    match canon {
+        Curve::Traced(t) if !t.closed => f64::INFINITY,
+        Curve::Traced(t) => t.span(),
+        _ => TAU,
+    }
+}
+
+/// The step between the points a canonical curve is laid out at: [`LAY_STEP`] of a
+/// circle's or a section's angle, a 256th of a trace.
+fn lay_step(canon: &Curve) -> f64 {
+    match canon {
+        Curve::Traced(t) => t.span() / 256.0,
+        _ => LAY_STEP,
+    }
+}
+
 /// The angle of `p` on a canonical curve.
 fn param_of(canon: &Curve, p: Point3) -> f64 {
     match canon {
         Curve::Section(s) => s.angle_of(p),
         Curve::Circle(c) => c.angle_of(p),
+        Curve::Traced(t) => t.param_of(p),
         _ => 0.0,
     }
 }
@@ -451,6 +473,7 @@ fn point_of(canon: &Curve, t: f64) -> Option<Point3> {
     match canon {
         Curve::Section(s) => s.point_at(t),
         Curve::Circle(c) => Some(c.point_at(t)),
+        Curve::Traced(trace) => trace.point_at(t),
         _ => None,
     }
 }
@@ -459,6 +482,7 @@ fn point_of(canon: &Curve, t: f64) -> Option<Point3> {
 fn runs_up(curve: &Curve) -> bool {
     match curve {
         Curve::Section(s) => s.ccw,
+        Curve::Traced(t) => t.up,
         Curve::Circle(c) => match canonical(*curve) {
             Curve::Circle(k) => k.normal.dot(c.normal) > 0.0,
             _ => true,
@@ -489,8 +513,9 @@ fn lay(chart: &Chart, e: &Edge3, from: P) -> Vec<Segment> {
     let extent = e.extent();
     let tb = if up { ta + extent } else { ta - extent };
     let (lo, hi) = (ta.min(tb), ta.max(tb));
-    let mut ts: Vec<f64> = ((lo / LAY_STEP).floor() as i64 + 1..=(hi / LAY_STEP).ceil() as i64)
-        .map(|k| k as f64 * LAY_STEP)
+    let step = lay_step(&canon);
+    let mut ts: Vec<f64> = ((lo / step).floor() as i64 + 1..=(hi / step).ceil() as i64)
+        .map(|k| k as f64 * step)
         .filter(|&t| t > lo + 1e-9 && t < hi - 1e-9)
         .collect();
     if !up {
@@ -557,8 +582,14 @@ fn cycle_edges(chart: &Chart, segments: &[Segment]) -> Result<Vec<Edge3>, String
         let (Some(prev), Some(this)) = (segments[(k + n - 1) % n].tag, segments[k].tag) else {
             return false;
         };
-        let gap = (this.t0 - prev.t1).rem_euclid(TAU);
-        prev.curve == this.curve && gap.min(TAU - gap) <= 1e-9
+        let round = period(&prev.curve);
+        let gap = if round.is_finite() {
+            let g = (this.t0 - prev.t1).rem_euclid(round);
+            g.min(round - g)
+        } else {
+            (this.t0 - prev.t1).abs()
+        };
+        prev.curve == this.curve && gap <= 1e-9 * round.clamp(1.0, 1e3)
     };
     // Start at a run's first segment; round a loop that is one run, where its angles go
     // back a whole turn: where it was laid from (a section's from its carrier's angle zero),
@@ -598,12 +629,17 @@ fn cycle_edges(chart: &Chart, segments: &[Segment]) -> Result<Vec<Edge3>, String
                 k += 1;
                 while k < n && carries_on((start + k) % n) {
                     let next = segments[(start + k) % n].tag.ok_or("a run lost its tag")?;
-                    let shift = TAU * ((t_end - next.t0) / TAU).round();
+                    let round = period(&tag.curve);
+                    let shift = if round.is_finite() {
+                        round * ((t_end - next.t0) / round).round()
+                    } else {
+                        0.0
+                    };
                     t_end = next.t1 + shift;
                     k += 1;
                 }
                 let up = t_end > t_start;
-                let whole = (t_end - t_start).abs() > TAU - 1e-6;
+                let whole = (t_end - t_start).abs() > period(&tag.curve) - 1e-6;
                 let a = point_of(&tag.curve, t_start).ok_or("a run's start is off its curve")?;
                 let b = if whole {
                     a
@@ -649,12 +685,14 @@ fn parametric(e: &Edge3, p: Point3) -> (f64, impl Fn(f64) -> Option<Point3> + '_
         }
         Curve::Circle(c) => c.angle_of(p),
         Curve::Section(s) => s.angle_of(p),
+        Curve::Traced(t) => t.param_of(p),
         Curve::Degenerate { .. } => 0.0,
     };
     let f = move |t: f64| match e.curve {
         Curve::Line => Some(e.a + d * t),
         Curve::Circle(c) => Some(c.point_at(t)),
         Curve::Section(s) => s.point_at(t),
+        Curve::Traced(trace) => trace.point_at(t),
         Curve::Degenerate { .. } => Some(e.a),
     };
     (t, f)
@@ -901,6 +939,8 @@ enum Cut {
     /// A stretch of a section from `start` to `end`, as its angle grows: where a curve
     /// that does not go round its carrier (a plane's hyperbola on a cone) crosses a face.
     SectionArc(Section, Point3, Point3),
+    /// A curve traced where the surfaces cross, whole.
+    Traced(Trace),
     /// The two faces lie on one surface: each is cut along the other's boundary.
     Same,
 }
@@ -1200,10 +1240,14 @@ fn plane_section(
                 },
             )
         }
-        Meridian::Line { .. } => sections(r, &Surface::Plane(*p), plane_face, revolution_face)
-            .ok_or(NativeError::Unsupported(
-                "intersect a cone with a plane it meets in a curve that does not go round its axis",
-            )),
+        Meridian::Line { .. } => {
+            match sections(r, &Surface::Plane(*p), plane_face, revolution_face) {
+                Some(cuts) => Ok(cuts),
+                None => traced(plane_face, revolution_face).ok_or(NativeError::Unsupported(
+                    "intersect a cone with a plane that touches it where it cuts it",
+                )),
+            }
+        }
         Meridian::Circle { center, radius } => {
             // The plane's height above the circle the tube's centre runs round, at its
             // lowest and highest: a plane no nearer than the tube's radius misses it, or
@@ -1220,8 +1264,8 @@ fn plane_section(
             if !cross_inside(plane_face, revolution_face) {
                 return Ok(Vec::new());
             }
-            Err(NativeError::Unsupported(
-                "intersect a torus with a plane that neither holds its axis nor is square to it",
+            traced(plane_face, revolution_face).ok_or(NativeError::Unsupported(
+                "intersect a torus with a plane that touches it where it cuts it",
             ))
         }
     }
@@ -1445,8 +1489,8 @@ fn crossing(
                 return Ok(Vec::new());
             }
         }
-        return Err(NativeError::Unsupported(
-            "intersect a torus with a surface of revolution on another axis",
+        return traced(a, b).ok_or(NativeError::Unsupported(
+            "intersect a torus with a surface it touches where it cuts it",
         ));
     }
     let mut carriers: Vec<(&Revolution, &Revolution)> = [(r1, r2), (r2, r1)]
@@ -1465,8 +1509,12 @@ fn crossing(
     {
         return Ok(Vec::new());
     }
-    Err(NativeError::Unsupported(
-        "intersect surfaces of revolution that meet in a curve turning back on itself",
+    if !cross_inside(a, b) {
+        return Ok(Vec::new());
+    }
+    // Followed along where it goes, turning back or not.
+    traced(a, b).ok_or(NativeError::Unsupported(
+        "intersect surfaces of revolution that touch where they cut each other",
     ))
 }
 
@@ -1503,11 +1551,57 @@ fn meets_only_at_edges(carrier: &Revolution, other: &Surface, a: &Prepared, b: &
     true
 }
 
+/// Where the other surface crosses `face`'s over a fine grid of `face`'s chart (its box):
+/// where `other`'s signed distance changes sign between two neighbouring points, the
+/// crossing found by bisection.
+fn crossings_on(face: &Prepared, other: &Surface) -> Vec<Point3> {
+    let n = 96;
+    let at = |i: usize, j: usize| {
+        P::new(
+            face.lo.x + (face.hi.x - face.lo.x) * i as f64 / n as f64,
+            face.lo.y + (face.hi.y - face.lo.y) * j as f64 / n as f64,
+        )
+    };
+    let side = |q: P| other.signed_distance(face.chart.to_world(q));
+    let values: Vec<Vec<f64>> = (0..=n)
+        .map(|i| (0..=n).map(|j| side(at(i, j))).collect())
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..=n {
+        for j in 0..=n {
+            for (di, dj) in [(1, 0), (0, 1)] {
+                let (k, l) = (i + di, j + dj);
+                if k > n || l > n {
+                    continue;
+                }
+                let (f0, f1) = (values[i][j], values[k][l]);
+                if (f0 > 0.0) == (f1 > 0.0) {
+                    continue;
+                }
+                let (mut lo, mut hi) = (at(i, j), at(k, l));
+                let positive = f0 > 0.0;
+                for _ in 0..40 {
+                    let mid = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
+                    if (side(mid) > 0.0) == positive {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                out.push(
+                    face.chart
+                        .to_world(P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0)),
+                );
+            }
+        }
+    }
+    out
+}
+
 /// Whether the surfaces of `a` and `b` cross inside both faces, clear of their edges:
-/// over a fine grid of each face's chart, where the other's signed distance changes sign
-/// between two neighbouring points, the crossing found by bisection lies well inside both.
-/// When they do not, the faces miss, touch, or meet along edges they both end at, and
-/// there is nothing to cut.
+/// a crossing over either face's grid ([`crossings_on`]) well inside both. When they do
+/// not, the faces miss, touch, or meet along edges they both end at, and there is nothing
+/// to cut.
 fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
     let edge = 100.0 * TOL;
     let well_inside = |f: &Prepared, p: Point3| -> bool {
@@ -1516,49 +1610,83 @@ fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
                 && arrangement::distance_to(&f.boundary, q, TOL) > edge
         })
     };
-    let n = 96;
-    for (face, other) in [(a, b), (b, a)] {
-        let at = |i: usize, j: usize| {
-            P::new(
-                face.lo.x + (face.hi.x - face.lo.x) * i as f64 / n as f64,
-                face.lo.y + (face.hi.y - face.lo.y) * j as f64 / n as f64,
-            )
-        };
-        let side = |q: P| other.surface.signed_distance(face.chart.to_world(q));
-        let values: Vec<Vec<f64>> = (0..=n)
-            .map(|i| (0..=n).map(|j| side(at(i, j))).collect())
-            .collect();
-        for i in 0..=n {
-            for j in 0..=n {
-                for (di, dj) in [(1, 0), (0, 1)] {
-                    let (k, l) = (i + di, j + dj);
-                    if k > n || l > n {
-                        continue;
-                    }
-                    let (f0, f1) = (values[i][j], values[k][l]);
-                    if (f0 > 0.0) == (f1 > 0.0) {
-                        continue;
-                    }
-                    let (mut lo, mut hi) = (at(i, j), at(k, l));
-                    let positive = f0 > 0.0;
-                    for _ in 0..40 {
-                        let mid = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
-                        if (side(mid) > 0.0) == positive {
-                            lo = mid;
-                        } else {
-                            hi = mid;
-                        }
-                    }
-                    let q = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
-                    let p = face.chart.to_world(q);
-                    if well_inside(face, p) && well_inside(other, p) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+    crossings_on(a, &b.surface)
+        .into_iter()
+        .chain(crossings_on(b, &a.surface))
+        .any(|p| well_inside(a, p) && well_inside(b, p))
+}
+
+/// The curves where faces `a` and `b`'s surfaces cross, traced from the crossings over
+/// both faces' grids within a box round both ([`crate::trace`]), those that come near both
+/// faces; `None` when they cross inside both but none could be traced (they touch along
+/// a curve, or meet where they touch).
+fn traced(a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
+    // The curves of these two surfaces traced already in this boolean, from other faces on
+    // them: one curve is one value, whichever faces it was found from.
+    let known: Vec<Trace> = TRACED.with(|t| {
+        t.borrow()
+            .iter()
+            .filter(|t| {
+                (t.a == a.surface && t.b == b.surface) || (t.a == b.surface && t.b == a.surface)
+            })
+            .copied()
+            .collect()
+    });
+    let on_known = |p: Point3| known.iter().any(|t| t.distance(p) <= 100.0 * TOL);
+    let seeds: Vec<Point3> = crossings_on(a, &b.surface)
+        .into_iter()
+        .chain(crossings_on(b, &a.surface))
+        .filter(|&p| !on_known(p))
+        .collect();
+    let (lo, hi) = (
+        Point3::new(
+            a.min.x.min(b.min.x),
+            a.min.y.min(b.min.y),
+            a.min.z.min(b.min.z),
+        ),
+        Point3::new(
+            a.max.x.max(b.max.x),
+            a.max.y.max(b.max.y),
+            a.max.z.max(b.max.z),
+        ),
+    );
+    let pad = 0.25 * (hi - lo).length() + 1.0;
+    let (lo, hi) = (lo - Vec3::new(pad, pad, pad), hi + Vec3::new(pad, pad, pad));
+    let found = if seeds.is_empty() {
+        Vec::new()
+    } else {
+        // Where the surfaces touch on the curve, nothing is traced.
+        crate::trace::traces(&a.surface, &b.surface, &seeds, lo, hi)?
+    };
+    TRACED.with(|t| t.borrow_mut().extend(found.iter().copied()));
+    let cuts: Vec<Cut> = known
+        .into_iter()
+        .chain(found)
+        .filter(|t| trace_meets(t, a) && trace_meets(t, b))
+        .map(Cut::Traced)
+        .collect();
+    (!cuts.is_empty()).then_some(cuts)
+}
+
+thread_local! {
+    /// The curves traced in the boolean under way ([`traced`]).
+    static TRACED: std::cell::RefCell<Vec<Trace>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a traced curve comes into a face's box.
+fn trace_meets(t: &Trace, face: &Prepared) -> bool {
+    let pad = 0.01 * t.span() + TOL;
+    (0..=128).any(|i| {
+        t.point_at(t.span() * f64::from(i) / 128.0)
+            .is_some_and(|p| {
+                p.x >= face.min.x - pad
+                    && p.x <= face.max.x + pad
+                    && p.y >= face.min.y - pad
+                    && p.y <= face.max.y + pad
+                    && p.z >= face.min.z - pad
+                    && p.z <= face.max.z + pad
+            })
+    })
 }
 
 /// Where two axes that are not parallel cross, if they do.
@@ -1677,17 +1805,40 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
                 )
             }
         }
-        (Cut::Section(section, start), _) => {
-            laid_copies(face, lay_loop(chart, Curve::Section(*section), *start))
+        (Cut::Section(section, start), _) => clipped_into(
+            face,
+            other,
+            Edge3 {
+                a: *start,
+                b: *start,
+                curve: Curve::Section(*section),
+            },
+        ),
+        (Cut::Traced(t), _) => {
+            let end = if t.closed {
+                t.start
+            } else {
+                t.point_at(t.span()).unwrap_or(t.start)
+            };
+            clipped_into(
+                face,
+                other,
+                Edge3 {
+                    a: t.start,
+                    b: end,
+                    curve: Curve::Traced(*t),
+                },
+            )
         }
-        (Cut::SectionArc(section, start, end), _) => {
-            let e = Edge3 {
+        (Cut::SectionArc(section, start, end), _) => clipped_into(
+            face,
+            other,
+            Edge3 {
                 a: *start,
                 b: *end,
                 curve: Curve::Section(*section),
-            };
-            laid_copies(face, lay(chart, &e, chart.to_2d(*start)))
-        }
+            },
+        ),
         (Cut::Same, _) => {
             // The other face's boundary, laid out in this face's chart, at each of its
             // places along this face's unwrapped `x`.
@@ -1705,6 +1856,160 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
             }
         }
     })
+}
+
+/// A curve the two faces' surfaces meet in (a section or a trace, as `whole`), laid in
+/// `face`'s chart where it lies on `other`: only the stretches of it inside `other`, each
+/// ending exactly where it crosses `other`'s edges (Gauss–Newton on the curve and the
+/// edge), so that where `other` meets a face beside it smoothly, the curves of the two
+/// faces end at one point rather than both running on side by side. The whole curve when
+/// its crossings cannot be told.
+fn clipped_into(face: &Prepared, other: &Prepared, whole: Edge3) -> Vec<Segment> {
+    let all = |e: &Edge3| laid_copies(face, lay(&face.chart, e, face.chart.to_2d(e.a)));
+    match stretches_on(other, &whole) {
+        Some(parts) => parts.iter().flat_map(all).collect(),
+        None => all(&whole),
+    }
+}
+
+/// The stretches of `whole` (laid in `other`'s chart) inside `other`, as edges on its
+/// curve, their ends where it crosses `other`'s edges; `None` when that cannot be told.
+fn stretches_on(other: &Prepared, whole: &Edge3) -> Option<Vec<Edge3>> {
+    let canon = canonical(whole.curve);
+    let up = runs_up(&whole.curve);
+    let closed = whole.closed();
+    let period = period(&canon);
+    let t_start = param_of(&canon, whole.a);
+    let extent = whole.extent();
+    // Where along the curve (from its start, its way) a parameter is.
+    let along = |t: f64| -> f64 {
+        let d = if up { t - t_start } else { t_start - t };
+        if period.is_finite() {
+            d.rem_euclid(period)
+        } else {
+            d
+        }
+    };
+    let laid = laid_copies(other, lay(&other.chart, whole, other.chart.to_2d(whole.a)));
+    // A face that goes round whole goes on across its seams: they are no edges to cross.
+    let round = |period: Option<f64>, width: f64| period.is_some_and(|p| width >= p - 10.0 * TOL);
+    let round_x = round(other.chart.period(), other.hi.x - other.lo.x);
+    let round_y = round(other.chart.v_period(), other.hi.y - other.lo.y);
+    let seam = |b: &Segment| {
+        let at = |x: f64, lo: f64, hi: f64| (x - lo).abs() <= TOL || (x - hi).abs() <= TOL;
+        (round_x && (b.a.x - b.b.x).abs() <= TOL && at(b.a.x, other.lo.x, other.hi.x))
+            || (round_y && (b.a.y - b.b.y).abs() <= TOL && at(b.a.y, other.lo.y, other.hi.y))
+    };
+    let mut cuts: Vec<f64> = Vec::new();
+    for s in &laid {
+        let tag = s.tag?;
+        for b in other.boundary.iter().filter(|b| !seam(b)) {
+            for q in arrangement::meeting(s, b, TOL) {
+                // The curve's parameter there, then the exact crossing with the edge.
+                let u = s.locate(q, TOL)?;
+                let full = s.extent(TOL);
+                let t = if full > 0.0 {
+                    tag.t0 + (tag.t1 - tag.t0) * (u / full).clamp(0.0, 1.0)
+                } else {
+                    tag.t0
+                };
+                let p = point_of(&canon, t)?;
+                let edge = boundary_edge(other, b)?;
+                let curve_edge = Edge3 {
+                    a: p,
+                    b: p,
+                    curve: canon,
+                };
+                let exact = meeting_point(&curve_edge, &edge, p);
+                let s_at = along(param_of(&canon, exact));
+                if s_at > TOL && s_at < extent - TOL {
+                    cuts.push(s_at);
+                }
+            }
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup_by(|x, y| (*x - *y).abs() <= TOL);
+    let point_at = |s: f64| -> Option<Point3> {
+        let t = if up { t_start + s } else { t_start - s };
+        point_of(&canon, t)
+    };
+    let inside_at = |s: f64| -> bool {
+        point_at(s).is_some_and(|p| {
+            other.surface.distance(p) <= 100.0 * TOL
+                && on_face(other, p).is_some_and(|q| arrangement::inside(&other.boundary, q, TOL))
+        })
+    };
+    // A stretch between crossings is in the face or out of it whole: told at a few of its
+    // points, one of which may fall on a seam.
+    let inside = |s0: f64, s1: f64| -> bool {
+        [0.5, 0.31, 0.69, 0.17, 0.83]
+            .iter()
+            .any(|f| inside_at(s0 + (s1 - s0) * f))
+    };
+    // The stretches between the crossings (round a closed curve, the last back to the
+    // first), those whose middles are inside `other`.
+    let mut ends: Vec<f64> = Vec::new();
+    if !closed {
+        ends.push(0.0);
+    }
+    ends.extend(cuts.iter().copied());
+    if !closed {
+        ends.push(extent);
+    }
+    if ends.len() < 2 {
+        // Not crossed: all of it or none.
+        return Some(if inside(0.0, extent) {
+            vec![*whole]
+        } else {
+            Vec::new()
+        });
+    }
+    let mut out = Vec::new();
+    let pairs = if closed { ends.len() } else { ends.len() - 1 };
+    for i in 0..pairs {
+        let s0 = ends[i];
+        let s1 = if i + 1 < ends.len() {
+            ends[i + 1]
+        } else {
+            ends[0] + extent
+        };
+        if s1 - s0 <= TOL || !inside(s0, s1) {
+            continue;
+        }
+        let a = point_at(s0)?;
+        let b = point_at(s1)?;
+        out.push(Edge3 {
+            a,
+            b,
+            curve: whole.curve,
+        });
+    }
+    Some(out)
+}
+
+/// The edge of `face` a segment of its boundary in its chart stands for, in space.
+fn boundary_edge(face: &Prepared, s: &Segment) -> Option<Edge3> {
+    match s.tag {
+        Some(tag) => {
+            let a = point_of(&tag.curve, tag.t0)?;
+            let b = point_of(&tag.curve, tag.t1)?;
+            Some(Edge3 {
+                a,
+                b,
+                curve: if tag.t1 >= tag.t0 {
+                    tag.curve
+                } else {
+                    tag.curve.reversed()
+                },
+            })
+        }
+        None => Some(Edge3 {
+            a: face.chart.to_world(s.a),
+            b: face.chart.to_world(s.b),
+            curve: face.chart.curve(s).ok()?,
+        }),
+    }
 }
 
 /// A curve laid out in a face's chart, at each of its places along the face's unwrapped
@@ -1802,6 +2107,9 @@ struct Piece {
     surface: Surface,
     loops: Vec<Vec<Edge3>>,
     sources: Vec<Source>,
+    /// Whether the face it was cut from went round its surface's axis whole (it had a
+    /// seam at its angle zero), and round a ring torus's tube (a seam at its v zero).
+    round: [bool; 2],
 }
 
 impl Piece {
@@ -1814,6 +2122,7 @@ impl Piece {
                 .map(|l| l.iter().rev().map(Edge3::reversed).collect())
                 .collect(),
             sources: self.sources.clone(),
+            round: self.round,
         }
     }
 }
@@ -1883,11 +2192,17 @@ fn pieces(faces: &[Prepared], others: &[Prepared]) -> Result<Vec<(Piece, Where)>
                 .to_world(P::new(inner.x + shift, inner.y + v_shift));
             let normal = face.chart.normal_at(point);
             let place = classify(point, normal, others)?;
+            let whole =
+                |period: Option<f64>, width: f64| period.is_some_and(|p| width >= p - 10.0 * TOL);
             out.push((
                 Piece {
                     surface: face.surface,
                     loops: outward_loops(&face.chart, loops),
                     sources: face.sources.clone(),
+                    round: [
+                        whole(face.chart.period(), face.hi.x - face.lo.x),
+                        whole(face.chart.v_period(), face.hi.y - face.lo.y),
+                    ],
                 },
                 place,
             ));
@@ -1990,6 +2305,7 @@ fn ray_hits(surface: &Surface, point: Point3, dir: Vec3) -> Vec<Option<f64>> {
 // One boolean of two solids.
 
 fn pairwise(op: BooleanOp, a: &Tagged, b: &Tagged) -> Result<Tagged, NativeError> {
+    TRACED.with(|t| t.borrow_mut().clear());
     let (fa, fb) = (prepare(a)?, prepare(b)?);
     let mut kept: Vec<Piece> = Vec::new();
     for (piece, place) in pieces(&fa, &fb)? {
@@ -2181,6 +2497,9 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             .collect();
         sources.sort();
         sources.dedup();
+        let round = group.iter().fold([false; 2], |acc, &i| {
+            [acc[0] || pieces[i].round[0], acc[1] || pieces[i].round[1]]
+        });
         if group.len() == 1 && !matches!(first.surface, Surface::Revolution(_)) {
             out.push(Piece {
                 sources,
@@ -2251,6 +2570,27 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
             .filter(|(_, g)| !g)
             .map(|(s, _)| s)
             .collect();
+        // Where what is left of a ring torus's face that went round its axis whole no longer
+        // does, but still goes round its tube, it keeps its seam at its angle zero as an edge,
+        // cut there in two, as OpenCASCADE leaves it (a piece round neither, or of a cylinder
+        // or a sphere, stays whole).
+        let mut kept = kept;
+        if let (Surface::Revolution(original), Some(period), Some(v_period)) =
+            (first.surface, chart.period(), chart.v_period())
+        {
+            let (lo, hi) = box_2d(&kept);
+            let round_tube = hi.y - lo.y >= v_period - 10.0 * TOL;
+            if round[0] && round_tube && hi.x - lo.x < period - 10.0 * TOL {
+                let seam = chart.to_2d(original.point(0.0, 0.0)).x;
+                let first = ((lo.x - seam) / period).ceil() as i64;
+                for n in first..=first + 2 {
+                    let c = seam + n as f64 * period;
+                    if c > lo.x + TOL && c < hi.x - TOL {
+                        kept.push(Segment::line(P::new(c, lo.y - 1.0), P::new(c, hi.y + 1.0)));
+                    }
+                }
+            }
+        }
         let arrangement = Arrangement::new(&kept, TOL);
         for region in arrangement.regions() {
             // The merged faces only: not what their holes enclose.
@@ -2274,6 +2614,7 @@ fn merge_faces(pieces: Vec<Piece>) -> Result<Vec<Piece>, NativeError> {
                 surface: first.surface,
                 loops: outward_loops(&chart, loops),
                 sources: sources.clone(),
+                round,
             });
         }
     }
@@ -2560,6 +2901,7 @@ fn same_way(a: &Curve, b: &Curve) -> bool {
     match (a, b) {
         (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) > 0.0,
         (Curve::Section(s), Curve::Section(t)) => s.ccw == t.ccw,
+        (Curve::Traced(s), Curve::Traced(t)) => s.up == t.up,
         (Curve::Degenerate { axis: s, .. }, Curve::Degenerate { axis: t, .. }) => s.dot(*t) > 0.0,
         _ => true,
     }
@@ -2629,6 +2971,7 @@ fn same_curve(solid: &Solid, a: &Edge, b: &Edge) -> bool {
                 && c.normal.cross(d.normal).length() <= 1e-9
         }
         (Curve::Section(c), Curve::Section(d)) => Section { ccw: d.ccw, ..c } == d,
+        (Curve::Traced(c), Curve::Traced(d)) => Trace { up: d.up, ..c } == d,
         _ => false,
     }
 }

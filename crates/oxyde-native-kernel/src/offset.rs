@@ -441,6 +441,7 @@ fn moved_curve(
             }
             Err(unsupported)
         }
+        Curve::Traced(_) => Err(unsupported),
         Curve::Section(section) => {
             // The same section of the moved surfaces.
             let carrier = moved.iter().find_map(|(old, new)| match (old, new) {

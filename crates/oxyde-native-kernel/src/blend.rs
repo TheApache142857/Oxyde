@@ -734,7 +734,7 @@ fn tangent_at(solid: &Solid, edge: &Edge, p: Point3) -> Option<Vec3> {
     match edge.curve {
         Curve::Line => (solid.point(edge.end) - solid.point(edge.start)).normalized(),
         Curve::Circle(c) => c.normal.cross(p - c.center).normalized(),
-        Curve::Section(_) => {
+        Curve::Section(_) | Curve::Traced(_) => {
             let (a, b) = (solid.point(edge.start), solid.point(edge.end));
             let s = edge.curve.position(a, b, p);
             let h = 1e-6;
