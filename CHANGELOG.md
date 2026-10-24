@@ -13,7 +13,7 @@ release yet; the git history has every detail.
 - **Preferences › Debug › Kernel** chooses the kernel parts are built with, from the next
   start: OpenCASCADE or Oxyde's own (experimental); `--kernel occt` or `--kernel native` on
   the command line chooses it for one session. With Oxyde's own, a feature it cannot build
-  yet (a STEP import, a smooth loft through ten sections) fails with a message in the tree and the body
+  yet (a smooth loft through ten sections) fails with a message in the tree and the body
   stays as it was; simulation meshes with the lattice mesher. The About box and the Debug
   page say which kernel the session uses.
 - With Oxyde's own kernel too, opening a part or an assembly, Reload Parts and coming back
@@ -89,6 +89,16 @@ release yet; the git history has every detail.
   another. Its faces' areas are exact where OpenCASCADE's are a few parts in a million off.
   A smooth loft through ten sections or more, and a shell or a fillet of a loft's faces,
   still fail with a message.
+- **STEP files** with it too. **File › Export › STEP** writes them as OpenCASCADE does, with
+  the parts' colours and materials, and both kernels read them back the same. **File ›
+  Import STEP…**, File › Open of a `.step` file and STEP assemblies read AP203, AP214 and
+  AP242 files as OpenCASCADE reads them: from KiCad's libraries and board exports, EasyEDA, Creo, SolidWorks and others, in
+  millimetres, inches or other units, with their colours and materials, each part of an
+  assembly once and placed where it is used. Whole cylinders written as their two circles,
+  cones and spheres closing to a point, round surfaces written as B-splines (read as the
+  cylinders, spheres and tori they are), rounded corners: all of these read, and faster
+  than with OpenCASCADE (the test cart: 7 ms against 259). IGES export still fails with a
+  message.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

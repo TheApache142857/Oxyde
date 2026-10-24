@@ -29,22 +29,24 @@ const MAX_STEP: f64 = std::f64::consts::TAU / 12.0;
 
 pub(crate) fn mesh(shape: &Shape, deflection: f64) -> Result<Mesh, String> {
     let mut mesh = Mesh::default();
-    for solid in &shape.solids {
+    for (i, solid) in shape.solids.iter().enumerate() {
         let polylines: Vec<Vec<Point3>> = solid
             .edges
             .iter()
             .map(|edge| edge_polyline(solid, edge, deflection))
             .collect();
-        for face in &solid.faces {
-            mesh.faces.push(match &face.surface {
-                Surface::Plane(_) => planar_mesh(face, &polylines)?,
+        for (k, face) in solid.faces.iter().enumerate() {
+            let face_mesh = match &face.surface {
+                Surface::Plane(_) => planar_mesh(face, &polylines),
                 Surface::Revolution(surface) => {
-                    revolution_mesh(solid, face, surface, &polylines, deflection)?
+                    revolution_mesh(solid, face, surface, &polylines, deflection)
                 }
                 Surface::Spline(surface) => {
-                    spline_mesh(solid, face, surface, &polylines, deflection)?
+                    spline_mesh(solid, face, surface, &polylines, deflection)
                 }
-            });
+            };
+            mesh.faces
+                .push(face_mesh.map_err(|e| format!("solid {i}, face {k}: {e}"))?);
         }
         mesh.edges.extend(
             polylines
@@ -195,7 +197,16 @@ fn revolution_mesh(
     let mut chords: Vec<Chord> = Vec::new();
     let mut sides: Vec<Side> = Vec::new();
     let mut rho_max: f64 = 0.0;
-    for u in loops.iter().flatten() {
+    // The loops as polygons in (θ, v), for when the strips cannot be made.
+    let mut polygons: Vec<Vec<((f64, f64), Point3)>> = Vec::with_capacity(loops.len());
+    for (k, u) in loops
+        .iter()
+        .enumerate()
+        .flat_map(|(k, l)| l.iter().map(move |u| (k, u)))
+    {
+        if polygons.len() <= k {
+            polygons.push(Vec::new());
+        }
         let line = use_polyline(u.edge_use, polylines);
         for p in &line {
             rho_max = rho_max.max(surface.rho_z(*p).0);
@@ -207,7 +218,8 @@ fn revolution_mesh(
             Vec::new()
         } else {
             let mut near = u.from;
-            line.iter()
+            let mut laid: Vec<(f64, f64)> = line
+                .iter()
                 .map(|&p| {
                     let (t, v) = surface.params(p);
                     let theta = if surface.rho_z(p).0 > 1e-9 {
@@ -223,7 +235,23 @@ fn revolution_mesh(
                     near = (theta, v);
                     near
                 })
-                .collect()
+                .collect();
+            // Its ends where the walk round the face puts them, which the straight uses
+            // beside it run from and to: the corners' own angles may be off by as much as
+            // their tolerances (a file's geometry), the difference spread along it.
+            if let (Some(&first), Some(&last)) = (laid.first(), laid.last()) {
+                let (d0, d1) = (
+                    (u.from.0 - first.0, u.from.1 - first.1),
+                    (u.to.0 - last.0, u.to.1 - last.1),
+                );
+                let k = laid.len().saturating_sub(1).max(1) as f64;
+                for (i, q) in laid.iter_mut().enumerate() {
+                    let t = i as f64 / k;
+                    q.0 += d0.0 * (1.0 - t) + d1.0 * t;
+                    q.1 += d0.1 * (1.0 - t) + d1.1 * t;
+                }
+            }
+            laid
         };
         let param = |i: usize| -> (f64, f64) {
             if let Some(&p) = bent.get(i) {
@@ -236,6 +264,7 @@ fn revolution_mesh(
             )
         };
         let point = |i: usize| line[i.min(line.len() - 1)];
+        polygons[k].extend((0..n).map(|i| (param(i), point(i))));
         if is_vertical(u) {
             sides.push(Side {
                 theta: u.from.0,
@@ -296,14 +325,21 @@ fn revolution_mesh(
         }
     };
 
-    strip_mesh(
-        &chords,
-        &sides,
-        &breaks,
-        &rows,
-        &|t, v| surface.point(t, v),
-        surface.outward,
-    )
+    let point = |t: f64, v: f64| surface.point(t, v);
+    strip_mesh(&chords, &sides, &breaks, &rows, &point, surface.outward).or_else(|_| {
+        // Lengths across and along: θ by the face's widest circle, v by the meridian's.
+        let along = match surface.meridian {
+            Meridian::Line { slope, .. } => (1.0 + slope * slope).sqrt(),
+            Meridian::Circle { radius, .. } => radius,
+        };
+        refined_mesh(
+            &polygons,
+            (rho_max.max(1e-9), along),
+            &point,
+            deflection,
+            surface.outward,
+        )
+    })
 }
 
 /// The triangles of a face laid out in a parameter plane `(t, v)`: in strips between the
@@ -399,7 +435,15 @@ fn spline_mesh(
         f64::NEG_INFINITY,
     );
     let (ua, ub) = surface.domain(0);
-    for u in loops.iter().flatten() {
+    let mut polygons: Vec<Vec<((f64, f64), Point3)>> = Vec::with_capacity(loops.len());
+    for (k, u) in loops
+        .iter()
+        .enumerate()
+        .flat_map(|(k, l)| l.iter().map(move |u| (k, u)))
+    {
+        if polygons.len() <= k {
+            polygons.push(Vec::new());
+        }
         let line = use_polyline(u.edge_use, polylines);
         let mut near = u.samples.first().map_or((0.0, 0.0), |s| (s.1, s.2));
         let params: Vec<(f64, f64)> = line
@@ -409,6 +453,13 @@ fn spline_mesh(
                 near
             })
             .collect();
+        polygons[k].extend(
+            params
+                .iter()
+                .zip(&line)
+                .take(line.len().saturating_sub(1))
+                .map(|(&a, &b)| (a, b)),
+        );
         for &(pu, pv) in &params {
             ulo = ulo.min(pu);
             uhi = uhi.max(pu);
@@ -473,7 +524,162 @@ fn spline_mesh(
             wrap(v, surface.domain(1), surface.data.closed[1]),
         )
     };
-    strip_mesh(&chords, &sides, &breaks, &rows, &point, surface.outward)
+    strip_mesh(&chords, &sides, &breaks, &rows, &point, surface.outward).or_else(|_| {
+        // Lengths across and along: the surface's rates at the face's middle.
+        let d = surface.derivatives(
+            wrap(0.5 * (ulo + uhi), surface.domain(0), surface.data.closed[0]),
+            wrap(0.5 * (vlo + vhi), surface.domain(1), surface.data.closed[1]),
+            1,
+        );
+        refined_mesh(
+            &polygons,
+            (d[1][0].length().max(1e-9), d[0][1].length().max(1e-9)),
+            &point,
+            deflection,
+            surface.outward,
+        )
+    })
+}
+
+/// A face's mesh from its loops laid out as polygons in its parameter plane (each point's
+/// parameters and its place): the polygons triangulated (ear clipping, the parameters
+/// scaled by `scale` to be lengths), then each triangle's sides inside the face halved
+/// where their middle lies further than `deflection` from the surface (`point`), a
+/// triangle with no such side but standing off the surface at its centroid split there, a
+/// few times over. The boundary is never cut, so the face meets its neighbours' meshes as
+/// the strips' do. What a face the strips cannot mesh gets (a file's face bounded by
+/// curves its writer fitted, a corner or two apart).
+fn refined_mesh(
+    polygons: &[Vec<((f64, f64), Point3)>],
+    scale: (f64, f64),
+    point: &dyn Fn(f64, f64) -> Point3,
+    deflection: f64,
+    outward: bool,
+) -> Result<FaceMesh, String> {
+    let mut params: Vec<(f64, f64)> = Vec::new();
+    let mut positions: Vec<Point3> = Vec::new();
+    let mut loops: Vec<Vec<usize>> = Vec::with_capacity(polygons.len());
+    let mut boundary: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for polygon in polygons {
+        let first = positions.len();
+        let n = polygon.len();
+        for &(q, p) in polygon {
+            params.push(q);
+            positions.push(p);
+        }
+        for i in 0..n {
+            let (a, b) = (first + i, first + (i + 1) % n);
+            boundary.insert((a.min(b), a.max(b)));
+        }
+        loops.push((first..first + n).collect());
+    }
+    let flat: Vec<Point2> = params
+        .iter()
+        .map(|&(u, v)| Point2::new(u * scale.0, v * scale.1))
+        .collect();
+    let mut triangles = triangulate::polygon_with_holes(&flat, &loops)?;
+    let tolerance = deflection.max(1e-6);
+    let mut midpoints: HashMap<(usize, usize), usize> = HashMap::new();
+    for _ in 0..8 {
+        if triangles.len() > 200_000 {
+            break;
+        }
+        // The sides to halve: inside the face, their middle off the surface.
+        let mut split: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut centroids: Vec<usize> = Vec::new();
+        for (t, tri) in triangles.iter().enumerate() {
+            let mut any = false;
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                let key = (a.min(b), a.max(b));
+                if boundary.contains(&key) {
+                    continue;
+                }
+                if split.contains_key(&key) {
+                    any = true;
+                    continue;
+                }
+                let m = (
+                    (params[a].0 + params[b].0) / 2.0,
+                    (params[a].1 + params[b].1) / 2.0,
+                );
+                let chord = positions[a] + (positions[b] - positions[a]) * 0.5;
+                let on = point(m.0, m.1);
+                if on.distance(chord) > tolerance {
+                    let index = *midpoints.entry(key).or_insert_with(|| {
+                        params.push(m);
+                        positions.push(on);
+                        params.len() - 1
+                    });
+                    split.insert(key, index);
+                    any = true;
+                }
+            }
+            if !any {
+                let [a, b, c] = *tri;
+                let m = (
+                    (params[a].0 + params[b].0 + params[c].0) / 3.0,
+                    (params[a].1 + params[b].1 + params[c].1) / 3.0,
+                );
+                let flat_centre = Point3::new(
+                    (positions[a].x + positions[b].x + positions[c].x) / 3.0,
+                    (positions[a].y + positions[b].y + positions[c].y) / 3.0,
+                    (positions[a].z + positions[b].z + positions[c].z) / 3.0,
+                );
+                if point(m.0, m.1).distance(flat_centre) > tolerance {
+                    centroids.push(t);
+                }
+            }
+        }
+        if split.is_empty() && centroids.is_empty() {
+            break;
+        }
+        let mut next: Vec<[usize; 3]> = Vec::with_capacity(triangles.len() * 2);
+        for (t, tri) in triangles.iter().enumerate() {
+            let [a, b, c] = *tri;
+            let mid = |p: usize, q: usize| split.get(&(p.min(q), p.max(q))).copied();
+            match (mid(a, b), mid(b, c), mid(c, a)) {
+                (None, None, None) => {
+                    if centroids.binary_search(&t).is_ok() {
+                        let m = (
+                            (params[a].0 + params[b].0 + params[c].0) / 3.0,
+                            (params[a].1 + params[b].1 + params[c].1) / 3.0,
+                        );
+                        params.push(m);
+                        positions.push(point(m.0, m.1));
+                        let o = params.len() - 1;
+                        next.extend([[a, b, o], [b, c, o], [c, a, o]]);
+                    } else {
+                        next.push(*tri);
+                    }
+                }
+                (Some(x), None, None) => next.extend([[a, x, c], [x, b, c]]),
+                (None, Some(y), None) => next.extend([[a, b, y], [a, y, c]]),
+                (None, None, Some(z)) => next.extend([[a, b, z], [z, b, c]]),
+                (Some(x), Some(y), None) => next.extend([[a, x, c], [x, y, c], [x, b, y]]),
+                (None, Some(y), Some(z)) => next.extend([[a, b, z], [z, b, y], [z, y, c]]),
+                (Some(x), None, Some(z)) => next.extend([[a, x, z], [x, b, c], [x, c, z]]),
+                (Some(x), Some(y), Some(z)) => {
+                    next.extend([[a, x, z], [x, b, y], [z, y, c], [x, y, z]]);
+                }
+            }
+        }
+        triangles = next;
+    }
+    Ok(FaceMesh {
+        positions: positions.iter().map(|&p| single(p)).collect(),
+        triangles: triangles
+            .iter()
+            .map(|t| {
+                // Counter-clockwise in the parameters faces along the surface's own normal.
+                if outward {
+                    [t[0] as u32, t[1] as u32, t[2] as u32]
+                } else {
+                    [t[0] as u32, t[2] as u32, t[1] as u32]
+                }
+            })
+            .collect(),
+    })
 }
 
 fn is_vertical(u: &ParamUse) -> bool {

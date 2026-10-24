@@ -957,23 +957,39 @@ impl SurfaceData {
         let s = &self.surface;
         let (ua, ub) = s.domain(0);
         let (va, vb) = s.domain(1);
-        // The three nearest points of the grid, in one pass.
-        let mut seeds = [(f64::INFINITY, (ua, va)); 3];
+        // The nearest points of the grid, in one pass: the three nearest, and those of the
+        // next five nearly as near (on a narrow band the grid's points across it are all
+        // about as near, and only those on the right side lead to the nearest point).
+        let mut seeds = [(f64::INFINITY, (ua, va)); 8];
         for &(u, v, q) in self.grid() {
             let d = q.distance(p);
-            if d < seeds[2].0 {
-                seeds[2] = (d, (u, v));
-                if seeds[2].0 < seeds[1].0 {
-                    seeds.swap(1, 2);
-                    if seeds[1].0 < seeds[0].0 {
-                        seeds.swap(0, 1);
+            if d < seeds[7].0 {
+                seeds[7] = (d, (u, v));
+                for k in (1..8).rev() {
+                    if seeds[k].0 < seeds[k - 1].0 {
+                        seeds.swap(k, k - 1);
+                    } else {
+                        break;
                     }
                 }
             }
         }
         let nearest_sample = seeds[0].0;
         let mut starts: Vec<(f64, f64)> = hint.into_iter().collect();
-        starts.extend(seeds.iter().filter(|s| s.0.is_finite()).map(|s| s.1));
+        starts.extend(
+            seeds
+                .iter()
+                .enumerate()
+                .filter(|(k, s)| s.0.is_finite() && (*k < 3 || s.0 <= 1.5 * nearest_sample))
+                .map(|(_, s)| s.1),
+        );
+        // Within the domain (or round it where the surface closes), not on the run past an
+        // open edge, where a surface that bends sharply there can come back near itself.
+        let inside = |(u, v): (f64, f64)| {
+            let (tu, tv) = (1e-9 * (ub - ua), 1e-9 * (vb - va));
+            (self.closed[0] || (u >= ua - tu && u <= ub + tu))
+                && (self.closed[1] || (v >= va - tv && v <= vb + tv))
+        };
         let mut best = (f64::INFINITY, (ua, va));
         let fit = |x: f64, a: f64, b: f64, closed: bool| {
             if closed {
@@ -983,9 +999,11 @@ impl SurfaceData {
                 x.clamp(a - m, b + m)
             }
         };
+        let range = ub - ua + vb - va;
         for (u0, v0) in starts {
             let (mut u, mut v) = (u0, v0);
-            for _ in 0..30 {
+            let mut converged = false;
+            for _ in 0..40 {
                 let d = s.derivatives(u, v, 2);
                 let r = d[0][0] - p.to_vec();
                 let (su, sv) = (d[1][0], d[0][1]);
@@ -1004,13 +1022,29 @@ impl SurfaceData {
                     let g = su.dot(su).max(sv.dot(sv)).max(1e-300);
                     (f[0] / g, f[1] / g)
                 };
-                let nu = fit(u - du, ua, ub, self.closed[0]);
-                let nv = fit(v - dv, va, vb, self.closed[1]);
-                let step = (nu - u).abs() + (nv - v).abs();
+                // A long step halved while it leads further off: across a surface bent
+                // sharply, or stretched far more one way than the other, Newton's step
+                // overshoots.
+                let here = r.length();
+                let mut t = 1.0;
+                let (mut nu, mut nv, mut step);
+                loop {
+                    nu = fit(u - t * du, ua, ub, self.closed[0]);
+                    nv = fit(v - t * dv, va, vb, self.closed[1]);
+                    step = (nu - u).abs() + (nv - v).abs();
+                    if step <= 1e-9 * range || t < 1e-6 {
+                        break;
+                    }
+                    if s.point(nu, nv).distance(p) <= here * (1.0 + 1e-12) {
+                        break;
+                    }
+                    t *= 0.5;
+                }
                 u = nu;
                 v = nv;
                 // Quadratic convergence: a step this small leaves the last one's rounding.
-                if step <= 1e-12 * (ub - ua + vb - va) {
+                if step <= 1e-12 * range {
+                    converged = true;
                     break;
                 }
             }
@@ -1018,9 +1052,10 @@ impl SurfaceData {
             if dist < best.0 {
                 best = (dist, (u, v));
             }
-            // From the hint, as near as the nearest of the grid's points or nearer: the
-            // nearest point, without searching from the grid.
-            if hint.is_some() && best.0 <= nearest_sample {
+            // From the hint, there and as near as the nearest of the grid's points or
+            // nearer, on the surface itself: the nearest point, without searching from the
+            // grid.
+            if hint.is_some() && converged && best.0 <= nearest_sample && inside(best.1) {
                 break;
             }
         }
@@ -1692,6 +1727,131 @@ pub(crate) fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<Vec<f64>>) -> Option<Vec<Ve
         }
     }
     Some(x)
+}
+
+/// The cubic B-spline through `points` (at least two), each at its share of the polygon
+/// through them (chord length), the knots averaged from those shares (the NURBS Book's A9.1):
+/// a line for two points, a parabola for three. The collocation system is banded and
+/// totally positive, solved without pivoting in time linear in the points.
+pub(crate) fn interpolate(points: &[Point3]) -> Option<BSplineCurve> {
+    let n = points.len();
+    if n < 2 {
+        return None;
+    }
+    let degree = 3.min(n - 1);
+    let mut t = vec![0.0; n];
+    for i in 1..n {
+        t[i] = t[i - 1] + points[i].distance(points[i - 1]);
+    }
+    let total = t[n - 1];
+    if total.is_nan() || total <= 0.0 {
+        return None;
+    }
+    for x in &mut t {
+        *x /= total;
+    }
+    let p = degree;
+    let mut knots = vec![0.0; p + 1];
+    for j in 1..n - p {
+        knots.push(t[j..j + p].iter().sum::<f64>() / p as f64);
+    }
+    knots.extend(std::iter::repeat_n(1.0, p + 1));
+    // Row k: the basis functions at t[k], in the columns span − p ..= span.
+    let mut rows: Vec<(usize, Vec<f64>)> = Vec::with_capacity(n);
+    for &tk in &t {
+        let span = find_span(&knots, p, n, tk);
+        let b = basis_derivatives(&knots, span, tk, p, 0);
+        rows.push((span - p, b[0][..=p].to_vec()));
+    }
+    // Banded elimination: each row's entries from its first column on.
+    let mut rhs: Vec<Vec3> = points.iter().map(|q| q.to_vec()).collect();
+    let width = 2 * p + 1;
+    let mut band: Vec<(usize, Vec<f64>)> = rows
+        .into_iter()
+        .map(|(first, b)| {
+            let mut v = vec![0.0; width];
+            v[..b.len()].copy_from_slice(&b);
+            (first, v)
+        })
+        .collect();
+    for k in 0..n {
+        let (first_k, row_k) = band[k].clone();
+        let col = k;
+        let pivot = row_k.get(col.checked_sub(first_k)?).copied()?;
+        if pivot.abs() < 1e-300 {
+            return None;
+        }
+        for r in (k + 1)..n.min(k + width) {
+            let (first_r, ref mut row_r) = band[r];
+            let Some(off) = col.checked_sub(first_r) else {
+                continue;
+            };
+            if off >= width || row_r[off] == 0.0 {
+                continue;
+            }
+            let f = row_r[off] / pivot;
+            for c in col..(first_k + width).min(n) {
+                let (i_k, i_r) = (c - first_k, c.checked_sub(first_r));
+                if let Some(i_r) = i_r
+                    && i_r < width
+                    && i_k < width
+                {
+                    row_r[i_r] -= f * row_k[i_k];
+                }
+            }
+            rhs[r] = rhs[r] - rhs[k] * f;
+        }
+    }
+    let mut x = vec![Vec3::ZERO; n];
+    for k in (0..n).rev() {
+        let (first, row) = &band[k];
+        let mut s = rhs[k];
+        for (c, &xc) in x
+            .iter()
+            .enumerate()
+            .take((first + width).min(n))
+            .skip(k + 1)
+        {
+            if let Some(i) = c.checked_sub(*first)
+                && i < width
+            {
+                s = s - xc * row[i];
+            }
+        }
+        x[k] = s * (1.0 / row[k - first]);
+    }
+    Some(BSplineCurve {
+        degree: p,
+        knots,
+        poles: x.iter().map(|v| Point3::new(v.x, v.y, v.z)).collect(),
+        weights: None,
+    })
+}
+
+/// A cubic B-spline within `tolerance` of the curve `at(s)` for `s` from 0 to `extent`:
+/// through more and more points of it, evenly along `s`, until the curve's points halfway
+/// between them are that close to it (at most 4096 pieces).
+pub(crate) fn fit(
+    at: &impl Fn(f64) -> Point3,
+    extent: f64,
+    tolerance: f64,
+) -> Option<BSplineCurve> {
+    let mut n = 16usize;
+    loop {
+        let points: Vec<Point3> = (0..=n).map(|i| at(extent * i as f64 / n as f64)).collect();
+        let curve = interpolate(&points)?;
+        let samples = curve.sample();
+        let worst = (0..n)
+            .map(|i| {
+                let p = at(extent * (i as f64 + 0.5) / n as f64);
+                curve.point(curve.nearest(p, &samples, false)).distance(p)
+            })
+            .fold(0.0, f64::max);
+        if worst <= tolerance || n >= 4096 {
+            return Some(curve);
+        }
+        n *= 2;
+    }
 }
 
 /// The tolerance OpenCASCADE's loft keeps the polynomial form of an arc within (observed).

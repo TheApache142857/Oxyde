@@ -15,11 +15,15 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex, PoisonError};
 
-use oxyde_geom::{Point3, Vec3};
+use oxyde_geom::{Point3, Transform, Vec3};
 
 use crate::brep::{EdgeUse, Face, Solid};
-use crate::geometry::{FaceIntegrals, SplineSurface, component};
-use crate::revolution::{GAUSS, WalkEdge};
+use crate::geometry::{FaceIntegrals, SplineSurface, Surface, component};
+use crate::revolution::{GAUSS, WalkEdge, gauss_legendre};
+
+/// Shorter Gauss–Legendre rules, for the short pieces of an edge of many spans.
+static GAUSS8: LazyLock<Vec<(f64, f64)>> = LazyLock::new(|| gauss_legendre(8));
+static GAUSS4: LazyLock<Vec<(f64, f64)>> = LazyLock::new(|| gauss_legendre(4));
 
 /// One edge use of a face on a B-spline surface, laid out in the surface's `(u, v)` plane.
 #[derive(Debug, Clone)]
@@ -108,10 +112,12 @@ impl UvUse {
         )
     }
 
-    /// Whether `v` stays the same all along it (within `tol` of its range).
-    fn along_u(&self, tol: f64) -> bool {
-        let v0 = self.samples.first().map_or(0.0, |s| s.2);
-        self.samples.iter().all(|s| (s.2 - v0).abs() <= tol)
+    /// Whether it runs along `d` (`u` for 0, `v` for 1), the other parameter staying the
+    /// same all along it (within `tol`).
+    fn along(&self, d: usize, tol: f64) -> bool {
+        let at = |s: &(f64, f64, f64)| if d == 0 { s.2 } else { s.1 };
+        let x0 = self.samples.first().map_or(0.0, at);
+        self.samples.iter().all(|s| (at(s) - x0).abs() <= tol)
     }
 
     /// Where along it the curve under it changes from one smooth piece to the next.
@@ -148,6 +154,21 @@ pub(crate) fn uv_loops(
                 samples.push((s, uv.0, uv.1));
                 near = Some(uv);
             }
+            // At a pole of the surface (a side of its domain drawn together to a point) any
+            // parameter along that side is the point: an end of the use there is where its
+            // own points lead from just inside, and the loop runs along the side from one
+            // use to the next (`gaps`).
+            for (end, inner) in [(0, 1), (n, n - 1)] {
+                let (_, pu, pv) = samples[end];
+                if at_pole(surface, pu, pv) {
+                    let s = samples[end].0 + (samples[inner].0 - samples[end].0) * 1e-4;
+                    let p = walk.curve.at(walk.a, walk.b, s).unwrap_or(walk.a);
+                    let uv = uv_near(surface, p, (samples[inner].1, samples[inner].2));
+                    samples[end].1 = uv.0;
+                    samples[end].2 = uv.1;
+                }
+            }
+            near = samples.last().map(|s| (s.1, s.2));
             laid.push(UvUse {
                 edge_use: u,
                 walk,
@@ -181,6 +202,47 @@ pub(crate) fn uv_loops(
         out.push(laid);
     }
     Ok(out)
+}
+
+/// Whether `(u, v)` is on a side of the surface's domain drawn together to a point: the
+/// curve of constant `u` (or `v`) through it, its ends and its middle, at one point.
+fn at_pole(surface: &SplineSurface, u: f64, v: f64) -> bool {
+    let tol = 1e-9 * surface.scale().max(1.0);
+    let [(ua, ub), (va, vb)] = [surface.domain(0), surface.domain(1)];
+    let side = |a: Point3, b: Point3, c: Point3| a.distance(b) <= tol && a.distance(c) <= tol;
+    let (u, v) = (
+        wrap(u, (ua, ub), surface.data.closed[0]),
+        wrap(v, (va, vb), surface.data.closed[1]),
+    );
+    side(
+        surface.point(u, va),
+        surface.point(u, 0.5 * (va + vb)),
+        surface.point(u, vb),
+    ) || side(
+        surface.point(ua, v),
+        surface.point(0.5 * (ua + ub), v),
+        surface.point(ub, v),
+    )
+}
+
+/// Where a loop runs from the end of one use to the start of the next along a side of the
+/// surface's domain drawn together to a pole: each `(u, v)` it leaves and reaches.
+fn gaps(loops: &[Vec<UvUse>], surface: &SplineSurface) -> Vec<((f64, f64), (f64, f64))> {
+    let [(ua, ub), (va, vb)] = [surface.domain(0), surface.domain(1)];
+    let tol = 1e-12 * (ub - ua + vb - va);
+    let mut out = Vec::new();
+    for l in loops {
+        for (k, u) in l.iter().enumerate() {
+            let next = &l[(k + 1) % l.len()];
+            let (Some(a), Some(b)) = (u.samples.last(), next.samples.first()) else {
+                continue;
+            };
+            if (a.1 - b.1).abs() + (a.2 - b.2).abs() > tol {
+                out.push(((a.1, a.2), (b.1, b.2)));
+            }
+        }
+    }
+    out
 }
 
 /// The loops as closed polygons of `(u, v)`.
@@ -250,15 +312,21 @@ fn integrands(surface: &SplineSurface, u: f64, v: f64, c: Point3) -> [f64; N] {
     ]
 }
 
-/// `∫ f(t, v) dt` from the start of the domain to `u` (wrapping round a surface that closes
-/// along `u`), over each knot span in halves.
-fn inner(surface: &SplineSurface, u: f64, v: f64, c: Point3) -> [f64; N] {
-    let (a, b) = surface.domain(0);
-    let closed = surface.data.closed[0];
-    let breaks = surface.data.surface.breaks(0);
+/// `∫ f` along `d` (`u` for 0, `v` for 1) from `from` to the point `(u, v)`'s own
+/// coordinate that way, the other held (wrapping round a surface that closes along `d`),
+/// over each knot span in halves.
+fn inner(surface: &SplineSurface, u: f64, v: f64, c: Point3, d: usize, from: f64) -> [f64; N] {
+    let (a, b) = surface.domain(d);
+    let closed = surface.data.closed[d];
+    let breaks = surface.data.surface.breaks(d);
     let l = b - a;
     let mut total = [0.0; N];
-    let (lo, hi, sign) = if u >= a { (a, u, 1.0) } else { (u, a, -1.0) };
+    let to = if d == 0 { u } else { v };
+    let (lo, hi, sign) = if to >= from {
+        (from, to, 1.0)
+    } else {
+        (to, from, -1.0)
+    };
     if hi <= lo {
         return total;
     }
@@ -283,7 +351,12 @@ fn inner(surface: &SplineSurface, u: f64, v: f64, c: Point3) -> [f64; N] {
         }
     }
     cuts.sort_by(f64::total_cmp);
-    let vv = wrap(v, surface.domain(1), surface.data.closed[1]);
+    let other = 1 - d;
+    let held = wrap(
+        if d == 0 { v } else { u },
+        surface.domain(other),
+        surface.data.closed[other],
+    );
     for w in cuts.windows(2) {
         let (x0, x1) = (w[0], w[1]);
         if x1 - x0 <= 0.0 {
@@ -295,8 +368,12 @@ fn inner(surface: &SplineSurface, u: f64, v: f64, c: Point3) -> [f64; N] {
             let (p0, p1) = (x0 + h * f64::from(k), x0 + h * f64::from(k + 1));
             let (mid, half) = ((p0 + p1) / 2.0, (p1 - p0) / 2.0);
             for &(xq, wq) in GAUSS.iter() {
-                let t = wrap(mid + half * xq, (a, b), closed);
-                let f = integrands(surface, t.clamp(a, b), vv, c);
+                let t = wrap(mid + half * xq, (a, b), closed).clamp(a, b);
+                let f = if d == 0 {
+                    integrands(surface, t, held, c)
+                } else {
+                    integrands(surface, held, t, c)
+                };
                 for (acc, value) in total.iter_mut().zip(f) {
                     *acc += wq * half * value * sign;
                 }
@@ -304,6 +381,50 @@ fn inner(surface: &SplineSurface, u: f64, v: f64, c: Point3) -> [f64; N] {
         }
     }
     total
+}
+
+/// Which way the integrals inside a face are taken, and from where: along the parameter
+/// whose knot spans across the face are fewer (each integral inside runs over them all),
+/// from the face's least value of it.
+fn inner_way(loops: &[Vec<UvUse>], surface: &SplineSurface) -> (usize, f64) {
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for s in loops.iter().flatten().flat_map(|u| &u.samples) {
+        for (d, x) in [s.1, s.2].into_iter().enumerate() {
+            lo[d] = lo[d].min(x);
+            hi[d] = hi[d].max(x);
+        }
+    }
+    let spans = |d: usize| {
+        let (a, b) = surface.domain(d);
+        let period = b - a;
+        let breaks = surface.data.surface.breaks(d);
+        // Interior breaks the face's range crosses, taken round where the surface closes.
+        let turns = if surface.data.closed[d] {
+            ((hi[d] - lo[d]) / period).ceil() as usize + 1
+        } else {
+            1
+        };
+        let inside = breaks
+            .iter()
+            .filter(|&&x| {
+                (0..turns as i64).any(|k| {
+                    let y = x + period * (k as f64 + ((lo[d] - a) / period).floor());
+                    y > lo[d] && y < hi[d]
+                })
+            })
+            .count();
+        inside + 1
+    };
+    let d = if spans(1) < spans(0) { 1 } else { 0 };
+    (
+        d,
+        if lo[d].is_finite() {
+            lo[d]
+        } else {
+            surface.domain(d).0
+        },
+    )
 }
 
 /// A face as the cache of integrals knows it: its surface, each edge use's ends, middle
@@ -342,6 +463,75 @@ impl Moments {
             flux: trace + d.dot(normal),
             flux_moment: q + md + d * trace + d * d.dot(normal),
         }
+    }
+
+    /// The face's moments once it is moved by `t`, a rigid motion or a mirror (which keeps
+    /// its outward normal outward): its point moved, `∫ x dA` moved, `∫ n dA` and
+    /// `∫ (x − c)((x − c)·n) dA` turned, `∫ (x − c) nᵀ dA` turned both ways.
+    fn transformed(&self, t: &Transform) -> Moments {
+        let v = &self.v;
+        let turn = |i: usize| t.apply_vector(Vec3::new(v[i], v[i + 1], v[i + 2]));
+        let shift = t.apply_point(Point3::ORIGIN).to_vec();
+        let first = turn(1) + shift * v[0];
+        let normal = turn(4);
+        let q = turn(16);
+        // R M Rᵀ: the matrix's columns turned, then its rows.
+        let col = |j: usize| t.apply_vector(Vec3::new(v[7 + j], v[10 + j], v[13 + j]));
+        let cols = [col(0), col(1), col(2)];
+        let mut m = [0.0; 9];
+        for i in 0..3 {
+            let row = t.apply_vector(Vec3::new(
+                component(cols[0], i),
+                component(cols[1], i),
+                component(cols[2], i),
+            ));
+            for j in 0..3 {
+                m[3 * i + j] = component(row, j);
+            }
+        }
+        let mut out = [0.0; N];
+        out[0] = v[0];
+        out[1..4].copy_from_slice(&[first.x, first.y, first.z]);
+        out[4..7].copy_from_slice(&[normal.x, normal.y, normal.z]);
+        out[7..16].copy_from_slice(&m);
+        out[16..19].copy_from_slice(&[q.x, q.y, q.z]);
+        Moments {
+            c: t.apply_point(self.c),
+            v: out,
+        }
+    }
+}
+
+/// The cache's hash of a face's key.
+fn hash_of(key: &Key) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// The integrals remembered for `old`'s B-spline faces, moved by `t` and remembered for
+/// the same faces of `new`, which is `old` moved by `t`: a part placed in an assembly, or
+/// patterned, is not integrated again.
+pub(crate) fn carry_over(old: &Solid, new: &Solid, t: &Transform) {
+    let mut map = INTEGRALS.lock().unwrap_or_else(PoisonError::into_inner);
+    for (a, b) in old.faces.iter().zip(&new.faces) {
+        let (Surface::Spline(sa), Surface::Spline(sb)) = (a.surface, b.surface) else {
+            continue;
+        };
+        let key = key_of(old, a, &sa);
+        let Some(m) = map
+            .get(&hash_of(&key))
+            .and_then(|bucket| bucket.iter().find(|(k, _)| *k == key).map(|(_, m)| *m))
+        else {
+            continue;
+        };
+        let moved = key_of(new, b, &sb);
+        if map.len() >= CACHE_SIZE {
+            map.clear();
+        }
+        map.entry(hash_of(&moved))
+            .or_default()
+            .push((moved, m.transformed(t)));
     }
 }
 
@@ -383,11 +573,7 @@ pub(crate) fn integrals(
     reference: Point3,
 ) -> Result<FaceIntegrals, String> {
     let key = key_of(solid, face, surface);
-    let hash = {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        h.finish()
-    };
+    let hash = hash_of(&key);
     if let Some(found) = INTEGRALS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -418,16 +604,17 @@ fn adaptive(
     pieces: u32,
     tolerance: &[f64; N],
 ) -> [f64; N] {
-    let rule = |lo: f64, hi: f64| -> [f64; N] {
+    let rule_of = |points: &[(f64, f64)], lo: f64, hi: f64| -> [f64; N] {
         let (mid, half) = ((lo + hi) / 2.0, (hi - lo) / 2.0);
         let mut out = [0.0; N];
-        for &(x, w) in GAUSS.iter() {
+        for &(x, w) in points {
             for (o, value) in out.iter_mut().zip(f(mid + half * x)) {
                 *o += w * half * value;
             }
         }
         out
     };
+    let rule = |lo: f64, hi: f64| rule_of(&GAUSS, lo, hi);
     let mut ends: Vec<f64> = vec![a];
     ends.extend(cuts.iter().copied().filter(|&c| c > a && c < b));
     ends.push(b);
@@ -438,13 +625,26 @@ fn adaptive(
         let step = (w[1] - w[0]) / f64::from(k);
         for i in 0..k {
             let (lo, hi) = (w[0] + step * f64::from(i), w[0] + step * f64::from(i + 1));
-            stack.push((lo, hi, rule(lo, hi), 0));
+            // A short piece between cuts is taken by a shorter rule below.
+            let short = !cuts.is_empty() && (hi - lo) < 0.5 * h;
+            stack.push((lo, hi, if short { [0.0; N] } else { rule(lo, hi) }, 0));
         }
     }
     let mut total = [0.0; N];
     if !cuts.is_empty() {
-        for (_, _, whole, _) in stack {
-            for (t, v) in total.iter_mut().zip(whole) {
+        // Each piece by a rule of as many points as its share of a whole piece's (a curve of
+        // many short spans: a few points each).
+        let h = (b - a) / f64::from(pieces);
+        for (lo, hi, whole, _) in stack {
+            let share = (hi - lo) / h;
+            let value = if share >= 0.5 {
+                whole
+            } else if share >= 0.125 {
+                rule_of(&GAUSS8, lo, hi)
+            } else {
+                rule_of(&GAUSS4, lo, hi)
+            };
+            for (t, v) in total.iter_mut().zip(value) {
                 *t += v;
             }
         }
@@ -552,9 +752,18 @@ fn tolerance_of(loops: &[Vec<UvUse>]) -> ([f64; N], Point3) {
     let size = lo.distance(hi).max(1e-6);
     let far = c.to_vec().length().max(size);
     let (l2, l3, l4) = (size * size, size * size * far, size * size * size * far);
-    let mut t = [l2 * 1e-11; N];
+    // A hundred-billionth of the face's size, or a thousandth of what its edges' tolerance
+    // leaves its area uncertain by (their distance off the surface along its perimeter):
+    // a face read from a file is only as exact as the file's geometry.
+    let edges = loops
+        .iter()
+        .flatten()
+        .map(|u| u.walk.tolerance)
+        .fold(0.0, f64::max);
+    let relative = 1e-11_f64.max(1e-3 * edges / size);
+    let mut t = [l2 * relative; N];
     for (i, x) in t.iter_mut().enumerate() {
-        *x = 1e-11
+        *x = relative
             * match i {
                 0 | 4..=6 => l2,
                 1..=3 | 7..=15 => l3,
@@ -579,21 +788,41 @@ fn moments_of(solid: &Solid, face: &Face, surface: &SplineSurface) -> Result<Mom
     if whole_domain(&loops, surface) {
         return Ok(orient(domain_moments(surface, c, &tolerance), 1.0, sign));
     }
-    let (va, vb) = surface.domain(1);
+    // Green's theorem: ∬ f du dv = ∮ F dv, F = ∫ f du (inside along u), or = −∮ G du,
+    // G = ∫ f dv (inside along v).
+    let (d, from) = inner_way(&loops, surface);
+    let other = 1 - d;
+    let (oa, ob) = surface.domain(other);
+    let sign_of = if d == 0 { 1.0 } else { -1.0 };
     let mut g = [0.0; N];
     for u in loops.iter().flatten() {
-        if u.along_u(1e-12 * (vb - va)) {
+        if u.along(d, 1e-12 * (ob - oa)) {
             continue;
         }
         let extent = u.walk.sweep;
         let along = |x: f64| -> [f64; N] {
-            let ((uu, vv), (_, dv)) = u.uv_rate(surface, x);
-            if dv == 0.0 {
+            let ((uu, vv), (du, dv)) = u.uv_rate(surface, x);
+            let rate = sign_of * if d == 0 { dv } else { du };
+            if rate == 0.0 {
                 return [0.0; N];
             }
-            inner(surface, uu, vv, c).map(|f| f * dv)
+            inner(surface, uu, vv, c, d, from).map(|f| f * rate)
         };
         let sum = adaptive(&along, 0.0, extent, &u.breaks(), 4, &tolerance);
+        for (acc, value) in g.iter_mut().zip(sum) {
+            *acc += value;
+        }
+    }
+    // Along the sides drawn together to a pole, straight in (u, v).
+    for ((u0, v0), (u1, v1)) in gaps(&loops, surface) {
+        let rate = sign_of * if d == 0 { v1 - v0 } else { u1 - u0 };
+        if rate == 0.0 {
+            continue;
+        }
+        let along = |t: f64| -> [f64; N] {
+            inner(surface, u0 + (u1 - u0) * t, v0 + (v1 - v0) * t, c, d, from).map(|f| f * rate)
+        };
+        let sum = adaptive(&along, 0.0, 1.0, &[], 4, &tolerance);
         for (acc, value) in g.iter_mut().zip(sum) {
             *acc += value;
         }

@@ -49,19 +49,30 @@ normals point into the void (`shells` empty means one shell of every face).
   `BASE_TOLERANCE` (1e-6 mm). More than `MAX_TOLERANCE` (1e-3 mm) means geometry that does
   not meet, and the operation is refused as a bug. Exact constructions stay at the base, and so do
   sections, each of whose points is found to rounding; curves fitted to others (B-splines,
-  §9) will raise them where they need to.
+  §9) will raise them where they need to. A solid read from a STEP file may need more, as
+  much as the file says its geometry is accurate to (`settle_tolerances_within`, §4).
 - **B-splines** (`nurbs.rs`), curves and surfaces, rational or not, of degrees up to 31,
   written from the mathematics (the algorithms of Piegl and Tiller's *The NURBS Book*):
   evaluation with derivatives (the basis functions' table on the stack), knot insertion, the
-  nearest point (Newton's method from the last point found on the same surface, and from
-  the nearest of a grid of its points; a tenth of the domain past an open edge, where the
-  last span runs on, so that a distance changes sign smoothly across the surface near its
-  edges), where a line crosses a surface (its Bézier pieces halved while their poles' boxes
-  meet the line, then Newton's method). A B-spline's poles are kept once for the life of
-  the process (the same B-spline made again is found again), and the kernel's curves and
-  surfaces refer to them with the rigid motion that places them: moving or patterning a
-  part never copies them. A face on a B-spline surface is a region of its `(u, v)` plane,
-  its edges taken onto the surface by the nearest point (`spline_face.rs`).
+  nearest point (Newton's method, a long step halved while it leads further off, from the
+  last point found on the same surface, kept when it converged inside the domain and as
+  near as the grid's nearest, else from the nearest of a grid of its points, the three
+  nearest and those nearly as near (on a narrow band the points across it are all about
+  as near); a tenth of the domain past an open edge, where the last span runs on, so that
+  a distance changes sign smoothly across the surface near its edges), where a line
+  crosses a surface (its Bézier pieces halved while their poles' boxes meet the line, then
+  Newton's method). A B-spline's poles are kept once for the life of the process (the same
+  B-spline made again is found again), and the kernel's curves and surfaces refer to them
+  with the rigid motion that places them: moving or patterning a part never copies them,
+  and its faces' integrals are moved with it, not taken again. A face on a B-spline surface
+  is a region of its `(u, v)` plane, its edges taken onto the surface by the nearest point
+  (`spline_face.rs`); where a loop goes through a pole of the surface (a side of its
+  domain drawn to a point), it runs along that side from one edge to the next. Its
+  integrals: Green's theorem, inside along the parameter whose knot spans across the face
+  are fewer, from the face's own edge; along the edges adaptively, to a hundred-billionth
+  of the face's size or a thousandth of what its edges' tolerances leave its area
+  uncertain by, whichever is larger (a face read from a file is only as exact as its
+  geometry).
 - Every result is checked before the kernel keeps it (`Solid::check`): every loop closed,
   every edge run along once each way (a degenerate edge once), corners on their face's
   surface and ends on their edge's curve within their tolerances, unit normals, proper
@@ -203,6 +214,76 @@ run along as a segment of constant `v`, a bent edge as 128 of its points, each m
   - Faces in OpenCASCADE's order: the side faces span after span, edge after edge from
     the first corner, then the first section's cap and the last's; a side face holding the
     middle of one of the first section's edges is named after that edge.
+
+### STEP files
+
+`step/`: the exchange structure of ISO 10303-21 (`p21.rs`: complex instances, typed
+parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
+
+- **Writing** (`export_step`, `write.rs`) as OpenCASCADE writes, from its files read as a
+  black box: AP214, a product for each shape, its solids `MANIFOLD_SOLID_BREP` (or
+  `BREP_WITH_VOIDS`) in millimetres, uncertainty 1e-7; every face an `ADVANCED_FACE` along
+  its surface's normal or not; degenerate edges left out (a cone's apex, a sphere's poles; a
+  whole sphere bounded by a `VERTEX_LOOP`). Planes, cylinders, cones (the axis turned where
+  the slope is negative), spheres, tori (a spindle torus a `DEGENERATE_TOROIDAL_SURFACE`) and
+  B-spline surfaces as they are; lines, circles, ellipses (a plane's sections of a
+  cylinder) and B-spline curves as they are, other sections and traced curves as cubic
+  B-splines through their points within 1e-7 of the part's size. Colours of solids and
+  faces, see-through or not; materials (name and density) as Fusion 360 writes them.
+- **Reading** (`import_step`, `read_step_assembly`, `read.rs`) of AP203, AP214 and AP242:
+  every product's solids (`MANIFOLD_SOLID_BREP`, `BREP_WITH_VOIDS`, `FACETED_BREP`, the
+  closed shells of a `SHELL_BASED_SURFACE_MODEL`), placed by the assembly's occurrences
+  (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` with `ITEM_DEFINED_TRANSFORMATION`s), each in its
+  representation's units (SI with any prefix, or converted: inches, degrees); the colours
+  of solids, shells and faces, a face's own over its solid's; the material of the first
+  product with solids.
+  - Surfaces as they are; a surface of linear extrusion the plane or cylinder it is (a line
+    swept, a circle along its axis), else the B-spline surface of degree one across,
+    spanning its face; a surface of revolution the plane, cylinder or cone (a line in a
+    plane through its axis, or square to it), sphere or torus (a circle in such a plane) it
+    is, else the rational B-spline surface it is exactly (its parameters the turn and then
+    the curve, ISO 10303-42's: its normal the turn's tangent across the curve's); offsets of
+    planes and surfaces of revolution; a trimmed surface its basis. Curves: lines,
+    circles, ellipses, B-splines, polylines (B-splines of degree one); a trimmed curve or a
+    surface curve its basis, the way it runs kept.
+  - **Exact B-splines** (`exact.rs`). A B-spline curve that is a line or a circle, a
+    B-spline surface that is a plane, a cylinder, a cone, a sphere or a torus (circles on
+    one axis across it, a line or a circle along them), within a billionth of its size at
+    its knots and between, is read as what it is: a rational B-spline of degree two holds a
+    circle exactly, and some systems write every round surface so. One that only follows
+    them (a polynomial within 1e-7 of a circle) is kept.
+  - **Faces settled** to the kernel's, once their solid is read. Loops round a surface of
+    revolution's axis without a seam (other systems than OpenCASCADE mostly write a
+    cylinder's side as its two circles, a cone's point as its circle and a `VERTEX_LOOP` at
+    the apex) are joined by one, up a straight line or a meridian, where both loops have a
+    vertex (else where the first has one, the other's edge split there), clear of the
+    face's holes; a face round to a pole gets its seam to it; loops round a torus's tube are
+    joined along a parallel; a whole sphere bounded by a vertex or by holes alone gets its
+    seam and both poles; two loops round a B-spline surface that closes (a tube's ends),
+    along its curve of constant parameter. Where a loop reaches an apex or a pole, the
+    degenerate edge is put back, turning about the axis as far as the loop does there
+    (counter-clockwise in `(θ, v)` for a face along its surface's natural normal); edges of
+    no length that some systems write there are left out. A sphere's axis is turned to keep
+    its poles clear of the face's edges (a box's rounded corner, its arcs through the
+    file's pole) unless the file puts a vertex at a pole. A straight edge on a surface of
+    revolution that is not one of its straight lines (across a wide cone, within the
+    file's accuracy) and every straight edge on a B-spline surface become B-splines of
+    degree one. The outer loop first: the widest, the file's outer bound only among loops
+    as wide (some writers call a hole the outer bound). A shell facing the wrong way is
+    turned.
+  - **Tolerances**: each vertex's and edge's measured as for every solid
+    (`settle_tolerances_within`), up to four times the accuracy the file states for its
+    geometry (`GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT`; Creo says 1.5e-3 mm), and at least the
+    kernel's own 1e-3 mm; then the solid is checked as every result is.
+  - **Assemblies**: each product once; a part's solids written as a STEP file of their own
+    in its own coordinates, with its colours and material; an assembly its children placed;
+    a mirrored occurrence a part of its own, the mirror applied; a product with solids and
+    children its solids a part beside the children; several top-level products under an
+    unnamed assembly; a file without products every solid where it is.
+- IGES is not written yet.
+- Faces on B-spline surfaces with a pole (a side of the domain drawn to a point, as a
+  corner's blend between three rounds) run along that side from one edge to the next in
+  `(u, v)` (`spline_face::gaps`), their integrals with it.
 
 ## 5. Booleans
 
@@ -370,7 +451,11 @@ vertex on an edge is a point of that edge's polyline or of one of its chords, so
 without gaps; triangles with two corners at a pole are left out. A face on a B-spline surface
 is meshed the same way in its `(u, v)` plane, its edges' points taken onto the surface, its
 strips and rows at steps within the deflection by the surface's second derivatives, and
-turning no more than a twelfth of a turn each.
+turning no more than a twelfth of a turn each. A face the strips cannot mesh (some faces of
+STEP files, bounded by curves their writer fitted) is triangulated in its parameter plane
+from its boundary's points (ear clipping), its triangles' sides inside the face halved
+where they stand further than the deflection off the surface, a triangle at its centroid
+where none does, never cutting the boundary, so that it meets its neighbours all the same.
 
 ## 7. Tests
 
@@ -405,6 +490,23 @@ turning no more than a twelfth of a turn each.
   other, through three to seven sections of squares, circles, a rectangle, a circle and a
   square, slots, and to sections on planes at an angle; a loft on a block, one cut through
   a block, holes across a loft and its corner, a loft cut by a slab beside its axis.
+- STEP: the files OpenCASCADE writes of such parts (balls, cones, tori, fillets at a corner
+  of three, chamfers, holes crossing, lofts) read by the native kernel and compared with
+  what OpenCASCADE reads of them; the native kernel's own files read back, with colours
+  and materials, and by OpenCASCADE; small files in `tests/data/step`, written by
+  `make.py` the ways other systems write such solids (a cylinder without a seam, a pin in
+  inches and degrees with a point bounded by a vertex loop, a hemisphere whose sphere's
+  axis runs through its edge, a dome of a rational B-spline, an assembly of a part used
+  twice with colours and a material), against OpenCASCADE and their closed forms; the
+  assembly's tree against OpenCASCADE's. Beside the tests, in October 2026, the 98 STEP
+  files found on the Raspberry Pi (not in the repository: KiCad's libraries and board
+  exports, EasyEDA's parts, Creo's assemblies, SolidWorks' and other systems' parts) were
+  each read and meshed by the native kernel and read by OpenCASCADE: every one read and
+  meshed, 92 within 1e-5 of OpenCASCADE's volume, two of Creo's within 1.5e-5 (the
+  accuracy those files state), and four whose rational B-spline surfaces OpenCASCADE
+  integrates 0.5 to 0.9 percent off (§8), the native kernel exactly. A board's export of
+  8,074 faces read in 18 s against OpenCASCADE's 120; Creo's assemblies of 1,150 faces in
+  15 to 17 s against 23.
 - In the crate, the B-splines: a rational circle and cylinder against their closed forms,
   derivatives against differences, knot insertion and degree raising keeping the curve,
   nearest points and a line's crossings; OpenCASCADE's polynomial arcs to its poles; a smooth
@@ -424,8 +526,8 @@ turning no more than a twelfth of a turn each.
   OpenCASCADE builds, and each kernel's rebuild and meshing time and triangle count
   (`kernel-coverage.md` in Cargo's directory for test files; `OXYDE_CORPUS` adds a folder of
   `.oxyprt` files). It fails when a part listed as built natively stops building or differs
-  from OpenCASCADE's. On the Raspberry Pi, October 2026: 30 of 31 parts, 60 of 61 features,
-  what is left a STEP import.
+  from OpenCASCADE's. On the Raspberry Pi, October 2026: 31 of 31 parts, 61 of 61
+  features.
   The native kernel rebuilds what meets in lines and circles 5 to 40 times faster than
   OpenCASCADE, what meets in sections 1.1 to 3 times faster (two holes crossing: 73 ms
   against 183 ms), where laying the curves out and merging the pieces takes most of the
@@ -465,6 +567,15 @@ turning no more than a twelfth of a turn each.
   stretch between its samples). Volumes agree to 1e-9.
 - A smooth loft through ten sections or more: OpenCASCADE approximates through them with
   knots; the native kernel says it cannot yet.
+- STEP files read: a rational B-spline surface's area, which OpenCASCADE takes by a rule
+  of too few points (a cylinder, a sphere and a torus written as rational B-splines: 0.8,
+  0.5 and 0.9 percent of their volumes off), the native kernel reads as the cylinder,
+  sphere or torus it is. A face bounded by a curve the writing system fitted: OpenCASCADE
+  integrates along the file's curves in the surface's parameters, the native kernel along
+  the curves themselves, as far apart as the file's accuracy (an EasyEDA part: 6e-5 of a
+  cone's area). A sphere's axis may be turned (§4, STEP files); OpenCASCADE keeps the
+  file's. A file whose top product is an assembly: OpenCASCADE's `import_step` gives no
+  material, the native kernel the first part's.
 
 ## 9. Steps
 
@@ -496,6 +607,87 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    the pole: sections matched corner to corner or cut at each other's polar angles, on
    planes at any angle; cones and cylinders between circles on one axis; joined to, cut
    from and cut by other bodies.
-6. STEP: writing first, then reading (SolidCraft's Part 21 parser is a start).
-7. Measure, planes normal to a curve, hidden-line drawings, a volume mesher.
+6. **Done** (but IGES). STEP files written as OpenCASCADE writes them and read: AP203,
+   AP214, AP242, assemblies, units, colours, materials, every surface and curve of the
+   corpus; faces settled to the kernel's (seams, poles, exact B-splines). The cart's STEP
+   import in `kernel_coverage.rs`: 6.9 ms against OpenCASCADE's 259.
+7. Booleans with many tools in one pass, measure, planes normal to a curve, hidden-line
+   drawings, a volume mesher: what opening files like the hackintosh case needs (§10).
 8. The native kernel as the default, once every feature test of `oxyde-tests` passes on it.
+
+## 10. Opening files like the hackintosh case
+
+The hackintosh case is the owner's test of October 2026: an imported STEP assembly
+(*Proto Case Hackintosh mATX HEAVY v106*, 1.67 L of parts) remodelled feature by feature
+through `oxyde-mcp` into an Oxyde assembly of 31 components (34 occurrences of 23 parts,
+three sub-assemblies, mates). Its parts are panels and brackets: sketches of lines, arcs and
+circles, extrusions and cuts, linear patterns of hexagonal holes (two staggered grids per
+panel, hundreds of holes), mirrors of patterns, R4 fillets, holes, offset planes, text
+outlines (TrueType glyphs flattened to lines) and a logo. Opening files like it with the
+native kernel means reading the STEP assembly, rebuilding the 23 parts, solving the mates,
+and measuring, drawing and exporting them, as with OpenCASCADE. The files are on the
+owner's PC; what follows comes from the STEP corpus (§7) and from parts built like the
+case's (a probe, October 2026, on the Raspberry Pi), each built by both kernels:
+
+| Part like the case's | OpenCASCADE | Native kernel |
+|---|---|---|
+| a panel with two staggered grids of hexagonal holes, 36 holes | 0.93 s | 2.8 s |
+| the same, 100 holes | 3.2 s | 49 s |
+| the same, 400 holes | 28 s | over 35 min (stopped) |
+| a plate's slots, patterned (15) and mirrored | 0.86 s | 1.5 s |
+| an island on a plate, its corners and top rounded (R4) | 0.08 s | 0.12 s |
+| 40 engraved glyph outlines (1,440 lines) cut 0.5 deep | 3.9 s | 8.0 s |
+
+Every one of them is the same solid with either kernel (volume and faces), and the native
+kernel meshes each 10 to 50 times faster. What is missing, most needed first:
+
+1. **Booleans with many tools.** A pattern's cuts are one boolean with every instance as
+   a tool, which the native kernel takes as that many booleans in turn (`curved::boolean`),
+   each cutting the whole solid again, its faces holding every hole cut so far: the time
+   grows with the square of the holes or faster, so a panel of the case's would take an
+   hour. Wanted: one pass for all the tools, each face of the target meeting only the
+   tools whose boxes meet it, its curves from all of them laid out in one arrangement, its
+   pieces kept or dropped against all the tools at once (a tree of the tools' boxes), tools
+   that do not meet each other never compared; and the arrangement of one face with many
+   curves made faster on its own (the 40 glyphs: twice OpenCASCADE's time). The goal: the
+   time linear in the tools, and the panels faster than OpenCASCADE, as the kernel's other
+   operations are.
+2. **The case itself, tried.** `oxyde-cli` rebuilds with OpenCASCADE only: give it
+   `--kernel native`, and a command that rebuilds a part, an assembly or a STEP file with
+   both kernels and reports each feature's status and time and how far the results differ
+   (what `kernel_coverage.rs` does, for any file); run it on the case's 23 parts and its
+   original STEP file on the owner's PC. Whatever fails there joins this list. Known risks:
+   the original comes from a system the corpus does not hold (its name, `v106`, suggests
+   Fusion 360); its
+   top panel's solid holds an island twice, overlapping itself, which the kernel's check of
+   every solid may refuse where OpenCASCADE reads it (then a solid read from a file would
+   need a gentler check, or the copy dropped); its CPU block carries lettering on a B-spline
+   surface (OpenCASCADE's boolean of it never finished).
+3. **Blends the native kernel still refuses**, each with its message: an edge ending where
+   more than three faces meet, a ridge and a valley meeting at a corner, more than three
+   edges meeting, corners where curved edges or curved faces meet, a blend ending on a
+   curved face or on a face running nearly along its edge, an arc going nearly all the way
+   round; and shells of B-spline faces. Which of them the case's fillets need is for step 2
+   to tell.
+4. **What the application asks of a kernel besides building**: `distance` (Measure shows
+   nothing with the native kernel), `edge_tangent` (a plane normal to a B-spline edge
+   fails; lines and circles are worked out without the kernel), `project_edges` (drawings
+   cannot be made), all answered "cannot" so far; `volume_mesh` (simulation uses the
+   lattice mesher instead of Netgen). Mates use the faces' planes and axes from the
+   topology, which the native kernel gives; interference checks are booleans (item 1).
+5. **B-spline faces made faster.** Reading Creo's 1,150-face assemblies takes 15 to 17 s
+   (OpenCASCADE: 23), 13 of them integrating 190 B-spline faces (Green's theorem along
+   edges of many spans, each point's inner integral across the face); booleans of B-spline
+   faces trace their curves through nearest-point searches (a loft cut by a slab: 2 s).
+   Gauss–Kronrod rules reusing their points, and the inner integrals carried along each
+   edge rather than taken afresh at every point, are the next steps; then booleans on the
+   imported solids (a STEP import's faces built on).
+6. **Text in the application's sketcher**, with its glyphs' quadratic curves kept as
+   B-splines (or arcs) rather than flattened to lines: fewer, exact edges for the logo and
+   the lettering. A model feature, not the kernel's, but what the kernel is given.
+7. Still to do from §9: IGES, a spindle or horn torus revolved from a sketch's arc, a sweep
+   along an arc it does not start square to, arcs extruded at a slant, smooth lofts through
+   ten sections or more, curves through points where surfaces touch.
+
+Steps 1 and 2 first: the first makes the case's panels buildable at all, the second turns
+this list from what parts like the case's need into what the case's own files need.

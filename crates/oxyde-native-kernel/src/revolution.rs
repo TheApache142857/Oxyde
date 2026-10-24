@@ -781,7 +781,20 @@ pub(crate) fn walk(
             straight,
         };
     }
-    if (theta - theta0).abs() > 1e-6 {
+    // Each straight edge keeps its angle, so the corners' own angles, off by as much as
+    // their tolerances, are what is left over when the loop comes round.
+    let tolerance = edges.iter().map(|e| e.tolerance).fold(0.0, f64::max);
+    let nearest = edges
+        .iter()
+        .map(|e| surface.rho_z(e.a).0)
+        .filter(|&rho| rho > near_axis)
+        .fold(f64::INFINITY, f64::min);
+    let slack = if nearest.is_finite() {
+        10.0 * tolerance * n as f64 / nearest
+    } else {
+        0.0
+    };
+    if (theta - theta0).abs() > slack.max(1e-6) {
         return Err("a loop winds round its surface's axis".to_owned());
     }
     if (v - v0).abs() > 1e-6 * surface.size().max(1.0) {

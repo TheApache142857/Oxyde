@@ -55,6 +55,7 @@ mod offset;
 mod revolution;
 mod revolve;
 mod spline_face;
+mod step;
 mod sweep;
 mod tessellate;
 mod trace;
@@ -406,24 +407,56 @@ impl Kernel for NativeKernel {
 
     fn export_step(
         &self,
-        _shapes: &[ShapeHandle],
-        _colors: &[StepColors],
-        _materials: &[Option<StepMaterial>],
-        _path: &Path,
+        shapes: &[ShapeHandle],
+        colors: &[StepColors],
+        materials: &[Option<StepMaterial>],
+        path: &Path,
     ) -> Result<(), NativeError> {
-        Err(NativeError::Unsupported("write STEP files"))
+        guarded(|| {
+            if !colors.is_empty() && colors.len() != shapes.len() {
+                return Err(NativeError::Failed(format!(
+                    "{} colour sets for {} shapes",
+                    colors.len(),
+                    shapes.len()
+                )));
+            }
+            if !materials.is_empty() && materials.len() != shapes.len() {
+                return Err(NativeError::Failed(format!(
+                    "{} materials for {} shapes",
+                    materials.len(),
+                    shapes.len()
+                )));
+            }
+            let held: Vec<Arc<Shape>> = shapes
+                .iter()
+                .map(|&s| self.shape(s))
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&Shape> = held.iter().map(|s| s.as_ref()).collect();
+            let names: Vec<String> = (0..refs.len()).map(|_| "SOLID".to_owned()).collect();
+            let text = step::write::write(&refs, &names, colors, materials)?;
+            std::fs::write(path, text)
+                .map_err(|e| NativeError::Failed(format!("cannot write {}: {e}", path.display())))
+        })
     }
 
     fn export_iges(&self, _shapes: &[ShapeHandle], _path: &Path) -> Result<(), NativeError> {
         Err(NativeError::Unsupported("write IGES files"))
     }
 
-    fn import_step(&mut self, _data: &[u8]) -> Result<StepImport, NativeError> {
-        Err(NativeError::Unsupported("read STEP files"))
+    fn import_step(&mut self, data: &[u8]) -> Result<StepImport, NativeError> {
+        guarded(|| {
+            let imported = step::read::import(data).map_err(NativeError::Failed)?;
+            let shape = self.insert(imported.shape)?;
+            Ok(StepImport {
+                shape,
+                colors: imported.colors,
+                material: imported.material,
+            })
+        })
     }
 
-    fn read_step_assembly(&mut self, _data: &[u8]) -> Result<StepAssembly, NativeError> {
-        Err(NativeError::Unsupported("read STEP assemblies"))
+    fn read_step_assembly(&mut self, data: &[u8]) -> Result<StepAssembly, NativeError> {
+        guarded(|| step::read::assembly(data).map_err(NativeError::Failed))
     }
 
     fn release(&mut self, shape: ShapeHandle) {

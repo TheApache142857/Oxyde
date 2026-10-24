@@ -449,6 +449,12 @@ impl Solid {
     /// curve, at its ends and a few points between. Never less than [`BASE_TOLERANCE`];
     /// more than [`MAX_TOLERANCE`] is an error, a sign of geometry that does not meet.
     pub fn settle_tolerances(&mut self) -> Result<(), String> {
+        self.settle_tolerances_within(MAX_TOLERANCE)
+    }
+
+    /// [`Solid::settle_tolerances`], more than `max` being the error: what a solid read
+    /// from a file whose geometry is only as accurate as the file says needs.
+    pub fn settle_tolerances_within(&mut self, max: f64) -> Result<(), String> {
         let mut vertex_tolerances = vec![BASE_TOLERANCE; self.vertices.len()];
         let mut edge_tolerances = vec![BASE_TOLERANCE; self.edges.len()];
         for face in &self.faces {
@@ -481,15 +487,11 @@ impl Solid {
         if let Some((v, t)) = vertex_tolerances
             .iter()
             .enumerate()
-            .find(|(_, t)| **t > MAX_TOLERANCE)
+            .find(|(_, t)| **t > max)
         {
             return Err(format!("vertex {v} lies {t} mm off what meets there"));
         }
-        if let Some((e, t)) = edge_tolerances
-            .iter()
-            .enumerate()
-            .find(|(_, t)| **t > MAX_TOLERANCE)
-        {
+        if let Some((e, t)) = edge_tolerances.iter().enumerate().find(|(_, t)| **t > max) {
             return Err(format!("edge {e} lies {t} mm off its faces"));
         }
         for (vertex, t) in self.vertices.iter_mut().zip(vertex_tolerances) {
@@ -577,7 +579,9 @@ impl Solid {
                                 && slope.is_finite()
                                 && (slope != 0.0 || radius > 0.0)
                         }
-                        Meridian::Circle { center, radius } => center >= 0.0 && radius > 0.0,
+                        // Centred across the axis: a spindle torus's inner part, while
+                        // the circle reaches back over the axis.
+                        Meridian::Circle { center, radius } => radius > 0.0 && center > -radius,
                     };
                     if (a.length() - 1.0).abs() > 1e-9
                         || (x.length() - 1.0).abs() > 1e-9
@@ -695,7 +699,7 @@ impl Solid {
     /// faces still run counter-clockwise about their (mirrored, still outward) normals.
     pub fn transformed(&self, transform: &Transform) -> Solid {
         let mirror = transform.is_mirror();
-        Solid {
+        let moved = Solid {
             vertices: self
                 .vertices
                 .iter()
@@ -731,7 +735,15 @@ impl Solid {
                 })
                 .collect(),
             shells: self.shells.clone(),
+        };
+        if moved
+            .faces
+            .iter()
+            .any(|f| matches!(f.surface, Surface::Spline(_)))
+        {
+            crate::spline_face::carry_over(self, &moved, transform);
         }
+        moved
     }
 
     /// The loops of a face on a surface of revolution as closed polygons of its `(θ, v)`

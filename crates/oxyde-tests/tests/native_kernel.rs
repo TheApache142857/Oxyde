@@ -2874,14 +2874,26 @@ fn lofts_to_sections_on_planes_at_an_angle() {
         Sketch::new(SketchPlane::Reference(up))
     };
     let cases: Vec<(&str, Draw, Draw)> = vec![
-        ("a square to a smaller one", square_of(20.0), square_of(10.0)),
+        (
+            "a square to a smaller one",
+            square_of(20.0),
+            square_of(10.0),
+        ),
         (
             "a square to a triangle",
             square_of(20.0),
-            polygon_of(vec![(8.0, 0.0), (-4.0, 6.928203230275509), (-4.0, -6.928203230275509)]),
+            polygon_of(vec![
+                (8.0, 0.0),
+                (-4.0, 6.928203230275509),
+                (-4.0, -6.928203230275509),
+            ]),
         ),
         ("a circle to a square", circle_of(8.0), square_of(12.0)),
-        ("a rectangle to a circle", rectangle_of(16.0, 8.0), circle_of(6.0)),
+        (
+            "a rectangle to a circle",
+            rectangle_of(16.0, 8.0),
+            circle_of(6.0),
+        ),
     ];
     for (what, first, last) in cases {
         for ruled in [false, true] {
@@ -2896,4 +2908,541 @@ fn lofts_to_sections_on_planes_at_an_angle() {
             assert_same_exactly(&format!("{what} at an angle, ruled {ruled}"), &part);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// STEP files.
+
+/// The volume, centre of mass, bounds and number of faces of a body's shapes together.
+fn totals<K: Kernel>(kernel: &K, shapes: &[ShapeHandle]) -> (f64, Point3, (Point3, Point3), usize) {
+    let mut volume = 0.0;
+    let mut moment = Vec3::ZERO;
+    let mut lo = Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let mut faces = 0;
+    for &s in shapes {
+        let m = measures(kernel, s);
+        volume += m.volume;
+        moment = moment + m.centre.to_vec() * m.volume;
+        lo = Point3::new(
+            lo.x.min(m.bounds.0.x),
+            lo.y.min(m.bounds.0.y),
+            lo.z.min(m.bounds.0.z),
+        );
+        hi = Point3::new(
+            hi.x.max(m.bounds.1.x),
+            hi.y.max(m.bounds.1.y),
+            hi.z.max(m.bounds.1.z),
+        );
+        faces += m.counts.faces;
+    }
+    let c = moment * (1.0 / volume);
+    (volume, Point3::new(c.x, c.y, c.z), (lo, hi), faces)
+}
+
+/// What the native kernel builds of `part`, written to STEP by it and read back by
+/// OpenCASCADE: the solids OpenCASCADE builds of it, face for face.
+fn assert_written_step_reads(what: &str, part: &Part) {
+    let mut native = NativeKernel::new();
+    let mut built = Part::from_definition(part.definition()).unwrap();
+    built.rebuild(&mut native);
+    for entry in built.timeline() {
+        assert_eq!(entry.status, FeatureStatus::Ok, "{what}: {}", entry.name);
+    }
+    let shapes: Vec<ShapeHandle> = built
+        .body()
+        .unwrap()
+        .solids
+        .iter()
+        .map(|s| s.shape)
+        .collect();
+    let path = std::env::temp_dir().join(format!("oxyde-native-{}.step", what.replace(' ', "-")));
+    native.export_step(&shapes, &[], &[], &path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let mut occt = OcctKernel::new();
+    let read = occt.import_step(&bytes).unwrap();
+    let (volume, centre, bounds, faces) = totals(&occt, &[read.shape]);
+    let mut reference = Part::from_definition(part.definition()).unwrap();
+    reference.rebuild(&mut occt);
+    let want: Vec<ShapeHandle> = reference
+        .body()
+        .unwrap()
+        .solids
+        .iter()
+        .map(|s| s.shape)
+        .collect();
+    let (v, c, b, f) = totals(&occt, &want);
+    assert_close(&format!("{what}, volume"), volume, v, FITTED);
+    assert_point_close(&format!("{what}, centre"), centre, c, FITTED);
+    assert_point_close(&format!("{what}, lower bound"), bounds.0, b.0, FITTED);
+    assert_point_close(&format!("{what}, upper bound"), bounds.1, b.1, FITTED);
+    assert_eq!(faces, f, "{what}: faces");
+    built.release(&mut native);
+    reference.release(&mut occt);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn step_files_the_native_kernel_writes_read_in_opencascade() {
+    let mut part = Part::new();
+    base_block(&mut part);
+    assert_written_step_reads("block", &part);
+    // Holes, a slot, arcs.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(10.0, 15.0), 4.0);
+    sketch.circle(Point2::new(30.0, 15.0), 3.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_written_step_reads("block with holes", &part);
+    // Spheres, cones, tori: their poles and apexes have no edges in the file.
+    let ball = |s: &mut Sketch| {
+        let g = &mut s.geometry;
+        let (south, north, centre) = (
+            g.point(Point2::new(0.0, -5.0)),
+            g.point(Point2::new(0.0, 5.0)),
+            g.point(Point2::new(0.0, 0.0)),
+        );
+        g.arc_between(centre, south, north);
+        g.line_between(north, south);
+    };
+    assert_written_step_reads("ball", &revolved_with(ball, true, WHOLE));
+    assert_written_step_reads(
+        "half ball",
+        &revolved_with(ball, true, std::f64::consts::PI),
+    );
+    let cone = |s: &mut Sketch| polygon(s, &[(0.0, 0.0), (5.0, 0.0), (0.0, 10.0)]);
+    assert_written_step_reads("cone", &revolved_with(cone, true, WHOLE));
+    let frustum = |s: &mut Sketch| polygon(s, &[(2.0, 0.0), (6.0, 0.0), (3.0, 10.0), (2.0, 10.0)]);
+    assert_written_step_reads("frustum", &revolved_with(frustum, false, WHOLE));
+    let torus = |s: &mut Sketch| {
+        s.circle(Point2::new(10.0, 0.0), 3.0);
+    };
+    assert_written_step_reads("torus", &revolved_with(torus, true, WHOLE));
+    // Two holes across each other (B-spline edges, fitted) and a bar cut at a slant (an
+    // ellipse).
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 4.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    sketch.circle(Point2::new(-5.0, 15.0), 3.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: true });
+    assert_written_step_reads("crossing holes", &part);
+    // Lofts: B-spline surfaces.
+    assert_written_step_reads(
+        "a loft of circles",
+        &loft_of(
+            vec![
+                (0.0, circle_of(10.0)),
+                (10.0, circle_of(5.0)),
+                (20.0, circle_of(10.0)),
+            ],
+            false,
+        ),
+    );
+    assert_written_step_reads(
+        "a loft from a circle to a square",
+        &loft_of(vec![(0.0, circle_of(8.0)), (15.0, square_of(12.0))], false),
+    );
+}
+
+/// A STEP file read by both kernels: the same volume, centre of mass, bounds, faces,
+/// colours and material.
+fn assert_reads_as_opencascade_does(what: &str, bytes: &[u8], tolerance: f64) {
+    let (native, occt) = assert_reads_solids_as_opencascade_does(what, bytes, tolerance);
+    assert_eq!(native, occt, "{what}: material");
+}
+
+/// [`assert_reads_as_opencascade_does`] but for the material, which each kernel read.
+fn assert_reads_solids_as_opencascade_does(
+    what: &str,
+    bytes: &[u8],
+    tolerance: f64,
+) -> (
+    Option<oxyde_kernel::StepMaterial>,
+    Option<oxyde_kernel::StepMaterial>,
+) {
+    let mut native = NativeKernel::new();
+    let read = native
+        .import_step(bytes)
+        .unwrap_or_else(|e| panic!("{what}: {e}"));
+    let mut occt = OcctKernel::new();
+    let reference = occt.import_step(bytes).unwrap();
+    let (volume, centre, bounds, faces) = totals(&native, &[read.shape]);
+    let (v, c, b, f) = totals(&occt, &[reference.shape]);
+    assert_close(&format!("{what}, volume"), volume, v, tolerance);
+    assert_point_close(&format!("{what}, centre"), centre, c, tolerance);
+    assert_point_close(&format!("{what}, lower bound"), bounds.0, b.0, tolerance);
+    assert_point_close(&format!("{what}, upper bound"), bounds.1, b.1, tolerance);
+    assert_eq!(faces, f, "{what}: faces");
+    assert_eq!(read.colors, reference.colors, "{what}: colours");
+    native.release(read.shape);
+    occt.release(reference.shape);
+    (read.material, reference.material)
+}
+
+/// What OpenCASCADE builds of `part`, written to STEP by it and read by the native kernel:
+/// what OpenCASCADE reads of the same file, face for face.
+fn assert_opencascade_step_reads(what: &str, part: &Part) {
+    let mut occt = OcctKernel::new();
+    let mut built = Part::from_definition(part.definition()).unwrap();
+    built.rebuild(&mut occt);
+    for entry in built.timeline() {
+        assert_eq!(entry.status, FeatureStatus::Ok, "{what}: {}", entry.name);
+    }
+    let shapes: Vec<ShapeHandle> = built
+        .body()
+        .unwrap()
+        .solids
+        .iter()
+        .map(|s| s.shape)
+        .collect();
+    let path = std::env::temp_dir().join(format!("oxyde-occt-{}.step", what.replace(' ', "-")));
+    occt.export_step(&shapes, &[], &[], &path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_reads_as_opencascade_does(what, &bytes, FITTED);
+    built.release(&mut occt);
+}
+
+#[test]
+fn step_files_opencascade_writes_read_in_the_native_kernel() {
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(10.0, 15.0), 4.0);
+    sketch.circle(Point2::new(30.0, 15.0), 3.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    assert_opencascade_step_reads("block with holes", &part);
+    // Spheres, cones, tori: OpenCASCADE leaves their poles' and apexes' edges out.
+    let ball = |s: &mut Sketch| {
+        let g = &mut s.geometry;
+        let (south, north, centre) = (
+            g.point(Point2::new(0.0, -5.0)),
+            g.point(Point2::new(0.0, 5.0)),
+            g.point(Point2::new(0.0, 0.0)),
+        );
+        g.arc_between(centre, south, north);
+        g.line_between(north, south);
+    };
+    assert_opencascade_step_reads("ball", &revolved_with(ball, true, WHOLE));
+    assert_opencascade_step_reads(
+        "half ball",
+        &revolved_with(ball, true, std::f64::consts::PI),
+    );
+    let cone = |s: &mut Sketch| polygon(s, &[(0.0, 0.0), (5.0, 0.0), (0.0, 10.0)]);
+    assert_opencascade_step_reads("cone", &revolved_with(cone, true, WHOLE));
+    assert_opencascade_step_reads(
+        "a third of a cone",
+        &revolved_with(cone, false, WHOLE / 3.0),
+    );
+    let frustum = |s: &mut Sketch| polygon(s, &[(2.0, 0.0), (6.0, 0.0), (3.0, 10.0), (2.0, 10.0)]);
+    assert_opencascade_step_reads("frustum", &revolved_with(frustum, false, WHOLE));
+    let torus = |s: &mut Sketch| {
+        s.circle(Point2::new(10.0, 0.0), 3.0);
+    };
+    assert_opencascade_step_reads("torus", &revolved_with(torus, true, WHOLE));
+    // Fillets: cylinders, tori and the spheres at a corner of three.
+    let mut part = Part::new();
+    let (b, l) = lined_block(&mut part);
+    part.add_feature(blended_by(
+        true,
+        vec![
+            EdgeName::between(FaceName::profile(b, l[0]), FaceName::end_cap(b)),
+            EdgeName::between(FaceName::profile(b, l[1]), FaceName::end_cap(b)),
+            EdgeName::between(FaceName::profile(b, l[0]), FaceName::profile(b, l[1])),
+        ],
+        2.0,
+    ));
+    assert_opencascade_step_reads("a corner of three fillets", &part);
+    let mut part = Part::new();
+    let (b, l) = lined_block(&mut part);
+    part.add_feature(blended_by(
+        false,
+        vec![EdgeName::between(
+            FaceName::profile(b, l[0]),
+            FaceName::end_cap(b),
+        )],
+        2.0,
+    ));
+    assert_opencascade_step_reads("a chamfer", &part);
+    // B-spline edges and surfaces.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(20.0, 15.0), 4.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
+    let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    sketch.circle(Point2::new(-5.0, 15.0), 3.0);
+    cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: true });
+    assert_opencascade_step_reads("crossing holes", &part);
+    assert_opencascade_step_reads(
+        "a loft of circles",
+        &loft_of(
+            vec![
+                (0.0, circle_of(10.0)),
+                (10.0, circle_of(5.0)),
+                (20.0, circle_of(10.0)),
+            ],
+            false,
+        ),
+    );
+    assert_opencascade_step_reads(
+        "a loft from a circle to a square",
+        &loft_of(vec![(0.0, circle_of(8.0)), (15.0, square_of(12.0))], false),
+    );
+}
+
+fn step_data(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+}
+
+/// The surfaces the native kernel reads a file's faces on, in order.
+fn surfaces_read(bytes: &[u8]) -> Vec<SurfaceKind> {
+    let mut native = NativeKernel::new();
+    let read = native.import_step(bytes).unwrap();
+    let kinds = native
+        .topology(read.shape)
+        .unwrap()
+        .faces
+        .iter()
+        .map(|f| f.surface)
+        .collect();
+    native.release(read.shape);
+    kinds
+}
+
+#[test]
+fn step_files_other_systems_write_read_in_the_native_kernel() {
+    // tests/data/step/make.py writes these, as other systems write such solids.
+    assert_reads_as_opencascade_does("cart", &step_data("cart.step"), EXACT);
+    let cylinder = step_data("step/seamless_cylinder.step");
+    assert_reads_as_opencascade_does("a cylinder without a seam", &cylinder, EXACT);
+    let pin = step_data("step/pointed_pin.step");
+    assert_reads_as_opencascade_does("a pin in inches with a point", &pin, EXACT);
+    let hemisphere = step_data("step/hemisphere_across.step");
+    assert_reads_as_opencascade_does("a hemisphere across its sphere's axis", &hemisphere, EXACT);
+    // OpenCASCADE takes a rational B-spline face's area by a rule of too few points: its
+    // volume of this dome is 4.6e-3 too large. The native kernel reads its surface as the
+    // sphere it is.
+    let dome = step_data("step/spline_dome.step");
+    // The exact volumes.
+    let mut native = NativeKernel::new();
+    for (what, bytes, volume) in [
+        ("cylinder", &cylinder, std::f64::consts::PI * 250.0),
+        (
+            "pin",
+            &pin,
+            std::f64::consts::PI * 0.0625 * (1.0 + 0.25 / 3.0) * 25.4f64.powi(3),
+        ),
+        (
+            "hemisphere",
+            &hemisphere,
+            std::f64::consts::TAU / 3.0 * 1000.0,
+        ),
+        ("dome", &dome, std::f64::consts::TAU / 3.0 * 1000.0),
+    ] {
+        let read = native.import_step(bytes).unwrap();
+        assert_close(what, native.volume(read.shape).unwrap(), volume, 1e-12);
+        native.release(read.shape);
+    }
+    // A rational B-spline that is a sphere is read as one, its edge a circle.
+    assert_eq!(
+        surfaces_read(&dome),
+        vec![SurfaceKind::Sphere, SurfaceKind::Plane]
+    );
+    assert_eq!(
+        surfaces_read(&pin),
+        vec![SurfaceKind::Cylinder, SurfaceKind::Cone, SurfaceKind::Plane]
+    );
+}
+
+#[test]
+fn step_files_the_native_kernel_writes_read_back_in_it() {
+    use oxyde_kernel::{StepColor, StepColors, StepMaterial};
+    let ball = |s: &mut Sketch| {
+        let g = &mut s.geometry;
+        let (south, north, centre) = (
+            g.point(Point2::new(0.0, -5.0)),
+            g.point(Point2::new(0.0, 5.0)),
+            g.point(Point2::new(0.0, 0.0)),
+        );
+        g.arc_between(centre, south, north);
+        g.line_between(north, south);
+    };
+    let mut holes = Part::new();
+    let base = base_block(&mut holes);
+    let mut sketch = on_top(base);
+    sketch.circle(Point2::new(10.0, 15.0), 4.0);
+    cut(
+        &mut holes,
+        sketch,
+        ExtrudeExtent::ThroughAll { both: false },
+    );
+    let torus = |s: &mut Sketch| {
+        s.circle(Point2::new(10.0, 0.0), 3.0);
+    };
+    let parts = [
+        ("block with a hole", holes),
+        ("ball", revolved_with(ball, true, WHOLE)),
+        ("torus", revolved_with(torus, true, WHOLE)),
+        (
+            "loft",
+            loft_of(vec![(0.0, circle_of(8.0)), (15.0, square_of(12.0))], false),
+        ),
+    ];
+    for (what, part) in parts {
+        let mut native = NativeKernel::new();
+        let mut built = Part::from_definition(part.definition()).unwrap();
+        built.rebuild(&mut native);
+        let shapes: Vec<ShapeHandle> = built
+            .body()
+            .unwrap()
+            .solids
+            .iter()
+            .map(|s| s.shape)
+            .collect();
+        let faces = native.topology(shapes[0]).unwrap().faces.len();
+        let red = StepColor {
+            rgb: [200, 30, 30],
+            transparency: 0.0,
+        };
+        let blue = StepColor {
+            rgb: [20, 40, 220],
+            transparency: 0.25,
+        };
+        let mut face_colors = vec![Some(red); faces];
+        face_colors[0] = Some(blue);
+        let colors = StepColors {
+            solids: vec![Some(red)],
+            faces: face_colors,
+        };
+        let material = StepMaterial {
+            name: "Aluminium".to_owned(),
+            description: "6061-T6".to_owned(),
+            density: 2700.0,
+        };
+        let path =
+            std::env::temp_dir().join(format!("oxyde-native-back-{}.step", what.replace(' ', "-")));
+        native
+            .export_step(
+                &shapes,
+                std::slice::from_ref(&colors),
+                &[Some(material.clone())],
+                &path,
+            )
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let read = native.import_step(&bytes).unwrap();
+        let (volume, centre, bounds, n) = totals(&native, &[read.shape]);
+        let (v, c, b, f) = totals(&native, &shapes);
+        assert_close(&format!("{what}, volume"), volume, v, 1e-12);
+        assert_point_close(&format!("{what}, centre"), centre, c, 1e-12);
+        assert_point_close(&format!("{what}, lower bound"), bounds.0, b.0, 1e-9);
+        assert_point_close(&format!("{what}, upper bound"), bounds.1, b.1, 1e-9);
+        assert_eq!(n, f, "{what}: faces");
+        assert_eq!(
+            read.colors.solids, colors.solids,
+            "{what}: the solid's colour"
+        );
+        let blues = read
+            .colors
+            .faces
+            .iter()
+            .filter(|c| c.is_some_and(|c| c.rgb == blue.rgb))
+            .count();
+        assert_eq!(blues, 1, "{what}: one face blue");
+        assert_eq!(read.material, Some(material), "{what}: material");
+        // OpenCASCADE reads what the native kernel read.
+        assert_reads_as_opencascade_does(what, &bytes, FITTED);
+        native.release(read.shape);
+        built.release(&mut native);
+    }
+}
+
+#[test]
+fn step_assemblies_read_in_the_native_kernel() {
+    use oxyde_kernel::StepNodeContent;
+    let bytes = step_data("step/assembly.step");
+    // The material the file names for its part: OpenCASCADE gives none for a file whose
+    // top product is an assembly (docs/NATIVE_KERNEL.md §8).
+    let (material, _) =
+        assert_reads_solids_as_opencascade_does("an assembly of two blocks", &bytes, EXACT);
+    assert_eq!(material.map(|m| m.name), Some("Steel".to_owned()));
+    let mut native = NativeKernel::new();
+    let mut occt = OcctKernel::new();
+    let tree = native.read_step_assembly(&bytes).unwrap();
+    let reference = occt.read_step_assembly(&bytes).unwrap();
+    assert_eq!(tree.nodes.len(), reference.nodes.len(), "nodes");
+    let instances = |t: &oxyde_kernel::StepAssembly| match &t.nodes[t.root].content {
+        StepNodeContent::Assembly { instances } => instances.clone(),
+        StepNodeContent::Part { .. } => panic!("the root is a part"),
+    };
+    let (ours, theirs) = (instances(&tree), instances(&reference));
+    assert_eq!(ours.len(), 2);
+    assert_eq!(ours.len(), theirs.len());
+    assert_eq!(
+        tree.nodes[tree.root].name,
+        reference.nodes[reference.root].name
+    );
+    for (a, b) in ours.iter().zip(&theirs) {
+        assert_eq!(a.name, b.name, "instance names");
+        for (ra, rb) in a.transform.rows.iter().zip(&b.transform.rows) {
+            for (x, y) in ra.iter().zip(rb) {
+                assert!(
+                    (x - y).abs() <= 1e-12,
+                    "{}: {:?} against {:?}",
+                    a.name,
+                    a.transform,
+                    b.transform
+                );
+            }
+        }
+        let (StepNodeContent::Part { step, material }, StepNodeContent::Part { material: m, .. }) = (
+            &tree.nodes[a.node].content,
+            &reference.nodes[b.node].content,
+        ) else {
+            panic!("instances of parts");
+        };
+        // OpenCASCADE's density comes back through its own unit, a rounding off.
+        let (material, m) = (material.as_ref().unwrap(), m.as_ref().unwrap());
+        assert_eq!(
+            (&material.name, &material.description),
+            (&m.name, &m.description)
+        );
+        assert_close("the part's density", material.density, m.density, 1e-12);
+        assert_eq!(
+            tree.nodes[a.node].name, reference.nodes[b.node].name,
+            "the part's name"
+        );
+        // The part's own file reads as the block, in its own place.
+        let part = native.import_step(step).unwrap();
+        assert_close(
+            "the part's volume",
+            native.volume(part.shape).unwrap(),
+            6000.0,
+            1e-12,
+        );
+        let (lo, hi) = native.bounds(part.shape).unwrap();
+        assert_point_close("the part's corner", lo, Point3::new(0.0, 0.0, 0.0), 1e-12);
+        assert_point_close(
+            "the part's far corner",
+            hi,
+            Point3::new(10.0, 20.0, 30.0),
+            1e-12,
+        );
+        assert_eq!(
+            part.colors.solids,
+            vec![Some(oxyde_kernel::StepColor {
+                rgb: [255, 0, 0],
+                transparency: 0.0
+            })]
+        );
+        native.release(part.shape);
+    }
+    // One part, used twice.
+    assert_eq!(ours[0].node, ours[1].node);
 }
