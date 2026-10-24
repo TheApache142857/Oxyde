@@ -108,6 +108,12 @@ release yet; the git history has every detail.
   needs). Curved faces bounded by curves of many pieces, as CATIA, SolidWorks and Creo
   write rounded edges, are meshed with the triangles they need and no more: a CATIA part
   shows 25,000 triangles instead of 615,000 and meshes four times faster.
+- **Flat faces with several holes** show as they are with it: a plate with a hole at each
+  corner, or a part read from a STEP file with many holes in one face, no longer shows
+  triangles laid over its holes and over each other (on five files from FreeCAD,
+  OpenCASCADE and Fusion 360, the solids shown were 6% to 180% off in volume). A sphere's
+  face that a Fusion 360 file joins to a hole in it no longer shows part of the hole covered
+  and as much of the face missing beside it.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

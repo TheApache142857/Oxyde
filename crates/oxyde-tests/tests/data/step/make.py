@@ -196,6 +196,35 @@ def hemisphere_across():
     return s.text("hemisphere across its sphere's axis")
 
 
+def facetted_dome():
+    """A hemisphere of radius 10 on the plane z = 0 with a flat facet 0.3 rad across about
+    an axis 30° above the edge at x = 10, written as Fusion 360 writes such a face: the
+    sphere's axis through the facet, its seam a meridian from the facet's circle down to the
+    hemisphere's edge, one loop running round the edge, up the seam, round the facet the
+    other way and back down. The reader turns the sphere's axis to z, clear of the loop."""
+    s = Step()
+    r, a = 10.0, 0.3
+    n = (math.sin(math.pi / 3), 0.0, 0.5)
+    x = (0.5, 0.0, -math.sin(math.pi / 3))
+    centre = tuple(r * math.cos(a) * c for c in n)
+    on_facet = tuple(r * (math.cos(a) * p + math.sin(a) * q) for p, q in zip(n, x))
+    b = s.vertex((r, 0, 0))
+    v = s.vertex(on_facet)
+    rim = s.edge(b, b, s.circle((0, 0, 0), r))
+    seam = s.edge(b, v, s.circle((0, 0, 0), r, (0, -1, 0), (1, 0, 0)))
+    facet_edge = s.edge(v, v, s.circle(centre, r * math.sin(a), n, x))
+    sphere = s.add(f"SPHERICAL_SURFACE('',{s.place((0, 0, 0), n, x)},{r!r})")
+    base = s.add(f"PLANE('',{s.place((0, 0, 0), (0, 0, -1))})")
+    facet = s.add(f"PLANE('',{s.place(centre, n, x)})")
+    dome = s.face(
+        [s.bound(s.loop([(rim, True), (seam, True), (facet_edge, False), (seam, False)]), True)], sphere
+    )
+    f0 = s.face([s.bound(s.loop([(rim, False)]), True)], base)
+    f1 = s.face([s.bound(s.loop([(facet_edge, True)]), True)], facet)
+    s.part_file("facetted dome", [dome, f0, f1])
+    return s.text("facetted dome")
+
+
 def rational_circle_poles(r, z=0.0):
     corners = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0)]
     return [(r * x, r * y, z) for x, y in corners], [1 if i % 2 == 0 else R2 for i in range(9)]
@@ -336,6 +365,7 @@ for name, make in [
     ("seamless_cylinder", seamless_cylinder),
     ("pointed_pin", pointed_pin),
     ("hemisphere_across", hemisphere_across),
+    ("facetted_dome", facetted_dome),
     ("loose_half_cylinder", loose_half_cylinder),
     ("spline_dome", spline_dome),
     ("assembly", assembly),

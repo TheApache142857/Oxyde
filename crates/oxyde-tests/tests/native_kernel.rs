@@ -950,6 +950,54 @@ fn display_meshes_cover_each_face_once_and_face_outwards() {
     part.release(&mut kernel);
 }
 
+/// The volume a display mesh holds: each triangle's tetrahedron to the origin, signed.
+fn mesh_volume(mesh: &oxyde_kernel::Mesh) -> f64 {
+    let mut held = 0.0;
+    for face in &mesh.faces {
+        for t in &face.triangles {
+            let [a, b, c] = t.map(|k| {
+                let [x, y, z] = face.positions[k as usize];
+                Vec3::new(f64::from(x), f64::from(y), f64::from(z))
+            });
+            held += a.dot(b.cross(c)) / 6.0;
+        }
+    }
+    held
+}
+
+#[test]
+fn display_meshes_of_a_plate_with_holes_at_its_corners_hold_its_volume() {
+    // Holes reaching as far along a cap as each other: the bridge from one to the cap's
+    // boundary is met by the next one's, which must join it on its inner side, or the cap's
+    // triangles overlap (a FreeCAD part's top face, holed so, covered 1.8 times its area).
+    let mut part = Part::new();
+    let mut sketch = front();
+    sketch.rectangle(Point2::new(0.0, 0.0), 40.0, 30.0);
+    for (x, y) in [(5.0, 5.0), (35.0, 5.0), (5.0, 25.0), (35.0, 25.0)] {
+        sketch.circle(Point2::new(x, y), 2.5);
+    }
+    boss(
+        &mut part,
+        sketch,
+        ExtrudeExtent::Blind { depth: 5.0 },
+        false,
+    );
+    let mut kernel = NativeKernel::new();
+    part.rebuild(&mut kernel);
+    let shape = part.body().expect("a body").solids[0].shape;
+    // At a thousandth of its size, as the viewport meshes it.
+    let (lo, hi) = kernel.bounds(shape).unwrap();
+    let held = mesh_volume(&kernel.tessellate(shape, lo.distance(hi) * 1e-3).unwrap());
+    let volume = kernel.volume(shape).unwrap();
+    // Chords 0.05 off a hole of radius 2.5 leave out 2.6% of it, 1.8e-3 of the volume:
+    // overlapping triangles held a third more.
+    assert!(
+        (held - volume).abs() <= 3e-3 * volume,
+        "the mesh holds {held} mm³, the solid {volume} mm³"
+    );
+    part.release(&mut kernel);
+}
+
 #[test]
 fn a_boss_on_a_face() {
     let mut part = Part::new();
@@ -3257,6 +3305,53 @@ fn step_files_other_systems_write_read_in_the_native_kernel() {
         surfaces_read(&pin),
         vec![SurfaceKind::Cylinder, SurfaceKind::Cone, SurfaceKind::Plane]
     );
+}
+
+#[test]
+fn a_sphere_s_seam_read_from_a_file_keeps_clear_of_a_hole_joined_to_its_rim() {
+    // tests/data/step/make.py: a hemisphere of radius 10 with a flat facet 0.3 rad across,
+    // its sphere's axis through the facet and its seam from the facet down to the rim, one
+    // loop round both, as Fusion 360 writes such a face. The reader turns the sphere's axis
+    // to z, where both of the loop's vertices are at the facet's angle: the seam put up to
+    // the pole from there crossed the facet's circle, and the face's mesh covered part of
+    // the facet and left as much uncovered beside it.
+    let bytes = step_data("step/facetted_dome.step");
+    let (r, a) = (10.0f64, 0.3f64);
+    let h = r * (1.0 - a.cos());
+    let pi = std::f64::consts::PI;
+    let exact = 2.0 / 3.0 * pi * r.powi(3) - pi * h * h * (3.0 * r - h) / 3.0;
+    let mut native = NativeKernel::new();
+    let read = native
+        .import_step(&bytes)
+        .unwrap_or_else(|e| panic!("the facetted dome: {e}"));
+    let volume = native.volume(read.shape).unwrap();
+    assert_close("the facetted dome's volume", volume, exact, EXACT);
+    // Finer than the viewport's 0.03, whose chords leave out 7e-3 of a ball this size.
+    let mesh = native.tessellate(read.shape, 0.002).unwrap();
+    let held = mesh_volume(&mesh);
+    assert!(
+        (held - volume).abs() <= 1e-3 * volume,
+        "the mesh holds {held} mm³, the solid {volume} mm³"
+    );
+    let n = Vec3::new(3f64.sqrt() / 2.0, 0.0, 0.5);
+    let topology = native.topology(read.shape).unwrap();
+    for (face, info) in mesh.faces.iter().zip(&topology.faces) {
+        if info.surface != SurfaceKind::Sphere {
+            continue;
+        }
+        for t in &face.triangles {
+            let c = t.iter().fold(Vec3::ZERO, |s, &k| {
+                let [x, y, z] = face.positions[k as usize];
+                s + Vec3::new(f64::from(x), f64::from(y), f64::from(z))
+            });
+            let off = c.normalized().unwrap().dot(n).acos();
+            assert!(
+                off > a - 1e-2,
+                "a triangle of the dome lies {off} rad from the facet's middle"
+            );
+        }
+    }
+    native.release(read.shape);
 }
 
 #[test]

@@ -1851,7 +1851,9 @@ impl SolidReader<'_, '_> {
                         );
                     }
                 };
-                let theta = self.seam_angle(rev, &loops[i].0, None, &holes);
+                let mut clear = holes.clone();
+                clear.extend(self.joined_holes(rev, &loops[i].0));
+                let theta = self.seam_angle(rev, &loops[i].0, None, &clear);
                 let a = self.vertex_at(rev, &loops[i].0, theta, true, id)?;
                 let la = self.current(&loops[i].0);
                 let size = rev.size().max(1.0);
@@ -1879,7 +1881,10 @@ impl SolidReader<'_, '_> {
                 let ib = pair[1].0;
                 let toward = wa * s > 0.0;
                 let (a, b, seam) = if along_axis {
-                    let theta = self.seam_angle(rev, &loops[ia].0, Some(&loops[ib].0), &holes);
+                    let mut clear = holes.clone();
+                    clear.extend(self.joined_holes(rev, &loops[ia].0));
+                    clear.extend(self.joined_holes(rev, &loops[ib].0));
+                    let theta = self.seam_angle(rev, &loops[ia].0, Some(&loops[ib].0), &clear);
                     let a = self.vertex_at(rev, &loops[ia].0, theta, true, id)?;
                     let b = self.vertex_at(rev, &loops[ib].0, theta, true, id)?;
                     (a, b, self.meridian_edge(rev, a, b, theta, toward))
@@ -1909,6 +1914,41 @@ impl SolidReader<'_, '_> {
             out.push((self.current(&loops[i].0), loops[i].1 && !merged));
         }
         Ok(out)
+    }
+
+    /// The angles taken by the holes a loop that goes round the axis carries along: runs of
+    /// its edges from a vertex back to it that do not go round (a Fusion 360 sphere's hole
+    /// joined to its rim at a vertex and by an edge run both ways, once the sphere's axis is
+    /// turned). A seam between them and the pole would cross them where they have no vertex.
+    fn joined_holes(&self, rev: &Revolution, uses: &[EdgeUse]) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        // The uses not yet in a run, and the vertex each starts at.
+        let mut pending: Vec<EdgeUse> = Vec::new();
+        let mut starts: Vec<u32> = Vec::new();
+        for &u in uses {
+            pending.push(u);
+            starts.push(self.solid.start_of(u));
+            let Some(i) = starts.iter().rposition(|&v| v == self.solid.end_of(u)) else {
+                continue;
+            };
+            let run: Vec<EdgeUse> = pending.drain(i..).collect();
+            starts.truncate(i);
+            if run.len() == uses.len()
+                || run
+                    .iter()
+                    .all(|r| self.solid.edges[r.edge as usize].curve.is_degenerate())
+            {
+                continue;
+            }
+            // A run the walk cannot follow tells nothing of where it lies.
+            if let Ok(p) = self.param_points(rev, &run)
+                && let (Some(first), Some(last)) = (p.first(), p.last())
+                && (last.0 - first.0).abs() <= PI
+            {
+                out.push(bounds_of(p.iter().map(|q| q.0)));
+            }
+        }
+        out
     }
 
     /// The angle a seam is put at between a loop that goes round the axis and another (or

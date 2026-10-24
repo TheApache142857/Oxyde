@@ -260,7 +260,10 @@ parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
     cylinder's side as its two circles, a cone's point as its circle and a `VERTEX_LOOP` at
     the apex) are joined by one, up a straight line or a meridian, where both loops have a
     vertex (else where the first has one, the other's edge split there), clear of the
-    face's holes; a face round to a pole gets its seam to it; loops round a torus's tube are
+    face's holes, those a loop carries along included (runs of its edges from a vertex
+    back to it that do not go round: Fusion 360 joins a sphere's hole to its rim at a
+    vertex and by its seam, which, the sphere's axis turned, no longer goes round with
+    it); a face round to a pole gets its seam to it; loops round a torus's tube are
     joined along a parallel; a whole sphere bounded by a vertex or by holes alone gets its
     seam and both poles; two loops round a B-spline surface that closes (a tube's ends),
     along its curve of constant parameter. Where a loop reaches an apex or a pole, the
@@ -449,7 +452,9 @@ are part of. What OpenCASCADE builds, observed as a black box, sets the rest:
 
 `tessellate.rs`. An arc is cut into chords within the deflection asked for, at most a twelfth
 of a turn each; a section into chords halved until each is within it. A planar face is triangulated over its edges' chords (holes bridged to the
-outer boundary, then ear clipping). A face on a surface of revolution is meshed in its
+outer boundary, then ear clipping; a bridge that reaches a corner where an earlier one
+ends, which the ring passes twice, joins it on the side the hole lies, or the ring crosses
+itself and the triangles cover parts of the face twice). A face on a surface of revolution is meshed in its
 `(θ, v)` plane: cut into strips at every angle a point of its boundary is at and at steps fine
 enough for its widest circle, each strip into trapezoids between the boundary's chords that
 cross it, each trapezoid stitched into triangles between its two sides (rows of points on the
@@ -512,7 +517,8 @@ where none does, never cutting the boundary, so that it meets its neighbours all
   inches and degrees with a point bounded by a vertex loop, a hemisphere whose sphere's
   axis runs through its edge, a dome of a rational B-spline, an assembly of a part used
   twice with colours and a material, a half cylinder written as loosely as its stated
-  accuracy of 0.01 mm allows, read whole and through its part's own file), against
+  accuracy of 0.01 mm allows, read whole and through its part's own file, a dome with a
+  facet its sphere's seam runs to, meshed clear of the facet), against
   OpenCASCADE and their closed forms; the assembly's tree against OpenCASCADE's.
   `step_corpus.rs` (ignored, run by hand) opens any STEP file with one kernel as the
   application does (the tree, each part's own file, the whole file measured, meshed at a
