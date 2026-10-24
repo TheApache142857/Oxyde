@@ -763,7 +763,7 @@ pub(crate) fn walk(
                     straight = false;
                 }
             }
-            Curve::Section(_) | Curve::Traced(_) => {
+            Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_) => {
                 (theta, v) = ParamPath::follow(surface, edge, from, near_axis)?.end();
                 straight = false;
             }
@@ -871,11 +871,11 @@ fn torus_roots(d: Vec3, dir: Vec3, a: Vec3, center: f64, radius: f64) -> Vec<f64
 // Area and mass integrals.
 
 /// Gauss–Legendre nodes and weights on `[−1, 1]`.
-static GAUSS: LazyLock<Vec<(f64, f64)>> = LazyLock::new(|| gauss_legendre(16));
+pub(crate) static GAUSS: LazyLock<Vec<(f64, f64)>> = LazyLock::new(|| gauss_legendre(16));
 
 /// The `n`-point Gauss–Legendre rule: the roots of the Legendre polynomial `P_n` by
 /// Newton's method from Chebyshev guesses, and their weights `2 / ((1 − x²) P_n'(x)²)`.
-fn gauss_legendre(n: usize) -> Vec<(f64, f64)> {
+pub(crate) fn gauss_legendre(n: usize) -> Vec<(f64, f64)> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let mut x = (PI * (i as f64 + 0.75) / (n as f64 + 0.5)).cos();

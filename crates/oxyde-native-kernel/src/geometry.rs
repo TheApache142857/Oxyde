@@ -12,6 +12,7 @@ use std::f64::consts::TAU;
 
 use oxyde_geom::{Axis, Plane, Point3, Transform, Vec3};
 
+pub(crate) use crate::nurbs::{SplineCurve, SplineSurface};
 use crate::revolution::{Meridian, Revolution};
 pub(crate) use crate::trace::Trace;
 
@@ -50,6 +51,8 @@ pub(crate) enum Curve {
     Section(Section),
     /// Where two surfaces cross, traced along ([`Trace`]).
     Traced(Trace),
+    /// A B-spline curve ([`SplineCurve`]).
+    Spline(SplineCurve),
 }
 
 impl Curve {
@@ -69,6 +72,7 @@ impl Curve {
             }
             Curve::Section(section) => Curve::Section(section.transformed(transform)),
             Curve::Traced(trace) => Curve::Traced(trace.transformed(transform)),
+            Curve::Spline(c) => Curve::Spline(c.transformed(transform)),
         }
     }
 
@@ -93,6 +97,7 @@ impl Curve {
                 up: !trace.up,
                 ..*trace
             }),
+            Curve::Spline(c) => Curve::Spline(c.reversed()),
         }
     }
 
@@ -109,6 +114,7 @@ impl Curve {
             Curve::Circle(c) => c.sweep(start, end, closed),
             Curve::Section(s) => s.sweep(start, end, closed),
             Curve::Traced(t) => t.sweep(start, end, closed),
+            Curve::Spline(c) => c.sweep(start, end, closed),
             Curve::Degenerate { turn, .. } => *turn,
         }
     }
@@ -125,6 +131,7 @@ impl Curve {
             Curve::Circle(c) => Some(c.point_at(c.angle_of(start) + s)),
             Curve::Section(sec) => sec.along(start, s),
             Curve::Traced(t) => t.along(start, s),
+            Curve::Spline(c) => Some(c.along(start, s)),
             Curve::Degenerate { .. } => Some(start),
         }
     }
@@ -141,8 +148,76 @@ impl Curve {
             Curve::Circle(c) => (c.angle_of(p) - c.angle_of(start)).rem_euclid(TAU),
             Curve::Section(sec) => sec.turned(start, p),
             Curve::Traced(t) => t.turned(start, p),
+            Curve::Spline(c) => c.turned(start, p),
             Curve::Degenerate { .. } => 0.0,
         }
+    }
+
+    /// The point `s` along an edge on this curve from `start` to `end` (running `extent`)
+    /// and the rate it moves at as `s` grows: exactly for a line, a circle and a B-spline,
+    /// from a traced curve's own cubic (its points, each taken onto both surfaces, are too
+    /// rough to be differenced), by central differences for a section.
+    pub fn point_rate(&self, start: Point3, end: Point3, extent: f64, s: f64) -> (Point3, Vec3) {
+        let sign = |up: bool| if up { 1.0 } else { -1.0 };
+        match self {
+            Curve::Line => {
+                let d = end - start;
+                let l = d.length();
+                if l > 0.0 {
+                    (start + d * (s / l), d * (1.0 / l))
+                } else {
+                    (start, Vec3::ZERO)
+                }
+            }
+            Curve::Circle(c) => {
+                let t = c.angle_of(start) + s;
+                let (x, y) = c.frame();
+                let p = c.point_at(t);
+                (p, (y * t.cos() - x * t.sin()) * c.radius)
+            }
+            Curve::Spline(c) => {
+                let u = c.param_along(start, s);
+                match c.derivatives(u, 1).as_slice() {
+                    [p, d, ..] => (Point3::new(p.x, p.y, p.z), *d * sign(c.up)),
+                    _ => (start, Vec3::ZERO),
+                }
+            }
+            Curve::Traced(t) => {
+                let from = t.param_of_remembered(start);
+                let at = if t.up { from + s } else { from - s };
+                match t.point_and_derivative(at) {
+                    Some((p, d)) => (p, d * sign(t.up)),
+                    None => (start, Vec3::ZERO),
+                }
+            }
+            Curve::Section(_) | Curve::Degenerate { .. } => {
+                let h = 1e-6 * extent.max(1e-9);
+                let at = |t: f64| self.at(start, end, t).unwrap_or(start);
+                (at(s), (at(s + h) - at(s - h)) * (0.5 / h))
+            }
+        }
+    }
+
+    /// Where along an edge on this curve from `start` (running `extent`) it changes from one
+    /// smooth piece to the next: a traced curve's samples (it is cubic between them); none
+    /// for the others.
+    pub fn smooth_breaks(&self, start: Point3, extent: f64) -> Vec<f64> {
+        let Curve::Traced(t) = self else {
+            return Vec::new();
+        };
+        let from = t.param_of_remembered(start);
+        let span = t.span();
+        let mut out: Vec<f64> = t
+            .sample_params()
+            .into_iter()
+            .map(|x| {
+                let d = if t.up { x - from } else { from - x };
+                if t.closed { d.rem_euclid(span) } else { d }
+            })
+            .filter(|&d| d > 1e-12 * span && d < extent - 1e-12 * span)
+            .collect();
+        out.sort_by(f64::total_cmp);
+        out
     }
 
     /// How far `p` lies off the curve (an edge's line taken whole, its point for a
@@ -161,6 +236,7 @@ impl Curve {
             Curve::Circle(c) => c.distance(p),
             Curve::Section(s) => s.distance(p),
             Curve::Traced(t) => t.distance(p),
+            Curve::Spline(c) => c.distance(p),
             Curve::Degenerate { .. } => p.distance(start),
         }
     }
@@ -202,6 +278,7 @@ impl Curve {
             }
             Curve::Section(sec) => sec.polyline(start, end, extent, d),
             Curve::Traced(t) => t.polyline(start, end, extent, d),
+            Curve::Spline(c) => c.polyline(start, end, extent, d),
         }
     }
 }
@@ -519,13 +596,15 @@ pub(crate) enum Surface {
     Plane(Plane),
     /// A cylinder, a cone, a sphere or a torus, saying which way its normal points.
     Revolution(Revolution),
+    /// A B-spline surface, saying which way its normal points ([`SplineSurface`]).
+    Spline(SplineSurface),
 }
 
 impl Surface {
     pub fn plane(&self) -> Option<&Plane> {
         match self {
             Surface::Plane(plane) => Some(plane),
-            Surface::Revolution(_) => None,
+            Surface::Revolution(_) | Surface::Spline(_) => None,
         }
     }
 
@@ -537,6 +616,7 @@ impl Surface {
                 normal: transform.apply_vector(plane.normal),
             }),
             Surface::Revolution(r) => Surface::Revolution(r.transformed(transform)),
+            Surface::Spline(s) => Surface::Spline(s.transformed(transform)),
         }
     }
 
@@ -551,6 +631,7 @@ impl Surface {
                 outward: !r.outward,
                 ..*r
             }),
+            Surface::Spline(s) => Surface::Spline(s.reversed()),
         }
     }
 
@@ -559,6 +640,7 @@ impl Surface {
         match self {
             Surface::Plane(plane) => (p - plane.origin).dot(plane.normal).abs(),
             Surface::Revolution(r) => r.distance(p),
+            Surface::Spline(s) => s.distance(p),
         }
     }
 
@@ -581,6 +663,7 @@ impl Surface {
                 };
                 if r.outward { away } else { -away }
             }
+            Surface::Spline(s) => s.signed_distance(p),
         }
     }
 
@@ -623,6 +706,9 @@ impl Surface {
                     }
                 }
             }
+            // Not made yet: an offset surface of a B-spline ([`crate::offset`] refuses it
+            // first, saying so).
+            Surface::Spline(_) => None,
         }
     }
 
@@ -636,6 +722,7 @@ impl Surface {
                 vec![(p.origin - point).dot(p.normal) / denom]
             }
             Surface::Revolution(r) => r.ray_hits(point, dir),
+            Surface::Spline(s) => s.line_hits(point, dir),
         }
     }
 }
@@ -714,28 +801,36 @@ impl PlaneSums {
             + r * r * r * (sin3(c1) - sin3(c0));
     }
 
-    /// A curved edge in the plane, `point(s)` its point `s` along it in the plane's
-    /// coordinates for `s` from 0 to `extent`: the same sums by Gauss–Legendre quadrature,
-    /// the derivatives from points a hair either side.
-    pub fn add_path(&mut self, extent: f64, point: &impl Fn(f64) -> (f64, f64)) {
-        let h = 1e-6 * extent.max(1e-9);
-        let d = |s: f64| {
-            let (a, b) = (point(s + h), point(s - h));
-            ((a.0 - b.0) / (2.0 * h), (a.1 - b.1) / (2.0 * h))
-        };
-        let piece = extent / 32.0;
-        self.twice_area += crate::revolution::quadrature(0.0, extent, piece, &|s| {
-            let ((x, y), (dx, dy)) = (point(s), d(s));
-            x * dy - y * dx
-        });
-        self.x2_dy += crate::revolution::quadrature(0.0, extent, piece, &|s| {
-            let (x, _) = point(s);
-            x * x * d(s).1
-        });
-        self.y2_dx += crate::revolution::quadrature(0.0, extent, piece, &|s| {
-            let (_, y) = point(s);
-            y * y * d(s).0
-        });
+    /// A curved edge in the plane, `point_rate(s)` its point `s` along it in the plane's
+    /// coordinates for `s` from 0 to `extent` and the rate it moves at: the same sums by
+    /// Gauss–Legendre quadrature, over the pieces between `breaks` (where the curve changes
+    /// from one smooth piece to the next), else in 32 pieces.
+    pub fn add_path(
+        &mut self,
+        extent: f64,
+        breaks: &[f64],
+        point_rate: &impl Fn(f64) -> ((f64, f64), (f64, f64)),
+    ) {
+        let mut ends = vec![0.0];
+        if breaks.is_empty() {
+            ends.extend((1..32).map(|k| extent * f64::from(k) / 32.0));
+        } else {
+            ends.extend(breaks.iter().copied().filter(|&b| b > 0.0 && b < extent));
+        }
+        ends.push(extent);
+        for w in ends.windows(2) {
+            let &[a, b] = w else {
+                continue;
+            };
+            let (mid, half) = ((a + b) / 2.0, (b - a) / 2.0);
+            for &(x, wq) in crate::revolution::GAUSS.iter() {
+                let ((px, py), (dx, dy)) = point_rate(mid + half * x);
+                let weight = wq * half;
+                self.twice_area += weight * (px * dy - py * dx);
+                self.x2_dy += weight * px * px * dy;
+                self.y2_dx += weight * py * py * dx;
+            }
+        }
     }
 
     /// The area and `∫ (x, y) dA` in the plane's coordinates.

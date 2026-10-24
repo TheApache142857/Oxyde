@@ -23,7 +23,10 @@
 // boundary (lib.rs) and reported as an internal error.
 #![allow(clippy::indexing_slicing)]
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use oxyde_geom::{Axis, LINEAR_TOLERANCE, Point3, Transform, Vec3};
 use oxyde_kernel::{
@@ -319,6 +322,18 @@ impl Solid {
     pub fn face_integrals(&self, face: &Face, reference: Point3) -> Result<FaceIntegrals, String> {
         match &face.surface {
             Surface::Plane(plane) => {
+                let bent = face.loops.iter().flatten().any(|u| {
+                    matches!(
+                        self.edges[u.edge as usize].curve,
+                        Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_)
+                    )
+                });
+                let key = bent.then(|| self.plane_key(plane, face));
+                if let Some(key) = &key
+                    && let Some((area, first)) = remembered_plane(key)
+                {
+                    return Ok(FaceIntegrals::of_plane(plane, area, first, reference));
+                }
                 let (x, n) = (plane.x_dir, plane.normal);
                 let y = n.cross(x);
                 let local = |p: Point3| {
@@ -348,16 +363,21 @@ impl Solid {
                             sums.add_arc(c, circle.radius, t0, t0 + turn);
                         }
                         Curve::Degenerate { .. } => {}
-                        Curve::Section(_) | Curve::Traced(_) => {
+                        Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_) => {
                             let w = self.walk_edge(*edge_use);
-                            sums.add_path(w.sweep, &|s| {
-                                local(w.curve.at(w.a, w.b, s).unwrap_or(w.a))
+                            let breaks = w.curve.smooth_breaks(w.a, w.sweep);
+                            sums.add_path(w.sweep, &breaks, &|s| {
+                                let (p, r) = w.curve.point_rate(w.a, w.b, w.sweep, s);
+                                (local(p), (r.dot(x), r.dot(y)))
                             });
                         }
                     }
                 }
                 let (area, mx, my) = sums.area_and_moment();
                 let first = plane.origin.to_vec() * area + x * mx + y * my;
+                if let Some(key) = key {
+                    remember_plane(key, area, first);
+                }
                 Ok(FaceIntegrals::of_plane(plane, area, first, reference))
             }
             Surface::Revolution(surface) => {
@@ -380,7 +400,34 @@ impl Solid {
                 }
                 Ok(sums.integrals(surface))
             }
+            Surface::Spline(surface) => {
+                crate::spline_face::integrals(self, face, surface, reference)
+            }
         }
+    }
+
+    /// A planar face as the cache of its area and moment knows it: its plane and each edge
+    /// use's ends, middle and extent, as bits.
+    fn plane_key(&self, plane: &oxyde_geom::Plane, face: &Face) -> Vec<u64> {
+        let mut key = Vec::new();
+        let point = |key: &mut Vec<u64>, p: Point3| {
+            key.extend([p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]);
+        };
+        point(&mut key, plane.origin);
+        for v in [plane.x_dir, plane.normal] {
+            key.extend([v.x.to_bits(), v.y.to_bits(), v.z.to_bits()]);
+        }
+        for uses in &face.loops {
+            key.push(u64::MAX);
+            for &u in uses {
+                let w = self.walk_edge(u);
+                point(&mut key, w.a);
+                point(&mut key, w.b);
+                point(&mut key, w.mid);
+                key.push(w.sweep.to_bits());
+            }
+        }
+        key
     }
 
     /// Volume and first moment of the solid about `reference`, by the divergence theorem.
@@ -490,7 +537,7 @@ impl Solid {
                         }
                     }
                 }
-                Curve::Section(_) | Curve::Traced(_) => {
+                Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_) => {
                     for v in [edge.start, edge.end] {
                         let off = edge.curve.distance(
                             self.point(edge.start),
@@ -542,6 +589,8 @@ impl Solid {
                         ));
                     }
                 }
+                // Checked when it was made (crate::nurbs).
+                Surface::Spline(_) => {}
             }
             if face.loops.is_empty() {
                 return Err(format!("face {f} has no boundary"));
@@ -713,6 +762,9 @@ impl Solid {
     /// Points of the face, inside it, where its surface reaches furthest along a model axis
     /// between its edges: a sphere's or a torus's bulge, which its edges may not reach.
     pub fn bulges(&self, face: &Face) -> Vec<Point3> {
+        if let Surface::Spline(surface) = &face.surface {
+            return crate::spline_face::bulges(self, face, surface);
+        }
         let Surface::Revolution(surface) = &face.surface else {
             return Vec::new();
         };
@@ -844,6 +896,7 @@ impl Shape {
                 let (surface, normal, axis) = match &face.surface {
                     Surface::Plane(plane) => (SurfaceKind::Plane, Some(plane.normal), None),
                     Surface::Revolution(r) => (r.kind(), None, Some(r.axis)),
+                    Surface::Spline(_) => (SurfaceKind::BSpline, None, None),
                 };
                 topology.faces.push(FaceInfo {
                     surface,
@@ -906,6 +959,14 @@ impl Shape {
                         vertices,
                         faces,
                     },
+                    Curve::Spline(c) => EdgeInfo {
+                        curve: CurveKind::BSpline,
+                        length: c.length_from(a, solid.sweep(edge)),
+                        midpoint: solid.midpoint(edge),
+                        axis: None,
+                        vertices,
+                        faces,
+                    },
                 });
             }
             topology
@@ -944,6 +1005,9 @@ impl Shape {
                     }
                     Curve::Traced(trace) => {
                         points.extend(trace.extremes(solid.point(edge.start), solid.sweep(edge)));
+                    }
+                    Curve::Spline(c) => {
+                        points.extend(c.extremes(solid.point(edge.start), solid.sweep(edge)));
                     }
                     _ => {}
                 }
@@ -1013,6 +1077,36 @@ impl Shape {
         }
         Ok(())
     }
+}
+
+/// The areas and first moments of the planar faces with curved edges taken lately (each
+/// a quadrature along its edges, asked for again and again), by their keys' hashes.
+type PlaneCache = HashMap<u64, Vec<(Vec<u64>, (f64, Vec3))>>;
+
+static PLANES: LazyLock<Mutex<PlaneCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn hash_key(key: &[u64]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+fn remembered_plane(key: &[u64]) -> Option<(f64, Vec3)> {
+    PLANES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&hash_key(key))
+        .and_then(|b| b.iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| *v))
+}
+
+fn remember_plane(key: Vec<u64>, area: f64, first: Vec3) {
+    let mut map = PLANES.lock().unwrap_or_else(PoisonError::into_inner);
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.entry(hash_key(&key))
+        .or_default()
+        .push((key, (area, first)));
 }
 
 /// Each item with the next one, the last with the first.

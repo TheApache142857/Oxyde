@@ -372,6 +372,7 @@ fn same_way(a: &Curve, b: &Curve) -> bool {
         (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) > 0.0,
         (Curve::Section(s), Curve::Section(t)) => s.ccw == t.ccw,
         (Curve::Traced(s), Curve::Traced(t)) => s.up == t.up,
+        (Curve::Spline(s), Curve::Spline(t)) => crate::nurbs::same_way(s, t),
         _ => true,
     }
 }

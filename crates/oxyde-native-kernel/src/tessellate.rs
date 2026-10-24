@@ -20,7 +20,7 @@ use oxyde_geom::{Point2, Point3};
 use oxyde_kernel::{FaceMesh, Mesh};
 
 use crate::brep::{EdgeUse, Face, ParamUse, Shape, Solid};
-use crate::geometry::Surface;
+use crate::geometry::{SplineSurface, Surface};
 use crate::revolution::{Meridian, Revolution, unwrap};
 use crate::triangulate;
 
@@ -40,6 +40,9 @@ pub(crate) fn mesh(shape: &Shape, deflection: f64) -> Result<Mesh, String> {
                 Surface::Plane(_) => planar_mesh(face, &polylines)?,
                 Surface::Revolution(surface) => {
                     revolution_mesh(solid, face, surface, &polylines, deflection)?
+                }
+                Surface::Spline(surface) => {
+                    spline_mesh(solid, face, surface, &polylines, deflection)?
                 }
             });
         }
@@ -293,6 +296,29 @@ fn revolution_mesh(
         }
     };
 
+    strip_mesh(
+        &chords,
+        &sides,
+        &breaks,
+        &rows,
+        &|t, v| surface.point(t, v),
+        surface.outward,
+    )
+}
+
+/// The triangles of a face laid out in a parameter plane `(t, v)`: in strips between the
+/// `breaks` along `t`, each strip in trapezoids between the boundary's `chords` that cross
+/// it, each trapezoid stitched between its two sides, rows of points at the `rows` along
+/// `v` (`point` gives them) or the points of a boundary `side` lying there. Triangles run
+/// counter-clockwise in `(t, v)` when `outward`.
+fn strip_mesh(
+    chords: &[Chord],
+    sides: &[Side],
+    breaks: &[f64],
+    rows: &[f64],
+    point: &dyn Fn(f64, f64) -> Point3,
+    outward: bool,
+) -> Result<FaceMesh, String> {
     let mut vertices = Vertices::default();
     let mut triangles: Vec<[u32; 3]> = Vec::new();
     for (strip, pair) in breaks.windows(2).enumerate() {
@@ -302,7 +328,7 @@ fn revolution_mesh(
         crossing.sort_by(|p, q| p.at(mid).0.total_cmp(&q.at(mid).0));
         if !crossing.len().is_multiple_of(2) {
             return Err(format!(
-                "a face of revolution does not close across its strip {strip}"
+                "a curved face does not close across its strip {strip}"
             ));
         }
         for pair in crossing.chunks(2) {
@@ -334,7 +360,7 @@ fn revolution_mesh(
                     }
                     None => {
                         for &v in rows.iter().filter(|&&v| v > v_lo + 1e-9 && v < v_hi - 1e-9) {
-                            out.push((v, vertices.at(surface.point(theta, v))));
+                            out.push((v, vertices.at(point(theta, v))));
                         }
                     }
                 }
@@ -343,13 +369,111 @@ fn revolution_mesh(
             };
             let left = chain(ta, &mut vertices);
             let right = chain(tb, &mut vertices);
-            stitch(&left, &right, surface.outward, &mut triangles);
+            stitch(&left, &right, outward, &mut triangles);
         }
     }
     Ok(FaceMesh {
         positions: vertices.positions.iter().map(|&p| single(p)).collect(),
         triangles,
     })
+}
+
+/// A face of a B-spline surface meshed in its `(u, v)` plane, as a face of revolution is
+/// in its `(θ, v)` ([`strip_mesh`]): its edges' points taken onto the surface, strips at
+/// every `u` a point of them is at and at steps fine enough for the deflection, rows along
+/// `v` likewise.
+fn spline_mesh(
+    solid: &Solid,
+    face: &Face,
+    surface: &SplineSurface,
+    polylines: &[Vec<Point3>],
+    deflection: f64,
+) -> Result<FaceMesh, String> {
+    let loops = crate::spline_face::uv_loops(solid, face, surface)?;
+    let mut chords: Vec<Chord> = Vec::new();
+    let mut sides: Vec<Side> = Vec::new();
+    let (mut ulo, mut uhi, mut vlo, mut vhi) = (
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    );
+    let (ua, ub) = surface.domain(0);
+    for u in loops.iter().flatten() {
+        let line = use_polyline(u.edge_use, polylines);
+        let mut near = u.samples.first().map_or((0.0, 0.0), |s| (s.1, s.2));
+        let params: Vec<(f64, f64)> = line
+            .iter()
+            .map(|&p| {
+                near = crate::spline_face::uv_near(surface, p, near);
+                near
+            })
+            .collect();
+        for &(pu, pv) in &params {
+            ulo = ulo.min(pu);
+            uhi = uhi.max(pu);
+            vlo = vlo.min(pv);
+            vhi = vhi.max(pv);
+        }
+        let u0 = params.first().map_or(0.0, |p| p.0);
+        if params.iter().all(|p| (p.0 - u0).abs() <= 1e-12 * (ub - ua)) {
+            sides.push(Side {
+                theta: u0,
+                points: params.iter().zip(&line).map(|(p, &q)| (p.1, q)).collect(),
+            });
+        } else {
+            for i in 0..line.len().saturating_sub(1) {
+                if (params[i + 1].0 - params[i].0).abs() > 1e-12 * (ub - ua) {
+                    chords.push(Chord {
+                        a: params[i],
+                        b: params[i + 1],
+                        pa: line[i],
+                        pb: line[i + 1],
+                    });
+                }
+            }
+        }
+    }
+    if !(uhi > ulo && vhi > vlo) {
+        return Err("a B-spline face with no extent".to_owned());
+    }
+    let (du, dv) = crate::spline_face::steps(surface, (ulo, uhi), (vlo, vhi), deflection);
+    let mut us: Vec<f64> = chords
+        .iter()
+        .flat_map(|c| [c.a.0, c.b.0])
+        .chain(sides.iter().map(|s| s.theta))
+        .collect();
+    us.sort_by(f64::total_cmp);
+    us.dedup_by(|a, b| (*a - *b).abs() <= 1e-12);
+    let mut breaks = Vec::with_capacity(us.len());
+    for pair in us.windows(2) {
+        let (t0, t1) = (pair[0], pair[1]);
+        let k = ((t1 - t0) / du).ceil().max(1.0) as usize;
+        for i in 0..k {
+            breaks.push(t0 + (t1 - t0) * i as f64 / k as f64);
+        }
+    }
+    if let Some(&last) = us.last() {
+        breaks.push(last);
+    }
+    let k = ((vhi - vlo) / dv).ceil().max(1.0) as usize;
+    let rows: Vec<f64> = (1..k)
+        .map(|i| vlo + (vhi - vlo) * i as f64 / k as f64)
+        .collect();
+    let wrap = |x: f64, (a, b): (f64, f64), closed: bool| {
+        if closed {
+            a + (x - a).rem_euclid(b - a)
+        } else {
+            x
+        }
+    };
+    let point = |u: f64, v: f64| {
+        surface.point(
+            wrap(u, surface.domain(0), surface.data.closed[0]),
+            wrap(v, surface.domain(1), surface.data.closed[1]),
+        )
+    };
+    strip_mesh(&chords, &sides, &breaks, &rows, &point, surface.outward)
 }
 
 fn is_vertical(u: &ParamUse) -> bool {

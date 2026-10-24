@@ -34,7 +34,7 @@ use oxyde_kernel::{BooleanOp, FaceSource, OpHistory};
 use crate::NativeError;
 use crate::arrangement::{self, Arrangement, Geom, P, Segment, Tag};
 use crate::brep::{Edge, EdgeUse, Face, Shape, Solid, Vertex};
-use crate::geometry::{Circle, Curve, Section, Surface, Trace};
+use crate::geometry::{Circle, Curve, Section, SplineCurve, SplineSurface, Surface, Trace};
 use crate::revolution::{Meridian, PlaneCurve, Revolution, WalkEdge, walk};
 
 /// An input face a face of the result is made of: the input's position in the boolean's
@@ -124,6 +124,15 @@ enum Chart {
         k: f64,
         m: f64,
     },
+    /// A B-spline surface's `x = k (u − u₀)` and `y = m (v − v₀)` from the start of its
+    /// domain, `k` and `m` its mean speeds along `u` and `v`, so that lengths in the chart
+    /// are about lengths on it; its edges at `u₀` (and `v₀`) are at `x = 0` (and `y = 0`),
+    /// where a surface that closes round on itself has its seam.
+    Spline {
+        surface: SplineSurface,
+        k: f64,
+        m: f64,
+    },
 }
 
 impl Chart {
@@ -136,7 +145,47 @@ impl Chart {
                 normal: plane.normal,
             },
             Surface::Revolution(r) => Chart::revolution(*r),
+            Surface::Spline(s) => Chart::spline(*s),
         }
+    }
+
+    fn spline(surface: SplineSurface) -> Chart {
+        let speed = |d: usize| {
+            let (a, b) = surface.domain(d);
+            let (c0, c1) = surface.domain(1 - d);
+            let mid = 0.5 * (c0 + c1);
+            let n = 32;
+            let total: f64 = (0..n)
+                .map(|i| {
+                    let t = a + (b - a) * (f64::from(i) + 0.5) / f64::from(n);
+                    let (u, v) = if d == 0 { (t, mid) } else { (mid, t) };
+                    let der = surface.derivatives(u, v, 1);
+                    if d == 0 { der[1][0] } else { der[0][1] }.length()
+                })
+                .sum();
+            (total / f64::from(n)).max(1e-9)
+        };
+        Chart::Spline {
+            surface,
+            k: speed(0),
+            m: speed(1),
+        }
+    }
+
+    /// A B-spline surface's parameters at chart point `p`, taken round within its domain
+    /// where it closes.
+    fn spline_params(surface: &SplineSurface, k: f64, m: f64, p: P) -> (f64, f64) {
+        let wrap = |x: f64, (a, b): (f64, f64), closed: bool| {
+            if closed {
+                a + x.rem_euclid(b - a)
+            } else {
+                a + x
+            }
+        };
+        (
+            wrap(p.x / k, surface.domain(0), surface.data.closed[0]),
+            wrap(p.y / m, surface.domain(1), surface.data.closed[1]),
+        )
     }
 
     fn revolution(surface: Revolution) -> Chart {
@@ -152,6 +201,10 @@ impl Chart {
         match self {
             Chart::Plane { .. } => None,
             Chart::Revolution { k, .. } => Some(TAU * k),
+            Chart::Spline { surface, k, .. } => surface.data.closed[0].then(|| {
+                let (a, b) = surface.domain(0);
+                k * (b - a)
+            }),
         }
     }
 
@@ -159,6 +212,10 @@ impl Chart {
     fn v_period(&self) -> Option<f64> {
         match self {
             Chart::Revolution { surface, m, .. } if surface.v_periodic() => Some(TAU * m),
+            Chart::Spline { surface, m, .. } if surface.data.closed[1] => {
+                let (a, b) = surface.domain(1);
+                Some(m * (b - a))
+            }
             _ => None,
         }
     }
@@ -167,6 +224,10 @@ impl Chart {
         match self {
             Chart::Plane { origin, x, y, .. } => origin + x * p.x + y * p.y,
             Chart::Revolution { surface, k, m } => surface.point(p.x / k, p.y / m),
+            Chart::Spline { surface, k, m } => {
+                let (u, v) = Chart::spline_params(&surface, k, m, p);
+                surface.point(u, v)
+            }
         }
     }
 
@@ -180,6 +241,24 @@ impl Chart {
             Chart::Revolution { surface, k, m } => {
                 let (theta, v) = surface.params(p);
                 P::new(theta.rem_euclid(TAU) * k, v * m)
+            }
+            Chart::Spline { surface, k, m } => {
+                let (u, v) = surface.params(p);
+                let along = |x: f64, (a, b): (f64, f64), closed: bool| {
+                    let d = x - a;
+                    if closed {
+                        let l = b - a;
+                        let d = d.rem_euclid(l);
+                        // The seam's far side is its near side.
+                        if l - d <= 1e-12 * l { 0.0 } else { d }
+                    } else {
+                        d
+                    }
+                };
+                P::new(
+                    along(u, surface.domain(0), surface.data.closed[0]) * k,
+                    along(v, surface.domain(1), surface.data.closed[1]) * m,
+                )
             }
         }
     }
@@ -249,6 +328,46 @@ impl Chart {
             (Chart::Revolution { .. }, Geom::Arc { .. }) => {
                 Err("an arc in a surface of revolution's chart".to_owned())
             }
+            (Chart::Spline { surface, k, m }, Geom::Line) => {
+                let (a, b) = (self.to_world(s.a), self.to_world(s.b));
+                // A straight line of the surface (a ruled face's rulings and edges).
+                let straight = [0.25, 0.5, 0.75].iter().all(|&f| {
+                    let q = self.to_world(P::new(
+                        s.a.x + (s.b.x - s.a.x) * f,
+                        s.a.y + (s.b.y - s.a.y) * f,
+                    ));
+                    q.distance(a + (b - a) * f) <= TOL
+                });
+                if straight && a.distance(b) > TOL {
+                    return Ok(Curve::Line);
+                }
+                if (s.a.x - s.b.x).abs() <= 2.0 * TOL {
+                    // Along v at its u.
+                    let (u, _) = Chart::spline_params(surface, *k, *m, s.a);
+                    let iso = surface.iso(1, u);
+                    Ok(Curve::Spline(if s.b.y > s.a.y {
+                        iso
+                    } else {
+                        iso.reversed()
+                    }))
+                } else if (s.a.y - s.b.y).abs() <= 2.0 * TOL {
+                    let (_, v) = Chart::spline_params(surface, *k, *m, s.a);
+                    let iso = surface.iso(0, v);
+                    Ok(Curve::Spline(if s.b.x > s.a.x {
+                        iso
+                    } else {
+                        iso.reversed()
+                    }))
+                } else {
+                    Err(
+                        "a cut across a B-spline surface that is neither straight nor along it"
+                            .to_owned(),
+                    )
+                }
+            }
+            (Chart::Spline { .. }, Geom::Arc { .. }) => {
+                Err("an arc in a B-spline surface's chart".to_owned())
+            }
         }
     }
 
@@ -257,6 +376,7 @@ impl Chart {
         match self {
             Chart::Plane { normal, .. } => *normal,
             Chart::Revolution { surface, .. } => surface.normal_at(p),
+            Chart::Spline { surface, .. } => surface.normal_at(p),
         }
     }
 }
@@ -329,6 +449,10 @@ fn outward_loops(chart: &Chart, loops: Vec<Vec<Edge3>>) -> Vec<Vec<Edge3>> {
             .into_iter()
             .map(|l| l.iter().rev().map(Edge3::reversed).collect())
             .collect(),
+        Chart::Spline { surface, .. } if !surface.outward => loops
+            .into_iter()
+            .map(|l| l.iter().rev().map(Edge3::reversed).collect())
+            .collect(),
         _ => loops,
     }
 }
@@ -356,8 +480,34 @@ fn boundary_2d(chart: &Chart, loops: &[Vec<Edge3>]) -> Result<Vec<Segment>, Stri
                             chart.to_2d(c.center),
                             c.normal.dot(*normal) > 0.0,
                         )),
-                        Curve::Section(_) | Curve::Traced(_) => out.extend(lay(chart, e, a)),
+                        Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_) => {
+                            out.extend(lay(chart, e, a));
+                        }
                         Curve::Degenerate { .. } => {}
+                    }
+                }
+            }
+            Chart::Spline { .. } => {
+                let mut near: Option<P> = None;
+                for e in edges {
+                    let from = match near {
+                        None => chart.to_2d(e.a),
+                        Some(n) => chart_near(chart, e.a, n),
+                    };
+                    match e.curve {
+                        Curve::Degenerate { .. } => {
+                            return Err("a degenerate edge on a B-spline face".to_owned());
+                        }
+                        Curve::Line => {
+                            let to = chart_near(chart, e.b, from);
+                            out.push(Segment::line(from, to));
+                            near = Some(to);
+                        }
+                        _ => {
+                            let laid = lay(chart, e, from);
+                            near = laid.last().map(|s| s.b).or(Some(from));
+                            out.extend(laid);
+                        }
                     }
                 }
             }
@@ -421,6 +571,7 @@ fn canonical(curve: Curve) -> Curve {
     match curve {
         Curve::Section(s) => Curve::Section(Section { ccw: true, ..s }),
         Curve::Traced(t) => Curve::Traced(Trace { up: true, ..t }),
+        Curve::Spline(c) => Curve::Spline(SplineCurve { up: true, ..c }),
         Curve::Circle(c) => {
             let n = c.normal;
             let first = if n.x.abs() > 1e-12 {
@@ -445,6 +596,11 @@ fn period(canon: &Curve) -> f64 {
     match canon {
         Curve::Traced(t) if !t.closed => f64::INFINITY,
         Curve::Traced(t) => t.span(),
+        Curve::Spline(c) if !c.closed() => f64::INFINITY,
+        Curve::Spline(c) => {
+            let (a, b) = c.domain();
+            b - a
+        }
         _ => TAU,
     }
 }
@@ -454,6 +610,10 @@ fn period(canon: &Curve) -> f64 {
 fn lay_step(canon: &Curve) -> f64 {
     match canon {
         Curve::Traced(t) => t.span() / 256.0,
+        Curve::Spline(c) => {
+            let (a, b) = c.domain();
+            (b - a) / 256.0
+        }
         _ => LAY_STEP,
     }
 }
@@ -464,6 +624,7 @@ fn param_of(canon: &Curve, p: Point3) -> f64 {
         Curve::Section(s) => s.angle_of(p),
         Curve::Circle(c) => c.angle_of(p),
         Curve::Traced(t) => t.param_of(p),
+        Curve::Spline(c) => c.param_of(p),
         _ => 0.0,
     }
 }
@@ -474,7 +635,22 @@ fn point_of(canon: &Curve, t: f64) -> Option<Point3> {
         Curve::Section(s) => s.point_at(t),
         Curve::Circle(c) => Some(c.point_at(t)),
         Curve::Traced(trace) => trace.point_at(t),
+        Curve::Spline(c) => spline_point(c, t),
         _ => None,
+    }
+}
+
+/// The point at parameter `t` of a B-spline curve, taken round where it closes; none off
+/// an open one's domain.
+fn spline_point(c: &SplineCurve, t: f64) -> Option<Point3> {
+    let (a, b) = c.domain();
+    let l = b - a;
+    if c.closed() {
+        Some(c.point_at(a + (t - a).rem_euclid(l)))
+    } else if t >= a - 1e-9 * l && t <= b + 1e-9 * l {
+        Some(c.point_at(t.clamp(a, b)))
+    } else {
+        None
     }
 }
 
@@ -483,6 +659,7 @@ fn runs_up(curve: &Curve) -> bool {
     match curve {
         Curve::Section(s) => s.ccw,
         Curve::Traced(t) => t.up,
+        Curve::Spline(c) => c.up,
         Curve::Circle(c) => match canonical(*curve) {
             Curve::Circle(k) => k.normal.dot(c.normal) > 0.0,
             _ => true,
@@ -686,6 +863,7 @@ fn parametric(e: &Edge3, p: Point3) -> (f64, impl Fn(f64) -> Option<Point3> + '_
         Curve::Circle(c) => c.angle_of(p),
         Curve::Section(s) => s.angle_of(p),
         Curve::Traced(t) => t.param_of(p),
+        Curve::Spline(c) => c.param_of(p),
         Curve::Degenerate { .. } => 0.0,
     };
     let f = move |t: f64| match e.curve {
@@ -693,6 +871,17 @@ fn parametric(e: &Edge3, p: Point3) -> (f64, impl Fn(f64) -> Option<Point3> + '_
         Curve::Circle(c) => Some(c.point_at(t)),
         Curve::Section(s) => s.point_at(t),
         Curve::Traced(trace) => trace.point_at(t),
+        Curve::Spline(c) => {
+            // A hair past an open curve's ends, as its polynomial runs on.
+            let (a, b) = c.domain();
+            if c.closed() {
+                spline_point(&c, t)
+            } else {
+                let x = t.clamp(a - 0.01 * (b - a), b + 0.01 * (b - a));
+                let der = c.derivatives(x, 0);
+                Some(Point3::new(der[0].x, der[0].y, der[0].z))
+            }
+        }
         Curve::Degenerate { .. } => Some(e.a),
     };
     (t, f)
@@ -858,8 +1047,12 @@ fn edges_box(loops: &[Vec<Edge3>]) -> (Point3, Point3) {
     let mut points = Vec::new();
     for e in loops.iter().flatten() {
         points.push(e.a);
-        if let Curve::Circle(c) = e.curve {
-            points.extend(c.extremes(c.angle_of(e.a), e.extent()));
+        match e.curve {
+            Curve::Circle(c) => points.extend(c.extremes(c.angle_of(e.a), e.extent())),
+            Curve::Section(c) => points.extend(c.extremes(e.a, e.extent())),
+            Curve::Traced(c) => points.extend(c.extremes(e.a, e.extent())),
+            Curve::Spline(c) => points.extend(c.extremes(e.a, e.extent())),
+            Curve::Line | Curve::Degenerate { .. } => {}
         }
     }
     box_of(points)
@@ -979,6 +1172,7 @@ fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
                 Vec::new()
             })
         }
+        (Surface::Spline(_), _) | (_, Surface::Spline(_)) => spline_meet(a, b),
         (Surface::Plane(_), Surface::Revolution(_)) => plane_revolution(a, b),
         (Surface::Revolution(_), Surface::Plane(_)) => plane_revolution(b, a),
         (Surface::Revolution(r1), Surface::Revolution(r2)) => {
@@ -1007,6 +1201,25 @@ fn meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
             }
         }
     }
+}
+
+/// Where a B-spline face meets another face: nowhere to cut when the two lie on one
+/// surface or meet only along edges they both end at (or touch), else the curves traced
+/// where their surfaces cross ([`traced`]).
+fn spline_meet(a: &Prepared, b: &Prepared) -> Result<Vec<Cut>, NativeError> {
+    if let (Surface::Spline(s), Surface::Spline(t)) = (&a.surface, &b.surface)
+        && std::ptr::eq(s.data, t.data)
+        && s.place == t.place
+    {
+        return Ok(vec![Cut::Same]);
+    }
+    let crossings = crossings_of(a, b);
+    if !crosses_inside(a, b, &crossings) {
+        return Ok(Vec::new());
+    }
+    traced_from(a, b, &crossings).ok_or(NativeError::Unsupported(
+        "cut a B-spline face where the surfaces touch",
+    ))
 }
 
 /// Two cylinders whose axes are parallel but apart: the lines along both where their
@@ -1261,10 +1474,11 @@ fn plane_section(
                 return Ok(Vec::new());
             }
             // The plane may cut the torus beside the faces, and the faces touch at most.
-            if !cross_inside(plane_face, revolution_face) {
+            let crossings = crossings_of(plane_face, revolution_face);
+            if !crosses_inside(plane_face, revolution_face, &crossings) {
                 return Ok(Vec::new());
             }
-            traced(plane_face, revolution_face).ok_or(NativeError::Unsupported(
+            traced_from(plane_face, revolution_face, &crossings).ok_or(NativeError::Unsupported(
                 "intersect a torus with a plane that touches it where it cuts it",
             ))
         }
@@ -1478,7 +1692,8 @@ fn crossing(
     let torus =
         |r: &Revolution| matches!(r.meridian, Meridian::Circle { center, .. } if center > 0.0);
     if torus(r1) || torus(r2) {
-        if !cross_inside(a, b) {
+        let crossings = crossings_of(a, b);
+        if !crosses_inside(a, b, &crossings) {
             return Ok(Vec::new());
         }
         // Along a cylinder's or a cone's lines, a torus may be only touched.
@@ -1489,7 +1704,7 @@ fn crossing(
                 return Ok(Vec::new());
             }
         }
-        return traced(a, b).ok_or(NativeError::Unsupported(
+        return traced_from(a, b, &crossings).ok_or(NativeError::Unsupported(
             "intersect a torus with a surface it touches where it cuts it",
         ));
     }
@@ -1509,11 +1724,12 @@ fn crossing(
     {
         return Ok(Vec::new());
     }
-    if !cross_inside(a, b) {
+    let crossings = crossings_of(a, b);
+    if !crosses_inside(a, b, &crossings) {
         return Ok(Vec::new());
     }
     // Followed along where it goes, turning back or not.
-    traced(a, b).ok_or(NativeError::Unsupported(
+    traced_from(a, b, &crossings).ok_or(NativeError::Unsupported(
         "intersect surfaces of revolution that touch where they cut each other",
     ))
 }
@@ -1551,11 +1767,32 @@ fn meets_only_at_edges(carrier: &Revolution, other: &Surface, a: &Prepared, b: &
     true
 }
 
-/// Where the other surface crosses `face`'s over a fine grid of `face`'s chart (its box):
-/// where `other`'s signed distance changes sign between two neighbouring points, the
-/// crossing found by bisection.
-fn crossings_on(face: &Prepared, other: &Surface) -> Vec<Point3> {
-    let n = 96;
+/// Where the other face's surface crosses `face`'s over a fine grid of `face`'s chart (its
+/// box): where `other`'s signed distance changes sign between two neighbouring points, the
+/// crossing found by regula falsi. A B-spline surface's distance is a search for its
+/// nearest point: it is taken only near the other face's box (a crossing further off could
+/// lie in neither face).
+fn crossings_on(face: &Prepared, other_face: &Prepared) -> Vec<Point3> {
+    let other = &other_face.surface;
+    let near_other = |p: Point3| -> bool {
+        if !matches!(other, Surface::Spline(_)) {
+            return true;
+        }
+        let pad = 0.1 * other_face.min.distance(other_face.max) + 10.0 * TOL;
+        p.x >= other_face.min.x - pad
+            && p.y >= other_face.min.y - pad
+            && p.z >= other_face.min.z - pad
+            && p.x <= other_face.max.x + pad
+            && p.y <= other_face.max.y + pad
+            && p.z <= other_face.max.z + pad
+    };
+    // Half as fine against a B-spline surface: the grid on its own face, against this
+    // face's surface, is the fine one and finds what is small on it.
+    let n = if matches!(other, Surface::Spline(_)) {
+        48
+    } else {
+        96
+    };
     let at = |i: usize, j: usize| {
         P::new(
             face.lo.x + (face.hi.x - face.lo.x) * i as f64 / n as f64,
@@ -1564,7 +1801,18 @@ fn crossings_on(face: &Prepared, other: &Surface) -> Vec<Point3> {
     };
     let side = |q: P| other.signed_distance(face.chart.to_world(q));
     let values: Vec<Vec<f64>> = (0..=n)
-        .map(|i| (0..=n).map(|j| side(at(i, j))).collect())
+        .map(|i| {
+            (0..=n)
+                .map(|j| {
+                    let q = at(i, j);
+                    if near_other(face.chart.to_world(q)) {
+                        side(q)
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        })
         .collect();
     let mut out = Vec::new();
     for i in 0..=n {
@@ -1575,34 +1823,69 @@ fn crossings_on(face: &Prepared, other: &Surface) -> Vec<Point3> {
                     continue;
                 }
                 let (f0, f1) = (values[i][j], values[k][l]);
-                if (f0 > 0.0) == (f1 > 0.0) {
+                if f0.is_nan() || f1.is_nan() || (f0 > 0.0) == (f1 > 0.0) {
                     continue;
                 }
-                let (mut lo, mut hi) = (at(i, j), at(k, l));
-                let positive = f0 > 0.0;
-                for _ in 0..40 {
-                    let mid = P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0);
-                    if (side(mid) > 0.0) == positive {
-                        lo = mid;
+                // Regula falsi (the Illinois way) between the two grid points.
+                let (a, b) = (at(i, j), at(k, l));
+                let along = |t: f64| P::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+                let (mut t0, mut t1, mut g0, mut g1) = (0.0, 1.0, f0, f1);
+                let mut t = 0.5;
+                let mut last = 0;
+                for _ in 0..60 {
+                    t = (t0 * g1 - t1 * g0) / (g1 - g0);
+                    if !(t > t0 && t < t1) {
+                        t = 0.5 * (t0 + t1);
+                    }
+                    let g = side(along(t));
+                    if g == 0.0 || t1 - t0 <= 1e-13 {
+                        break;
+                    }
+                    if (g > 0.0) == (g0 > 0.0) {
+                        t0 = t;
+                        g0 = g;
+                        if last == 0 {
+                            g1 *= 0.5;
+                        }
+                        last = 0;
                     } else {
-                        hi = mid;
+                        t1 = t;
+                        g1 = g;
+                        if last == 1 {
+                            g0 *= 0.5;
+                        }
+                        last = 1;
+                    }
+                    if g.abs() <= 1e-12 {
+                        break;
                     }
                 }
-                out.push(
-                    face.chart
-                        .to_world(P::new((lo.x + hi.x) / 2.0, (lo.y + hi.y) / 2.0)),
-                );
+                let mid = along(t);
+                // Where the distance jumps rather than passes through zero (past a B-spline
+                // surface's reach), there is no crossing.
+                if side(mid).abs() > 1e3 * TOL {
+                    continue;
+                }
+                out.push(face.chart.to_world(mid));
             }
         }
     }
     out
 }
 
-/// Whether the surfaces of `a` and `b` cross inside both faces, clear of their edges:
-/// a crossing over either face's grid ([`crossings_on`]) well inside both. When they do
-/// not, the faces miss, touch, or meet along edges they both end at, and there is nothing
-/// to cut.
-fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
+/// The crossings over both faces' grids ([`crossings_on`]).
+fn crossings_of(a: &Prepared, b: &Prepared) -> Vec<Point3> {
+    crossings_on(a, b)
+        .into_iter()
+        .chain(crossings_on(b, a))
+        .collect()
+}
+
+/// Whether the surfaces of `a` and `b` cross inside both faces, clear of their edges: one
+/// of `crossings` (over either face's grid, [`crossings_of`]) well inside both. When they
+/// do not, the faces miss, touch, or meet along edges they both end at, and there is
+/// nothing to cut.
+fn crosses_inside(a: &Prepared, b: &Prepared, crossings: &[Point3]) -> bool {
     let edge = 100.0 * TOL;
     let well_inside = |f: &Prepared, p: Point3| -> bool {
         on_face(f, p).is_some_and(|q| {
@@ -1610,10 +1893,9 @@ fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
                 && arrangement::distance_to(&f.boundary, q, TOL) > edge
         })
     };
-    crossings_on(a, &b.surface)
-        .into_iter()
-        .chain(crossings_on(b, &a.surface))
-        .any(|p| well_inside(a, p) && well_inside(b, p))
+    crossings
+        .iter()
+        .any(|&p| well_inside(a, p) && well_inside(b, p))
 }
 
 /// The curves where faces `a` and `b`'s surfaces cross, traced from the crossings over
@@ -1621,6 +1903,11 @@ fn cross_inside(a: &Prepared, b: &Prepared) -> bool {
 /// faces; `None` when they cross inside both but none could be traced (they touch along
 /// a curve, or meet where they touch).
 fn traced(a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
+    traced_from(a, b, &crossings_of(a, b))
+}
+
+/// [`traced`], from crossings already found over the faces' grids.
+fn traced_from(a: &Prepared, b: &Prepared, crossings: &[Point3]) -> Option<Vec<Cut>> {
     // The curves of these two surfaces traced already in this boolean, from other faces on
     // them: one curve is one value, whichever faces it was found from.
     let known: Vec<Trace> = TRACED.with(|t| {
@@ -1633,9 +1920,9 @@ fn traced(a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
             .collect()
     });
     let on_known = |p: Point3| known.iter().any(|t| t.distance(p) <= 100.0 * TOL);
-    let seeds: Vec<Point3> = crossings_on(a, &b.surface)
-        .into_iter()
-        .chain(crossings_on(b, &a.surface))
+    let seeds: Vec<Point3> = crossings
+        .iter()
+        .copied()
         .filter(|&p| !on_known(p))
         .collect();
     let (lo, hi) = (
@@ -1656,7 +1943,7 @@ fn traced(a: &Prepared, b: &Prepared) -> Option<Vec<Cut>> {
         Vec::new()
     } else {
         // Where the surfaces touch on the curve, nothing is traced.
-        crate::trace::traces(&a.surface, &b.surface, &seeds, lo, hi)?
+        crate::trace::traces(&a.surface, &b.surface, &seeds, lo, hi, &known)?
     };
     TRACED.with(|t| t.borrow_mut().extend(found.iter().copied()));
     let cuts: Vec<Cut> = known
@@ -1804,6 +2091,12 @@ fn cut_into(face: &Prepared, cut: &Cut, other: &Prepared) -> Result<Vec<Segment>
                     lay_loop(chart, Curve::Circle(*circle), seam_start(surface, circle)),
                 )
             }
+        }
+        // A B-spline face meets other faces in traced curves only (spline_meet).
+        (Cut::Line(..) | Cut::Circle(..), Chart::Spline { .. }) => {
+            return Err(internal(
+                "a line or a circle cut into a B-spline face".to_owned(),
+            ));
         }
         (Cut::Section(section, start), _) => clipped_into(
             face,
@@ -2298,6 +2591,7 @@ fn ray_hits(surface: &Surface, point: Point3, dir: Vec3) -> Vec<Option<f64>> {
             vec![Some((p.origin - point).dot(p.normal) / denom)]
         }
         Surface::Revolution(r) => r.ray_hits(point, dir).into_iter().map(Some).collect(),
+        Surface::Spline(s) => s.line_hits(point, dir).into_iter().map(Some).collect(),
     }
 }
 
@@ -2389,6 +2683,7 @@ fn same_surface(a: &Surface, b: &Surface) -> bool {
             p.normal.dot(q.normal) > 1.0 - 1e-9 && (q.origin - p.origin).dot(p.normal).abs() <= TOL
         }
         (Surface::Revolution(c), Surface::Revolution(d)) => c.same_as(d, TOL),
+        (Surface::Spline(c), Surface::Spline(d)) => c == d,
         _ => false,
     }
 }
@@ -2902,6 +3197,7 @@ fn same_way(a: &Curve, b: &Curve) -> bool {
         (Curve::Circle(s), Curve::Circle(t)) => s.normal.dot(t.normal) > 0.0,
         (Curve::Section(s), Curve::Section(t)) => s.ccw == t.ccw,
         (Curve::Traced(s), Curve::Traced(t)) => s.up == t.up,
+        (Curve::Spline(s), Curve::Spline(t)) => crate::nurbs::same_way(s, t),
         (Curve::Degenerate { axis: s, .. }, Curve::Degenerate { axis: t, .. }) => s.dot(*t) > 0.0,
         _ => true,
     }

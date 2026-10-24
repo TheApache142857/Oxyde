@@ -37,9 +37,9 @@ normals point into the void (`shells` empty means one shell of every face).
   along as it turns about the axis there, as OpenCASCADE's degenerate edges do. It carries
   its turn and the axis it turns about, belongs to one face and is run along once; or
   **traced**, where two surfaces cross in a curve no closed form or single angle follows
-  (§5).
-- A **face** lies on a surface, a plane (its normal out of the solid) or a surface of
-  revolution, and is bounded by loops of edge uses: the outer one counter-clockwise seen
+  (§5); or a **B-spline** curve.
+- A **face** lies on a surface, a plane (its normal out of the solid), a surface of
+  revolution or a B-spline surface, and is bounded by loops of edge uses: the outer one counter-clockwise seen
   from outside, then its holes, clockwise. A face that goes round its axis whole has a seam,
   an edge it runs along once each way, as OpenCASCADE has it.
 - **Tolerances.** Each vertex and each edge says how far the geometry meeting there may be
@@ -50,6 +50,18 @@ normals point into the void (`shells` empty means one shell of every face).
   not meet, and the operation is refused as a bug. Exact constructions stay at the base, and so do
   sections, each of whose points is found to rounding; curves fitted to others (B-splines,
   §9) will raise them where they need to.
+- **B-splines** (`nurbs.rs`), curves and surfaces, rational or not, of degrees up to 31,
+  written from the mathematics (the algorithms of Piegl and Tiller's *The NURBS Book*):
+  evaluation with derivatives (the basis functions' table on the stack), knot insertion, the
+  nearest point (Newton's method from the last point found on the same surface, and from
+  the nearest of a grid of its points; a tenth of the domain past an open edge, where the
+  last span runs on, so that a distance changes sign smoothly across the surface near its
+  edges), where a line crosses a surface (its Bézier pieces halved while their poles' boxes
+  meet the line, then Newton's method). A B-spline's poles are kept once for the life of
+  the process (the same B-spline made again is found again), and the kernel's curves and
+  surfaces refer to them with the rigid motion that places them: moving or patterning a
+  part never copies them. A face on a B-spline surface is a region of its `(u, v)` plane,
+  its edges taken onto the surface by the nearest point (`spline_face.rs`).
 - Every result is checked before the kernel keeps it (`Solid::check`): every loop closed,
   every edge run along once each way (a degenerate edge once), corners on their face's
   surface and ends on their edge's curve within their tolerances, unit normals, proper
@@ -157,6 +169,41 @@ run along as a segment of constant `v`, a bent edge as 128 of its points, each m
   are named after the faces they are offset from, and so is the rim left round an opening
   (`OffsetFace`); with nothing to open, a void inside or a skin round the solid.
 
+- `loft` (`loft.rs`), with the B-splines of `nurbs.rs`: what OpenCASCADE's
+  `BRepOffsetAPI_ThruSections` builds, observed as a black box (its output's poles, knots
+  and weights read through its public API, never its source), followed to the pole:
+  - **Sections matched.** Sections with as many edges each are matched corner to corner,
+    each one's start and way round chosen to keep its corners nearest the previous one's
+    (the least sum of the distances, of every start and both ways). Otherwise each section
+    is cut at the polar angles, about its centroid along its perimeter, of every section's
+    corners, so that all have a corner at each angle, all run counter-clockwise along the
+    loft and start at the first section's first corner's angle. The angles are taken in
+    each section's frame: the first plane's, carried from plane to plane by the least
+    rotation between their normals.
+  - **Edges as polynomials.** A line is a B-spline of degree one. An arc is the polynomial
+    OpenCASCADE makes of it: of the least degree from 3 to 14 that keeps within 1e-7 mm of
+    the arc at the point of the same fraction of its angle, with the ends and their
+    tangents exact and the rest the least-squares fit; an arc no degree up to 14 follows is
+    halved (a whole circle of radius 100 is two halves of degree 11).
+    `nurbs::polynomial_arc` reproduces OpenCASCADE's poles to 1e-10.
+  - **Ruled lofts, and lofts of two sections.** A face for each pair of edges from one
+    section to the next, straight across: a cone or a cylinder between arcs of circles on
+    one axis at the same angles round it (its axis along the loft), else a B-spline surface
+    of degree one across, the higher of the two edges' degrees along. The sections' edges
+    are their exact lines and circles (the B-spline faces' own edges within 1e-7 of them);
+    the edges up the loft are lines, as B-splines of degree one.
+  - **Smooth lofts** of three sections to nine: one surface for each edge through every
+    section, of degree one less than the number of sections across them, through each
+    section at its share of the polygon of the sections' poles (the root mean square of the
+    distances between corresponding poles: every section's edges raised to the highest
+    degree among them and their knots to one set, each section one curve of all its
+    edges). The end sections' edges are the surfaces' B-spline curves there, the edges up
+    the loft their B-spline curves across. Through ten sections or more OpenCASCADE
+    approximates; the native kernel says it cannot yet.
+  - Faces in OpenCASCADE's order: the side faces span after span, edge after edge from
+    the first corner, then the first section's cap and the last's; a side face holding the
+    middle of one of the first section's edges is named after that edge.
+
 ## 5. Booleans
 
 `boolean.rs` dispatches and checks: a result must be closed (checked when kept), a fuse
@@ -165,8 +212,9 @@ never loses volume, a cut or a common never gains any, nothing reaches beyond th
 - **Every solid** (`curved.rs`), flat-faced or curved, is cut face by face: one engine for
   all (a BSP-tree one for flat-faced solids was dropped once this one was as good, and
   still 10 to 30 times faster than OpenCASCADE's on them). Each face is laid out flat in its
-  chart: a plane's coordinates, or a surface of revolution's `(k θ, m v)`, scaled to lengths,
-  where lines and the circles it shares an axis with are straight or arcs. It is cut along
+  chart: a plane's coordinates, a surface of revolution's `(k θ, m v)`, a B-spline
+  surface's `(k (u − u₀), m (v − v₀))`, scaled to lengths (`k` and `m` the B-spline's mean
+  speeds), where lines and the circles it shares an axis with are straight or arcs. It is cut along
   the curves it shares with the other solid's faces in a planar arrangement of segments and
   arcs (`arrangement.rs`: split where they cross or touch, welded, regions traced round each
   point by direction then curvature; candidate pairs found by sweeping their boxes, points
@@ -252,11 +300,22 @@ never loses volume, a cut or a common never gains any, nothing reaches beyond th
   OpenCASCADE leaves it; a piece round neither, or of any other surface, stays whole. A ring
   torus's face is laid out round its tube from a gap between its pieces before they are
   merged, so that pieces either side of the tube's seam become one face again.
+- **B-spline faces** meet every other face in traced curves: found from the crossings
+  over both faces' grids (against a B-spline's distance only near its face's box, half as
+  fine: the grid on the B-spline face itself, against the other surface, is the fine one),
+  each by regula falsi; a curve running past a B-spline's reach ends there, and one seed
+  near a curve traced already (within a step of it) starts none. Their charts close round
+  where the surface does, with a seam at `u₀` (an edge along `v`, the surface's own curve
+  there); where a cut runs straight across a B-spline face's chart along `u` or `v`, its
+  edge is the surface's curve there, or a line where the surface holds one (a ruled face's
+  rulings). Rays to tell inside from outside cross B-spline faces where their Bézier
+  pieces say. Two faces on one B-spline surface are one surface.
 - These still answer *not supported yet*, and the feature fails with that message, its body
   as it was: surfaces that touch where they cross (a hole whose wall touches a fillet just
   where it crosses it, the curve through the touching point: the tracing stops where the
   normals are within a thousandth of a radian), surfaces that touch along a curve across
-  their faces, and B-spline curves and surfaces.
+  their faces, B-spline faces that touch other faces where they cross them, shells and
+  blends of B-spline faces.
 
 ### Chamfers and fillets
 
@@ -308,7 +367,10 @@ enough for its widest circle, each strip into trapezoids between the boundary's 
 cross it, each trapezoid stitched into triangles between its two sides (rows of points on the
 surface along a curved meridian, or the points of a boundary edge lying there). Every mesh
 vertex on an edge is a point of that edge's polyline or of one of its chords, so faces meet
-without gaps; triangles with two corners at a pole are left out.
+without gaps; triangles with two corners at a pole are left out. A face on a B-spline surface
+is meshed the same way in its `(u, v)` plane, its edges' points taken onto the surface, its
+strips and rows at steps within the deflection by the surface's second derivatives, and
+turning no more than a twelfth of a turn each.
 
 ## 7. Tests
 
@@ -337,11 +399,24 @@ without gaps; triangles with two corners at a pole are left out.
   a round bar, opened at one face, two or none, inwards and outwards, of a block with a
   hole, of one with rounded edges, of a turned cup with a cone, and one too thick; sweeps of
   a circle along a line, an arc, round a circle and along a line and an arc, of a square and
-  a slot along arcs and lines, one cut into a block, and one round a sharp corner, refused.
+  a slot along arcs and lines, one cut into a block, and one round a sharp corner, refused;
+  lofts, ruled and smooth, between squares, circles (cones and cylinders), a circle and a
+  square, a rectangle and a circle, a triangle and a square, slots, rectangles across each
+  other, through three to seven sections of squares, circles, a rectangle, a circle and a
+  square, slots, and to sections on planes at an angle; a loft on a block, one cut through
+  a block, holes across a loft and its corner, a loft cut by a slab beside its axis.
+- In the crate, the B-splines: a rational circle and cylinder against their closed forms,
+  derivatives against differences, knot insertion and degree raising keeping the curve,
+  nearest points and a line's crossings; OpenCASCADE's polynomial arcs to its poles; a smooth
+  loft's faces' integrals against a brute-force double integral of their surfaces (1e-10),
+  its volume against OpenCASCADE's and a loft of circles' against the closed form, its mesh
+  within the deflection.
 - How close is close: 1e-6 relative, except where OpenCASCADE bounds a face by a B-spline it
   fitted to an intersection, or a B-spline surface to a blend, where its areas and volumes
   are only as good as the fit (`FITTED`, 1e-4; §8). A blend face's axis is compared as a
-  line (either way along it) and a corner's sphere by its centre (§8).
+  line (either way along it) and a corner's sphere by its centre (§8). A loft, whose
+  B-splines the native kernel makes as OpenCASCADE does, is held to 1e-6 but for its
+  B-spline faces' areas and centroids (1e-3: OpenCASCADE's own are off, §8).
 - `crates/oxyde-tests/tests/kernel_coverage.rs` is the measure of progress and the
   benchmark: a corpus of parts holding every feature type (the application's demo bracket
   and flange among them) rebuilt by both kernels, feature by feature. It reports what the
@@ -349,14 +424,16 @@ without gaps; triangles with two corners at a pole are left out.
   OpenCASCADE builds, and each kernel's rebuild and meshing time and triangle count
   (`kernel-coverage.md` in Cargo's directory for test files; `OXYDE_CORPUS` adds a folder of
   `.oxyprt` files). It fails when a part listed as built natively stops building or differs
-  from OpenCASCADE's. On the Raspberry Pi, October 2026: 29 of 31 parts, 59 of 61 features,
-  what is left a loft and a STEP import.
+  from OpenCASCADE's. On the Raspberry Pi, October 2026: 30 of 31 parts, 60 of 61 features,
+  what is left a STEP import.
   The native kernel rebuilds what meets in lines and circles 5 to 40 times faster than
-  OpenCASCADE, what meets in sections 1.1 to 3 times faster (two holes crossing: 66 ms
-  against 194 ms; a round bar cut at a slant: 21 against 22), where laying the curves out
-  and merging the pieces takes most of the time, and its blends 10 to 40 times faster (the
-  demo bracket, a fillet and a chamfer on its plate and upright: 10 ms against 90), and its
-  shells and sweeps 25 to 40 times (a block's shell: 1.5 ms against 58).
+  OpenCASCADE, what meets in sections 1.1 to 3 times faster (two holes crossing: 73 ms
+  against 183 ms), where laying the curves out and merging the pieces takes most of the
+  time, its blends 7 to 40 times faster (the demo bracket, a fillet and a chamfer on its
+  plate and upright: 13 ms against 89), its shells and sweeps 15 to 30 times (a block's
+  shell: 1.8 ms against 55), its lofts 2.5 times (a circle to a square: 16 ms against 41).
+  Booleans of B-spline faces are slower: each crossing is traced through searches for the
+  surfaces' nearest points (a smooth loft of circles cut by a slab beside its axis: 2 s).
 
 ## 8. Where it differs from OpenCASCADE
 
@@ -381,6 +458,14 @@ without gaps; triangles with two corners at a pole are left out.
 - A sweep along a path that turns sharply where two of its curves meet: OpenCASCADE builds
   a solid whose part after the corner has no volume; the native kernel refuses it.
 
+- A B-spline face's area and centroid: OpenCASCADE takes them by a Gauss rule of so many
+  points, further off the higher the surface's degree (a smooth loft through four
+  sections: 3e-6 of a face's area; through seven: 1.5e-4 of a face's centroid); the native
+  kernel's match the integral to 1e-10 (adaptive Gauss–Legendre, a traced edge stretch by
+  stretch between its samples). Volumes agree to 1e-9.
+- A smooth loft through ten sections or more: OpenCASCADE approximates through them with
+  knots; the native kernel says it cannot yet.
+
 ## 9. Steps
 
 Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
@@ -396,8 +481,10 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
    polylines and rebuilt as exact edges, with mass properties by quadrature along them;
    faces that only touch or meet along their edges; one boolean engine for every solid;
    traced curves: tori crossed off their axis (a plane beside it, a hole through a torus's
-   side), curves that turn back on themselves (holes partly crossing), holes across fillets.
-   To do: B-spline curves and surfaces, curves through points where the surfaces touch.
+   side), curves that turn back on themselves (holes partly crossing), holes across fillets;
+   B-spline curves and surfaces (evaluation, nearest points, faces on them, their integrals,
+   meshes and booleans, the poles kept once and placed). To do: curves through points
+   where the surfaces touch.
 3. **Done.** Chamfers and fillets: equal, two distances, a distance and an angle; along
    straight edges between planes and parallel cylinders and round edges between surfaces on
    one axis; runs of edges that carry on smoothly; corners of one, two (a mitre) and three
@@ -405,7 +492,10 @@ Each step is tested against OpenCASCADE on the same parts in `oxyde-tests`.
 4. **Done.** Shell, inwards and outwards, opened or closed, by offsets that keep the
    topology (planes, cylinders, cones, spheres, tori moved along their normals); sweep along
    paths of lines and arcs that turn smoothly, glued piece by piece.
-5. Loft.
+5. **Done** (but through ten sections or more). Loft, ruled and smooth, as OpenCASCADE's to
+   the pole: sections matched corner to corner or cut at each other's polar angles, on
+   planes at any angle; cones and cylinders between circles on one axis; joined to, cut
+   from and cut by other bodies.
 6. STEP: writing first, then reading (SolidCraft's Part 21 parser is a start).
 7. Measure, planes normal to a curve, hidden-line drawings, a volume mesher.
 8. The native kernel as the default, once every feature test of `oxyde-tests` passes on it.

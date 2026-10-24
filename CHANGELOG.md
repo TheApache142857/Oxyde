@@ -13,7 +13,7 @@ release yet; the git history has every detail.
 - **Preferences › Debug › Kernel** chooses the kernel parts are built with, from the next
   start: OpenCASCADE or Oxyde's own (experimental); `--kernel occt` or `--kernel native` on
   the command line chooses it for one session. With Oxyde's own, a feature it cannot build
-  yet (a fillet, a shell, a STEP import) fails with a message in the tree and the body
+  yet (a STEP import, a smooth loft through ten sections) fails with a message in the tree and the body
   stays as it was; simulation meshes with the lattice mesher. The About box and the Debug
   page say which kernel the session uses.
 - With Oxyde's own kernel too, opening a part or an assembly, Reload Parts and coming back
@@ -80,6 +80,15 @@ release yet; the git history has every detail.
   through a ring's side), a hole that only partly crosses another, and a hole across a
   fillet or a rounded rim, tracing the curves where the surfaces cross exactly. A hole whose
   wall touches the round just where it crosses it still fails with a message.
+- **Loft** builds with it, ruled or smooth, through two sections to nine: squares to
+  squares, circles to circles (cones and cylinders between circles on one axis), a circle
+  to a square, sections with different numbers of edges (matched round their centres, as
+  OpenCASCADE matches them), sections on planes at an angle. Its faces are B-spline
+  surfaces made as OpenCASCADE makes them, pole for pole, so the shape, the faces and the
+  names are the same with either kernel; joined to a body, cut from one, holed, cut by
+  another. Its faces' areas are exact where OpenCASCADE's are a few parts in a million off.
+  A smooth loft through ten sections or more, and a shell or a fillet of a loft's faces,
+  still fail with a message.
 - **Files**: a part's `manifest.json` now records the kernel that built it, `"kernel": "occt"`
   (FORMAT.md §2). Parts saved before have no key and are read as built by OpenCASCADE; older
   builds of Oxyde ignore the key, so files stay readable both ways and `format_version` is

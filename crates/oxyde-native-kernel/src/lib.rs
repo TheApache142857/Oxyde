@@ -9,11 +9,11 @@
 //! and §10 (Native kernel).
 //!
 //! What it builds so far: boxes, extrusions and revolves of profiles of lines, arcs and
-//! circles (faces on planes, cylinders, cones, spheres and tori; edges on lines, circles,
-//! sections, the exact curves where a cylinder or a cone crosses another surface, traced
-//! curves where other surfaces cross, and degenerate edges at a cone's apex or a sphere's
-//! pole), their moved or mirrored copies, booleans (fuse, cut, common) of them, voids
-//! included, chamfers and fillets of their edges, shells of them, and
+//! circles (faces on planes, cylinders, cones, spheres, tori and B-spline surfaces; edges
+//! on lines, circles, sections, the exact curves where a cylinder or a cone crosses another
+//! surface, traced curves where other surfaces cross, B-spline curves, and degenerate edges
+//! at a cone's apex or a sphere's pole), lofts, their moved or mirrored copies, booleans
+//! (fuse, cut, common) of them, voids included, chamfers and fillets of their edges, shells of them, and
 //! sweeps of profiles along paths of lines and arcs, with their topology, exact mass
 //! properties, bounds and display meshes. Every other operation answers [`NativeError::Unsupported`] until it is written,
 //! so a caller sees a failing feature with a message, never a crash. `docs/NATIVE_KERNEL.md`
@@ -49,9 +49,12 @@ mod brep;
 mod build;
 mod curved;
 mod geometry;
+mod loft;
+mod nurbs;
 mod offset;
 mod revolution;
 mod revolve;
+mod spline_face;
 mod sweep;
 mod tessellate;
 mod trace;
@@ -224,6 +227,20 @@ impl Kernel for NativeKernel {
                 shape: self.insert(shape)?,
                 history,
             })
+        })
+    }
+
+    fn loft(
+        &mut self,
+        sections: &[(Plane, oxyde_geom::Loop)],
+        ruled: bool,
+    ) -> Result<Option<OpResult>, NativeError> {
+        guarded(|| {
+            let (shape, history) = loft::loft(sections, ruled)?;
+            Ok(Some(OpResult {
+                shape: self.insert(shape)?,
+                history,
+            }))
         })
     }
 

@@ -726,6 +726,7 @@ fn normal_at(surface: &Surface, p: Point3) -> Vec3 {
     match surface {
         Surface::Plane(plane) => plane.normal,
         Surface::Revolution(r) => r.normal_at(p),
+        Surface::Spline(s) => s.normal_at(p),
     }
 }
 
@@ -734,7 +735,7 @@ fn tangent_at(solid: &Solid, edge: &Edge, p: Point3) -> Option<Vec3> {
     match edge.curve {
         Curve::Line => (solid.point(edge.end) - solid.point(edge.start)).normalized(),
         Curve::Circle(c) => c.normal.cross(p - c.center).normalized(),
-        Curve::Section(_) | Curve::Traced(_) => {
+        Curve::Section(_) | Curve::Traced(_) | Curve::Spline(_) => {
             let (a, b) = (solid.point(edge.start), solid.point(edge.end));
             let s = edge.curve.position(a, b, p);
             let h = 1e-6;
@@ -1657,7 +1658,7 @@ fn corner_planes(solid: &Solid, meeting: &[&Run]) -> Result<Vec<Plane>, NativeEr
         .iter()
         .map(|&f| match solid.faces[f as usize].surface {
             Surface::Plane(p) => Ok(p),
-            Surface::Revolution(_) => Err(NativeError::Unsupported(
+            Surface::Revolution(_) | Surface::Spline(_) => Err(NativeError::Unsupported(
                 "blend a corner where curved faces meet",
             )),
         })

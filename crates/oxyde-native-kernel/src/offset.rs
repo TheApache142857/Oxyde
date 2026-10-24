@@ -121,6 +121,15 @@ pub(crate) fn shell(
 /// `solid` with each face moved `distances[face]` along its normal (out of the solid for a
 /// positive distance), its topology kept.
 pub(crate) fn offset_solid(solid: &Solid, distances: &[f64]) -> Result<Solid, NativeError> {
+    if solid
+        .faces
+        .iter()
+        .any(|f| matches!(f.surface, Surface::Spline(_)))
+    {
+        return Err(NativeError::Unsupported(
+            "shell a part with B-spline faces (a loft's)",
+        ));
+    }
     let surfaces: Vec<Surface> = solid
         .faces
         .iter()
@@ -235,6 +244,7 @@ fn moved_vertex(
     let normal = |s: &Surface, q: Point3| match s {
         Surface::Plane(plane) => plane.normal,
         Surface::Revolution(r) => r.normal_at(q),
+        Surface::Spline(sp) => sp.normal_at(q),
     };
     // The surfaces round the vertex, each with how far it moves: one surface once, and
     // surfaces meeting smoothly there (a round's cylinder and the face it runs into) as
@@ -441,7 +451,7 @@ fn moved_curve(
             }
             Err(unsupported)
         }
-        Curve::Traced(_) => Err(unsupported),
+        Curve::Traced(_) | Curve::Spline(_) => Err(unsupported),
         Curve::Section(section) => {
             // The same section of the moved surfaces.
             let carrier = moved.iter().find_map(|(old, new)| match (old, new) {

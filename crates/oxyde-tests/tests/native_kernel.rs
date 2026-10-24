@@ -39,6 +39,7 @@ fn measures<K: Kernel>(kernel: &K, shape: ShapeHandle) -> Measures {
 /// native kernel gets, `oxyde-native-kernel`'s tests check that against the integral).
 const EXACT: f64 = 1e-6;
 const FITTED: f64 = 1e-4;
+const HIGH_DEGREE: f64 = 1e-3;
 
 fn assert_close(what: &str, native: f64, occt: f64, tolerance: f64) {
     assert!(
@@ -165,10 +166,25 @@ fn assert_same_faces(what: &str, part: &Part) {
     compare_parts(what, part, false);
 }
 
+/// As [`assert_same_part`], the solids' volumes, centres and bounds held to [`EXACT`] even
+/// where OpenCASCADE's edges or faces are B-splines: where the native kernel makes the same
+/// B-splines (a loft's). A B-spline face's area and centroid are held to [`HIGH_DEGREE`]:
+/// OpenCASCADE takes them by a Gauss rule of so many points, further off the higher the
+/// surface's degree (a smooth loft through four sections, degree 3 across: 3e-6 of its
+/// faces' areas; through seven, degree 6: 1.5e-4 of a face's centroid), where the native
+/// kernel's match the integral to 1e-10 (`oxyde-native-kernel`'s loft tests check it).
+fn assert_same_exactly(what: &str, part: &Part) {
+    compare_parts_within(what, part, true, Some(EXACT));
+}
+
 fn compare_parts(what: &str, part: &Part, every_edge: bool) {
+    compare_parts_within(what, part, every_edge, None);
+}
+
+fn compare_parts_within(what: &str, part: &Part, every_edge: bool, within: Option<f64>) {
     let occt = build(part, &mut OcctKernel::new());
     let native = build(part, &mut NativeKernel::new());
-    let tolerance = if occt.fitted { FITTED } else { EXACT };
+    let tolerance = within.unwrap_or(if occt.fitted { FITTED } else { EXACT });
     assert_eq!(native.solids.len(), occt.solids.len(), "{what}: bodies");
     for (i, (n, o)) in native.solids.iter().zip(&occt.solids).enumerate() {
         if every_edge {
@@ -204,13 +220,15 @@ fn compare_parts(what: &str, part: &Part, every_edge: bool) {
     // Where OpenCASCADE fits a B-spline surface to a blend (a bevel between a cylinder and
     // a cone on one axis), the native kernel makes the exact one, a cone: their areas only
     // as close as the fit.
-    let tolerance = if occt.faces.iter().any(|f| f.surface == SurfaceKind::BSpline) {
-        FITTED
-    } else {
-        tolerance
-    };
+    let any_bspline = occt.faces.iter().any(|f| f.surface == SurfaceKind::BSpline);
     for (n, o) in native.faces.iter().zip(&occt.faces) {
         let name = &n.name;
+        let tolerance = match within {
+            Some(_) if o.surface == SurfaceKind::BSpline => HIGH_DEGREE,
+            Some(t) => t,
+            None if any_bspline => FITTED,
+            None => tolerance,
+        };
         let fitted_blend = o.surface == SurfaceKind::BSpline
             && n.surface != SurfaceKind::Plane
             && matches!(
@@ -1076,20 +1094,21 @@ fn what_the_native_kernel_cannot_do_yet_fails_the_feature_and_keeps_the_body() {
     let mut sketch = on_top(base);
     sketch.circle(Point2::new(20.0, 15.0), 4.0);
     cut(&mut part, sketch, ExtrudeExtent::ThroughAll { both: false });
-    // A loft from a circle on the top to a square above it, which it cannot make yet.
-    let mut round = on_top(base);
-    round.circle(Point2::new(20.0, 15.0), 8.0);
-    let round = part.add_feature(FeatureKind::Sketch(round));
-    let up = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Offset {
-        base: oxyde_model::PlaneRef::Standard(StandardPlane::Front),
-        offset: 25.0,
-        flip: false,
-    }));
-    let mut square = Sketch::new(SketchPlane::Reference(up));
-    square.rectangle(Point2::new(14.0, 9.0), 12.0, 12.0);
-    let square = part.add_feature(FeatureKind::Sketch(square));
+    // A smooth loft through ten squares above it, which it cannot make yet (OpenCASCADE
+    // approximates rather than passes through so many).
+    let mut profiles = Vec::new();
+    for k in 0..10 {
+        let mut square = section_sketch(&mut part, 12.0 + 5.0 * f64::from(k));
+        let side = 12.0 + f64::from(k % 3);
+        square.rectangle(
+            Point2::new(20.0 - side / 2.0, 15.0 - side / 2.0),
+            side,
+            side,
+        );
+        profiles.push(part.add_feature(FeatureKind::Sketch(square)));
+    }
     let loft = part.add_feature(FeatureKind::Loft(oxyde_model::Loft {
-        profiles: vec![round, square],
+        profiles,
         op: ExtrudeOp::Boss,
         ruled: false,
         bodies: Vec::new(),
@@ -2570,4 +2589,311 @@ fn a_hole_touching_a_round_where_it_crosses_it_fails_saying_so() {
         other => panic!("expected an error, got {other:?}"),
     }
     part.release(&mut kernel);
+}
+
+// ---------------------------------------------------------------------------------------
+// Lofts: B-spline surfaces through the sections, as OpenCASCADE makes them.
+
+/// A sketch on the Front plane moved `z` along its normal (the Front plane itself at 0).
+fn section_sketch(part: &mut Part, z: f64) -> Sketch {
+    if z == 0.0 {
+        return front();
+    }
+    let plane = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Offset {
+        base: oxyde_model::PlaneRef::Standard(StandardPlane::Front),
+        offset: z,
+        flip: false,
+    }));
+    Sketch::new(SketchPlane::Reference(plane))
+}
+
+/// What a loft section is: drawn on its sketch.
+type Draw = Box<dyn Fn(&mut Sketch)>;
+
+fn square_of(side: f64) -> Draw {
+    Box::new(move |s: &mut Sketch| {
+        s.rectangle(Point2::new(-side / 2.0, -side / 2.0), side, side);
+    })
+}
+
+fn rectangle_of(w: f64, h: f64) -> Draw {
+    Box::new(move |s: &mut Sketch| {
+        s.rectangle(Point2::new(-w / 2.0, -h / 2.0), w, h);
+    })
+}
+
+fn circle_of(r: f64) -> Draw {
+    Box::new(move |s: &mut Sketch| {
+        s.circle(Point2::ORIGIN, r);
+    })
+}
+
+fn polygon_of(corners: Vec<(f64, f64)>) -> Draw {
+    Box::new(move |s: &mut Sketch| polygon(s, &corners))
+}
+
+/// A slot `w` between its arcs' centres, `r` round them, on the sketch's x axis.
+fn slot_of(w: f64, r: f64) -> Draw {
+    Box::new(move |s: &mut Sketch| {
+        let h = w / 2.0;
+        s.line(Point2::new(-h, -r), Point2::new(h, -r));
+        arc(s, (h, 0.0), (h, -r), (h, r));
+        s.line(Point2::new(h, r), Point2::new(-h, r));
+        arc(s, (-h, 0.0), (-h, r), (-h, -r));
+    })
+}
+
+/// A part of one loft through `sections`, each drawn at its height.
+fn loft_of(sections: Vec<(f64, Draw)>, ruled: bool) -> Part {
+    let mut part = Part::new();
+    let mut profiles = Vec::new();
+    for (z, draw) in sections {
+        let mut sketch = section_sketch(&mut part, z);
+        draw(&mut sketch);
+        profiles.push(part.add_feature(FeatureKind::Sketch(sketch)));
+    }
+    part.add_feature(FeatureKind::Loft(oxyde_model::Loft {
+        profiles,
+        op: ExtrudeOp::NewBody,
+        ruled,
+        bodies: Vec::new(),
+    }));
+    part
+}
+
+#[test]
+fn lofts_between_two_sections() {
+    for ruled in [false, true] {
+        let way = if ruled { "ruled" } else { "smooth" };
+        let cases: Vec<(&str, Vec<(f64, Draw)>)> = vec![
+            (
+                "squares",
+                vec![(0.0, square_of(20.0)), (15.0, square_of(10.0))],
+            ),
+            (
+                "narrowing circles",
+                vec![(0.0, circle_of(10.0)), (15.0, circle_of(5.0))],
+            ),
+            (
+                "widening circles",
+                vec![(0.0, circle_of(5.0)), (15.0, circle_of(10.0))],
+            ),
+            (
+                "equal circles",
+                vec![(0.0, circle_of(10.0)), (15.0, circle_of(10.0))],
+            ),
+            (
+                "a circle to a square",
+                vec![(0.0, circle_of(8.0)), (15.0, square_of(12.0))],
+            ),
+            (
+                "a rectangle to a circle",
+                vec![(0.0, rectangle_of(16.0, 8.0)), (15.0, circle_of(8.0))],
+            ),
+            (
+                "a triangle to a square",
+                vec![
+                    (
+                        0.0,
+                        polygon_of(vec![
+                            (10.0, 0.0),
+                            (-5.0, 8.660254037844386),
+                            (-5.0, -8.660254037844386),
+                        ]),
+                    ),
+                    (15.0, square_of(12.0)),
+                ],
+            ),
+            (
+                "slots",
+                vec![(0.0, slot_of(20.0, 5.0)), (15.0, slot_of(10.0, 3.0))],
+            ),
+            (
+                "a rectangle to one across it",
+                vec![
+                    (0.0, rectangle_of(16.0, 8.0)),
+                    (15.0, rectangle_of(8.0, 16.0)),
+                ],
+            ),
+        ];
+        for (what, sections) in cases {
+            assert_same_exactly(&format!("{way} loft, {what}"), &loft_of(sections, ruled));
+        }
+    }
+}
+
+#[test]
+fn lofts_through_three_sections_and_more() {
+    let squares = |secs: &[(f64, f64)]| -> Vec<(f64, Draw)> {
+        secs.iter().map(|&(z, s)| (z, square_of(s))).collect()
+    };
+    let circles = |secs: &[(f64, f64)]| -> Vec<(f64, Draw)> {
+        secs.iter().map(|&(z, s)| (z, circle_of(s / 2.0))).collect()
+    };
+    let spacings: [&[(f64, f64)]; 4] = [
+        &[(0.0, 20.0), (5.0, 10.0), (20.0, 20.0)],
+        &[(0.0, 20.0), (4.0, 10.0), (20.0, 15.0), (24.0, 20.0)],
+        &[
+            (0.0, 20.0),
+            (3.0, 10.0),
+            (11.0, 15.0),
+            (30.0, 20.0),
+            (32.0, 8.0),
+        ],
+        &[
+            (0.0, 20.0),
+            (10.0, 10.0),
+            (20.0, 15.0),
+            (30.0, 20.0),
+            (40.0, 8.0),
+            (50.0, 12.0),
+            (60.0, 14.0),
+        ],
+    ];
+    for secs in spacings {
+        for ruled in [false, true] {
+            let way = if ruled { "ruled" } else { "smooth" };
+            assert_same_exactly(
+                &format!("{way} squares {secs:?}"),
+                &loft_of(squares(secs), ruled),
+            );
+            assert_same_exactly(
+                &format!("{way} circles {secs:?}"),
+                &loft_of(circles(secs), ruled),
+            );
+        }
+    }
+    let mixed: Vec<(f64, Draw)> = vec![
+        (0.0, rectangle_of(16.0, 8.0)),
+        (4.0, circle_of(8.0)),
+        (20.0, square_of(10.0)),
+    ];
+    assert_same_exactly("smooth rectangle, circle, square", &loft_of(mixed, false));
+    let slots: Vec<(f64, Draw)> = vec![
+        (0.0, slot_of(20.0, 5.0)),
+        (10.0, slot_of(10.0, 3.0)),
+        (25.0, slot_of(16.0, 4.0)),
+    ];
+    assert_same_exactly("smooth slots", &loft_of(slots, false));
+}
+
+/// A loft of `op` through `sections` drawn on sketches the caller made.
+fn loft_feature(
+    part: &mut Part,
+    profiles: Vec<FeatureId>,
+    op: ExtrudeOp,
+    ruled: bool,
+) -> FeatureId {
+    part.add_feature(FeatureKind::Loft(oxyde_model::Loft {
+        profiles,
+        op,
+        ruled,
+        bodies: Vec::new(),
+    }))
+}
+
+#[test]
+fn lofts_joined_to_cut_from_and_cut_by_other_bodies() {
+    // A loft from a circle on a block's top up to a square, joined to the block.
+    let mut part = Part::new();
+    let base = base_block(&mut part);
+    let mut round = on_top(base);
+    round.circle(Point2::new(20.0, 15.0), 8.0);
+    let round = part.add_feature(FeatureKind::Sketch(round));
+    let mut square = section_sketch(&mut part, 25.0);
+    square.rectangle(Point2::new(14.0, 9.0), 12.0, 12.0);
+    let square = part.add_feature(FeatureKind::Sketch(square));
+    loft_feature(&mut part, vec![round, square], ExtrudeOp::Boss, false);
+    assert_same_exactly("a loft on a block", &part);
+
+    // A smooth loft of three circles cut out of a block, through it.
+    let mut part = Part::new();
+    base_block(&mut part);
+    let mut profiles = Vec::new();
+    for (z, r) in [(-5.0, 6.0), (5.0, 9.0), (15.0, 5.0)] {
+        let mut s = section_sketch(&mut part, z);
+        s.circle(Point2::new(20.0, 15.0), r);
+        profiles.push(part.add_feature(FeatureKind::Sketch(s)));
+    }
+    loft_feature(&mut part, profiles, ExtrudeOp::Cut, false);
+    assert_same_part("a smooth loft cut through a block", &part);
+
+    // A hole across a smooth loft of squares.
+    let mut part = Part::new();
+    let mut profiles = Vec::new();
+    for (z, side) in [(0.0, 20.0), (10.0, 14.0), (25.0, 18.0)] {
+        let mut s = section_sketch(&mut part, z);
+        s.rectangle(Point2::new(-side / 2.0, -side / 2.0), side, side);
+        profiles.push(part.add_feature(FeatureKind::Sketch(s)));
+    }
+    loft_feature(&mut part, profiles, ExtrudeOp::NewBody, false);
+    let solid_loft = Part::from_definition(part.definition()).unwrap();
+    // On the Right plane, the sketch's x runs down the model's z.
+    let mut hole = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    hole.circle(Point2::new(-12.0, 0.0), 3.0);
+    cut(&mut part, hole, ExtrudeExtent::ThroughAll { both: true });
+    assert_same_part("a hole across a smooth loft", &part);
+    // And one across its bottom corner, partly in it.
+    let mut part = solid_loft;
+    let mut hole = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    hole.circle(Point2::new(0.0, 12.0), 3.0);
+    cut(&mut part, hole, ExtrudeExtent::ThroughAll { both: true });
+    assert_same_part("a hole across a smooth loft's corner", &part);
+
+    // A smooth loft of circles cut by a slab beside its axis.
+    let mut part = Part::new();
+    let mut profiles = Vec::new();
+    for (z, r) in [(0.0, 10.0), (10.0, 6.0), (20.0, 9.0)] {
+        let mut s = section_sketch(&mut part, z);
+        s.circle(Point2::ORIGIN, r);
+        profiles.push(part.add_feature(FeatureKind::Sketch(s)));
+    }
+    loft_feature(&mut part, profiles, ExtrudeOp::NewBody, false);
+    let mut slab = Sketch::new(SketchPlane::Standard(StandardPlane::Right));
+    slab.rectangle(Point2::new(-24.0, -5.0), 20.0, 30.0);
+    cut(&mut part, slab, ExtrudeExtent::ThroughAll { both: true });
+    assert_same_part("a smooth loft of circles cut beside its axis", &part);
+}
+
+#[test]
+fn lofts_to_sections_on_planes_at_an_angle() {
+    // The Front plane turned about the X axis, then moved along its normal: a sketch on it
+    // keeps the Front plane's frame, turned with it.
+    let tilted = |part: &mut Part, angle: f64, offset: f64| -> Sketch {
+        let turned = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Angle {
+            base: oxyde_model::PlaneRef::Standard(StandardPlane::Front),
+            line: AxisRef::Standard(StandardAxis::X),
+            angle,
+            flip: false,
+        }));
+        let up = part.add_feature(FeatureKind::Plane(oxyde_model::RefPlane::Offset {
+            base: oxyde_model::PlaneRef::Reference(turned),
+            offset,
+            flip: false,
+        }));
+        Sketch::new(SketchPlane::Reference(up))
+    };
+    let cases: Vec<(&str, Draw, Draw)> = vec![
+        ("a square to a smaller one", square_of(20.0), square_of(10.0)),
+        (
+            "a square to a triangle",
+            square_of(20.0),
+            polygon_of(vec![(8.0, 0.0), (-4.0, 6.928203230275509), (-4.0, -6.928203230275509)]),
+        ),
+        ("a circle to a square", circle_of(8.0), square_of(12.0)),
+        ("a rectangle to a circle", rectangle_of(16.0, 8.0), circle_of(6.0)),
+    ];
+    for (what, first, last) in cases {
+        for ruled in [false, true] {
+            let mut part = Part::new();
+            let mut a = front();
+            first(&mut a);
+            let a = part.add_feature(FeatureKind::Sketch(a));
+            let mut b = tilted(&mut part, 30f64.to_radians(), 15.0);
+            last(&mut b);
+            let b = part.add_feature(FeatureKind::Sketch(b));
+            loft_feature(&mut part, vec![a, b], ExtrudeOp::NewBody, ruled);
+            assert_same_exactly(&format!("{what} at an angle, ruled {ruled}"), &part);
+        }
+    }
 }

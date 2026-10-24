@@ -24,7 +24,7 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use oxyde_geom::{LINEAR_TOLERANCE, Point3, Transform, Vec3};
 
-use crate::geometry::Surface;
+use crate::geometry::{Curve, Surface};
 use crate::revolution::Meridian;
 
 /// A curve where two surfaces cross, followed from `start`: the way it runs from there is
@@ -91,6 +91,21 @@ fn surface_bits(s: &Surface, out: &mut Vec<u64>) {
             }
             out.push(u64::from(r.outward));
         }
+        Surface::Spline(sp) => {
+            out.extend([4, sp.data.hash, u64::from(sp.outward)]);
+            for row in sp.place.rows {
+                out.extend(row.iter().map(|x| x.to_bits()));
+            }
+        }
+    }
+}
+
+/// How far `p` is from the surface, signed ([`Surface::signed_distance`]), and the
+/// surface's normal there: a B-spline's both from one search for its nearest point.
+fn side(s: &Surface, p: Point3) -> (f64, Vec3) {
+    match s {
+        Surface::Spline(sp) => sp.signed_distance_normal(p),
+        _ => (s.signed_distance(p), normal(s, p)),
     }
 }
 
@@ -99,6 +114,7 @@ fn normal(s: &Surface, p: Point3) -> Vec3 {
     match s {
         Surface::Plane(plane) => plane.normal,
         Surface::Revolution(r) => r.normal_at(p),
+        Surface::Spline(s) => s.normal_at(p),
     }
 }
 
@@ -126,20 +142,48 @@ fn solve(rows: [Vec3; 3], b: [f64; 3]) -> Option<Vec3> {
 /// `guess` moved onto both surfaces, keeping its place along `t` (in the plane through it
 /// square to `t`).
 pub(crate) fn onto_both(a: &Surface, b: &Surface, guess: Point3, t: Vec3) -> Option<Point3> {
+    onto_both_normals(a, b, guess, t).map(|r| r.0)
+}
+
+/// [`onto_both`], and the surfaces' normals at the point.
+fn onto_both_normals(
+    a: &Surface,
+    b: &Surface,
+    guess: Point3,
+    t: Vec3,
+) -> Option<(Point3, Vec3, Vec3)> {
     let mut q = guess;
     for _ in 0..30 {
-        let r = [
-            -a.signed_distance(q),
-            -b.signed_distance(q),
-            -(q - guess).dot(t),
-        ];
-        let step = solve([normal(a, q), normal(b, q), t], r)?;
+        let ((da, na), (db, nb)) = (side(a, q), side(b, q));
+        // On both to rounding: there.
+        if da.abs() < 1e-13 && db.abs() < 1e-13 {
+            return Some((q, na, nb));
+        }
+        let r = [-da, -db, -(q - guess).dot(t)];
+        let step = solve([na, nb, t], r)?;
         q = q + step;
         if step.length() < 1e-14 {
             break;
         }
     }
-    (a.signed_distance(q).abs() < 1e-9 && b.signed_distance(q).abs() < 1e-9).then_some(q)
+    let ((da, na), (db, nb)) = (side(a, q), side(b, q));
+    (da.abs() < 1e-9 && db.abs() < 1e-9).then_some((q, na, nb))
+}
+
+/// Whether `p` lies past a B-spline surface's reach: its nearest point more than a
+/// twentieth of the domain past an open edge, half the way the surface's last span is run
+/// on there ([`crate::nurbs::SurfaceData::nearest`]). A plane or a surface of revolution
+/// reaches everywhere.
+fn past_reach(s: &Surface, p: Point3) -> bool {
+    let Surface::Spline(sp) = s else {
+        return false;
+    };
+    let (u, v) = sp.params(p);
+    [(0, u), (1, v)].iter().any(|&(d, x)| {
+        let (lo, hi) = sp.domain(d);
+        let m = 0.05 * (hi - lo);
+        !sp.data.closed[d] && (x < lo - m || x > hi + m)
+    })
 }
 
 /// A length the two surfaces are about the size of: what steps are scaled by.
@@ -150,6 +194,7 @@ fn scale(a: &Surface, b: &Surface) -> f64 {
             Meridian::Line { radius, .. } => radius.abs().max(1.0),
             Meridian::Circle { radius, .. } => radius,
         },
+        Surface::Spline(sp) => sp.scale(),
     };
     let s = size(a).min(size(b));
     if s.is_finite() { s } else { 10.0 }
@@ -202,13 +247,21 @@ fn march(
         }
         // At the end of a curve already traced, the last step lands on its end.
         let step = h.min(limit - s);
-        let Some(q) = onto_both(a, b, p + t * step, t) else {
+        let guess = p + t * step;
+        let Some(q) = onto_both(a, b, guess, t) else {
+            if past_reach(a, guess) || past_reach(b, guess) {
+                return (points, Ended::Out);
+            }
             if h > h_min {
                 h /= 2.0;
                 continue;
             }
             return (points, Ended::Touched);
         };
+        // Run off a B-spline surface: the curve ends there, as where it leaves the box.
+        if past_reach(a, q) || past_reach(b, q) {
+            return (points, Ended::Out);
+        }
         let Some(tq) = direction(a, b, forward, q) else {
             return (points, Ended::Touched);
         };
@@ -352,6 +405,59 @@ impl Trace {
         Some(onto_both(&self.a, &self.b, guess, tangent).unwrap_or(guess))
     }
 
+    /// The parameters of its samples.
+    pub fn sample_params(&self) -> Vec<f64> {
+        self.samples().points.iter().map(|p| p.0).collect()
+    }
+
+    /// The point at `s` and the curve's derivative along its parameter there: along its
+    /// tangent (the cross product of the surfaces' normals), as fast as the cubic between
+    /// the samples about it runs that way (which taking the cubic's point onto both
+    /// surfaces keeps).
+    pub fn point_and_derivative(&self, s: f64) -> Option<(Point3, Vec3)> {
+        let samples = self.samples();
+        let points = &samples.points;
+        let n = points.len();
+        if n < 2 {
+            return None;
+        }
+        let end = points[n - 1].0;
+        let s = if self.closed {
+            s.rem_euclid(end.max(f64::MIN_POSITIVE))
+        } else {
+            s.clamp(0.0, end)
+        };
+        let k = points.partition_point(|p| p.0 <= s).clamp(1, n - 1);
+        let (s0, p0, t0) = points[k - 1];
+        let (s1, p1, t1) = points[k];
+        let h = s1 - s0;
+        if h <= 0.0 {
+            return Some((p0, t0));
+        }
+        let u = (s - s0) / h;
+        let (d00, d10, d01, d11) = (
+            6.0 * u * u - 6.0 * u,
+            3.0 * u * u - 4.0 * u + 1.0,
+            -6.0 * u * u + 6.0 * u,
+            3.0 * u * u - 2.0 * u,
+        );
+        let rate =
+            (p0.to_vec() * d00 + t0 * (h * d10) + p1.to_vec() * d01 + t1 * (h * d11)) * (1.0 / h);
+        let (h00, h10, h01, h11) = (
+            2.0 * u * u * u - 3.0 * u * u + 1.0,
+            u * u * u - 2.0 * u * u + u,
+            -2.0 * u * u * u + 3.0 * u * u,
+            u * u * u - u * u,
+        );
+        let guess =
+            p0 + (p0.to_vec() * (h00 - 1.0) + t0 * (h * h10) + p1.to_vec() * h01 + t1 * (h * h11));
+        let tangent = (t0 * (1.0 - u) + t1 * u).normalized().unwrap_or(t0);
+        let (q, na, nb) = onto_both_normals(&self.a, &self.b, guess, tangent)?;
+        let t = na.cross(nb).normalized()?;
+        let t = if self.forward { t } else { -t };
+        Some((q, t * rate.dot(t)))
+    }
+
     /// How far the curve runs from its start: its whole length round a closed one.
     pub fn span(&self) -> f64 {
         self.samples().points.last().map_or(0.0, |p| p.0)
@@ -380,21 +486,18 @@ impl Trace {
         }
         // Refined: where the curve's tangent is square to the way to `p`.
         let mut s = best.1;
-        let h = 1e-6 * self.span().max(1.0);
+        let span = self.span().max(1.0);
         for _ in 0..8 {
-            let (Some(q), Some(q1), Some(q0)) =
-                (self.point_at(s), self.point_at(s + h), self.point_at(s - h))
-            else {
+            let Some((q, d)) = self.point_and_derivative(s) else {
                 break;
             };
-            let d = (q1 - q0) * (1.0 / (2.0 * h));
             let dd = d.dot(d);
             if dd <= 0.0 {
                 break;
             }
             let step = (p - q).dot(d) / dd;
             s += step;
-            if step.abs() < 1e-13 {
+            if step.abs() < 1e-13 * span {
                 break;
             }
         }
@@ -406,7 +509,7 @@ impl Trace {
     }
 
     /// The parameter of `p`, remembered for the points looked up lately.
-    fn param_of_remembered(&self, p: Point3) -> f64 {
+    pub fn param_of_remembered(&self, p: Point3) -> f64 {
         let key = self.key();
         let at = [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
         if let Some(found) = PARAMS.with(|m| {
@@ -519,12 +622,23 @@ impl Trace {
 
     /// Its length from `start` along `extent`, by quadrature of its speed.
     pub fn length_from(&self, start: Point3, extent: f64) -> f64 {
-        let h = 1e-6 * extent.max(1.0);
-        let speed = |s: f64| match (self.along(start, s + h), self.along(start, s - h)) {
-            (Some(a), Some(b)) => a.distance(b) / (2.0 * h),
-            _ => 1.0,
-        };
-        crate::revolution::quadrature(0.0, extent, extent / 32.0, &speed)
+        // Its speed by its own derivative, over each stretch between its samples (a cubic
+        // there, taken onto both surfaces) by the four-point Gauss–Legendre rule.
+        let curve = Curve::Traced(*self);
+        let mut ends = vec![0.0];
+        ends.extend(curve.smooth_breaks(start, extent));
+        ends.push(extent);
+        let (x, w) = (0.861_136_311_594_052_6, 0.347_854_845_137_453_9);
+        let (y, v) = (0.339_981_043_584_856_3, 0.652_145_154_862_546_1);
+        let mut total = 0.0;
+        for pair in ends.windows(2) {
+            let (mid, half) = ((pair[0] + pair[1]) / 2.0, (pair[1] - pair[0]) / 2.0);
+            for (t, weight) in [(-x, w), (-y, v), (y, v), (x, w)] {
+                let (_, rate) = curve.point_rate(start, start, extent, mid + half * t);
+                total += weight * half * rate.length();
+            }
+        }
+        total
     }
 
     /// The extremes an edge from `start` running `extent` reaches along each model axis,
@@ -572,17 +686,23 @@ impl Trace {
 }
 
 /// The curves where surfaces `a` and `b` cross near `seeds` (points on both, or near both),
-/// within the box `lo`–`hi`: each traced both ways from the first seed not already on one,
-/// a closed one from that seed, an open one from where it leaves the box, along `n_a × n_b`.
+/// within the box `lo`–`hi`: each traced both ways from the first seed not already on one
+/// (of these, or of the `known` ones traced before), a closed one from that seed, an open
+/// one from where it leaves the box, along `n_a × n_b`.
 pub(crate) fn traces(
     a: &Surface,
     b: &Surface,
     seeds: &[Point3],
     lo: Point3,
     hi: Point3,
+    known: &[Trace],
 ) -> Option<Vec<Trace>> {
     let mut out: Vec<(Trace, Vec<Point3>)> = Vec::new();
     let near = 0.05 * scale(a, b);
+    let known_points: Vec<Vec<Point3>> = known
+        .iter()
+        .map(|t| t.samples().points.iter().map(|p| p.1).collect())
+        .collect();
     for &seed in seeds {
         let Some(t) = direction(a, b, true, seed) else {
             continue;
@@ -590,9 +710,15 @@ pub(crate) fn traces(
         let Some(seed) = onto_both(a, b, seed, t) else {
             continue;
         };
+        // Past a B-spline surface's reach the curve is not followed (`march` stops there).
+        if past_reach(a, seed) || past_reach(b, seed) {
+            continue;
+        }
         if out
             .iter()
-            .any(|(_, pts)| pts.iter().any(|p| p.distance(seed) <= near))
+            .map(|(_, pts)| pts)
+            .chain(&known_points)
+            .any(|pts| pts.iter().any(|p| p.distance(seed) <= near))
         {
             continue;
         }
@@ -673,7 +799,7 @@ mod tests {
         let seeds = [Point3::new(8.0, 9.0, 0.0), Point3::new(8.0, -9.0, 0.0)];
         let lo = Point3::new(-20.0, -20.0, -20.0);
         let hi = Point3::new(20.0, 20.0, 20.0);
-        let found = traces(&plane, &torus(), &seeds, lo, hi).unwrap();
+        let found = traces(&plane, &torus(), &seeds, lo, hi, &[]).unwrap();
         assert!(!found.is_empty());
         for trace in &found {
             assert!(trace.closed, "{trace:?}");
