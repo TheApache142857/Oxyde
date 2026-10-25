@@ -3,6 +3,7 @@
 //! [`crate::looking`], [`crate::assembling`]).
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use oxyde_format::Properties;
 use oxyde_model::{Appearance, MaterialLibrary};
@@ -566,7 +567,17 @@ pub fn list() -> Vec<Value> {
 
 /// Whether there is a tool of that name.
 pub fn exists(name: &str) -> bool {
-    list().iter().any(|t| t["name"] == name)
+    // The names once: the list builds every tool's schema, which a call has no use for.
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            list()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .iter()
+        .any(|n| n == name)
 }
 
 /// The tools a session offers: in an Oxyde window, all but those that choose or save the

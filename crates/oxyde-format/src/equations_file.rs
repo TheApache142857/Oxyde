@@ -69,10 +69,39 @@ pub fn read_equations_file(path: &Path) -> Result<Vec<LinkedValue>, FormatError>
     parse_equations_file(&std::fs::read_to_string(path)?)
 }
 
+/// Refuses a value that would not read back from the file: a name that is not a valid
+/// variable name, an empty expression, or one spread over several lines (the rest of it
+/// would become another line of the file, so it must stay on one).
+fn check_value(value: &LinkedValue) -> Result<(), FormatError> {
+    let invalid =
+        |reason: String| FormatError::InvalidModel(oxyde_model::ModelError::Expression(reason));
+    if !oxyde_sketch::is_valid_name(&value.name) {
+        return Err(invalid(format!(
+            "\"{}\" is not a valid variable name for an equations file",
+            value.name
+        )));
+    }
+    let expression = value.expression.trim();
+    if expression.is_empty() {
+        return Err(invalid(format!("\"{}\" has no expression", value.name)));
+    }
+    if expression.chars().any(char::is_control) {
+        return Err(invalid(format!(
+            "the expression of \"{}\" must be on one line",
+            value.name
+        )));
+    }
+    Ok(())
+}
+
 /// Writes the variables `values` into the equations file at `path`: lines naming one of them
 /// get its new expression, the others are added at the end, and every other line (comments,
-/// other variables) is kept as it was. The file is created if it does not exist.
+/// other variables) is kept as it was. The file is created if it does not exist. A value
+/// that would not read back (see [`check_value`]) is refused before the file is touched.
 pub fn update_equations_file(path: &Path, values: &[LinkedValue]) -> Result<(), FormatError> {
+    for value in values {
+        check_value(value)?;
+    }
     let old = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -110,6 +139,8 @@ pub fn update_equations_file(path: &Path, values: &[LinkedValue]) -> Result<(), 
             text.push_str(&format!("\"{}\" = {}\n", v.name, v.expression));
         }
     }
+    // And one that would not read back once written.
+    parse_equations_file(&text)?;
     crate::write_file(path, text.as_bytes())
 }
 
@@ -200,6 +231,34 @@ mod tests {
             text,
             "' Case\n\"Width\" = 233\n\"Depth\" = 320\n\"Height\" = 290\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A value the file could not give back is refused, and the file is left as it was.
+    #[test]
+    fn values_that_would_not_read_back_are_refused_before_writing() {
+        let dir = std::env::temp_dir().join(format!("oxyde-eqfile-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Case.txt");
+        std::fs::write(&path, "\"Width\" = 233\n").unwrap();
+        let set = |name: &str, expression: &str| LinkedValue {
+            name: name.to_owned(),
+            expression: expression.to_owned(),
+        };
+        for bad in [
+            set("Width", ""),
+            set("Width", "30 +\n2"),
+            set("Width", "1\n\"Evil\" = 2"),
+            set("Wi\"dth", "3"),
+            set("D1@Sketch1", "3"),
+            set(" Width", "3"),
+        ] {
+            assert!(
+                update_equations_file(&path, std::slice::from_ref(&bad)).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "\"Width\" = 233\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

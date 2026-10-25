@@ -181,7 +181,14 @@ impl Session {
                 Ok(value)
             }
             Err(e) => {
-                self.restore(before, labels);
+                // A change refused before it touched the part (a bad argument, a name that
+                // does not exist) leaves nothing to put back; one refused half-way is undone
+                // from the snapshot, which rebuilds the part from its first feature.
+                if doc.part.definition() != before {
+                    self.restore(before, labels);
+                } else {
+                    doc.labels = labels;
+                }
                 Err(e)
             }
         }

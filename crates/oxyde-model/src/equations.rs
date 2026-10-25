@@ -897,6 +897,11 @@ impl Part {
             }
             return Ok((dimension.unit.to_display(new), changed));
         }
+        // A dimension refuses this in `set_dimension`; a variable would print as "inf" and
+        // not read back.
+        if !value.is_finite() {
+            return Err(format!("{value} is not a number"));
+        }
         let global = self
             .equations
             .globals

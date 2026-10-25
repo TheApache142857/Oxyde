@@ -368,10 +368,34 @@ mod display_style {
 impl Preferences {
     /// The saved preferences, or the defaults when there are none or they cannot be read.
     pub fn load() -> Self {
-        path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|bytes| Self::from_json(&bytes))
-            .unwrap_or_default()
+        Self::load_reporting().0
+    }
+
+    /// [`Preferences::load`], also saying when the file was there but could not be read:
+    /// the defaults are used then, and the file is kept as `preferences.json.bak`, so that
+    /// the next save does not write over the shortcuts and recent files it holds.
+    pub fn load_reporting() -> (Self, Option<String>) {
+        let Some(path) = path() else {
+            return (Self::default(), None);
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return (Self::default(), None);
+        };
+        match Self::from_json(&bytes) {
+            Some(prefs) => (prefs, None),
+            None => {
+                let backup = path.with_extension("json.bak");
+                let message = if std::fs::copy(&path, &backup).is_ok() {
+                    format!(
+                        "Preferences could not be read and were reset; the old file is kept as {}",
+                        backup.display()
+                    )
+                } else {
+                    "Preferences could not be read and were reset".to_owned()
+                };
+                (Self::default(), Some(message))
+            }
+        }
     }
 
     /// Preferences read from their file, older files brought up to date: one with edges

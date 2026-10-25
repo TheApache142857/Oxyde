@@ -94,7 +94,8 @@ pub fn find_program(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// A random token, so that only the agent this window started reaches it: the standard
-/// library's hasher keys are random for each process and each `RandomState`.
+/// library's hasher is keyed from the operating system's randomness (once per thread, the
+/// key then stepped for each `RandomState`), so its output cannot be guessed from outside.
 fn token() -> String {
     let mut out = String::new();
     for _ in 0..2 {
@@ -351,18 +352,21 @@ impl Drop for Agent {
         };
         let _ = std::thread::Builder::new()
             .name("assistant-agent-stop".to_owned())
-            .spawn(move || {
-                let start = std::time::Instant::now();
-                while start.elapsed() < STOP_GRACE {
-                    if !matches!(child.try_wait(), Ok(None)) {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-            });
+            .spawn(move || stop_child(&mut child));
     }
+}
+
+/// Waits up to [`STOP_GRACE`] for an agent whose input was closed to end, then kills it.
+fn stop_child(child: &mut Child) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < STOP_GRACE {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---- The conversation ----------------------------------------------------------------------
@@ -518,6 +522,19 @@ impl Assistant {
                 chosen.get_or_insert_with(|| "cancelled".to_owned());
             }
         }
+    }
+
+    /// Stops the agent and waits for it to end, on this thread: when the window closes. The
+    /// thread that [`Agent`]'s drop would leave to do it dies with the process, and an
+    /// agent that ignores its closed input would live on after Oxyde.
+    pub fn shutdown(&mut self) {
+        if let Some(mut agent) = self.agent.take() {
+            agent.stdin = None;
+            if let Some(mut child) = agent.child.take() {
+                stop_child(&mut child);
+            }
+        }
+        self.disconnect();
     }
 
     /// Stops the agent and clears the conversation. (The window frees the MCP session's

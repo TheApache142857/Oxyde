@@ -5,6 +5,40 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Fixes from a code review (unreleased, October 2026)
+
+- **A linked equations file can no longer be broken by what is written into it.** A variable
+  name that is not valid, an empty expression or one spread over several lines is refused
+  before the file is touched, in the Equations windows and through the MCP server's
+  `set_variable` and `link_equations`. Until now such a value went into the file; every
+  document linked to it then silently kept its old values, and the file could only be mended
+  in a text editor.
+- **A number too large for an equation (`1e999`) is refused when typed.** It used to be
+  accepted as infinity and shown as an error, after which every save of the part was refused
+  with "the file would not open again", until the equation was found and fixed.
+- **Edit locks tell a running window from a crashed one on macOS.** Whether the window that
+  wrote a lock still ran was read from `/proc`, which macOS does not have, and the computer's
+  name from a shell variable a window started from the desktop does not see: on a Mac every
+  other window's lock looked like one left by a crash and was taken over without asking.
+  Locks now ask the system for both, on every platform.
+- **An agent's refused tool call no longer rebuilds the whole part.** A call refused before it
+  changed anything (a bad argument, a name that does not exist) used to put the part back
+  from its snapshot, which rebuilt it from the first feature; in the assistant panel the
+  window froze for as long as that took on every mistake of the agent's.
+- **The assistant's agent works in a scratch folder of Oxyde's when the document is not
+  saved** (in the temporary folder), no longer in the user's home folder.
+- **The agent of the assistant panel is stopped and waited for when the window closes**;
+  before, one that ignored its closed input could live on after Oxyde quit.
+- **A flow study's case folder is cleared only when it is a case of Oxyde's, or empty.** The
+  files and folders removed before a run are picked by name (`system`, time folders,
+  `log.*`…), so a folder of the user's that happened to be there is now refused, with a
+  message, instead of emptied.
+- **Preferences that cannot be read are kept as `preferences.json.bak`**, and the status bar
+  says so, instead of the file being written over by the defaults at the next save without a
+  word.
+- The thermal expansion field of a cooling study reads `×0.001/K` instead of `×10⁻³/K`: the
+  superscript minus had no glyph in the fonts used on macOS and Linux and showed as a box.
+
 ### Equations: clicking variables in a long tree, and name fields that fit (unreleased, October 2026)
 
 - **Clicking a variable in the tree's Equations folders now works when the tree is long

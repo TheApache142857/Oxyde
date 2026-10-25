@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -70,18 +71,49 @@ impl LockInfo {
     }
 }
 
+/// This computer's name, asked once: `COMPUTERNAME` on Windows, the system's `gethostname`
+/// elsewhere (`HOSTNAME` is a shell variable that a window started from the desktop does
+/// not see, and macOS has no `/etc/hostname`), then those two as fallbacks.
 fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            std::env::var("COMPUTERNAME")
                 .ok()
-                .map(|h| h.trim().to_owned())
                 .filter(|h| !h.is_empty())
+                .or_else(system_hostname)
+                .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
+                .or_else(|| {
+                    std::fs::read_to_string("/etc/hostname")
+                        .ok()
+                        .map(|h| h.trim().to_owned())
+                        .filter(|h| !h.is_empty())
+                })
+                .unwrap_or_else(|| "this computer".to_owned())
         })
-        .unwrap_or_else(|| "this computer".to_owned())
+        .clone()
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    unsafe extern "C" {
+        fn gethostname(name: *mut u8, len: usize) -> i32;
+    }
+    let mut buffer = [0u8; 256];
+    // SAFETY: `gethostname` writes at most `len` bytes into `name`, a buffer of exactly
+    // that size that outlives the call.
+    if unsafe { gethostname(buffer.as_mut_ptr(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&b| b == 0).unwrap_or(buffer.len());
+    let bytes = buffer.get(..end).unwrap_or_default();
+    let name = String::from_utf8_lossy(bytes).trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 /// Whether a process with this id runs on this computer.
@@ -101,9 +133,34 @@ fn process_alive(pid: u32) -> bool {
             Err(_) => true,
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        Path::new(&format!("/proc/{pid}")).exists()
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        // No process has an id a `pid_t` cannot hold, nor 0 or less (those name process
+        // groups): such a lock was not written by a window.
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // Signal 0 sends nothing and says whether the process exists: it does when the call
+        // succeeds, and also when it is refused because the process is another user's
+        // (EPERM); only "no such process" (ESRCH, 3 on every Unix) says it is gone. (macOS
+        // has no `/proc` to look in.)
+        // SAFETY: `kill` with signal 0 only consults the process table.
+        if unsafe { kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(3)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        // Cannot tell: assume it runs, so nothing is taken over by mistake.
+        let _ = pid;
+        true
     }
 }
 
@@ -141,10 +198,11 @@ impl Locks {
         if self.held.contains(document) {
             return Ok(());
         }
-        if let Some(existing) = read(document) {
-            if !existing.is_ours() && !existing.is_stale() {
-                return Err(existing);
-            }
+        if let Some(existing) = read(document)
+            && !existing.is_ours()
+            && !existing.is_stale()
+        {
+            return Err(existing);
         }
         self.write(document);
         Ok(())
@@ -157,10 +215,10 @@ impl Locks {
 
     fn write(&mut self, document: &Path) {
         let ours = LockInfo::ours();
-        if let Ok(text) = serde_json::to_string_pretty(&ours) {
-            if std::fs::write(lock_path(document), text).is_ok() {
-                self.held.insert(document.to_path_buf());
-            }
+        if let Ok(text) = serde_json::to_string_pretty(&ours)
+            && std::fs::write(lock_path(document), text).is_ok()
+        {
+            self.held.insert(document.to_path_buf());
         }
     }
 
@@ -238,11 +296,7 @@ mod tests {
             pid: 4242,
             since: 0,
         };
-        std::fs::write(
-            lock_path(&document),
-            serde_json::to_string(&other).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(lock_path(&document), serde_json::to_string(&other).unwrap()).unwrap();
         let mut locks = Locks::default();
         let holder = locks.acquire(&document).unwrap_err();
         assert_eq!(holder, other);
@@ -262,11 +316,7 @@ mod tests {
             pid: u32::MAX - 7,
             ..LockInfo::ours()
         };
-        std::fs::write(
-            lock_path(&document),
-            serde_json::to_string(&stale).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(lock_path(&document), serde_json::to_string(&stale).unwrap()).unwrap();
         let mut locks = Locks::default();
         assert!(locks.acquire(&document).is_ok());
         assert!(read(&document).unwrap().is_ours());
@@ -277,5 +327,14 @@ mod tests {
         let document = temp_document("d.oxyprt");
         std::fs::write(lock_path(&document), b"not json").unwrap();
         assert!(Locks::default().acquire(&document).is_ok());
+    }
+
+    /// This window's process runs; one with an id no process can have does not; and the
+    /// computer has a name to put in the lock.
+    #[test]
+    fn this_window_counts_as_running() {
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(u32::MAX - 7));
+        assert!(!hostname().is_empty());
     }
 }

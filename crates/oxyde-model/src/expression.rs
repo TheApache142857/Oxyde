@@ -427,6 +427,10 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             let value = number
                 .parse::<f64>()
                 .map_err(|_| format!("\"{number}\" is not a number"))?;
+            // "1e999" reads as infinity, which would print as "inf" and not read back.
+            if !value.is_finite() {
+                return Err(format!("\"{number}\" is too large"));
+            }
             tokens.push(Token::Number(value));
         } else if c == '"' {
             chars.next();
@@ -678,6 +682,10 @@ mod tests {
         assert!(eval("sqrt(-1)").is_err());
         assert!(eval("min(1)").unwrap_err().contains("argument"));
         assert!(eval("\"Width").unwrap_err().contains("quote"));
+        // A number that overflows is refused when typed, not kept as an infinity that
+        // would print as "inf" and make the part unsavable.
+        assert!(eval("1e999").unwrap_err().contains("too large"));
+        assert!(eval("2 * 1e400").unwrap_err().contains("too large"));
         // Deep nesting is refused instead of overflowing the stack.
         let deep = format!("{}1{}", "(".repeat(100_000), ")".repeat(100_000));
         assert!(eval(&deep).unwrap_err().contains("nested"));
