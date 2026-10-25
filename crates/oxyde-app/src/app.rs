@@ -319,11 +319,13 @@ pub struct OxydeApp {
 
 impl OxydeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>) -> Self {
-        let mut app = Self::blank(crate::prefs::Preferences::load(), file);
+        let (prefs, prefs_problem) = crate::prefs::Preferences::load_reporting();
+        let mut app = Self::blank(prefs, file);
         let (materials, problem) = crate::materials::load();
         app.materials = materials;
-        if let Some(problem) = problem {
-            app.status = problem;
+        let problems: Vec<String> = prefs_problem.into_iter().chain(problem).collect();
+        if !problems.is_empty() {
+            app.status = problems.join("; ");
         }
         app.apply_preferences(&cc.egui_ctx);
         app.wgpu_state = cc.wgpu_render_state.clone();
@@ -2207,6 +2209,16 @@ impl eframe::App for OxydeApp {
             }
         }
         self.internal_error_window(ctx);
+    }
+
+    /// The window is closing: the assistant panel's MCP session gives its shapes back to
+    /// the window's kernel, and its agent is stopped and waited for, so that none lives on
+    /// after Oxyde.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(mut session) = self.assistant.mcp.take() {
+            session.release_in_window(&mut self.kernel);
+        }
+        self.assistant.shutdown();
     }
 }
 

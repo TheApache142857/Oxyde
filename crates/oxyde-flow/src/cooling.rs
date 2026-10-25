@@ -670,7 +670,8 @@ fn write_regions(
     let put = |path: &str, text: &str| {
         crate::case::put(&dir.join(path), text).map_err(|e| match e {
             CaseError::Io { path, error } => RunError::Io { path, error },
-            CaseError::Study(e) => RunError::Io {
+            // `put` writes one file: neither can come from it.
+            CaseError::Study(_) | CaseError::InTheWay { .. } => RunError::Io {
                 path: dir.join(path),
                 error: std::io::Error::other(e.to_string()),
             },

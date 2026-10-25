@@ -2158,7 +2158,9 @@ fn heat_rows(ui: &mut egui::Ui, heat: &mut CoolingSettings) -> bool {
                         .range(0.0..=100.0)
                         .speed(0.01)
                         .max_decimals(4)
-                        .suffix(" ×10⁻³/K"),
+                        // No superscript minus: the fonts on macOS and Linux have no glyph
+                        // for it (`theme::tests::interface_characters_have_glyphs`).
+                        .suffix(" ×0.001/K"),
                 )
                 .on_hover_text("How much the fluid swells as it warms: water 0.21, air 3.4 (1/T)")
                 .changed()

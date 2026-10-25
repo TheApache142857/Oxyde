@@ -34,17 +34,20 @@ impl OxydeApp {
         }
     }
 
-    /// The folder the agent works in: the document's, else the home folder.
+    /// The folder the agent works in: the document's, else a scratch folder of Oxyde's.
     fn assistant_folder(&self) -> PathBuf {
         let path = match &self.asm {
             Some(doc) => doc.path.clone(),
             None => self.doc.path.clone(),
         };
-        path.and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-            .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default()
+        if let Some(folder) = path.and_then(|p| p.parent().map(std::path::Path::to_path_buf)) {
+            return folder;
+        }
+        // An unsaved document has no folder: a scratch one of Oxyde's then, never the
+        // user's home folder, which the agent's own file tools would otherwise work in.
+        let scratch = std::env::temp_dir().join("oxyde-assistant");
+        let _ = std::fs::create_dir_all(&scratch);
+        scratch
     }
 
     /// Each frame: what the agent said, and its tools' messages, answered on the document.

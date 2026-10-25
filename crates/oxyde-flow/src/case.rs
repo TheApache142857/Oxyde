@@ -127,6 +127,8 @@ pub enum CaseError {
     Study(StudyError),
     /// A file or folder could not be written.
     Io { path: PathBuf, error: io::Error },
+    /// The case folder holds something, and it is not an OpenFOAM case of Oxyde's.
+    InTheWay { path: PathBuf },
 }
 
 impl fmt::Display for CaseError {
@@ -136,6 +138,11 @@ impl fmt::Display for CaseError {
             CaseError::Io { path, error } => {
                 write!(f, "could not write {}: {error}", path.display())
             }
+            CaseError::InTheWay { path } => write!(
+                f,
+                "{} is in the way: it is not an OpenFOAM case of Oxyde's",
+                path.display()
+            ),
         }
     }
 }
@@ -150,7 +157,8 @@ impl From<StudyError> for CaseError {
 
 /// Writes `study` as an OpenFOAM case in `dir`, which is made if needed. What an earlier
 /// case left there (mesh, results, logs, the files written here) is removed first; nothing
-/// else in the folder is touched.
+/// else in the folder is touched. A folder that holds something and is not a case of
+/// Oxyde's is refused.
 pub fn write_case(dir: &Path, study: &FlowStudy) -> Result<Case, CaseError> {
     study.check()?;
     clear_outputs(dir)?;
@@ -263,7 +271,9 @@ pub fn write_case(dir: &Path, study: &FlowStudy) -> Result<Case, CaseError> {
 }
 
 /// Removes what an earlier case left in `dir`: the files this module writes, the mesh,
-/// time folders, processor folders, post-processing output and logs.
+/// time folders, processor folders, post-processing output and logs. Only an empty folder
+/// or one this module wrote (`case.foam` marks it) is cleared: what goes is picked by name,
+/// which a folder of the user's could share.
 pub(crate) fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
     let io_err = |path: &Path, error| CaseError::Io {
         path: path.to_path_buf(),
@@ -271,6 +281,14 @@ pub(crate) fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
     };
     if !dir.exists() {
         return fs::create_dir_all(dir).map_err(|e| io_err(dir, e));
+    }
+    if !dir.join("case.foam").is_file() {
+        let mut entries = fs::read_dir(dir).map_err(|e| io_err(dir, e))?;
+        if entries.next().is_some() {
+            return Err(CaseError::InTheWay {
+                path: dir.to_path_buf(),
+            });
+        }
     }
     for sub in [
         "constant/polyMesh",
@@ -292,7 +310,9 @@ pub(crate) fn clear_outputs(dir: &Path) -> Result<(), CaseError> {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
-        let time_dir = name.parse::<f64>().is_ok();
+        // OpenFOAM names time folders by their time: `0`, `100`, `0.5`, `1e-05`.
+        let time_dir =
+            name.starts_with(|c: char| c.is_ascii_digit()) && name.parse::<f64>().is_ok();
         let processor_dir = name
             .strip_prefix("processor")
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
@@ -1274,6 +1294,24 @@ mod tests {
         assert!(dir.join("notes.txt").exists());
         assert!(dir.join("processorStuff").exists());
         assert!(dir.join("0.orig/U").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A folder with something in it that is not a case of Oxyde's is refused untouched,
+    /// even when it holds folders a case would have cleared.
+    #[test]
+    fn a_folder_that_is_not_a_case_is_left_alone() {
+        let dir = scratch("inway");
+        fs::create_dir_all(dir.join("system")).unwrap();
+        fs::create_dir_all(dir.join("100")).unwrap();
+        fs::write(dir.join("notes.txt"), "mine").unwrap();
+        assert!(matches!(
+            write_case(&dir, &study()),
+            Err(CaseError::InTheWay { .. })
+        ));
+        for kept in ["system", "100", "notes.txt"] {
+            assert!(dir.join(kept).exists(), "{kept}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
