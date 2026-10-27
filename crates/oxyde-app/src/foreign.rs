@@ -144,6 +144,15 @@ mod tests {
         assert!(importable_extensions().contains(&"ipt"));
     }
 
+    #[cfg(feature = "cadmpeg")]
+    #[test]
+    fn a_file_named_like_another_programs_but_not_one_is_refused() {
+        let progress = Progress::default();
+        let bytes = b"Not a SolidWorks part.\n".repeat(64);
+        let error = step_contents("Bracket.sldprt", bytes, &progress).unwrap_err();
+        assert_eq!(error, oxyde_cadmpeg::ConvertError::Unrecognized.to_string());
+    }
+
     #[test]
     fn a_step_file_is_passed_on_untouched() {
         let progress = Progress::default();

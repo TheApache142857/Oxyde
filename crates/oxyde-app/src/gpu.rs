@@ -1840,8 +1840,8 @@ mod tests {
     use oxyde_geom::{Point3, Vec3};
     use oxyde_kernel::Kernel;
     use oxyde_render::{
-        Camera, DisplayStyle, Highlight, Material, Pick, Scene, StandardView, Style, Texture,
-        render, render_styled,
+        Camera, Highlight, Material, Pick, Scene, StandardView, Style, Texture, render,
+        render_styled,
     };
 
     use super::GpuViewport;
@@ -1970,6 +1970,8 @@ mod tests {
         );
     }
 
+    // Built with OpenCASCADE's boxes, so only compiled in with it.
+    #[cfg(feature = "occt")]
     #[test]
     #[ignore = "needs a GPU"]
     fn gpu_matches_the_software_renderer_in_every_display_style() {
@@ -2012,7 +2014,7 @@ mod tests {
         };
         let empty = render_styled(&Scene::default(), &camera, w, h, &highlight, &Style::LIGHT);
         let at = ((top[1] as usize) * w + top[0] as usize) * 4;
-        for (display, name) in DisplayStyle::ALL {
+        for (display, name) in oxyde_render::DisplayStyle::ALL {
             let style = Style {
                 display,
                 ..Style::LIGHT
