@@ -1209,8 +1209,14 @@ impl OxydeApp {
                 }
                 self.open_recent_menu(ui, &ctx);
                 if ui
-                    .button("Import STEP assembly…")
-                    .on_hover_text("One part file per part and one assembly file per assembly")
+                    .button(format!(
+                        "Import assembly ({})…",
+                        crate::foreign::IMPORT_KIND
+                    ))
+                    .on_hover_text(format!(
+                        "One part file per part and one assembly file per assembly{}",
+                        crate::foreign::FOREIGN_HINT
+                    ))
                     .clicked()
                 {
                     ui.close_menu();

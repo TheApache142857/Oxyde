@@ -20,6 +20,7 @@ oxyde-model = { workspace = true }
 oxyde-sketch = { workspace = true }
 oxyde-assembly = { workspace = true }
 oxyde-format = { workspace = true }
+oxyde-cadmpeg = { workspace = true, optional = true }
 oxyde-render = { workspace = true }
 oxyde-sim = { workspace = true }
 oxyde-sim-gpu = { workspace = true }
@@ -32,9 +33,11 @@ serde_json = { workspace = true }
 
 [features]
 # The kernels compiled in; the session's is chosen at start (src/kernel.rs). At least one.
-default = ["occt", "native"]
+default = ["occt", "native", "cadmpeg"]
 occt = ["dep:oxyde-occt"]
 native = ["dep:oxyde-native-kernel"]
+# Importing other programs' files (SolidWorks, Fusion 360, Inventor...) through cadmpeg.
+cadmpeg = ["dep:oxyde-cadmpeg"]
 
 [build-dependencies]
 winresource = "0.1"

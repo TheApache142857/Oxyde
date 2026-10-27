@@ -1,0 +1,19 @@
+[package]
+name = "oxyde-cadmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Reads other CAD programs' files (SolidWorks, Fusion 360, Inventor, CATIA...) as STEP, through cadmpeg."
+
+[dependencies]
+# Pinned to one commit: cadmpeg has no release yet and its library API moves.
+# To try a fix before it lands upstream, point these at a fork's branch for a while.
+cadmpeg-core = { git = "https://github.com/cadmpeg/cadmpeg", rev = "d92395b" }
+cadmpeg-container = { git = "https://github.com/cadmpeg/cadmpeg", rev = "d92395b" }
+cadmpeg-ir = { git = "https://github.com/cadmpeg/cadmpeg", rev = "d92395b" }
+cadmpeg-registry = { git = "https://github.com/cadmpeg/cadmpeg", rev = "d92395b" }
+
+[dev-dependencies]
+oxyde-kernel = { workspace = true }
+oxyde-native-kernel = { workspace = true }

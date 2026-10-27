@@ -18,6 +18,7 @@ oxyde-native-kernel = { path = "crates/oxyde-native-kernel" }
 oxyde-model = { path = "crates/oxyde-model" }
 oxyde-assembly = { path = "crates/oxyde-assembly" }
 oxyde-format = { path = "crates/oxyde-format" }
+oxyde-cadmpeg = { path = "crates/oxyde-cadmpeg" }
 oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
 oxyde-sim = { path = "crates/oxyde-sim" }

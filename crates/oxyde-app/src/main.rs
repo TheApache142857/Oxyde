@@ -41,6 +41,7 @@ mod edit_in_place;
 mod equations_ui;
 mod evaluate;
 mod export;
+mod foreign;
 mod features_ui;
 mod flow_ui;
 mod generative_ui;

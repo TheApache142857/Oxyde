@@ -89,14 +89,18 @@ pub enum Outcome {
         /// Why the part may not be as it was saved: built by another kernel.
         warning: Option<String>,
     },
-    /// A part rebuilt with an Imported feature added (a new part from a STEP file, or
-    /// Import STEP into the open part).
+    /// A part rebuilt with an Imported feature added (a new part from a STEP or other CAD
+    /// file, or Import into the open part).
     PartImported {
         part: Part,
         file_name: String,
         /// A new part named after the file: no undo step, nothing unsaved.
         fresh: Option<String>,
+        /// What the translation from another program's format left behind, if anything.
+        note: Option<String>,
     },
+    /// A file that could not be imported, and why.
+    ImportFailed { file_name: String, error: String },
     /// A part made from a generative outcome and saved to `path`: what was done (or why it
     /// could not be made), and the surfaces it was made of, to check it on.
     PartCreated {
@@ -109,6 +113,8 @@ pub enum Outcome {
         plan: Result<ImportPlan, String>,
         path: PathBuf,
         source: String,
+        /// What the translation from another program's format left behind, if anything.
+        note: Option<String>,
     },
 }
 
@@ -288,8 +294,9 @@ impl OxydeApp {
         );
     }
 
-    /// Reads a STEP file into an Imported feature: into a copy of `definition`, rebuilt
-    /// off the UI thread; `fresh` names a new part made from the file.
+    /// Reads a STEP file, or another program's file translated to STEP, into an Imported
+    /// feature: into a copy of `definition`, rebuilt off the UI thread; `fresh` names a new
+    /// part made from the file.
     pub(crate) fn import_step_job(
         &mut self,
         path: &Path,
@@ -307,6 +314,11 @@ impl OxydeApp {
         self.start_job(
             &format!("Importing {file_name}"),
             move |kernel, progress| {
+                let (bytes, note) = match crate::foreign::step_contents(&file_name, bytes, progress)
+                {
+                    Ok(translated) => translated,
+                    Err(error) => return Outcome::ImportFailed { file_name, error },
+                };
                 progress.say(format!("Reading {file_name}"));
                 let mut part = Part::from_definition(definition).unwrap_or_else(|e| {
                     // Cannot happen for the definition of a live part; reported anyway.
@@ -322,13 +334,14 @@ impl OxydeApp {
                     part,
                     file_name,
                     fresh,
+                    note,
                 }
             },
         );
     }
 
-    /// Reads the product structure of a STEP file off the UI thread; the folder is
-    /// asked for once it is known what the file holds.
+    /// Reads the product structure of a STEP file (or another program's file, translated to
+    /// STEP) off the UI thread; the folder is asked for once it is known what the file holds.
     pub(crate) fn plan_step_job(&mut self, path: &Path) {
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -340,13 +353,24 @@ impl OxydeApp {
         let source = name_of(path);
         let path = path.to_path_buf();
         self.start_job(&format!("Reading {source}"), move |kernel, progress| {
-            progress.say(format!("Reading the parts and assemblies of {source}"));
-            let plan = match kernel.read_step_assembly(&bytes) {
-                Ok(tree) => oxyde_format::step_import::plan_step_import(&tree, &source)
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
+            let (plan, note) = match crate::foreign::step_contents(&source, bytes, progress) {
+                Ok((bytes, note)) => {
+                    progress.say(format!("Reading the parts and assemblies of {source}"));
+                    let plan = match kernel.read_step_assembly(&bytes) {
+                        Ok(tree) => oxyde_format::step_import::plan_step_import(&tree, &source)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    (plan, note)
+                }
+                Err(e) => (Err(e), None),
             };
-            Outcome::StepPlanned { plan, path, source }
+            Outcome::StepPlanned {
+                plan,
+                path,
+                source,
+                note,
+            }
         });
     }
 
@@ -491,14 +515,23 @@ impl OxydeApp {
                 part,
                 file_name,
                 fresh,
-            } => self.part_imported(part, &file_name, fresh),
+                note,
+            } => self.part_imported(part, &file_name, fresh, note),
+            Outcome::ImportFailed { file_name, error } => {
+                self.status = format!("Could not import {file_name}: {error}");
+            }
             Outcome::PartCreated {
                 path,
                 result,
                 pieces,
             } => self.part_created(path, result, pieces),
-            Outcome::StepPlanned { plan, path, source } => match plan {
-                Ok(plan) => self.write_step_plan(&plan, &path, &source),
+            Outcome::StepPlanned {
+                plan,
+                path,
+                source,
+                note,
+            } => match plan {
+                Ok(plan) => self.write_step_plan(&plan, &path, &source, note.as_deref()),
                 Err(e) => self.status = format!("Could not import {source}: {e}"),
             },
         }

@@ -970,22 +970,16 @@ impl OxydeApp {
                 self.status = "New assembly: Insert Component adds a part file".to_owned();
             }
             PendingAction::Open => {
-                if let Some(path) = rfd::FileDialog::new()
+                let mut openable = vec![PART_EXTENSION, ASSEMBLY_EXTENSION, LEGACY_PART_EXTENSION];
+                openable.extend(crate::foreign::importable_extensions());
+                let dialog = rfd::FileDialog::new()
                     .add_filter(
-                        "Oxyde document or STEP",
-                        &[
-                            PART_EXTENSION,
-                            ASSEMBLY_EXTENSION,
-                            LEGACY_PART_EXTENSION,
-                            "step",
-                            "stp",
-                        ],
+                        format!("Oxyde document or {}", crate::foreign::IMPORT_KIND),
+                        &openable[..],
                     )
                     .add_filter("Oxyde part", &[PART_EXTENSION, LEGACY_PART_EXTENSION])
-                    .add_filter("Oxyde assembly", &[ASSEMBLY_EXTENSION])
-                    .add_filter("STEP", &["step", "stp"])
-                    .pick_file()
-                {
+                    .add_filter("Oxyde assembly", &[ASSEMBLY_EXTENSION]);
+                if let Some(path) = crate::foreign::add_filters(dialog).pick_file() {
                     self.open_path(&path);
                 }
             }
@@ -1002,13 +996,13 @@ impl OxydeApp {
             PendingAction::OpenComponent(o) => self.open_component(o),
             PendingAction::FinishEdit => self.finish_edit(ctx),
             PendingAction::OpenStep => {
-                if let Some(path) = pick_step() {
+                if let Some(path) = crate::foreign::pick_importable() {
                     self.leave_assembly();
                     self.open_step_as_part(&path);
                 }
             }
             PendingAction::ImportStepAssembly => {
-                if let Some(path) = pick_step() {
+                if let Some(path) = crate::foreign::pick_importable() {
                     self.import_step_assembly(&path);
                 }
             }
@@ -1066,14 +1060,14 @@ impl OxydeApp {
         self.open_path_with(path, crate::edit_in_place::LockMode::Lock);
     }
 
-    /// Opens a part, assembly or STEP file, taking its edit lock as `mode` says (a STEP
-    /// file is read into a new, unsaved part and needs none).
+    /// Opens a part, assembly, STEP or other CAD file, taking its edit lock as `mode` says
+    /// (a STEP or CAD file is read into a new, unsaved part and needs none).
     pub(crate) fn open_path_with(&mut self, path: &Path, mode: crate::edit_in_place::LockMode) {
         if crate::assembly_ui::is_assembly(path) {
             self.open_assembly_with(path, mode);
             return;
         }
-        if is_step(path) {
+        if crate::foreign::is_importable(path) {
             self.leave_assembly();
             self.open_step_as_part(path);
             return;
@@ -1112,6 +1106,7 @@ impl OxydeApp {
         part: oxyde_model::Part,
         file_name: &str,
         fresh: Option<String>,
+        note: Option<String>,
     ) {
         let id = part.timeline().last().map(|e| e.id);
         match fresh {
@@ -1137,7 +1132,10 @@ impl OxydeApp {
         self.viewport.request_fit();
         self.status = match id.and_then(|id| self.doc.part.status(id)) {
             Some(FeatureStatus::Error(message)) => format!("Import failed: {message}"),
-            _ => format!("Imported {file_name}"),
+            _ => match note {
+                Some(note) => format!("Imported {file_name} ({note})"),
+                None => format!("Imported {file_name}"),
+            },
         };
     }
 
@@ -1156,6 +1154,7 @@ impl OxydeApp {
         plan: &oxyde_format::step_import::ImportPlan,
         path: &Path,
         source: &str,
+        note: Option<&str>,
     ) {
         let mut dialog = rfd::FileDialog::new().set_title(format!(
             "Folder for the {} part(s) and {} assembly file(s) of {source}",
@@ -1202,15 +1201,18 @@ impl OxydeApp {
                     plan.assembly_count(),
                     dir.display()
                 );
+                if let Some(note) = note {
+                    self.status += &format!(" ({note})");
+                }
             }
             Err(e) => self.status = format!("Could not write the imported files: {e}"),
         }
     }
 
-    /// File › Import STEP: adds the file's solids to the part as an "Imported" feature at
-    /// the rollback bar, read and rebuilt off the UI thread.
+    /// File › Import STEP (or another program's file): adds the file's solids to the part
+    /// as an "Imported" feature at the rollback bar, read and rebuilt off the UI thread.
     pub(crate) fn import_step(&mut self) {
-        if let Some(path) = pick_step() {
+        if let Some(path) = crate::foreign::pick_importable() {
             self.finish_sketch(true);
             let definition = self.doc.part.definition();
             self.import_step_job(&path, definition, None);
@@ -2050,18 +2052,6 @@ impl OxydeApp {
             self.window_title = title;
         }
     }
-}
-
-fn is_step(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("step") || e.eq_ignore_ascii_case("stp"))
-}
-
-fn pick_step() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("STEP", &["step", "stp"])
-        .pick_file()
 }
 
 /// The screen square a plane is drawn as (see [`paint_plane`]).

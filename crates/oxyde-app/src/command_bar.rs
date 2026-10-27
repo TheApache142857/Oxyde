@@ -61,13 +61,23 @@ impl OxydeApp {
                 }
                 self.open_recent_menu(ui, &ctx);
                 self.finish_editing_item(ui);
-                if ui.button("New part from STEP…").clicked() {
+                if ui
+                    .button(format!("New part from {}…", crate::foreign::IMPORT_KIND))
+                    .on_hover_text(crate::foreign::FOREIGN_HINT.trim_start())
+                    .clicked()
+                {
                     ui.close_menu();
                     self.guard(PendingAction::OpenStep, &ctx);
                 }
                 if ui
-                    .button("Import STEP assembly…")
-                    .on_hover_text("One part file per part and one assembly file per assembly")
+                    .button(format!(
+                        "Import assembly ({})…",
+                        crate::foreign::IMPORT_KIND
+                    ))
+                    .on_hover_text(format!(
+                        "One part file per part and one assembly file per assembly{}",
+                        crate::foreign::FOREIGN_HINT
+                    ))
                     .clicked()
                 {
                     ui.close_menu();
@@ -90,7 +100,11 @@ impl OxydeApp {
                     ui.close_menu();
                     self.save_as();
                 }
-                if ui.button("Import STEP…").clicked() {
+                if ui
+                    .button(format!("Import {}…", crate::foreign::IMPORT_KIND))
+                    .on_hover_text(crate::foreign::FOREIGN_HINT.trim_start())
+                    .clicked()
+                {
                     ui.close_menu();
                     self.import_step();
                 }
@@ -594,8 +608,12 @@ impl OxydeApp {
             self.run(command);
         }
         group_separator(ui);
-        if command_button(ui, Icon::Imported, "Import STEP", true, false)
-            .on_hover_text("Add the solids of a STEP file to the part, as an Imported feature")
+        if command_button(ui, Icon::Imported, "Import", true, false)
+            .on_hover_text(format!(
+                "Add the solids of a {} to the part, as an Imported feature{}",
+                crate::foreign::IMPORT_KIND,
+                crate::foreign::FOREIGN_HINT
+            ))
             .clicked()
         {
             self.import_step();
