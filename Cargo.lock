@@ -2943,6 +2943,7 @@ dependencies = [
  "eframe",
  "image",
  "oxyde-assembly",
+ "oxyde-cadmpeg",
  "oxyde-flow",
  "oxyde-format",
  "oxyde-geom",
@@ -2978,6 +2979,8 @@ dependencies = [
  "cadmpeg-core",
  "cadmpeg-ir",
  "cadmpeg-registry",
+ "oxyde-kernel",
+ "oxyde-native-kernel",
 ]
 
 [[package]]
