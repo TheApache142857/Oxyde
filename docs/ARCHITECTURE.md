@@ -26,6 +26,7 @@ Status: **draft**. This document records design decisions; change it in the same
 | `oxyde-sim` | — | anything else in the workspace |
 | `oxyde-sim-gpu` | `sim` | anything else in the workspace |
 | `oxyde-flow` | — | anything else in the workspace |
+| `oxyde-cadmpeg` | — (`kernel`, `native-kernel` dev only) | `occt`, `model`, `sketch`, `assembly`, `format`, `render`, `app` |
 | `oxyde-app` | all of the above | — |
 | `oxyde-cli` | `format`, `model`, `occt`, `kernel`, `render` | `app`, `eframe` |
 | `oxyde-mcp` | `geom`, `sketch`, `kernel`, `occt`, `model`, `assembly`, `format`, `render`, `cli` | `app`, `eframe` |
@@ -36,6 +37,8 @@ Status: **draft**. This document records design decisions; change it in the same
 `oxyde-sim-gpu` runs generative design's solve on a graphics card behind `oxyde_sim::generative::Backend`: WGSL compute shaders through the `wgpu` `eframe` brings, with the same features (no crate added), conjugate gradients in double precision and their multigrid preconditioner in single. The CPU's solve stays as the fallback and as the reference its tests compare against (`docs/SIMULATION.md` §9).
 
 `oxyde-flow` (the Simulation tab's flow and cooling studies) stands alone the same way, on the same kind of labelled triangle meshes. Its solver is OpenFOAM, which is GPL-3.0, so it is never linked: the crate writes an OpenFOAM case (text files), starts OpenFOAM's programs as separate processes in the installation's environment, and reads back the files they write (`docs/CFD.md`).
+
+`oxyde-cadmpeg` reads other CAD programs' files (SolidWorks, Fusion 360, Inventor, CATIA, FreeCAD, Rhino, IGES, ACIS, NX, Creo) through [cadmpeg](https://github.com/cadmpeg/cadmpeg) (Apache-2.0, pinned to one commit) and gives back STEP bytes: it knows no kernel and no part, so the application hands its STEP to the STEP import it already has, inside the import job, and the part keeps the STEP as it keeps any imported STEP. It depends on the kernel crates only for its example and tests, which read the STEP with the native kernel. `oxyde-app` compiles it in by its Cargo feature `cadmpeg` (on by default).
 
 `oxyde-native-kernel` is Oxyde's own kernel, in Rust (`docs/NATIVE_KERNEL.md`, and §10, *Native kernel*): a second implementation of the `Kernel` trait beside `oxyde-occt`, which it never depends on. It is written from the mathematics; code may be adapted from SolidCraft's kernel (MIT OR Apache-2.0) where it does not depend on truck, with its notice kept, but never from OpenCASCADE's source (LGPL). Until its operations are written, each answers `NativeError::Unsupported`.
 

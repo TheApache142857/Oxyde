@@ -46,6 +46,18 @@ const FORBIDDEN: &[(&str, &[&str])] = &[
         ],
     ),
     ("oxyde-flow", &["*"]),
+    (
+        "oxyde-cadmpeg",
+        &[
+            "oxyde-occt",
+            "oxyde-model",
+            "oxyde-sketch",
+            "oxyde-assembly",
+            "oxyde-format",
+            "oxyde-render",
+            "oxyde-app",
+        ],
+    ),
     ("oxyde-app", &[]),
     ("oxyde-cli", &["oxyde-app"]),
     ("oxyde-mcp", &["oxyde-app"]),

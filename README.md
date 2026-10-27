@@ -211,6 +211,7 @@ shape: geometry is rebuilt from it, the same way every time. The design rules ar
 | `oxyde-sim` | Finite element simulation: tetrahedral meshing, static, frequency and thermal solvers, topology optimization, generative design on a grid of voxels, result plots; depends on no other crate |
 | `oxyde-sim-gpu` | Generative design's solve on a graphics card: WGSL compute shaders through `wgpu`, the CPU's solve as fallback and reference |
 | `oxyde-flow` | Flow simulation through OpenFOAM, run as a separate program: cases written, run and read back; depends on no other crate |
+| `oxyde-cadmpeg` | Other CAD programs' files (SolidWorks, Fusion 360, Inventor, CATIA, FreeCAD, Rhino, IGES, ACIS, NX, Creo) translated to STEP through cadmpeg; depends on no other crate |
 | `oxyde-app` | Desktop application (egui and wgpu) |
 | `oxyde-cli` | Headless command line: rebuild a part and measure, check, export, picture or draw it |
 | `oxyde-mcp` | MCP server: an AI assistant models, inspects and compares parts and assemblies |

@@ -5,6 +5,21 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Other CAD programs' files imported through cadmpeg (unreleased, October 2026)
+
+- Open, New part from file, Import and Import assembly take SolidWorks (`.sldprt`), Fusion
+  360 (`.f3d`), Inventor (`.ipt`, `.iam`), CATIA V5 (`.CATPart`), FreeCAD (`.FCStd`), Rhino
+  (`.3dm`), IGES, ACIS (`.sat`, `.sab`, `.smt`, `.smb`), NX and Creo (`.prt`) and Creo View
+  (`.pvz`) files beside STEP. [cadmpeg](https://github.com/cadmpeg/cadmpeg) translates the
+  file to STEP while it is imported, and the part keeps that STEP, so it never needs the
+  original file again.
+- How much comes through depends on the format and is still little for most of them:
+  FreeCAD parts come through as solids; files from the other programs often come through
+  only in part or not at all. The status line says when cadmpeg could not carry everything
+  over, and a file with no faces it can write is refused with a message rather than
+  imported empty.
+- Oxyde can be built without it (Cargo feature `cadmpeg`, on by default).
+
 ### A kernel of Oxyde's own, started (unreleased, October 2026)
 
 - Work has begun on a geometry kernel written in Rust, as an alternative to OpenCASCADE
