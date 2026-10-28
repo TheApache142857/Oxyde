@@ -268,6 +268,48 @@ def spline_dome():
     return s.text("B-spline dome")
 
 
+def bspline(s, poles, degree=3):
+    """A B-spline curve of one span (a Bézier curve) through these poles."""
+    pts = ",".join(s.pt(q) for q in poles)
+    m = degree + 1
+    return s.add(f"B_SPLINE_CURVE_WITH_KNOTS('',{degree},({pts}),.UNSPECIFIED.,.F.,.F.,({m},{m}),(0.,1.),.UNSPECIFIED.)")
+
+
+def backwards_spline_edges():
+    """A prism 5 high on a profile of a straight line from (0, 0) to (10, 0) and a cubic
+    Bézier arch back over it through the poles (10, 8) and (0, 8), 48 mm² (so 240 mm³):
+    its arch edges written as cadmpeg 0.6.7 writes most of its B-spline edges, the sense
+    .T. with the start vertex at the curve's last pole and the end vertex at its first."""
+    s = Step()
+    a = s.vertex((0, 0, 0))
+    b = s.vertex((10, 0, 0))
+    c = s.vertex((0, 0, 5))
+    d = s.vertex((10, 0, 5))
+    arch = lambda z: [(10, 0, z), (10, 8, z), (0, 8, z), (0, 0, z)]
+    curve0 = bspline(s, arch(0))
+    arch0 = s.edge(a, b, curve0)
+    arch1 = s.edge(c, d, bspline(s, arch(5)))
+    bottom_line = s.edge(b, a, s.line((10, 0, 0), (0, 0, 0)))
+    top_line = s.edge(c, d, s.line((0, 0, 5), (10, 0, 5)))
+    left = s.edge(a, c, s.line((0, 0, 0), (0, 0, 5)))
+    right = s.edge(b, d, s.line((10, 0, 0), (10, 0, 5)))
+    z = s.add(f"VECTOR('',{s.dir((0, 0, 1))},5.)")
+    swept = s.add(f"SURFACE_OF_LINEAR_EXTRUSION('',{curve0},{z})")
+    bottom = s.add(f"PLANE('',{s.place((0, 0, 0), (0, 0, -1))})")
+    top = s.add(f"PLANE('',{s.place((0, 0, 5))})")
+    flat = s.add(f"PLANE('',{s.place((0, 0, 0), (0, -1, 0), (1, 0, 0))})")
+    side = s.face(
+        [s.bound(s.loop([(arch0, False), (left, True), (arch1, True), (right, False)]), True)], swept
+    )
+    back = s.face(
+        [s.bound(s.loop([(bottom_line, False), (right, True), (top_line, False), (left, False)]), True)], flat
+    )
+    f0 = s.face([s.bound(s.loop([(arch0, True), (bottom_line, True)]), True)], bottom)
+    f1 = s.face([s.bound(s.loop([(top_line, True), (arch1, False)]), True)], top)
+    s.part_file("arch", [side, back, f0, f1])
+    return s.text("backwards spline edges")
+
+
 def block_faces(s, size):
     """The six faces of a block from the origin to `size`."""
     (a, b, c) = size
@@ -368,6 +410,7 @@ for name, make in [
     ("facetted_dome", facetted_dome),
     ("loose_half_cylinder", loose_half_cylinder),
     ("spline_dome", spline_dome),
+    ("backwards_spline_edges", backwards_spline_edges),
     ("assembly", assembly),
 ]:
     with open(f"{name}.step", "w") as f:

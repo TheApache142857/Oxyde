@@ -108,6 +108,10 @@ release yet; the git history has every detail.
   needs). Curved faces bounded by curves of many pieces, as CATIA, SolidWorks and Creo
   write rounded edges, are meshed with the triangles they need and no more: a CATIA part
   shows 25,000 triangles instead of 615,000 and meshes four times faster.
+- **STEP files converted by cadmpeg** (SolidWorks parts and others) no longer fail with it
+  on their curved edges ("edge … lies … mm off its faces"): cadmpeg 0.6.7 writes most of
+  them with their direction the wrong way round for their curve, and such an edge is now
+  read the way its two corners say it runs, as OpenCASCADE reads it.
 - **Patterns of many holes** are fast with it: a pattern's cuts (or bosses) are made in one
   operation instead of one after the other. A panel of 400 hexagonal holes rebuilds in under
   a second, where it took over half an hour, and one of 1,024 in 3 s against OpenCASCADE's

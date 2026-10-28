@@ -937,8 +937,9 @@ impl<'a> Geometry<'a> {
         Ok((spline_or_exact(s).reversed(), true))
     }
 
-    /// An edge's curve, run from its start the curve's way when `same`.
-    fn curve(&self, id: u64, same: bool) -> R<Curve> {
+    /// An edge's curve, run from its start the curve's way when `same`; on an open B-spline
+    /// or polyline, the way its vertices `ends` say it runs (see [`sense_of_ends`]).
+    fn curve(&self, id: u64, same: bool, ends: (Point3, Point3)) -> R<Curve> {
         let (id, agree) = self.profile(id)?;
         let same = same == agree;
         let f = self.f;
@@ -947,10 +948,13 @@ impl<'a> Geometry<'a> {
             .map_or_else(|| bad("an empty curve", id), Ok)?;
         match f.kind(id)? {
             "LINE" => Ok(Curve::Line),
-            "POLYLINE" => Ok(Curve::Spline(SplineCurve {
-                up: same,
-                ..SplineCurve::new(self.polyline(id)?)
-            })),
+            "POLYLINE" => {
+                let c = SplineCurve::new(self.polyline(id)?);
+                Ok(Curve::Spline(SplineCurve {
+                    up: sense_of_ends(&c, ends).unwrap_or(same),
+                    ..c
+                }))
+            }
             "CIRCLE" => {
                 let (o, z, _) = self.placement(arg_ref(r, 1, id)?)?;
                 let radius = arg_real(r, 2, id)? * self.units.length;
@@ -968,21 +972,37 @@ impl<'a> Geometry<'a> {
             }
             "B_SPLINE_CURVE_WITH_KNOTS" => {
                 let c = self.bspline_curve(id)?;
-                Ok(match exact::curve(&c) {
+                let exact = exact::curve(&c);
+                let c = SplineCurve::new(c);
+                let same = sense_of_ends(&c, ends).unwrap_or(same);
+                Ok(match exact {
                     Some(ExactCurve::Line) => Curve::Line,
                     Some(ExactCurve::Circle(circle)) => Curve::Circle(Circle {
                         normal: if same { circle.normal } else { -circle.normal },
                         ..circle
                     }),
-                    None => Curve::Spline(SplineCurve {
-                        up: same,
-                        ..SplineCurve::new(c)
-                    }),
+                    None => Curve::Spline(SplineCurve { up: same, ..c }),
                 })
             }
             other => bad(&format!("a curve the kernel cannot read yet ({other})"), id),
         }
     }
+}
+
+/// Which way an edge from `a` to `b` runs along an open B-spline, as its vertices say: up
+/// its parameter when `b` lies further along it than `a`. Some writers (cadmpeg 0.6.7, on
+/// most of its B-spline edges) give an edge the sense `.T.` with its start vertex at the
+/// curve's last pole and its end at its first; the edge is then the curve between them,
+/// run backwards, as OpenCASCADE reads it, not the curve followed on past its end. `None`
+/// on a closed curve, or with both ends at one place along it, where only the file's
+/// sense can say.
+fn sense_of_ends(c: &SplineCurve, (a, b): (Point3, Point3)) -> Option<bool> {
+    if c.closed() {
+        return None;
+    }
+    let (lo, hi) = c.domain();
+    let (ta, tb) = (c.param_of(a), c.param_of(b));
+    ((tb - ta).abs() > 1e-9 * (hi - lo)).then_some(tb > ta)
 }
 
 /// A B-spline surface as the plane, cylinder, cone, sphere or torus it is exactly, else as
@@ -1168,7 +1188,8 @@ impl SolidReader<'_, '_> {
         let start = self.vertex(arg_ref(r, 1, id)?)?;
         let end = self.vertex(arg_ref(r, 2, id)?)?;
         let same = r.params.get(4).is_none_or(boolean);
-        let curve = self.g.curve(arg_ref(r, 3, id)?, same)?;
+        let ends = (self.solid.point(start), self.solid.point(end));
+        let curve = self.g.curve(arg_ref(r, 3, id)?, same, ends)?;
         let edge = Edge::new(start, end, curve);
         let out = if start == end && self.no_length(&edge) {
             None

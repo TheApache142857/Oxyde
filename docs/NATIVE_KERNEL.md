@@ -248,7 +248,13 @@ parameters, the `\X2\`, `\X\` and `\S\` encodings of strings) read and written.
     the curve, ISO 10303-42's: its normal the turn's tangent across the curve's); offsets of
     planes and surfaces of revolution; a trimmed surface its basis. Curves: lines,
     circles, ellipses, B-splines, polylines (B-splines of degree one); a trimmed curve or a
-    surface curve its basis, the way it runs kept.
+    surface curve its basis, the way it runs kept. An edge on an open B-spline or polyline
+    runs the way its vertices say, from the one further down the curve's parameter to the
+    one further up it or back, whatever its sense: cadmpeg 0.6.7 writes most of its
+    B-spline edges `.T.` with the start vertex at the curve's last pole and the end at its
+    first, which OpenCASCADE reads as the curve between them run backwards (its edge's
+    curve reversed), where following such an edge from its start ran on past its curve's
+    end.
   - **Exact B-splines** (`exact.rs`). A B-spline curve that is a line or a circle, a
     B-spline surface that is a plane, a cylinder, a cone, a sphere or a torus (circles on
     one axis across it, a line or a circle along them), within a billionth of its size at
@@ -532,7 +538,8 @@ where none does, never cutting the boundary, so that it meets its neighbours all
   axis runs through its edge, a dome of a rational B-spline, an assembly of a part used
   twice with colours and a material, a half cylinder written as loosely as its stated
   accuracy of 0.01 mm allows, read whole and through its part's own file, a dome with a
-  facet its sphere's seam runs to, meshed clear of the facet), against
+  facet its sphere's seam runs to, meshed clear of the facet, a prism on an arch whose
+  edges are written against their curves, as cadmpeg writes them), against
   OpenCASCADE and their closed forms; the assembly's tree against OpenCASCADE's.
   `step_corpus.rs` (ignored, run by hand) opens any STEP file with one kernel as the
   application does (the tree, each part's own file, the whole file measured, meshed at a

@@ -3386,6 +3386,28 @@ fn step_files_other_systems_write_read_in_the_native_kernel() {
 }
 
 #[test]
+fn step_edges_written_against_their_curves_read_the_way_their_vertices_say() {
+    // tests/data/step/make.py: a prism on a straight line and a cubic arch over it, its two
+    // arch edges written as cadmpeg 0.6.7 writes most of its B-spline edges, the sense .T.
+    // with the start vertex at the curve's last pole and the end at its first. Followed
+    // forwards from its start, such an edge ran on past the end of its curve and the file
+    // was refused (an edge 60 mm off its faces); it is the curve between its vertices, run
+    // backwards, as OpenCASCADE reads it.
+    let bytes = step_data("step/backwards_spline_edges.step");
+    assert_reads_as_opencascade_does("a prism with backwards arch edges", &bytes, EXACT);
+    let mut native = NativeKernel::new();
+    let read = native.import_step(&bytes).unwrap();
+    // The arch's area, 1440 ∫ t²(1 − t)² dt = 48 mm², times its height.
+    assert_close(
+        "the prism's volume",
+        native.volume(read.shape).unwrap(),
+        240.0,
+        1e-12,
+    );
+    native.release(read.shape);
+}
+
+#[test]
 fn a_sphere_s_seam_read_from_a_file_keeps_clear_of_a_hole_joined_to_its_rim() {
     // tests/data/step/make.py: a hemisphere of radius 10 with a flat facet 0.3 rad across,
     // its sphere's axis through the facet and its seam from the facet down to the rim, one
