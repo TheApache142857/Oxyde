@@ -11,6 +11,11 @@ release yet; the git history has every detail.
   part free to slide (a board against a plate and one edge, say), the solver could push it
   tens of metres along that slide, every mate still holding, and the next mate then failed.
   It now stays where the mates first hold.
+- **Faces a hair off square still mate.** Imported parts often have faces a few thousandths
+  of a degree off square (the edges of a board from KiCad, say), so mating one by three faces
+  to square ones could not hold exactly and the last mate failed. A mate now holds when its
+  directions are within about 0.06°, the difference shared out among the mates; positions
+  are held as tightly as before.
 
 - **Oxyde's MCP server is registered in Claude Code through `scripts/oxyde-mcp.cmd`**, which
   runs a copy of the built server: a session using it no longer keeps

@@ -72,8 +72,13 @@ struct Active {
     lock: Option<Lock>,
 }
 
-/// Largest acceptable error of a held mate (mm, or mm-equivalents for directions).
+/// Largest acceptable error of a held mate in position, per mm of the assembly's size.
 const TOLERANCE: f64 = 1e-6;
+/// Largest acceptable error of a held mate in direction (radians; about 0.06°). Far looser
+/// than positions: faces of imported parts are often a hair off square (a KiCad board's
+/// edges, 0.006° apart), and mating such a part by three faces to square ones cannot hold
+/// exactly. The solver shares the difference out among the mates.
+const ANGLE_TOLERANCE: f64 = 1e-3;
 const ITERATIONS: usize = 200;
 /// The fixed damping of a solver step, per unit of each unknown squared: see [`descend`].
 const FLOOR: f64 = 1e-6;
@@ -251,6 +256,14 @@ pub fn solve_about(
     }
 }
 
+/// How far one mate is from holding.
+struct Miss {
+    /// mm.
+    position: f64,
+    /// Radians, about (the length of a difference of unit vectors, or an angle).
+    direction: f64,
+}
+
 /// What solving one group of mates gives.
 struct Solved {
     placements: Vec<(ComponentId, Placement)>,
@@ -304,8 +317,9 @@ fn solve_group(
         }
         out
     };
-    // Residuals of each mate, and where they start in the full vector.
-    let evaluate = |x: &[f64]| -> (Vec<f64>, Vec<(usize, usize)>) {
+    // Residuals of each mate, and where they start in the full vector, with directions
+    // weighed by `weight` (`size` to solve; see `misses` for the others).
+    let evaluate = |x: &[f64], weight: f64| -> (Vec<f64>, Vec<(usize, usize)>) {
         let placed = placements(x);
         let mut r = Vec::new();
         let mut spans = Vec::new();
@@ -314,10 +328,10 @@ fn solve_group(
             let a = m.a.1.placed(&placed[&m.a.0]);
             let b = m.b.1.placed(&placed[&m.b.0]);
             // Errors were ruled out when the mate was accepted.
-            let _ = residuals(m.kind, m.aligned, m.fold, &a, &b, size, &mut r);
+            let _ = residuals(m.kind, m.aligned, m.fold, &a, &b, weight, &mut r);
             if let Some(lock) = &m.lock {
                 match (placed.get(&m.a.0), placed.get(&m.b.0)) {
-                    (Some(pa), Some(pb)) => lock_residuals(lock, &a, pa, pb, size, &mut r),
+                    (Some(pa), Some(pb)) => lock_residuals(lock, &a, pa, pb, weight, &mut r),
                     // Never: both sides are placed. The lock's three rows stay.
                     _ => r.extend([0.0; 3]),
                 }
@@ -330,7 +344,7 @@ fn solve_group(
     let n = 6 * moving.len();
     // Residuals of the mates in `mask` only.
     let objective = |x: &[f64], mask: &[bool]| -> Vec<f64> {
-        let (r, spans) = evaluate(x);
+        let (r, spans) = evaluate(x, size);
         spans
             .iter()
             .zip(mask)
@@ -339,14 +353,26 @@ fn solve_group(
             .collect()
     };
     let limit = TOLERANCE * size.max(1.0);
-    // How far each mate is from holding.
-    let misses = |x: &[f64]| -> Vec<f64> {
-        let (r, spans) = evaluate(x);
+    // How far each mate is from holding: in position (mm), and in direction (radians, about).
+    // Every direction equation is a direction difference or an angle times the weight, so
+    // a weight of 0 leaves the positions alone and the change from 0 to 1 the directions.
+    let misses = |x: &[f64]| -> Vec<Miss> {
+        let (at, spans) = evaluate(x, 0.0);
+        let (unit, _) = evaluate(x, 1.0);
+        let worst = |v: &mut dyn Iterator<Item = f64>| v.fold(0.0f64, |w, v| w.max(v.abs()));
         spans
             .iter()
-            .map(|(s, e)| r[*s..*e].iter().fold(0.0f64, |w, v| w.max(v.abs())))
+            .map(|(s, e)| {
+                let at = at.get(*s..*e).unwrap_or_default();
+                let unit = unit.get(*s..*e).unwrap_or_default();
+                Miss {
+                    position: worst(&mut at.iter().copied()),
+                    direction: worst(&mut unit.iter().zip(at).map(|(u, a)| u - a)),
+                }
+            })
             .collect()
     };
+    let holds = |m: &Miss| m.position <= limit && m.direction <= ANGLE_TOLERANCE;
     let run = |x: &mut Vec<f64>, mask: &[bool]| {
         if n > 0 {
             levenberg_marquardt(x, &|x| objective(x, mask), size);
@@ -356,7 +382,7 @@ fn solve_group(
     let mut mask = vec![true; active.len()];
     let mut x = vec![0.0; n];
     run(&mut x, &mask);
-    if misses(&x).iter().any(|m| *m > limit) {
+    if !misses(&x).iter().all(holds) {
         // Something fights: add the mates one at a time, in order, and leave out each
         // one that cannot hold with those before it, as SolidWorks blames the newest.
         mask = vec![false; active.len()];
@@ -366,7 +392,7 @@ fn solve_group(
             let mut trial = x.clone();
             run(&mut trial, &mask);
             let miss = misses(&trial);
-            if mask.iter().zip(&miss).all(|(on, m)| !on || *m <= limit) {
+            if mask.iter().zip(&miss).all(|(on, m)| !on || holds(m)) {
                 x = trial;
             } else {
                 mask[i] = false;
@@ -378,7 +404,9 @@ fn solve_group(
         .iter()
         .zip(&mask)
         .zip(&miss)
-        .map(|((m, on), worst)| {
+        .map(|((m, on), miss)| {
+            // In mm, a direction as the gap it leaves across the assembly.
+            let worst = miss.position.max(miss.direction * size);
             let status = if *on {
                 MateStatus::Ok
             } else if n == 0 {
