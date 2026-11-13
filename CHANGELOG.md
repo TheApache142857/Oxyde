@@ -7,6 +7,11 @@ release yet; the git history has every detail.
 
 ### The MCP server and an idle window (November 2026)
 
+- **A mated part no longer flies off along the faces it is mated to.** When the mates left a
+  part free to slide (a board against a plate and one edge, say), the solver could push it
+  tens of metres along that slide, every mate still holding, and the next mate then failed.
+  It now stays where the mates first hold.
+
 - **Oxyde's MCP server is registered in Claude Code through `scripts/oxyde-mcp.cmd`**, which
   runs a copy of the built server: a session using it no longer keeps
   `target\debug\oxyde-mcp.exe` open, which stopped `cargo` from rebuilding it.

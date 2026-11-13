@@ -193,6 +193,37 @@ fn a_flipped_alignment_turns_about_the_axis_it_keeps() {
     assert!(close(p.translation.y, 0.0) && close(p.translation.z, 0.0), "{p:?}");
 }
 
+/// The PCB of the "moto buttons" assembly: a board from a STEP file, its bottom on a
+/// plate and its side, a hair off square, flush with the plate's edge. The board must turn
+/// over to meet the side and may still slide along that edge. That slide has no slope but
+/// the round-off of the solver's own derivatives, which once sent the board tens of metres
+/// away along it, every mate still holding.
+#[test]
+fn a_free_slide_does_not_send_the_part_away() {
+    let (mut asm, a, b) = two();
+    asm.component_mut(b).unwrap().placement = Placement::IDENTITY;
+    let plane = |x: f64, y: f64, z: f64, normal: Vec3| Primitive::Plane {
+        origin: Point3::new(x, y, z),
+        normal: normal.normalized().unwrap(),
+    };
+    let geometry = move |m: &MateRef| -> Result<Primitive, String> {
+        Ok(match (m.component == a, &m.target) {
+            (true, MateTarget::Plane(StandardPlane::Top)) => plane(30.0, 0.0, 1.6, Vec3::Z),
+            (true, _) => plane(60.0, -12.5, 0.8, Vec3::X),
+            (false, MateTarget::Plane(StandardPlane::Top)) => plane(9.0, 11.7, 0.0, -Vec3::Z),
+            (false, _) => plane(0.0, 20.6, 0.4, Vec3::new(-1.0, 0.0004, 0.0)),
+        })
+    };
+    let top = |c| r(c, MateTarget::Plane(StandardPlane::Top));
+    asm.add_mate(MateKind::Coincident, top(b), top(a), false);
+    asm.add_mate(MateKind::Coincident, front(b), front(a), true);
+    let solution = solve(&asm, geometry, 75.0);
+    assert_eq!(solution.errors(), 0, "{:?}", solution.mates);
+    let (_, p) = solution.placements.iter().find(|(c, _)| *c == b).unwrap();
+    // Turned over and pushed against the edge, no further than the board is from it.
+    assert!(p.translation.length() < 200.0, "{p:?}");
+}
+
 #[test]
 fn faces_of_solids_start_anti_aligned_when_square() {
     let plane = |normal: Vec3| Primitive::Plane {

@@ -75,6 +75,8 @@ struct Active {
 /// Largest acceptable error of a held mate (mm, or mm-equivalents for directions).
 const TOLERANCE: f64 = 1e-6;
 const ITERATIONS: usize = 200;
+/// The fixed damping of a solver step, per unit of each unknown squared: see [`descend`].
+const FLOOR: f64 = 1e-6;
 
 /// Moves the components that are not fixed until the mates hold, starting from where they
 /// are, so that the answer is the nearest one: what dragging a part expects. Each
@@ -573,7 +575,15 @@ fn levenberg_marquardt(x: &mut [f64], f: &dyn Fn(&[f64]) -> Vec<f64>, size: f64)
         if current <= done {
             break;
         }
-        let mut step = descend(x, f, &numeric_jacobian(x, f), &r, current, &mut lambda);
+        let mut step = descend(
+            x,
+            f,
+            &numeric_jacobian(x, f),
+            &r,
+            current,
+            &mut lambda,
+            size,
+        );
         if step.is_none() {
             // Every way looks level from here although the mates do not hold: a mate that
             // starts on a symmetric spot (faces in line for an angle, points together for
@@ -585,7 +595,15 @@ fn levenberg_marquardt(x: &mut [f64], f: &dyn Fn(&[f64]) -> Vec<f64>, size: f64)
                 .map(|(k, v)| v + nudge(k, size))
                 .collect();
             lambda = 1e-3;
-            step = descend(x, f, &numeric_jacobian(&aside, f), &r, current, &mut lambda);
+            step = descend(
+                x,
+                f,
+                &numeric_jacobian(&aside, f),
+                &r,
+                current,
+                &mut lambda,
+                size,
+            );
         }
         let Some((trial, rt, ct)) = step else {
             break;
@@ -612,6 +630,7 @@ fn descend(
     r: &[f64],
     current: f64,
     lambda: &mut f64,
+    size: f64,
 ) -> Option<(Vec<f64>, Vec<f64>, f64)> {
     let n = x.len();
     // Normal equations: (JᵀJ + λ diag) δ = −Jᵀr.
@@ -631,7 +650,14 @@ fn descend(
     for _ in 0..12 {
         let mut m = a.clone();
         for (p, row) in m.iter_mut().enumerate() {
-            row[p] += *lambda * (a[p][p] + 1e-9);
+            // Besides Marquardt's damping, which fades as the solve goes well, a small fixed
+            // one in the unknown's own units (a turn moves geometry by about `size` per
+            // radian). Along a motion the mates leave free the only slope is the round-off
+            // of the numeric Jacobian, and without this the near-singular system turns that
+            // noise into a step of metres: a part sliding off along the faces it is mated
+            // to, its mates still holding.
+            let unit = if p % 6 < 3 { size } else { 1.0 };
+            row[p] += *lambda * (a[p][p] + 1e-9) + FLOOR * unit * unit;
         }
         let Some(step) = solve_linear(m, g.clone()) else {
             *lambda *= 10.0;
