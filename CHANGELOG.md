@@ -10,6 +10,10 @@ release yet; the git history has every detail.
 - **Oxyde's MCP server is registered in Claude Code through `scripts/oxyde-mcp.cmd`**, which
   runs a copy of the built server: a session using it no longer keeps
   `target\debug\oxyde-mcp.exe` open, which stopped `cargo` from rebuilding it.
+- **The Performance overlay no longer keeps the window drawing.** It asked for a new frame
+  on every frame, so with it on the viewport never went idle: about 60 fps with Oxyde in the
+  background, more in front. It now refreshes once a second, and its fps counts the frames
+  actually drawn in the last second: about 1 while nothing happens.
 - **`OXYDE_REPAINT_TRACE=1`** prints, for each frame of the window, which code asked for it:
   to find what keeps the viewport drawing, and the graphics card busy, while nothing happens.
 
