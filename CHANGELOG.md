@@ -5,6 +5,17 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Rotate in Move Component (unreleased, November 2026)
+
+- **Move Component turns parts about one axis, by dragging or by typed angles**, as
+  SolidWorks' Rotate Component, to line up imported parts such as a circuit board. The handle
+  on the selected component has three rings around its arrows: dragging the ring about X, Y or
+  Z turns the component about that assembly axis through its centre, and nothing else, the
+  mates pulling it back as for the arrows. While Move Component is on, its panel shows the
+  component and ΔX, ΔY, ΔZ in degrees; Apply turns it by those angles about its centre (about
+  X first, then Y, then Z). Each drag and each Apply is one undo step; a fixed component does
+  not turn. Shift+drag still turns a component freely.
+
 ### The MCP server and an idle window (November 2026)
 
 - **A mated part no longer flies off along the faces it is mated to.** When the mates left a

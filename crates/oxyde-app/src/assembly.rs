@@ -675,6 +675,18 @@ impl AssemblyDoc {
         )
     }
 
+    /// The centre of a component's bounding box, in assembly coordinates: the point Move
+    /// Component turns it about.
+    pub fn component_center(&self, component: ComponentId) -> Option<Point3> {
+        let placement = self.component(component)?.placement;
+        let (lo, hi) = self.component_bounds(component)?;
+        Some(placement.apply_point(Point3::new(
+            (lo.x + hi.x) / 2.0,
+            (lo.y + hi.y) / 2.0,
+            (lo.z + hi.z) / 2.0,
+        )))
+    }
+
     /// The visible parts of `assembly` as one mesh; remembers which faces are whose.
     pub fn scene_mesh(&mut self, assembly: &Assembly) -> Mesh {
         let (mesh, ranges) = {

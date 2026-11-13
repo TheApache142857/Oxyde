@@ -400,6 +400,30 @@ fn fixed_components_do_not_move() {
     assert_eq!(solution.errors(), 1);
 }
 
+/// Typed angles turn about the assembly's axes through the centre, X first, then Y, then Z.
+#[test]
+fn placement_turns_by_typed_angles_x_then_y_then_z() {
+    use std::f64::consts::FRAC_PI_2;
+    let center = Point3::new(1.0, 2.0, 3.0);
+    let start = placed(Vec3::new(5.0, -4.0, 2.0), Vec3::new(0.3, 0.1, -0.2));
+    // About X alone: the same as a rotation vector along X.
+    let a = start.rotated_xyz([0.4, 0.0, 0.0], center);
+    let b = start.moved(Vec3::X * 0.4, center, Vec3::ZERO);
+    let p = Point3::new(7.0, -1.0, 0.5);
+    assert!((a.apply_point(p) - b.apply_point(p)).length() < 1e-9);
+    // The centre stays where it is.
+    let turned = Placement::IDENTITY.rotated_xyz([0.3, -1.1, 2.0], center);
+    assert!((turned.apply_point(center) - center).length() < 1e-9);
+    // A quarter turn about X takes Y to Z, then one about Y takes Z to X; the other
+    // order would leave Y on Z.
+    let both = Placement::IDENTITY.rotated_xyz([FRAC_PI_2, FRAC_PI_2, 0.0], Point3::ORIGIN);
+    let y = both.apply_vector(Vec3::Y);
+    assert!((y - Vec3::X).length() < 1e-9, "{y:?}");
+    // Nothing typed, nothing moved.
+    let same = start.rotated_xyz([0.0; 3], center);
+    assert!((same.apply_point(p) - start.apply_point(p)).length() < 1e-9);
+}
+
 #[test]
 fn placement_moves_about_a_center() {
     let p = Placement::IDENTITY.moved(
