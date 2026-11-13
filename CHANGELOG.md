@@ -16,6 +16,28 @@ release yet; the git history has every detail.
   X first, then Y, then Z). Each drag and each Apply is one undo step; a fixed component does
   not turn. Shift+drag still turns a component freely.
 
+### The MCP server and an idle window (November 2026)
+
+- **A mated part no longer flies off along the faces it is mated to.** When the mates left a
+  part free to slide (a board against a plate and one edge, say), the solver could push it
+  tens of metres along that slide, every mate still holding, and the next mate then failed.
+  It now stays where the mates first hold.
+- **Faces a hair off square still mate.** Imported parts often have faces a few thousandths
+  of a degree off square (the edges of a board from KiCad, say), so mating one by three faces
+  to square ones could not hold exactly and the last mate failed. A mate now holds when its
+  directions are within about 0.06°, the difference shared out among the mates; positions
+  are held as tightly as before.
+
+- **Oxyde's MCP server is registered in Claude Code through `scripts/oxyde-mcp.cmd`**, which
+  runs a copy of the built server: a session using it no longer keeps
+  `target\debug\oxyde-mcp.exe` open, which stopped `cargo` from rebuilding it.
+- **The Performance overlay no longer keeps the window drawing.** It asked for a new frame
+  on every frame, so with it on the viewport never went idle: about 60 fps with Oxyde in the
+  background, more in front. It now refreshes once a second, and its fps counts the frames
+  actually drawn in the last second: about 1 while nothing happens.
+- **`OXYDE_REPAINT_TRACE=1`** prints, for each frame of the window, which code asked for it:
+  to find what keeps the viewport drawing, and the graphics card busy, while nothing happens.
+
 ### Fixes from a code review (unreleased, October 2026)
 
 - **A linked equations file can no longer be broken by what is written into it.** A variable

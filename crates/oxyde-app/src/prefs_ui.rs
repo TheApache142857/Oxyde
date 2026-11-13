@@ -39,8 +39,10 @@ pub struct PrefsWindow {
 /// Timings and counts for the debug overlay.
 #[derive(Default)]
 pub struct DebugStats {
-    /// Smoothed frame time, seconds.
+    /// Smoothed time between frames, seconds.
     pub frame: f64,
+    /// When the frames of the last second were drawn (egui's clock, seconds).
+    pub drawn: std::collections::VecDeque<f64>,
     /// Last part rebuild, seconds.
     pub rebuild: Option<f64>,
     /// Last feature preview built, seconds.
@@ -653,6 +655,12 @@ impl OxydeApp {
         } else {
             self.debug_stats.frame * 0.9 + dt * 0.1
         };
+        let now = ctx.input(|i| i.time);
+        let drawn = &mut self.debug_stats.drawn;
+        drawn.push_back(now);
+        while drawn.front().is_some_and(|t| now - t > 1.0) {
+            drawn.pop_front();
+        }
         let d = &self.prefs.debug;
         if d.ui_inspector {
             let mut open = true;
@@ -676,10 +684,13 @@ impl OxydeApp {
             let (triangles, edges) = self.viewport.scene_size();
             let ms =
                 |s: Option<f64>| s.map_or_else(|| "—".to_owned(), |s| format!("{:.1} ms", s * 1e3));
+            // Frames actually drawn in the last second: an idle window shows about 1, the
+            // overlay's own refresh, where 1 / frame time would claim a frame rate it is not
+            // drawing at.
             lines.push(format!(
-                "{:.1} ms/frame ({:.0} fps) · {}",
+                "{} fps · {:.1} ms between frames · {}",
+                self.debug_stats.drawn.len(),
                 self.debug_stats.frame * 1e3,
-                1.0 / self.debug_stats.frame.max(1e-6),
                 self.viewport.renderer_name()
             ));
             lines.push(format!("{triangles} triangles · {edges} edge segments"));
@@ -689,8 +700,10 @@ impl OxydeApp {
                 ms(self.debug_stats.preview),
                 ms(self.debug_stats.solve)
             ));
-            // Keep the frame time moving.
-            ctx.request_repaint();
+            // Refreshed once a second. Asking for a frame every frame, as it used to, kept the
+            // window drawing at the screen's refresh rate while nothing happened, so the
+            // overlay showed the very load it was opened to look for.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if d.hover_info {
             lines.push(self.hover_description());

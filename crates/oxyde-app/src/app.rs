@@ -2203,6 +2203,15 @@ pub(crate) fn bodies_volume<K: Kernel>(
 
 impl eframe::App for OxydeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // `OXYDE_REPAINT_TRACE`: which line of code asked for this frame, on stderr. An idle
+        // window should print nothing; a line printed over and over is what keeps the
+        // viewport drawing (and the graphics card busy) when nothing happens.
+        if std::env::var_os("OXYDE_REPAINT_TRACE").is_some() {
+            let causes: Vec<String> = ctx.repaint_causes().iter().map(|c| c.to_string()).collect();
+            if !causes.is_empty() {
+                eprintln!("repaint: {}", causes.join(", "));
+            }
+        }
         // The last net: a panic anywhere in a frame (a command applied, a panel drawn)
         // ends the frame, not the application. See `recover_frame`.
         let undo_before = self.doc.undo_depth();
