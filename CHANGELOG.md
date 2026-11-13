@@ -5,6 +5,14 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### The MCP server and an idle window (November 2026)
+
+- **Oxyde's MCP server is registered in Claude Code through `scripts/oxyde-mcp.cmd`**, which
+  runs a copy of the built server: a session using it no longer keeps
+  `target\debug\oxyde-mcp.exe` open, which stopped `cargo` from rebuilding it.
+- **`OXYDE_REPAINT_TRACE=1`** prints, for each frame of the window, which code asked for it:
+  to find what keeps the viewport drawing, and the graphics card busy, while nothing happens.
+
 ### Fixes from a code review (unreleased, October 2026)
 
 - **A linked equations file can no longer be broken by what is written into it.** A variable
