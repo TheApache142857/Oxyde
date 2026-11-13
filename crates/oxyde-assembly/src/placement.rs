@@ -98,11 +98,26 @@ impl Placement {
     /// Rotated by `rotation_vector` (axis × angle, radians) about `center`, then moved by
     /// `shift`, all in assembly coordinates.
     pub fn moved(&self, rotation_vector: Vec3, center: Point3, shift: Vec3) -> Placement {
-        let q = rotation_matrix(rotation_vector);
-        let rotation = multiply(&q, &self.rotation);
+        self.turned(&rotation_matrix(rotation_vector), center, shift)
+    }
+
+    /// Rotated about the assembly's X, Y and Z axes through `center` by `angles` (radians),
+    /// X first, then Y, then Z, as the typed angles of SolidWorks' Rotate Component.
+    pub fn rotated_xyz(&self, angles: [f64; 3], center: Point3) -> Placement {
+        let [x, y, z] = angles;
+        let q = multiply(
+            &rotation_matrix(Vec3::Z * z),
+            &multiply(&rotation_matrix(Vec3::Y * y), &rotation_matrix(Vec3::X * x)),
+        );
+        self.turned(&q, center, Vec3::ZERO)
+    }
+
+    /// Turned by the rotation matrix `q` about `center`, then moved by `shift`.
+    fn turned(&self, q: &[[f64; 3]; 3], center: Point3, shift: Vec3) -> Placement {
+        let rotation = multiply(q, &self.rotation);
         // p' = Q (R p + t − c) + c + shift
         let c = center.to_vec();
-        let translation = apply(&q, self.translation - c) + c + shift;
+        let translation = apply(q, self.translation - c) + c + shift;
         Placement {
             rotation: orthonormalize(rotation),
             translation,

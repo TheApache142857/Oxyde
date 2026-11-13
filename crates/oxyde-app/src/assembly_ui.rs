@@ -971,8 +971,8 @@ impl OxydeApp {
         self.move_handle = None;
         self.handle_shapes.clear();
         self.status = if self.move_mode {
-            "Move Component: drag a component, or an arrow of its handle along X, Y or Z; \
-             Shift+drag turns it; Esc ends"
+            "Move Component: drag a component, an arrow of its handle to slide it along X, \
+             Y or Z, or a ring to turn it about that axis; Shift+drag turns it freely; Esc ends"
                 .to_owned()
         } else {
             "Move Component ended".to_owned()
@@ -1656,6 +1656,7 @@ impl OxydeApp {
             self.generative_panel(ui);
         }
         self.mate_manager(ui);
+        self.move_manager(ui);
         self.refresh_mate_preview();
         self.property_manager(ui);
         self.assembly_tree(ui);
@@ -2548,7 +2549,7 @@ impl OxydeApp {
         // A press on the move handle (as drawn last frame) is the handle's, not the view's.
         let hover = ui.ctx().pointer_hover_pos();
         self.viewport.pointer_taken = self.move_handle.is_some()
-            || hover.is_some_and(|p| handle_arrow_at(&self.handle_shapes, p).is_some());
+            || hover.is_some_and(|p| handle_part_at(&self.handle_shapes, p).is_some());
         let output = self.viewport.ui(ui, picks, hint, false);
         self.viewport_rect = output.rect;
         let overlays = self.draw_assembly_references(ui, &output);
@@ -2812,94 +2813,124 @@ impl OxydeApp {
         overlays
     }
 
-    /// The XYZ handle of Move Component, as Creo's drag handle or Cura's: three arrows
-    /// along the assembly's axes at the selected component (the one being dragged, else
-    /// the first selected free one). Dragging an arrow slides the component along that
-    /// axis alone, the mates pulling it back as with a plain drag.
+    /// The component Move Component works on: the one being dragged, else the first
+    /// selected one.
+    fn move_target(&self) -> Option<ComponentId> {
+        if let Some(drag) = self.move_handle {
+            return Some(drag.component);
+        }
+        let doc = self.asm.as_ref()?;
+        self.grabbing.or_else(|| {
+            doc.selection
+                .iter()
+                .filter_map(|s| s.component())
+                .find(|c| *c != ComponentId::ASSEMBLY)
+        })
+    }
+
+    /// The handle of Move Component, as SolidWorks' triad, Creo's drag handle or Cura's:
+    /// three arrows along the assembly's axes and three rings about them, at the centre of
+    /// the selected component (the one being dragged, else the first selected free one).
+    /// Dragging an arrow slides the component along that axis alone, dragging a ring turns
+    /// it about that axis alone, the mates pulling it back as with a plain drag. One undo
+    /// step per drag.
     fn move_handle_ui(&mut self, ui: &egui::Ui, output: &crate::viewport::ViewportOutput) {
         self.handle_shapes.clear();
         if !self.move_mode || self.mate_dialog.is_some() {
             self.move_handle = None;
             return;
         }
+        let Some(id) = self.move_target() else {
+            return;
+        };
         let Some(doc) = self.asm.as_ref() else {
             return;
         };
-        let id = match self.move_handle {
-            Some(drag) => Some(drag.component),
-            None => self.grabbing.or_else(|| {
-                doc.selection
-                    .iter()
-                    .filter_map(|s| s.component())
-                    .find(|c| *c != ComponentId::ASSEMBLY)
-            }),
-        };
-        let Some(id) = id else {
-            return;
-        };
-        let (Some(component), Some((lo, hi))) = (doc.component(id), doc.component_bounds(id))
-        else {
+        let (Some(component), Some(center)) = (doc.component(id), doc.component_center(id)) else {
             self.move_handle = None;
             return;
         };
         if component.fixed {
             return;
         }
-        let center = component.placement.apply_point(Point3::new(
-            (lo.x + hi.x) / 2.0,
-            (lo.y + hi.y) / 2.0,
-            (lo.z + hi.z) / 2.0,
-        ));
         let to_screen = |p: Point3| self.viewport.to_screen(p, output);
         let origin = to_screen(center);
         // Arrows of a fixed length on screen; an axis seen end-on is left out.
-        let mut arrows = Vec::new();
+        let mut shapes = HandleShapes::default();
         for (axis, direction) in HANDLE_AXES.into_iter().enumerate() {
             let d = to_screen(center + direction) - origin;
             if d.length() < 1e-4 {
                 continue;
             }
-            arrows.push(HandleArrow {
+            shapes.arrows.push(HandleArrow {
                 axis,
                 from: origin,
                 to: origin + d.normalized() * HANDLE_LENGTH,
             });
+        }
+        // Rings of a fixed size on screen; a ring seen nearly edge-on is left out, as it
+        // could not be turned by following it.
+        let ring_axes = |axis: usize| {
+            let (u, v) = ring_frame(axis);
+            (
+                to_screen(center + u) - origin,
+                to_screen(center + v) - origin,
+            )
+        };
+        for axis in 0..3 {
+            let (su, sv) = ring_axes(axis);
+            let Some(k) = ring_scale(su, sv) else {
+                continue;
+            };
+            let points = (0..RING_SEGMENTS)
+                .map(|i| {
+                    let (s, c) =
+                        (std::f32::consts::TAU * i as f32 / RING_SEGMENTS as f32).sin_cos();
+                    origin + (su * c + sv * s) * k
+                })
+                .collect();
+            shapes.rings.push(HandleRing { axis, points });
         }
         let response = &output.response;
         let pointer = response
             .hover_pos()
             .or_else(|| response.interact_pointer_pos());
         let hot = match self.move_handle {
-            Some(drag) => Some(drag.axis),
-            None => pointer
-                .and_then(|p| handle_arrow_at(&arrows, p))
-                .map(|a| a.axis),
+            Some(drag) => Some(drag.part),
+            None => pointer.and_then(|p| handle_part_at(&shapes, p)),
         };
 
-        // Dragging an arrow.
+        // Dragging an arrow or a ring.
         if self.move_handle.is_none()
             && response.drag_started_by(egui::PointerButton::Primary)
-            && let (Some(axis), Some(at)) = (hot, response.interact_pointer_pos())
+            && let (Some(part), Some(at)) = (hot, response.interact_pointer_pos())
         {
             if let Some(doc) = self.asm.as_mut() {
                 doc.checkpoint();
             }
             self.move_handle = Some(HandleDrag {
                 component: id,
-                axis,
+                part,
                 last: at,
             });
         }
         if let Some(mut drag) = self.move_handle {
             match response.interact_pointer_pos() {
                 Some(at) if response.dragged_by(egui::PointerButton::Primary) => {
-                    let direction = HANDLE_AXES[drag.axis];
-                    let mm = axis_shift(at - drag.last, to_screen(center + direction) - origin);
+                    let axis = handle_axis(drag.part.axis);
+                    let (rotation, shift) = if drag.part.ring {
+                        let (su, sv) = ring_axes(drag.part.axis);
+                        let angle = ring_turn(su, sv, drag.last - origin, at - origin);
+                        (axis * angle, Vec3::ZERO)
+                    } else {
+                        let mm = axis_shift(at - drag.last, to_screen(center + axis) - origin);
+                        (Vec3::ZERO, axis * mm)
+                    };
                     drag.last = at;
                     self.move_handle = Some(drag);
                     if let Some(doc) = self.asm.as_mut() {
                         if let Some(c) = doc.assembly.component_mut(id) {
-                            c.placement = c.placement.moved(Vec3::ZERO, center, direction * mm);
+                            c.placement = c.placement.moved(rotation, center, shift);
                         }
                         doc.solve();
                     }
@@ -2909,8 +2940,108 @@ impl OxydeApp {
         }
 
         let painter = ui.painter_at(output.rect);
-        paint_move_handle(&painter, &arrows, hot);
-        self.handle_shapes = arrows;
+        paint_move_handle(&painter, &shapes, hot);
+        self.handle_shapes = shapes;
+    }
+
+    /// Turns a component by typed angles (radians) about the assembly's X, Y and Z axes
+    /// through its centre, then lets the mates pull it back: one undo step.
+    fn rotate_component(&mut self, id: ComponentId, angles: [f64; 3]) {
+        let Some(doc) = self.asm.as_mut() else {
+            return;
+        };
+        let Some(center) = doc.component_center(id) else {
+            return;
+        };
+        if doc.component(id).is_none_or(|c| c.fixed) {
+            return;
+        }
+        doc.checkpoint();
+        if let Some(c) = doc.assembly.component_mut(id) {
+            c.placement = c.placement.rotated_xyz(angles, center);
+        }
+        doc.solve();
+    }
+
+    /// The Move Component PropertyManager: the component the handle is on, and turning it
+    /// by typed angles about the assembly's axes, as the Delta XYZ of SolidWorks' Rotate
+    /// Component.
+    fn move_manager(&mut self, ui: &mut egui::Ui) {
+        if !self.move_mode || self.mate_dialog.is_some() {
+            return;
+        }
+        let target = self.move_target();
+        let Some(doc) = self.asm.as_ref() else {
+            return;
+        };
+        let target = target.and_then(|id| doc.component(id).map(|c| (id, c.name.clone(), c.fixed)));
+        let mut close = false;
+        let mut apply = None;
+        let angles = &mut self.move_angles;
+        egui::Frame::none()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(Stroke::new(
+                1.0_f32,
+                ui.visuals().widgets.noninteractive.bg_stroke.color,
+            ))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    icons::small(ui, Icon::Move, 22.0);
+                    ui.label(RichText::new("Move Component").strong().size(15.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icons::icon_button(ui, Icon::Ok, 24.0, true)
+                            .on_hover_text("OK: end Move Component (Esc)")
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                crate::property_manager::section(ui, "Component");
+                match &target {
+                    Some((_, name, false)) => ui.label(name.as_str()),
+                    Some((_, name, true)) => {
+                        ui.label(format!("{name} is fixed: Float it to move it"))
+                    }
+                    None => ui.weak("Select a component"),
+                };
+                crate::property_manager::section(ui, "Rotate");
+                for (angle, label) in angles.iter_mut().zip(["ΔX", "ΔY", "ΔZ"]) {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(
+                            egui::DragValue::new(angle)
+                                .speed(0.5)
+                                .range(-360.0..=360.0)
+                                .suffix("°")
+                                .custom_parser(crate::dialogs::angle_parser),
+                        );
+                    });
+                }
+                let free = matches!(target, Some((_, _, false)));
+                let any = angles.iter().any(|a| *a != 0.0);
+                if ui
+                    .add_enabled(free && any, egui::Button::new("Apply"))
+                    .on_hover_text(
+                        "Turn the component about its centre by these angles: \
+                         about X first, then Y, then Z",
+                    )
+                    .clicked()
+                {
+                    apply = target.as_ref().map(|t| t.0);
+                }
+                ui.weak("Or drag a ring of the handle to turn it about one axis");
+            });
+        if let Some(id) = apply {
+            self.rotate_component(id, self.move_angles.map(f64::to_radians));
+        }
+        if close {
+            self.toggle_move_mode();
+        }
     }
 
     /// Alt+drag: slides (or turns) the grabbed component, then lets the mates pull it back.
@@ -3524,13 +3655,143 @@ pub(crate) struct HandleArrow {
     pub to: egui::Pos2,
 }
 
-/// A drag of one arrow of the move handle.
+/// Radius of the handle's rings on screen, in points.
+const RING_RADIUS: f32 = 55.0;
+/// Points drawn on a ring.
+const RING_SEGMENTS: usize = 64;
+/// How flat a ring may look (its narrow width over its wide one) and still be drawn.
+const RING_MIN_RATIO: f32 = 0.15;
+/// The assembly axis of a part of the handle: 0, 1, 2 for X, Y, Z.
+fn handle_axis(axis: usize) -> Vec3 {
+    match axis {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    }
+}
+
+/// For the ring about an axis, two directions of its plane, `u × v` being the axis: a turn
+/// from `u` towards `v` is a positive turn about the axis.
+fn ring_frame(axis: usize) -> (Vec3, Vec3) {
+    match axis {
+        0 => (Vec3::Y, Vec3::Z),
+        1 => (Vec3::Z, Vec3::X),
+        _ => (Vec3::X, Vec3::Y),
+    }
+}
+
+/// A ring of the move handle as drawn: the circle about an axis, as it looks on screen.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HandleRing {
+    /// 0, 1, 2 for X, Y, Z.
+    pub axis: usize,
+    pub points: Vec<egui::Pos2>,
+}
+
+/// The move handle as drawn, for hit testing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HandleShapes {
+    pub arrows: Vec<HandleArrow>,
+    pub rings: Vec<HandleRing>,
+}
+
+impl HandleShapes {
+    pub(crate) fn clear(&mut self) {
+        self.arrows.clear();
+        self.rings.clear();
+    }
+}
+
+/// A part of the move handle: the arrow along an axis or the ring about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HandlePart {
+    /// 0, 1, 2 for X, Y, Z.
+    pub axis: usize,
+    pub ring: bool,
+}
+
+/// A drag of one arrow or ring of the move handle.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandleDrag {
     pub component: ComponentId,
-    pub axis: usize,
+    pub part: HandlePart,
     /// Where the pointer was when the component was last moved.
     pub last: egui::Pos2,
+}
+
+/// The part of the handle under a screen position, the nearest when several are; an arrow
+/// wins a tie with a ring.
+pub(crate) fn handle_part_at(shapes: &HandleShapes, at: egui::Pos2) -> Option<HandlePart> {
+    let arrow = handle_arrow_at(&shapes.arrows, at).map(|a| {
+        let d = crate::sketch_mode::segment_distance(at, a.from, a.to);
+        (
+            HandlePart {
+                axis: a.axis,
+                ring: false,
+            },
+            d,
+        )
+    });
+    let ring = shapes
+        .rings
+        .iter()
+        .filter_map(|r| {
+            // Each point to the next, the last back to the first.
+            let next = r.points.iter().cycle().skip(1);
+            r.points
+                .iter()
+                .zip(next)
+                .map(|(a, b)| crate::sketch_mode::segment_distance(at, *a, *b))
+                .min_by(f32::total_cmp)
+                .map(|d| {
+                    (
+                        HandlePart {
+                            axis: r.axis,
+                            ring: true,
+                        },
+                        d,
+                    )
+                })
+        })
+        .filter(|(_, d)| *d <= HANDLE_REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    match (arrow, ring) {
+        (Some(a), Some(r)) => Some(if r.1 < a.1 { r.0 } else { a.0 }),
+        (a, r) => a.or(r).map(|(part, _)| part),
+    }
+}
+
+/// How much to scale a ring whose plane directions look like `su` and `sv` on screen (one
+/// millimetre each) so that its widest radius is [`RING_RADIUS`]; `None` when it is seen
+/// too nearly edge-on to follow with the pointer.
+pub(crate) fn ring_scale(su: egui::Vec2, sv: egui::Vec2) -> Option<f32> {
+    // The ring looks like an ellipse whose half-axes are the singular values of [su sv].
+    let (a, b, c) = (su.length_sq(), sv.length_sq(), su.dot(sv));
+    let mean = (a + b) / 2.0;
+    let spread = (((a - b) / 2.0).powi(2) + c * c).sqrt();
+    let wide = (mean + spread).sqrt();
+    let narrow = (mean - spread).max(0.0).sqrt();
+    (wide > 1e-6 && narrow / wide >= RING_MIN_RATIO).then(|| RING_RADIUS / wide)
+}
+
+/// How far a pointer moving from `from` to `to` (both from the handle's centre) turns a
+/// ring whose plane directions `u` and `v` look like `su` and `sv` on screen: the change
+/// of its angle in the ring's own plane, in radians, positive from `u` towards `v`.
+pub(crate) fn ring_turn(su: egui::Vec2, sv: egui::Vec2, from: egui::Vec2, to: egui::Vec2) -> f64 {
+    let det = su.x * sv.y - su.y * sv.x;
+    if det.abs() < 1e-9 {
+        return 0.0;
+    }
+    // The pointer in the ring's plane: the inverse of [su sv] applied to it.
+    let angle = |p: egui::Vec2| {
+        let x = (p.x * sv.y - p.y * sv.x) / det;
+        let y = (su.x * p.y - su.y * p.x) / det;
+        (y as f64).atan2(x as f64)
+    };
+    let turn = angle(to) - angle(from);
+    // The short way round: across ±180° the angle jumps by a full turn.
+    let tau = std::f64::consts::TAU;
+    (turn + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI
 }
 
 /// The arrow under a screen position, the nearest when several are.
@@ -3564,14 +3825,36 @@ fn handle_color(axis: usize, hot: bool) -> Color32 {
     }
 }
 
-/// Draws the move handle: arrows with heads and letters, the held or hovered one in
-/// yellow, and a knob at the centre.
-fn paint_move_handle(painter: &egui::Painter, arrows: &[HandleArrow], hot: Option<usize>) {
+/// Draws the move handle: rings, arrows with heads and letters over them, the held or
+/// hovered part in yellow, and a knob at the centre.
+fn paint_move_handle(painter: &egui::Painter, shapes: &HandleShapes, hot: Option<HandlePart>) {
     let halo = Color32::from_rgba_unmultiplied(255, 255, 255, 150);
+    for ring in &shapes.rings {
+        let is_hot = hot
+            == Some(HandlePart {
+                axis: ring.axis,
+                ring: true,
+            });
+        let color = handle_color(ring.axis, is_hot);
+        let width = if is_hot { 3.5_f32 } else { 2.0_f32 };
+        painter.add(egui::Shape::closed_line(
+            ring.points.clone(),
+            Stroke::new(width + 2.0, halo),
+        ));
+        painter.add(egui::Shape::closed_line(
+            ring.points.clone(),
+            Stroke::new(width, color),
+        ));
+    }
+    let arrows = &shapes.arrows;
     for arrow in arrows {
         let d = (arrow.to - arrow.from).normalized();
         let side = egui::vec2(-d.y, d.x);
-        let is_hot = hot == Some(arrow.axis);
+        let is_hot = hot
+            == Some(HandlePart {
+                axis: arrow.axis,
+                ring: false,
+            });
         let color = handle_color(arrow.axis, is_hot);
         let width = if is_hot { 4.5_f32 } else { 3.0_f32 };
         let shaft = arrow.to - d * 10.0;
@@ -3649,5 +3932,79 @@ mod handle_tests {
         );
         assert!((axis_shift(egui::vec2(-4.0, -3.0), per_mm) + 1.0).abs() < 1e-9);
         assert_eq!(axis_shift(egui::vec2(5.0, 5.0), egui::Vec2::ZERO), 0.0);
+    }
+
+    #[test]
+    fn a_ring_is_sized_by_its_widest_radius_and_left_out_edge_on() {
+        // A circle seen face-on, two points per millimetre.
+        let k = ring_scale(egui::vec2(2.0, 0.0), egui::vec2(0.0, -2.0)).unwrap();
+        assert!((k - RING_RADIUS / 2.0).abs() < 1e-4);
+        // Tilted: an ellipse four wide and one high is still drawn, by its wide side.
+        let k = ring_scale(egui::vec2(4.0, 0.0), egui::vec2(0.0, 1.0)).unwrap();
+        assert!((k - RING_RADIUS / 4.0).abs() < 1e-4);
+        // Nearly edge-on, or end-on, it is not.
+        assert_eq!(ring_scale(egui::vec2(4.0, 0.0), egui::vec2(0.0, 0.2)), None);
+        assert_eq!(ring_scale(egui::vec2(3.0, 1.0), egui::vec2(6.0, 2.0)), None);
+        assert_eq!(ring_scale(egui::Vec2::ZERO, egui::Vec2::ZERO), None);
+    }
+
+    #[test]
+    fn following_a_ring_turns_by_the_angle_swept_in_its_plane() {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        // u to the right and v up on screen (screen y grows downwards).
+        let (su, sv) = (egui::vec2(1.0, 0.0), egui::vec2(0.0, -1.0));
+        let turn = ring_turn(su, sv, egui::vec2(10.0, 0.0), egui::vec2(0.0, -10.0));
+        assert!((turn - FRAC_PI_2).abs() < 1e-6, "{turn}");
+        // Seen from the other side, v points down: the same screen movement turns back.
+        let turn = ring_turn(su, -sv, egui::vec2(10.0, 0.0), egui::vec2(0.0, -10.0));
+        assert!((turn + FRAC_PI_2).abs() < 1e-6, "{turn}");
+        // A flattened ring: the angle is read in the ring's plane, not on screen.
+        let turn = ring_turn(
+            egui::vec2(4.0, 0.0),
+            egui::vec2(0.0, -1.0),
+            egui::vec2(4.0, 0.0),
+            egui::vec2(2.0, -0.5),
+        );
+        assert!((turn - PI / 4.0).abs() < 1e-6, "{turn}");
+        // Across the half turn, the short way round.
+        let turn = ring_turn(su, sv, egui::vec2(-10.0, -0.1), egui::vec2(-10.0, 0.1));
+        assert!(turn.abs() < 0.05, "{turn}");
+        assert_eq!(
+            ring_turn(su, su, egui::vec2(1.0, 0.0), egui::vec2(0.0, 1.0)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn the_nearest_ring_or_arrow_is_taken() {
+        let o = egui::pos2(100.0, 100.0);
+        let points = (0..RING_SEGMENTS)
+            .map(|i| {
+                let (s, c) = (std::f32::consts::TAU * i as f32 / RING_SEGMENTS as f32).sin_cos();
+                o + egui::vec2(c, s) * RING_RADIUS
+            })
+            .collect();
+        let shapes = HandleShapes {
+            arrows: vec![HandleArrow {
+                axis: 0,
+                from: o,
+                to: egui::pos2(180.0, 100.0),
+            }],
+            rings: vec![HandleRing { axis: 2, points }],
+        };
+        let ring = Some(HandlePart {
+            axis: 2,
+            ring: true,
+        });
+        let arrow = Some(HandlePart {
+            axis: 0,
+            ring: false,
+        });
+        assert_eq!(handle_part_at(&shapes, egui::pos2(100.0, 157.0)), ring);
+        assert_eq!(handle_part_at(&shapes, egui::pos2(130.0, 102.0)), arrow);
+        // Where the arrow crosses the ring, the arrow.
+        assert_eq!(handle_part_at(&shapes, egui::pos2(155.0, 100.0)), arrow);
+        // Inside the ring, away from both: the component's, not the handle's.
+        assert_eq!(handle_part_at(&shapes, egui::pos2(110.0, 130.0)), None);
     }
 }
