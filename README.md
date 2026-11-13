@@ -188,8 +188,13 @@ with the OpenCASCADE DLLs on `PATH` as for the tests:
 
 ```sh
 cargo build -p oxyde-mcp
-claude mcp add oxyde -- C:/path/to/Oxyde/target/debug/oxyde-mcp.exe
+claude mcp add oxyde -- C:/path/to/Oxyde/scripts/oxyde-mcp.cmd
 ```
+
+On Windows, register `scripts/oxyde-mcp.cmd` rather than the executable: it runs a copy kept
+in `%LOCALAPPDATA%\Oxyde\mcp`, refreshed when the build is newer, so a session using the
+server does not keep `target\debug\oxyde-mcp.exe` open and stop `cargo` from replacing it.
+A new build reaches the next session that starts the server.
 
 `oxyde-mcp --tools` prints its tools and their arguments, and `oxyde-mcp --batch calls.jsonl`
 runs tool calls from a file (one `{"tool": ..., "arguments": {...}}` per line) without a client.
