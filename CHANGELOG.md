@@ -35,6 +35,11 @@ release yet; the git history has every detail.
   on every frame, so with it on the viewport never went idle: about 60 fps with Oxyde in the
   background, more in front. It now refreshes once a second, and its fps counts the frames
   actually drawn in the last second: about 1 while nothing happens.
+- **A window left minimized no longer piles up memory.** While Oxyde could not draw its
+  window (minimized, or with the display asleep), each frame's picture was still sent towards
+  the graphics card and kept until the window was drawn again: a window left minimized for a
+  day or two held 20 GB and more, freed only once it was shown. Those frames are now let go
+  as they are dropped.
 - **`OXYDE_REPAINT_TRACE=1`** prints, for each frame of the window, which code asked for it:
   to find what keeps the viewport drawing, and the graphics card busy, while nothing happens.
 
