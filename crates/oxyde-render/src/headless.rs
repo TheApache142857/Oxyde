@@ -44,11 +44,23 @@ pub fn snapshot(
     height: usize,
     style: &Style,
 ) -> Frame {
+    snapshot_highlighted(mesh, view, width, height, style, &Highlight::default())
+}
+
+/// As [`snapshot`], with faces and edges drawn hovered or selected.
+pub fn snapshot_highlighted(
+    mesh: &Mesh,
+    view: StandardView,
+    width: usize,
+    height: usize,
+    style: &Style,
+    highlight: &Highlight,
+) -> Frame {
     let scene = Scene::from_mesh(mesh);
     let mut camera = Camera::default();
     camera.set_view(view);
     if let Some((lo, hi)) = scene.bounds() {
         camera.fit(lo, hi, width as f64, height as f64);
     }
-    render_styled(&scene, &camera, width, height, &Highlight::default(), style)
+    render_styled(&scene, &camera, width, height, highlight, style)
 }

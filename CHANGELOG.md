@@ -11,6 +11,10 @@ release yet; the git history has every detail.
   very light grey panels, hairline dividers and a clear blue accent, over a soft grey-to-white
   viewport with thinner, softer edges. Flux stays the default; choosing another theme brings
   its own look back. `oxyde-cli snapshot --style studio` draws a picture in the Studio colours.
+- **Modern look** (Preferences › Graphics, on with the Studio theme): a selected or hovered
+  face keeps its own colour under a tint of the selection colour, and the selected faces get a
+  2 px outline round them, in the GPU viewport and the software renderer alike.
+  `oxyde-cli snapshot --select-face N` draws face N selected.
 
 ### Rotate in Move Component (unreleased, November 2026)
 

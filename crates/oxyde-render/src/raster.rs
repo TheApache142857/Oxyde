@@ -481,9 +481,75 @@ fn face_color(
     highlight: &Highlight,
     style: &Style,
 ) -> ([f32; 3], bool) {
+    let own = rgb(material.color.unwrap_or(style.face));
     match face_highlight(face, highlight, style) {
+        Some(color) if style.selection_tint > 0.0 => {
+            let t = style.selection_tint.min(1.0);
+            let mix = |a: f32, b: f32| a + (b - a) * t;
+            (
+                [
+                    mix(own[0], color[0]),
+                    mix(own[1], color[1]),
+                    mix(own[2], color[2]),
+                ],
+                false,
+            )
+        }
         Some(color) => (color, false),
-        None => (rgb(material.color.unwrap_or(style.face)), true),
+        None => (own, true),
+    }
+}
+
+/// Paints an outline `style.selection_outline` pixels wide round the selected faces, just
+/// outside them, in the selected-edge colour. A pixel belongs to a face where that face is
+/// the nearest thing drawn and no edge is drawn over it, as the GPU's id image has it.
+fn outline_selection(frame: &mut Frame, highlight: &Highlight, style: &Style) {
+    let r = style.selection_outline.round() as i64;
+    if r <= 0 || !style.display.shades_faces() {
+        return;
+    }
+    let selected: Vec<u32> = highlight
+        .selected
+        .iter()
+        .filter_map(|p| match p {
+            Pick::Face(i) => Some(i + 1),
+            Pick::Edge(_) => None,
+        })
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    let (w, h) = (frame.width as i64, frame.height as i64);
+    let on_selected = |frame: &Frame, x: i64, y: i64| {
+        let i = (y * w + x) as usize;
+        frame.edge_ids.get(i) == Some(&0)
+            && frame
+                .face_ids
+                .get(i)
+                .is_some_and(|id| selected.contains(id))
+    };
+    let mut ring = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if on_selected(frame, x, y) {
+                continue;
+            }
+            let near = (-r..=r).any(|dy| {
+                (-r..=r).any(|dx| {
+                    let (sx, sy) = (x + dx, y + dy);
+                    dx * dx + dy * dy <= r * r
+                        && (0..w).contains(&sx)
+                        && (0..h).contains(&sy)
+                        && on_selected(frame, sx, sy)
+                })
+            });
+            if near {
+                ring.push((y * w + x) as usize);
+            }
+        }
+    }
+    for i in ring {
+        frame.put(i, style.edge_selected);
     }
 }
 
@@ -799,6 +865,7 @@ pub fn render_styled(
     if shaded {
         see_through(&mut frame);
     }
+    outline_selection(&mut frame, highlight, style);
     frame
 }
 
@@ -1066,6 +1133,50 @@ mod tests {
         camera
     }
 
+    #[test]
+    fn a_tinted_selection_keeps_the_face_colour_and_gets_an_outline() {
+        // The front square (face 0), seen from the front, selected.
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let selected = Highlight {
+            selected: vec![Pick::Face(0)],
+            ..Highlight::default()
+        };
+        let classic = render_styled(&scene, &camera, 100, 100, &selected, &Style::LIGHT);
+        let studio = Style {
+            face_selected: [0, 0, 255],
+            ..Style::STUDIO
+        };
+        let tinted = render_styled(&scene, &camera, 100, 100, &selected, &studio);
+        let at = |f: &Frame, x: usize, y: usize| {
+            let k = (y * 100 + x) * 4;
+            [f.rgba[k], f.rgba[k + 1], f.rgba[k + 2]]
+        };
+        // The middle of the face: Light paints the selection colour, Studio mixes it in,
+        // so red and green (from the grey face) remain and blue rises.
+        let c = at(&tinted, 50, 50);
+        let face_only = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &studio);
+        let own = at(&face_only, 50, 50);
+        assert!(c[2] > own[2], "{c:?} over {own:?}");
+        assert!(c[0] > 0 && c[0] < own[0], "{c:?} over {own:?}");
+        assert_ne!(at(&classic, 50, 50), c);
+        // An outline in the selected-edge colour just outside the face, none without
+        // a selection, and none in the Light style.
+        let ring = |f: &Frame| {
+            f.rgba
+                .chunks(4)
+                .filter(|p| p[..3] == studio.edge_selected)
+                .count()
+        };
+        assert!(ring(&tinted) > 100, "{} outline pixels", ring(&tinted));
+        assert_eq!(ring(&face_only), 0);
+        let light_ring = classic
+            .rgba
+            .chunks(4)
+            .filter(|p| p[..3] == Style::LIGHT.edge_selected)
+            .count();
+        assert_eq!(light_ring, 0);
+    }
     #[test]
     fn nearest_face_wins_and_picks_exactly() {
         let scene = Scene::from_mesh(&mesh());

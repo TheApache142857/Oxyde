@@ -183,9 +183,15 @@ impl OxydeApp {
                     g.ui_theme = theme;
                     // The viewport follows; its colours can still be changed below.
                     g.set_style(&theme.viewport());
+                    // Studio comes with the modern look; the other themes keep the classic one.
+                    g.modern_look = theme == crate::theme::UiTheme::Studio;
                 }
             }
         });
+        ui.checkbox(&mut g.modern_look, "Modern look")
+            .on_hover_text(
+                "Selected faces keep their colour under a tint, with an outline round them",
+            );
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Renderer");
         ui.horizontal(|ui| {

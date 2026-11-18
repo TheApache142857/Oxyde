@@ -109,6 +109,13 @@ pub struct Style {
     /// than with the plain shading. Screen-space, from the depth buffer. Only in the
     /// shaded styles ([`Style::occlusion`]).
     pub ambient_occlusion: f32,
+    /// How a hovered or selected face shows it in the shaded styles: 0 paints it in the
+    /// highlight colour; above 0 the highlight colour is laid over the face's own colour
+    /// by that fraction (up to 1), so its shading and colour still read through.
+    pub selection_tint: f32,
+    /// Width in pixels of an outline drawn round the selected faces, just outside them,
+    /// in the selected-edge colour, in the shaded styles; 0 for none.
+    pub selection_outline: f32,
 }
 
 /// Brightness of an sRGB colour, 0..1, near enough to tell lines from a background.
@@ -141,6 +148,8 @@ impl Style {
         highlight_width: 3.0,
         floor_reflection: 0.0,
         ambient_occlusion: 0.0,
+        selection_tint: 0.0,
+        selection_outline: 0.0,
     };
 
     /// Dark background, light part.
@@ -177,6 +186,8 @@ impl Style {
         edge_hovered: [255, 140, 0],
         edge_width: 1.0,
         highlight_width: 2.5,
+        selection_tint: 0.55,
+        selection_outline: 2.0,
         ..Style::LIGHT
     };
 

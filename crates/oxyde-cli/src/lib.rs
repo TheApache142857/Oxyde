@@ -30,7 +30,7 @@ use oxyde_format::{drawing, gltf, obj, threemf};
 use oxyde_kernel::{Kernel, Mesh, StepMaterial};
 use oxyde_model::{FeatureStatus, Finish, ModelError, Part};
 use oxyde_occt::{OcctError, OcctKernel};
-use oxyde_render::{NORMAL_MESH_FRACTION, StandardView, Style};
+use oxyde_render::{Highlight, NORMAL_MESH_FRACTION, Pick, StandardView, Style};
 use serde::{Deserialize, Serialize};
 
 /// Everything is fine.
@@ -802,10 +802,19 @@ pub fn snapshot_rebuilt(
     width: usize,
     height: usize,
 ) -> Result<()> {
-    snapshot_rebuilt_styled(rebuilt, out, view, width, height, &Style::default())
+    snapshot_rebuilt_styled(
+        rebuilt,
+        out,
+        view,
+        width,
+        height,
+        &Style::default(),
+        &Highlight::default(),
+    )
 }
 
-/// As [`snapshot_rebuilt`], in the colours and display style of `style`.
+/// As [`snapshot_rebuilt`], in the colours and display style of `style`, with the faces and
+/// edges of `highlight` drawn hovered or selected.
 pub fn snapshot_rebuilt_styled(
     rebuilt: &Rebuilt,
     out: &Path,
@@ -813,9 +822,10 @@ pub fn snapshot_rebuilt_styled(
     width: usize,
     height: usize,
     style: &Style,
+    highlight: &Highlight,
 ) -> Result<()> {
     let mesh = rebuilt.display_mesh()?;
-    let frame = oxyde_render::snapshot(&mesh, view, width, height, style);
+    let frame = oxyde_render::snapshot_highlighted(&mesh, view, width, height, style, highlight);
     let file = std::fs::File::create(out).map_err(|e| Error(format!("{}: {e}", out.display())))?;
     let mut encoder = png::Encoder::new(io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
@@ -1021,6 +1031,9 @@ enum Command {
         /// The viewport colours: one of the renderer's presets.
         #[arg(long, value_enum, default_value_t = Look::Light)]
         style: Look,
+        /// A face to draw selected, by its index in the part's topology (repeatable).
+        #[arg(long = "select-face")]
+        select_face: Vec<u32>,
     },
     /// Rebuild a part and write its front, top, right and isometric views on a sheet with
     /// a title block, hidden lines dashed: PDF (.pdf), SVG (.svg) or DXF (.dxf, at the
@@ -1137,9 +1150,22 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
             width,
             height,
             style,
+            select_face,
         } => {
             let rebuilt = rebuild(&part)?;
-            snapshot_rebuilt_styled(&rebuilt, &file, view.into(), width, height, &style.into())?;
+            let highlight = Highlight {
+                selected: select_face.into_iter().map(Pick::Face).collect(),
+                ..Highlight::default()
+            };
+            snapshot_rebuilt_styled(
+                &rebuilt,
+                &file,
+                view.into(),
+                width,
+                height,
+                &style.into(),
+                &highlight,
+            )?;
             let features = rebuilt.features();
             let failed = write_failures(out, &features)?;
             writeln!(out, "wrote {} ({width}x{height})", file.display())?;
@@ -1335,6 +1361,7 @@ mod tests {
         );
         let help = String::from_utf8(out).unwrap();
         assert!(help.contains("--style"), "{help}");
+        assert!(help.contains("--select-face"), "{help}");
         for name in ["light", "dark", "white", "studio"] {
             assert!(help.contains(name), "{name} in {help}");
         }
