@@ -26,6 +26,8 @@ struct Measured {
     edges: usize,
     vertices: usize,
     names: Vec<String>,
+    /// The surface kind of each face, sorted.
+    surfaces: Vec<String>,
 }
 
 fn arr(p: Point3) -> [f64; 3] {
@@ -54,6 +56,13 @@ fn measure<K: Kernel>(part: &Part, kernel: &K) -> Measured {
         .map(|n| format!("{n:?}"))
         .collect();
     names.sort();
+    let mut surfaces: Vec<String> = body
+        .topology
+        .faces
+        .iter()
+        .map(|f| format!("{:?}", f.surface))
+        .collect();
+    surfaces.sort();
     Measured {
         volume: kernel.volume(shape).unwrap(),
         area: body.topology.faces.iter().map(|f| f.area).sum(),
@@ -64,10 +73,12 @@ fn measure<K: Kernel>(part: &Part, kernel: &K) -> Measured {
         edges: body.topology.edges.len(),
         vertices: body.topology.vertices.len(),
         names,
+        surfaces,
     }
 }
 
-fn same(name: &str, occt: &Measured, solidcore: &Measured) {
+/// Where the measures (volume, area, centre, bounds) disagree, none when they agree.
+fn measures_differ(occt: &Measured, solidcore: &Measured) -> Vec<String> {
     let size = (0..3)
         .map(|i| occt.hi[i] - occt.lo[i])
         .fold(0.0f64, f64::max)
@@ -96,6 +107,11 @@ fn same(name: &str, occt: &Measured, solidcore: &Measured) {
             solidcore.lo, solidcore.hi, occt.lo, occt.hi
         ));
     }
+    problems
+}
+
+fn same(name: &str, occt: &Measured, solidcore: &Measured) {
+    let mut problems = measures_differ(occt, solidcore);
     if (occt.faces, occt.edges, occt.vertices)
         != (solidcore.faces, solidcore.edges, solidcore.vertices)
     {
@@ -114,19 +130,81 @@ fn same(name: &str, occt: &Measured, solidcore: &Measured) {
     assert!(problems.is_empty(), "{name}:\n{}", problems.join("\n"));
 }
 
-/// Builds `make`'s part with both kernels and compares them.
-fn compare(name: &str, make: fn() -> Part) {
+/// `make`'s part built with OpenCASCADE and with solidcore.
+fn both(make: fn() -> Part) -> (Measured, Measured) {
     let mut occt_kernel = OcctKernel::new();
     let mut occt = make();
     occt.rebuild(&mut occt_kernel);
     let mut solid_kernel = SolidcoreKernel::new();
     let mut solid = make();
     solid.rebuild(&mut solid_kernel);
-    same(
-        name,
-        &measure(&occt, &occt_kernel),
-        &measure(&solid, &solid_kernel),
+    (measure(&occt, &occt_kernel), measure(&solid, &solid_kernel))
+}
+
+/// Builds `make`'s part with both kernels and compares them.
+fn compare(name: &str, make: fn() -> Part) {
+    let (occt, solid) = both(make);
+    same(name, &occt, &solid);
+}
+
+/// A known difference, pinned as it is today: solidcore makes a circle's extruded wall as two
+/// rational-spline faces, OpenCASCADE as one cylinder. The measures still agree; the part has
+/// one face, three edges and two vertices more; and the wall named `wall` (part 0) with
+/// OpenCASCADE is parts 1 and 2 with solidcore. This fails the day solidcore changes it.
+fn known_round_wall_difference(name: &str, make: fn() -> Part, wall: &str) {
+    let (occt, solid) = both(make);
+    let problems = measures_differ(&occt, &solid);
+    assert!(
+        problems.is_empty(),
+        "{name}:
+{}",
+        problems.join(
+            "
+"
+        )
     );
+    assert_eq!(
+        (occt.faces, occt.edges, occt.vertices),
+        (7, 15, 10),
+        "{name}: OpenCASCADE"
+    );
+    assert_eq!(
+        (solid.faces, solid.edges, solid.vertices),
+        (8, 18, 12),
+        "{name}: solidcore"
+    );
+    let count = |m: &Measured, kind: &str| m.surfaces.iter().filter(|s| *s == kind).count();
+    assert_eq!(
+        (count(&occt, "Cylinder"), count(&occt, "BSpline")),
+        (1, 0),
+        "{name}"
+    );
+    assert_eq!(
+        (count(&solid, "Cylinder"), count(&solid, "BSpline")),
+        (0, 2),
+        "{name}"
+    );
+    assert!(
+        occt.names.iter().any(|n| n == wall),
+        "{name}: {wall} in {:?}",
+        occt.names
+    );
+    let mut expected: Vec<String> = occt
+        .names
+        .iter()
+        .flat_map(|n| {
+            if n == wall {
+                vec![
+                    n.replace("part: 0", "part: 1"),
+                    n.replace("part: 0", "part: 2"),
+                ]
+            } else {
+                vec![n.clone()]
+            }
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(solid.names, expected, "{name}");
 }
 
 fn sketch_on_front() -> Sketch {
@@ -187,9 +265,12 @@ fn an_extruded_block_matches_opencascade() {
 }
 
 #[test]
-#[ignore = "spike finding: solidcore makes a round wall as two rational-spline faces, OpenCASCADE as one cylinder, so the part has 8 faces against 7 and the wall's names are parts 1 and 2 against part 0; volume, area, centre and bounds agree"]
-fn a_block_with_a_hole_in_its_sketch_matches_opencascade() {
-    compare("block with a hole", block_with_a_hole_in_its_sketch);
+fn a_block_with_a_hole_in_its_sketch_differs_only_by_its_round_wall() {
+    known_round_wall_difference(
+        "block with a hole",
+        block_with_a_hole_in_its_sketch,
+        "FaceName { key: Profile { feature: FeatureId(2), segment: 10 }, part: 0 }",
+    );
 }
 
 #[test]
@@ -198,9 +279,12 @@ fn two_blocks_joined_match_opencascade() {
 }
 
 #[test]
-#[ignore = "spike finding: solidcore makes a round wall as two rational-spline faces, OpenCASCADE as one cylinder, so the part has 8 faces against 7 and the wall's names are parts 1 and 2 against part 0; volume, area, centre and bounds agree"]
-fn a_hole_cut_through_a_block_matches_opencascade() {
-    compare("hole cut through a block", a_hole_cut_through_a_block);
+fn a_hole_cut_through_a_block_differs_only_by_its_round_wall() {
+    known_round_wall_difference(
+        "hole cut through a block",
+        a_hole_cut_through_a_block,
+        "FaceName { key: Profile { feature: FeatureId(4), segment: 2 }, part: 0 }",
+    );
 }
 
 /// A notch cut down into the block's top: the top side face is split in two by the cut, so
