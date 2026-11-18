@@ -1168,6 +1168,138 @@ impl OxydeApp {
     }
 }
 
+/// One place along the timeline strip: a feature, by its index in the part, or the rollback
+/// marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StripSlot {
+    Feature(usize),
+    Marker,
+}
+
+/// The strip's places in order: the `count` features, the rollback marker before the first
+/// rolled-back one (`rollback`), or after the last when nothing is rolled back.
+pub(crate) fn strip_slots(count: usize, rollback: Option<usize>) -> Vec<StripSlot> {
+    let marker_at = rollback.unwrap_or(count).min(count);
+    let mut slots = Vec::with_capacity(count + 1);
+    for i in 0..count {
+        if i == marker_at {
+            slots.push(StripSlot::Marker);
+        }
+        slots.push(StripSlot::Feature(i));
+    }
+    if marker_at == count {
+        slots.push(StripSlot::Marker);
+    }
+    slots
+}
+
+impl OxydeApp {
+    /// The timeline strip (Preferences › Graphics, on with Studio): the features as a row of
+    /// icons along the bottom of the window, in order, with the rollback marker among them,
+    /// as Fusion shows the history. A click selects a feature, a double click edits it, and
+    /// its menu rolls back to before it. The tree on the left stays as it is.
+    pub(crate) fn timeline_strip(&mut self, ui: &mut egui::Ui) {
+        let entries = self.doc.part.timeline();
+        let icons_of: Vec<Icon> = self
+            .doc
+            .part
+            .features()
+            .iter()
+            .map(|f| feature_icon(f.kind()))
+            .collect();
+        let rollback_at = self.doc.part.rollback_position();
+        let mut select = None;
+        let mut edit = None;
+        let mut roll_to = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("timeline_strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    for slot in strip_slots(entries.len(), rollback_at) {
+                        let index = match slot {
+                            StripSlot::Marker => {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 28.0), Sense::hover());
+                                let x = rect.center().x;
+                                ui.painter().vline(
+                                    x,
+                                    rect.y_range(),
+                                    Stroke::new(2.0_f32, rollback()),
+                                );
+                                ui.painter().circle_filled(
+                                    egui::pos2(x, rect.top() + 4.0),
+                                    3.5,
+                                    rollback(),
+                                );
+                                continue;
+                            }
+                            StripSlot::Feature(index) => index,
+                        };
+                        let (Some(entry), Some(&icon)) = (entries.get(index), icons_of.get(index))
+                        else {
+                            continue;
+                        };
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
+                        let active = !matches!(
+                            entry.status,
+                            FeatureStatus::RolledBack | FeatureStatus::Suppressed
+                        );
+                        let painter = ui.painter();
+                        if self.selected_feature == Some(entry.id) {
+                            painter.rect_filled(
+                                rect,
+                                4.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.6),
+                            );
+                        } else if response.hovered() {
+                            painter.rect_filled(
+                                rect,
+                                4.0,
+                                ui.visuals().widgets.hovered.weak_bg_fill,
+                            );
+                        }
+                        icons::paint(painter, rect.shrink(4.0), icon, active);
+                        let dot = match entry.status {
+                            FeatureStatus::Error(_) => Some(crate::theme::tokens().err),
+                            FeatureStatus::Warning(_) => Some(crate::theme::tokens().warn),
+                            _ => None,
+                        };
+                        if let Some(color) = dot {
+                            painter.circle_filled(
+                                rect.right_top() + egui::vec2(-4.0, 4.0),
+                                3.0,
+                                color,
+                            );
+                        }
+                        let response = response.on_hover_text(entry.name.as_str());
+                        if response.double_clicked() {
+                            edit = Some(entry.id);
+                        } else if response.clicked() {
+                            select = Some(entry.id);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Roll back to before this").clicked() {
+                                roll_to = Some(index);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            });
+        if let Some(id) = select {
+            self.selected_feature = Some(id);
+        }
+        if let Some(id) = edit {
+            self.edit_feature(id);
+        }
+        if let Some(index) = roll_to {
+            self.apply_action(Action::RollTo(index), &[]);
+        }
+    }
+}
+
 /// The rollback bar: a line with a round handle, dragged vertically between features.
 fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
     let width = ui.available_width();
@@ -1187,6 +1319,28 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_strip_puts_the_rollback_marker_among_the_features() {
+        use StripSlot::{Feature, Marker};
+        assert_eq!(
+            strip_slots(3, None),
+            vec![Feature(0), Feature(1), Feature(2), Marker]
+        );
+        assert_eq!(
+            strip_slots(3, Some(1)),
+            vec![Feature(0), Marker, Feature(1), Feature(2)]
+        );
+        assert_eq!(
+            strip_slots(3, Some(0)),
+            vec![Marker, Feature(0), Feature(1), Feature(2)]
+        );
+        assert_eq!(
+            strip_slots(2, Some(9)),
+            vec![Feature(0), Feature(1), Marker]
+        );
+        assert_eq!(strip_slots(0, None), vec![Marker]);
+    }
 
     #[test]
     fn studio_marks_rows_with_eyes_dots_and_hairlines() {

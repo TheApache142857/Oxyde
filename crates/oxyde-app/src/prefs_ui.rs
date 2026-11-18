@@ -186,6 +186,7 @@ impl OxydeApp {
                     g.set_style(&theme.viewport());
                     // Studio comes with the modern look; the other themes keep the classic one.
                     g.modern_look = theme == crate::theme::UiTheme::Studio;
+                    g.timeline_strip = theme == crate::theme::UiTheme::Studio;
                 }
             }
         });
@@ -193,6 +194,8 @@ impl OxydeApp {
             .on_hover_text(
                 "Soft studio lighting; selected faces keep their colour under a tint, with an outline round them",
             );
+        ui.checkbox(&mut g.timeline_strip, "Timeline strip")
+            .on_hover_text("The features as a row of icons along the bottom of the window");
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Renderer");
         ui.horizontal(|ui| {

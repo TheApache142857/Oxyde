@@ -2310,6 +2310,9 @@ impl OxydeApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| self.menu_bar(ui));
         egui::TopBottomPanel::top("commands").show(ctx, |ui| self.command_bar(ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        if self.prefs.graphics.timeline_strip {
+            egui::TopBottomPanel::bottom("timeline_strip").show(ctx, |ui| self.timeline_strip(ui));
+        }
         egui::SidePanel::left("feature_manager")
             .resizable(true)
             .default_width(290.0)

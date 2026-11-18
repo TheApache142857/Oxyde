@@ -33,6 +33,9 @@ release yet; the git history has every detail.
 - **Studio's command bar**: on the Features and Evaluate tabs the commands sit in named
   clusters (Create, Modify, Pattern, Look, Construct, Import, Equations; Inspect, Rebuild) on
   rounded panels, in place of separators.
+- **Timeline strip** (Preferences › Graphics, on with Studio): the part's features as a row of
+  icons along the bottom of the window, in order, with the rollback marker among them. A click
+  selects a feature, a double click edits it, and its menu rolls back to before it.
 
 ### Rotate in Move Component (unreleased, November 2026)
 

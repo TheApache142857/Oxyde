@@ -121,6 +121,8 @@ pub struct Graphics {
     /// The modern look (Preferences › Graphics, and on with the Studio theme): soft studio
     /// lighting, and selected faces tinted rather than repainted, with an outline round them.
     pub modern_look: bool,
+    /// The timeline strip along the bottom of the window (on with the Studio theme).
+    pub timeline_strip: bool,
 }
 
 impl Default for Graphics {
@@ -147,6 +149,7 @@ impl Default for Graphics {
             ambient_occlusion: true,
             ambient_occlusion_strength: 0.6,
             modern_look: false,
+            timeline_strip: false,
         };
         g.set_style(&g.ui_theme.viewport());
         g
