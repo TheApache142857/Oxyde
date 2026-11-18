@@ -824,8 +824,23 @@ pub fn snapshot_rebuilt_styled(
     style: &Style,
     highlight: &Highlight,
 ) -> Result<()> {
+    let mut camera = oxyde_render::Camera::default();
+    camera.set_view(view);
+    snapshot_rebuilt_from(rebuilt, out, camera, width, height, style, highlight)
+}
+
+/// As [`snapshot_rebuilt_styled`], seen the way `camera` looks.
+pub fn snapshot_rebuilt_from(
+    rebuilt: &Rebuilt,
+    out: &Path,
+    camera: oxyde_render::Camera,
+    width: usize,
+    height: usize,
+    style: &Style,
+    highlight: &Highlight,
+) -> Result<()> {
     let mesh = rebuilt.display_mesh()?;
-    let frame = oxyde_render::snapshot_highlighted(&mesh, view, width, height, style, highlight);
+    let frame = oxyde_render::snapshot_from(&mesh, camera, width, height, style, highlight);
     let file = std::fs::File::create(out).map_err(|e| Error(format!("{}: {e}", out.display())))?;
     let mut encoder = png::Encoder::new(io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
@@ -1031,6 +1046,10 @@ enum Command {
         /// The viewport colours: one of the renderer's presets.
         #[arg(long, value_enum, default_value_t = Look::Light)]
         style: Look,
+        /// Elevation of the view in degrees (from below -90 to above 90), in place of the
+        /// view's own: the isometric view is at 35.
+        #[arg(long, allow_negative_numbers = true)]
+        pitch: Option<f64>,
         /// A face to draw selected, by its index in the part's topology (repeatable).
         #[arg(long = "select-face")]
         select_face: Vec<u32>,
@@ -1150,6 +1169,7 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
             width,
             height,
             style,
+            pitch,
             select_face,
         } => {
             let rebuilt = rebuild(&part)?;
@@ -1157,10 +1177,15 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
                 selected: select_face.into_iter().map(Pick::Face).collect(),
                 ..Highlight::default()
             };
-            snapshot_rebuilt_styled(
+            let mut camera = oxyde_render::Camera::default();
+            camera.set_view(view.into());
+            if let Some(degrees) = pitch {
+                camera.pitch = degrees.clamp(-90.0, 90.0).to_radians();
+            }
+            snapshot_rebuilt_from(
                 &rebuilt,
                 &file,
-                view.into(),
+                camera,
                 width,
                 height,
                 &style.into(),
@@ -1362,6 +1387,7 @@ mod tests {
         let help = String::from_utf8(out).unwrap();
         assert!(help.contains("--style"), "{help}");
         assert!(help.contains("--select-face"), "{help}");
+        assert!(help.contains("--pitch"), "{help}");
         for name in ["light", "dark", "white", "studio"] {
             assert!(help.contains(name), "{name} in {help}");
         }

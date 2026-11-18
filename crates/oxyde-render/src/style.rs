@@ -193,7 +193,7 @@ impl Style {
     pub const STUDIO: Style = Style {
         background_top: [214, 219, 225],
         background_bottom: [251, 251, 252],
-        face: [188, 193, 200],
+        face: [198, 203, 210],
         face_selected: [96, 160, 255],
         face_hovered: [255, 190, 110],
         edge: [62, 67, 75],

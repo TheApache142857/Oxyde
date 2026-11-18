@@ -272,10 +272,15 @@ fn shade_face(in: FaceOut) -> vec4<f32> {
     var shine = 0.0;
     if (soft > 0.0) {
         let sky = 0.5 + 0.5 * n.y;
-        light = light + (0.28 + 0.14 * sky + 0.25 * facing + 0.42 * key - light) * soft;
+        var fill = 0.0;
+        let fill_raw = 2.0 * view.eye.xyz - view.key.xyz;
+        if (length(fill_raw) > 0.0) {
+            fill = max(dot(n, normalize(fill_raw)), 0.0);
+        }
+        light = light + (0.20 + 0.26 * sky + 0.20 * facing + 0.40 * key + 0.16 * fill - light) * soft;
         let half = view.key.xyz + view.eye.xyz;
         if (length(half) > 0.0) {
-            shine = pow(max(dot(n, normalize(half)), 0.0), 32.0) * 0.22 * soft * 255.0;
+            shine = pow(max(dot(n, normalize(half)), 0.0), 20.0) * 0.32 * soft * 255.0;
         }
     }
     if (view.ao.x > 0.0 && view.floor.w < 0.5) {

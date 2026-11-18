@@ -711,9 +711,12 @@ fn shade(n: V3, lights: &Lights) -> f32 {
     if lights.soft <= 0.0 {
         return classic;
     }
-    // Sky-to-ground ambient: a face turned up (+Y, the world's up) gets more of it.
+    // Sky-to-ground ambient: a face turned up (+Y, the world's up) gets more of it; and a
+    // fill light from the other side of the viewer than the key, so the shadowed side
+    // of a round face does not go flat.
     let sky = (0.5 + 0.5 * n[1]) as f32;
-    let soft = 0.28 + 0.14 * sky + (0.25 * facing + 0.42 * key) as f32;
+    let fill = fill_light(lights).map_or(0.0, |f| dot(n, f).max(0.0));
+    let soft = 0.20 + 0.26 * sky + (0.20 * facing + 0.40 * key + 0.16 * fill) as f32;
     classic + (soft - classic) * lights.soft.min(1.0)
 }
 
@@ -734,7 +737,14 @@ fn specular(n: V3, lights: &Lights) -> f32 {
         return 0.0;
     }
     let along = (dot(n, half) / len).max(0.0) as f32;
-    along.powf(32.0) * 0.22 * lights.soft.min(1.0)
+    along.powf(20.0) * 0.32 * lights.soft.min(1.0)
+}
+
+/// The soft lighting's fill light: the key light mirrored through the viewer.
+fn fill_light(lights: &Lights) -> Option<V3> {
+    let raw = sub(scale(lights.eye, 2.0), lights.key);
+    let len = length(raw);
+    (len > 0.0).then(|| scale(raw, 1.0 / len))
 }
 
 /// How far ambient occlusion looks around a pixel, as a fraction of the image's smaller
@@ -1472,7 +1482,7 @@ mod tests {
         let half = add(lights.key, lights.eye);
         let half = scale(half, 1.0 / length(half));
         let peak = specular(half, &lights);
-        assert!((peak - 0.22).abs() < 1e-4, "{peak}");
+        assert!((peak - 0.32).abs() < 1e-4, "{peak}");
         assert!(specular([1.0, 0.0, 0.0], &lights) < peak);
     }
 
