@@ -192,6 +192,16 @@ impl Graphics {
             } else {
                 0.0
             },
+            ground_grid: if self.modern_look {
+                Style::STUDIO.ground_grid
+            } else {
+                0.0
+            },
+            contact_shadow: if self.modern_look {
+                Style::STUDIO.contact_shadow
+            } else {
+                0.0
+            },
         }
     }
 

@@ -21,6 +21,9 @@ release yet; the git history has every detail.
 - **View cube** with the modern look: a small cube in the viewport's top-right corner turns
   with the model; clicking a face (FRONT, TOP, RIGHT, ...) turns the view to it, and the home
   button beside it goes back to the isometric view.
+- **Ground grid and contact shadow** with the modern look, seen from above: a grid on the floor
+  under the part (its spacing 1, 2 or 5 times a power of ten, fading away from the part) and a
+  soft shadow round the part's footprint, in the GPU viewport and the software renderer alike.
 - **Studio's page layout**: one type scale (12 / 13 / 15 points), a little more padding and
   taller rows, and panel sections headed by their title over a hairline divider.
 - **Studio's feature tree**: an eye on every item that can be hidden, a small red or amber dot

@@ -330,6 +330,123 @@ impl Floor {
     }
 }
 
+/// The floor under the part as the modern look draws it: a grid fading away from the part
+/// and a soft shadow round its footprint, on the floor plane of [`Floor`], seen from above.
+/// Both renderers paint it over the background from [`Ground::cover`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ground {
+    /// Height of the floor (mm).
+    pub y: f64,
+    /// The part's footprint on the floor: lowest x, lowest z, highest x, highest z (mm).
+    pub footprint: [f64; 4],
+    /// Grid spacing (mm): 1, 2 or 5 times a power of ten, about an eighth of the footprint.
+    pub step: f64,
+    /// [`Style::ground_grid`] and [`Style::contact_shadow`].
+    pub grid: f32,
+    pub shadow: f32,
+}
+
+/// How far the grid reaches from the footprint's centre, in footprint sizes.
+const GRID_REACH: f64 = 2.5;
+/// The shadow's softness: its Gaussian width, in footprint sizes.
+const SHADOW_WIDTH: f64 = 0.12;
+/// How dark the grid ink and the shadow get at full strength.
+const GRID_INK: f32 = 0.35;
+const SHADOW_DARK: f64 = 0.45;
+
+impl Ground {
+    /// The ground of a scene with `bounds` seen through `camera` in `style`, or none: no
+    /// grid and no shadow, a line style, or a view from below the floor.
+    pub fn under(bounds: Option<(V3, V3)>, camera: &Camera, style: &Style) -> Option<Ground> {
+        if !style.display.shades_faces()
+            || (style.ground_grid <= 0.0 && style.contact_shadow <= 0.0)
+        {
+            return None;
+        }
+        let (lo, hi) = bounds?;
+        let floor = Floor::under(lo, hi);
+        if !floor.visible(camera) {
+            return None;
+        }
+        let footprint = [lo[0], lo[2], hi[0], hi[2]];
+        let size = (hi[0] - lo[0]).max(hi[2] - lo[2]).max(1e-3);
+        Some(Ground {
+            y: floor.y,
+            footprint,
+            step: nice_step(size / 8.0),
+            grid: style.ground_grid.min(1.0),
+            shadow: style.contact_shadow.min(1.0),
+        })
+    }
+
+    /// The footprint's larger side (mm).
+    pub fn size(&self) -> f64 {
+        let [x0, z0, x1, z1] = self.footprint;
+        (x1 - x0).max(z1 - z0).max(1e-3)
+    }
+
+    /// How much grid ink and shadow lie on the floor point (`x`, `z`) when a pixel covers
+    /// `mm_per_px` millimetres of floor: (ink, shadow), each 0..1.
+    pub fn cover(&self, x: f64, z: f64, mm_per_px: f64) -> (f32, f32) {
+        let [x0, z0, x1, z1] = self.footprint;
+        let size = self.size();
+        let dx = (x0 - x).max(x - x1).max(0.0);
+        let dz = (z0 - z).max(z - z1).max(0.0);
+        let d = (dx * dx + dz * dz).sqrt() / (SHADOW_WIDTH * size);
+        let shadow = f64::from(self.shadow) * SHADOW_DARK * (-d * d).exp();
+        let near = |v: f64| {
+            let r = (v / self.step).rem_euclid(1.0);
+            r.min(1.0 - r) * self.step
+        };
+        let line = (1.0 - near(x).min(near(z)) / mm_per_px.max(1e-9)).clamp(0.0, 1.0);
+        let (cx, cz) = ((x0 + x1) / 2.0, (z0 + z1) / 2.0);
+        let r = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
+        let fade = (1.0 - r / (GRID_REACH * size)).clamp(0.0, 1.0);
+        (self.grid * GRID_INK * (line * fade) as f32, shadow as f32)
+    }
+}
+
+/// The spacing nearest above `at_least` among 1, 2 and 5 times a power of ten.
+fn nice_step(at_least: f64) -> f64 {
+    let power = 10f64.powf(at_least.max(1e-6).log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * power)
+        .find(|s| *s >= at_least)
+        .unwrap_or(10.0 * power)
+}
+
+/// Paints the ground over the background, before anything else is drawn.
+fn paint_ground(frame: &mut Frame, ground: &Ground, camera: &Camera, style: &Style) {
+    let (w, h) = (frame.width, frame.height);
+    let s = camera.pixels_per_mm(h as f64);
+    let (right, up, eye) = (camera.right(), camera.up(), camera.eye_direction());
+    let mm_per_px = 1.0 / (s * eye[1]);
+    let ink = rgb(style.edge);
+    for y in 0..h {
+        for x in 0..w {
+            let across = (x as f64 + 0.5 - w as f64 / 2.0) / s;
+            let down = (h as f64 / 2.0 - (y as f64 + 0.5)) / s;
+            let p = add(camera.target, add(scale(right, across), scale(up, down)));
+            let q = add(p, scale(eye, (ground.y - p[1]) / eye[1]));
+            let (grid, shadow) = ground.cover(q[0], q[2], mm_per_px);
+            if grid <= 0.0 && shadow <= 0.0 {
+                continue;
+            }
+            let i = y * w + x;
+            let k = i * 4;
+            let Some(&[r, g, b]) = frame.rgba.get(k..k + 3) else {
+                continue;
+            };
+            let mut c = [f32::from(r), f32::from(g), f32::from(b)];
+            for (v, ink) in c.iter_mut().zip(ink) {
+                *v = (*v + (ink - *v) * grid) * (1.0 - shadow);
+            }
+            frame.put(i, c.map(|v| v.round().clamp(0.0, 255.0) as u8));
+        }
+    }
+}
+
 /// A rendered image with its depth and id buffers.
 pub struct Frame {
     pub width: usize,
@@ -724,6 +841,9 @@ pub fn render_styled(
         for x in 0..width {
             frame.put(y * width + x, c);
         }
+    }
+    if let Some(ground) = Ground::under(scene.bounds(), camera, style) {
+        paint_ground(&mut frame, &ground, camera, style);
     }
 
     let (w, h) = (width as f64, height as f64);
@@ -1162,6 +1282,64 @@ mod tests {
         };
         camera.set_view(StandardView::Front);
         camera
+    }
+
+    #[test]
+    fn the_ground_lays_a_grid_and_a_shadow_under_the_part() {
+        assert_eq!(nice_step(0.8), 1.0);
+        assert_eq!(nice_step(1.3), 2.0);
+        assert_eq!(nice_step(3.0), 5.0);
+        assert_eq!(nice_step(7.0), 10.0);
+        assert_eq!(nice_step(12.5), 20.0);
+        let camera = Camera::default(); // isometric, from above
+        let bounds = Some(([0.0, 0.0, 0.0], [80.0, 10.0, 40.0]));
+        assert_eq!(Ground::under(bounds, &camera, &Style::LIGHT), None);
+        let ground = Ground::under(bounds, &camera, &Style::STUDIO).expect("Studio has a ground");
+        assert_eq!(ground.step, 10.0);
+        assert!(ground.y < 0.0);
+        // Under the part the shadow is full; far from it, nothing.
+        let (_, under) = ground.cover(40.0, 20.0, 0.5);
+        assert!((under - 0.45).abs() < 1e-6, "{under}");
+        assert_eq!(ground.cover(1000.0, 1000.0, 0.5), (0.0, 0.0));
+        // On a grid line near the part the ink is strong; half way between lines, none.
+        let (on, _) = ground.cover(110.0, -35.0, 0.5);
+        let (between, _) = ground.cover(105.0, -35.0, 0.5);
+        assert!(on > 0.1 && between == 0.0, "{on} {between}");
+        // Seen from below, or in a line style, there is none.
+        let mut below = Camera::default();
+        below.set_view(StandardView::Bottom);
+        assert_eq!(Ground::under(bounds, &below, &Style::STUDIO), None);
+        let lines = Style {
+            display: DisplayStyle::HiddenLinesRemoved,
+            ..Style::STUDIO
+        };
+        assert_eq!(Ground::under(bounds, &camera, &lines), None);
+        // In a picture the floor round the part darkens.
+        let scene = Scene::from_mesh(&mesh());
+        let mut camera = Camera::default();
+        let (lo, hi) = scene.bounds().unwrap();
+        camera.fit(lo, hi, 100.0, 100.0);
+        let bare = Style {
+            ground_grid: 0.0,
+            contact_shadow: 0.0,
+            ..Style::STUDIO
+        };
+        let with = render_styled(
+            &scene,
+            &camera,
+            100,
+            100,
+            &Highlight::default(),
+            &Style::STUDIO,
+        );
+        let without = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &bare);
+        let changed = with
+            .rgba
+            .chunks(4)
+            .zip(without.rgba.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 100, "{changed} pixels changed");
     }
 
     #[test]

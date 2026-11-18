@@ -41,8 +41,8 @@ const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const EDGE_BIT: u32 = 0x8000_0000;
 /// Every colour texture is resampled to this size, so they fit one texture array.
 const TEXTURE_SIZE: u32 = 512;
-/// Bytes of the `View` uniform: 21 vec4s.
-const VIEW_BYTES: u64 = 21 * 16;
+/// Bytes of the `View` uniform: 23 vec4s.
+const VIEW_BYTES: u64 = 23 * 16;
 /// The ambient occlusion image: one occlusion value per pixel.
 const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// One edge segment in its vertex buffer: start, end, edge index, millimetres along the
@@ -79,6 +79,11 @@ struct View {
     // Selection: x: how much a highlight colour is laid over a face's own colour (0: the
     // face is painted in it), y: outline width round the selected faces (pixels).
     selection: vec4<f32>,
+    // The ground (modern look): x: shadow, y: grid strength (0: none), z: grid step (mm),
+    // w: floor height (mm).
+    ground: vec4<f32>,
+    // The part's footprint on the floor: lowest x, lowest z, highest x, highest z (mm).
+    footprint: vec4<f32>,
 };
 
 struct FaceMaterial {
@@ -139,8 +144,38 @@ fn background(t: f32) -> vec3<f32> {
     return linear(mix(view.colors[0].xyz, view.colors[1].xyz, clamp(t, 0.0, 1.0)));
 }
 
+// The ground of the modern look, as `Ground::cover` and `paint_ground` in the software
+// renderer: the floor point under this pixel, its grid ink and its shadow.
+fn on_ground(base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    let s = view.viewport.y * view.scale.y * 0.5;
+    let e = view.eye.xyz;
+    let p = view.center.xyz
+        + view.right.xyz * ((pixel.x - view.viewport.x * 0.5) / s)
+        + view.up.xyz * ((view.viewport.y * 0.5 - pixel.y) / s);
+    let q = p + e * ((view.ground.w - p.y) / e.y);
+    let fp = view.footprint;
+    let size = max(max(fp.z - fp.x, fp.w - fp.y), 1e-3);
+    let dx = max(max(fp.x - q.x, q.x - fp.z), 0.0);
+    let dz = max(max(fp.y - q.z, q.z - fp.w), 0.0);
+    let d = sqrt(dx * dx + dz * dz) / (0.12 * size);
+    let shadow = view.ground.x * 0.45 * exp(-d * d);
+    let step = view.ground.z;
+    let rx = fract(q.x / step);
+    let rz = fract(q.z / step);
+    let near = min(min(rx, 1.0 - rx), min(rz, 1.0 - rz)) * step;
+    let line = clamp(1.0 - near * s * e.y, 0.0, 1.0);
+    let r = length(vec2<f32>(q.x, q.z) - vec2<f32>((fp.x + fp.z) * 0.5, (fp.y + fp.w) * 0.5));
+    let fade = clamp(1.0 - r / (2.5 * size), 0.0, 1.0);
+    let ink = view.ground.y * 0.35 * line * fade;
+    return (base + (view.colors[5].xyz - base) * ink) * (1.0 - shadow);
+}
+
 @fragment
 fn background_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
+    if (view.ground.x > 0.0 || view.ground.y > 0.0) {
+        let base = mix(view.colors[0].xyz, view.colors[1].xyz, clamp(in.t, 0.0, 1.0));
+        return vec4<f32>(linear(on_ground(base, in.position.xy)), 1.0);
+    }
     return vec4<f32>(background(in.t), 1.0);
 }
 
@@ -1409,6 +1444,9 @@ impl GpuViewport {
             0.0,
         ]);
         view.extend([style.selection_tint, style.selection_outline, 0.0, 0.0]);
+        let ground = oxyde_render::Ground::under(self.bounds, camera, style);
+        view.extend(ground.map_or([0.0; 4], |g| [g.shadow, g.grid, g.step as f32, g.y as f32]));
+        view.extend(ground.map_or([0.0; 4], |g| g.footprint.map(|v| v as f32)));
         self.queue
             .write_buffer(&self.uniforms, 0, &bytes_f32(view.clone()));
         // The reflection pass: flagged, and without occlusion.

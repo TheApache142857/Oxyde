@@ -120,6 +120,14 @@ pub struct Style {
     /// ambient (faces turned up get more), the key light, and a faint specular highlight,
     /// so curved faces read as round. Both renderers compute the same.
     pub soft_light: f32,
+    /// A grid on the floor under the part, 0 (none) to 1, fading away from it ([`Ground`]).
+    /// Only in the shaded styles, seen from above the floor.
+    ///
+    /// [`Ground`]: crate::Ground
+    pub ground_grid: f32,
+    /// A soft shadow on the floor round the part's footprint, 0 (none) to 1. Only in the
+    /// shaded styles, seen from above the floor.
+    pub contact_shadow: f32,
 }
 
 /// Brightness of an sRGB colour, 0..1, near enough to tell lines from a background.
@@ -155,6 +163,8 @@ impl Style {
         selection_tint: 0.0,
         selection_outline: 0.0,
         soft_light: 0.0,
+        ground_grid: 0.0,
+        contact_shadow: 0.0,
     };
 
     /// Dark background, light part.
@@ -194,6 +204,8 @@ impl Style {
         selection_tint: 0.55,
         selection_outline: 2.0,
         soft_light: 1.0,
+        ground_grid: 1.0,
+        contact_shadow: 1.0,
         ..Style::LIGHT
     };
 
