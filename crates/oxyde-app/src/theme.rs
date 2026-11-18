@@ -3,7 +3,9 @@
 //! *Flux* (the default) is the dark navy and cyan of the KiCad Flux viewer; *Light* is its
 //! daylight counterpart. *Gruvbox dark* and *Gruvbox light* are the warm "retro groove"
 //! palette of the Gruvbox colour scheme, and *Classic 95* the grey, navy and teal of
-//! Windows 95, with square corners and Microsoft Sans Serif where Windows has it. The others
+//! Windows 95, with square corners and Microsoft Sans Serif where Windows has it. *Studio*
+//! is a quiet light look: neutral greys, white panels, a soft grey-to-white viewport and
+//! thin edges (`Style::STUDIO`). The others
 //! use the system's interface font (Segoe UI on Windows) rather than egui's bundled one.
 //!
 //! Colours drawn by hand elsewhere (icons, the timeline's badges, selection boxes, sketch
@@ -26,15 +28,17 @@ pub enum UiTheme {
     GruvboxDark,
     GruvboxLight,
     Classic95,
+    Studio,
 }
 
 impl UiTheme {
-    pub const ALL: [(UiTheme, &'static str); 5] = [
+    pub const ALL: [(UiTheme, &'static str); 6] = [
         (UiTheme::Flux, "Flux (dark)"),
         (UiTheme::Light, "Light"),
         (UiTheme::GruvboxDark, "Gruvbox dark"),
         (UiTheme::GruvboxLight, "Gruvbox light"),
         (UiTheme::Classic95, "Classic 95"),
+        (UiTheme::Studio, "Studio (light)"),
     ];
 
     /// Its name in the preferences file.
@@ -45,6 +49,7 @@ impl UiTheme {
             UiTheme::GruvboxDark => "gruvbox_dark",
             UiTheme::GruvboxLight => "gruvbox_light",
             UiTheme::Classic95 => "classic_95",
+            UiTheme::Studio => "studio",
         }
     }
 
@@ -56,6 +61,7 @@ impl UiTheme {
             UiTheme::GruvboxDark => GRUVBOX_DARK_VIEWPORT,
             UiTheme::GruvboxLight => GRUVBOX_LIGHT_VIEWPORT,
             UiTheme::Classic95 => CLASSIC_95_VIEWPORT,
+            UiTheme::Studio => Style::STUDIO,
         }
     }
 
@@ -67,6 +73,7 @@ impl UiTheme {
             UiTheme::GruvboxDark => &GRUVBOX_DARK,
             UiTheme::GruvboxLight => &GRUVBOX_LIGHT,
             UiTheme::Classic95 => &CLASSIC_95,
+            UiTheme::Studio => &STUDIO,
         }
     }
 
@@ -148,8 +155,8 @@ pub const CLASSIC_95_VIEWPORT: Style = Style {
     ..Style::LIGHT
 };
 
-/// The themes' viewport colours, offered beside the renderer's own presets. (Light's are
-/// the renderer's Light.)
+/// The themes' viewport colours, offered beside the renderer's own presets. (Light's and
+/// Studio's are the renderer's Light and Studio.)
 pub const VIEWPORT_PRESETS: [(&str, Style); 4] = [
     ("Flux", FLUX_VIEWPORT),
     ("Gruvbox dark", GRUVBOX_DARK_VIEWPORT),
@@ -208,6 +215,23 @@ pub const LIGHT: Tokens = Tokens {
     err: hex(0xd32f2f),
     icon_ink: hex(0x2e3a46),
     icon_sketch: hex(0x1e6fd9),
+};
+
+/// Studio: near-black text on white and very light grey panels, hairline dividers and a
+/// clear blue accent.
+pub const STUDIO: Tokens = Tokens {
+    bg: hex(0xedeff2),
+    panel: hex(0xf7f8f9),
+    panel2: hex(0xffffff),
+    line: hex(0xdde1e6),
+    fg: hex(0x1f2328),
+    dim: hex(0x66707a),
+    accent: hex(0x1f7ae0),
+    accent_bg: hex(0xdcebfb),
+    warn: hex(0xb86e00),
+    err: hex(0xd03030),
+    icon_ink: hex(0x3a424c),
+    icon_sketch: hex(0x1f7ae0),
 };
 
 /// Gruvbox's dark palette: cream on warm charcoal, the aqua of its blue as the accent.
@@ -619,5 +643,18 @@ mod tests {
             serde_json::from_str::<UiTheme>("\"vaporwave\"").unwrap(),
             UiTheme::Flux
         );
+        assert_eq!(
+            serde_json::to_string(&UiTheme::Studio).unwrap(),
+            "\"studio\""
+        );
+    }
+
+    /// Studio is a light theme on the renderer's Studio viewport; Flux stays the default.
+    #[test]
+    fn studio_is_a_light_theme_on_the_studio_viewport() {
+        assert_eq!(UiTheme::default(), UiTheme::Flux);
+        assert!(!UiTheme::Studio.is_dark());
+        assert_eq!(UiTheme::Studio.viewport(), Style::STUDIO);
+        assert_eq!(UiTheme::Studio.tokens().accent, STUDIO.accent);
     }
 }

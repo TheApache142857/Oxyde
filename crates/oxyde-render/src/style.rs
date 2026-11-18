@@ -164,11 +164,28 @@ impl Style {
         ..Style::LIGHT
     };
 
+    /// A soft studio look: a neutral grey fading to white behind a mid-grey part, with
+    /// thin, softer edges, so the part reads by its shading more than by its outlines.
+    pub const STUDIO: Style = Style {
+        background_top: [214, 219, 225],
+        background_bottom: [251, 251, 252],
+        face: [188, 193, 200],
+        face_selected: [96, 160, 255],
+        face_hovered: [255, 190, 110],
+        edge: [62, 67, 75],
+        edge_selected: [0, 110, 255],
+        edge_hovered: [255, 140, 0],
+        edge_width: 1.0,
+        highlight_width: 2.5,
+        ..Style::LIGHT
+    };
+
     /// The named presets, for a settings page.
-    pub const PRESETS: [(&'static str, Style); 3] = [
+    pub const PRESETS: [(&'static str, Style); 4] = [
         ("Light", Style::LIGHT),
         ("Dark", Style::DARK),
         ("White", Style::WHITE),
+        ("Studio", Style::STUDIO),
     ];
 
     /// The background half way down.
@@ -250,6 +267,23 @@ mod tests {
         );
         assert!(DisplayStyle::Shaded.shades_faces() && !DisplayStyle::Shaded.draws_all_edges());
         assert!(!DisplayStyle::Wireframe.shades_faces());
+    }
+
+    #[test]
+    fn the_studio_preset_has_thin_soft_edges_on_a_light_background() {
+        let studio = Style::STUDIO;
+        assert!(studio.edge_width < Style::LIGHT.edge_width);
+        assert!(studio.highlight_width < Style::LIGHT.highlight_width);
+        assert!(studio.highlight_width > studio.edge_width);
+        // A light background, and edges lighter than Light's yet still standing out.
+        assert!(luminance(studio.background_middle()) > 0.8);
+        assert!(luminance(studio.edge) > luminance(Style::LIGHT.edge));
+        assert!(luminance(studio.background_middle()) - luminance(studio.edge) > LINE_CONTRAST);
+        assert!(
+            Style::PRESETS
+                .iter()
+                .any(|(name, s)| *name == "Studio" && *s == studio)
+        );
     }
 
     #[test]

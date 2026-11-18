@@ -5,6 +5,13 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Studio theme and a modern look (unreleased, November 2026)
+
+- **Studio theme** (Preferences › Graphics › Interface): a quiet light look with white and
+  very light grey panels, hairline dividers and a clear blue accent, over a soft grey-to-white
+  viewport with thinner, softer edges. Flux stays the default; choosing another theme brings
+  its own look back. `oxyde-cli snapshot --style studio` draws a picture in the Studio colours.
+
 ### Rotate in Move Component (unreleased, November 2026)
 
 - **Move Component turns parts about one axis, by dragging or by typed angles**, as

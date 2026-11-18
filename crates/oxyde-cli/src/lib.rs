@@ -802,8 +802,20 @@ pub fn snapshot_rebuilt(
     width: usize,
     height: usize,
 ) -> Result<()> {
+    snapshot_rebuilt_styled(rebuilt, out, view, width, height, &Style::default())
+}
+
+/// As [`snapshot_rebuilt`], in the colours and display style of `style`.
+pub fn snapshot_rebuilt_styled(
+    rebuilt: &Rebuilt,
+    out: &Path,
+    view: StandardView,
+    width: usize,
+    height: usize,
+    style: &Style,
+) -> Result<()> {
     let mesh = rebuilt.display_mesh()?;
-    let frame = oxyde_render::snapshot(&mesh, view, width, height, &Style::default());
+    let frame = oxyde_render::snapshot(&mesh, view, width, height, style);
     let file = std::fs::File::create(out).map_err(|e| Error(format!("{}: {e}", out.display())))?;
     let mut encoder = png::Encoder::new(io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
@@ -1006,6 +1018,9 @@ enum Command {
         width: usize,
         #[arg(long, default_value_t = 768)]
         height: usize,
+        /// The viewport colours: one of the renderer's presets.
+        #[arg(long, value_enum, default_value_t = Look::Light)]
+        style: Look,
     },
     /// Rebuild a part and write its front, top, right and isometric views on a sheet with
     /// a title block, hidden lines dashed: PDF (.pdf), SVG (.svg) or DXF (.dxf, at the
@@ -1025,6 +1040,26 @@ enum Command {
         #[arg(long)]
         no_hidden: bool,
     },
+}
+
+/// The renderer's viewport presets, as `--style` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Look {
+    Light,
+    Dark,
+    White,
+    Studio,
+}
+
+impl From<Look> for Style {
+    fn from(look: Look) -> Style {
+        match look {
+            Look::Light => Style::LIGHT,
+            Look::Dark => Style::DARK,
+            Look::White => Style::WHITE,
+            Look::Studio => Style::STUDIO,
+        }
+    }
 }
 
 /// A standard view, as `--view` names it.
@@ -1101,8 +1136,11 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
             view,
             width,
             height,
+            style,
         } => {
-            let features = snapshot(&part, &file, view.into(), width, height)?;
+            let rebuilt = rebuild(&part)?;
+            snapshot_rebuilt_styled(&rebuilt, &file, view.into(), width, height, &style.into())?;
+            let features = rebuilt.features();
             let failed = write_failures(out, &features)?;
             writeln!(out, "wrote {} ({width}x{height})", file.display())?;
             Ok(if failed { EXIT_FAILED } else { EXIT_OK })
@@ -1286,6 +1324,22 @@ mod tests {
         assert_eq!(json["features"][0]["type"], "Extrude");
         let back: Evaluation = serde_json::from_value(json).unwrap();
         assert_eq!(back, eval);
+    }
+
+    #[test]
+    fn snapshots_take_the_renderer_presets_by_name() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(["oxyde-cli", "snapshot", "--help"], &mut out, &mut err),
+            0
+        );
+        let help = String::from_utf8(out).unwrap();
+        assert!(help.contains("--style"), "{help}");
+        for name in ["light", "dark", "white", "studio"] {
+            assert!(help.contains(name), "{name} in {help}");
+        }
+        assert_eq!(Style::from(Look::Studio), Style::STUDIO);
+        assert_eq!(Style::from(Look::Light), Style::default());
     }
 
     #[test]
