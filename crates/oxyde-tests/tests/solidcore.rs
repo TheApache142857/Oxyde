@@ -203,6 +203,24 @@ fn a_hole_cut_through_a_block_matches_opencascade() {
     compare("hole cut through a block", a_hole_cut_through_a_block);
 }
 
+/// A notch cut down into the block's top: the top side face is split in two by the cut, so
+/// its two pieces are named through the attribute's split rule, not by geometry.
+fn a_notch_splitting_a_side_face() -> Part {
+    let mut part = block();
+    let mut sketch = sketch_on_front();
+    sketch.rectangle(Point2::new(18.0, 12.0), 4.0, 12.0);
+    let s = part.add_feature(FeatureKind::Sketch(sketch));
+    let mut cut = Extrude::blind(s, ExtrudeOp::Cut, 10.0);
+    cut.reverse = true;
+    part.add_feature(FeatureKind::Extrude(cut));
+    part
+}
+
+#[test]
+fn a_notch_splitting_a_side_face_matches_opencascade() {
+    compare("notch splitting a side face", a_notch_splitting_a_side_face);
+}
+
 /// A box and a moved copy of it, straight through the kernels.
 #[test]
 fn a_box_and_its_moved_copy_match_opencascade() {
