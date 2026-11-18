@@ -15,6 +15,7 @@ path = "src/main.rs"
 oxyde-geom = { workspace = true }
 oxyde-kernel = { workspace = true }
 oxyde-occt = { workspace = true }
+oxyde-solidcore = { workspace = true, optional = true }
 oxyde-model = { workspace = true }
 oxyde-sketch = { workspace = true }
 oxyde-assembly = { workspace = true }
@@ -29,6 +30,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 rfd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# SolidCraft's kernel as a second choice at start (src/kernel.rs), off by default: the spike.
+solidcore = ["dep:oxyde-solidcore"]
 
 [build-dependencies]
 winresource = "0.1"

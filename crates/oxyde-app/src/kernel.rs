@@ -1,9 +1,10 @@
 //! The kernel the application builds parts with, chosen once when the application starts, for
 //! the whole session: by `--kernel <name>`, else by Preferences › Debug › Kernel. Changing the
 //! preference takes effect at the next start, so that every shape of a session comes from one
-//! kernel. OpenCASCADE (`oxyde-occt`) is the only kernel so far; [`AppKernel`] hands every
-//! [`Kernel`] call to the chosen one, so that another backend is one more variant here
-//! (docs/ARCHITECTURE.md §2 and §10).
+//! kernel. OpenCASCADE (`oxyde-occt`) is the default; SolidCraft's kernel, solidcore
+//! (`oxyde-solidcore`), is the second choice in builds with the `solidcore` feature (the
+//! spike). [`AppKernel`] hands every [`Kernel`] call to the chosen one (docs/ARCHITECTURE.md
+//! §2 and §10).
 
 use std::sync::OnceLock;
 
@@ -15,24 +16,58 @@ use oxyde_kernel::{
     Topology, TopologyCounts, VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
 use oxyde_occt::{OcctError, OcctKernel};
+#[cfg(feature = "solidcore")]
+use oxyde_solidcore::{SolidcoreError, SolidcoreKernel};
 use serde::{Deserialize, Serialize};
 
 /// Which kernel builds the parts.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KernelKind {
     /// OpenCASCADE.
     #[default]
     Occt,
+    /// SolidCraft's kernel: boxes, extrusions, booleans and moves only (the spike).
+    #[cfg(feature = "solidcore")]
+    Solidcore,
+}
+
+impl Serialize for KernelKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// A kernel this build does not have (written by a build with another feature) reads as the
+/// default rather than failing, which would lose every other preference with it.
+impl<'de> Deserialize<'de> for KernelKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(KernelKind::parse(&name).unwrap_or_default())
+    }
 }
 
 impl KernelKind {
-    pub const ALL: [KernelKind; 1] = [KernelKind::Occt];
+    pub const ALL: &[KernelKind] = &[
+        KernelKind::Occt,
+        #[cfg(feature = "solidcore")]
+        KernelKind::Solidcore,
+    ];
+
+    /// Its name in preferences and on the command line.
+    pub fn name(self) -> &'static str {
+        match self {
+            KernelKind::Occt => "occt",
+            #[cfg(feature = "solidcore")]
+            KernelKind::Solidcore => "solidcore",
+        }
+    }
 
     /// Its name for people.
     pub fn label(self) -> &'static str {
         match self {
             KernelKind::Occt => "OpenCASCADE",
+            #[cfg(feature = "solidcore")]
+            KernelKind::Solidcore => "solidcore (SolidCraft's kernel, spike)",
         }
     }
 
@@ -40,6 +75,8 @@ impl KernelKind {
     pub fn file_kernel(self) -> PartKernel {
         match self {
             KernelKind::Occt => PartKernel::Occt,
+            #[cfg(feature = "solidcore")]
+            KernelKind::Solidcore => PartKernel::Solidcore,
         }
     }
 
@@ -47,6 +84,8 @@ impl KernelKind {
     pub fn parse(name: &str) -> Option<KernelKind> {
         match name {
             "occt" | "opencascade" => Some(KernelKind::Occt),
+            #[cfg(feature = "solidcore")]
+            "solidcore" => Some(KernelKind::Solidcore),
             _ => None,
         }
     }
@@ -55,9 +94,7 @@ impl KernelKind {
     pub fn names() -> String {
         KernelKind::ALL
             .iter()
-            .map(|kind| match kind {
-                KernelKind::Occt => "occt",
-            })
+            .map(|kind| kind.name())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -80,6 +117,8 @@ pub fn chosen() -> KernelKind {
 pub fn description() -> String {
     match chosen() {
         KernelKind::Occt => format!("OpenCASCADE {}", OcctKernel::occt_version()),
+        #[cfg(feature = "solidcore")]
+        KernelKind::Solidcore => KernelKind::Solidcore.label().to_owned(),
     }
 }
 
@@ -91,6 +130,7 @@ pub fn rebuilt_warning(built_by: &PartKernel, using: KernelKind) -> Option<Strin
     }
     let was = match built_by {
         PartKernel::Occt => "OpenCASCADE".to_owned(),
+        PartKernel::Solidcore => "solidcore".to_owned(),
         PartKernel::Other(name) => format!("a kernel named \"{name}\""),
     };
     Some(format!(
@@ -103,18 +143,24 @@ pub fn rebuilt_warning(built_by: &PartKernel, using: KernelKind) -> Option<Strin
 /// The session's kernel: whichever kernel was chosen, as one type.
 pub enum AppKernel {
     Occt(OcctKernel),
+    #[cfg(feature = "solidcore")]
+    Solidcore(SolidcoreKernel),
 }
 
 /// An error of the session's kernel.
 #[derive(Debug)]
 pub enum AppKernelError {
     Occt(OcctError),
+    #[cfg(feature = "solidcore")]
+    Solidcore(SolidcoreError),
 }
 
 impl std::fmt::Display for AppKernelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AppKernelError::Occt(e) => e.fmt(f),
+            #[cfg(feature = "solidcore")]
+            AppKernelError::Solidcore(e) => e.fmt(f),
         }
     }
 }
@@ -126,14 +172,18 @@ impl AppKernel {
     pub fn new(kind: KernelKind) -> AppKernel {
         match kind {
             KernelKind::Occt => AppKernel::Occt(OcctKernel::new()),
+            #[cfg(feature = "solidcore")]
+            KernelKind::Solidcore => AppKernel::Solidcore(SolidcoreKernel::new()),
         }
     }
 
     /// The OpenCASCADE kernel inside, for the code that works with it alone (the assistant
-    /// panel's MCP session).
-    pub fn occt_mut(&mut self) -> &mut OcctKernel {
+    /// panel's MCP session); none when the session runs another kernel.
+    pub fn occt_mut(&mut self) -> Option<&mut OcctKernel> {
         match self {
-            AppKernel::Occt(k) => k,
+            AppKernel::Occt(k) => Some(k),
+            #[cfg(feature = "solidcore")]
+            AppKernel::Solidcore(_) => None,
         }
     }
 
@@ -141,6 +191,8 @@ impl AppKernel {
     pub fn kind(&self) -> KernelKind {
         match self {
             AppKernel::Occt(_) => KernelKind::Occt,
+            #[cfg(feature = "solidcore")]
+            AppKernel::Solidcore(_) => KernelKind::Solidcore,
         }
     }
 }
@@ -150,6 +202,8 @@ macro_rules! each {
     ($self:expr, $k:ident => $call:expr) => {
         match $self {
             AppKernel::Occt($k) => $call.map_err(AppKernelError::Occt),
+            #[cfg(feature = "solidcore")]
+            AppKernel::Solidcore($k) => $call.map_err(AppKernelError::Solidcore),
         }
     };
 }
@@ -159,6 +213,8 @@ macro_rules! each_plain {
     ($self:expr, $k:ident => $call:expr) => {
         match $self {
             AppKernel::Occt($k) => $call,
+            #[cfg(feature = "solidcore")]
+            AppKernel::Solidcore($k) => $call,
         }
     };
 }
@@ -394,6 +450,9 @@ impl Kernel for AppKernel {
     fn open_worker() -> Option<Self> {
         match chosen() {
             KernelKind::Occt => OcctKernel::open_worker().map(AppKernel::Occt),
+            // The spike runs its jobs on the calling thread.
+            #[cfg(feature = "solidcore")]
+            KernelKind::Solidcore => None,
         }
     }
 }
@@ -424,7 +483,7 @@ mod tests {
         assert_eq!(KernelKind::parse("occt"), Some(KernelKind::Occt));
         assert_eq!(KernelKind::parse("opencascade"), Some(KernelKind::Occt));
         assert_eq!(KernelKind::parse("parasolid"), None);
-        assert_eq!(KernelKind::names(), "occt");
+        assert!(KernelKind::names().starts_with("occt"));
         assert_eq!(KernelKind::default(), KernelKind::Occt);
     }
 
@@ -457,5 +516,23 @@ mod tests {
         let worker = AppKernel::open_worker().expect("OpenCASCADE opens workers");
         assert!((worker.volume(shape).unwrap() - 24.0).abs() < 1e-6);
         kernel.release(shape);
+    }
+
+    #[cfg(feature = "solidcore")]
+    #[test]
+    fn solidcore_is_chosen_by_name_and_builds_a_box() {
+        assert_eq!(KernelKind::parse("solidcore"), Some(KernelKind::Solidcore));
+        assert_eq!(KernelKind::Solidcore.file_kernel(), PartKernel::Solidcore);
+        let mut kernel = AppKernel::new(KernelKind::Solidcore);
+        assert!(kernel.occt_mut().is_none());
+        let shape = kernel
+            .make_box(Point3::ORIGIN, Vec3::new(2.0, 3.0, 4.0))
+            .unwrap();
+        assert!((kernel.volume(shape).unwrap() - 24.0).abs() < 1e-6);
+        let error = kernel.fillet(shape, &[0], 0.5).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the solidcore kernel cannot fillet yet (spike)"
+        );
     }
 }

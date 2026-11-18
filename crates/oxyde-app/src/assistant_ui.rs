@@ -87,6 +87,16 @@ impl OxydeApp {
             return Some(json!({ "jsonrpc": "2.0", "id": id, "result": {
                 "content": [{ "type": "text", "text": why }], "isError": true } }));
         }
+        // The assistant's tools run on OpenCASCADE; another session kernel says so.
+        if self.kernel.occt_mut().is_none() {
+            let id = message.get("id").cloned()?;
+            let why = format!(
+                "The assistant works with OpenCASCADE only; this session uses {}.",
+                self.kernel.kind().label()
+            );
+            return Some(json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "content": [{ "type": "text", "text": why }], "isError": true } }));
+        }
         let session = self
             .assistant
             .mcp
@@ -99,7 +109,10 @@ impl OxydeApp {
                 document_id: doc.document_id.clone(),
                 properties: doc.properties.clone(),
             };
-            let answer = session.handle_in_window(self.kernel.occt_mut(), &mut lent, message);
+            let answer = match self.kernel.occt_mut() {
+                Some(kernel) => session.handle_in_window(kernel, &mut lent, message),
+                None => None,
+            };
             if let WindowDocument::Assembly {
                 assembly,
                 properties,
@@ -132,7 +145,10 @@ impl OxydeApp {
             document_id: self.doc.document_id.clone(),
             properties: self.doc.properties.clone(),
         };
-        let answer = session.handle_in_window(self.kernel.occt_mut(), &mut lent, message);
+        let answer = match self.kernel.occt_mut() {
+            Some(kernel) => session.handle_in_window(kernel, &mut lent, message),
+            None => None,
+        };
         if let WindowDocument::Part {
             part, properties, ..
         } = lent
@@ -205,7 +221,9 @@ impl OxydeApp {
                     .clicked()
                 {
                     if let Some(mut session) = self.assistant.mcp.take() {
-                        session.release_in_window(self.kernel.occt_mut());
+                        if let Some(kernel) = self.kernel.occt_mut() {
+                            session.release_in_window(kernel);
+                        }
                     }
                     self.assistant.new_chat();
                 }

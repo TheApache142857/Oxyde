@@ -286,7 +286,10 @@ mod tests {
         assert_eq!(start.kernel, None);
         assert_eq!(
             problems,
-            vec!["--kernel takes occt, not \"parasolid\"; using the preference".to_owned()]
+            vec![format!(
+                "--kernel takes {}, not \"parasolid\"; using the preference",
+                KernelKind::names()
+            )]
         );
         let (start, problems) = start_args(args(&["--kernel"]));
         assert_eq!(start.kernel, None);

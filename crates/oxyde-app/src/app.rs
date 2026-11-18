@@ -2230,7 +2230,9 @@ impl eframe::App for OxydeApp {
     /// after Oxyde.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(mut session) = self.assistant.mcp.take() {
-            session.release_in_window(self.kernel.occt_mut());
+            if let Some(kernel) = self.kernel.occt_mut() {
+                session.release_in_window(kernel);
+            }
         }
         self.assistant.shutdown();
     }

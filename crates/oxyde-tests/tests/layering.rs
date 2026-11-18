@@ -17,13 +17,35 @@ use std::path::{Path, PathBuf};
 /// every other crate of the workspace.
 const FORBIDDEN: &[(&str, &[&str])] = &[
     ("oxyde-geom", &["*"]),
-    ("oxyde-sketch", &["oxyde-kernel", "oxyde-occt"]),
-    ("oxyde-kernel", &["oxyde-occt", "oxyde-model"]),
+    (
+        "oxyde-sketch",
+        &["oxyde-kernel", "oxyde-occt", "oxyde-solidcore"],
+    ),
+    (
+        "oxyde-kernel",
+        &["oxyde-occt", "oxyde-solidcore", "oxyde-model"],
+    ),
     ("oxyde-occt", &["oxyde-model", "oxyde-sketch", "oxyde-app"]),
-    ("oxyde-model", &["oxyde-occt", "oxyde-app"]),
-    ("oxyde-assembly", &["oxyde-occt", "oxyde-app"]),
-    ("oxyde-format", &["oxyde-occt", "oxyde-app"]),
-    ("oxyde-render", &["oxyde-occt", "oxyde-model", "oxyde-app"]),
+    (
+        "oxyde-solidcore",
+        &["oxyde-occt", "oxyde-model", "oxyde-sketch", "oxyde-app"],
+    ),
+    (
+        "oxyde-model",
+        &["oxyde-occt", "oxyde-solidcore", "oxyde-app"],
+    ),
+    (
+        "oxyde-assembly",
+        &["oxyde-occt", "oxyde-solidcore", "oxyde-app"],
+    ),
+    (
+        "oxyde-format",
+        &["oxyde-occt", "oxyde-solidcore", "oxyde-app"],
+    ),
+    (
+        "oxyde-render",
+        &["oxyde-occt", "oxyde-solidcore", "oxyde-model", "oxyde-app"],
+    ),
     ("oxyde-sim", &["*"]),
     (
         "oxyde-sim-gpu",

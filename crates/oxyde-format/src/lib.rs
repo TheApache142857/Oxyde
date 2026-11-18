@@ -167,6 +167,8 @@ pub enum PartKernel {
     /// OpenCASCADE (`oxyde-occt`), `"occt"`; also every part saved before the key existed.
     #[default]
     Occt,
+    /// SolidCraft's kernel, solidcore (`oxyde-solidcore`), `"solidcore"`.
+    Solidcore,
     /// A name this reader does not know, kept as it was so that it can be reported and
     /// written back.
     Other(String),
@@ -177,6 +179,7 @@ impl PartKernel {
     pub fn name(&self) -> &str {
         match self {
             PartKernel::Occt => "occt",
+            PartKernel::Solidcore => "solidcore",
             PartKernel::Other(name) => name,
         }
     }
@@ -185,6 +188,7 @@ impl PartKernel {
     fn from_manifest(name: Option<&str>) -> Self {
         match name {
             None | Some("occt") => PartKernel::Occt,
+            Some("solidcore") => PartKernel::Solidcore,
             Some(other) => PartKernel::Other(other.to_owned()),
         }
     }
@@ -1239,7 +1243,11 @@ mod tests {
 
     #[test]
     fn the_manifest_records_the_kernel_and_keeps_names_it_does_not_know() {
-        for kernel in [PartKernel::Occt, PartKernel::Other("someday".to_owned())] {
+        for kernel in [
+            PartKernel::Occt,
+            PartKernel::Solidcore,
+            PartKernel::Other("someday".to_owned()),
+        ] {
             let part = PartFile {
                 kernel: kernel.clone(),
                 ..PartFile::new()
