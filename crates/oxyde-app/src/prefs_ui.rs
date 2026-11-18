@@ -66,6 +66,7 @@ impl OxydeApp {
             style: p.graphics.style(),
             mouse: p.navigation.mouse,
             show_triad: p.graphics.show_triad,
+            view_cube: p.graphics.modern_look,
             orbit_speed: p.navigation.orbit_speed,
             zoom_speed: p.navigation.zoom_speed,
             invert_zoom: p.navigation.invert_zoom,

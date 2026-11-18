@@ -101,6 +101,8 @@ pub struct ViewSettings {
     pub style: Style,
     pub mouse: MouseScheme,
     pub show_triad: bool,
+    /// The view cube and home button in the top-right corner (the modern look).
+    pub view_cube: bool,
     /// 1 = default.
     pub orbit_speed: f64,
     pub zoom_speed: f64,
@@ -120,6 +122,7 @@ impl Default for ViewSettings {
             style: Style::default(),
             mouse: MouseScheme::default(),
             show_triad: true,
+            view_cube: false,
             orbit_speed: 1.0,
             zoom_speed: 1.0,
             invert_zoom: false,
@@ -443,13 +446,27 @@ impl Viewport {
             }
         }
 
+        // The view cube: the pointer on it is the cube's, and a click turns the view.
+        let cube = self
+            .settings
+            .view_cube
+            .then(|| crate::view_cube::ViewCube::layout(rect, &self.camera));
+        let on_cube = match (&cube, response.hover_pos()) {
+            (Some(cube), Some(p)) => cube.hit(p),
+            _ => None,
+        };
+        if let Some(target) = on_cube.filter(|_| response.clicked()) {
+            self.set_view(target.view());
+            ui.ctx().request_repaint();
+        }
+
         // Navigation.
         let (shift, ctrl, alt) =
             ui.input(|i| (i.modifiers.shift, i.modifiers.ctrl, i.modifiers.alt));
         let delta = response.drag_delta();
         let middle = response.dragged_by(egui::PointerButton::Middle);
         let secondary = response.dragged_by(egui::PointerButton::Secondary);
-        let taken = self.pointer_taken;
+        let taken = self.pointer_taken || on_cube.is_some();
         let mut primary = response.dragged_by(egui::PointerButton::Primary) && !taken;
         if response.double_clicked_by(egui::PointerButton::Middle) {
             self.fit_pending = true;
@@ -674,6 +691,9 @@ impl Viewport {
         }
         if self.settings.show_triad {
             self.draw_triad(&painter, rect);
+        }
+        if let Some(cube) = &cube {
+            cube.paint(&painter, on_cube);
         }
         if let (Some(start), Some(end)) = (self.box_start, response.hover_pos()) {
             let color = egui::Color32::from_rgb(79, 195, 247);

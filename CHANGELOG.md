@@ -18,6 +18,9 @@ release yet; the git history has every detail.
 - **Soft studio lighting** with the modern look: a sky-to-ground ambient (faces turned up get
   more light), the key light, and a faint highlight, so curved faces read as round. The GPU
   viewport and the software renderer compute the same.
+- **View cube** with the modern look: a small cube in the viewport's top-right corner turns
+  with the model; clicking a face (FRONT, TOP, RIGHT, ...) turns the view to it, and the home
+  button beside it goes back to the isometric view.
 
 ### Rotate in Move Component (unreleased, November 2026)
 
