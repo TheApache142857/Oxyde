@@ -2322,6 +2322,7 @@ impl OxydeApp {
                     |(part, note, pieces)| {
                         progress.say("Saving the part");
                         let file = oxyde_format::PartFile {
+                            kernel: Default::default(),
                             document_id: oxyde_format::new_document_id(),
                             definition: part.definition(),
                             properties: oxyde_format::Properties {

@@ -56,6 +56,7 @@ mod icons;
 mod in_place_tree;
 mod interference;
 mod jobs;
+mod kernel;
 mod lockfile;
 mod materials;
 mod materials_ui;
@@ -131,6 +132,39 @@ fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDes
     }
 }
 
+/// What the command line asks of the window.
+#[derive(Debug, Default, PartialEq)]
+struct StartArgs {
+    /// The document to open: the first argument that is not an option.
+    file: Option<PathBuf>,
+    /// `--kernel <name>`: this session's kernel, whatever the preference says.
+    kernel: Option<kernel::KernelKind>,
+}
+
+/// Reads `[--kernel <name>] [file]`, in any order. An unknown kernel name or a missing one
+/// is reported (the preference then chooses), never fatal.
+fn start_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> (StartArgs, Vec<String>) {
+    let mut start = StartArgs::default();
+    let mut problems = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--kernel" {
+            let name = args.next().unwrap_or_default();
+            let name = name.to_string_lossy();
+            start.kernel = kernel::KernelKind::parse(&name);
+            if start.kernel.is_none() {
+                problems.push(format!(
+                    "--kernel takes {}, not \"{name}\"; using the preference",
+                    kernel::KernelKind::names()
+                ));
+            }
+        } else if start.file.is_none() {
+            start.file = Some(PathBuf::from(arg));
+        }
+    }
+    (start, problems)
+}
+
 fn run(renderer: eframe::Renderer, file: Option<PathBuf>) -> eframe::Result<()> {
     eframe::run_native(
         "Oxyde",
@@ -148,9 +182,9 @@ fn main() -> eframe::Result<()> {
     // every DLL is there (OpenCASCADE is loaded to ask it its version).
     if first.as_deref() == Some(std::ffi::OsStr::new("--version")) {
         println!(
-            "Oxyde {} (OpenCASCADE {})",
+            "Oxyde {} ({})",
             env!("CARGO_PKG_VERSION"),
-            oxyde_occt::OcctKernel::occt_version()
+            kernel::description()
         );
         return Ok(());
     }
@@ -167,9 +201,15 @@ fn main() -> eframe::Result<()> {
             &mut std::io::stderr().lock(),
         ));
     }
-    let file = first.map(PathBuf::from);
+    let (start, problems) = start_args(std::env::args_os().skip(1));
+    for problem in problems {
+        eprintln!("{problem}");
+    }
+    let file = start.file;
+    let prefs = prefs::Preferences::load();
+    kernel::choose(start.kernel.unwrap_or(prefs.kernel));
     let software = std::env::var("OXYDE_RENDERER").is_ok_and(|v| v.eq_ignore_ascii_case("cpu"))
-        || prefs::Preferences::load().graphics.renderer == prefs::Renderer::Software;
+        || prefs.graphics.renderer == prefs::Renderer::Software;
     if software {
         return run(eframe::Renderer::Glow, file);
     }
@@ -179,5 +219,43 @@ fn main() -> eframe::Result<()> {
             run(eframe::Renderer::Glow, file)
         }
         ok => ok,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::{StartArgs, kernel::KernelKind, start_args};
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_command_line_names_a_file_and_a_kernel() {
+        assert_eq!(start_args(args(&[])), (StartArgs::default(), Vec::new()));
+        let (start, problems) = start_args(args(&["--kernel", "occt", "Bracket.oxyprt"]));
+        assert!(problems.is_empty());
+        assert_eq!(start.kernel, Some(KernelKind::Occt));
+        assert_eq!(start.file, Some(PathBuf::from("Bracket.oxyprt")));
+        // The file first works too; the first file wins.
+        let (start, _) = start_args(args(&["A.oxyprt", "--kernel", "opencascade", "B.oxyprt"]));
+        assert_eq!(start.file, Some(PathBuf::from("A.oxyprt")));
+        assert_eq!(start.kernel, Some(KernelKind::Occt));
+    }
+
+    #[test]
+    fn an_unknown_kernel_is_reported_and_the_preference_chooses() {
+        let (start, problems) = start_args(args(&["--kernel", "parasolid"]));
+        assert_eq!(start.kernel, None);
+        assert_eq!(
+            problems,
+            vec!["--kernel takes occt, not \"parasolid\"; using the preference".to_owned()]
+        );
+        let (start, problems) = start_args(args(&["--kernel"]));
+        assert_eq!(start.kernel, None);
+        assert_eq!(problems.len(), 1);
     }
 }

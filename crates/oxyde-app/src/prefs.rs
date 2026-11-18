@@ -28,6 +28,8 @@ pub struct Preferences {
     pub render: crate::render_ui::RenderPrefs,
     /// The Simulation tab's mesh and plot settings and the elastic properties typed in.
     pub simulation: crate::simulation_ui::SimulationPrefs,
+    /// The kernel parts are built with, from the next start (`--kernel` overrides it).
+    pub kernel: crate::kernel::KernelKind,
 }
 
 impl Default for Preferences {
@@ -41,6 +43,7 @@ impl Default for Preferences {
             recent: Vec::new(),
             render: Default::default(),
             simulation: Default::default(),
+            kernel: Default::default(),
         }
     }
 }

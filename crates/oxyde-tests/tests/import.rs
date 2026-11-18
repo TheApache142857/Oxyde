@@ -84,6 +84,7 @@ fn imported_box_is_named_and_can_be_built_on() {
 
     // The part keeps the file: save, reload, rebuild to the same volume.
     let file = oxyde_format::PartFile {
+        kernel: Default::default(),
         definition: part.definition(),
         ..oxyde_format::PartFile::new()
     };

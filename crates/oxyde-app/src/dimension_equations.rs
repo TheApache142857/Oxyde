@@ -823,6 +823,7 @@ mod cycle {
         let expr = part.parse_expression("\"Depth\" / 10").unwrap();
         part.add_equation(target, expr).unwrap();
         let file = oxyde_format::PartFile {
+            kernel: Default::default(),
             document_id: oxyde_format::new_document_id(),
             definition: part.definition(),
             properties: Default::default(),

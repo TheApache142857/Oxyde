@@ -900,6 +900,7 @@ impl OxydeApp {
                 for loaded in asm.docs.values().flatten() {
                     let hash = match loaded {
                         Loaded::Part(p) => oxyde_format::results::part_hash(&PartFile {
+                            kernel: Default::default(),
                             document_id: p.document_id.clone(),
                             definition: p.part.definition(),
                             properties: p.properties.clone(),

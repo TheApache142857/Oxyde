@@ -13,13 +13,13 @@ use oxyde_model::{
     EdgeName, FaceName, FeatureId, FeatureKind, FeatureStatus, ReferenceGeometry, Sketch,
     SketchPlane, StandardPlane,
 };
-use oxyde_occt::OcctKernel;
 use oxyde_render::{Pick, Scene};
 
 use crate::dialogs::{BlendDialog, Dialog, DimensionTarget, plane_name};
 use crate::document::Document;
 use crate::equations_ui::EquationsWindow;
 use crate::features_ui::PatternKind;
+use crate::kernel::AppKernel;
 use crate::property_manager::PanelPick;
 use crate::sketch_mode::{self, SketchRequest, SketchSession, Tool};
 use crate::viewport::{Viewport, ViewportOutput};
@@ -192,7 +192,7 @@ pub(crate) fn paint_origin(painter: &egui::Painter, to_screen: &dyn Fn(Point3) -
 }
 
 pub struct OxydeApp {
-    pub(crate) kernel: OcctKernel,
+    pub(crate) kernel: AppKernel,
     pub(crate) doc: Document,
     pub(crate) viewport: Viewport,
     pub(crate) selected_feature: Option<FeatureId>,
@@ -354,7 +354,7 @@ impl OxydeApp {
     /// GPU, and nothing applied to egui yet. Tests build it to draw panels headlessly.
     pub(crate) fn blank(prefs: crate::prefs::Preferences, file: Option<PathBuf>) -> Self {
         Self {
-            kernel: OcctKernel::new(),
+            kernel: AppKernel::new(crate::kernel::chosen()),
             doc: Document::new(),
             viewport: Viewport::new(),
             selected_feature: None,
@@ -2230,7 +2230,7 @@ impl eframe::App for OxydeApp {
     /// after Oxyde.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(mut session) = self.assistant.mcp.take() {
-            session.release_in_window(&mut self.kernel);
+            session.release_in_window(self.kernel.occt_mut());
         }
         self.assistant.shutdown();
     }

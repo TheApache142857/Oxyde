@@ -71,6 +71,7 @@ fn scratch(name: &str) -> PathBuf {
 
 fn save(path: &Path, part: &Part) {
     let file = PartFile {
+        kernel: Default::default(),
         document_id: new_document_id(),
         definition: part.definition(),
         properties: Properties::default(),

@@ -326,6 +326,7 @@ impl AssemblyDoc {
             return Err(format!("{name} changed on disk: reload the parts (Ctrl+B)"));
         }
         let file = oxyde_format::PartFile {
+            kernel: Default::default(),
             document_id: p.document_id.clone(),
             definition: p.part.definition(),
             properties: p.properties.clone(),
@@ -508,6 +509,7 @@ mod tests {
             10.0,
         )));
         let file = oxyde_format::PartFile {
+            kernel: Default::default(),
             document_id: oxyde_format::new_document_id(),
             definition: part.definition(),
             properties: Default::default(),
