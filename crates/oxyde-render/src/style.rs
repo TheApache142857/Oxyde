@@ -116,6 +116,10 @@ pub struct Style {
     /// Width in pixels of an outline drawn round the selected faces, just outside them,
     /// in the selected-edge colour, in the shaded styles; 0 for none.
     pub selection_outline: f32,
+    /// Soft studio lighting, 0 (the classic headlight and key light) to 1: a sky-to-ground
+    /// ambient (faces turned up get more), the key light, and a faint specular highlight,
+    /// so curved faces read as round. Both renderers compute the same.
+    pub soft_light: f32,
 }
 
 /// Brightness of an sRGB colour, 0..1, near enough to tell lines from a background.
@@ -150,6 +154,7 @@ impl Style {
         ambient_occlusion: 0.0,
         selection_tint: 0.0,
         selection_outline: 0.0,
+        soft_light: 0.0,
     };
 
     /// Dark background, light part.
@@ -188,6 +193,7 @@ impl Style {
         highlight_width: 2.5,
         selection_tint: 0.55,
         selection_outline: 2.0,
+        soft_light: 1.0,
         ..Style::LIGHT
     };
 

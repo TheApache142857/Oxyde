@@ -573,6 +573,8 @@ struct Lights {
     eye: V3,
     /// Towards the key light.
     key: V3,
+    /// How much of the soft studio lighting, 0..1 ([`Style::soft_light`]).
+    soft: f32,
 }
 
 /// Brightness factor for a surface with unit normal `n`: ambient, plus a headlight so no
@@ -588,7 +590,34 @@ fn shade(n: V3, lights: &Lights) -> f32 {
     };
     let facing = dot(n, lights.eye);
     let key = dot(n, lights.key).max(0.0);
-    (0.38 + 0.37 * facing + 0.40 * key) as f32
+    let classic = (0.38 + 0.37 * facing + 0.40 * key) as f32;
+    if lights.soft <= 0.0 {
+        return classic;
+    }
+    // Sky-to-ground ambient: a face turned up (+Y, the world's up) gets more of it.
+    let sky = (0.5 + 0.5 * n[1]) as f32;
+    let soft = 0.28 + 0.14 * sky + (0.25 * facing + 0.42 * key) as f32;
+    classic + (soft - classic) * lights.soft.min(1.0)
+}
+
+/// The specular highlight of the soft lighting, 0..1 of white, added over the shaded
+/// colour: Blinn's half-way vector between the key light and the viewer.
+fn specular(n: V3, lights: &Lights) -> f32 {
+    if lights.soft <= 0.0 {
+        return 0.0;
+    }
+    let n = if dot(n, lights.eye) < 0.0 {
+        scale(n, -1.0)
+    } else {
+        n
+    };
+    let half = add(lights.key, lights.eye);
+    let len = length(half);
+    if len <= 0.0 {
+        return 0.0;
+    }
+    let along = (dot(n, half) / len).max(0.0) as f32;
+    along.powf(32.0) * 0.22 * lights.soft.min(1.0)
 }
 
 /// How far ambient occlusion looks around a pixel, as a fraction of the image's smaller
@@ -701,6 +730,7 @@ pub fn render_styled(
     let lights = Lights {
         eye: camera.eye_direction(),
         key: camera.key_light(),
+        soft: style.soft_light,
     };
     let depth_of = |p: V3| -dot(sub(p, camera.target), camera.eye_direction());
     let draw_face =
@@ -945,6 +975,7 @@ fn raster_triangle(
             );
             let n = normalize(n);
             let light = n.map_or(1.0, |n| shade(n, lights));
+            let shine = n.map_or(0.0, |n| specular(n, lights)) * 255.0;
             let q = add(
                 add(scale(world[0], w0), scale(world[1], w1)),
                 scale(world[2], w2),
@@ -957,7 +988,7 @@ fn raster_triangle(
                 ),
                 None => paint.base,
             };
-            let color = base.map(|c| (c * light).min(255.0));
+            let color = base.map(|c| (c * light + shine).min(255.0));
             if opaque {
                 frame.put(index, color.map(|c| c as u8));
                 continue;
@@ -1222,6 +1253,7 @@ mod tests {
         let lights = Lights {
             eye: camera.eye_direction(),
             key: camera.key_light(),
+            soft: 0.0,
         };
         let x = shade([1.0, 0.0, 0.0], &lights);
         let y = shade([0.0, 1.0, 0.0], &lights);
@@ -1231,6 +1263,39 @@ mod tests {
         assert!(z - x > 0.1 && y - z > 0.1);
         // Flipped normals shade the same.
         assert_eq!(shade([-1.0, 0.0, 0.0], &lights), x);
+        assert_eq!(specular([0.0, 1.0, 0.0], &lights), 0.0);
+    }
+
+    #[test]
+    fn soft_light_keeps_the_shades_apart_and_adds_a_highlight() {
+        let camera = Camera::default(); // isometric
+        let lights = Lights {
+            eye: camera.eye_direction(),
+            key: camera.key_light(),
+            soft: 1.0,
+        };
+        let x = shade([1.0, 0.0, 0.0], &lights);
+        let y = shade([0.0, 1.0, 0.0], &lights);
+        let z = shade([0.0, 0.0, 1.0], &lights);
+        assert!(y > z && z > x, "x {x}, y {y}, z {z}");
+        assert!(z - x > 0.05 && y - z > 0.05);
+        // With the viewer and the key light straight ahead, a face turned up and one
+        // turned down by as much face both alike: classic shading cannot tell them apart,
+        // the sky-to-ground ambient lights the one turned up more.
+        let ahead = |soft: f32| Lights {
+            eye: [0.0, 0.0, 1.0],
+            key: [0.0, 0.0, 1.0],
+            soft,
+        };
+        let (up, down) = ([0.0, 0.6, 0.8], [0.0, -0.6, 0.8]);
+        assert_eq!(shade(up, &ahead(0.0)), shade(down, &ahead(0.0)));
+        assert!(shade(up, &ahead(1.0)) > shade(down, &ahead(1.0)) + 0.05);
+        // The highlight peaks where the normal is half way to the key light.
+        let half = add(lights.key, lights.eye);
+        let half = scale(half, 1.0 / length(half));
+        let peak = specular(half, &lights);
+        assert!((peak - 0.22).abs() < 1e-4, "{peak}");
+        assert!(specular([1.0, 0.0, 0.0], &lights) < peak);
     }
 
     #[test]

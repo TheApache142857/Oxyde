@@ -118,8 +118,8 @@ pub struct Graphics {
     /// How strong it is, 0..1.
     #[serde(alias = "subsurface_strength")]
     pub ambient_occlusion_strength: f32,
-    /// The modern look (Preferences › Graphics, and on with the Studio theme): selected
-    /// faces tinted rather than repainted, with an outline round them.
+    /// The modern look (Preferences › Graphics, and on with the Studio theme): soft studio
+    /// lighting, and selected faces tinted rather than repainted, with an outline round them.
     pub modern_look: bool,
 }
 
@@ -184,6 +184,11 @@ impl Graphics {
             },
             selection_outline: if self.modern_look {
                 Style::STUDIO.selection_outline
+            } else {
+                0.0
+            },
+            soft_light: if self.modern_look {
+                Style::STUDIO.soft_light
             } else {
                 0.0
             },

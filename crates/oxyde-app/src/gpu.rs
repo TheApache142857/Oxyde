@@ -55,7 +55,7 @@ struct View {
     right: vec4<f32>,
     up: vec4<f32>,
     eye: vec4<f32>,
-    // xyz: towards the key light.
+    // xyz: towards the key light; w: soft lighting 0..1.
     key: vec4<f32>,
     // x, y: millimetres to clip space; z: depth scale; w: edge depth bias (mm).
     scale: vec4<f32>,
@@ -231,9 +231,23 @@ fn shade_face(in: FaceOut) -> vec4<f32> {
     let facing = dot(n, view.eye.xyz);
     let key = max(dot(n, view.key.xyz), 0.0);
     var light = 0.38 + 0.37 * facing + 0.40 * key;
+    // As `shade` and `specular` there: the soft lighting's sky-to-ground ambient and
+    // highlight.
+    let soft = min(view.key.w, 1.0);
+    var shine = 0.0;
+    if (soft > 0.0) {
+        let sky = 0.5 + 0.5 * n.y;
+        light = light + (0.28 + 0.14 * sky + 0.25 * facing + 0.42 * key - light) * soft;
+        let half = view.key.xyz + view.eye.xyz;
+        if (length(half) > 0.0) {
+            shine = pow(max(dot(n, normalize(half)), 0.0), 32.0) * 0.22 * soft * 255.0;
+        }
+    }
     if (view.ao.x > 0.0 && view.floor.w < 0.5) {
         let occlusion = textureLoad(ao_image, vec2<i32>(in.position.xy), 0).x;
-        light = light * (1.0 - 0.75 * view.ao.x * occlusion);
+        let dark = 1.0 - 0.75 * view.ao.x * occlusion;
+        light = light * dark;
+        shine = shine * dark;
     }
     let flags = face_flags[in.face];
     let material = materials[in.face];
@@ -250,7 +264,7 @@ fn shade_face(in: FaceOut) -> vec4<f32> {
         let height = max(view.floor.x - in.world.y, 0.0);
         alpha = alpha * view.floor.y * clamp(1.0 - height / max(view.floor.z, 1e-6), 0.0, 1.0);
     }
-    return vec4<f32>(linear(min(base * light, vec3<f32>(255.0))), alpha);
+    return vec4<f32>(linear(min(base * light + vec3<f32>(shine), vec3<f32>(255.0))), alpha);
 }
 
 @fragment
@@ -1335,7 +1349,12 @@ impl GpuViewport {
         view.extend(v4(right));
         view.extend(v4(up));
         view.extend(v4(eye));
-        view.extend([key[0] as f32, key[1] as f32, key[2] as f32, 0.0]);
+        view.extend([
+            key[0] as f32,
+            key[1] as f32,
+            key[2] as f32,
+            style.soft_light,
+        ]);
         view.extend([
             (2.0 / (camera.height * aspect)) as f32,
             (2.0 / camera.height) as f32,

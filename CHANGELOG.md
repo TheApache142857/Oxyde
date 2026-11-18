@@ -15,6 +15,9 @@ release yet; the git history has every detail.
   face keeps its own colour under a tint of the selection colour, and the selected faces get a
   2 px outline round them, in the GPU viewport and the software renderer alike.
   `oxyde-cli snapshot --select-face N` draws face N selected.
+- **Soft studio lighting** with the modern look: a sky-to-ground ambient (faces turned up get
+  more light), the key light, and a faint highlight, so curved faces read as round. The GPU
+  viewport and the software renderer compute the same.
 
 ### Rotate in Move Component (unreleased, November 2026)
 

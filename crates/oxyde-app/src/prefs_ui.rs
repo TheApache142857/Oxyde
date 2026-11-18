@@ -190,7 +190,7 @@ impl OxydeApp {
         });
         ui.checkbox(&mut g.modern_look, "Modern look")
             .on_hover_text(
-                "Selected faces keep their colour under a tint, with an outline round them",
+                "Soft studio lighting; selected faces keep their colour under a tint, with an outline round them",
             );
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Renderer");
