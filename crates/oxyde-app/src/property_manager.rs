@@ -192,6 +192,18 @@ fn reference_box_set<T>(
 
 /// A section title, as KiCad Flux's panels: small, upper case, dimmed.
 pub(crate) fn section(ui: &mut egui::Ui, title: &str) {
+    // Studio: a flat header, the title as written over a hairline divider.
+    if crate::theme::current() == crate::theme::UiTheme::Studio {
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(title)
+                .size(12.0)
+                .strong()
+                .color(crate::theme::tokens().fg),
+        );
+        ui.separator();
+        return;
+    }
     ui.add_space(8.0);
     ui.label(
         RichText::new(title.to_uppercase())

@@ -21,6 +21,8 @@ release yet; the git history has every detail.
 - **View cube** with the modern look: a small cube in the viewport's top-right corner turns
   with the model; clicking a face (FRONT, TOP, RIGHT, ...) turns the view to it, and the home
   button beside it goes back to the isometric view.
+- **Studio's page layout**: one type scale (12 / 13 / 15 points), a little more padding and
+  taller rows, and panel sections headed by their title over a hairline divider.
 
 ### Rotate in Move Component (unreleased, November 2026)
 

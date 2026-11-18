@@ -442,6 +442,37 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
         ]
         .into();
     });
+    if theme == UiTheme::Studio {
+        apply_studio_spacing(ctx);
+    }
+}
+
+/// Studio's type scale and room: one scale (12 / 13 / 15 points), a little more padding
+/// round controls and in windows, and taller rows, for a calmer page.
+fn apply_studio_spacing(ctx: &egui::Context) {
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.button_padding = egui::vec2(10.0, 5.0);
+        s.spacing.interact_size.y = 26.0;
+        s.spacing.window_margin = egui::Margin::same(14.0);
+        s.spacing.menu_margin = egui::Margin::same(8.0);
+        let size = |style: TextStyle, points: f32| {
+            let family = if style == TextStyle::Monospace {
+                FontFamily::Monospace
+            } else {
+                FontFamily::Proportional
+            };
+            (style, FontId::new(points, family))
+        };
+        s.text_styles = [
+            size(TextStyle::Small, 12.0),
+            size(TextStyle::Body, 13.0),
+            size(TextStyle::Button, 13.0),
+            size(TextStyle::Heading, 15.0),
+            size(TextStyle::Monospace, 12.5),
+        ]
+        .into();
+    });
 }
 
 /// Uses the system's interface and code fonts, keeping egui's own as fallbacks for the
@@ -647,6 +678,26 @@ mod tests {
             serde_json::to_string(&UiTheme::Studio).unwrap(),
             "\"studio\""
         );
+    }
+
+    /// Studio has its own type scale and room; the other themes keep theirs.
+    #[test]
+    fn studio_has_its_own_type_scale_and_spacing() {
+        let ctx = egui::Context::default();
+        let heading = |ctx: &egui::Context| {
+            ctx.style()
+                .text_styles
+                .get(&TextStyle::Heading)
+                .map(|f| f.size)
+        };
+        apply(&ctx, UiTheme::Studio);
+        assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 6.0));
+        assert_eq!(ctx.style().spacing.interact_size.y, 26.0);
+        assert_eq!(heading(&ctx), Some(15.0));
+        apply(&ctx, UiTheme::Flux);
+        assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 5.0));
+        assert_eq!(ctx.style().spacing.interact_size.y, 24.0);
+        assert_eq!(heading(&ctx), Some(17.0));
     }
 
     /// Studio is a light theme on the renderer's Studio viewport; Flux stays the default.
