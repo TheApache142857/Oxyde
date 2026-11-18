@@ -18,11 +18,42 @@ const VIEWS: [(Icon, &str, StandardView); 4] = [
     (Icon::ViewIso, "Isometric", StandardView::Isometric),
 ];
 
-/// A thin vertical separator between groups of command buttons.
+/// A thin vertical separator between groups of command buttons; in Studio, where the groups
+/// are clusters, a little room instead.
 fn group_separator(ui: &mut egui::Ui) {
+    if crate::theme::current() == crate::theme::UiTheme::Studio {
+        ui.add_space(6.0);
+        return;
+    }
     ui.add_space(2.0);
     ui.separator();
     ui.add_space(2.0);
+}
+
+/// A group of command buttons. With `studio` it is a cluster: the buttons on a rounded panel
+/// with the group's name under them. Otherwise the buttons are drawn as they are.
+fn cluster(ui: &mut egui::Ui, name: &str, studio: bool, add: impl FnOnce(&mut egui::Ui)) {
+    if !studio {
+        add(ui);
+        return;
+    }
+    let t = crate::theme::tokens();
+    egui::Frame::none()
+        .fill(t.panel2)
+        .stroke(egui::Stroke::new(1.0_f32, t.line))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(add);
+                ui.label(
+                    egui::RichText::new(name.to_uppercase())
+                        .size(10.0)
+                        .extra_letter_spacing(0.5)
+                        .color(t.dim),
+                );
+            });
+        });
 }
 
 impl OxydeApp {
@@ -437,177 +468,192 @@ impl OxydeApp {
 
     fn features_tab(&mut self, ui: &mut egui::Ui) {
         let (sketch, body, seeds) = (self.has_sketch(), self.has_body(), self.has_patternable());
-        self.command(
-            ui,
-            Icon::Extrude,
-            "Extrude",
-            sketch,
-            "Extrude a sketch, adding or removing material.\nSelect the sketch first, or pick it in the tree after.",
-            Command::Extrude,
-        );
-        self.command(
-            ui,
-            Icon::Revolve,
-            "Revolve",
-            sketch,
-            "Revolve a sketch about an axis, adding or removing material.",
-            Command::Revolve,
-        );
-        self.command(
-            ui,
-            Icon::Sweep,
-            "Sweep",
-            self.sketches().len() >= 2,
-            "Sweep a closed sketch along the curves of another sketch (a pipe along a bend), adding or removing material.\nSelect the profile first; the path is picked next.",
-            Command::Sweep,
-        );
-        self.command(
-            ui,
-            Icon::Loft,
-            "Loft",
-            self.sketches().len() >= 2,
-            "A solid through the closed contours of several sketches, in order (a square into a circle), adding or removing material.\nCtrl+click the sketches in the tree, or pick them after.",
-            Command::Loft,
-        );
+        let studio = crate::theme::current() == crate::theme::UiTheme::Studio;
+        cluster(ui, "Create", studio, |ui| {
+            self.command(
+                ui,
+                Icon::Extrude,
+                "Extrude",
+                sketch,
+                "Extrude a sketch, adding or removing material.\nSelect the sketch first, or pick it in the tree after.",
+                Command::Extrude,
+            );
+            self.command(
+                ui,
+                Icon::Revolve,
+                "Revolve",
+                sketch,
+                "Revolve a sketch about an axis, adding or removing material.",
+                Command::Revolve,
+            );
+            self.command(
+                ui,
+                Icon::Sweep,
+                "Sweep",
+                self.sketches().len() >= 2,
+                "Sweep a closed sketch along the curves of another sketch (a pipe along a bend), adding or removing material.\nSelect the profile first; the path is picked next.",
+                Command::Sweep,
+            );
+            self.command(
+                ui,
+                Icon::Loft,
+                "Loft",
+                self.sketches().len() >= 2,
+                "A solid through the closed contours of several sketches, in order (a square into a circle), adding or removing material.\nCtrl+click the sketches in the tree, or pick them after.",
+                Command::Loft,
+            );
+        });
         group_separator(ui);
-        self.command(
-            ui,
-            Icon::Fillet,
-            "Fillet",
-            body,
-            "Round edges. Select edges (or faces) first, or click them after.",
-            Command::Blend(true),
-        );
-        self.command(
-            ui,
-            Icon::Chamfer,
-            "Chamfer",
-            body,
-            "Bevel edges. Select edges (or faces) first, or click them after.",
-            Command::Blend(false),
-        );
-        self.command(
-            ui,
-            Icon::Shell,
-            "Shell",
-            body,
-            "Hollow the part, removing the selected faces.",
-            Command::Shell,
-        );
-        self.command(
-            ui,
-            Icon::Hole,
-            "Hole Wizard",
-            body,
-            "Clearance, tapped, counterbored or countersunk holes, sized for ISO metric screws, \
-             at the lone points of a sketch.\nSketch points on a face first (Sketch › Point), \
-             then select the sketch.",
-            Command::Hole,
-        );
+        cluster(ui, "Modify", studio, |ui| {
+            self.command(
+                ui,
+                Icon::Fillet,
+                "Fillet",
+                body,
+                "Round edges. Select edges (or faces) first, or click them after.",
+                Command::Blend(true),
+            );
+            self.command(
+                ui,
+                Icon::Chamfer,
+                "Chamfer",
+                body,
+                "Bevel edges. Select edges (or faces) first, or click them after.",
+                Command::Blend(false),
+            );
+            self.command(
+                ui,
+                Icon::Shell,
+                "Shell",
+                body,
+                "Hollow the part, removing the selected faces.",
+                Command::Shell,
+            );
+            self.command(
+                ui,
+                Icon::Hole,
+                "Hole Wizard",
+                body,
+                "Clearance, tapped, counterbored or countersunk holes, sized for ISO metric screws, \
+                 at the lone points of a sketch.\nSketch points on a face first (Sketch › Point), \
+                 then select the sketch.",
+                Command::Hole,
+            );
+        });
         group_separator(ui);
-        self.command(
-            ui,
-            Icon::LinearPattern,
-            "Linear Pattern",
-            seeds,
-            "Copy features along one or two directions.",
-            Command::Pattern(PatternKind::Linear),
-        );
-        self.command(
-            ui,
-            Icon::CircularPattern,
-            "Circular Pattern",
-            seeds,
-            "Copy features around an axis.",
-            Command::Pattern(PatternKind::Circular),
-        );
-        self.command(
-            ui,
-            Icon::Mirror,
-            "Mirror",
-            seeds || body,
-            "Mirror features, or whole bodies, about a plane or a flat face.",
-            Command::Pattern(PatternKind::Mirror),
-        );
-        let bodies = self.body_count() >= 2;
-        self.command(
-            ui,
-            Icon::Combine,
-            "Combine",
-            bodies,
-            "Join, cut or intersect bodies of the part.\nMake bodies with Extrude › New body.",
-            Command::Combine,
-        );
+        cluster(ui, "Pattern", studio, |ui| {
+            self.command(
+                ui,
+                Icon::LinearPattern,
+                "Linear Pattern",
+                seeds,
+                "Copy features along one or two directions.",
+                Command::Pattern(PatternKind::Linear),
+            );
+            self.command(
+                ui,
+                Icon::CircularPattern,
+                "Circular Pattern",
+                seeds,
+                "Copy features around an axis.",
+                Command::Pattern(PatternKind::Circular),
+            );
+            self.command(
+                ui,
+                Icon::Mirror,
+                "Mirror",
+                seeds || body,
+                "Mirror features, or whole bodies, about a plane or a flat face.",
+                Command::Pattern(PatternKind::Mirror),
+            );
+            let bodies = self.body_count() >= 2;
+            self.command(
+                ui,
+                Icon::Combine,
+                "Combine",
+                bodies,
+                "Join, cut or intersect bodies of the part.\nMake bodies with Extrude › New body.",
+                Command::Combine,
+            );
+        });
         group_separator(ui);
-        if command_button(
-            ui,
-            Icon::Appearance,
-            "Appearance",
-            body,
-            self.command_is_appearance(),
-        )
-        .on_hover_text(
-            "Colour, transparency or a texture for the selected faces, a body or the part.",
-        )
-        .clicked()
-        {
-            self.begin_appearance();
-        }
+        cluster(ui, "Look", studio, |ui| {
+            if command_button(
+                ui,
+                Icon::Appearance,
+                "Appearance",
+                body,
+                self.command_is_appearance(),
+            )
+            .on_hover_text(
+                "Colour, transparency or a texture for the selected faces, a body or the part.",
+            )
+            .clicked()
+            {
+                self.begin_appearance();
+            }
+        });
         group_separator(ui);
-        let response = command_button(
-            ui,
-            Icon::ReferenceGeometry,
-            "Reference Geometry",
-            true,
-            false,
-        )
-        .on_hover_text("Planes and axes to build on");
-        icons::dropdown_marker(ui, &response);
-        let popup = ui.make_persistent_id("reference_geometry_menu");
-        if response.clicked() {
-            ui.memory_mut(|m| m.toggle_popup(popup));
-        }
-        let mut chosen = None;
-        egui::popup::popup_below_widget(
-            ui,
-            popup,
-            &response,
-            egui::PopupCloseBehavior::CloseOnClick,
-            |ui| {
-                ui.set_min_width(140.0);
-                for (icon, label, command) in [
-                    (Icon::RefPlane, "Plane", Command::RefPlane),
-                    (Icon::RefAxis, "Axis", Command::RefAxis),
-                ] {
-                    let clicked = ui
-                        .horizontal(|ui| {
-                            icons::small(ui, icon, 18.0);
-                            ui.button(label).clicked()
-                        })
-                        .inner;
-                    if clicked {
-                        chosen = Some(command);
+        cluster(ui, "Construct", studio, |ui| {
+            let response = command_button(
+                ui,
+                Icon::ReferenceGeometry,
+                "Reference Geometry",
+                true,
+                false,
+            )
+            .on_hover_text("Planes and axes to build on");
+            icons::dropdown_marker(ui, &response);
+            let popup = ui.make_persistent_id("reference_geometry_menu");
+            if response.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(popup));
+            }
+            let mut chosen = None;
+            egui::popup::popup_below_widget(
+                ui,
+                popup,
+                &response,
+                egui::PopupCloseBehavior::CloseOnClick,
+                |ui| {
+                    ui.set_min_width(140.0);
+                    for (icon, label, command) in [
+                        (Icon::RefPlane, "Plane", Command::RefPlane),
+                        (Icon::RefAxis, "Axis", Command::RefAxis),
+                    ] {
+                        let clicked = ui
+                            .horizontal(|ui| {
+                                icons::small(ui, icon, 18.0);
+                                ui.button(label).clicked()
+                            })
+                            .inner;
+                        if clicked {
+                            chosen = Some(command);
+                        }
                     }
-                }
-            },
-        );
-        if let Some(command) = chosen {
-            self.run(command);
-        }
+                },
+            );
+            if let Some(command) = chosen {
+                self.run(command);
+            }
+        });
         group_separator(ui);
-        if command_button(ui, Icon::Imported, "Import STEP", true, false)
-            .on_hover_text("Add the solids of a STEP file to the part, as an Imported feature")
-            .clicked()
-        {
-            self.import_step();
-        }
+        cluster(ui, "Import", studio, |ui| {
+            if command_button(ui, Icon::Imported, "Import STEP", true, false)
+                .on_hover_text("Add the solids of a STEP file to the part, as an Imported feature")
+                .clicked()
+            {
+                self.import_step();
+            }
+        });
         group_separator(ui);
-        if command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
-            .on_hover_text("Equations, global variables and dimensions")
-            .clicked()
-        {
-            self.equations.show(EquationsTab::Equations);
-        }
+        cluster(ui, "Equations", studio, |ui| {
+            if command_button(ui, Icon::Equations, "Equations", true, self.equations.open)
+                .on_hover_text("Equations, global variables and dimensions")
+                .clicked()
+            {
+                self.equations.show(EquationsTab::Equations);
+            }
+        });
     }
 
     fn sketch_tab(&mut self, ui: &mut egui::Ui) {
@@ -700,34 +746,41 @@ impl OxydeApp {
 
     fn evaluate_tab(&mut self, ui: &mut egui::Ui) {
         let body = self.has_body();
-        if command_button(
-            ui,
-            Icon::MassProperties,
-            "Mass Properties",
-            body,
-            self.show_mass_properties,
-        )
-        .on_hover_text("Volume, surface area and size of the part")
-        .clicked()
-        {
-            self.show_mass_properties = !self.show_mass_properties;
-        }
-        if command_button(ui, Icon::Measure, "Measure", body, self.show_measure)
-            .on_hover_text("Lengths, areas, distances and angles of the selected faces and edges")
+        let studio = crate::theme::current() == crate::theme::UiTheme::Studio;
+        cluster(ui, "Inspect", studio, |ui| {
+            if command_button(
+                ui,
+                Icon::MassProperties,
+                "Mass Properties",
+                body,
+                self.show_mass_properties,
+            )
+            .on_hover_text("Volume, surface area and size of the part")
             .clicked()
-        {
-            self.show_measure = !self.show_measure;
-        }
-        self.section_view_button(ui, body);
+            {
+                self.show_mass_properties = !self.show_mass_properties;
+            }
+            if command_button(ui, Icon::Measure, "Measure", body, self.show_measure)
+                .on_hover_text(
+                    "Lengths, areas, distances and angles of the selected faces and edges",
+                )
+                .clicked()
+            {
+                self.show_measure = !self.show_measure;
+            }
+            self.section_view_button(ui, body);
+        });
         group_separator(ui);
-        if command_button(ui, Icon::Rebuild, "Rebuild", true, false)
-            .on_hover_text("Rebuild every feature (Ctrl+B)")
-            .clicked()
-        {
-            self.doc.release(&mut self.kernel);
-            self.rebuild();
-            self.status = "Rebuilt".to_owned();
-        }
+        cluster(ui, "Rebuild", studio, |ui| {
+            if command_button(ui, Icon::Rebuild, "Rebuild", true, false)
+                .on_hover_text("Rebuild every feature (Ctrl+B)")
+                .clicked()
+            {
+                self.doc.release(&mut self.kernel);
+                self.rebuild();
+                self.status = "Rebuilt".to_owned();
+            }
+        });
     }
 
     /// View › Display Style, and the heads-up toolbar's flyout: the five styles, the
@@ -919,5 +972,32 @@ impl OxydeApp {
                         });
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Studio cluster names its group under the buttons, so it is taller than the bare
+    /// buttons; without Studio the buttons are drawn as they are.
+    #[test]
+    fn studio_clusters_name_their_group_under_the_buttons() {
+        let height = |studio: bool| {
+            let ctx = egui::Context::default();
+            let mut height = 0.0;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let top = ui.cursor().top();
+                    cluster(ui, "Create", studio, |ui| {
+                        ui.add_sized([60.0, 40.0], egui::Button::new("Extrude"));
+                    });
+                    height = ui.cursor().top() - top;
+                });
+            });
+            height
+        };
+        let (bare, studio) = (height(false), height(true));
+        assert!(studio > bare + 8.0, "{studio} against {bare}");
     }
 }

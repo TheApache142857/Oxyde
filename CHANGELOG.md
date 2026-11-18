@@ -30,6 +30,9 @@ release yet; the git history has every detail.
 - **Studio's feature tree**: an eye on every item that can be hidden, a small red or amber dot
   for an error or a warning instead of the coloured name and icon, hairline separators between
   rows and guides along the indents.
+- **Studio's command bar**: on the Features and Evaluate tabs the commands sit in named
+  clusters (Create, Modify, Pattern, Look, Construct, Import, Equations; Inspect, Rebuild) on
+  rounded panels, in place of separators.
 
 ### Rotate in Move Component (unreleased, November 2026)
 
