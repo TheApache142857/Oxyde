@@ -23,6 +23,9 @@ release yet; the git history has every detail.
   button beside it goes back to the isometric view.
 - **Studio's page layout**: one type scale (12 / 13 / 15 points), a little more padding and
   taller rows, and panel sections headed by their title over a hairline divider.
+- **Studio's feature tree**: an eye on every item that can be hidden, a small red or amber dot
+  for an error or a warning instead of the coloured name and icon, hairline separators between
+  rows and guides along the indents.
 
 ### Rotate in Move Component (unreleased, November 2026)
 

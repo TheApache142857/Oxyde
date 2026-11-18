@@ -136,7 +136,31 @@ pub(crate) struct RowResponse {
     pub(crate) eye_clicked: bool,
 }
 
+/// How the tree marks its rows: the classic way, or Studio's (an eye always shown on what
+/// can be hidden, a status dot in place of the error and warning icons, hairline
+/// separators between rows and guides along the indents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowMarks {
+    pub(crate) eye_always: bool,
+    pub(crate) status_dot: bool,
+    pub(crate) separators: bool,
+    pub(crate) indent_guides: bool,
+}
+
+impl RowMarks {
+    pub(crate) fn of(theme: crate::theme::UiTheme) -> RowMarks {
+        let studio = theme == crate::theme::UiTheme::Studio;
+        RowMarks {
+            eye_always: studio,
+            status_dot: studio,
+            separators: studio,
+            indent_guides: studio,
+        }
+    }
+}
+
 pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
+    let marks = RowMarks::of(crate::theme::current());
     let height = 22.0;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
@@ -162,6 +186,14 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
             painter.rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
         } else if response.hovered() || row.hovered {
             painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let hairline = Stroke::new(1.0_f32, crate::theme::tokens().line.gamma_multiply(0.6));
+        if marks.separators {
+            painter.hline(rect.x_range(), rect.bottom() - 0.5, hairline);
+        }
+        if marks.indent_guides && row.indent > 0.0 {
+            let x = rect.left() + row.indent - 6.0;
+            painter.vline(x, rect.y_range(), hairline);
         }
         if let Some(expanded) = row.expander {
             let c = expander_rect.center();
@@ -201,11 +233,14 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
         );
         painter.galley(text_pos, galley, visuals.text_color());
         if let Some(shown) = row.eye {
-            // A closed eye stays visible; the open one appears on hover.
+            // A closed eye stays visible; the open one appears on hover (always, dimmed,
+            // in Studio).
             if !shown {
                 icons::paint(painter, eye_rect, Icon::EyeClosed, true);
             } else if response.hovered() {
                 icons::paint(painter, eye_rect, Icon::Eye, true);
+            } else if marks.eye_always {
+                icons::paint(painter, eye_rect, Icon::Eye, false);
             }
         }
         if let Some(badge) = row.badge {
@@ -213,7 +248,17 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
                 egui::pos2(rect.right() - 11.0, rect.center().y),
                 egui::Vec2::splat(15.0),
             );
-            icons::paint(painter, badge_rect, badge, true);
+            let dot = match badge {
+                Icon::Error if marks.status_dot => Some(crate::theme::tokens().err),
+                Icon::Warning if marks.status_dot => Some(crate::theme::tokens().warn),
+                _ => None,
+            };
+            match dot {
+                Some(color) => {
+                    painter.circle_filled(badge_rect.center(), 4.0, color);
+                }
+                None => icons::paint(painter, badge_rect, badge, true),
+            }
         }
     }
     RowResponse {
@@ -746,7 +791,11 @@ impl OxydeApp {
         if let Some(external) = external {
             label.push_str(if external.in_context { " ->" } else { " ->?" });
         }
+        // Studio says it with the status dot alone; the classic tree colours the name too.
+        let dot = RowMarks::of(crate::theme::current()).status_dot;
         let (mut text, badge) = match &entry.status {
+            FeatureStatus::Error(_) if dot => (RichText::new(label), Some(Icon::Error)),
+            FeatureStatus::Warning(_) if dot => (RichText::new(label), Some(Icon::Warning)),
             FeatureStatus::Error(_) => (RichText::new(label).color(error()), Some(Icon::Error)),
             FeatureStatus::Warning(_) => {
                 (RichText::new(label).color(warning()), Some(Icon::Warning))
@@ -1133,4 +1182,31 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
         CursorIcon::ResizeVertical
     };
     response.on_hover_cursor(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn studio_marks_rows_with_eyes_dots_and_hairlines() {
+        use crate::theme::UiTheme;
+        let studio = RowMarks::of(UiTheme::Studio);
+        assert!(studio.eye_always && studio.status_dot);
+        assert!(studio.separators && studio.indent_guides);
+        for (theme, _) in UiTheme::ALL {
+            if theme != UiTheme::Studio {
+                assert_eq!(
+                    RowMarks::of(theme),
+                    RowMarks {
+                        eye_always: false,
+                        status_dot: false,
+                        separators: false,
+                        indent_guides: false,
+                    },
+                    "{theme:?} keeps the classic tree"
+                );
+            }
+        }
+    }
 }
