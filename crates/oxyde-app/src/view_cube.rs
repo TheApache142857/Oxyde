@@ -47,8 +47,11 @@ pub(crate) struct ViewCube {
     home: Rect,
 }
 
-/// The six faces: outward normal, two directions across it, the view looking at it.
-const FACES: [([f64; 3], [f64; 3], [f64; 3], StandardView, &str); 6] = [
+/// A face: outward normal, two directions across it, the view looking at it, its name.
+type FaceSpec = ([f64; 3], [f64; 3], [f64; 3], StandardView, &'static str);
+
+/// The six faces.
+const FACES: [FaceSpec; 6] = [
     (
         [0.0, 0.0, 1.0],
         [1.0, 0.0, 0.0],
