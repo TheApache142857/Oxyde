@@ -98,10 +98,37 @@ fn options(renderer: eframe::Renderer) -> eframe::NativeOptions {
         renderer,
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             device_descriptor: std::sync::Arc::new(device_descriptor),
+            on_surface_error: flush_dropped_frames(),
             ..Default::default()
         },
         ..Default::default()
     }
+}
+
+/// The window's GPU queue, kept for [`flush_dropped_frames`]; set once the window has its
+/// device.
+static WINDOW_QUEUE: std::sync::OnceLock<std::sync::Arc<eframe::wgpu::Queue>> =
+    std::sync::OnceLock::new();
+
+/// What to do when the window cannot be drawn: egui's own answer, after sending the frame's
+/// uploads to the GPU.
+///
+/// egui uploads a frame's triangles and textures (`Queue::write_buffer`) before it asks for
+/// the window's surface, and drops the frame without submitting when it cannot have one: on
+/// every frame while the window is minimized (`Outdated`), and while the display sleeps. wgpu
+/// keeps those uploads in staging memory until the next submit, so a window left minimized
+/// for a day or two piled up gigabytes that came back only once it was drawn again. An empty
+/// submit hands them to the GPU and lets wgpu free them.
+fn flush_dropped_frames() -> std::sync::Arc<
+    dyn Fn(eframe::wgpu::SurfaceError) -> eframe::egui_wgpu::SurfaceErrorAction + Send + Sync,
+> {
+    let egui_default = eframe::egui_wgpu::WgpuConfiguration::default().on_surface_error;
+    std::sync::Arc::new(move |error| {
+        if let Some(queue) = WINDOW_QUEUE.get() {
+            queue.submit([]);
+        }
+        egui_default(error)
+    })
 }
 
 /// The GPU device the window draws with: egui's own settings, but asking for the largest
@@ -169,7 +196,13 @@ fn run(renderer: eframe::Renderer, file: Option<PathBuf>) -> eframe::Result<()> 
     eframe::run_native(
         "Oxyde",
         options(renderer),
-        Box::new(move |cc| Ok(Box::new(app::OxydeApp::new(cc, file)))),
+        Box::new(move |cc| {
+            if let Some(state) = &cc.wgpu_render_state {
+                // The GPU window is started once; the OpenGL fallback has no queue to keep.
+                let _ = WINDOW_QUEUE.set(state.queue.clone());
+            }
+            Ok(Box::new(app::OxydeApp::new(cc, file)))
+        }),
     )
 }
 
