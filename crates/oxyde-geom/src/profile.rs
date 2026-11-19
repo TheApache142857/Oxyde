@@ -724,7 +724,7 @@ fn line_circle(p: Point2, q: Point2, c: Point2, r: f64, tolerance: f64) -> Vec<P
 /// Where a line meets an ellipse: where it meets the unit circle once the ellipse's
 /// semi-axes are scaled to one.
 fn line_ellipse(p: Point2, q: Point2, ellipse: &Ellipse2, tolerance: f64) -> Vec<Point2> {
-    let ((px, py), (qx, qy)) = (ellipse.to_unit(p), ellipse.to_unit(q));
+    let ((px, py), (qx, qy)) = (ellipse.scaled(p), ellipse.scaled(q));
     line_circle(
         Point2::new(px, py),
         Point2::new(qx, qy),
@@ -733,7 +733,7 @@ fn line_ellipse(p: Point2, q: Point2, ellipse: &Ellipse2, tolerance: f64) -> Vec
         tolerance / ellipse.largest_radius(),
     )
     .into_iter()
-    .map(|u| ellipse.from_unit(u.x, u.y))
+    .map(|u| ellipse.unscaled(u.x, u.y))
     .collect()
 }
 

@@ -1471,13 +1471,13 @@ mod tests {
 
     #[test]
     fn newer_versions_are_refused() {
-        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":3");
+        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":4");
         let bytes = archive_with(&[(MANIFEST, &manifest)]);
         assert!(matches!(
             read_part(Cursor::new(bytes)),
             Err(FormatError::UnsupportedVersion {
-                found: 3,
-                supported: 2
+                found: 4,
+                supported: 3
             })
         ));
     }

@@ -760,6 +760,19 @@ impl ConstrainedSketch {
         }
     }
 
+    /// Points along an ellipse, or along an elliptic arc from its start to its end, in
+    /// `steps` equal turns of the eccentric angle.
+    pub fn ellipse_path(&self, id: EntityId, steps: usize) -> Option<Vec<Point2>> {
+        let ellipse = self.ellipse_of(id)?;
+        let (a0, sweep) = match self.entity(id)?.geometry {
+            Geometry::EllipticArc { start, end, .. } => {
+                ellipse.sweep(self.position(start)?, self.position(end)?)
+            }
+            _ => (0.0, TAU),
+        };
+        Some(ellipse.points(a0, sweep, steps))
+    }
+
     /// Current counter-clockwise angle from one line to another, in radians, in (−π, π].
     pub fn angle_between(&self, first: EntityId, second: EntityId) -> Option<f64> {
         let direction = |l| {
@@ -975,7 +988,9 @@ impl ConstrainedSketch {
                 }
                 Geometry::Circle { radius, .. } => *radius = params[layout.radius[&e.id]],
                 Geometry::Ellipse { minor, .. } | Geometry::EllipticArc { minor, .. } => {
-                    *minor = params[layout.radius[&e.id]];
+                    if let Some(&value) = layout.radius.get(&e.id).and_then(|&i| params.get(i)) {
+                        *minor = value;
+                    }
                 }
                 _ => {}
             }
@@ -1062,11 +1077,7 @@ pub(crate) fn has_own_equations(geometry: &Geometry) -> bool {
 
 /// Counter-clockwise elliptic arc from its ends to the three-point form.
 fn elliptic_arc_curve(ellipse: Ellipse2, start: Point2, end: Point2) -> Curve2 {
-    let a0 = ellipse.angle_of(start);
-    let mut sweep = (ellipse.angle_of(end) - a0).rem_euclid(TAU);
-    if sweep < 1e-12 {
-        sweep = TAU;
-    }
+    let (a0, sweep) = ellipse.sweep(start, end);
     Curve2::EllipticArc {
         ellipse,
         start,
@@ -1193,7 +1204,7 @@ impl Layout {
             }
             Geometry::Ellipse { center, major, .. } => {
                 let mut v = [point(center), point(major)].concat();
-                v.push(self.radius[&id]);
+                v.extend(self.radius.get(&id));
                 v
             }
             Geometry::EllipticArc {
@@ -1204,7 +1215,7 @@ impl Layout {
                 ..
             } => {
                 let mut v = [point(center), point(major), point(start), point(end)].concat();
-                v.push(self.radius[&id]);
+                v.extend(self.radius.get(&id));
                 v
             }
         }
@@ -1452,12 +1463,12 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
     /// The implicit equations of an arc, its two ends at the same distance from its centre,
     /// and of an elliptic arc, its two ends on its ellipse.
     pub fn arc(&self, id: EntityId, out: &mut Vec<T>) {
-        match self.layout.kind[&id] {
-            Geometry::Arc { center, start, end } => {
+        match self.layout.kind.get(&id).copied() {
+            Some(Geometry::Arc { center, start, end }) => {
                 let c = self.point(center);
                 out.push(distance(c, self.point(start)) - distance(c, self.point(end)));
             }
-            Geometry::EllipticArc { start, end, .. } => {
+            Some(Geometry::EllipticArc { start, end, .. }) => {
                 let (c, m, b) = self.ellipse(id);
                 for p in [start, end] {
                     out.push(Self::off_ellipse(self.point(p), c, m, b));

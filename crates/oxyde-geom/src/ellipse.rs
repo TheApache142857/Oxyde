@@ -63,27 +63,44 @@ impl Ellipse2 {
 
     /// The point at eccentric angle `t`.
     pub fn at(&self, t: f64) -> Point2 {
-        self.from_unit(t.cos(), t.sin())
+        self.unscaled(t.cos(), t.sin())
     }
 
     /// The eccentric angle of `p`, a point of the ellipse; for any other point, the angle of
     /// the point of the ellipse on the line from the centre through it, as seen with both
     /// semi-axes scaled to one.
     pub fn angle_of(&self, p: Point2) -> f64 {
-        let (x, y) = self.to_unit(p);
+        let (x, y) = self.scaled(p);
         y.atan2(x)
+    }
+
+    /// The eccentric angle of `start` and the counter-clockwise turn from it to `end`, a
+    /// whole turn when the two meet.
+    pub fn sweep(&self, start: Point2, end: Point2) -> (f64, f64) {
+        let a0 = self.angle_of(start);
+        let sweep = (self.angle_of(end) - a0).rem_euclid(TAU);
+        (a0, if sweep < 1e-12 { TAU } else { sweep })
+    }
+
+    /// The points from angle `a0` turning by `sweep`, in `steps` equal turns, both ends
+    /// included.
+    pub fn points(&self, a0: f64, sweep: f64, steps: usize) -> Vec<Point2> {
+        let steps = steps.max(1);
+        (0..=steps)
+            .map(|k| self.at(a0 + sweep * k as f64 / steps as f64))
+            .collect()
     }
 
     /// `p` in the ellipse's own coordinates, in units of its semi-axes: the ellipse is the
     /// unit circle there.
-    pub(crate) fn to_unit(&self, p: Point2) -> (f64, f64) {
+    pub(crate) fn scaled(&self, p: Point2) -> (f64, f64) {
         let ((ux, uy), a, b) = self.frame();
         let (dx, dy) = (p.x - self.center.x, p.y - self.center.y);
         ((dx * ux + dy * uy) / a, (dy * ux - dx * uy) / b)
     }
 
-    /// The point at `(x, y)` in the ellipse's own coordinates (see [`Self::to_unit`]).
-    pub(crate) fn from_unit(&self, x: f64, y: f64) -> Point2 {
+    /// The point at `(x, y)` in the ellipse's own coordinates (see [`Self::scaled`]).
+    pub(crate) fn unscaled(&self, x: f64, y: f64) -> Point2 {
         let ((ux, uy), a, b) = self.frame();
         let (along, across) = (a * x, b * y);
         Point2::new(
@@ -96,7 +113,7 @@ impl Ellipse2 {
     /// the distance to it, and for a circle exactly half of `(d² − r²) / r`.
     pub(crate) fn offset(&self, p: Point2) -> f64 {
         let (_, a, b) = self.frame();
-        let (x, y) = self.to_unit(p);
+        let (x, y) = self.scaled(p);
         (x * x + y * y - 1.0) * a * b / (a + b)
     }
 
@@ -117,7 +134,7 @@ impl Ellipse2 {
     /// Whether `other` is the same curve, within `tolerance`: the same centre, and each
     /// ellipse through the other's axis ends and a point between them, which two different
     /// concentric ellipses never share all of.
-    pub(crate) fn same_as(&self, other: &Ellipse2, tolerance: f64) -> bool {
+    pub fn same_as(&self, other: &Ellipse2, tolerance: f64) -> bool {
         let on = |e: &Ellipse2, p: Point2| e.offset(p).abs() <= tolerance;
         let eighth = TAU / 8.0;
         self.center.distance(other.center) <= tolerance

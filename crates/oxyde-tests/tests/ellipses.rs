@@ -1,14 +1,14 @@
-//! Ellipses and elliptic arcs in sketches, extruded and cut by OpenCASCADE. Volumes are
-//! checked against π·a·b times the depth, whichever semi-axis is the longer and whichever
-//! way the profile walks an arc.
+//! Ellipses and elliptic arcs in sketches, extruded, cut and revolved by OpenCASCADE.
+//! Volumes are checked against π·a·b times the depth or the path of the centre, whichever
+//! semi-axis is the longer and whichever way the profile walks an arc.
 
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 
 use oxyde_geom::Point2;
 use oxyde_kernel::Kernel;
 use oxyde_model::{
-    Extrude, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, Part, Resolution, Sketch,
-    SketchPlane, StandardPlane,
+    Extrude, ExtrudeOp, FaceName, FeatureId, FeatureKind, FeatureStatus, Part, Resolution, Revolve,
+    RevolveAxis, Sketch, SketchPlane, StandardPlane,
 };
 use oxyde_occt::OcctKernel;
 
@@ -118,5 +118,35 @@ fn an_elliptic_hole_cuts_its_area_out() {
         volume(&part, &kernel),
         40.0 * 40.0 * 5.0 - PI * 12.0 * 7.0 * 5.0,
     );
+    part.release(&mut kernel);
+}
+
+#[test]
+fn a_revolved_ellipse_sweeps_its_area_round_the_axis() {
+    // An ellipse 3 by 2, its centre 10 from a centerline on the y axis: by Pappus, its area
+    // times the path of its centre.
+    let mut kernel = OcctKernel::new();
+    let mut part = Part::new();
+    let mut sketch = front();
+    let axis = sketch
+        .geometry
+        .line(Point2::new(0.0, -5.0), Point2::new(0.0, 5.0));
+    sketch.geometry.set_construction(axis, true);
+    sketch
+        .geometry
+        .ellipse(Point2::new(10.0, 0.0), Point2::new(10.0, 3.0), 2.0);
+    let s = part.add_feature(FeatureKind::Sketch(sketch));
+    part.add_feature(FeatureKind::Revolve(Revolve {
+        sketch: s,
+        op: ExtrudeOp::Boss,
+        axis: RevolveAxis::SketchLine(axis.0),
+        angle: TAU,
+        mid_plane: false,
+        reverse: false,
+        bodies: Vec::new(),
+    }));
+    part.rebuild(&mut kernel);
+    assert_all_ok(&part);
+    assert_close(volume(&part, &kernel), PI * 3.0 * 2.0 * TAU * 10.0);
     part.release(&mut kernel);
 }
