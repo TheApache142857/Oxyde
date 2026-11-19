@@ -37,6 +37,18 @@ release yet; the git history has every detail.
   icons along the bottom of the window, in order, with the rollback marker among them. A click
   selects a feature, a double click edits it, and its menu rolls back to before it.
 
+### Convert Entities projects part geometry onto the sketch (unreleased, November 2026)
+
+- **Convert Entities copies part edges and vertices from anywhere on the part**, projected
+  onto the sketch plane along its normal, as SolidWorks does: the edges of a boss on the far
+  side of the part, the outline of a face above the sketch (Ctrl+click), or the corner of a
+  slanted face as a point. Lines, and circles and arcs facing the sketch, are copied; an edge
+  seen twice from the sketch (the top and bottom of a wall) is offered once. A vertex is
+  offered where no edge is under the cursor, so clicking near the end of an edge still copies
+  the edge. A circle tilted to the sketch would become an ellipse, which sketches do not have
+  yet, so only its vertex is offered. The copies are fixed where they are and do not follow
+  later changes to the part. Snapping while drawing still uses only the edges in the plane.
+
 ### Rotate in Move Component (unreleased, November 2026)
 
 - **Move Component turns parts about one axis, by dragging or by typed angles**, as
@@ -67,6 +79,11 @@ release yet; the git history has every detail.
   on every frame, so with it on the viewport never went idle: about 60 fps with Oxyde in the
   background, more in front. It now refreshes once a second, and its fps counts the frames
   actually drawn in the last second: about 1 while nothing happens.
+- **A window left minimized no longer piles up memory.** While Oxyde could not draw its
+  window (minimized, or with the display asleep), each frame's picture was still sent towards
+  the graphics card and kept until the window was drawn again: a window left minimized for a
+  day or two held 20 GB and more, freed only once it was shown. Those frames are now let go
+  as they are dropped.
 - **`OXYDE_REPAINT_TRACE=1`** prints, for each frame of the window, which code asked for it:
   to find what keeps the viewport drawing, and the graphics card busy, while nothing happens.
 

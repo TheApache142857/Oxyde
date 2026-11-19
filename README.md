@@ -77,7 +77,7 @@ what changed in each version is in the [changelog](CHANGELOG.md).
 
 - **Sketches** on the standard planes, reference planes or flat faces: lines, rectangles,
   circles, centrepoint, three-point and tangent arcs, slots, polygons and points; construction
-  geometry, sketch fillets and offsets, trim and extend, and Convert Entities from part edges.
+  geometry, sketch fillets and offsets, trim and extend, and Convert Entities from part edges and vertices, projected onto the sketch plane.
 - **Relations and dimensions** solved as you draw: coincident, horizontal, vertical, parallel,
   perpendicular, tangent, equal, collinear, concentric, fix and more; Smart Dimension for
   lengths, distances, angles, radii and diameters. Colours show what is fully defined, and
