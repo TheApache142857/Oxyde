@@ -456,6 +456,7 @@ pub(crate) fn export(session: &mut Session, args: &Value) -> Result<ToolOutput> 
             let scratch = std::env::temp_dir()
                 .join(format!("oxyde-mcp-export-{}.oxyprt", std::process::id()));
             let file = oxyde_format::PartFile {
+                kernel: Default::default(),
                 document_id: doc.document_id.clone(),
                 definition: doc.part.definition(),
                 properties: doc.properties.clone(),

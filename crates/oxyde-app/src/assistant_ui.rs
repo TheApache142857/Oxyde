@@ -99,7 +99,7 @@ impl OxydeApp {
                 document_id: doc.document_id.clone(),
                 properties: doc.properties.clone(),
             };
-            let answer = session.handle_in_window(&mut self.kernel, &mut lent, message);
+            let answer = session.handle_in_window(self.kernel.occt_mut(), &mut lent, message);
             if let WindowDocument::Assembly {
                 assembly,
                 properties,
@@ -132,7 +132,7 @@ impl OxydeApp {
             document_id: self.doc.document_id.clone(),
             properties: self.doc.properties.clone(),
         };
-        let answer = session.handle_in_window(&mut self.kernel, &mut lent, message);
+        let answer = session.handle_in_window(self.kernel.occt_mut(), &mut lent, message);
         if let WindowDocument::Part {
             part, properties, ..
         } = lent
@@ -205,7 +205,7 @@ impl OxydeApp {
                     .clicked()
                 {
                     if let Some(mut session) = self.assistant.mcp.take() {
-                        session.release_in_window(&mut self.kernel);
+                        session.release_in_window(self.kernel.occt_mut());
                     }
                     self.assistant.new_chat();
                 }

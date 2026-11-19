@@ -46,6 +46,7 @@ fn folder(name: &str) -> PathBuf {
 
 fn save_plate(path: &Path) {
     let file = PartFile {
+        kernel: Default::default(),
         document_id: oxyde_format::new_document_id(),
         definition: plate().definition(),
         properties: Properties::default(),

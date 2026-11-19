@@ -166,6 +166,7 @@ mod tests {
         assert!(built > 80.0 * 50.0 * 10.0, "volume {built}");
 
         let file = PartFile {
+            kernel: Default::default(),
             document_id: oxyde_format::new_document_id(),
             definition: part.definition(),
             properties: Properties::default(),

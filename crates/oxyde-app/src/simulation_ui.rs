@@ -65,7 +65,6 @@ use oxyde_kernel::{
     VolumeMeshOptions,
 };
 use oxyde_model::{BodyId, FaceName, Material, Mechanical, Thermal};
-use oxyde_occt::OcctKernel;
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
     ContactCandidate, ContactKind, Elastic, FixtureKind, FrequencyResults, FrequencyStudy,
@@ -5846,7 +5845,7 @@ fn netgen_mesh(
     cancel: &AtomicBool,
     progress: &(dyn Fn(f64, &'static str) + Sync),
 ) -> Result<TetMesh, VolumeMeshError> {
-    let Some(mut kernel) = OcctKernel::open_worker() else {
+    let Some(mut kernel) = crate::kernel::AppKernel::open_worker() else {
         return Err(VolumeMeshError::Failed(
             "no kernel could be opened on the study's thread".to_owned(),
         ));

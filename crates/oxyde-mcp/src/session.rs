@@ -150,6 +150,7 @@ impl Session {
             doc.properties.material = material.name.clone();
         }
         let file = PartFile {
+            kernel: Default::default(),
             document_id: doc.document_id.clone(),
             definition: doc.part.definition(),
             properties: doc.properties.clone(),

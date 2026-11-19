@@ -5,6 +5,16 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Choose the kernel at start (unreleased, November 2026)
+
+- **Preferences › Debug › Kernel** chooses the geometry kernel parts are built with, from the
+  next start, and `oxyde --kernel occt` chooses it for one session; an unknown name is
+  reported and the preference is used. OpenCASCADE is the only kernel so far: this is the
+  place another one will be offered. The About box and the Debug page name the session's
+  kernel and its version.
+- **Part files record the kernel that built them** (`manifest.json`'s `kernel`, FORMAT.md §2):
+  opening a part built by another kernel says so in the status line, since faces and edges may
+  be cut and named differently. Older files read as built by OpenCASCADE.
 ### Studio theme and a modern look (unreleased, November 2026)
 
 - **Studio theme** (Preferences › Graphics › Interface): a quiet light look with white and

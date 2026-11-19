@@ -40,7 +40,8 @@ Rules:
   "kind": "part",
   "document_id": "6f1c1f6e-3c9b-4f62-9a47-2d1e8f0c5b11",
   "units": { "length": "mm", "angle": "deg" },
-  "created_by": "oxyde 0.0.3"
+  "created_by": "oxyde 0.0.3",
+  "kernel": "occt"
 }
 ```
 
@@ -48,6 +49,7 @@ Rules:
 - `format_version`: 1 for assemblies and drawings. Parts are 1 when every reference plane in them is an offset plane and 2 when one is made another way (at an angle, through a line, through three points, normal to a curve: the `plane` feature's `construction`, §3), so readers of version 1 still open the others. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
 - `units` are display units. Values in `model.json` are always millimetres.
+- `kernel` (parts only, optional): the geometry kernel that built the part when it was saved, `"occt"` for OpenCASCADE. Absent means `"occt"` (every part saved before the key existed). It is a record, not a requirement: a part opens with the kernel the session has, and the application warns when that is another one, since another kernel can cut faces differently and so resolve face and edge names differently. A name the reader does not know is kept and written back. Readers of version 1 ignore the key, so `format_version` does not change.
 
 ## 3. `model.json`
 

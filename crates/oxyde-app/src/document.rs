@@ -90,6 +90,7 @@ impl Document {
             document_id: self.document_id.clone(),
             definition: self.part.definition(),
             properties: self.properties.clone(),
+            kernel: crate::kernel::chosen().file_kernel(),
         }
     }
 

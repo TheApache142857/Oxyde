@@ -470,6 +470,7 @@ mod tests {
             10.0,
         )));
         let file = oxyde_format::PartFile {
+            kernel: Default::default(),
             document_id: oxyde_format::new_document_id(),
             definition: part.definition(),
             properties: Default::default(),
