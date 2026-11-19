@@ -80,6 +80,16 @@ fn not_yet(what: &str) -> SolidcoreError {
     SolidcoreError(format!("the solidcore kernel cannot {what} yet (spike)"))
 }
 
+/// What a profile curve that has no solidcore segment fails an extrusion with.
+fn unbuilt(why: convert::Unbuilt) -> SolidcoreError {
+    match why {
+        convert::Unbuilt::NoCircle => {
+            SolidcoreError("a profile arc has no circle through it".to_owned())
+        }
+        convert::Unbuilt::Kind => not_yet("extrude this kind of sketch curve"),
+    }
+}
+
 type Result<T> = std::result::Result<T, SolidcoreError>;
 
 /// Oxyde's kernel on solidcore.
@@ -267,8 +277,7 @@ impl Kernel for SolidcoreKernel {
         if off.length() > 1e-9 * vector.length().max(1.0) {
             return Err(not_yet("extrude at a slant to the sketch plane"));
         }
-        let regions = convert::regions(profile)
-            .ok_or_else(|| SolidcoreError("a profile arc has no circle through it".to_owned()))?;
+        let regions = convert::regions(profile).map_err(unbuilt)?;
         let (start, end) = if along >= 0.0 {
             (0.0, along)
         } else {
@@ -475,5 +484,22 @@ impl Kernel for SolidcoreKernel {
 
     fn release(&mut self, shape: ShapeHandle) {
         self.bodies.remove(&shape.raw());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_curve_the_adapter_does_not_build_fails_like_any_unsupported_operation() {
+        assert_eq!(
+            unbuilt(convert::Unbuilt::Kind).to_string(),
+            "the solidcore kernel cannot extrude this kind of sketch curve yet (spike)"
+        );
+        assert_eq!(
+            unbuilt(convert::Unbuilt::NoCircle).to_string(),
+            "a profile arc has no circle through it"
+        );
     }
 }

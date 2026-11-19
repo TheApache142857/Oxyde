@@ -44,55 +44,74 @@ fn angle(center: Point2, p: Point2) -> f64 {
     (p.y - center.y).atan2(p.x - center.x)
 }
 
+/// Why a profile curve has no solidcore segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unbuilt {
+    /// An arc whose three points are in line.
+    NoCircle,
+    /// A kind of curve the adapter does not give solidcore.
+    Kind,
+}
+
 /// One sketch curve as a solidcore segment; arcs run from `start` through `mid` to `end`.
-fn segment(curve: &Curve2) -> Option<Seg2> {
+fn segment(curve: &Curve2) -> Result<Seg2, Unbuilt> {
     match *curve {
-        Curve2::Line { start, end } => Some(Seg2::Line {
+        Curve2::Line { start, end } => Ok(Seg2::Line {
             a: v2(start),
             b: v2(end),
         }),
         Curve2::Arc { start, mid, end } => {
-            let (center, radius) = circle_through(start, mid, end)?;
+            let (center, radius) = circle_through(start, mid, end).ok_or(Unbuilt::NoCircle)?;
             let tau = std::f64::consts::TAU;
             let (a0, am, a1) = (angle(center, start), angle(center, mid), angle(center, end));
             // Counter-clockwise from start to end passes the middle, or the arc runs clockwise.
             let ccw = (a1 - a0).rem_euclid(tau);
             let through = (am - a0).rem_euclid(tau);
             let sweep = if through <= ccw { ccw } else { ccw - tau };
-            Some(Seg2::Arc {
+            Ok(Seg2::Arc {
                 center: v2(center),
                 radius,
                 start: a0,
                 sweep,
             })
         }
-        Curve2::Circle { center, radius } => Some(Seg2::Arc {
+        ref other => whole_circle(other),
+    }
+}
+
+/// A full circle as a solidcore segment. Every other curve, a kind `Curve2` gained after the
+/// adapter was written included, is not built.
+fn whole_circle(curve: &Curve2) -> Result<Seg2, Unbuilt> {
+    if let Curve2::Circle { center, radius } = *curve {
+        Ok(Seg2::Arc {
             center: v2(center),
             radius,
             start: 0.0,
             sweep: std::f64::consts::TAU,
-        }),
+        })
+    } else {
+        Err(Unbuilt::Kind)
     }
 }
 
-fn loop2(l: &Loop) -> Option<Loop2> {
+fn loop2(l: &Loop) -> Result<Loop2, Unbuilt> {
     let segs = l
         .segments
         .iter()
         .map(|s| segment(&s.curve))
-        .collect::<Option<Vec<_>>>()?;
-    Some(Loop2 { segs })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Loop2 { segs })
 }
 
-/// The profile's regions as solidcore's, or none when a segment has no circle through it.
-pub(crate) fn regions(profile: &Profile) -> Option<Vec<Region2>> {
+/// The profile's regions as solidcore's.
+pub(crate) fn regions(profile: &Profile) -> Result<Vec<Region2>, Unbuilt> {
     profile
         .regions
         .iter()
         .map(|r| {
-            Some(Region2 {
+            Ok(Region2 {
                 outer: loop2(&r.outer)?,
-                holes: r.holes.iter().map(loop2).collect::<Option<Vec<_>>>()?,
+                holes: r.holes.iter().map(loop2).collect::<Result<Vec<_>, _>>()?,
             })
         })
         .collect()
@@ -195,14 +214,24 @@ pub(crate) fn extrusion_source(
                 let off = Point2::new(a.x + t * dx, a.y + t * dy).distance(m);
                 (-1e-9..=1.0 + 1e-9).contains(&t) && off < ON
             }
-            Curve2::Circle { center, radius } => (center.distance(m) - radius).abs() < ON,
             Curve2::Arc { start, mid, end } => {
                 let (center, radius) = circle_through(start, mid, end)?;
                 (center.distance(m) - radius).abs() < ON
             }
+            ref other => on_circle(other, m),
         };
         on.then_some(FaceSource::ProfileSegment(id))
     })
+}
+
+/// Whether `m` lies on `curve` when it is a full circle; on no other curve, since the
+/// adapter builds no other kind of whole curve.
+fn on_circle(curve: &Curve2, m: Point2) -> bool {
+    if let Curve2::Circle { center, radius } = *curve {
+        (center.distance(m) - radius).abs() < ON
+    } else {
+        false
+    }
 }
 
 /// Every segment of the profile with its id.
@@ -223,7 +252,7 @@ mod tests {
         let a = Point2::new(1.0, 0.0);
         let top = Point2::new(0.0, 1.0);
         let b = Point2::new(-1.0, 0.0);
-        let Some(Seg2::Arc { sweep, radius, .. }) = segment(&Curve2::Arc {
+        let Ok(Seg2::Arc { sweep, radius, .. }) = segment(&Curve2::Arc {
             start: a,
             mid: top,
             end: b,
@@ -232,7 +261,7 @@ mod tests {
         };
         assert!((radius - 1.0).abs() < 1e-12);
         assert!((sweep - std::f64::consts::PI).abs() < 1e-12);
-        let Some(Seg2::Arc { sweep, .. }) = segment(&Curve2::Arc {
+        let Ok(Seg2::Arc { sweep, .. }) = segment(&Curve2::Arc {
             start: a,
             mid: Point2::new(0.0, -1.0),
             end: b,
@@ -241,5 +270,29 @@ mod tests {
         };
         assert!((sweep + std::f64::consts::PI).abs() < 1e-12);
         assert!(circle_through(a, Point2::new(2.0, 0.0), Point2::new(3.0, 0.0)).is_none());
+        assert!(matches!(
+            segment(&Curve2::Arc {
+                start: a,
+                mid: Point2::new(2.0, 0.0),
+                end: Point2::new(3.0, 0.0),
+            }),
+            Err(Unbuilt::NoCircle)
+        ));
+    }
+
+    #[test]
+    fn a_curve_other_than_a_circle_reaching_the_fallback_is_not_built() {
+        let line = Curve2::Line {
+            start: Point2::new(0.0, 0.0),
+            end: Point2::new(1.0, 0.0),
+        };
+        assert!(matches!(whole_circle(&line), Err(Unbuilt::Kind)));
+        assert!(!on_circle(&line, Point2::new(0.5, 0.0)));
+        let circle = Curve2::Circle {
+            center: Point2::new(0.0, 0.0),
+            radius: 2.0,
+        };
+        assert!(whole_circle(&circle).is_ok());
+        assert!(on_circle(&circle, Point2::new(0.0, 2.0)));
     }
 }
