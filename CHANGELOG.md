@@ -5,6 +5,18 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
+### Convert Entities projects part geometry onto the sketch (unreleased, November 2026)
+
+- **Convert Entities copies part edges and vertices from anywhere on the part**, projected
+  onto the sketch plane along its normal, as SolidWorks does: the edges of a boss on the far
+  side of the part, the outline of a face above the sketch (Ctrl+click), or the corner of a
+  slanted face as a point. Lines, and circles and arcs facing the sketch, are copied; an edge
+  seen twice from the sketch (the top and bottom of a wall) is offered once. A vertex is
+  offered where no edge is under the cursor, so clicking near the end of an edge still copies
+  the edge. A circle tilted to the sketch would become an ellipse, which sketches do not have
+  yet, so only its vertex is offered. The copies are fixed where they are and do not follow
+  later changes to the part. Snapping while drawing still uses only the edges in the plane.
+
 ### Rotate in Move Component (unreleased, November 2026)
 
 - **Move Component turns parts about one axis, by dragging or by typed angles**, as

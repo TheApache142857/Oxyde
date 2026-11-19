@@ -258,6 +258,14 @@ pub struct DimensionOption {
     pub angle: bool,
 }
 
+/// What Convert Entities would copy: a part edge, by index in `ModelGeometry::curves`, or a
+/// part vertex, by index in `ModelGeometry::vertices`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelPick {
+    Curve(usize),
+    Vertex(usize),
+}
+
 pub struct SketchSession {
     pub feature: FeatureId,
     pub name: String,
@@ -286,8 +294,8 @@ pub struct SketchSession {
     pub driven: HashSet<RelationId>,
     pending: Vec<Pending>,
     hover: Option<EntityId>,
-    /// Part edge under the cursor (Convert Entities), by index in `model.curves`.
-    model_hover: Option<usize>,
+    /// Part edge or vertex under the cursor (Convert Entities).
+    model_hover: Option<ModelPick>,
     drag: Option<Drag>,
     labels: Vec<(Rect, RelationId)>,
     history: Vec<ConstrainedSketch>,
@@ -1749,23 +1757,34 @@ impl SketchSession {
         }
     }
 
-    /// The part edge under a screen position.
-    fn model_hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<usize> {
-        self.model
-            .curves
-            .iter()
-            .enumerate()
-            .map(|(i, curve)| {
-                let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
-                let d = path
-                    .windows(2)
-                    .map(|w| segment_distance(pos, w[0], w[1]))
-                    .fold(f32::INFINITY, f32::min);
-                (i, d)
-            })
-            .filter(|(_, d)| *d < PICK)
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(i, _)| i)
+    /// The part edge under a screen position, else the part vertex: a vertex is picked only
+    /// away from every edge, so clicking near the end of an edge still converts the edge.
+    fn model_hit(&self, pos: Pos2, to_screen: &dyn Fn(Point2) -> Pos2) -> Option<ModelPick> {
+        let nearest = |distances: &mut dyn Iterator<Item = (usize, f32)>| {
+            distances
+                .filter(|(_, d)| *d < PICK)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        };
+        let curve = nearest(&mut self.model.curves.iter().enumerate().map(|(i, curve)| {
+            let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
+            let d = path
+                .windows(2)
+                .map(|w| segment_distance(pos, w[0], w[1]))
+                .fold(f32::INFINITY, f32::min);
+            (i, d)
+        }));
+        curve.map(ModelPick::Curve).or_else(|| {
+            nearest(
+                &mut self
+                    .model
+                    .vertices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, (to_screen(*p) - pos).length())),
+            )
+            .map(ModelPick::Vertex)
+        })
     }
 
     /// A point fixed at `at`: an existing one there, or a new one.
@@ -1805,6 +1824,21 @@ impl SketchSession {
             self.refuse_change();
             self.message =
                 Some("Those edges cannot be added with the existing relations".to_owned());
+        }
+    }
+
+    /// Convert Entities on a part vertex: a point fixed where the vertex projects onto the
+    /// sketch plane (an existing point there is fixed instead of adding another).
+    fn convert_vertex(&mut self, index: usize) {
+        let Some(at) = self.model.vertices.get(index).copied() else {
+            return;
+        };
+        self.checkpoint();
+        self.fixed_point_at(at);
+        if !self.solve() {
+            self.refuse_change();
+            self.message =
+                Some("That vertex cannot be added with the existing relations".to_owned());
         }
     }
 
@@ -1919,9 +1953,19 @@ impl SketchSession {
                 painter.line_segment([c - Vec2::new(0.0, 5.0), c + Vec2::new(0.0, 5.0)], stroke);
             }
         }
-        if let Some(curve) = self.model_hover.and_then(|i| self.model.curves.get(i)) {
-            let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
-            painter.add(Shape::line(path, Stroke::new(3.0_f32, ink_hovered())));
+        match self.model_hover {
+            Some(ModelPick::Curve(i)) => {
+                if let Some(curve) = self.model.curves.get(i) {
+                    let path: Vec<Pos2> = model_path(curve).into_iter().map(to_screen).collect();
+                    painter.add(Shape::line(path, Stroke::new(3.0_f32, ink_hovered())));
+                }
+            }
+            Some(ModelPick::Vertex(i)) => {
+                if let Some(p) = self.model.vertices.get(i) {
+                    painter.circle_filled(to_screen(*p), 4.0, ink_hovered());
+                }
+            }
+            None => {}
         }
 
         // Sketch origin: a point that can be picked, with its axes.
@@ -3069,13 +3113,12 @@ pub fn interact(
                     }
                 }
                 Tool::Convert => {
-                    if let Some(index) = session.model_hover {
+                    match session.model_hover {
                         // Ctrl+click: the whole outline the edge is part of.
-                        if additive {
-                            session.convert_chain(index);
-                        } else {
-                            session.convert(index);
-                        }
+                        Some(ModelPick::Curve(index)) if additive => session.convert_chain(index),
+                        Some(ModelPick::Curve(index)) => session.convert(index),
+                        Some(ModelPick::Vertex(index)) => session.convert_vertex(index),
+                        None => {}
                     }
                 }
                 Tool::Mirror => {
@@ -3484,6 +3527,7 @@ mod tests {
                 ModelCurve::Circle(Point2::new(20.0, 10.0), 4.0),
                 ModelCurve::Line(Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)),
             ],
+            vertices: Vec::new(),
         };
         // A circle centred on the hole: its centre is fixed there.
         session.set_tool(Tool::Circle);
@@ -3535,6 +3579,7 @@ mod tests {
         outline.model = ModelGeometry {
             points: Vec::new(),
             curves,
+            vertices: Vec::new(),
         };
         outline.convert_chain(1);
         let lines = outline
@@ -3548,6 +3593,51 @@ mod tests {
         assert_eq!(profile.regions.len(), 1, "a closed outline");
         assert!(outline.undo(), "one step");
         assert!(outline.sketch.profile_segments().is_empty());
+    }
+
+    #[test]
+    fn part_vertices_are_converted_to_fixed_points_away_from_edges() {
+        use super::ModelPick;
+        use crate::model_refs::{ModelCurve, ModelGeometry};
+        let mut session = session(ConstrainedSketch::new());
+        session.model = ModelGeometry {
+            points: Vec::new(),
+            curves: vec![ModelCurve::Line(
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+            )],
+            vertices: vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(10.0, 0.0),
+                Point2::new(5.0, 5.0),
+            ],
+        };
+        let to_screen = |p: Point2| Pos2::new(p.x as f32 * 10.0, p.y as f32 * 10.0);
+        // At the end of the edge the edge is picked, as before vertices could be.
+        assert_eq!(
+            session.model_hit(Pos2::new(1.0, 1.0), &to_screen),
+            Some(ModelPick::Curve(0))
+        );
+        // Away from every edge, the vertex.
+        assert_eq!(
+            session.model_hit(Pos2::new(51.0, 49.0), &to_screen),
+            Some(ModelPick::Vertex(2))
+        );
+        assert_eq!(session.model_hit(Pos2::new(200.0, 200.0), &to_screen), None);
+
+        session.convert_vertex(2);
+        let point = session
+            .sketch
+            .entities()
+            .iter()
+            .find(|e| matches!(e.geometry, Geometry::Point(p) if p.distance(Point2::new(5.0, 5.0)) < 1e-9))
+            .map(|e| e.id)
+            .expect("a point where the vertex projects");
+        assert!(session.sketch.is_fixed(point));
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged);
+        assert!(session.undo(), "one step");
+        assert!(session.sketch.position(point).is_none());
     }
 
     #[test]
