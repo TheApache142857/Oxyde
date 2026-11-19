@@ -77,6 +77,7 @@ mod sketch_mode;
 mod splash;
 mod theme;
 mod timeline;
+mod view_cube;
 mod viewport;
 
 use std::path::PathBuf;

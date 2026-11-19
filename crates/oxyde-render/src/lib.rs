@@ -52,10 +52,12 @@ mod style;
 mod vec3;
 
 pub use camera::{Camera, StandardView};
-pub use headless::{NORMAL_MESH_FRACTION, mesh_deflection, snapshot};
+pub use headless::{
+    NORMAL_MESH_FRACTION, mesh_deflection, snapshot, snapshot_from, snapshot_highlighted,
+};
 pub use material::{Material, Texture, TextureRef};
 pub use raster::{
-    AO_RADIUS, AO_REACH, Floor, Frame, GpuMesh, Highlight, Pick, Scene, picks_in_rect, render,
-    render_styled,
+    AO_RADIUS, AO_REACH, Floor, Frame, GpuMesh, Ground, Highlight, Pick, Scene, picks_in_rect,
+    render, render_styled,
 };
 pub use style::{DisplayStyle, EdgePass, HIDDEN_DASH, Rgb, Style};

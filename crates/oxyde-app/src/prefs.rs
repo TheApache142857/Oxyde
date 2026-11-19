@@ -121,6 +121,11 @@ pub struct Graphics {
     /// How strong it is, 0..1.
     #[serde(alias = "subsurface_strength")]
     pub ambient_occlusion_strength: f32,
+    /// The modern look (Preferences › Graphics, and on with the Studio theme): soft studio
+    /// lighting, and selected faces tinted rather than repainted, with an outline round them.
+    pub modern_look: bool,
+    /// The timeline strip along the bottom of the window (on with the Studio theme).
+    pub timeline_strip: bool,
 }
 
 impl Default for Graphics {
@@ -146,6 +151,8 @@ impl Default for Graphics {
             reflection_strength: 0.35,
             ambient_occlusion: true,
             ambient_occlusion_strength: 0.6,
+            modern_look: false,
+            timeline_strip: false,
         };
         g.set_style(&g.ui_theme.viewport());
         g
@@ -173,6 +180,31 @@ impl Graphics {
             },
             ambient_occlusion: if self.ambient_occlusion {
                 self.ambient_occlusion_strength.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            selection_tint: if self.modern_look {
+                Style::STUDIO.selection_tint
+            } else {
+                0.0
+            },
+            selection_outline: if self.modern_look {
+                Style::STUDIO.selection_outline
+            } else {
+                0.0
+            },
+            soft_light: if self.modern_look {
+                Style::STUDIO.soft_light
+            } else {
+                0.0
+            },
+            ground_grid: if self.modern_look {
+                Style::STUDIO.ground_grid
+            } else {
+                0.0
+            },
+            contact_shadow: if self.modern_look {
+                Style::STUDIO.contact_shadow
             } else {
                 0.0
             },
@@ -829,6 +861,22 @@ impl Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_modern_look_is_off_by_default_and_takes_the_studio_settings() {
+        let mut graphics = Graphics::default();
+        assert!(!graphics.modern_look);
+        let classic = graphics.style();
+        assert_eq!(classic.selection_tint, 0.0);
+        assert_eq!(classic.selection_outline, 0.0);
+        graphics.modern_look = true;
+        let modern = graphics.style();
+        assert_eq!(modern.selection_tint, Style::STUDIO.selection_tint);
+        assert_eq!(modern.selection_outline, Style::STUDIO.selection_outline);
+        // Preferences saved before the switch existed read as off.
+        let old = Preferences::from_json(br#"{"graphics": {"show_triad": true}}"#).unwrap();
+        assert!(!old.graphics.modern_look);
+    }
 
     #[test]
     fn the_display_style_is_saved_and_read_back() {

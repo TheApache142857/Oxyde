@@ -15,6 +15,37 @@ release yet; the git history has every detail.
 - **Part files record the kernel that built them** (`manifest.json`'s `kernel`, FORMAT.md §2):
   opening a part built by another kernel says so in the status line, since faces and edges may
   be cut and named differently. Older files read as built by OpenCASCADE.
+### Studio theme and a modern look (unreleased, November 2026)
+
+- **Studio theme** (Preferences › Graphics › Interface): a quiet light look with white and
+  very light grey panels, hairline dividers and a clear blue accent, over a soft grey-to-white
+  viewport with thinner, softer edges. Flux stays the default; choosing another theme brings
+  its own look back. `oxyde-cli snapshot --style studio` draws a picture in the Studio colours.
+- **Modern look** (Preferences › Graphics, on with the Studio theme): a selected or hovered
+  face keeps its own colour under a tint of the selection colour, and the selected faces get a
+  2 px outline round them, in the GPU viewport and the software renderer alike.
+  `oxyde-cli snapshot --select-face N` draws face N selected.
+- **Soft studio lighting** with the modern look: a sky-to-ground ambient (faces turned up get
+  more light), the key light, a fill light from the other side, and a soft highlight, on a
+  slightly lighter part, so curved faces read as round. The GPU viewport and the software
+  renderer compute the same. `oxyde-cli snapshot --pitch 15` looks from lower down.
+- **View cube** with the modern look: a small cube in the viewport's top-right corner turns
+  with the model; clicking a face (FRONT, TOP, RIGHT, ...) turns the view to it, and the home
+  button beside it goes back to the isometric view.
+- **Ground grid and contact shadow** with the modern look, seen from above: a grid on the floor
+  under the part (its spacing 1, 2 or 5 times a power of ten, fading away from the part) and a
+  soft shadow round the part's footprint, in the GPU viewport and the software renderer alike.
+- **Studio's page layout**: one type scale (12 / 13 / 15 points), a little more padding and
+  taller rows, and panel sections headed by their title over a hairline divider.
+- **Studio's feature tree**: an eye on every item that can be hidden, a small red or amber dot
+  for an error or a warning instead of the coloured name and icon, hairline separators between
+  rows and guides along the indents.
+- **Studio's command bar**: on the Features and Evaluate tabs the commands sit in named
+  clusters (Create, Modify, Pattern, Look, Construct, Import, Equations; Inspect, Rebuild) on
+  rounded panels, in place of separators.
+- **Timeline strip** (Preferences › Graphics, on with Studio): the part's features as a row of
+  icons along the bottom of the window, in order, with the rollback marker among them. A click
+  selects a feature, a double click edits it, and its menu rolls back to before it.
 
 ### Convert Entities projects part geometry onto the sketch (unreleased, November 2026)
 

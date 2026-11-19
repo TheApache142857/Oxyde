@@ -109,6 +109,25 @@ pub struct Style {
     /// than with the plain shading. Screen-space, from the depth buffer. Only in the
     /// shaded styles ([`Style::occlusion`]).
     pub ambient_occlusion: f32,
+    /// How a hovered or selected face shows it in the shaded styles: 0 paints it in the
+    /// highlight colour; above 0 the highlight colour is laid over the face's own colour
+    /// by that fraction (up to 1), so its shading and colour still read through.
+    pub selection_tint: f32,
+    /// Width in pixels of an outline drawn round the selected faces, just outside them,
+    /// in the selected-edge colour, in the shaded styles; 0 for none.
+    pub selection_outline: f32,
+    /// Soft studio lighting, 0 (the classic headlight and key light) to 1: a sky-to-ground
+    /// ambient (faces turned up get more), the key light, and a faint specular highlight,
+    /// so curved faces read as round. Both renderers compute the same.
+    pub soft_light: f32,
+    /// A grid on the floor under the part, 0 (none) to 1, fading away from it ([`Ground`]).
+    /// Only in the shaded styles, seen from above the floor.
+    ///
+    /// [`Ground`]: crate::Ground
+    pub ground_grid: f32,
+    /// A soft shadow on the floor round the part's footprint, 0 (none) to 1. Only in the
+    /// shaded styles, seen from above the floor.
+    pub contact_shadow: f32,
 }
 
 /// Brightness of an sRGB colour, 0..1, near enough to tell lines from a background.
@@ -141,6 +160,11 @@ impl Style {
         highlight_width: 3.0,
         floor_reflection: 0.0,
         ambient_occlusion: 0.0,
+        selection_tint: 0.0,
+        selection_outline: 0.0,
+        soft_light: 0.0,
+        ground_grid: 0.0,
+        contact_shadow: 0.0,
     };
 
     /// Dark background, light part.
@@ -164,11 +188,33 @@ impl Style {
         ..Style::LIGHT
     };
 
+    /// A soft studio look: a neutral grey fading to white behind a mid-grey part, with
+    /// thin, softer edges, so the part reads by its shading more than by its outlines.
+    pub const STUDIO: Style = Style {
+        background_top: [214, 219, 225],
+        background_bottom: [251, 251, 252],
+        face: [198, 203, 210],
+        face_selected: [96, 160, 255],
+        face_hovered: [255, 190, 110],
+        edge: [62, 67, 75],
+        edge_selected: [0, 110, 255],
+        edge_hovered: [255, 140, 0],
+        edge_width: 1.0,
+        highlight_width: 2.5,
+        selection_tint: 0.55,
+        selection_outline: 2.0,
+        soft_light: 1.0,
+        ground_grid: 1.0,
+        contact_shadow: 1.0,
+        ..Style::LIGHT
+    };
+
     /// The named presets, for a settings page.
-    pub const PRESETS: [(&'static str, Style); 3] = [
+    pub const PRESETS: [(&'static str, Style); 4] = [
         ("Light", Style::LIGHT),
         ("Dark", Style::DARK),
         ("White", Style::WHITE),
+        ("Studio", Style::STUDIO),
     ];
 
     /// The background half way down.
@@ -250,6 +296,23 @@ mod tests {
         );
         assert!(DisplayStyle::Shaded.shades_faces() && !DisplayStyle::Shaded.draws_all_edges());
         assert!(!DisplayStyle::Wireframe.shades_faces());
+    }
+
+    #[test]
+    fn the_studio_preset_has_thin_soft_edges_on_a_light_background() {
+        let studio = Style::STUDIO;
+        assert!(studio.edge_width < Style::LIGHT.edge_width);
+        assert!(studio.highlight_width < Style::LIGHT.highlight_width);
+        assert!(studio.highlight_width > studio.edge_width);
+        // A light background, and edges lighter than Light's yet still standing out.
+        assert!(luminance(studio.background_middle()) > 0.8);
+        assert!(luminance(studio.edge) > luminance(Style::LIGHT.edge));
+        assert!(luminance(studio.background_middle()) - luminance(studio.edge) > LINE_CONTRAST);
+        assert!(
+            Style::PRESETS
+                .iter()
+                .any(|(name, s)| *name == "Studio" && *s == studio)
+        );
     }
 
     #[test]

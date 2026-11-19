@@ -136,7 +136,31 @@ pub(crate) struct RowResponse {
     pub(crate) eye_clicked: bool,
 }
 
+/// How the tree marks its rows: the classic way, or Studio's (an eye always shown on what
+/// can be hidden, a status dot in place of the error and warning icons, hairline
+/// separators between rows and guides along the indents).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowMarks {
+    pub(crate) eye_always: bool,
+    pub(crate) status_dot: bool,
+    pub(crate) separators: bool,
+    pub(crate) indent_guides: bool,
+}
+
+impl RowMarks {
+    pub(crate) fn of(theme: crate::theme::UiTheme) -> RowMarks {
+        let studio = theme == crate::theme::UiTheme::Studio;
+        RowMarks {
+            eye_always: studio,
+            status_dot: studio,
+            separators: studio,
+            indent_guides: studio,
+        }
+    }
+}
+
 pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
+    let marks = RowMarks::of(crate::theme::current());
     let height = 22.0;
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
@@ -162,6 +186,14 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
             painter.rect_filled(rect, 3.0, visuals.selection.bg_fill.gamma_multiply(0.45));
         } else if response.hovered() || row.hovered {
             painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+        }
+        let hairline = Stroke::new(1.0_f32, crate::theme::tokens().line.gamma_multiply(0.6));
+        if marks.separators {
+            painter.hline(rect.x_range(), rect.bottom() - 0.5, hairline);
+        }
+        if marks.indent_guides && row.indent > 0.0 {
+            let x = rect.left() + row.indent - 6.0;
+            painter.vline(x, rect.y_range(), hairline);
         }
         if let Some(expanded) = row.expander {
             let c = expander_rect.center();
@@ -201,11 +233,14 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
         );
         painter.galley(text_pos, galley, visuals.text_color());
         if let Some(shown) = row.eye {
-            // A closed eye stays visible; the open one appears on hover.
+            // A closed eye stays visible; the open one appears on hover (always, dimmed,
+            // in Studio).
             if !shown {
                 icons::paint(painter, eye_rect, Icon::EyeClosed, true);
             } else if response.hovered() {
                 icons::paint(painter, eye_rect, Icon::Eye, true);
+            } else if marks.eye_always {
+                icons::paint(painter, eye_rect, Icon::Eye, false);
             }
         }
         if let Some(badge) = row.badge {
@@ -213,7 +248,17 @@ pub(crate) fn tree_row(ui: &mut egui::Ui, row: Row) -> RowResponse {
                 egui::pos2(rect.right() - 11.0, rect.center().y),
                 egui::Vec2::splat(15.0),
             );
-            icons::paint(painter, badge_rect, badge, true);
+            let dot = match badge {
+                Icon::Error if marks.status_dot => Some(crate::theme::tokens().err),
+                Icon::Warning if marks.status_dot => Some(crate::theme::tokens().warn),
+                _ => None,
+            };
+            match dot {
+                Some(color) => {
+                    painter.circle_filled(badge_rect.center(), 4.0, color);
+                }
+                None => icons::paint(painter, badge_rect, badge, true),
+            }
         }
     }
     RowResponse {
@@ -746,7 +791,11 @@ impl OxydeApp {
         if let Some(external) = external {
             label.push_str(if external.in_context { " ->" } else { " ->?" });
         }
+        // Studio says it with the status dot alone; the classic tree colours the name too.
+        let dot = RowMarks::of(crate::theme::current()).status_dot;
         let (mut text, badge) = match &entry.status {
+            FeatureStatus::Error(_) if dot => (RichText::new(label), Some(Icon::Error)),
+            FeatureStatus::Warning(_) if dot => (RichText::new(label), Some(Icon::Warning)),
             FeatureStatus::Error(_) => (RichText::new(label).color(error()), Some(Icon::Error)),
             FeatureStatus::Warning(_) => {
                 (RichText::new(label).color(warning()), Some(Icon::Warning))
@@ -1119,6 +1168,138 @@ impl OxydeApp {
     }
 }
 
+/// One place along the timeline strip: a feature, by its index in the part, or the rollback
+/// marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StripSlot {
+    Feature(usize),
+    Marker,
+}
+
+/// The strip's places in order: the `count` features, the rollback marker before the first
+/// rolled-back one (`rollback`), or after the last when nothing is rolled back.
+pub(crate) fn strip_slots(count: usize, rollback: Option<usize>) -> Vec<StripSlot> {
+    let marker_at = rollback.unwrap_or(count).min(count);
+    let mut slots = Vec::with_capacity(count + 1);
+    for i in 0..count {
+        if i == marker_at {
+            slots.push(StripSlot::Marker);
+        }
+        slots.push(StripSlot::Feature(i));
+    }
+    if marker_at == count {
+        slots.push(StripSlot::Marker);
+    }
+    slots
+}
+
+impl OxydeApp {
+    /// The timeline strip (Preferences › Graphics, on with Studio): the features as a row of
+    /// icons along the bottom of the window, in order, with the rollback marker among them,
+    /// as Fusion shows the history. A click selects a feature, a double click edits it, and
+    /// its menu rolls back to before it. The tree on the left stays as it is.
+    pub(crate) fn timeline_strip(&mut self, ui: &mut egui::Ui) {
+        let entries = self.doc.part.timeline();
+        let icons_of: Vec<Icon> = self
+            .doc
+            .part
+            .features()
+            .iter()
+            .map(|f| feature_icon(f.kind()))
+            .collect();
+        let rollback_at = self.doc.part.rollback_position();
+        let mut select = None;
+        let mut edit = None;
+        let mut roll_to = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("timeline_strip")
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    for slot in strip_slots(entries.len(), rollback_at) {
+                        let index = match slot {
+                            StripSlot::Marker => {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 28.0), Sense::hover());
+                                let x = rect.center().x;
+                                ui.painter().vline(
+                                    x,
+                                    rect.y_range(),
+                                    Stroke::new(2.0_f32, rollback()),
+                                );
+                                ui.painter().circle_filled(
+                                    egui::pos2(x, rect.top() + 4.0),
+                                    3.5,
+                                    rollback(),
+                                );
+                                continue;
+                            }
+                            StripSlot::Feature(index) => index,
+                        };
+                        let (Some(entry), Some(&icon)) = (entries.get(index), icons_of.get(index))
+                        else {
+                            continue;
+                        };
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
+                        let active = !matches!(
+                            entry.status,
+                            FeatureStatus::RolledBack | FeatureStatus::Suppressed
+                        );
+                        let painter = ui.painter();
+                        if self.selected_feature == Some(entry.id) {
+                            painter.rect_filled(
+                                rect,
+                                4.0,
+                                ui.visuals().selection.bg_fill.gamma_multiply(0.6),
+                            );
+                        } else if response.hovered() {
+                            painter.rect_filled(
+                                rect,
+                                4.0,
+                                ui.visuals().widgets.hovered.weak_bg_fill,
+                            );
+                        }
+                        icons::paint(painter, rect.shrink(4.0), icon, active);
+                        let dot = match entry.status {
+                            FeatureStatus::Error(_) => Some(crate::theme::tokens().err),
+                            FeatureStatus::Warning(_) => Some(crate::theme::tokens().warn),
+                            _ => None,
+                        };
+                        if let Some(color) = dot {
+                            painter.circle_filled(
+                                rect.right_top() + egui::vec2(-4.0, 4.0),
+                                3.0,
+                                color,
+                            );
+                        }
+                        let response = response.on_hover_text(entry.name.as_str());
+                        if response.double_clicked() {
+                            edit = Some(entry.id);
+                        } else if response.clicked() {
+                            select = Some(entry.id);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Roll back to before this").clicked() {
+                                roll_to = Some(index);
+                                ui.close_menu();
+                            }
+                        });
+                    }
+                });
+            });
+        if let Some(id) = select {
+            self.selected_feature = Some(id);
+        }
+        if let Some(id) = edit {
+            self.edit_feature(id);
+        }
+        if let Some(index) = roll_to {
+            self.apply_action(Action::RollTo(index), &[]);
+        }
+    }
+}
+
 /// The rollback bar: a line with a round handle, dragged vertically between features.
 fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
     let width = ui.available_width();
@@ -1133,4 +1314,53 @@ fn rollback_bar(ui: &mut egui::Ui) -> egui::Response {
         CursorIcon::ResizeVertical
     };
     response.on_hover_cursor(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_strip_puts_the_rollback_marker_among_the_features() {
+        use StripSlot::{Feature, Marker};
+        assert_eq!(
+            strip_slots(3, None),
+            vec![Feature(0), Feature(1), Feature(2), Marker]
+        );
+        assert_eq!(
+            strip_slots(3, Some(1)),
+            vec![Feature(0), Marker, Feature(1), Feature(2)]
+        );
+        assert_eq!(
+            strip_slots(3, Some(0)),
+            vec![Marker, Feature(0), Feature(1), Feature(2)]
+        );
+        assert_eq!(
+            strip_slots(2, Some(9)),
+            vec![Feature(0), Feature(1), Marker]
+        );
+        assert_eq!(strip_slots(0, None), vec![Marker]);
+    }
+
+    #[test]
+    fn studio_marks_rows_with_eyes_dots_and_hairlines() {
+        use crate::theme::UiTheme;
+        let studio = RowMarks::of(UiTheme::Studio);
+        assert!(studio.eye_always && studio.status_dot);
+        assert!(studio.separators && studio.indent_guides);
+        for (theme, _) in UiTheme::ALL {
+            if theme != UiTheme::Studio {
+                assert_eq!(
+                    RowMarks::of(theme),
+                    RowMarks {
+                        eye_always: false,
+                        status_dot: false,
+                        separators: false,
+                        indent_guides: false,
+                    },
+                    "{theme:?} keeps the classic tree"
+                );
+            }
+        }
+    }
 }

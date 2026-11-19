@@ -30,7 +30,7 @@ use oxyde_format::{drawing, gltf, obj, threemf};
 use oxyde_kernel::{Kernel, Mesh, StepMaterial};
 use oxyde_model::{FeatureStatus, Finish, ModelError, Part};
 use oxyde_occt::{OcctError, OcctKernel};
-use oxyde_render::{NORMAL_MESH_FRACTION, StandardView, Style};
+use oxyde_render::{Highlight, NORMAL_MESH_FRACTION, Pick, StandardView, Style};
 use serde::{Deserialize, Serialize};
 
 /// Everything is fine.
@@ -802,8 +802,45 @@ pub fn snapshot_rebuilt(
     width: usize,
     height: usize,
 ) -> Result<()> {
+    snapshot_rebuilt_styled(
+        rebuilt,
+        out,
+        view,
+        width,
+        height,
+        &Style::default(),
+        &Highlight::default(),
+    )
+}
+
+/// As [`snapshot_rebuilt`], in the colours and display style of `style`, with the faces and
+/// edges of `highlight` drawn hovered or selected.
+pub fn snapshot_rebuilt_styled(
+    rebuilt: &Rebuilt,
+    out: &Path,
+    view: StandardView,
+    width: usize,
+    height: usize,
+    style: &Style,
+    highlight: &Highlight,
+) -> Result<()> {
+    let mut camera = oxyde_render::Camera::default();
+    camera.set_view(view);
+    snapshot_rebuilt_from(rebuilt, out, camera, width, height, style, highlight)
+}
+
+/// As [`snapshot_rebuilt_styled`], seen the way `camera` looks.
+pub fn snapshot_rebuilt_from(
+    rebuilt: &Rebuilt,
+    out: &Path,
+    camera: oxyde_render::Camera,
+    width: usize,
+    height: usize,
+    style: &Style,
+    highlight: &Highlight,
+) -> Result<()> {
     let mesh = rebuilt.display_mesh()?;
-    let frame = oxyde_render::snapshot(&mesh, view, width, height, &Style::default());
+    let frame = oxyde_render::snapshot_from(&mesh, camera, width, height, style, highlight);
     let file = std::fs::File::create(out).map_err(|e| Error(format!("{}: {e}", out.display())))?;
     let mut encoder = png::Encoder::new(io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
@@ -1006,6 +1043,16 @@ enum Command {
         width: usize,
         #[arg(long, default_value_t = 768)]
         height: usize,
+        /// The viewport colours: one of the renderer's presets.
+        #[arg(long, value_enum, default_value_t = Look::Light)]
+        style: Look,
+        /// Elevation of the view in degrees (from below -90 to above 90), in place of the
+        /// view's own: the isometric view is at 35.
+        #[arg(long, allow_negative_numbers = true)]
+        pitch: Option<f64>,
+        /// A face to draw selected, by its index in the part's topology (repeatable).
+        #[arg(long = "select-face")]
+        select_face: Vec<u32>,
     },
     /// Rebuild a part and write its front, top, right and isometric views on a sheet with
     /// a title block, hidden lines dashed: PDF (.pdf), SVG (.svg) or DXF (.dxf, at the
@@ -1025,6 +1072,26 @@ enum Command {
         #[arg(long)]
         no_hidden: bool,
     },
+}
+
+/// The renderer's viewport presets, as `--style` names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Look {
+    Light,
+    Dark,
+    White,
+    Studio,
+}
+
+impl From<Look> for Style {
+    fn from(look: Look) -> Style {
+        match look {
+            Look::Light => Style::LIGHT,
+            Look::Dark => Style::DARK,
+            Look::White => Style::WHITE,
+            Look::Studio => Style::STUDIO,
+        }
+    }
 }
 
 /// A standard view, as `--view` names it.
@@ -1101,8 +1168,30 @@ fn execute(command: Command, out: &mut dyn Write) -> Result<i32> {
             view,
             width,
             height,
+            style,
+            pitch,
+            select_face,
         } => {
-            let features = snapshot(&part, &file, view.into(), width, height)?;
+            let rebuilt = rebuild(&part)?;
+            let highlight = Highlight {
+                selected: select_face.into_iter().map(Pick::Face).collect(),
+                ..Highlight::default()
+            };
+            let mut camera = oxyde_render::Camera::default();
+            camera.set_view(view.into());
+            if let Some(degrees) = pitch {
+                camera.pitch = degrees.clamp(-90.0, 90.0).to_radians();
+            }
+            snapshot_rebuilt_from(
+                &rebuilt,
+                &file,
+                camera,
+                width,
+                height,
+                &style.into(),
+                &highlight,
+            )?;
+            let features = rebuilt.features();
             let failed = write_failures(out, &features)?;
             writeln!(out, "wrote {} ({width}x{height})", file.display())?;
             Ok(if failed { EXIT_FAILED } else { EXIT_OK })
@@ -1286,6 +1375,24 @@ mod tests {
         assert_eq!(json["features"][0]["type"], "Extrude");
         let back: Evaluation = serde_json::from_value(json).unwrap();
         assert_eq!(back, eval);
+    }
+
+    #[test]
+    fn snapshots_take_the_renderer_presets_by_name() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(["oxyde-cli", "snapshot", "--help"], &mut out, &mut err),
+            0
+        );
+        let help = String::from_utf8(out).unwrap();
+        assert!(help.contains("--style"), "{help}");
+        assert!(help.contains("--select-face"), "{help}");
+        assert!(help.contains("--pitch"), "{help}");
+        for name in ["light", "dark", "white", "studio"] {
+            assert!(help.contains(name), "{name} in {help}");
+        }
+        assert_eq!(Style::from(Look::Studio), Style::STUDIO);
+        assert_eq!(Style::from(Look::Light), Style::default());
     }
 
     #[test]
