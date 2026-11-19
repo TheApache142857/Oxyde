@@ -330,6 +330,123 @@ impl Floor {
     }
 }
 
+/// The floor under the part as the modern look draws it: a grid fading away from the part
+/// and a soft shadow round its footprint, on the floor plane of [`Floor`], seen from above.
+/// Both renderers paint it over the background from [`Ground::cover`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ground {
+    /// Height of the floor (mm).
+    pub y: f64,
+    /// The part's footprint on the floor: lowest x, lowest z, highest x, highest z (mm).
+    pub footprint: [f64; 4],
+    /// Grid spacing (mm): 1, 2 or 5 times a power of ten, about an eighth of the footprint.
+    pub step: f64,
+    /// [`Style::ground_grid`] and [`Style::contact_shadow`].
+    pub grid: f32,
+    pub shadow: f32,
+}
+
+/// How far the grid reaches from the footprint's centre, in footprint sizes.
+const GRID_REACH: f64 = 2.5;
+/// The shadow's softness: its Gaussian width, in footprint sizes.
+const SHADOW_WIDTH: f64 = 0.12;
+/// How dark the grid ink and the shadow get at full strength.
+const GRID_INK: f32 = 0.35;
+const SHADOW_DARK: f64 = 0.45;
+
+impl Ground {
+    /// The ground of a scene with `bounds` seen through `camera` in `style`, or none: no
+    /// grid and no shadow, a line style, or a view from below the floor.
+    pub fn under(bounds: Option<(V3, V3)>, camera: &Camera, style: &Style) -> Option<Ground> {
+        if !style.display.shades_faces()
+            || (style.ground_grid <= 0.0 && style.contact_shadow <= 0.0)
+        {
+            return None;
+        }
+        let (lo, hi) = bounds?;
+        let floor = Floor::under(lo, hi);
+        if !floor.visible(camera) {
+            return None;
+        }
+        let footprint = [lo[0], lo[2], hi[0], hi[2]];
+        let size = (hi[0] - lo[0]).max(hi[2] - lo[2]).max(1e-3);
+        Some(Ground {
+            y: floor.y,
+            footprint,
+            step: nice_step(size / 8.0),
+            grid: style.ground_grid.min(1.0),
+            shadow: style.contact_shadow.min(1.0),
+        })
+    }
+
+    /// The footprint's larger side (mm).
+    pub fn size(&self) -> f64 {
+        let [x0, z0, x1, z1] = self.footprint;
+        (x1 - x0).max(z1 - z0).max(1e-3)
+    }
+
+    /// How much grid ink and shadow lie on the floor point (`x`, `z`) when a pixel covers
+    /// `mm_per_px` millimetres of floor: (ink, shadow), each 0..1.
+    pub fn cover(&self, x: f64, z: f64, mm_per_px: f64) -> (f32, f32) {
+        let [x0, z0, x1, z1] = self.footprint;
+        let size = self.size();
+        let dx = (x0 - x).max(x - x1).max(0.0);
+        let dz = (z0 - z).max(z - z1).max(0.0);
+        let d = (dx * dx + dz * dz).sqrt() / (SHADOW_WIDTH * size);
+        let shadow = f64::from(self.shadow) * SHADOW_DARK * (-d * d).exp();
+        let near = |v: f64| {
+            let r = (v / self.step).rem_euclid(1.0);
+            r.min(1.0 - r) * self.step
+        };
+        let line = (1.0 - near(x).min(near(z)) / mm_per_px.max(1e-9)).clamp(0.0, 1.0);
+        let (cx, cz) = ((x0 + x1) / 2.0, (z0 + z1) / 2.0);
+        let r = ((x - cx).powi(2) + (z - cz).powi(2)).sqrt();
+        let fade = (1.0 - r / (GRID_REACH * size)).clamp(0.0, 1.0);
+        (self.grid * GRID_INK * (line * fade) as f32, shadow as f32)
+    }
+}
+
+/// The spacing nearest above `at_least` among 1, 2 and 5 times a power of ten.
+fn nice_step(at_least: f64) -> f64 {
+    let power = 10f64.powf(at_least.max(1e-6).log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * power)
+        .find(|s| *s >= at_least)
+        .unwrap_or(10.0 * power)
+}
+
+/// Paints the ground over the background, before anything else is drawn.
+fn paint_ground(frame: &mut Frame, ground: &Ground, camera: &Camera, style: &Style) {
+    let (w, h) = (frame.width, frame.height);
+    let s = camera.pixels_per_mm(h as f64);
+    let (right, up, eye) = (camera.right(), camera.up(), camera.eye_direction());
+    let mm_per_px = 1.0 / (s * eye[1]);
+    let ink = rgb(style.edge);
+    for y in 0..h {
+        for x in 0..w {
+            let across = (x as f64 + 0.5 - w as f64 / 2.0) / s;
+            let down = (h as f64 / 2.0 - (y as f64 + 0.5)) / s;
+            let p = add(camera.target, add(scale(right, across), scale(up, down)));
+            let q = add(p, scale(eye, (ground.y - p[1]) / eye[1]));
+            let (grid, shadow) = ground.cover(q[0], q[2], mm_per_px);
+            if grid <= 0.0 && shadow <= 0.0 {
+                continue;
+            }
+            let i = y * w + x;
+            let k = i * 4;
+            let Some(&[r, g, b]) = frame.rgba.get(k..k + 3) else {
+                continue;
+            };
+            let mut c = [f32::from(r), f32::from(g), f32::from(b)];
+            for (v, ink) in c.iter_mut().zip(ink) {
+                *v = (*v + (ink - *v) * grid) * (1.0 - shadow);
+            }
+            frame.put(i, c.map(|v| v.round().clamp(0.0, 255.0) as u8));
+        }
+    }
+}
+
 /// A rendered image with its depth and id buffers.
 pub struct Frame {
     pub width: usize,
@@ -481,9 +598,75 @@ fn face_color(
     highlight: &Highlight,
     style: &Style,
 ) -> ([f32; 3], bool) {
+    let own = rgb(material.color.unwrap_or(style.face));
     match face_highlight(face, highlight, style) {
+        Some(color) if style.selection_tint > 0.0 => {
+            let t = style.selection_tint.min(1.0);
+            let mix = |a: f32, b: f32| a + (b - a) * t;
+            (
+                [
+                    mix(own[0], color[0]),
+                    mix(own[1], color[1]),
+                    mix(own[2], color[2]),
+                ],
+                false,
+            )
+        }
         Some(color) => (color, false),
-        None => (rgb(material.color.unwrap_or(style.face)), true),
+        None => (own, true),
+    }
+}
+
+/// Paints an outline `style.selection_outline` pixels wide round the selected faces, just
+/// outside them, in the selected-edge colour. A pixel belongs to a face where that face is
+/// the nearest thing drawn and no edge is drawn over it, as the GPU's id image has it.
+fn outline_selection(frame: &mut Frame, highlight: &Highlight, style: &Style) {
+    let r = style.selection_outline.round() as i64;
+    if r <= 0 || !style.display.shades_faces() {
+        return;
+    }
+    let selected: Vec<u32> = highlight
+        .selected
+        .iter()
+        .filter_map(|p| match p {
+            Pick::Face(i) => Some(i + 1),
+            Pick::Edge(_) => None,
+        })
+        .collect();
+    if selected.is_empty() {
+        return;
+    }
+    let (w, h) = (frame.width as i64, frame.height as i64);
+    let on_selected = |frame: &Frame, x: i64, y: i64| {
+        let i = (y * w + x) as usize;
+        frame.edge_ids.get(i) == Some(&0)
+            && frame
+                .face_ids
+                .get(i)
+                .is_some_and(|id| selected.contains(id))
+    };
+    let mut ring = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if on_selected(frame, x, y) {
+                continue;
+            }
+            let near = (-r..=r).any(|dy| {
+                (-r..=r).any(|dx| {
+                    let (sx, sy) = (x + dx, y + dy);
+                    dx * dx + dy * dy <= r * r
+                        && (0..w).contains(&sx)
+                        && (0..h).contains(&sy)
+                        && on_selected(frame, sx, sy)
+                })
+            });
+            if near {
+                ring.push((y * w + x) as usize);
+            }
+        }
+    }
+    for i in ring {
+        frame.put(i, style.edge_selected);
     }
 }
 
@@ -507,6 +690,8 @@ struct Lights {
     eye: V3,
     /// Towards the key light.
     key: V3,
+    /// How much of the soft studio lighting, 0..1 ([`Style::soft_light`]).
+    soft: f32,
 }
 
 /// Brightness factor for a surface with unit normal `n`: ambient, plus a headlight so no
@@ -522,7 +707,44 @@ fn shade(n: V3, lights: &Lights) -> f32 {
     };
     let facing = dot(n, lights.eye);
     let key = dot(n, lights.key).max(0.0);
-    (0.38 + 0.37 * facing + 0.40 * key) as f32
+    let classic = (0.38 + 0.37 * facing + 0.40 * key) as f32;
+    if lights.soft <= 0.0 {
+        return classic;
+    }
+    // Sky-to-ground ambient: a face turned up (+Y, the world's up) gets more of it; and a
+    // fill light from the other side of the viewer than the key, so the shadowed side
+    // of a round face does not go flat.
+    let sky = (0.5 + 0.5 * n[1]) as f32;
+    let fill = fill_light(lights).map_or(0.0, |f| dot(n, f).max(0.0));
+    let soft = 0.20 + 0.26 * sky + (0.20 * facing + 0.40 * key + 0.16 * fill) as f32;
+    classic + (soft - classic) * lights.soft.min(1.0)
+}
+
+/// The specular highlight of the soft lighting, 0..1 of white, added over the shaded
+/// colour: Blinn's half-way vector between the key light and the viewer.
+fn specular(n: V3, lights: &Lights) -> f32 {
+    if lights.soft <= 0.0 {
+        return 0.0;
+    }
+    let n = if dot(n, lights.eye) < 0.0 {
+        scale(n, -1.0)
+    } else {
+        n
+    };
+    let half = add(lights.key, lights.eye);
+    let len = length(half);
+    if len <= 0.0 {
+        return 0.0;
+    }
+    let along = (dot(n, half) / len).max(0.0) as f32;
+    along.powf(20.0) * 0.32 * lights.soft.min(1.0)
+}
+
+/// The soft lighting's fill light: the key light mirrored through the viewer.
+fn fill_light(lights: &Lights) -> Option<V3> {
+    let raw = sub(scale(lights.eye, 2.0), lights.key);
+    let len = length(raw);
+    (len > 0.0).then(|| scale(raw, 1.0 / len))
 }
 
 /// How far ambient occlusion looks around a pixel, as a fraction of the image's smaller
@@ -630,11 +852,15 @@ pub fn render_styled(
             frame.put(y * width + x, c);
         }
     }
+    if let Some(ground) = Ground::under(scene.bounds(), camera, style) {
+        paint_ground(&mut frame, &ground, camera, style);
+    }
 
     let (w, h) = (width as f64, height as f64);
     let lights = Lights {
         eye: camera.eye_direction(),
         key: camera.key_light(),
+        soft: style.soft_light,
     };
     let depth_of = |p: V3| -dot(sub(p, camera.target), camera.eye_direction());
     let draw_face =
@@ -799,6 +1025,7 @@ pub fn render_styled(
     if shaded {
         see_through(&mut frame);
     }
+    outline_selection(&mut frame, highlight, style);
     frame
 }
 
@@ -878,6 +1105,7 @@ fn raster_triangle(
             );
             let n = normalize(n);
             let light = n.map_or(1.0, |n| shade(n, lights));
+            let shine = n.map_or(0.0, |n| specular(n, lights)) * 255.0;
             let q = add(
                 add(scale(world[0], w0), scale(world[1], w1)),
                 scale(world[2], w2),
@@ -890,7 +1118,7 @@ fn raster_triangle(
                 ),
                 None => paint.base,
             };
-            let color = base.map(|c| (c * light).min(255.0));
+            let color = base.map(|c| (c * light + shine).min(255.0));
             if opaque {
                 frame.put(index, color.map(|c| c as u8));
                 continue;
@@ -1067,6 +1295,108 @@ mod tests {
     }
 
     #[test]
+    fn the_ground_lays_a_grid_and_a_shadow_under_the_part() {
+        assert_eq!(nice_step(0.8), 1.0);
+        assert_eq!(nice_step(1.3), 2.0);
+        assert_eq!(nice_step(3.0), 5.0);
+        assert_eq!(nice_step(7.0), 10.0);
+        assert_eq!(nice_step(12.5), 20.0);
+        let camera = Camera::default(); // isometric, from above
+        let bounds = Some(([0.0, 0.0, 0.0], [80.0, 10.0, 40.0]));
+        assert_eq!(Ground::under(bounds, &camera, &Style::LIGHT), None);
+        let ground = Ground::under(bounds, &camera, &Style::STUDIO).expect("Studio has a ground");
+        assert_eq!(ground.step, 10.0);
+        assert!(ground.y < 0.0);
+        // Under the part the shadow is full; far from it, nothing.
+        let (_, under) = ground.cover(40.0, 20.0, 0.5);
+        assert!((under - 0.45).abs() < 1e-6, "{under}");
+        assert_eq!(ground.cover(1000.0, 1000.0, 0.5), (0.0, 0.0));
+        // On a grid line near the part the ink is strong; half way between lines, none.
+        let (on, _) = ground.cover(110.0, -35.0, 0.5);
+        let (between, _) = ground.cover(105.0, -35.0, 0.5);
+        assert!(on > 0.1 && between == 0.0, "{on} {between}");
+        // Seen from below, or in a line style, there is none.
+        let mut below = Camera::default();
+        below.set_view(StandardView::Bottom);
+        assert_eq!(Ground::under(bounds, &below, &Style::STUDIO), None);
+        let lines = Style {
+            display: DisplayStyle::HiddenLinesRemoved,
+            ..Style::STUDIO
+        };
+        assert_eq!(Ground::under(bounds, &camera, &lines), None);
+        // In a picture the floor round the part darkens.
+        let scene = Scene::from_mesh(&mesh());
+        let mut camera = Camera::default();
+        let (lo, hi) = scene.bounds().unwrap();
+        camera.fit(lo, hi, 100.0, 100.0);
+        let bare = Style {
+            ground_grid: 0.0,
+            contact_shadow: 0.0,
+            ..Style::STUDIO
+        };
+        let with = render_styled(
+            &scene,
+            &camera,
+            100,
+            100,
+            &Highlight::default(),
+            &Style::STUDIO,
+        );
+        let without = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &bare);
+        let changed = with
+            .rgba
+            .chunks(4)
+            .zip(without.rgba.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 100, "{changed} pixels changed");
+    }
+
+    #[test]
+    fn a_tinted_selection_keeps_the_face_colour_and_gets_an_outline() {
+        // The front square (face 0), seen from the front, selected.
+        let scene = Scene::from_mesh(&mesh());
+        let camera = front_camera();
+        let selected = Highlight {
+            selected: vec![Pick::Face(0)],
+            ..Highlight::default()
+        };
+        let classic = render_styled(&scene, &camera, 100, 100, &selected, &Style::LIGHT);
+        let studio = Style {
+            face_selected: [0, 0, 255],
+            ..Style::STUDIO
+        };
+        let tinted = render_styled(&scene, &camera, 100, 100, &selected, &studio);
+        let at = |f: &Frame, x: usize, y: usize| {
+            let k = (y * 100 + x) * 4;
+            [f.rgba[k], f.rgba[k + 1], f.rgba[k + 2]]
+        };
+        // The middle of the face: Light paints the selection colour, Studio mixes it in,
+        // so red and green (from the grey face) remain and blue rises.
+        let c = at(&tinted, 50, 50);
+        let face_only = render_styled(&scene, &camera, 100, 100, &Highlight::default(), &studio);
+        let own = at(&face_only, 50, 50);
+        assert!(c[2] > own[2], "{c:?} over {own:?}");
+        assert!(c[0] > 0 && c[0] < own[0], "{c:?} over {own:?}");
+        assert_ne!(at(&classic, 50, 50), c);
+        // An outline in the selected-edge colour just outside the face, none without
+        // a selection, and none in the Light style.
+        let ring = |f: &Frame| {
+            f.rgba
+                .chunks(4)
+                .filter(|p| p[..3] == studio.edge_selected)
+                .count()
+        };
+        assert!(ring(&tinted) > 100, "{} outline pixels", ring(&tinted));
+        assert_eq!(ring(&face_only), 0);
+        let light_ring = classic
+            .rgba
+            .chunks(4)
+            .filter(|p| p[..3] == Style::LIGHT.edge_selected)
+            .count();
+        assert_eq!(light_ring, 0);
+    }
+    #[test]
     fn nearest_face_wins_and_picks_exactly() {
         let scene = Scene::from_mesh(&mesh());
         let frame = render(&scene, &front_camera(), 100, 100, &Highlight::default());
@@ -1111,6 +1441,7 @@ mod tests {
         let lights = Lights {
             eye: camera.eye_direction(),
             key: camera.key_light(),
+            soft: 0.0,
         };
         let x = shade([1.0, 0.0, 0.0], &lights);
         let y = shade([0.0, 1.0, 0.0], &lights);
@@ -1120,6 +1451,39 @@ mod tests {
         assert!(z - x > 0.1 && y - z > 0.1);
         // Flipped normals shade the same.
         assert_eq!(shade([-1.0, 0.0, 0.0], &lights), x);
+        assert_eq!(specular([0.0, 1.0, 0.0], &lights), 0.0);
+    }
+
+    #[test]
+    fn soft_light_keeps_the_shades_apart_and_adds_a_highlight() {
+        let camera = Camera::default(); // isometric
+        let lights = Lights {
+            eye: camera.eye_direction(),
+            key: camera.key_light(),
+            soft: 1.0,
+        };
+        let x = shade([1.0, 0.0, 0.0], &lights);
+        let y = shade([0.0, 1.0, 0.0], &lights);
+        let z = shade([0.0, 0.0, 1.0], &lights);
+        assert!(y > z && z > x, "x {x}, y {y}, z {z}");
+        assert!(z - x > 0.05 && y - z > 0.05);
+        // With the viewer and the key light straight ahead, a face turned up and one
+        // turned down by as much face both alike: classic shading cannot tell them apart,
+        // the sky-to-ground ambient lights the one turned up more.
+        let ahead = |soft: f32| Lights {
+            eye: [0.0, 0.0, 1.0],
+            key: [0.0, 0.0, 1.0],
+            soft,
+        };
+        let (up, down) = ([0.0, 0.6, 0.8], [0.0, -0.6, 0.8]);
+        assert_eq!(shade(up, &ahead(0.0)), shade(down, &ahead(0.0)));
+        assert!(shade(up, &ahead(1.0)) > shade(down, &ahead(1.0)) + 0.05);
+        // The highlight peaks where the normal is half way to the key light.
+        let half = add(lights.key, lights.eye);
+        let half = scale(half, 1.0 / length(half));
+        let peak = specular(half, &lights);
+        assert!((peak - 0.32).abs() < 1e-4, "{peak}");
+        assert!(specular([1.0, 0.0, 0.0], &lights) < peak);
     }
 
     #[test]

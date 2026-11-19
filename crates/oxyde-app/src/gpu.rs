@@ -41,8 +41,8 @@ const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const EDGE_BIT: u32 = 0x8000_0000;
 /// Every colour texture is resampled to this size, so they fit one texture array.
 const TEXTURE_SIZE: u32 = 512;
-/// Bytes of the `View` uniform: 20 vec4s.
-const VIEW_BYTES: u64 = 20 * 16;
+/// Bytes of the `View` uniform: 23 vec4s.
+const VIEW_BYTES: u64 = 23 * 16;
 /// The ambient occlusion image: one occlusion value per pixel.
 const AO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 /// One edge segment in its vertex buffer: start, end, edge index, millimetres along the
@@ -55,7 +55,7 @@ struct View {
     right: vec4<f32>,
     up: vec4<f32>,
     eye: vec4<f32>,
-    // xyz: towards the key light.
+    // xyz: towards the key light; w: soft lighting 0..1.
     key: vec4<f32>,
     // x, y: millimetres to clip space; z: depth scale; w: edge depth bias (mm).
     scale: vec4<f32>,
@@ -76,6 +76,14 @@ struct View {
     lines: vec4<f32>,
     // Hidden edges: x: dash and y: gap length (pixels), z: pixels per millimetre.
     dash: vec4<f32>,
+    // Selection: x: how much a highlight colour is laid over a face's own colour (0: the
+    // face is painted in it), y: outline width round the selected faces (pixels).
+    selection: vec4<f32>,
+    // The ground (modern look): x: shadow, y: grid strength (0: none), z: grid step (mm),
+    // w: floor height (mm).
+    ground: vec4<f32>,
+    // The part's footprint on the floor: lowest x, lowest z, highest x, highest z (mm).
+    footprint: vec4<f32>,
 };
 
 struct FaceMaterial {
@@ -96,6 +104,8 @@ struct FaceMaterial {
 @group(0) @binding(6) var ao_depth: texture_depth_2d;
 // The occlusion per pixel: raw for the blur pass, blurred for the faces.
 @group(0) @binding(7) var ao_image: texture_2d<f32>;
+// The face and edge ids of the image, for the selection outline.
+@group(0) @binding(8) var id_image: texture_2d<u32>;
 
 fn project(p: vec3<f32>, bias: f32) -> vec4<f32> {
     let v = p - view.center.xyz;
@@ -134,8 +144,38 @@ fn background(t: f32) -> vec3<f32> {
     return linear(mix(view.colors[0].xyz, view.colors[1].xyz, clamp(t, 0.0, 1.0)));
 }
 
+// The ground of the modern look, as `Ground::cover` and `paint_ground` in the software
+// renderer: the floor point under this pixel, its grid ink and its shadow.
+fn on_ground(base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    let s = view.viewport.y * view.scale.y * 0.5;
+    let e = view.eye.xyz;
+    let p = view.center.xyz
+        + view.right.xyz * ((pixel.x - view.viewport.x * 0.5) / s)
+        + view.up.xyz * ((view.viewport.y * 0.5 - pixel.y) / s);
+    let q = p + e * ((view.ground.w - p.y) / e.y);
+    let fp = view.footprint;
+    let size = max(max(fp.z - fp.x, fp.w - fp.y), 1e-3);
+    let dx = max(max(fp.x - q.x, q.x - fp.z), 0.0);
+    let dz = max(max(fp.y - q.z, q.z - fp.w), 0.0);
+    let d = sqrt(dx * dx + dz * dz) / (0.12 * size);
+    let shadow = view.ground.x * 0.45 * exp(-d * d);
+    let step = view.ground.z;
+    let rx = fract(q.x / step);
+    let rz = fract(q.z / step);
+    let near = min(min(rx, 1.0 - rx), min(rz, 1.0 - rz)) * step;
+    let line = clamp(1.0 - near * s * e.y, 0.0, 1.0);
+    let r = length(vec2<f32>(q.x, q.z) - vec2<f32>((fp.x + fp.z) * 0.5, (fp.y + fp.w) * 0.5));
+    let fade = clamp(1.0 - r / (2.5 * size), 0.0, 1.0);
+    let ink = view.ground.y * 0.35 * line * fade;
+    return (base + (view.colors[5].xyz - base) * ink) * (1.0 - shadow);
+}
+
 @fragment
 fn background_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
+    if (view.ground.x > 0.0 || view.ground.y > 0.0) {
+        let base = mix(view.colors[0].xyz, view.colors[1].xyz, clamp(in.t, 0.0, 1.0));
+        return vec4<f32>(linear(on_ground(base, in.position.xy)), 1.0);
+    }
     return vec4<f32>(background(in.t), 1.0);
 }
 
@@ -206,6 +246,15 @@ fn face_blend_fs(in: FaceOut) -> @location(0) vec4<f32> {
     return shade_face(in);
 }
 
+// As `face_color` in the software renderer: in the shaded styles a highlight colour may be
+// laid over the face's own colour rather than replace it.
+fn highlighted(own: vec3<f32>, highlight: vec3<f32>) -> vec3<f32> {
+    if (view.selection.x > 0.0 && view.lines.y < 0.5) {
+        return mix(own, highlight, min(view.selection.x, 1.0));
+    }
+    return highlight;
+}
+
 fn shade_face(in: FaceOut) -> vec4<f32> {
     var n = normalize(in.normal);
     // Seen from outside: face the viewer (also tolerates inconsistent winding).
@@ -217,18 +266,37 @@ fn shade_face(in: FaceOut) -> vec4<f32> {
     let facing = dot(n, view.eye.xyz);
     let key = max(dot(n, view.key.xyz), 0.0);
     var light = 0.38 + 0.37 * facing + 0.40 * key;
+    // As `shade` and `specular` there: the soft lighting's sky-to-ground ambient and
+    // highlight.
+    let soft = min(view.key.w, 1.0);
+    var shine = 0.0;
+    if (soft > 0.0) {
+        let sky = 0.5 + 0.5 * n.y;
+        var fill = 0.0;
+        let fill_raw = 2.0 * view.eye.xyz - view.key.xyz;
+        if (length(fill_raw) > 0.0) {
+            fill = max(dot(n, normalize(fill_raw)), 0.0);
+        }
+        light = light + (0.20 + 0.26 * sky + 0.20 * facing + 0.40 * key + 0.16 * fill - light) * soft;
+        let half = view.key.xyz + view.eye.xyz;
+        if (length(half) > 0.0) {
+            shine = pow(max(dot(n, normalize(half)), 0.0), 20.0) * 0.32 * soft * 255.0;
+        }
+    }
     if (view.ao.x > 0.0 && view.floor.w < 0.5) {
         let occlusion = textureLoad(ao_image, vec2<i32>(in.position.xy), 0).x;
-        light = light * (1.0 - 0.75 * view.ao.x * occlusion);
+        let dark = 1.0 - 0.75 * view.ao.x * occlusion;
+        light = light * dark;
+        shine = shine * dark;
     }
     let flags = face_flags[in.face];
     let material = materials[in.face];
     var base = material.color.xyz;
     var alpha = material.color.w;
     if ((flags & 1u) != 0u) {
-        base = view.colors[4].xyz;
+        base = highlighted(base, view.colors[4].xyz);
     } else if ((flags & 2u) != 0u) {
-        base = view.colors[3].xyz;
+        base = highlighted(base, view.colors[3].xyz);
     } else if (material.texture.x >= 0.0) {
         base = triplanar(i32(material.texture.x), material.texture.y, material.texture.z, in.world, n);
     }
@@ -236,7 +304,7 @@ fn shade_face(in: FaceOut) -> vec4<f32> {
         let height = max(view.floor.x - in.world.y, 0.0);
         alpha = alpha * view.floor.y * clamp(1.0 - height / max(view.floor.z, 1e-6), 0.0, 1.0);
     }
-    return vec4<f32>(linear(min(base * light, vec3<f32>(255.0))), alpha);
+    return vec4<f32>(linear(min(base * light + vec3<f32>(shine), vec3<f32>(255.0))), alpha);
 }
 
 @fragment
@@ -294,6 +362,40 @@ fn ao_blur_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
         }
     }
     return vec4<f32>(sum / 9.0, 0.0, 0.0, 1.0);
+}
+
+// ---- Selection outline, from the id image --------------------------------------------------
+
+// Whether a pixel shows a selected face: a face id (not an edge's) whose face is flagged.
+fn selected_at(p: vec2<i32>) -> bool {
+    let id = textureLoad(id_image, p, 0).x;
+    if (id == 0u || (id & 0x80000000u) != 0u) {
+        return false;
+    }
+    return (face_flags[id - 1u] & 2u) != 0u;
+}
+
+// As `outline_selection` in the software renderer: a pixel off the selected faces within
+// the outline width (a disc) of one on them takes the selected-edge colour.
+@fragment
+fn outline_fs(in: BackgroundOut) -> @location(0) vec4<f32> {
+    let px = vec2<i32>(in.position.xy);
+    let size = vec2<i32>(view.viewport.xy);
+    let r = i32(round(view.selection.y));
+    if (r <= 0 || selected_at(px)) {
+        discard;
+    }
+    for (var y = -r; y <= r; y = y + 1) {
+        for (var x = -r; x <= r; x = x + 1) {
+            let sp = px + vec2<i32>(x, y);
+            if (x * x + y * y <= r * r && all(sp >= vec2<i32>(0, 0)) && all(sp < size)) {
+                if (selected_at(sp)) {
+                    return vec4<f32>(linear(view.colors[6].xyz), 1.0);
+                }
+            }
+        }
+    }
+    discard;
 }
 
 // ---- Edges, as screen-space quads -------------------------------------------------------
@@ -438,7 +540,7 @@ impl Targets {
             "oxyde ids",
             ID_FORMAT,
             1,
-            attachment | wgpu::TextureUsages::COPY_SRC,
+            attachment | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let ids_depth = make("oxyde id depth", DEPTH_FORMAT, 1, attachment);
         let readable = attachment | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -615,10 +717,14 @@ pub struct GpuViewport {
     ao_depth_pass: wgpu::RenderPipeline,
     ao: wgpu::RenderPipeline,
     ao_blur: wgpu::RenderPipeline,
+    /// The outline round the selected faces, over the finished image.
+    outline: wgpu::RenderPipeline,
     /// Bound where the occlusion depth is being written (a bind group cannot hold a
     /// pass's own attachment).
     dummy_depth: wgpu::TextureView,
     dummy_ao: wgpu::TextureView,
+    /// Bound wherever the id image is not read (it is the id pass's own attachment).
+    dummy_ids: wgpu::TextureView,
     mesh: Option<MeshBuffers>,
     /// The style the material buffer was built with (it holds the default face colour).
     material_style: Option<Style>,
@@ -716,6 +822,16 @@ impl GpuViewport {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let dummy = |label, format| {
@@ -738,6 +854,7 @@ impl GpuViewport {
         };
         let dummy_depth = dummy("oxyde placeholder depth", DEPTH_FORMAT);
         let dummy_ao = dummy("oxyde placeholder occlusion", AO_FORMAT);
+        let dummy_ids = dummy("oxyde placeholder ids", ID_FORMAT);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("oxyde textures"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -1003,6 +1120,15 @@ impl GpuViewport {
             1,
             None,
         );
+        let outline = pipeline(
+            "selection outline",
+            "background_vs",
+            "outline_fs",
+            &[],
+            opaque(COLOR_FORMAT),
+            1,
+            None,
+        );
         let uniform = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1035,8 +1161,10 @@ impl GpuViewport {
             ao_depth_pass,
             ao,
             ao_blur,
+            outline,
             dummy_depth,
             dummy_ao,
+            dummy_ids,
             mesh: None,
             material_style: None,
             materials_cpu: (Vec::new(), Vec::new()),
@@ -1261,7 +1389,12 @@ impl GpuViewport {
         view.extend(v4(right));
         view.extend(v4(up));
         view.extend(v4(eye));
-        view.extend([key[0] as f32, key[1] as f32, key[2] as f32, 0.0]);
+        view.extend([
+            key[0] as f32,
+            key[1] as f32,
+            key[2] as f32,
+            style.soft_light,
+        ]);
         view.extend([
             (2.0 / (camera.height * aspect)) as f32,
             (2.0 / camera.height) as f32,
@@ -1315,6 +1448,10 @@ impl GpuViewport {
             camera.pixels_per_mm(f64::from(height)) as f32,
             0.0,
         ]);
+        view.extend([style.selection_tint, style.selection_outline, 0.0, 0.0]);
+        let ground = oxyde_render::Ground::under(self.bounds, camera, style);
+        view.extend(ground.map_or([0.0; 4], |g| [g.shadow, g.grid, g.step as f32, g.y as f32]));
+        view.extend(ground.map_or([0.0; 4], |g| g.footprint.map(|v| v as f32)));
         self.queue
             .write_buffer(&self.uniforms, 0, &bytes_f32(view.clone()));
         // The reflection pass: flagged, and without occlusion.
@@ -1378,53 +1515,67 @@ impl GpuViewport {
                 (&empty_materials, &empty_textures)
             }
         };
-        let bind =
-            |label, uniforms: &wgpu::Buffer, depth: &wgpu::TextureView, ao: &wgpu::TextureView| {
-                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout: &self.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: uniforms.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: face_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: edge_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: materials.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(textures),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 5,
-                            resource: wgpu::BindingResource::Sampler(&self.sampler),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 6,
-                            resource: wgpu::BindingResource::TextureView(depth),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::TextureView(ao),
-                        },
-                    ],
-                })
-            };
-        let bind_group = bind("oxyde view", &self.uniforms, &targets.ao_depth, &targets.ao);
+        let bind = |label,
+                    uniforms: &wgpu::Buffer,
+                    depth: &wgpu::TextureView,
+                    ao: &wgpu::TextureView,
+                    ids: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: face_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: edge_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: materials.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(textures),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(ao),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 8,
+                        resource: wgpu::BindingResource::TextureView(ids),
+                    },
+                ],
+            })
+        };
+        let bind_group = bind(
+            "oxyde view",
+            &self.uniforms,
+            &targets.ao_depth,
+            &targets.ao,
+            &self.dummy_ids,
+        );
         let mirror_group = bind(
             "oxyde mirrored view",
             &self.mirror_uniforms,
             &targets.ao_depth,
             &targets.ao,
+            &self.dummy_ids,
         );
         // While the occlusion depth is drawn it cannot be bound; while the blur reads the
         // raw occlusion it is what binding 7 holds.
@@ -1433,12 +1584,14 @@ impl GpuViewport {
             &self.uniforms,
             &self.dummy_depth,
             &self.dummy_ao,
+            &self.dummy_ids,
         );
         let blur_group = bind(
             "oxyde occlusion blur",
             &self.uniforms,
             &targets.ao_depth,
             &targets.ao_raw,
+            &self.dummy_ids,
         );
         // The see-through faces, sorted for this view direction: kept from the last
         // frame while the view only pans or zooms.
@@ -1654,6 +1807,33 @@ impl GpuViewport {
                     pass.draw(0..6, 0..mesh.segment_count);
                 }
             }
+        }
+        if style.selection_outline > 0.0 && display.shades_faces() && self.mesh.is_some() {
+            // Over the finished (resolved) image, reading the ids just written.
+            let outline_group = bind(
+                "oxyde selection outline",
+                &self.uniforms,
+                &targets.ao_depth,
+                &targets.ao,
+                &targets.ids_view,
+            );
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("oxyde selection outline"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.resolved_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &outline_group, &[]);
+            pass.set_pipeline(&self.outline);
+            pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
         self.texture.unwrap_or_default()
@@ -2057,6 +2237,72 @@ mod tests {
                 "{name}: {agree} of {checked} picks agree"
             );
         }
+    }
+
+    /// The Studio selection (tint and outline) on the GPU matches the software renderer's.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn gpu_matches_the_software_renderer_with_the_studio_selection() {
+        let Some(state) = gpu() else {
+            return;
+        };
+        let mut kernel = oxyde_occt::OcctKernel::new();
+        let a = kernel
+            .make_box(Point3::new(0.0, 0.0, 0.0), Vec3::new(40.0, 20.0, 10.0))
+            .unwrap();
+        let mesh = kernel.tessellate(a, 0.05).unwrap();
+        let scene = Scene::from_mesh(&mesh);
+        let (w, h) = (320usize, 240usize);
+        let mut camera = Camera::default();
+        camera.set_view(StandardView::Isometric);
+        let (lo, hi) = scene.bounds().unwrap();
+        camera.fit(lo, hi, w as f64, h as f64);
+        let mut gpu = GpuViewport::new(&state, super::DEFAULT_SAMPLES);
+        gpu.set_mesh(&scene.gpu_mesh(), scene.bounds());
+        let top = camera.project([20.0, 20.0, 5.0], w as f64, h as f64);
+        let picked = render(&scene, &camera, w, h, &Highlight::default()).pick(top[0], top[1], 0.0);
+        assert!(matches!(picked, Some(Pick::Face(_))), "{picked:?}");
+        let highlight = Highlight {
+            selected: picked.into_iter().collect(),
+            ..Highlight::default()
+        };
+        let style = Style::STUDIO;
+        gpu.render(&camera, w as u32, h as u32, &highlight, &style);
+        let (gw, gh, gpu_rgba) = gpu.read_image().unwrap();
+        let cpu = render_styled(&scene, &camera, w, h, &highlight, &style);
+        snapshot("studio_selection_gpu", gw, gh, &gpu_rgba);
+        snapshot("studio_selection_software", gw, gh, &cpu.rgba);
+        let mut total = 0u64;
+        for (p, q) in gpu_rgba.chunks(4).zip(cpu.rgba.chunks(4)) {
+            for c in 0..3 {
+                total += u64::from(p[c].abs_diff(q[c]));
+            }
+        }
+        let mean = total as f64 / (w * h * 3) as f64;
+        assert!(mean < 6.0, "mean channel difference {mean:.2}");
+        let at = ((top[1] as usize) * w + top[0] as usize) * 4;
+        let (g, c) = (&gpu_rgba[at..at + 3], &cpu.rgba[at..at + 3]);
+        assert!(
+            g.iter().zip(c).all(|(a, b)| a.abs_diff(*b) < 24),
+            "the selected face is {g:?} on the GPU, {c:?} in software"
+        );
+        // Both draw an outline of about the same size in the selected-edge colour.
+        let ring = |rgba: &[u8]| {
+            rgba.chunks(4)
+                .filter(|p| {
+                    p[..3]
+                        .iter()
+                        .zip(style.edge_selected)
+                        .all(|(a, b)| a.abs_diff(b) <= 2)
+                })
+                .count()
+        };
+        let (on_gpu, in_software) = (ring(&gpu_rgba), ring(&cpu.rgba));
+        assert!(in_software > 50, "{in_software} outline pixels in software");
+        assert!(
+            on_gpu * 10 >= in_software * 6 && on_gpu * 10 <= in_software * 16,
+            "{on_gpu} outline pixels on the GPU, {in_software} in software"
+        );
     }
 
     /// A headless GPU, or `None` on machines without one.

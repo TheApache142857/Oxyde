@@ -66,6 +66,7 @@ impl OxydeApp {
             style: p.graphics.style(),
             mouse: p.navigation.mouse,
             show_triad: p.graphics.show_triad,
+            view_cube: p.graphics.modern_look,
             orbit_speed: p.navigation.orbit_speed,
             zoom_speed: p.navigation.zoom_speed,
             invert_zoom: p.navigation.invert_zoom,
@@ -183,9 +184,18 @@ impl OxydeApp {
                     g.ui_theme = theme;
                     // The viewport follows; its colours can still be changed below.
                     g.set_style(&theme.viewport());
+                    // Studio comes with the modern look; the other themes keep the classic one.
+                    g.modern_look = theme == crate::theme::UiTheme::Studio;
+                    g.timeline_strip = theme == crate::theme::UiTheme::Studio;
                 }
             }
         });
+        ui.checkbox(&mut g.modern_look, "Modern look")
+            .on_hover_text(
+                "Soft studio lighting; selected faces keep their colour under a tint, with an outline round them",
+            );
+        ui.checkbox(&mut g.timeline_strip, "Timeline strip")
+            .on_hover_text("The features as a row of icons along the bottom of the window");
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Renderer");
         ui.horizontal(|ui| {
