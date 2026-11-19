@@ -39,7 +39,9 @@
 #include <HLRBRep_HLRToShape.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <ElCLib.hxx>
 #include <GC_MakeArcOfCircle.hxx>
+#include <GC_MakeArcOfEllipse.hxx>
 #include <GCPnts_TangentialDeflection.hxx>
 #include <GProp_GProps.hxx>
 #include <GeomAbs_CurveType.hxx>
@@ -54,6 +56,7 @@
 #include <Interface_Static.hxx>
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
+#include <Precision.hxx>
 #include <STEPControl_Reader.hxx>
 #include <STEPControl_Writer.hxx>
 #include <STEPCAFControl_Reader.hxx>
@@ -106,6 +109,7 @@
 #include <gp_Cone.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Elips.hxx>
 #include <gp_Lin.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
@@ -701,6 +705,26 @@ struct Frame {
     gp_Pnt at(double u, double v) const { return origin.Translated(x * u + y * v); }
 };
 
+// The ellipse of centre (cx, cy), one semi-axis to (mx, my) and the other `minor` long.
+// OpenCASCADE's major axis is the longer one, so the other semi-axis takes that role when
+// it is longer; either way the ellipse runs counter-clockwise about the plane's normal.
+gp_Elips plane_ellipse(const Frame& frame, double cx, double cy, double mx, double my,
+                       double minor, uint32_t id) {
+    const double ux = mx - cx;
+    const double uy = my - cy;
+    const double a = std::hypot(ux, uy);
+    const double b = std::abs(minor);
+    if (!(a > Precision::Confusion()) || !(b > Precision::Confusion())) {
+        throw std::runtime_error("ellipse " + std::to_string(id) + " has a semi-axis of no length");
+    }
+    const gp_Dir normal = frame.axes.Direction();
+    const gp_Dir along(frame.x * (ux / a) + frame.y * (uy / a));
+    if (a >= b) {
+        return gp_Elips(gp_Ax2(frame.at(cx, cy), normal, along), a, b);
+    }
+    return gp_Elips(gp_Ax2(frame.at(cx, cy), normal, normal.Crossed(along)), b, a);
+}
+
 TopoDS_Edge make_edge(const SegmentData& seg, const Frame& frame) {
     switch (seg.kind) {
     case SegmentKind::Line: {
@@ -729,6 +753,36 @@ TopoDS_Edge make_edge(const SegmentData& seg, const Frame& frame) {
         BRepBuilderAPI_MakeEdge maker(circle);
         if (maker.IsDone()) {
             return maker.Edge();
+        }
+        break;
+    }
+    case SegmentKind::Ellipse: {
+        BRepBuilderAPI_MakeEdge maker(
+            plane_ellipse(frame, seg.x0, seg.y0, seg.x1, seg.y1, seg.r, seg.id));
+        if (maker.IsDone()) {
+            return maker.Edge();
+        }
+        break;
+    }
+    case SegmentKind::EllipticArc: {
+        const gp_Elips ellipse =
+            plane_ellipse(frame, seg.x3, seg.y3, seg.x4, seg.y4, seg.r, seg.id);
+        const gp_Pnt start = frame.at(seg.x0, seg.y0);
+        const gp_Pnt mid = frame.at(seg.x1, seg.y1);
+        const gp_Pnt end = frame.at(seg.x2, seg.y2);
+        // Counter-clockwise from start to end when the middle comes first that way;
+        // otherwise the arc is the counter-clockwise one from end to start, reversed.
+        const double turn = 2.0 * std::acos(-1.0);
+        const double t0 = ElCLib::Parameter(ellipse, start);
+        const double to_mid = std::fmod(ElCLib::Parameter(ellipse, mid) - t0 + 2.0 * turn, turn);
+        const double to_end = std::fmod(ElCLib::Parameter(ellipse, end) - t0 + 2.0 * turn, turn);
+        const bool ccw = to_mid < to_end;
+        GC_MakeArcOfEllipse arc(ellipse, ccw ? start : end, ccw ? end : start, true);
+        if (arc.IsDone()) {
+            BRepBuilderAPI_MakeEdge maker(arc.Value());
+            if (maker.IsDone()) {
+                return ccw ? maker.Edge() : TopoDS::Edge(maker.Edge().Reversed());
+            }
         }
         break;
     }

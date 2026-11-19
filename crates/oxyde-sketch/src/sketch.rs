@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
 
-use oxyde_geom::{Curve2, Point2, ProfileSegment};
+use oxyde_geom::{Curve2, Ellipse2, Point2, ProfileSegment};
 
-/// Identity of a sketch entity. The ids of lines, arcs and circles are also the profile
-/// segment ids, and therefore name the faces an extrusion sweeps from them.
+/// Identity of a sketch entity. The ids of lines, arcs, circles and ellipses are also the
+/// profile segment ids, and therefore name the faces an extrusion sweeps from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EntityId(pub u32);
 
@@ -34,6 +34,22 @@ pub enum Geometry {
     /// the solver keeps `start` and `end` at the same distance from `center`.
     Arc {
         center: EntityId,
+        start: EntityId,
+        end: EntityId,
+    },
+    /// One semi-axis runs from `center` to the point `major`; the other, square to it, is
+    /// `minor` long.
+    Ellipse {
+        center: EntityId,
+        major: EntityId,
+        minor: f64,
+    },
+    /// Runs counter-clockwise from `start` to `end` on the ellipse of `center`, `major` and
+    /// `minor`. The solver keeps `start` and `end` on that ellipse.
+    EllipticArc {
+        center: EntityId,
+        major: EntityId,
+        minor: f64,
         start: EntityId,
         end: EntityId,
     },
@@ -83,6 +99,12 @@ pub enum Constraint {
     PointOnLine(EntityId, EntityId),
     /// A point on a circle or arc.
     PointOnCircle(EntityId, EntityId),
+    /// A point on an ellipse or elliptic arc.
+    PointOnEllipse(EntityId, EntityId),
+    /// Length of the semi-axis of an ellipse or elliptic arc towards its `major` point.
+    MajorRadius(EntityId, f64),
+    /// Length of the other semi-axis of an ellipse or elliptic arc.
+    MinorRadius(EntityId, f64),
     /// A point at the middle of a line.
     Midpoint(EntityId, EntityId),
     /// A line tangent to a circle or arc.
@@ -109,7 +131,9 @@ impl Constraint {
             | Vertical(a)
             | Length(a, _)
             | Radius(a, _)
-            | Diameter(a, _) => vec![a],
+            | Diameter(a, _)
+            | MajorRadius(a, _)
+            | MinorRadius(a, _) => vec![a],
             Coincident(a, b)
             | HorizontalPoints(a, b)
             | VerticalPoints(a, b)
@@ -123,6 +147,7 @@ impl Constraint {
             | Angle(a, b, _)
             | PointOnLine(a, b)
             | PointOnCircle(a, b)
+            | PointOnEllipse(a, b)
             | Midpoint(a, b)
             | Tangent(a, b)
             | PointLineDistance(a, b, _)
@@ -155,6 +180,8 @@ impl Constraint {
             | Length(_, v)
             | Radius(_, v)
             | Diameter(_, v)
+            | MajorRadius(_, v)
+            | MinorRadius(_, v)
             | Angle(_, _, v)
             | PointLineDistance(_, _, v)
             | LineDistance(_, _, v) => Some(v),
@@ -434,6 +461,39 @@ impl ConstrainedSketch {
         })
     }
 
+    /// An ellipse on existing centre and major points.
+    pub fn ellipse_around(&mut self, center: EntityId, major: EntityId, minor: f64) -> EntityId {
+        self.push(Geometry::Ellipse {
+            center,
+            major,
+            minor,
+        })
+    }
+
+    /// An ellipse with new centre and major points.
+    pub fn ellipse(&mut self, center: Point2, major: Point2, minor: f64) -> EntityId {
+        let (c, m) = (self.point(center), self.point(major));
+        self.ellipse_around(c, m, minor)
+    }
+
+    /// A counter-clockwise elliptic arc on existing centre, major, start and end points.
+    pub fn elliptic_arc_between(
+        &mut self,
+        center: EntityId,
+        major: EntityId,
+        minor: f64,
+        start: EntityId,
+        end: EntityId,
+    ) -> EntityId {
+        self.push(Geometry::EllipticArc {
+            center,
+            major,
+            minor,
+            start,
+            end,
+        })
+    }
+
     /// A rectangle of four lines sharing their corners, with horizontal and vertical
     /// relations added as SolidWorks does. Returns the bottom, right, top and left lines.
     pub fn rectangle(&mut self, corner: Point2, width: f64, height: f64) -> [EntityId; 4] {
@@ -496,6 +556,8 @@ impl ConstrainedSketch {
                 | Length(_, v)
                 | Radius(_, v)
                 | Diameter(_, v)
+                | MajorRadius(_, v)
+                | MinorRadius(_, v)
                 | Angle(_, _, v)
                 | PointLineDistance(_, _, v)
                 | LineDistance(_, _, v),
@@ -676,6 +738,28 @@ impl ConstrainedSketch {
         }
     }
 
+    /// Current centre, major point and minor semi-axis of an ellipse or elliptic arc.
+    pub fn ellipse_of(&self, id: EntityId) -> Option<Ellipse2> {
+        match self.entity(id)?.geometry {
+            Geometry::Ellipse {
+                center,
+                major,
+                minor,
+            }
+            | Geometry::EllipticArc {
+                center,
+                major,
+                minor,
+                ..
+            } => Some(Ellipse2 {
+                center: self.position(center)?,
+                major: self.position(major)?,
+                minor,
+            }),
+            _ => None,
+        }
+    }
+
     /// Current counter-clockwise angle from one line to another, in radians, in (−π, π].
     pub fn angle_between(&self, first: EntityId, second: EntityId) -> Option<f64> {
         let direction = |l| {
@@ -737,7 +821,7 @@ impl ConstrainedSketch {
         }
     }
 
-    /// Lines, arcs and circles that are not construction geometry, as profile curves
+    /// Lines, arcs, circles and ellipses that are not construction geometry, as profile curves
     /// (segment id = entity id), ready for `oxyde_geom::Profile::from_curves`.
     pub fn profile_segments(&self) -> Vec<ProfileSegment> {
         let at = |id| self.position(id).unwrap_or_default();
@@ -758,6 +842,30 @@ impl ConstrainedSketch {
                     Geometry::Arc { center, start, end } => {
                         arc_curve(at(center), at(start), at(end))
                     }
+                    Geometry::Ellipse {
+                        center,
+                        major,
+                        minor,
+                    } => Curve2::Ellipse(Ellipse2 {
+                        center: at(center),
+                        major: at(major),
+                        minor,
+                    }),
+                    Geometry::EllipticArc {
+                        center,
+                        major,
+                        minor,
+                        start,
+                        end,
+                    } => elliptic_arc_curve(
+                        Ellipse2 {
+                            center: at(center),
+                            major: at(major),
+                            minor,
+                        },
+                        at(start),
+                        at(end),
+                    ),
                 };
                 Some(ProfileSegment { id: e.id.0, curve })
             })
@@ -778,6 +886,10 @@ impl ConstrainedSketch {
                 Geometry::Circle { radius, .. } => {
                     layout.radius.insert(e.id, layout.params.len());
                     layout.params.push(radius);
+                }
+                Geometry::Ellipse { minor, .. } | Geometry::EllipticArc { minor, .. } => {
+                    layout.radius.insert(e.id, layout.params.len());
+                    layout.params.push(minor);
                 }
                 _ => {}
             }
@@ -831,6 +943,11 @@ impl ConstrainedSketch {
                     layout.expect(p, Kind::Point, i)?;
                     layout.expect(r, Kind::Round, i)?;
                 }
+                PointOnEllipse(p, e) => {
+                    layout.expect(p, Kind::Point, i)?;
+                    layout.expect(e, Kind::Elliptic, i)?;
+                }
+                MajorRadius(e, _) | MinorRadius(e, _) => layout.expect(e, Kind::Elliptic, i)?,
                 Tangent(l, r) => {
                     layout.expect(l, Kind::Line, i)?;
                     layout.expect(r, Kind::Round, i)?;
@@ -857,12 +974,16 @@ impl ConstrainedSketch {
                     *p = Point2::new(params[i], params[i + 1]);
                 }
                 Geometry::Circle { radius, .. } => *radius = params[layout.radius[&e.id]],
+                Geometry::Ellipse { minor, .. } | Geometry::EllipticArc { minor, .. } => {
+                    *minor = params[layout.radius[&e.id]];
+                }
                 _ => {}
             }
         }
     }
 
-    /// Appends the residuals of the equal-radius equations of `arcs`, then of `relations`
+    /// Appends the residuals of the implicit equations of `arcs` (an arc's ends at one
+    /// radius, an elliptic arc's ends on its ellipse), then of `relations`
     /// (indices into the relations, in that order); `owners` receives, per residual, the
     /// index of its relation (`None` for an arc's implicit equation).
     pub(crate) fn residuals(
@@ -919,6 +1040,38 @@ pub(crate) fn curve_points(geometry: &Geometry) -> Vec<EntityId> {
         Geometry::Line { start, end } => vec![start, end],
         Geometry::Circle { center, .. } => vec![center],
         Geometry::Arc { center, start, end } => vec![center, start, end],
+        Geometry::Ellipse { center, major, .. } => vec![center, major],
+        Geometry::EllipticArc {
+            center,
+            major,
+            start,
+            end,
+            ..
+        } => vec![center, major, start, end],
+    }
+}
+
+/// Whether the entity has implicit equations of its own: an arc's or an elliptic arc's ends
+/// on its curve.
+pub(crate) fn has_own_equations(geometry: &Geometry) -> bool {
+    matches!(
+        geometry,
+        Geometry::Arc { .. } | Geometry::EllipticArc { .. }
+    )
+}
+
+/// Counter-clockwise elliptic arc from its ends to the three-point form.
+fn elliptic_arc_curve(ellipse: Ellipse2, start: Point2, end: Point2) -> Curve2 {
+    let a0 = ellipse.angle_of(start);
+    let mut sweep = (ellipse.angle_of(end) - a0).rem_euclid(TAU);
+    if sweep < 1e-12 {
+        sweep = TAU;
+    }
+    Curve2::EllipticArc {
+        ellipse,
+        start,
+        mid: ellipse.at(a0 + sweep / 2.0),
+        end,
     }
 }
 
@@ -949,6 +1102,8 @@ pub(crate) enum Kind {
     Line,
     /// Circle or arc.
     Round,
+    /// Ellipse or elliptic arc.
+    Elliptic,
 }
 
 impl Kind {
@@ -957,6 +1112,7 @@ impl Kind {
             Kind::Point => "point",
             Kind::Line => "line",
             Kind::Round => "circle or arc",
+            Kind::Elliptic => "ellipse or elliptic arc",
         }
     }
 
@@ -966,6 +1122,10 @@ impl Kind {
             (Kind::Point, Geometry::Point(_))
                 | (Kind::Line, Geometry::Line { .. })
                 | (Kind::Round, Geometry::Circle { .. } | Geometry::Arc { .. })
+                | (
+                    Kind::Elliptic,
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }
+                )
         )
     }
 }
@@ -977,7 +1137,7 @@ pub(crate) struct Layout {
     pub params: Vec<f64>,
     /// Index of a point's x (y follows).
     pub point: HashMap<EntityId, usize>,
-    /// Index of a circle's radius.
+    /// Index of a circle's radius, or of an ellipse's or elliptic arc's minor semi-axis.
     pub radius: HashMap<EntityId, usize>,
     pub kind: HashMap<EntityId, Geometry>,
     /// Points held by a `Fixed` constraint: their parameters are not unknowns.
@@ -1030,6 +1190,22 @@ impl Layout {
             }
             Geometry::Arc { center, start, end } => {
                 [point(center), point(start), point(end)].concat()
+            }
+            Geometry::Ellipse { center, major, .. } => {
+                let mut v = [point(center), point(major)].concat();
+                v.push(self.radius[&id]);
+                v
+            }
+            Geometry::EllipticArc {
+                center,
+                major,
+                start,
+                end,
+                ..
+            } => {
+                let mut v = [point(center), point(major), point(start), point(end)].concat();
+                v.push(self.radius[&id]);
+                v
             }
         }
     }
@@ -1226,6 +1402,43 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
         }
     }
 
+    /// Centre, major point and minor semi-axis of an ellipse or elliptic arc.
+    fn ellipse(&self, id: EntityId) -> (Point<T>, Point<T>, T) {
+        match (self.layout.kind.get(&id), self.layout.radius.get(&id)) {
+            (
+                Some(
+                    Geometry::Ellipse { center, major, .. }
+                    | Geometry::EllipticArc { center, major, .. },
+                ),
+                Some(minor),
+            ) => (
+                self.point(*center),
+                self.point(*major),
+                (self.param)(*minor),
+            ),
+            // `layout()` checked that every constrained entity is of the right kind; a
+            // point ellipse at the origin is the harmless answer if it ever is not.
+            _ => {
+                let zero = T::constant(0.0);
+                ((zero, zero), (zero, zero), zero)
+            }
+        }
+    }
+
+    /// How far `p` lies off the ellipse of `center`, `major` and `minor`: zero on it, and
+    /// near it about the distance to it (for a circle, `(d² − r²) / 2r`).
+    fn off_ellipse(p: Point<T>, center: Point<T>, major: Point<T>, minor: T) -> T {
+        let (u, d) = (
+            (major.0 - center.0, major.1 - center.1),
+            (p.0 - center.0, p.1 - center.1),
+        );
+        let a = (u.0 * u.0 + u.1 * u.1).sqrt().at_least(1e-12);
+        let b = minor.abs().at_least(1e-12);
+        let along = (d.0 * u.0 + d.1 * u.1) / a;
+        let across = (u.0 * d.1 - u.1 * d.0) / a;
+        (along * along * b * b + across * across * a * a - a * a * b * b) / (a * b * (a + b))
+    }
+
     /// The end point a line and an arc share, if any.
     fn shared_end(&self, line: EntityId, round: EntityId) -> Option<EntityId> {
         match (self.layout.kind[&line], self.layout.kind[&round]) {
@@ -1236,11 +1449,21 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
         }
     }
 
-    /// The implicit equation of an arc: its two ends at the same distance from its centre.
+    /// The implicit equations of an arc, its two ends at the same distance from its centre,
+    /// and of an elliptic arc, its two ends on its ellipse.
     pub fn arc(&self, id: EntityId, out: &mut Vec<T>) {
-        if let Geometry::Arc { center, start, end } = self.layout.kind[&id] {
-            let c = self.point(center);
-            out.push(distance(c, self.point(start)) - distance(c, self.point(end)));
+        match self.layout.kind[&id] {
+            Geometry::Arc { center, start, end } => {
+                let c = self.point(center);
+                out.push(distance(c, self.point(start)) - distance(c, self.point(end)));
+            }
+            Geometry::EllipticArc { start, end, .. } => {
+                let (c, m, b) = self.ellipse(id);
+                for p in [start, end] {
+                    out.push(Self::off_ellipse(self.point(p), c, m, b));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1301,6 +1524,15 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
                 let (c, radius) = self.round(r);
                 out.push(distance(self.point(p), c) - radius);
             }
+            PointOnEllipse(p, e) => {
+                let (c, m, b) = self.ellipse(e);
+                out.push(Self::off_ellipse(self.point(p), c, m, b));
+            }
+            MajorRadius(e, value) => {
+                let (c, m, _) = self.ellipse(e);
+                out.push(distance(c, m) - k(value));
+            }
+            MinorRadius(e, value) => out.push(self.ellipse(e).2 - k(value)),
             Midpoint(p, l) => {
                 let (s, e) = self.line(l);
                 let p = self.point(p);

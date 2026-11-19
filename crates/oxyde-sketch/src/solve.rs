@@ -16,8 +16,7 @@
 
 use crate::linalg::{Basis, null_space, solve_linear};
 use crate::sketch::{
-    ConstrainedSketch, Constraint, Dual, EntityId, Eval, Geometry, Layout, RelationId, Scalar,
-    SketchError,
+    ConstrainedSketch, Constraint, Dual, EntityId, Eval, Layout, RelationId, Scalar, SketchError,
 };
 
 /// State of one relation after solving, as colour-coded in SolidWorks.
@@ -223,7 +222,7 @@ impl ConstrainedSketch {
         }
         let mut equations: Vec<(Equation, Vec<usize>)> = Vec::new();
         for e in &self.entities {
-            if matches!(e.geometry, Geometry::Arc { .. }) {
+            if crate::sketch::has_own_equations(&e.geometry) {
                 equations.push((Equation::Arc(e.id), free_of(&[e.id])));
             }
         }
@@ -583,7 +582,22 @@ mod tests {
         };
         let tip = s.point(Point2::new(-12.0, 3.0));
         let joined = s.line_between(end, tip);
+        let ellipse = s.ellipse(Point2::new(14.0, 3.0), Point2::new(19.0, 5.0), 2.0);
+        let (ec, em) = (
+            s.point(Point2::new(-14.0, 8.0)),
+            s.point(Point2::new(-10.0, 5.0)),
+        );
+        let (from, to) = (
+            s.point(Point2::new(-15.0, 11.0)),
+            s.point(Point2::new(-18.0, 7.0)),
+        );
+        let elliptic_arc = s.elliptic_arc_between(ec, em, 3.5, from, to);
+        let r = s.point(Point2::new(15.0, 6.0));
         for constraint in [
+            PointOnEllipse(r, ellipse),
+            PointOnEllipse(p, elliptic_arc),
+            MajorRadius(ellipse, 6.0),
+            MinorRadius(elliptic_arc, 3.0),
             Tangent(joined, arc),
             Coincident(p, q),
             Horizontal(a),
@@ -624,7 +638,7 @@ mod tests {
         let arcs: Vec<_> = sketch
             .entities()
             .iter()
-            .filter(|e| matches!(e.geometry, crate::Geometry::Arc { .. }))
+            .filter(|e| crate::sketch::has_own_equations(&e.geometry))
             .map(|e| e.id)
             .collect();
         let relations: Vec<usize> = (0..sketch.relations().len()).collect();

@@ -229,7 +229,8 @@ impl ConstrainedSketch {
     fn curve(&self, id: EntityId) -> Option<Curve> {
         let at = |p| self.position(p);
         match self.entity(id)?.geometry {
-            Geometry::Point(_) => None,
+            // Ellipses neither trim nor cut.
+            Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => None,
             Geometry::Line { start, end } => Some(Curve::Segment(at(start)?, at(end)?)),
             Geometry::Circle { center, radius } => Some(Curve::Circle(at(center)?, radius)),
             Geometry::Arc { center, start, end } => {
@@ -423,7 +424,7 @@ impl ConstrainedSketch {
                     self.set_construction(second, entity.construction);
                     self.after_ends_moved(curve, &entity);
                 }
-                Geometry::Point(_) => {}
+                Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {}
             },
         }
         true
@@ -735,6 +736,28 @@ impl ConstrainedSketch {
                     let s = copy_point(self, start, &mut created);
                     let f = copy_point(self, end, &mut created);
                     self.arc_between(c, f, s)
+                }
+                Geometry::Ellipse {
+                    center,
+                    major,
+                    minor,
+                } => {
+                    let c = copy_point(self, center, &mut created);
+                    let m = copy_point(self, major, &mut created);
+                    self.ellipse_around(c, m, minor)
+                }
+                Geometry::EllipticArc {
+                    center,
+                    major,
+                    minor,
+                    start,
+                    end,
+                } => {
+                    let c = copy_point(self, center, &mut created);
+                    let m = copy_point(self, major, &mut created);
+                    let s = copy_point(self, start, &mut created);
+                    let f = copy_point(self, end, &mut created);
+                    self.elliptic_arc_between(c, m, minor, f, s)
                 }
             };
             self.set_construction(new, e.construction);

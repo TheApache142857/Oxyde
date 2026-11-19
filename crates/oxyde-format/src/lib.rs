@@ -55,6 +55,7 @@ use std::collections::HashMap;
 
 use oxyde_assembly::Assembly;
 use oxyde_model::{FeatureKind, ModelError, Part, PartDefinition, RefPlane};
+use oxyde_sketch::Geometry;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -69,10 +70,14 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// The newest `format_version` of parts this crate reads: 2 adds the reference planes
 /// other than offset ones (at an angle, through a line, through three points, normal to a
-/// curve). A part is written with 1 when it holds only what version 1 knows, so older
-/// readers still open it, and refuse the others with a clear message instead of failing
-/// on a plane they cannot read.
-pub const PART_FORMAT_VERSION: u32 = 2;
+/// curve), 3 ellipses and elliptic arcs in sketches. A part is written with the oldest
+/// version that holds what it has, so older readers still open it, and refuse the others
+/// with a clear message instead of failing on a plane or a curve they cannot read.
+pub const PART_FORMAT_VERSION: u32 = 3;
+
+/// The `format_version` of parts holding a reference plane other than an offset one (and
+/// no ellipse).
+pub const PLANE_PART_FORMAT_VERSION: u32 = 2;
 
 /// The newest `format_version` of simulation studies and results this crate reads: 2 adds
 /// thermal studies, 3 topology studies, 4 generative studies, 5 flow studies, 6 cooling
@@ -361,15 +366,26 @@ fn check_version(found: u32, newest: u32) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// The `format_version` a part is written with: 2 when it holds a reference plane other
-/// than an offset one (version 1 readers could not read it), else 1, which readers of
-/// version 1 still open.
+/// The `format_version` a part is written with: 3 when a sketch holds an ellipse or an
+/// elliptic arc, 2 when it holds a reference plane other than an offset one, else 1, which
+/// readers of version 1 still open.
 pub fn part_version(definition: &PartDefinition) -> u32 {
+    let ellipse = definition.features.iter().any(|f| match f.kind() {
+        FeatureKind::Sketch(sketch) => sketch.geometry.entities().iter().any(|e| {
+            matches!(
+                e.geometry,
+                Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }
+            )
+        }),
+        _ => false,
+    });
     let new_plane = definition.features.iter().any(
         |f| matches!(f.kind(), FeatureKind::Plane(p) if !matches!(p, RefPlane::Offset { .. })),
     );
-    if new_plane {
+    if ellipse {
         PART_FORMAT_VERSION
+    } else if new_plane {
+        PLANE_PART_FORMAT_VERSION
     } else {
         FORMAT_VERSION
     }
@@ -1232,7 +1248,7 @@ mod tests {
             serde_json::from_slice(&read_entry(&mut archive, MANIFEST).unwrap()).unwrap();
         assert_eq!(manifest["format"], "oxyde");
         // The sample holds planes at an angle and through points: version 2.
-        assert_eq!(manifest["format_version"], PART_FORMAT_VERSION);
+        assert_eq!(manifest["format_version"], PLANE_PART_FORMAT_VERSION);
         assert_eq!(manifest["kind"], "part");
         assert_eq!(manifest["kernel"], "occt");
     }
@@ -1514,6 +1530,47 @@ mod tests {
             })
         ));
         assert!(check_version(version as u32, PART_FORMAT_VERSION).is_ok());
+    }
+
+    #[test]
+    fn a_part_with_an_ellipse_is_version_3_and_reads_back() {
+        let mut part = Part::new();
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        let ellipse = sketch
+            .geometry
+            .ellipse(Point2::new(1.0, 2.0), Point2::new(9.0, 2.0), 3.0);
+        sketch
+            .geometry
+            .constrain(Constraint::MinorRadius(ellipse, 3.0));
+        sketch
+            .geometry
+            .constrain(Constraint::MajorRadius(ellipse, 8.0));
+        let (c, m) = (
+            sketch.geometry.point(Point2::new(-20.0, 0.0)),
+            sketch.geometry.point(Point2::new(-14.0, 0.0)),
+        );
+        let (s, e) = (
+            sketch.geometry.point(Point2::new(-14.0, 0.0)),
+            sketch.geometry.point(Point2::new(-26.0, 0.0)),
+        );
+        let arc = sketch.geometry.elliptic_arc_between(c, m, 2.0, s, e);
+        let on = sketch.geometry.point(Point2::new(-20.0, 2.0));
+        sketch
+            .geometry
+            .constrain(Constraint::PointOnEllipse(on, arc));
+        part.add_feature(FeatureKind::Sketch(sketch));
+        let mut file = PartFile::new();
+        file.definition = part.definition();
+        assert_eq!(written_version(&file), 3);
+        assert_eq!(round_trip(&file), file);
+        // A reader of version 2 refuses it with a message.
+        assert!(matches!(
+            check_version(3, PLANE_PART_FORMAT_VERSION),
+            Err(FormatError::UnsupportedVersion {
+                found: 3,
+                supported: 2
+            })
+        ));
     }
 
     #[test]

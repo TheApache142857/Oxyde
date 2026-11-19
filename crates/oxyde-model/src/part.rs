@@ -1136,6 +1136,30 @@ impl<'a> Context<'a> {
                         }
                         circle_point(c, radius, from + t)
                     }
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {
+                        let ellipse = solved
+                            .solved
+                            .ellipse_of(EntityId(*entity))
+                            .filter(|e| e.is_valid())
+                            .ok_or_else(|| format!("ellipse {entity} of {name} has no size"))?;
+                        let mut t = ellipse.angle_of(q);
+                        if let Geometry::EllipticArc { start, end, .. } = geometry {
+                            let from = ellipse.angle_of(at(start)?);
+                            let sweep = (ellipse.angle_of(at(end)?) - from).rem_euclid(TAU);
+                            let sweep = if sweep <= 1e-12 { TAU } else { sweep };
+                            // As for an arc: past the end, the nearer end.
+                            let mut turned = (t - from).rem_euclid(TAU);
+                            if turned > sweep {
+                                turned = if turned - sweep < TAU - turned {
+                                    sweep
+                                } else {
+                                    0.0
+                                };
+                            }
+                            t = from + turned;
+                        }
+                        ellipse_point(&ellipse, t)
+                    }
                 };
                 let tangent = plane.x_dir * tx + plane.y_dir() * ty;
                 Ok((plane.to_world(point), tangent))
@@ -1366,6 +1390,15 @@ fn circle_point(center: Point2, radius: f64, angle: f64) -> (Point2, (f64, f64))
         Point2::new(center.x + radius * cos, center.y + radius * sin),
         (-sin, cos),
     )
+}
+
+/// The point of an ellipse at eccentric angle `t`, and its unit tangent there, counter-clockwise.
+fn ellipse_point(ellipse: &oxyde_geom::Ellipse2, t: f64) -> (Point2, (f64, f64)) {
+    // The derivative of the point at `t` is the radius a quarter turn later.
+    let ahead = ellipse.at(t + std::f64::consts::FRAC_PI_2);
+    let (dx, dy) = (ahead.x - ellipse.center.x, ahead.y - ellipse.center.y);
+    let length = dx.hypot(dy);
+    (ellipse.at(t), (dx / length, dy / length))
 }
 
 fn face_plane(body: &Body, index: u32) -> Option<Plane> {
@@ -1999,6 +2032,18 @@ fn hole_points(sketch: &ConstrainedSketch) -> Vec<(u32, oxyde_geom::Point2)> {
             }
             Geometry::Arc { center, start, end } => {
                 used.extend([center, start, end]);
+            }
+            Geometry::Ellipse { center, major, .. } => {
+                used.extend([center, major]);
+            }
+            Geometry::EllipticArc {
+                center,
+                major,
+                start,
+                end,
+                ..
+            } => {
+                used.extend([center, major, start, end]);
             }
             Geometry::Point(_) => {}
         }

@@ -817,14 +817,38 @@ pub(crate) struct EntityDto {
     pub geometry: GeometryDto,
 }
 
-/// Lines, circles and arcs refer to point entities by id.
+/// Lines, circles, arcs and ellipses refer to point entities by id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum GeometryDto {
-    Point { at: [f64; 2] },
-    Line { start: u32, end: u32 },
-    Circle { center: u32, radius: f64 },
-    Arc { center: u32, start: u32, end: u32 },
+    Point {
+        at: [f64; 2],
+    },
+    Line {
+        start: u32,
+        end: u32,
+    },
+    Circle {
+        center: u32,
+        radius: f64,
+    },
+    Arc {
+        center: u32,
+        start: u32,
+        end: u32,
+    },
+    Ellipse {
+        center: u32,
+        major: u32,
+        minor: f64,
+    },
+    EllipticArc {
+        center: u32,
+        major: u32,
+        minor: f64,
+        start: u32,
+        end: u32,
+    },
 }
 
 /// Relations and dimensions. Lengths in mm, angles in radians.
@@ -850,6 +874,9 @@ pub(crate) enum RelationDto {
     Angle { a: u32, b: u32, value: f64 },
     PointOnLine { point: u32, line: u32 },
     PointOnCircle { point: u32, curve: u32 },
+    PointOnEllipse { point: u32, curve: u32 },
+    MajorRadius { curve: u32, value: f64 },
+    MinorRadius { curve: u32, value: f64 },
     Midpoint { point: u32, line: u32 },
     Tangent { line: u32, curve: u32 },
     PointLineDistance { point: u32, line: u32, value: f64 },
@@ -1317,6 +1344,28 @@ fn entity_dto(e: &Entity) -> EntityDto {
                 start: start.0,
                 end: end.0,
             },
+            Geometry::Ellipse {
+                center,
+                major,
+                minor,
+            } => GeometryDto::Ellipse {
+                center: center.0,
+                major: major.0,
+                minor,
+            },
+            Geometry::EllipticArc {
+                center,
+                major,
+                minor,
+                start,
+                end,
+            } => GeometryDto::EllipticArc {
+                center: center.0,
+                major: major.0,
+                minor,
+                start: start.0,
+                end: end.0,
+            },
         },
     }
 }
@@ -1366,6 +1415,12 @@ fn relation_dto(c: &Constraint) -> RelationDto {
             point: p.0,
             curve: r.0,
         },
+        C::PointOnEllipse(p, e) => R::PointOnEllipse {
+            point: p.0,
+            curve: e.0,
+        },
+        C::MajorRadius(e, value) => R::MajorRadius { curve: e.0, value },
+        C::MinorRadius(e, value) => R::MinorRadius { curve: e.0, value },
         C::Midpoint(p, l) => R::Midpoint {
             point: p.0,
             line: l.0,
@@ -1571,6 +1626,28 @@ fn entity_from(dto: EntityDto) -> Entity {
                 start: id(start),
                 end: id(end),
             },
+            GeometryDto::Ellipse {
+                center,
+                major,
+                minor,
+            } => Geometry::Ellipse {
+                center: id(center),
+                major: id(major),
+                minor,
+            },
+            GeometryDto::EllipticArc {
+                center,
+                major,
+                minor,
+                start,
+                end,
+            } => Geometry::EllipticArc {
+                center: id(center),
+                major: id(major),
+                minor,
+                start: id(start),
+                end: id(end),
+            },
         },
     }
 }
@@ -1599,6 +1676,9 @@ fn relation_from(dto: RelationDto) -> Constraint {
         R::Angle { a, b, value } => C::Angle(id(a), id(b), value),
         R::PointOnLine { point, line } => C::PointOnLine(id(point), id(line)),
         R::PointOnCircle { point, curve } => C::PointOnCircle(id(point), id(curve)),
+        R::PointOnEllipse { point, curve } => C::PointOnEllipse(id(point), id(curve)),
+        R::MajorRadius { curve, value } => C::MajorRadius(id(curve), value),
+        R::MinorRadius { curve, value } => C::MinorRadius(id(curve), value),
         R::Midpoint { point, line } => C::Midpoint(id(point), id(line)),
         R::Tangent { line, curve } => C::Tangent(id(line), id(curve)),
         R::PointLineDistance { point, line, value } => {
