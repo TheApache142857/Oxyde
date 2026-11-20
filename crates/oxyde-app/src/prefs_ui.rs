@@ -632,7 +632,7 @@ impl OxydeApp {
         ui.checkbox(&mut d.ui_inspector, "Interface: egui inspector window");
         ui.add_space(8.0);
         crate::property_manager::section(ui, "Kernel");
-        for kind in crate::kernel::KernelKind::ALL {
+        for &kind in crate::kernel::KernelKind::ALL {
             if ui.radio(self.prefs.kernel == kind, kind.label()).clicked() {
                 self.prefs.kernel = kind;
             }

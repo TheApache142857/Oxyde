@@ -1,0 +1,16 @@
+[package]
+name = "oxyde-solidcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxyde-geom = { workspace = true }
+oxyde-kernel = { workspace = true }
+solidcore = { workspace = true }
+solidcore-record = { workspace = true }
+solidcore-convert = { workspace = true }
+solidcore-ops = { workspace = true }
+solidcore-tess = { workspace = true }

@@ -23,6 +23,15 @@ oxyde-mcp = { path = "crates/oxyde-mcp" }
 oxyde-sim = { path = "crates/oxyde-sim" }
 oxyde-sim-gpu = { path = "crates/oxyde-sim-gpu" }
 oxyde-flow = { path = "crates/oxyde-flow" }
+oxyde-solidcore = { path = "crates/oxyde-solidcore" }
+
+# SolidCraft's kernel (Apache-2.0), pinned to one commit of its repository; the crates live in
+# its solidcore/ folder. Only oxyde-solidcore uses them, behind oxyde-app's `solidcore` feature.
+solidcore = { git = "https://github.com/tangency-labs/solidcraft", rev = "b369833d71347964d2cdc439377684375bb6a6bb" }
+solidcore-record = { git = "https://github.com/tangency-labs/solidcraft", rev = "b369833d71347964d2cdc439377684375bb6a6bb" }
+solidcore-convert = { git = "https://github.com/tangency-labs/solidcraft", rev = "b369833d71347964d2cdc439377684375bb6a6bb" }
+solidcore-ops = { git = "https://github.com/tangency-labs/solidcraft", rev = "b369833d71347964d2cdc439377684375bb6a6bb" }
+solidcore-tess = { git = "https://github.com/tangency-labs/solidcraft", rev = "b369833d71347964d2cdc439377684375bb6a6bb" }
 
 clap = { version = "4.6", features = ["derive"] }
 cxx = "1.0"

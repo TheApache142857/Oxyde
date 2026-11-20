@@ -19,6 +19,14 @@ release yet; the git history has every detail.
 - **File format**: a part whose sketches hold an ellipse is written as `format_version` 3
   (FORMAT.md §2, §3 Sketches); older Oxyde refuses it with a message. Parts without one are
   written as before.
+### SolidCraft's kernel, a first trial (unreleased, November 2026)
+
+- **solidcore**, the geometry kernel of SolidCraft, can build parts in a build made with the
+  `solidcore` feature: Preferences › Debug › Kernel, or `oxyde --kernel solidcore`. It builds
+  boxes, extrusions (straight along the sketch normal), joins, cuts, intersections and moves,
+  with persistent face names; any other feature fails in the timeline with a message, and the
+  assistant panel keeps to OpenCASCADE. Part files record `"kernel": "solidcore"`. OpenCASCADE
+  stays the default, and builds without the feature are unchanged.
 
 ### Choose the kernel at start (unreleased, November 2026)
 
