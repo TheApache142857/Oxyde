@@ -451,6 +451,8 @@ impl OxydeApp {
                         Geometry::Line { .. } => "Line",
                         Geometry::Circle { .. } => "Circle",
                         Geometry::Arc { .. } => "Arc",
+                        Geometry::Ellipse { .. } => "Ellipse",
+                        Geometry::EllipticArc { .. } => "Elliptic arc",
                     },
                     None => "(deleted)",
                 },
@@ -499,7 +501,10 @@ impl OxydeApp {
         let line = match s.geometry.entity(EntityId(entity))?.geometry {
             Geometry::Point(_) => return None,
             Geometry::Line { .. } => true,
-            Geometry::Circle { .. } | Geometry::Arc { .. } => false,
+            Geometry::Circle { .. }
+            | Geometry::Arc { .. }
+            | Geometry::Ellipse { .. }
+            | Geometry::EllipticArc { .. } => false,
         };
         Some(PlaneEntity::SketchCurve {
             sketch,

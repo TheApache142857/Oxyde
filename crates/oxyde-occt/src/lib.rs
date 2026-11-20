@@ -790,6 +790,10 @@ fn segment_data(segment: &ProfileSegment) -> ffi::SegmentData {
         y1: 0.0,
         x2: 0.0,
         y2: 0.0,
+        x3: 0.0,
+        y3: 0.0,
+        x4: 0.0,
+        y4: 0.0,
         r: 0.0,
     };
     match segment.curve {
@@ -805,6 +809,23 @@ fn segment_data(segment: &ProfileSegment) -> ffi::SegmentData {
         Curve2::Circle { center, radius } => {
             data.kind = ffi::SegmentKind::Circle;
             (data.x0, data.y0, data.r) = (center.x, center.y, radius);
+        }
+        Curve2::Ellipse(ellipse) => {
+            data.kind = ffi::SegmentKind::Ellipse;
+            (data.x0, data.y0) = (ellipse.center.x, ellipse.center.y);
+            (data.x1, data.y1, data.r) = (ellipse.major.x, ellipse.major.y, ellipse.minor);
+        }
+        Curve2::EllipticArc {
+            ellipse,
+            start,
+            mid,
+            end,
+        } => {
+            data.kind = ffi::SegmentKind::EllipticArc;
+            (data.x0, data.y0, data.x1, data.y1) = (start.x, start.y, mid.x, mid.y);
+            (data.x2, data.y2) = (end.x, end.y);
+            (data.x3, data.y3) = (ellipse.center.x, ellipse.center.y);
+            (data.x4, data.y4, data.r) = (ellipse.major.x, ellipse.major.y, ellipse.minor);
         }
     }
     data

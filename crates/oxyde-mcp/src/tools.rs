@@ -191,7 +191,8 @@ pub fn list() -> Vec<Value> {
         tool(
             "sketch",
             "Adds a sketch made of shapes, fully dimensioned from the origin: rect (center or \
-            corner, size, optional radius for rounded corners), circle (center, diameter), slot (start, end, \
+            corner, size, optional radius for rounded corners), circle (center, diameter), ellipse (center, \
+            radii [a, b], angle of a), slot (start, end, \
             width), polygon (center, sides, radius, angle), polyline (points, closed, fillet; a point may be \
             {at, fillet} or {at, center, cw} for an arc from the previous point), line (start, end, \
             construction for a centerline), arc (center, start, end), point (at), text (text, size: the em in mm, font: a .ttf path or a system font file name such as \"arial\" or \"ariali\", at, angle, slant (degrees of synthetic oblique), spacing (mm added between letters), align left|center|right, valign baseline|middle|bottom|top; the letters' outlines, fixed). Each item may carry \

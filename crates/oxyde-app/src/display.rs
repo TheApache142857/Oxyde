@@ -130,6 +130,14 @@ pub fn lone_points(sketch: &ConstrainedSketch) -> Vec<Point2> {
                 used.insert(center);
             }
             Geometry::Arc { center, start, end } => used.extend([center, start, end]),
+            Geometry::Ellipse { center, major, .. } => used.extend([center, major]),
+            Geometry::EllipticArc {
+                center,
+                major,
+                start,
+                end,
+                ..
+            } => used.extend([center, major, start, end]),
         }
     }
     let origin = sketch.origin();
@@ -173,6 +181,8 @@ pub fn sketch_curves(sketch: &ConstrainedSketch) -> Vec<(u32, Vec<Point2>, bool)
                     let sweep = (a1 - a0).rem_euclid(std::f64::consts::TAU);
                     arc(c, c.distance(s), a0, sweep, 40)
                 }
+                Geometry::Ellipse { .. } => sketch.ellipse_path(e.id, 64)?,
+                Geometry::EllipticArc { .. } => sketch.ellipse_path(e.id, 40)?,
             };
             Some((e.id.0, points, e.construction))
         })

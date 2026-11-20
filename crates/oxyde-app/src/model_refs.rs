@@ -2,9 +2,12 @@
 //! points, middles and centres of the straight, circular and arc edges lying in the sketch
 //! plane. Convert Entities copies those edges into the sketch, and also projects the part's
 //! other edges and its vertices onto the plane along its normal, as SolidWorks does, so that
-//! new geometry can be placed exactly on existing (or imported) geometry.
+//! new geometry can be placed exactly on existing (or imported) geometry. A circle tilted to
+//! the plane projects to an ellipse, exactly.
 
-use oxyde_geom::{Axis, Plane, Point2, Point3};
+use std::f64::consts::{PI, TAU};
+
+use oxyde_geom::{Axis, Ellipse2, Plane, Point2, Point3};
 use oxyde_kernel::{CurveKind, EdgeInfo, Topology};
 
 /// Edges further than this from the sketch plane are projected onto it, not snapped to (mm).
@@ -30,6 +33,13 @@ pub enum ModelCurve {
     /// Counter-clockwise from `start` to `end`.
     Arc {
         center: Point2,
+        start: Point2,
+        end: Point2,
+    },
+    Ellipse(Ellipse2),
+    /// Counter-clockwise from `start` to `end` on the ellipse.
+    EllipticArc {
+        ellipse: Ellipse2,
         start: Point2,
         end: Point2,
     },
@@ -91,13 +101,89 @@ fn round_curve(plane: &Plane, axis: &Axis, edge: &EdgeInfo, ends: &[Point3]) -> 
     }
 }
 
+/// A circular edge about an axis tilted to the sketch plane, seen along the plane's normal:
+/// an ellipse, or an arc of it counter-clockwise through the projected middle. The ellipse's
+/// long semi-axis is the radius, square to both the axis and the normal; the short one is the
+/// radius times the cosine of the tilt. A circle seen edge-on projects to the stretch of the
+/// line it covers.
+fn tilted_curve(
+    plane: &Plane,
+    axis: &Axis,
+    edge: &EdgeInfo,
+    ends: &[Point3],
+) -> Option<ModelCurve> {
+    let n = axis.direction.normalized()?;
+    let radius = edge.midpoint.distance(axis.origin);
+    let major_3d = n.cross(plane.normal).normalized()?;
+    let major = Point2::new(major_3d.dot(plane.x_dir), major_3d.dot(plane.y_dir()));
+    let center = local(plane, axis.origin);
+    let ellipse = Ellipse2 {
+        center,
+        major: Point2::new(center.x + radius * major.x, center.y + radius * major.y),
+        minor: radius * n.dot(plane.normal).abs(),
+    };
+    let arc = match ends {
+        [a, b] if a.distance(*b) > 1e-9 => Some((*a, *b)),
+        _ => None,
+    };
+    if !ellipse.is_valid() {
+        // Edge-on: where the circle reaches along the major direction, from its angle
+        // about the axis measured from that direction.
+        let across = n.cross(major_3d);
+        let angle = |p: Point3| {
+            let d = p - axis.origin;
+            d.dot(across).atan2(d.dot(major_3d))
+        };
+        let (lo, hi) = match arc {
+            None => (-radius, radius),
+            Some((a, b)) => {
+                let (a0, am, a1) = (angle(a), angle(edge.midpoint), angle(b));
+                let ccw = (am - a0).rem_euclid(TAU) < (a1 - a0).rem_euclid(TAU);
+                let (from, sweep) = if ccw {
+                    (a0, (a1 - a0).rem_euclid(TAU))
+                } else {
+                    (a1, (a0 - a1).rem_euclid(TAU))
+                };
+                let (p, q) = (radius * a0.cos(), radius * a1.cos());
+                let (mut lo, mut hi) = (p.min(q), p.max(q));
+                for (extreme, at) in [(0.0, radius), (PI, -radius)] {
+                    if (extreme - from).rem_euclid(TAU) <= sweep {
+                        lo = lo.min(at);
+                        hi = hi.max(at);
+                    }
+                }
+                (lo, hi)
+            }
+        };
+        let at = |t: f64| Point2::new(center.x + t * major.x, center.y + t * major.y);
+        return (hi - lo >= SAME_POINT).then(|| ModelCurve::Line(at(lo), at(hi)));
+    }
+    Some(match arc {
+        Some((a, b)) => {
+            let (mut start, mut end) = (local(plane, a), local(plane, b));
+            let (a0, sweep) = ellipse.sweep(start, end);
+            if (ellipse.angle_of(local(plane, edge.midpoint)) - a0).rem_euclid(TAU) > sweep {
+                std::mem::swap(&mut start, &mut end);
+            }
+            ModelCurve::EllipticArc {
+                ellipse,
+                start,
+                end,
+            }
+        }
+        None => ModelCurve::Ellipse(ellipse),
+    })
+}
+
 impl ModelCurve {
-    /// Its two ends, or none for a full circle.
+    /// Its two ends, or none for a full circle or ellipse.
     fn ends(&self) -> Option<[Point2; 2]> {
         match *self {
             ModelCurve::Line(a, b) => Some([a, b]),
-            ModelCurve::Arc { start, end, .. } => Some([start, end]),
-            ModelCurve::Circle(..) => None,
+            ModelCurve::Arc { start, end, .. } | ModelCurve::EllipticArc { start, end, .. } => {
+                Some([start, end])
+            }
+            ModelCurve::Circle(..) | ModelCurve::Ellipse(_) => None,
         }
     }
 
@@ -120,6 +206,19 @@ impl ModelCurve {
                     end: e,
                 },
             ) => near(center, c) && near(start, s) && near(end, e),
+            (ModelCurve::Ellipse(a), ModelCurve::Ellipse(b)) => a.same_as(&b, SAME_POINT),
+            (
+                ModelCurve::EllipticArc {
+                    ellipse,
+                    start,
+                    end,
+                },
+                ModelCurve::EllipticArc {
+                    ellipse: other,
+                    start: s,
+                    end: e,
+                },
+            ) => ellipse.same_as(&other, SAME_POINT) && near(start, s) && near(end, e),
             _ => false,
         }
     }
@@ -195,18 +294,21 @@ impl ModelGeometry {
             }
         }
         // The other edges projected along the normal. A line square to the plane projects to
-        // its vertex alone. A circle tilted to the plane would project to an ellipse, and
-        // other curves to splines, which sketches cannot hold: those give their vertices only.
+        // its vertex alone, a circle tilted to the plane to an ellipse. Other curves would
+        // project to splines, which sketches cannot hold: those give their vertices only.
         for (edge, ends) in away {
             let curve = match (edge.curve, ends.as_slice()) {
                 (CurveKind::Line, [p, q]) => {
                     let (a, b) = (local(plane, *p), local(plane, *q));
                     (a.distance(b) >= SAME_POINT).then_some(ModelCurve::Line(a, b))
                 }
-                (CurveKind::Circle, _) => edge
-                    .axis
-                    .filter(|axis| flat(plane, axis))
-                    .map(|axis| round_curve(plane, &axis, edge, &ends)),
+                (CurveKind::Circle, _) => edge.axis.and_then(|axis| {
+                    if flat(plane, &axis) {
+                        Some(round_curve(plane, &axis, edge, &ends))
+                    } else {
+                        tilted_curve(plane, &axis, edge, &ends)
+                    }
+                }),
                 _ => None,
             };
             if let Some(curve) = curve
@@ -233,10 +335,10 @@ impl ModelGeometry {
 
 #[cfg(test)]
 mod tests {
-    use oxyde_geom::{Axis, Plane, Point2, Point3, Vec3};
+    use oxyde_geom::{Axis, Ellipse2, Plane, Point2, Point3, Vec3};
     use oxyde_kernel::{CurveKind, EdgeInfo, Topology, VertexInfo};
 
-    use super::{ModelCurve, ModelGeometry, ModelPointKind};
+    use super::{ModelCurve, ModelGeometry, ModelPointKind, local};
 
     fn edge(
         curve: CurveKind,
@@ -335,7 +437,7 @@ mod tests {
                 // Ends of a half circle of radius 2 about a vertical axis, 9 mm up.
                 (7.0, 9.0, 5.0),
                 (3.0, 9.0, 5.0),
-                // The vertex of a circle tilted to the plane.
+                // The vertex of a circle seen edge-on.
                 (20.0, 5.0, 0.0),
             ]
             .map(|(x, y, z)| VertexInfo {
@@ -374,7 +476,7 @@ mod tests {
                     Point3::new(5.0, 9.0, 7.0),
                     Axis::new(Point3::new(5.0, 9.0, 5.0), Vec3::Y),
                 ),
-                // Tilted: it would project to an ellipse.
+                // Its axis in the plane: seen edge-on, across its diameter.
                 edge(
                     CurveKind::Circle,
                     vec![8],
@@ -391,9 +493,9 @@ mod tests {
         };
         let geometry = ModelGeometry::from_body(&topology, &Plane::TOP);
         let near = |a: Point2, b: Point2| a.distance(b) < 1e-9;
-        // The edge in the plane, the slanted edge and the half circle: the copy of edge 0-1
-        // above the plane is the same curve and is listed once.
-        assert_eq!(geometry.curves.len(), 3, "{:?}", geometry.curves);
+        // The edge in the plane, the slanted edge, the half circle and the circle seen
+        // edge-on: the copy of edge 0-1 above the plane is the same curve and is listed once.
+        assert_eq!(geometry.curves.len(), 4, "{:?}", geometry.curves);
         assert!(matches!(
             geometry.curves[0],
             ModelCurve::Line(a, b) if near(a, Point2::new(0.0, 0.0)) && near(b, Point2::new(10.0, 0.0))
@@ -417,6 +519,12 @@ mod tests {
             start,
             end,
             Point2::new(5.0, -7.0)
+        ));
+        // The circle about X seen from above: the line x = 20 from z = -2 to 2.
+        assert!(matches!(
+            geometry.curves[3],
+            ModelCurve::Line(a, b) if (near(a, Point2::new(20.0, -2.0)) && near(b, Point2::new(20.0, 2.0)))
+                || (near(a, Point2::new(20.0, 2.0)) && near(b, Point2::new(20.0, -2.0)))
         ));
         // Snapping stays on the plane: the ends and middle of edge 0-1, nothing projected.
         assert_eq!(geometry.points.len(), 3);
@@ -447,6 +555,98 @@ mod tests {
                 geometry.vertices
             );
         }
+    }
+
+    /// A circle of radius 2 about an axis through (30, 4, 0) tilted 45° from the Top plane's
+    /// normal towards +Z, as a whole circle from its vertex at (32, 4, 0), or as the half from
+    /// there through its highest point.
+    fn tilted_circle(half: bool) -> Topology {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let direction = Vec3::new(0.0, s, s);
+        let (ends, midpoint) = if half {
+            // Counter-clockwise about the axis from (32, 4, 0): through the point along
+            // axis × (1, 0, 0) = (0, s, −s), to (28, 4, 0).
+            (
+                vec![(32.0, 4.0, 0.0), (28.0, 4.0, 0.0)],
+                Point3::new(30.0, 4.0 + 2.0 * s, -2.0 * s),
+            )
+        } else {
+            (vec![(32.0, 4.0, 0.0)], Point3::new(28.0, 4.0, 0.0))
+        };
+        let n = ends.len() as u32;
+        Topology {
+            faces: Vec::new(),
+            vertices: ends
+                .into_iter()
+                .map(|(x, y, z)| VertexInfo {
+                    point: Point3::new(x, y, z),
+                })
+                .collect(),
+            edges: vec![edge(
+                CurveKind::Circle,
+                (0..n).collect(),
+                midpoint,
+                Axis::new(Point3::new(30.0, 4.0, 0.0), direction),
+            )],
+        }
+    }
+
+    #[test]
+    fn a_tilted_circle_projects_to_an_ellipse() {
+        let geometry = ModelGeometry::from_body(&tilted_circle(false), &Plane::TOP);
+        let [ModelCurve::Ellipse(ellipse)] = geometry.curves[..] else {
+            panic!("{:?}", geometry.curves);
+        };
+        // The radius across the tilt, along x; the radius times cos 45° along the tilt.
+        let want = Ellipse2 {
+            center: Point2::new(30.0, 0.0),
+            major: Point2::new(32.0, 0.0),
+            minor: 2.0 * std::f64::consts::FRAC_1_SQRT_2,
+        };
+        assert!(ellipse.same_as(&want, 1e-12), "{ellipse:?}");
+        // Every point of the circle lands on it: the projection is exact.
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        for k in 0..12 {
+            let t = std::f64::consts::TAU * k as f64 / 12.0;
+            let p = Point3::new(
+                30.0 + 2.0 * t.cos(),
+                4.0 + 2.0 * s * t.sin(),
+                -2.0 * s * t.sin(),
+            );
+            let q = local(&Plane::TOP, p);
+            let (x, y) = ((q.x - 30.0) / 2.0, q.y / (2.0 * s));
+            assert!((x * x + y * y - 1.0).abs() < 1e-12, "{q:?}");
+        }
+    }
+
+    #[test]
+    fn a_tilted_half_circle_projects_to_half_an_ellipse_through_its_middle() {
+        let geometry = ModelGeometry::from_body(&tilted_circle(true), &Plane::TOP);
+        let [
+            ModelCurve::EllipticArc {
+                ellipse,
+                start,
+                end,
+            },
+        ] = geometry.curves[..]
+        else {
+            panic!("{:?}", geometry.curves);
+        };
+        // The middle (30, 4 + √2, −√2) lands at (30, √2): the sketch's y is −z.
+        let middle = Point2::new(30.0, std::f64::consts::SQRT_2);
+        let (a0, sweep) = ellipse.sweep(start, end);
+        let at = (ellipse.angle_of(middle) - a0).rem_euclid(std::f64::consts::TAU);
+        assert!(at < sweep, "{start:?} {end:?}");
+        assert!((sweep - std::f64::consts::PI).abs() < 1e-12);
+        let ends = [start, end];
+        assert!(
+            ends.iter()
+                .any(|p| p.distance(Point2::new(32.0, 0.0)) < 1e-12)
+        );
+        assert!(
+            ends.iter()
+                .any(|p| p.distance(Point2::new(28.0, 0.0)) < 1e-12)
+        );
     }
 
     #[test]

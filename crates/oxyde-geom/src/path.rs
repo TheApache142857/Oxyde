@@ -61,9 +61,15 @@ impl Path {
         let Some(first) = curves.first() else {
             return Err(PathError::Empty);
         };
-        // A full circle is a path on its own; anything else with it is disconnected.
-        if let Curve2::Circle { radius, .. } = first.curve {
-            if radius.is_nan() || radius <= LINEAR_TOLERANCE {
+        // A full circle or ellipse is a path on its own; anything else with it is
+        // disconnected.
+        let whole = match first.curve {
+            Curve2::Circle { radius, .. } => Some(radius > LINEAR_TOLERANCE),
+            Curve2::Ellipse(ellipse) => Some(ellipse.is_valid()),
+            _ => None,
+        };
+        if let Some(valid) = whole {
+            if !valid {
                 return Err(PathError::Degenerate { segment: first.id });
             }
             if let Some(other) = curves.get(1) {
@@ -80,13 +86,15 @@ impl Path {
         let mut ends = Vec::with_capacity(curves.len());
         for segment in curves {
             let (start, end) = match segment.curve {
-                Curve2::Circle { .. } => {
+                Curve2::Circle { .. } | Curve2::Ellipse(_) => {
                     return Err(PathError::Disconnected {
                         a: first.id,
                         b: segment.id,
                     });
                 }
-                Curve2::Line { start, end } | Curve2::Arc { start, end, .. } => (start, end),
+                Curve2::Line { start, end }
+                | Curve2::Arc { start, end, .. }
+                | Curve2::EllipticArc { start, end, .. } => (start, end),
             };
             if near(start, end) {
                 return Err(PathError::Degenerate {
@@ -181,6 +189,7 @@ impl Path {
         let first = self.segments.first()?;
         match first.curve {
             Curve2::Circle { center, radius } => Some(Point2::new(center.x + radius, center.y)),
+            Curve2::Ellipse(ellipse) => Some(ellipse.major),
             other => other.endpoints().map(|e| e.0),
         }
     }

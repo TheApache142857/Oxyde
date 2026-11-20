@@ -973,3 +973,133 @@ fn offsetting_a_circle_and_an_open_chain() {
     assert_eq!(s.chain_of(a), vec![a], "the chain stops at the junction");
     assert!(s.chain_of(s.endpoints(a).unwrap().0).is_empty());
 }
+
+/// An ellipse around a fixed centre, its major point level with the centre.
+fn level_ellipse(
+    s: &mut ConstrainedSketch,
+    major: f64,
+    minor: f64,
+) -> (EntityId, EntityId, EntityId) {
+    let e = s.ellipse(
+        Point2::new(0.2, -0.1),
+        Point2::new(major + 1.0, 0.4),
+        minor + 0.5,
+    );
+    let Geometry::Ellipse {
+        center, major: m, ..
+    } = s.entity(e).unwrap().geometry
+    else {
+        panic!("not an ellipse")
+    };
+    s.move_point(center, Point2::ORIGIN);
+    s.constrain(Fixed(center));
+    s.constrain(HorizontalPoints(center, m));
+    (e, center, m)
+}
+
+#[test]
+fn a_dimensioned_ellipse_is_fully_defined_and_profiles_as_one() {
+    let mut s = ConstrainedSketch::new();
+    let (e, _, m) = level_ellipse(&mut s, 8.0, 3.0);
+    s.constrain(MajorRadius(e, 8.0));
+    s.constrain(MinorRadius(e, 3.0));
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    assert_eq!(report.degrees_of_freedom, 0);
+    assert!(close(s.position(m).unwrap(), 8.0, 0.0));
+    let ellipse = s.ellipse_of(e).unwrap();
+    assert!((ellipse.minor - 3.0).abs() < 1e-9);
+    let segments = s.profile_segments();
+    assert_eq!(segments.len(), 1);
+    assert_eq!(segments[0].id, e.0);
+    assert!(matches!(segments[0].curve, Curve2::Ellipse(_)));
+    let profile = Profile::from_curves(&segments).unwrap();
+    let area = profile.regions[0].outer.signed_area().abs();
+    assert!((area / (PI * 24.0) - 1.0).abs() < 0.01, "{area}");
+}
+
+#[test]
+fn a_point_on_an_ellipse_stays_on_it() {
+    let mut s = ConstrainedSketch::new();
+    let (e, c, _) = level_ellipse(&mut s, 8.0, 3.0);
+    s.constrain(MajorRadius(e, 8.0));
+    s.constrain(MinorRadius(e, 3.0));
+    let p = s.point(Point2::new(1.0, 5.0));
+    s.constrain(PointOnEllipse(p, e));
+    s.constrain(VerticalDistance(c, p, 2.0));
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    let q = s.position(p).unwrap();
+    // On x²/64 + y²/9 = 1 at y = ±2.
+    assert!(
+        (q.x * q.x / 64.0 + q.y * q.y / 9.0 - 1.0).abs() < 1e-9,
+        "{q:?}"
+    );
+    assert!((q.y.abs() - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn an_elliptic_arc_keeps_its_ends_on_its_ellipse() {
+    let mut s = ConstrainedSketch::new();
+    let c = s.point(Point2::ORIGIN);
+    let m = s.point(Point2::new(8.0, 0.0));
+    let start = s.point(Point2::new(8.0, 0.0));
+    let end = s.point(Point2::new(-8.0, 0.3));
+    s.constrain(Fixed(c));
+    let arc = s.elliptic_arc_between(c, m, 3.0, start, end);
+    s.constrain(Coincident(start, m));
+    s.constrain(HorizontalPoints(c, end));
+    s.constrain(MajorRadius(arc, 8.0));
+    s.constrain(MinorRadius(arc, 3.0));
+    s.constrain(HorizontalPoints(c, m));
+    let report = s.solve().unwrap();
+    assert!(report.converged, "{report:?}");
+    assert_eq!(report.degrees_of_freedom, 0, "{report:?}");
+    assert!(close(s.position(end).unwrap(), -8.0, 0.0));
+    // Counter-clockwise from (8, 0) to (−8, 0): the upper half.
+    let segments = s.profile_segments();
+    let Curve2::EllipticArc { mid, .. } = segments[0].curve else {
+        panic!("not an elliptic arc")
+    };
+    assert!(close(mid, 0.0, 3.0), "{mid:?}");
+    // Changing the minor axis moves nothing but the curve.
+    let minor = s
+        .relations()
+        .iter()
+        .find(|r| matches!(r.constraint, MinorRadius(..)))
+        .unwrap()
+        .id;
+    s.set_dimension(minor, 5.0);
+    assert!(s.solve().unwrap().converged);
+    assert!(close(s.position(end).unwrap(), -8.0, 0.0));
+    assert!((s.ellipse_of(arc).unwrap().minor - 5.0).abs() < 1e-9);
+}
+
+#[test]
+fn ellipse_relations_refuse_other_curves() {
+    let mut s = ConstrainedSketch::new();
+    let circle = s.circle(Point2::ORIGIN, 3.0);
+    s.constrain(MinorRadius(circle, 2.0));
+    assert!(matches!(
+        s.solve(),
+        Err(SketchError::WrongKind {
+            expected: "ellipse or elliptic arc",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_mirrored_ellipse_mirrors_its_axes() {
+    let mut s = ConstrainedSketch::new();
+    let axis = s.line(Point2::ORIGIN, Point2::new(0.0, 10.0));
+    s.constrain(Vertical(axis));
+    let e = s.ellipse(Point2::new(5.0, 2.0), Point2::new(9.0, 5.0), 2.0);
+    let created = s.mirror(&[e], axis).unwrap();
+    let copy = *created.last().unwrap();
+    assert!(s.solve().unwrap().converged);
+    let mirrored = s.ellipse_of(copy).unwrap();
+    assert!(close(mirrored.center, -5.0, 2.0));
+    assert!(close(mirrored.major, -9.0, 5.0));
+    assert_eq!(mirrored.minor, 2.0);
+}

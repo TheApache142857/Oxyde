@@ -43,6 +43,11 @@ pub(crate) mod bridge {
         Arc,
         /// center (x0, y0), radius r
         Circle,
+        /// center (x0, y0), one semi-axis to (x1, y1), the other r long
+        Ellipse,
+        /// (x0, y0) through (x1, y1) to (x2, y2) on the ellipse of center (x3, y3), one
+        /// semi-axis to (x4, y4), the other r long
+        EllipticArc,
     }
 
     struct SegmentData {
@@ -54,6 +59,10 @@ pub(crate) mod bridge {
         y1: f64,
         x2: f64,
         y2: f64,
+        x3: f64,
+        y3: f64,
+        x4: f64,
+        y4: f64,
         r: f64,
     }
 

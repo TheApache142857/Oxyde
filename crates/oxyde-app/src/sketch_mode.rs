@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
-use oxyde_geom::{LINEAR_TOLERANCE, Plane, Point2};
+use oxyde_geom::{Ellipse2, LINEAR_TOLERANCE, Plane, Point2};
 use oxyde_model::FeatureId;
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, ConstraintState, Definition, EntityId, Geometry, RelationId,
@@ -967,7 +967,7 @@ impl SketchSession {
                 Some(Geometry::Point(_)) => points.push(*id),
                 Some(Geometry::Line { .. }) => lines.push(*id),
                 Some(Geometry::Circle { .. } | Geometry::Arc { .. }) => rounds.push(*id),
-                None => {}
+                Some(Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }) | None => {}
             }
         }
         (points, lines, rounds)
@@ -1107,6 +1107,20 @@ impl SketchSession {
                             arc_path(c, s, f).into_iter().map(to_screen).collect();
                         path.windows(2)
                             .map(|w| segment_distance(pos, w[0], w[1]))
+                            .fold(f32::INFINITY, f32::min)
+                    }
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {
+                        let path: Vec<Pos2> = self
+                            .sketch
+                            .ellipse_path(e.id, 72)?
+                            .into_iter()
+                            .map(to_screen)
+                            .collect();
+                        path.windows(2)
+                            .filter_map(|w| match *w {
+                                [a, b] => Some(segment_distance(pos, a, b)),
+                                _ => None,
+                            })
                             .fold(f32::INFINITY, f32::min)
                     }
                 };
@@ -1884,7 +1898,39 @@ impl SketchSession {
                 );
                 self.sketch.arc_between(c, s, e);
             }
+            ModelCurve::Ellipse(ellipse) => {
+                let c = self.fixed_point_at(ellipse.center);
+                let m = self.fixed_point_at(ellipse.major);
+                let id = self.sketch.ellipse_around(c, m, ellipse.minor);
+                self.hold_minor(id, &ellipse);
+            }
+            ModelCurve::EllipticArc {
+                ellipse,
+                start,
+                end,
+            } => {
+                let (c, m, s, e) = (
+                    self.fixed_point_at(ellipse.center),
+                    self.fixed_point_at(ellipse.major),
+                    self.fixed_point_at(start),
+                    self.fixed_point_at(end),
+                );
+                let id = self.sketch.elliptic_arc_between(c, m, ellipse.minor, s, e);
+                // Ends off the major axis hold the minor semi-axis already.
+                let on_axis = |p: Point2| ellipse.angle_of(p).sin().abs() < 1e-6;
+                if on_axis(start) && on_axis(end) {
+                    self.hold_minor(id, &ellipse);
+                }
+            }
         }
+    }
+
+    /// A fixed construction point at the end of the minor semi-axis holds it without a
+    /// dimension, as the rim point of a converted circle holds its radius.
+    fn hold_minor(&mut self, id: EntityId, ellipse: &Ellipse2) {
+        let rim = self.fixed_point_at(ellipse.at(std::f64::consts::FRAC_PI_2));
+        self.sketch.set_construction(rim, true);
+        self.sketch.constrain(Constraint::PointOnEllipse(rim, id));
     }
 
     /// Adds Horizontal or Vertical to a nearly horizontal or vertical new line.
@@ -2562,6 +2608,10 @@ fn outside_placement(
             Geometry::Point(p) => Some((p, 0.0)),
             Geometry::Circle { center, radius } => Some((s.position(center)?, radius)),
             Geometry::Arc { center, .. } => Some((s.position(center)?, s.radius_of(e.id)?)),
+            Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {
+                let ellipse = s.ellipse_of(e.id)?;
+                Some((ellipse.center, ellipse.largest_radius()))
+            }
             Geometry::Line { .. } => None,
         })
         .filter(|(p, _)| between.contains(&across(*p)))
@@ -2831,6 +2881,15 @@ fn model_path(curve: &ModelCurve) -> Vec<Point2> {
         ModelCurve::Line(a, b) => vec![a, b],
         ModelCurve::Circle(c, r) => arc_points(c, r, 0.0, std::f64::consts::TAU, 72),
         ModelCurve::Arc { center, start, end } => arc_path(center, start, end),
+        ModelCurve::Ellipse(ellipse) => ellipse.points(0.0, std::f64::consts::TAU, 72),
+        ModelCurve::EllipticArc {
+            ellipse,
+            start,
+            end,
+        } => {
+            let (a0, sweep) = ellipse.sweep(start, end);
+            ellipse.points(a0, sweep, 48)
+        }
     }
 }
 
@@ -2948,6 +3007,33 @@ fn curve_path(sketch: &ConstrainedSketch, geometry: Geometry) -> Option<Vec<Poin
             72,
         )),
         Geometry::Arc { center, start, end } => Some(arc_path(at(center), at(start), at(end))),
+        Geometry::Ellipse {
+            center,
+            major,
+            minor,
+        } => {
+            let ellipse = Ellipse2 {
+                center: at(center),
+                major: at(major),
+                minor,
+            };
+            Some(ellipse.points(0.0, std::f64::consts::TAU, 72))
+        }
+        Geometry::EllipticArc {
+            center,
+            major,
+            minor,
+            start,
+            end,
+        } => {
+            let ellipse = Ellipse2 {
+                center: at(center),
+                major: at(major),
+                minor,
+            };
+            let (a0, sweep) = ellipse.sweep(at(start), at(end));
+            Some(ellipse.points(a0, sweep, 48))
+        }
     }
 }
 
@@ -3593,6 +3679,56 @@ mod tests {
         assert_eq!(profile.regions.len(), 1, "a closed outline");
         assert!(outline.undo(), "one step");
         assert!(outline.sketch.profile_segments().is_empty());
+    }
+
+    #[test]
+    fn projected_ellipses_convert_fixed_and_extrudable() {
+        use crate::model_refs::{ModelCurve, ModelGeometry};
+        use oxyde_geom::Ellipse2;
+        let ellipse = Ellipse2 {
+            center: Point2::new(30.0, 0.0),
+            major: Point2::new(28.0, 0.0),
+            minor: std::f64::consts::SQRT_2,
+        };
+        let mut session = session(ConstrainedSketch::new());
+        session.model = ModelGeometry {
+            points: Vec::new(),
+            curves: vec![
+                ModelCurve::Ellipse(ellipse),
+                // Half of another, on its major axis, closed by a line.
+                ModelCurve::EllipticArc {
+                    ellipse: Ellipse2 {
+                        center: Point2::new(0.0, 0.0),
+                        major: Point2::new(5.0, 0.0),
+                        minor: 2.0,
+                    },
+                    start: Point2::new(5.0, 0.0),
+                    end: Point2::new(-5.0, 0.0),
+                },
+                ModelCurve::Line(Point2::new(-5.0, 0.0), Point2::new(5.0, 0.0)),
+            ],
+            vertices: Vec::new(),
+        };
+        session.convert(0);
+        session.convert_chain(1);
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged, "{report:?}");
+        // Nothing can move: the minor semi-axes are held by their fixed rim points.
+        assert_eq!(report.degrees_of_freedom, 0, "{report:?}");
+        let profile = oxyde_geom::Profile::from_curves(&session.sketch.profile_segments()).unwrap();
+        assert_eq!(profile.regions.len(), 2);
+        let areas: Vec<f64> = profile
+            .regions
+            .iter()
+            .map(|r| r.outer.signed_area().abs())
+            .collect();
+        let pi = std::f64::consts::PI;
+        for want in [pi * 2.0 * std::f64::consts::SQRT_2, pi * 5.0 * 2.0 / 2.0] {
+            assert!(
+                areas.iter().any(|a| (a / want - 1.0).abs() < 0.02),
+                "{want} in {areas:?}"
+            );
+        }
     }
 
     #[test]
