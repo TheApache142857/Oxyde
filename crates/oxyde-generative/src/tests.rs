@@ -1392,3 +1392,352 @@ fn a_single_body_is_redesigned_around_its_kept_regions() {
     });
     assert_eq!(in_hole.count(), 0);
 }
+
+// Checks against values derived outside the solver: beam theory, finite differences and
+// the symmetry of a symmetric problem.
+
+/// The cantilever of the beam check, mm, MPa and N: its length, depth and width, Young's
+/// modulus (Poisson's ratio 0, so that the held end leaves the section free to keep its
+/// shape and beam theory applies), and the shear on its free end.
+const BEAM_LENGTH: f64 = 40.0;
+const BEAM_DEPTH: f64 = 4.0;
+const BEAM_WIDTH: f64 = 4.0;
+const BEAM_MODULUS: f64 = 200_000.0;
+const BEAM_LOAD: f64 = 100.0;
+/// Timoshenko's shear coefficient of a rectangle at Poisson's ratio 0, 10 (1 + ν) / (12 + 11 ν).
+const BEAM_SHEAR_COEFFICIENT: f64 = 5.0 / 6.0;
+/// How far the finer grid's deflection may lie from beam theory: trilinear bricks with eight
+/// through the depth are stiffer in bending than the beam by a few per cent.
+const BEAM_TOLERANCE: f64 = 0.10;
+const BEAM_SOLVE_TOLERANCE: f64 = 1e-10;
+const BEAM_SOLVE_ITERATIONS: usize = 1000;
+/// The compliances of nested grids, as rounding leaves them: the solves' error enters them
+/// squared.
+const NESTED_ROUNDING: f64 = 1e-9;
+
+/// The tip deflection of the beam on voxels of `BEAM_DEPTH / n`, held at every node of its
+/// face x = 0 and sheared on its face x = `BEAM_LENGTH` by `BEAM_LOAD` spread evenly over
+/// it: its compliance over the load, the face's deflection weighted by the area each node
+/// carries.
+fn cantilever_deflection(n: usize) -> f64 {
+    let h = BEAM_DEPTH / n as f64;
+    let along = (BEAM_LENGTH / h).round() as usize;
+    let dims = Dims {
+        cells: [along, n, n],
+    };
+    let brick = Brick::new(0.0);
+    let stiffness = vec![BEAM_MODULUS * h; dims.cell_count()];
+    let held: Vec<u32> = (0..dims.node_count())
+        .map(|i| if dims.node_coords(i)[0] == 0 { 0 } else { NONE })
+        .collect();
+    let projectors = [[0.0; 9]];
+    let fine = Fine::new(dims, &brick, &stiffness, &held, &projectors, 0.0);
+    // A node of the loaded face carries a cell's area, half on an edge, a quarter at a corner.
+    let share = |c: usize| if c == 0 || c == n { 0.5 } else { 1.0 };
+    let mut loads = vec![0.0; 3 * dims.node_count()];
+    for j in 0..=n {
+        for k in 0..=n {
+            let node = dims.node([along, j, k]);
+            loads[3 * node + 1] = -BEAM_LOAD * share(j) * share(k) / (n * n) as f64;
+        }
+    }
+    let mut u = vec![0.0; loads.len()];
+    let cancel = AtomicBool::new(false);
+    multigrid::solve(
+        &fine,
+        &loads,
+        &mut u,
+        BEAM_SOLVE_TOLERANCE,
+        BEAM_SOLVE_ITERATIONS,
+        &cancel,
+        1,
+    )
+    .unwrap();
+    let compliance: f64 = loads.iter().zip(&u).map(|(f, x)| f * x).sum();
+    compliance / BEAM_LOAD
+}
+
+#[test]
+fn a_solid_cantilever_bends_as_beam_theory_says() {
+    let second_moment = BEAM_WIDTH * BEAM_DEPTH.powi(3) / 12.0;
+    let area = BEAM_WIDTH * BEAM_DEPTH;
+    let shear_modulus = BEAM_MODULUS / 2.0;
+    let theory = BEAM_LOAD * BEAM_LENGTH.powi(3) / (3.0 * BEAM_MODULUS * second_moment)
+        + BEAM_LOAD * BEAM_LENGTH / (BEAM_SHEAR_COEFFICIENT * shear_modulus * area);
+    let coarse = cantilever_deflection(4);
+    let fine = cantilever_deflection(8);
+    // The finer grid's displacements include the coarser one's: it is no stiffer.
+    assert!(
+        coarse <= fine * (1.0 + NESTED_ROUNDING),
+        "{coarse} mm on the coarser grid, {fine} mm on the finer"
+    );
+    assert!(
+        (fine - theory).abs() <= BEAM_TOLERANCE * theory,
+        "{fine} mm against {theory} mm"
+    );
+}
+
+/// The finite difference checks: the step in a voxel's density, the agreement asked of the
+/// slopes (a fraction of the largest), and the solves, exact to rounding on grids this small
+/// (the finest level is factored).
+const FD_STEP: f64 = 1e-4;
+const FD_TOLERANCE: f64 = 1e-4;
+const FD_SOLVE_TOLERANCE: f64 = 1e-12;
+const FD_LOAD: f64 = 100.0;
+
+/// A cantilever of 8 × 3 × 2 voxels of 1 mm, held at x = 0, of uneven densities, loaded down
+/// on its free end: its densities, displacements for any densities, and the slopes.
+struct FdCantilever {
+    dims: Dims,
+    brick: Brick,
+    held: Vec<u32>,
+    loads: Vec<f64>,
+    base: Vec<f64>,
+}
+
+impl FdCantilever {
+    fn new() -> FdCantilever {
+        let dims = Dims { cells: [8, 3, 2] };
+        let held = (0..dims.node_count())
+            .map(|n| if dims.node_coords(n)[0] == 0 { 0 } else { NONE })
+            .collect();
+        let mut loads = vec![0.0; 3 * dims.node_count()];
+        for j in 0..=3 {
+            for k in 0..=2 {
+                loads[3 * dims.node([8, j, k]) + 1] = -FD_LOAD / 12.0;
+            }
+        }
+        FdCantilever {
+            dims,
+            brick: Brick::new(STEEL.poisson),
+            held,
+            loads,
+            base: (0..dims.cell_count())
+                .map(|v| 0.5 + 0.05 * (v % 7) as f64)
+                .collect(),
+        }
+    }
+
+    fn stiffness(&self, rho: &[f64]) -> Vec<f64> {
+        rho.iter()
+            .map(|&r| {
+                STEEL.youngs_modulus * (VOID_STIFFNESS + r.powf(PENALTY) * (1.0 - VOID_STIFFNESS))
+            })
+            .collect()
+    }
+
+    fn stiffness_slope(&self, v: usize) -> f64 {
+        PENALTY * self.base[v].powf(PENALTY - 1.0) * (1.0 - VOID_STIFFNESS) * STEEL.youngs_modulus
+    }
+
+    /// `K(stiffness) x = b`.
+    fn solve(&self, stiffness: &[f64], b: &[f64]) -> Vec<f64> {
+        let projectors = [[0.0; 9]];
+        let fine = Fine::new(
+            self.dims,
+            &self.brick,
+            stiffness,
+            &self.held,
+            &projectors,
+            SCALAR_BELOW * STEEL.youngs_modulus,
+        );
+        let mut x = vec![0.0; b.len()];
+        let cancel = AtomicBool::new(false);
+        multigrid::solve(
+            &fine,
+            b,
+            &mut x,
+            FD_SOLVE_TOLERANCE,
+            SOLVE_ITERATIONS,
+            &cancel,
+            1,
+        )
+        .unwrap();
+        x
+    }
+
+    fn displacements(&self, rho: &[f64]) -> Vec<f64> {
+        self.solve(&self.stiffness(rho), &self.loads)
+    }
+
+    fn elements<'a>(&'a self, rho: &'a [f64], state: &'a [State]) -> ElementContext<'a> {
+        ElementContext {
+            dims: self.dims,
+            brick: &self.brick,
+            rho,
+            state,
+            anchored: &[],
+            modulus: STEEL.youngs_modulus,
+            h: 1.0,
+        }
+    }
+
+    /// `slopes` against the central differences of `measure` at the root, the tip and a
+    /// voxel between.
+    fn assert_differences(&self, slopes: &[f64], measure: &dyn Fn(&[f64]) -> f64) {
+        let largest = slopes.iter().fold(0.0f64, |m, s| m.max(s.abs()));
+        assert!(largest > 0.0);
+        let dims = self.dims;
+        for v in [
+            dims.cell([0, 1, 0]),
+            dims.cell([7, 1, 1]),
+            dims.cell([4, 2, 0]),
+        ] {
+            let at = |d: f64| {
+                let mut rho = self.base.clone();
+                rho[v] += d;
+                measure(&rho)
+            };
+            let difference = (at(FD_STEP) - at(-FD_STEP)) / (2.0 * FD_STEP);
+            assert!(
+                (slopes[v] - difference).abs() <= FD_TOLERANCE * largest,
+                "voxel {v}: {} against {difference}",
+                slopes[v]
+            );
+        }
+    }
+}
+
+#[test]
+fn compliance_slopes_are_its_central_differences() {
+    let beam = FdCantilever::new();
+    let stiffness = beam.stiffness(&beam.base);
+    let u = beam.displacements(&beam.base);
+    let energies = element_energies(beam.dims, &beam.brick, &u, &stiffness, 1);
+    let slopes: Vec<f64> = (0..beam.base.len())
+        .map(|v| -beam.stiffness_slope(v) * energies[v])
+        .collect();
+    let compliance = |rho: &[f64]| -> f64 {
+        let u = beam.displacements(rho);
+        beam.loads.iter().zip(&u).map(|(f, x)| f * x).sum()
+    };
+    beam.assert_differences(&slopes, &compliance);
+}
+
+#[test]
+fn stress_norm_slopes_are_its_central_differences() {
+    // The p-norm of the relaxed von Mises stresses, its slopes by the adjoint solve, as
+    // Minimize mass builds them, the filter and the projection left out.
+    let beam = FdCantilever::new();
+    let state = vec![State::Free; beam.base.len()];
+    let stiffness = beam.stiffness(&beam.base);
+    let u = beam.displacements(&beam.base);
+    let elements = beam.elements(&beam.base, &state);
+    let gathered = elements.stress_norm(std::slice::from_ref(&u));
+    let mut slopes = elements.stress_slopes(&gathered);
+    let lambda = beam.solve(&stiffness, &elements.stress_rhs(&gathered, 0, &u));
+    let products = element_products(beam.dims, &beam.brick, &lambda, &u, &stiffness, 1);
+    for (v, s) in slopes.iter_mut().enumerate() {
+        *s -= products[v] * beam.stiffness_slope(v);
+    }
+    let norm = |rho: &[f64]| -> f64 {
+        let u = beam.displacements(rho);
+        beam.elements(rho, &state).stress_norm(&[u]).norm
+    };
+    beam.assert_differences(&slopes, &norm);
+}
+
+/// The symmetry checks: displacements of mirror nodes, as a fraction of the largest, from a
+/// solve exact to rounding (the finest level is factored), and the densities of mirror
+/// voxels, a step of the bytes the outcome keeps.
+const SYMMETRY_TOLERANCE: f64 = 1e-9;
+const SYMMETRY_DENSITY_STEP: u8 = 1;
+/// Iterations of the symmetric optimization: rounding in the solves can break the symmetry
+/// over a long run.
+const SYMMETRY_ITERATIONS: usize = 10;
+
+#[test]
+fn a_symmetric_beam_bends_symmetrically() {
+    // 10 × 3 × 2 voxels of 1 mm held at both ends, loaded down at the middle of its top,
+    // its densities mirrored about x = 5 mm.
+    let dims = Dims { cells: [10, 3, 2] };
+    let [nx, ny, _] = dims.nodes();
+    let brick = Brick::new(STEEL.poisson);
+    let held: Vec<u32> = (0..dims.node_count())
+        .map(|n| {
+            let x = dims.node_coords(n)[0];
+            if x == 0 || x == nx - 1 { 0 } else { NONE }
+        })
+        .collect();
+    let stiffness: Vec<f64> = (0..dims.cell_count())
+        .map(|e| {
+            let [i, j, k] = dims.cell_coords(e);
+            let r = 0.5 + 0.05 * ((i.min(9 - i) + 3 * j + 5 * k) % 7) as f64;
+            STEEL.youngs_modulus * r.powf(PENALTY)
+        })
+        .collect();
+    let mut loads = vec![0.0; 3 * dims.node_count()];
+    for (x, share) in [(4, 0.25), (5, 0.5), (6, 0.25)] {
+        for k in 0..3 {
+            loads[3 * dims.node([x, ny - 1, k]) + 1] = -FD_LOAD * share / 3.0;
+        }
+    }
+    let projectors = [[0.0; 9]];
+    let fine = Fine::new(dims, &brick, &stiffness, &held, &projectors, 0.0);
+    let mut u = vec![0.0; loads.len()];
+    let cancel = AtomicBool::new(false);
+    multigrid::solve(
+        &fine,
+        &loads,
+        &mut u,
+        FD_SOLVE_TOLERANCE,
+        SOLVE_ITERATIONS,
+        &cancel,
+        1,
+    )
+    .unwrap();
+    let largest = u.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    assert!(largest > 0.0);
+    for n in 0..dims.node_count() {
+        let [x, y, z] = dims.node_coords(n);
+        let m = dims.node([nx - 1 - x, y, z]);
+        let (a, b) = (&u[3 * n..3 * n + 3], &u[3 * m..3 * m + 3]);
+        assert!(
+            (a[0] + b[0]).abs() <= SYMMETRY_TOLERANCE * largest
+                && (a[1] - b[1]).abs() <= SYMMETRY_TOLERANCE * largest
+                && (a[2] - b[2]).abs() <= SYMMETRY_TOLERANCE * largest,
+            "node {n}: {a:?} against its mirror's {b:?}"
+        );
+    }
+}
+
+#[test]
+fn a_symmetric_study_grows_a_symmetric_design() {
+    // A bridge 60 × 20 × 10 mm: a pad held on its outer face at each end, a pad on the
+    // middle of the top loaded down. It is the same turned half a turn about the vertical
+    // line through its centre (the faces' triangles too, which the loads are sampled on),
+    // and no manufacturing constraint ties the voxels together.
+    let mut study = bracket(2.0);
+    study.space.preserve = vec![
+        block(0, [0.0, 0.0, 0.0], [4.0, 20.0, 10.0]),
+        block(1, [56.0, 0.0, 0.0], [60.0, 20.0, 10.0]),
+        block(2, [26.0, 16.0, 2.0], [34.0, 20.0, 8.0]),
+    ];
+    study.fixtures = vec![Fixture {
+        kind: FixtureKind::Fixed,
+        labels: vec![0, 11],
+    }];
+    study.loads = vec![Load {
+        kind: LoadKind::Force {
+            total: 1000.0,
+            direction: Some([0.0, -1.0, 0.0]),
+        },
+        labels: vec![23],
+    }];
+    study.max_iterations = SYMMETRY_ITERATIONS;
+    let (grid, outcome) = run(&study, Method::Unrestricted, 1);
+    let [nx, ny, nz] = grid.counts;
+    assert_eq!(grid.counts, [30, 10, 5]);
+    for k in 0..nz {
+        for j in 0..ny {
+            for i in 0..nx {
+                let a = outcome.density[i + nx * (j + ny * k)];
+                let b = outcome.density[(nx - 1 - i) + nx * (j + ny * (nz - 1 - k))];
+                assert!(
+                    a.abs_diff(b) <= SYMMETRY_DENSITY_STEP,
+                    "voxel ({i}, {j}, {k}): {a} against {b}"
+                );
+            }
+        }
+    }
+}
