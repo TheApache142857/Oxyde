@@ -5,7 +5,7 @@ use crate::math::V3;
 /// How a fixture holds its faces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureKind {
-    /// No motion at all (SolidWorks' *Fixed Geometry*).
+    /// No motion at all.
     Fixed,
     /// No motion normal to the faces; free to slide along them (*Roller/Slider*).
     Roller,
@@ -26,7 +26,7 @@ pub enum LoadKind {
     /// MPa, normal to the faces, pushing into them when positive.
     Pressure { value: f64 },
     /// A force in newtons acting at `point`, off the faces (a component's weight at its
-    /// centre of mass), carried to them as a distributing link (RBE3) carries it: spread
+    /// centre of mass), carried to them as a distributing link carries it: spread
     /// over them by area, with the moment its offset makes spread in proportion to each
     /// node's distance from their centre. It stiffens nothing.
     Remote { force: V3, point: V3 },
@@ -67,8 +67,7 @@ pub fn thread_count(wanted: usize) -> usize {
     .max(1)
 }
 
-/// Planes the shape is mirrored about, through `point` and parallel to the standard planes:
-/// SolidWorks' symmetry control, Fusion 360's symmetry planes.
+/// Planes the shape is mirrored about, through `point` and parallel to the standard planes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Symmetry {
     /// mm: the point the planes pass through; the origin for the standard planes.

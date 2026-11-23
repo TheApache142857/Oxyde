@@ -552,7 +552,7 @@ fn a_milled_bracket_has_no_undercut_seen_from_the_tool() {
 
 #[test]
 fn a_bracket_milled_from_both_sides_has_no_undercut_seen_from_both() {
-    // Milled from +Z and −Z at once, as Autodesk's example mills from +Y and −Y: along
+    // Milled from +Z and −Z at once: along
     // every column across Z the material is one run, no void between two solid voxels
     // (each voxel is either reached from above, from below, or stays).
     let study = bracket(2.0);

@@ -1,5 +1,5 @@
-//! Generative design: shapes grown between bodies to keep and bodies to stay clear of, as
-//! Fusion 360's generative design makes them (`docs/SIMULATION.md` §9).
+//! Generative design: shapes grown between bodies to keep and bodies to stay clear of
+//! (`docs/SIMULATION.md` §9 in the Oxyde repository).
 //!
 //! - **The design space** ([`Grid`]): the box around the preserve bodies (and the bodies of
 //!   the preserve regions: faces kept to a depth) cut into cubic voxels, each *preserve*
@@ -34,8 +34,8 @@
 //!   *Additive* prints layer by layer along the build direction (`additive`): a voxel can
 //!   only be as dense as the voxel under it and that one's four neighbours across the layer
 //!   (a cross), which keeps overhangs within 45° in every direction.
-//! - **Milling from several sides** (Fusion 360's setup orientations, as Autodesk's
-//!   machinery example mills from +Y and −Y): along each side's lines from the tool inwards,
+//! - **Milling from several sides** (from +Y and from −Y, for example): along each side's
+//!   lines from the tool inwards,
 //!   each voxel is raised to the densest one in front of it (what the tool cannot reach from
 //!   that side stays), then the least over the sides is taken (what it reaches from one side
 //!   is gone). Each void voxel (an obstacle) is reached from the side with the fewest design
@@ -247,10 +247,9 @@ pub struct LoadCase {
     pub remote_masses: Vec<usize>,
 }
 
-/// A component carried by faces of the preserve bodies (Fusion 360's point mass, the
-/// instrument a bracket holds): under a load case's acceleration its weight reaches the
-/// faces as a force and a moment spread over them by area, as a distributing link (RBE3)
-/// carries it, the faces moving on average as the mass does. It stiffens nothing.
+/// A component carried by faces of the preserve bodies (a point mass: the instrument a
+/// bracket holds): under a load case's acceleration its weight reaches the faces as a force
+/// and a moment spread over them by area, as a distributing link carries it, the faces moving on average as the mass does. It stiffens nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteMass {
     /// kg.

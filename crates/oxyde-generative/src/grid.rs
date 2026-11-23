@@ -27,7 +27,7 @@
 //!   preserve voxel around. A fixture holds the corner of that voxel nearest its
 //!   sample (all three directions, or a roller's normal); a load spreads its sample's share
 //!   (by area) over the voxel's corners by trilinear weights.
-//! - **Remote masses** are linked to their faces' samples as a distributing link (RBE3) is:
+//! - **Remote masses** are linked to their faces' samples as a distributing link is:
 //!   the mass moves as the samples' mean translation and their mean turn about their
 //!   centroid, weighted by area, carried to its point; its weight under a case's
 //!   acceleration reaches each sample as that link's transpose gives it, a force and a
