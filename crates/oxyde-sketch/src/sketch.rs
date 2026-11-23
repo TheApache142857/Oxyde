@@ -19,7 +19,7 @@ impl fmt::Display for EntityId {
 
 /// Geometry of an entity. Lines, circles and arcs refer to point entities, so that
 /// connected geometry shares points as in SolidWorks.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Geometry {
     Point(Point2),
     Line {
@@ -55,7 +55,7 @@ pub enum Geometry {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub id: EntityId,
     pub geometry: Geometry,
@@ -670,7 +670,7 @@ impl ConstrainedSketch {
     pub fn recorded_origin(&self) -> Option<EntityId> {
         self.origin.filter(|id| {
             matches!(
-                self.entity(*id).map(|e| e.geometry),
+                self.entity(*id).map(|e| e.geometry.clone()),
                 Some(Geometry::Point(_))
             )
         })
@@ -906,7 +906,7 @@ impl ConstrainedSketch {
                 }
                 _ => {}
             }
-            layout.kind.insert(e.id, e.geometry);
+            layout.kind.insert(e.id, e.geometry.clone());
         }
         // Entity references.
         for e in &self.entities {
@@ -1452,7 +1452,10 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
 
     /// The end point a line and an arc share, if any.
     fn shared_end(&self, line: EntityId, round: EntityId) -> Option<EntityId> {
-        match (self.layout.kind[&line], self.layout.kind[&round]) {
+        match (
+            self.layout.kind[&line].clone(),
+            self.layout.kind[&round].clone(),
+        ) {
             (Geometry::Line { start: s, end: e }, Geometry::Arc { start, end, .. }) => {
                 [s, e].into_iter().find(|p| *p == start || *p == end)
             }
@@ -1463,7 +1466,7 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
     /// The implicit equations of an arc, its two ends at the same distance from its centre,
     /// and of an elliptic arc, its two ends on its ellipse.
     pub fn arc(&self, id: EntityId, out: &mut Vec<T>) {
-        match self.layout.kind.get(&id).copied() {
+        match self.layout.kind.get(&id).cloned() {
             Some(Geometry::Arc { center, start, end }) => {
                 let c = self.point(center);
                 out.push(distance(c, self.point(start)) - distance(c, self.point(end)));

@@ -305,7 +305,7 @@ fn stored_sketches_are_validated() {
     assert_eq!(rebuilt, s);
 
     let mut entities = s.entities().to_vec();
-    entities.push(entities[0]);
+    entities.push(entities[0].clone());
     assert!(matches!(
         ConstrainedSketch::from_parts(entities, Vec::new(), Counters::default()),
         Err(SketchError::DuplicateId(_))

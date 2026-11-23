@@ -1093,7 +1093,7 @@ impl<'a> Context<'a> {
                 let geometry = solved
                     .solved
                     .entity(EntityId(*entity))
-                    .map(|e| e.geometry)
+                    .map(|e| e.geometry.clone())
                     .ok_or_else(|| gone_from_sketch("curve", *entity, name))?;
                 let at = |id: EntityId| {
                     solved

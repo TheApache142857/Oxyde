@@ -479,7 +479,7 @@ impl SketchSession {
     fn click_mirror(&mut self, hit: Option<EntityId>, additive: bool) {
         let is_line = |id: EntityId| {
             matches!(
-                self.sketch.entity(id).map(|e| e.geometry),
+                self.sketch.entity(id).map(|e| e.geometry.clone()),
                 Some(Geometry::Line { .. })
             )
         };
@@ -652,7 +652,7 @@ impl SketchSession {
     /// cursor as the line to mirror about.
     fn mirror_preview_for(&self, line: EntityId) -> Vec<Vec<Point2>> {
         let is_line = matches!(
-            self.sketch.entity(line).map(|e| e.geometry),
+            self.sketch.entity(line).map(|e| e.geometry.clone()),
             Some(Geometry::Line { .. })
         );
         let entities: Vec<EntityId> = self
@@ -672,7 +672,7 @@ impl SketchSession {
         let _ = trial.solve();
         copies
             .iter()
-            .filter_map(|id| curve_path(&trial, trial.entity(*id)?.geometry))
+            .filter_map(|id| curve_path(&trial, trial.entity(*id)?.geometry.clone()))
             .collect()
     }
 
@@ -809,7 +809,7 @@ impl SketchSession {
         }
         self.curve_hit(pos, to_screen).filter(|id| {
             matches!(
-                self.sketch.entity(*id).map(|e| e.geometry),
+                self.sketch.entity(*id).map(|e| e.geometry.clone()),
                 Some(Geometry::Line { .. })
             )
         })
@@ -963,7 +963,7 @@ impl SketchSession {
     fn selected_kinds(&self) -> (Vec<EntityId>, Vec<EntityId>, Vec<EntityId>) {
         let (mut points, mut lines, mut rounds) = (Vec::new(), Vec::new(), Vec::new());
         for id in &self.selection {
-            match self.sketch.entity(*id).map(|e| e.geometry) {
+            match self.sketch.entity(*id).map(|e| e.geometry.clone()) {
                 Some(Geometry::Point(_)) => points.push(*id),
                 Some(Geometry::Line { .. }) => lines.push(*id),
                 Some(Geometry::Circle { .. } | Geometry::Arc { .. }) => rounds.push(*id),
@@ -981,7 +981,7 @@ impl SketchSession {
         let one = |label, c| (label, vec![c]);
         // Fixing a curve fixes the points it stands on, as SolidWorks does.
         let fix_points = |id: EntityId| -> Vec<Constraint> {
-            let points = match self.sketch.entity(id).map(|e| e.geometry) {
+            let points = match self.sketch.entity(id).map(|e| e.geometry.clone()) {
                 Some(Geometry::Line { start, end }) => vec![start, end],
                 Some(Geometry::Arc { center, start, end }) => vec![center, start, end],
                 _ => Vec::new(),
@@ -1218,7 +1218,7 @@ impl SketchSession {
                 self.selection.push(id);
                 // A single circle needs no second click.
                 let round = matches!(
-                    self.sketch.entity(id).map(|e| e.geometry),
+                    self.sketch.entity(id).map(|e| e.geometry.clone()),
                     Some(Geometry::Circle { .. } | Geometry::Arc { .. })
                 );
                 if round {
@@ -1254,7 +1254,7 @@ impl SketchSession {
     // ---- Dragging ----------------------------------------------------------------------------
 
     fn start_drag(&mut self, id: EntityId, at: Point2) {
-        let kind = match self.sketch.entity(id).map(|e| e.geometry) {
+        let kind = match self.sketch.entity(id).map(|e| e.geometry.clone()) {
             Some(Geometry::Point(_)) if !self.sketch.is_fixed(id) => DragKind::Point(id),
             Some(Geometry::Line { start, end }) => DragKind::Line(start, end),
             Some(Geometry::Arc { center, start, end }) => DragKind::Arc(center, start, end),
@@ -1324,7 +1324,7 @@ impl SketchSession {
     fn attach(&mut self, point: EntityId, snap: Option<Snap>) {
         let on = |sketch: &ConstrainedSketch, curve: EntityId| match sketch
             .entity(curve)
-            .map(|e| e.geometry)
+            .map(|e| e.geometry.clone())
         {
             Some(Geometry::Line { .. }) => Constraint::PointOnLine(point, curve),
             _ => Constraint::PointOnCircle(point, curve),
@@ -2050,7 +2050,7 @@ impl SketchSession {
                 1.6_f32
             };
             let stroke = Stroke::new(width, color);
-            let Some(path) = curve_path(&self.sketch, e.geometry) else {
+            let Some(path) = curve_path(&self.sketch, e.geometry.clone()) else {
                 continue;
             };
             let path: Vec<Pos2> = path.into_iter().map(to_screen).collect();
@@ -2651,7 +2651,7 @@ fn unit(a: Point2, b: Point2) -> Option<(f64, f64)> {
 /// measurement. For two entities, the first option is the one Smart Dimension picks.
 fn dimension_options(s: &ConstrainedSketch, selection: &[EntityId]) -> Vec<DimensionOption> {
     use Constraint::*;
-    let kind = |id: EntityId| s.entity(id).map(|e| e.geometry);
+    let kind = |id: EntityId| s.entity(id).map(|e| e.geometry.clone());
     let center = |id: EntityId| match kind(id)? {
         Geometry::Circle { center, .. } | Geometry::Arc { center, .. } => Some(center),
         _ => None,
@@ -3044,10 +3044,10 @@ fn moved_curves(before: &ConstrainedSketch, after: &ConstrainedSketch) -> Vec<Ve
         .entities()
         .iter()
         .filter_map(|e| {
-            let path = curve_path(after, e.geometry)?;
+            let path = curve_path(after, e.geometry.clone())?;
             let old = before
                 .entity(e.id)
-                .and_then(|old| curve_path(before, old.geometry));
+                .and_then(|old| curve_path(before, old.geometry.clone()));
             let same = old.is_some_and(|old| {
                 old.len() == path.len() && old.iter().zip(&path).all(|(a, b)| a.distance(*b) < 1e-7)
             });

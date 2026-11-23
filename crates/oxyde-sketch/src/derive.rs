@@ -66,7 +66,7 @@ struct FilletPlan {
 impl ConstrainedSketch {
     fn is_line(&self, id: EntityId) -> bool {
         matches!(
-            self.entity(id).map(|e| e.geometry),
+            self.entity(id).map(|e| e.geometry.clone()),
             Some(Geometry::Line { .. })
         )
     }
@@ -548,7 +548,8 @@ impl ConstrainedSketch {
         let Some((ls, le)) = self.endpoints(line) else {
             return false;
         };
-        let Some(Geometry::Arc { center, start, end }) = self.entity(arc).map(|e| e.geometry)
+        let Some(Geometry::Arc { center, start, end }) =
+            self.entity(arc).map(|e| e.geometry.clone())
         else {
             return false;
         };
@@ -608,7 +609,7 @@ impl ConstrainedSketch {
             let mut base: Option<(EntityId, EntityId)> = None;
             let mut dimensioned = false;
             for link in &plan.links {
-                let entity = *self.entity(link.id)?;
+                let entity = self.entity(link.id)?.clone();
                 let new = match entity.geometry {
                     Geometry::Line { start, end } => {
                         let s = self.offset_point(&mut new_points, &plan, start)?;

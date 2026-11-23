@@ -385,7 +385,7 @@ impl ConstrainedSketch {
         let Some(plan) = self.trim_plan(curve, at) else {
             return false;
         };
-        let Some(entity) = self.entity(curve).copied() else {
+        let Some(entity) = self.entity(curve).cloned() else {
             return false;
         };
         match plan.piece {
@@ -433,7 +433,7 @@ impl ConstrainedSketch {
     /// A new point at a crossing, kept on the curve that made it.
     fn cut_point(&mut self, cut: Cut) -> EntityId {
         let q = self.point(cut.point);
-        let on = match self.entity(cut.by).map(|e| e.geometry) {
+        let on = match self.entity(cut.by).map(|e| e.geometry.clone()) {
             Some(Geometry::Line { .. }) => Constraint::PointOnLine(q, cut.by),
             _ => Constraint::PointOnCircle(q, cut.by),
         };
@@ -639,7 +639,7 @@ impl ConstrainedSketch {
         let Some(plan) = self.extend_plan(curve, at) else {
             return false;
         };
-        let Some(entity) = self.entity(curve).copied() else {
+        let Some(entity) = self.entity(curve).cloned() else {
             return false;
         };
         let q = self.cut_point(plan.cut);
@@ -709,7 +709,7 @@ impl ConstrainedSketch {
         let originals: Vec<Entity> = entities
             .iter()
             .filter(|id| **id != line)
-            .filter_map(|id| self.entity(*id).copied())
+            .filter_map(|id| self.entity(*id).cloned())
             .collect();
         for e in originals {
             let new = match e.geometry {

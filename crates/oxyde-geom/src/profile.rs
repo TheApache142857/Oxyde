@@ -11,7 +11,7 @@ use crate::ellipse::{Ellipse2, within};
 use crate::{LINEAR_TOLERANCE, Point2};
 
 /// A 2D sketch curve in plane coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Curve2 {
     Line {
         start: Point2,
@@ -50,15 +50,15 @@ impl Curve2 {
 
     /// The same curve traversed the other way.
     pub fn reversed(&self) -> Curve2 {
-        match *self {
+        match self {
             Curve2::Line { start, end } => Curve2::Line {
-                start: end,
-                end: start,
+                start: *end,
+                end: *start,
             },
             Curve2::Arc { start, mid, end } => Curve2::Arc {
-                start: end,
-                mid,
-                end: start,
+                start: *end,
+                mid: *mid,
+                end: *start,
             },
             Curve2::EllipticArc {
                 ellipse,
@@ -66,12 +66,12 @@ impl Curve2 {
                 mid,
                 end,
             } => Curve2::EllipticArc {
-                ellipse,
-                start: end,
-                mid,
-                end: start,
+                ellipse: *ellipse,
+                start: *end,
+                mid: *mid,
+                end: *start,
             },
-            closed @ (Curve2::Circle { .. } | Curve2::Ellipse(_)) => closed,
+            closed @ (Curve2::Circle { .. } | Curve2::Ellipse(_)) => closed.clone(),
         }
     }
 
@@ -237,7 +237,7 @@ fn circle_through(a: Point2, b: Point2, c: Point2) -> Option<(Point2, f64)> {
 ///
 /// The id is what lets the modeling engine name the faces an extrusion generates
 /// ("the side face made by sketch line 3") independently of kernel numbering.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProfileSegment {
     pub id: u32,
     pub curve: Curve2,
@@ -357,7 +357,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                     });
                 }
                 loops.push(Loop {
-                    segments: vec![*segment],
+                    segments: vec![segment.clone()],
                 });
             }
             Curve2::Line { start, end } => {
@@ -366,7 +366,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                         segment: segment.id,
                     });
                 }
-                open.push(*segment);
+                open.push(segment.clone());
             }
             Curve2::Arc { start, mid, end } => {
                 if near(start, end) || circle_through(start, mid, end).is_none() {
@@ -374,7 +374,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                         segment: segment.id,
                     });
                 }
-                open.push(*segment);
+                open.push(segment.clone());
             }
             Curve2::Ellipse(ellipse) => {
                 if !ellipse.is_valid() {
@@ -383,7 +383,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                     });
                 }
                 loops.push(Loop {
-                    segments: vec![*segment],
+                    segments: vec![segment.clone()],
                 });
             }
             Curve2::EllipticArc {
@@ -397,7 +397,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
                         segment: segment.id,
                     });
                 }
-                open.push(*segment);
+                open.push(segment.clone());
             }
         }
     }
@@ -444,7 +444,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
         }
         used[first] = true;
         let (loop_start, mut cursor) = ends[first];
-        let mut segments = vec![open[first]];
+        let mut segments = vec![open[first].clone()];
 
         while !near(cursor, loop_start) {
             let next = (0..open.len())
@@ -455,7 +455,7 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
             };
             used[j] = true;
             let segment = if near(ends[j].0, cursor) {
-                open[j]
+                open[j].clone()
             } else {
                 ProfileSegment {
                     id: open[j].id,

@@ -79,7 +79,7 @@ impl Path {
                 });
             }
             return Ok(Path {
-                segments: vec![*first],
+                segments: vec![first.clone()],
                 closed: true,
             });
         }
@@ -134,7 +134,7 @@ impl Path {
         let mut segments = Vec::with_capacity(curves.len());
         // The first curve runs away from the free end.
         let oriented = |j: usize, from: Point2| -> ProfileSegment {
-            let segment = curves.get(j).copied().unwrap_or(*first);
+            let segment = curves.get(j).cloned().unwrap_or_else(|| first.clone());
             if near(ends.get(j).map_or(from, |e| e.0), from) {
                 segment
             } else {
@@ -150,8 +150,8 @@ impl Path {
         let mut cursor = free_end;
         let segment = oriented(first_index, cursor);
         cursor = segment.curve.endpoints().map_or(cursor, |e| e.1);
-        segments.push(segment);
         let path_start = segment.curve.endpoints().map_or(cursor, |e| e.0);
+        segments.push(segment);
         loop {
             let next = (0..curves.len()).find(|&j| {
                 !used.get(j).copied().unwrap_or(true)
@@ -181,13 +181,13 @@ impl Path {
 
     /// The curves of the path, in order and oriented.
     pub fn curves(&self) -> impl Iterator<Item = Curve2> + '_ {
-        self.segments.iter().map(|s| s.curve)
+        self.segments.iter().map(|s| s.curve.clone())
     }
 
     /// Where the path starts (any point of a closed round path).
     pub fn start(&self) -> Option<Point2> {
         let first = self.segments.first()?;
-        match first.curve {
+        match &first.curve {
             Curve2::Circle { center, radius } => Some(Point2::new(center.x + radius, center.y)),
             Curve2::Ellipse(ellipse) => Some(ellipse.major),
             other => other.endpoints().map(|e| e.0),

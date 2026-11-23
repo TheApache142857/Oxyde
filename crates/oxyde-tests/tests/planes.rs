@@ -395,7 +395,7 @@ fn planes_normal_to_curves_at_points() {
         Point2::new(100.0, 0.0),
         Point2::new(110.0, -10.0),
     );
-    let start = match path.geometry.entity(arc).map(|e| e.geometry) {
+    let start = match path.geometry.entity(arc).map(|e| e.geometry.clone()) {
         Some(oxyde_sketch::Geometry::Arc { start, .. }) => start,
         _ => unreachable!(),
     };
