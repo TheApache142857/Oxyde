@@ -23,9 +23,9 @@ use super::DesignSpace;
 use super::grid::{Grid, Voxel, triangles_of};
 use crate::bvh::{Bvh, Hit};
 use crate::math::{V3, add, cross, dot, lerp, scale, sub};
-use crate::mesh::kuhn_tets;
-use crate::mesher::SurfaceMesh;
-use crate::topology::{Shape, smooth_holding};
+use crate::shape::{Shape, smooth_holding};
+use crate::surfaces::SurfaceMesh;
+use crate::tets::kuhn_tets;
 
 /// Half of a byte's range: a voxel is in the material from 128 up.
 const THRESHOLD: f64 = 127.5;

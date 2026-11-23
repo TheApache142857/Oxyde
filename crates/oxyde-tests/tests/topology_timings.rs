@@ -23,13 +23,12 @@ use std::time::Instant;
 use oxyde_format::simulation::{
     FixtureKind as FileFixture, ForceDirection, LoadKind as FileLoad, MeshQuality, MeshSize,
 };
+use oxyde_generative::material::Elastic;
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions};
 use oxyde_kernel::{Kernel, VolumeMeshOptions};
 use oxyde_model::Part;
 use oxyde_occt::OcctKernel;
-use oxyde_sim::{
-    Elastic, Fixture, FixtureKind, Load, LoadKind, Preserve, SolveOptions, Study, TetMesh,
-    TopologyStudy,
-};
+use oxyde_sim::{Preserve, Study, TetMesh, TopologyStudy};
 
 #[test]
 #[ignore = "a timing run on a part named by OXYDE_TOPOLOGY_PART"]

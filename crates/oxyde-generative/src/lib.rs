@@ -15,8 +15,8 @@
 //!   carry none) and gathered by a p-norm (p = 8) scaled to the largest, its slopes by an
 //!   adjoint solve per load case, and the design moved by the method of moving asymptotes
 //!   (`mma`) towards the least mass that keeps them.
-//! - **The optimization** is SIMP as in [`crate::topology`]: a design density per voxel (or
-//!   per group of voxels the manufacturing ties together), averaged over a sphere (the
+//! - **The optimization** is SIMP as in Oxyde's topology studies (`oxyde_sim::topology`):
+//!   a design density per voxel (or per group of voxels the manufacturing ties together), averaged over a sphere (the
 //!   density filter, of radius half the minimum thickness: members thinner than that are
 //!   discouraged, not ruled out, as projection alone guarantees no length scale), then
 //!   pushed towards solid or void by a smoothed Heaviside projection whose sharpness `β`
@@ -53,16 +53,45 @@
 //!   iteration by LOBPCG preconditioned by the multigrid cycle, each a constraint for the
 //!   method of moving asymptotes, the mass going as the sixth power of the density below a
 //!   tenth so near-void regions do not vibrate on their own.
-//! - [`check_part`] checks the part made of an outcome: its surface meshed with
-//!   tetrahedra, each load case solved on it by the static solver, for numbers the voxels
-//!   only estimate.
+//! - The part made of an outcome is checked outside this crate (`oxyde_sim::check` in
+//!   Oxyde): its surface meshed with tetrahedra, each load case solved on it by the static
+//!   solver, for numbers the voxels only estimate.
 
+// Never crash: a panic in a modelling or UI path would take the unsaved document with it.
+// Return an error or fall back to a safe default instead.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 // Indices into the grid's arrays and the design's groups, all sized here from the grid.
 #![allow(clippy::indexing_slicing)]
 
+pub mod bvh;
+pub mod eigen;
+pub mod material;
+pub mod math;
+pub mod pool;
+pub mod shape;
+pub mod study;
+pub mod surfaces;
+pub mod tets;
+
 mod additive;
 mod brick;
-mod check;
 mod decimate;
 mod frequency;
 mod grid;
@@ -71,7 +100,6 @@ mod multigrid;
 mod surface;
 
 pub use crate::eigen::{EigenSpace, Vector};
-pub use check::{CheckError, Missing, PartCheck, check_part};
 pub use decimate::{decimate, decimate_holding, solid_pieces};
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
 pub use multigrid::{Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved};
@@ -79,11 +107,14 @@ pub use surface::{exact_surface, surface};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// A label on no face: a boundary facet the mesher could not tie to a model face.
+pub const NO_LABEL: u32 = u32::MAX;
+
 use crate::material::Elastic;
 use crate::math::V3;
-use crate::mesher::SurfaceMesh;
-use crate::solve::{Fixture, Load, SolveOptions, thread_count};
-use crate::topology::Symmetry;
+use crate::study::Symmetry;
+use crate::study::{Fixture, Load, SolveOptions, thread_count};
+use crate::surfaces::SurfaceMesh;
 use brick::{Brick, DOFS, von_mises};
 use multigrid::{Dims, Fine, par_fill};
 

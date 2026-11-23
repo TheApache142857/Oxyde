@@ -86,7 +86,7 @@ pub trait EigenSpace {
 }
 
 /// The pencil `A − λ B`, as closures on vectors of `size` values in the CPU's memory.
-pub(crate) struct EigenProblem<'a> {
+pub struct EigenProblem<'a> {
     /// The length of a vector.
     pub size: usize,
     /// `y = A x`.
@@ -103,7 +103,7 @@ pub(crate) struct EigenProblem<'a> {
 
 /// What [`smallest`] looks for.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct EigenOptions {
+pub struct EigenOptions {
     /// The pairs wanted, lowest first.
     pub count: usize,
     /// Vectors more in the block, to speed the last wanted ones up.
@@ -115,7 +115,7 @@ pub(crate) struct EigenOptions {
 
 /// The lowest eigenpairs found.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Eigenpairs {
+pub struct Eigenpairs {
     /// Ascending.
     pub values: Vec<f64>,
     /// B-orthonormal: `vᵢᵀ B vⱼ = δᵢⱼ`.
@@ -129,7 +129,7 @@ pub(crate) struct Eigenpairs {
 
 /// Why no eigenpairs could be found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EigenError {
+pub enum EigenError {
     Cancelled,
     /// No block of independent vectors could be made: fewer unknowns are kept than pairs
     /// are wanted, or `B` is zero on them.
@@ -303,7 +303,7 @@ struct Column {
 /// The lowest `options.count` eigenpairs of `problem`, from the vectors of `start` (a
 /// previous solve's, for a problem that changed a little) and pseudo-random ones for the
 /// rest of the block. Out of iterations, the pairs as far as they got, `converged` false.
-pub(crate) fn smallest(
+pub fn smallest(
     problem: &mut EigenProblem<'_>,
     options: &EigenOptions,
     start: Option<&[Vec<f64>]>,
@@ -320,7 +320,7 @@ pub(crate) fn smallest(
 
 /// [`smallest`] in `space`, wherever it keeps its vectors; `progress` hears how far the
 /// wanted pairs are from converging, from 0 to 1.
-pub(crate) fn smallest_in<S: EigenSpace + ?Sized>(
+pub fn smallest_in<S: EigenSpace + ?Sized>(
     space: &mut S,
     options: &EigenOptions,
     start: Option<&[Vec<f64>]>,

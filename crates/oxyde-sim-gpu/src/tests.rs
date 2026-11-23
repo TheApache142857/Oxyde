@@ -1,13 +1,15 @@
 //! The card against the CPU. On a machine without a usable graphics card each test says so
-//! and passes: the CPU's solve, which `oxyde-sim`'s own tests cover, is used there.
+//! and passes: the CPU's solve, which `oxyde-generative`'s own tests cover, is used there.
 
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use oxyde_sim::generative::{
+use oxyde_generative::material::Elastic;
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
+use oxyde_generative::{
     CpuBackend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, generate_on,
 };
-use oxyde_sim::{Elastic, Fixture, FixtureKind, Load, LoadKind, SolveOptions, SurfaceMesh};
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 

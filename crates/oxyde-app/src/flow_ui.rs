@@ -2238,8 +2238,8 @@ fn solver_rows(ui: &mut egui::Ui, flow: &mut FlowSettings) -> bool {
 mod tests {
     use super::*;
     use crate::simulation_ui::{SimFace, StudyItem};
+    use oxyde_generative::surfaces::SurfaceMesh;
     use oxyde_model::{FaceName, FeatureId};
-    use oxyde_sim::SurfaceMesh;
 
     fn face(k: u32) -> SimFace {
         SimFace {

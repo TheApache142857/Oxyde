@@ -31,48 +31,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::amg::{BsrRef, Multigrid};
 use crate::contact::{self, Contact, ContactResult, ContactSolve, Multipliers, Tie};
-use crate::material::Elastic;
-use crate::math::{
+use crate::mesh::{EDGES, TetMesh};
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{
     IDENTITY, M3, V3, add, cross, dot, inverse, mat_mul, mat_t_vec, mat_vec, norm, normalize,
     scale, sub, symmetric_eigenvalues, transpose,
 };
-use crate::mesh::{EDGES, TetMesh};
-
-/// How a fixture holds its faces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FixtureKind {
-    /// No motion at all (SolidWorks' *Fixed Geometry*).
-    Fixed,
-    /// No motion normal to the faces; free to slide along them (*Roller/Slider*).
-    Roller,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Fixture {
-    pub kind: FixtureKind,
-    /// The face labels it holds.
-    pub labels: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LoadKind {
-    /// A total force in newtons, spread over the faces by area: along `direction` (any
-    /// length), or, when `None`, normal to each face, pushing into it.
-    Force { total: f64, direction: Option<V3> },
-    /// MPa, normal to the faces, pushing into them when positive.
-    Pressure { value: f64 },
-    /// A force in newtons acting at `point`, off the faces (a component's weight at its
-    /// centre of mass), carried to them as a distributing link (RBE3) carries it: spread
-    /// over them by area, with the moment its offset makes spread in proportion to each
-    /// node's distance from their centre. It stiffens nothing.
-    Remote { force: V3, point: V3 },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Load {
-    pub kind: LoadKind,
-    pub labels: Vec<u32>,
-}
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions, thread_count};
 
 /// What a linear static study holds.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -84,25 +49,6 @@ pub struct Study {
     /// Contacts between bodies meshed apart. Bodies meshed together share their nodes
     /// where they touch and need none.
     pub contacts: Vec<Contact>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SolveOptions {
-    /// The solve stops when the residual is this fraction of the loads.
-    pub tolerance: f64,
-    pub max_iterations: usize,
-    /// Threads; 0 for every core.
-    pub threads: usize,
-}
-
-impl Default for SolveOptions {
-    fn default() -> Self {
-        Self {
-            tolerance: 1e-8,
-            max_iterations: 40_000,
-            threads: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -530,16 +476,6 @@ impl BlockMatrix {
             values: self.blocks.as_flattened(),
         }
     }
-}
-
-pub(crate) fn thread_count(wanted: usize) -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    if wanted == 0 {
-        cores
-    } else {
-        wanted.min(cores)
-    }
-    .max(1)
 }
 
 /// Row ranges of about equal numbers of blocks, one per thread.
@@ -2293,7 +2229,7 @@ mod tests {
     fn a_cantilever_meshed_by_the_mesher_is_close_to_beam_theory() {
         // The lattice mesher bevels the beam's long edges, which lowers I by a few per
         // cent: the tip goes a little further than beam theory says.
-        let surface = crate::mesher::box_surface([0.0; 3], [200.0, 20.0, 20.0]);
+        let surface = oxyde_generative::surfaces::box_surface([0.0; 3], [200.0, 20.0, 20.0]);
         let options = crate::MeshOptions {
             element_size: 4.0,
             ..crate::MeshOptions::default()
@@ -2340,7 +2276,7 @@ mod tests {
     #[ignore = "a timing run, not a check"]
     fn solve_timings() {
         for size in [4.0, 2.5] {
-            let surface = crate::mesher::box_surface([0.0; 3], [200.0, 20.0, 20.0]);
+            let surface = oxyde_generative::surfaces::box_surface([0.0; 3], [200.0, 20.0, 20.0]);
             let options = crate::MeshOptions {
                 element_size: size,
                 ..crate::MeshOptions::default()

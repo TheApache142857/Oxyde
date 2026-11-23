@@ -216,7 +216,7 @@ fn smin_slopes(x: f64, s: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generative::Voxel;
+    use crate::Voxel;
 
     #[test]
     fn the_smooth_bounds_are_close_and_their_slopes_right() {

@@ -1,6 +1,6 @@
 //! Generative design's solve on a graphics card (`docs/SIMULATION.md` §9): the same
-//! preconditioned conjugate gradients as `oxyde_sim::generative`'s CPU multigrid, as WGSL
-//! compute shaders through `wgpu`, behind `oxyde_sim::generative::Backend`.
+//! preconditioned conjugate gradients as `oxyde_generative`'s CPU multigrid, as WGSL
+//! compute shaders through `wgpu`, behind `oxyde_generative::Backend`.
 //!
 //! - **What stays on the CPU**: the multigrid plan (`System::plan`: the Galerkin coarse
 //!   levels, the block Jacobi inverses, the smoothing intervals, the coarsest level
@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use oxyde_sim::generative::{
+use oxyde_generative::{
     Backend, CellKind, EigenSpace, GenerativeError, Plan, PlanLevel, SMOOTHING_DEGREE,
     SPECTRUM_RATIO, Solved, System, Vector,
 };

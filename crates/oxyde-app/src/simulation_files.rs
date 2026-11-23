@@ -1405,7 +1405,7 @@ mod tests {
         mesh.make_quadratic();
         // Its facets on no face of a model: the results have no label table.
         for f in &mut mesh.facets {
-            f.label = oxyde_sim::NO_LABEL;
+            f.label = oxyde_generative::NO_LABEL;
         }
         let elements = mesh.tets.len();
         let topology = TopologyResults {
@@ -1454,7 +1454,7 @@ mod tests {
 
         let mut mesh = TetMesh::structured_box([0.0; 3], [2.0, 1.0, 1.0], [2, 1, 1]);
         for f in &mut mesh.facets {
-            f.label = oxyde_sim::NO_LABEL;
+            f.label = oxyde_generative::NO_LABEL;
         }
         let n = mesh.nodes.len();
         let mode = |hz: f64, d: usize| {

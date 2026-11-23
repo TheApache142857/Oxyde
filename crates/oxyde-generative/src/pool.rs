@@ -156,7 +156,7 @@ fn pool() -> &'static Pool {
 /// Runs `job(0)`, …, `job(tasks − 1)` on the pool's threads and the caller's, and returns
 /// once every one is done. Each task should depend on its index only, so that what they
 /// make does not depend on which thread runs which.
-pub(crate) fn run(tasks: usize, job: &(dyn Fn(usize) + Sync)) {
+pub fn run(tasks: usize, job: &(dyn Fn(usize) + Sync)) {
     if tasks <= 1 || INSIDE.with(Cell::get) {
         for task in 0..tasks {
             job(task);
