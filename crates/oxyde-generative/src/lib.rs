@@ -59,6 +59,7 @@
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead.
+#![forbid(unsafe_code)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -84,7 +85,6 @@ pub mod bvh;
 pub mod eigen;
 pub mod material;
 pub mod math;
-pub mod pool;
 pub mod shape;
 pub mod study;
 pub mod surfaces;
