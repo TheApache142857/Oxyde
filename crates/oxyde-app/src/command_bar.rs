@@ -293,6 +293,7 @@ impl OxydeApp {
                     self.show_measure = true;
                 }
             });
+            ui.menu_button("Window", |ui| self.window_menu(ui));
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts").clicked() {
                     ui.close_menu();

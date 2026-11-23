@@ -318,6 +318,15 @@ impl OxydeApp {
                 "The Mate command places the parts as soon as both sides are picked; off, \
                  they stay put until OK, so every mate is picked where the parts sit now",
             );
+        crate::property_manager::section(ui, "Windows");
+        ui.checkbox(
+            &mut self.prefs.open_in_new_window,
+            "Open documents in a new window",
+        )
+        .on_hover_text(
+            "File › Open and Open recent open the document in a window of its own, as Creo \
+             does; off, it replaces the document of the window it is opened from",
+        );
         ui.add_space(8.0);
         if ui.button("Reset graphics to defaults").clicked() {
             self.prefs.graphics = Default::default();

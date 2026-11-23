@@ -191,134 +191,187 @@ pub(crate) fn paint_origin(painter: &egui::Painter, to_screen: &dyn Fn(Point3) -
     );
 }
 
-pub struct OxydeApp {
-    pub(crate) kernel: AppKernel,
-    pub(crate) doc: Document,
-    pub(crate) viewport: Viewport,
-    pub(crate) selected_feature: Option<FeatureId>,
-    /// Several features selected in the timeline (Ctrl+click, Shift+click), including
-    /// `selected_feature`, which anchors it; empty for a plain selection.
-    pub(crate) selected_features: Vec<FeatureId>,
-    pub(crate) selected_plane: Option<StandardPlane>,
-    /// A body selected in the Solid Bodies folder.
-    pub(crate) selected_body: Option<oxyde_model::BodyId>,
-    /// The Solid Bodies folder is open in the timeline.
-    pub(crate) bodies_expanded: bool,
-    /// Which tab of the left panel is shown: the feature tree or the configurations.
-    pub(crate) left_tab: crate::configurations_ui::LeftTab,
-    pub(crate) configurations_panel: crate::configurations_ui::ConfigurationsPanel,
-    pub(crate) selection: Vec<Selected>,
-    pub(crate) dialog: Option<Dialog>,
-    /// The sketch being edited, when in sketch mode.
-    pub(crate) sketch: Option<SketchSession>,
-    /// Tools › Equations window (equations, global variables and dimensions).
-    pub(crate) equations: EquationsWindow,
-    /// The part's Equations folder is open in its tree.
-    pub(crate) part_equations_expanded: bool,
-    /// The assembly's Equations folder is open in its tree, and those of these components.
-    pub(crate) asm_equations_expanded: bool,
-    pub(crate) asm_part_equations_expanded: std::collections::HashSet<oxyde_assembly::ComponentId>,
-    /// Nodes open in the tree of the assembly a part is edited in (`in_place_tree.rs`).
-    pub(crate) place_expanded: std::collections::HashSet<crate::in_place_tree::Node>,
-    pub(crate) status: String,
-    pub(crate) tab: CommandTab,
-    /// A sketch tool clicked outside sketch mode: picked once the new sketch opens.
-    pub(crate) pending_tool: Option<Tool>,
-    /// The sketch open is the hole positions of the Hole Wizard, which opens on leaving it.
-    pub(crate) hole_positions: bool,
-    pub(crate) show_mass_properties: bool,
-    pub(crate) show_measure: bool,
-    /// The distance Measure found between the two selected faces or edges, for the
-    /// document revision and selection it was measured for.
-    pub(crate) measure_cache: Option<crate::evaluate::MeasureCache>,
-    pub(crate) asm_measure_cache: Option<crate::evaluate::AsmMeasureCache>,
-    /// Evaluate › Interference Detection, while its window is open (assemblies).
-    pub(crate) interference: Option<crate::interference::InterferenceWindow>,
-    /// Evaluate › Section View, while its window is open.
-    pub(crate) section: Option<crate::section_view::SectionView>,
-    /// Which planes, axes, sketches and origins are drawn.
-    pub(crate) visibility: crate::display::Visibility,
-    /// Features expanded in the timeline (showing the sketch they absorb).
-    pub(crate) expanded: std::collections::HashSet<FeatureId>,
-    /// A feature the timeline scrolls to on the next frame (selected in the viewport).
-    pub(crate) scroll_to_feature: Option<FeatureId>,
-    /// Document revision the viewport currently shows.
-    pub(crate) scene_revision: Option<u64>,
-    /// Status-bar summary, cached per document revision.
-    summary: Option<(u64, String)>,
-    window_title: String,
-    allow_close: bool,
-    /// The open assembly; the app is in assembly mode while there is one.
-    pub(crate) asm: Option<crate::assembly::AssemblyDoc>,
-    pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
-    pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
-    /// The open feature command's feature, built and shown in the viewport.
-    pub(crate) preview: Option<crate::preview::Preview>,
-    /// The assembly command bar's tab.
-    pub(crate) asm_tab: crate::assembly_ui::AsmTab,
-    /// The assembly's own plane selected in its tree or the viewport.
-    pub(crate) asm_plane: Option<StandardPlane>,
-    /// A component the assembly tree scrolls to on the next frame.
-    pub(crate) asm_scroll_to: Option<oxyde_assembly::ComponentId>,
-    pub(crate) show_bom: bool,
-    pub(crate) bom_mode: oxyde_assembly::bom::BomMode,
-    /// Assembly revision the viewport shows.
-    pub(crate) asm_scene: Option<u64>,
-    /// The component being moved with Alt+drag.
-    pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
-    /// Move Component is on: a plain left-drag moves a component (Shift turns it).
-    pub(crate) move_mode: bool,
-    /// An arrow or ring of the move handle being dragged.
-    pub(crate) move_handle: Option<crate::assembly_ui::HandleDrag>,
-    /// The move handle's arrows and rings as drawn last frame, to know what the pointer
-    /// is on.
-    pub(crate) handle_shapes: crate::assembly_ui::HandleShapes,
-    /// The typed turn of Move Component about the assembly's X, Y and Z axes, in degrees
-    /// (radians only once applied).
-    pub(crate) move_angles: [f64; 3],
-    /// A component whose part should open once unsaved changes are dealt with.
-    pub(crate) pending_open_component: Option<crate::assembly::Occurrence>,
-    /// The assemblies set aside while a component is edited in place, outermost first.
-    pub(crate) edit_stack: Vec<crate::edit_in_place::Suspended>,
-    /// An action to take once editing in place is finished, level by level.
-    pub(crate) after_unwind: Option<PendingAction>,
-    /// The edit locks this window holds (one per open document).
-    pub(crate) locks: crate::lockfile::Locks,
-    /// File › Export STL, while its window is open.
-    pub(crate) mesh_export: Option<crate::mesh_export::MeshExportDialog>,
-    /// File › Export › Image: the picture settings window.
-    pub(crate) image_export: Option<crate::export::ImageExportDialog>,
-    /// File › Export › Drawing: the sheet's settings and its views.
-    pub(crate) drawing_export: Option<crate::drawing_export::DrawingExport>,
-    /// The Render tab: its render and the meshes it is made from.
-    pub(crate) render: crate::render_ui::RenderView,
-    /// The Simulation tab: the study, its mesh and results.
-    pub(crate) simulation: crate::simulation_ui::SimulationView,
-    /// The GPU device egui draws with, when the window has one: the Render tab traces on
-    /// it.
-    pub(crate) wgpu_state: Option<eframe::egui_wgpu::RenderState>,
-    pub(crate) prefs: crate::prefs::Preferences,
-    pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
-    pub(crate) debug_stats: crate::prefs_ui::DebugStats,
-    /// Where the viewport was last drawn, for the debug overlay.
-    pub(crate) viewport_rect: egui::Rect,
-    pub(crate) splash: crate::splash::Splash,
-    /// Decoded texture images of the open documents.
-    pub(crate) texture_cache: crate::appearance_ui::TextureCache,
-    /// The user's material library (`materials.json` next to the preferences).
-    pub(crate) materials: oxyde_model::MaterialLibrary,
-    /// Tools › Materials…: the library editor.
-    pub(crate) materials_window: crate::materials_ui::MaterialsWindow,
-    /// A question asked before something is done (over every other window).
-    pub(crate) confirm: Option<crate::materials_ui::Confirm>,
-    /// Work going on off the UI thread, with its progress window.
-    pub(crate) job: Option<crate::jobs::Job>,
-    /// The assistant panel (the *MCP* button): an agent modelling on this document.
-    pub(crate) assistant: crate::assistant::Assistant,
-    /// A bug caught (a panic in a rebuild or in a frame), shown until dismissed.
-    pub(crate) internal_error: Option<crate::dialogs::InternalErrorReport>,
-    /// Frames in a row that ended in a caught panic.
-    failed_frames: u32,
+/// Declares the application's state in two parts: what every window shares (the kernel,
+/// the preferences, the material library) and what each document window has of its own.
+/// It makes [`OxydeApp`] with both, [`DocWindow`] with the window part, and
+/// [`OxydeApp::swap_window`], which trades the window part between them (`windows.rs`).
+macro_rules! app_state {
+    (
+        shared { $( $(#[$sm:meta])* $svis:vis $sf:ident : $st:ty, )* }
+        window { $( $(#[$wm:meta])* $wvis:vis $wf:ident : $wt:ty, )* }
+    ) => {
+        pub struct OxydeApp {
+            $( $(#[$sm])* $svis $sf: $st, )*
+            $( $(#[$wm])* $wvis $wf: $wt, )*
+        }
+
+        /// One document window's own state: everything of [`OxydeApp`] but what the
+        /// windows share.
+        pub(crate) struct DocWindow {
+            $( $(#[$wm])* pub(crate) $wf: $wt, )*
+        }
+
+        /// What the windows share.
+        struct Shared {
+            $( $sf: $st, )*
+        }
+
+        impl OxydeApp {
+            fn assemble(shared: Shared, window: DocWindow) -> Self {
+                Self {
+                    $( $sf: shared.$sf, )*
+                    $( $wf: window.$wf, )*
+                }
+            }
+
+            /// Trades the window state the application holds for `window`'s.
+            pub(crate) fn swap_window(&mut self, window: &mut DocWindow) {
+                $( std::mem::swap(&mut self.$wf, &mut window.$wf); )*
+            }
+        }
+    };
+}
+
+app_state! {
+    shared {
+        pub(crate) kernel: AppKernel,
+        /// The GPU device egui draws with, when the window has one: the Render tab traces on
+        /// it.
+        pub(crate) wgpu_state: Option<eframe::egui_wgpu::RenderState>,
+        pub(crate) prefs: crate::prefs::Preferences,
+        pub(crate) prefs_window: crate::prefs_ui::PrefsWindow,
+        pub(crate) debug_stats: crate::prefs_ui::DebugStats,
+        pub(crate) splash: crate::splash::Splash,
+        /// Decoded texture images of the open documents.
+        pub(crate) texture_cache: crate::appearance_ui::TextureCache,
+        /// The user's material library (`materials.json` next to the preferences).
+        pub(crate) materials: oxyde_model::MaterialLibrary,
+        /// Tools › Materials…: the library editor.
+        pub(crate) materials_window: crate::materials_ui::MaterialsWindow,
+        /// A bug caught (a panic in a rebuild or in a frame), shown until dismissed.
+        pub(crate) internal_error: Option<crate::dialogs::InternalErrorReport>,
+        /// Frames in a row that ended in a caught panic.
+        failed_frames: u32,
+        /// The document windows besides the main one, each with its own document, shown as
+        /// its own OS window (`windows.rs`).
+        pub(crate) windows: Vec<crate::windows::ExtraWindow>,
+        /// Every window's title and the documents it has open, gathered at the start of a
+        /// frame: what the Window menu lists and what a file already open is found by.
+        pub(crate) window_list: Vec<crate::windows::WindowEntry>,
+        /// The number the next extra window's id is made from.
+        pub(crate) next_window: u64,
+    }
+    window {
+        pub(crate) doc: Document,
+        pub(crate) viewport: Viewport,
+        pub(crate) selected_feature: Option<FeatureId>,
+        /// Several features selected in the timeline (Ctrl+click, Shift+click), including
+        /// `selected_feature`, which anchors it; empty for a plain selection.
+        pub(crate) selected_features: Vec<FeatureId>,
+        pub(crate) selected_plane: Option<StandardPlane>,
+        /// A body selected in the Solid Bodies folder.
+        pub(crate) selected_body: Option<oxyde_model::BodyId>,
+        /// The Solid Bodies folder is open in the timeline.
+        pub(crate) bodies_expanded: bool,
+        /// Which tab of the left panel is shown: the feature tree or the configurations.
+        pub(crate) left_tab: crate::configurations_ui::LeftTab,
+        pub(crate) configurations_panel: crate::configurations_ui::ConfigurationsPanel,
+        pub(crate) selection: Vec<Selected>,
+        pub(crate) dialog: Option<Dialog>,
+        /// The sketch being edited, when in sketch mode.
+        pub(crate) sketch: Option<SketchSession>,
+        /// Tools › Equations window (equations, global variables and dimensions).
+        pub(crate) equations: EquationsWindow,
+        /// The part's Equations folder is open in its tree.
+        pub(crate) part_equations_expanded: bool,
+        /// The assembly's Equations folder is open in its tree, and those of these components.
+        pub(crate) asm_equations_expanded: bool,
+        pub(crate) asm_part_equations_expanded: std::collections::HashSet<oxyde_assembly::ComponentId>,
+        /// Nodes open in the tree of the assembly a part is edited in (`in_place_tree.rs`).
+        pub(crate) place_expanded: std::collections::HashSet<crate::in_place_tree::Node>,
+        pub(crate) status: String,
+        pub(crate) tab: CommandTab,
+        /// A sketch tool clicked outside sketch mode: picked once the new sketch opens.
+        pub(crate) pending_tool: Option<Tool>,
+        /// The sketch open is the hole positions of the Hole Wizard, which opens on leaving it.
+        pub(crate) hole_positions: bool,
+        pub(crate) show_mass_properties: bool,
+        pub(crate) show_measure: bool,
+        /// The distance Measure found between the two selected faces or edges, for the
+        /// document revision and selection it was measured for.
+        pub(crate) measure_cache: Option<crate::evaluate::MeasureCache>,
+        pub(crate) asm_measure_cache: Option<crate::evaluate::AsmMeasureCache>,
+        /// Evaluate › Interference Detection, while its window is open (assemblies).
+        pub(crate) interference: Option<crate::interference::InterferenceWindow>,
+        /// Evaluate › Section View, while its window is open.
+        pub(crate) section: Option<crate::section_view::SectionView>,
+        /// Which planes, axes, sketches and origins are drawn.
+        pub(crate) visibility: crate::display::Visibility,
+        /// Features expanded in the timeline (showing the sketch they absorb).
+        pub(crate) expanded: std::collections::HashSet<FeatureId>,
+        /// A feature the timeline scrolls to on the next frame (selected in the viewport).
+        pub(crate) scroll_to_feature: Option<FeatureId>,
+        /// Document revision the viewport currently shows.
+        pub(crate) scene_revision: Option<u64>,
+        /// Status-bar summary, cached per document revision.
+        summary: Option<(u64, String)>,
+        pub(crate) window_title: String,
+        pub(crate) allow_close: bool,
+        /// The open assembly; the app is in assembly mode while there is one.
+        pub(crate) asm: Option<crate::assembly::AssemblyDoc>,
+        pub(crate) mate_dialog: Option<crate::assembly_ui::MateDialog>,
+        pub(crate) mate_preview: Option<crate::assembly_ui::MatePreview>,
+        /// The open feature command's feature, built and shown in the viewport.
+        pub(crate) preview: Option<crate::preview::Preview>,
+        /// The assembly command bar's tab.
+        pub(crate) asm_tab: crate::assembly_ui::AsmTab,
+        /// The assembly's own plane selected in its tree or the viewport.
+        pub(crate) asm_plane: Option<StandardPlane>,
+        /// A component the assembly tree scrolls to on the next frame.
+        pub(crate) asm_scroll_to: Option<oxyde_assembly::ComponentId>,
+        pub(crate) show_bom: bool,
+        pub(crate) bom_mode: oxyde_assembly::bom::BomMode,
+        /// Assembly revision the viewport shows.
+        pub(crate) asm_scene: Option<u64>,
+        /// The component being moved with Alt+drag.
+        pub(crate) grabbing: Option<oxyde_assembly::ComponentId>,
+        /// Move Component is on: a plain left-drag moves a component (Shift turns it).
+        pub(crate) move_mode: bool,
+        /// An arrow or ring of the move handle being dragged.
+        pub(crate) move_handle: Option<crate::assembly_ui::HandleDrag>,
+        /// The move handle's arrows and rings as drawn last frame, to know what the pointer
+        /// is on.
+        pub(crate) handle_shapes: crate::assembly_ui::HandleShapes,
+        /// The typed turn of Move Component about the assembly's X, Y and Z axes, in degrees
+        /// (radians only once applied).
+        pub(crate) move_angles: [f64; 3],
+        /// A component whose part should open once unsaved changes are dealt with.
+        pub(crate) pending_open_component: Option<crate::assembly::Occurrence>,
+        /// The assemblies set aside while a component is edited in place, outermost first.
+        pub(crate) edit_stack: Vec<crate::edit_in_place::Suspended>,
+        /// An action to take once editing in place is finished, level by level.
+        pub(crate) after_unwind: Option<PendingAction>,
+        /// The edit locks this window holds (one per open document).
+        pub(crate) locks: crate::lockfile::Locks,
+        /// File › Export STL, while its window is open.
+        pub(crate) mesh_export: Option<crate::mesh_export::MeshExportDialog>,
+        /// File › Export › Image: the picture settings window.
+        pub(crate) image_export: Option<crate::export::ImageExportDialog>,
+        /// File › Export › Drawing: the sheet's settings and its views.
+        pub(crate) drawing_export: Option<crate::drawing_export::DrawingExport>,
+        /// The Render tab: its render and the meshes it is made from.
+        pub(crate) render: crate::render_ui::RenderView,
+        /// The Simulation tab: the study, its mesh and results.
+        pub(crate) simulation: crate::simulation_ui::SimulationView,
+        /// Where the viewport was last drawn, for the debug overlay.
+        pub(crate) viewport_rect: egui::Rect,
+        /// A question asked before something is done (over every other window).
+        pub(crate) confirm: Option<crate::materials_ui::Confirm>,
+        /// Work going on off the UI thread, with its progress window.
+        pub(crate) job: Option<crate::jobs::Job>,
+        /// The assistant panel (the *MCP* button): an agent modelling on this document.
+        pub(crate) assistant: crate::assistant::Assistant,
+    }
 }
 
 impl OxydeApp {
@@ -333,12 +386,19 @@ impl OxydeApp {
         }
         app.apply_preferences(&cc.egui_ctx);
         app.wgpu_state = cc.wgpu_render_state.clone();
-        if let Some(state) = &cc.wgpu_render_state {
+        app.viewport = app.new_viewport();
+        app
+    }
+
+    /// A viewport for a new window: on the graphics card when the application has one.
+    pub(crate) fn new_viewport(&self) -> Viewport {
+        let mut viewport = Viewport::new();
+        if let Some(state) = &self.wgpu_state {
             let info = state.adapter.get_info();
-            app.viewport.enable_gpu(
+            viewport.enable_gpu(
                 crate::gpu::GpuViewport::new(
                     state,
-                    if app.prefs.graphics.antialiasing {
+                    if self.prefs.graphics.antialiasing {
                         crate::gpu::DEFAULT_SAMPLES
                     } else {
                         1
@@ -347,14 +407,39 @@ impl OxydeApp {
                 format!("GPU: {} ({:?})", info.name, info.backend),
             );
         }
-        app
+        viewport
     }
 
     /// The application before it has a window: an empty part, the standard materials, no
     /// GPU, and nothing applied to egui yet. Tests build it to draw panels headlessly.
     pub(crate) fn blank(prefs: crate::prefs::Preferences, file: Option<PathBuf>) -> Self {
+        Self::assemble(
+            Shared {
+                kernel: AppKernel::new(crate::kernel::chosen()),
+                wgpu_state: None,
+                prefs,
+                prefs_window: Default::default(),
+                debug_stats: Default::default(),
+                // The file to open, if any, is opened by the splash screen's last step.
+                splash: crate::splash::Splash::new(file),
+                texture_cache: Default::default(),
+                materials: oxyde_model::MaterialLibrary::standard(),
+                materials_window: Default::default(),
+                internal_error: None,
+                failed_frames: 0,
+                windows: Vec::new(),
+                window_list: Vec::new(),
+                next_window: 1,
+            },
+            DocWindow::fresh(),
+        )
+    }
+}
+
+impl DocWindow {
+    /// A window's state with nothing open yet: an empty part, as the application starts.
+    pub(crate) fn fresh() -> Self {
         Self {
-            kernel: AppKernel::new(crate::kernel::chosen()),
             doc: Document::new(),
             viewport: Viewport::new(),
             selected_feature: None,
@@ -413,24 +498,15 @@ impl OxydeApp {
             drawing_export: None,
             render: Default::default(),
             simulation: Default::default(),
-            wgpu_state: None,
-            prefs,
-            prefs_window: Default::default(),
-            debug_stats: Default::default(),
             viewport_rect: egui::Rect::NOTHING,
-            // The file to open, if any, is opened by the splash screen's last step.
-            splash: crate::splash::Splash::new(file),
-            texture_cache: Default::default(),
-            materials: oxyde_model::MaterialLibrary::standard(),
-            materials_window: Default::default(),
             confirm: None,
             job: None,
             assistant: Default::default(),
-            internal_error: None,
-            failed_frames: 0,
         }
     }
+}
 
+impl OxydeApp {
     // ---- Model changes -----------------------------------------------------------------------
 
     pub(crate) fn rebuild(&mut self) {
@@ -954,6 +1030,15 @@ impl OxydeApp {
     // ---- Files -------------------------------------------------------------------------------
 
     pub(crate) fn guard(&mut self, action: PendingAction, ctx: &egui::Context) {
+        // A document opened in a new window discards nothing here.
+        if matches!(
+            action,
+            PendingAction::Open | PendingAction::OpenRecent(_) | PendingAction::OpenStep
+        ) && self.opens_in_new_window()
+        {
+            self.perform(action, ctx);
+            return;
+        }
         // Components edited in place are finished first, innermost first, each asking
         // about its unsaved changes; the action follows once the main assembly is back.
         if action.leaves_everything() && !self.edit_stack.is_empty() {
@@ -975,7 +1060,11 @@ impl OxydeApp {
 
     pub(crate) fn perform(&mut self, action: PendingAction, ctx: &egui::Context) {
         use oxyde_format::{ASSEMBLY_EXTENSION, LEGACY_PART_EXTENSION, PART_EXTENSION};
-        if action.leaves_everything() {
+        let opening = matches!(
+            action,
+            PendingAction::Open | PendingAction::OpenRecent(_) | PendingAction::OpenStep
+        );
+        if action.leaves_everything() && !(opening && self.opens_in_new_window()) {
             // Normally finished one by one by `guard`; freed here if that was bypassed.
             self.drop_edit_stack();
         }
@@ -1006,12 +1095,12 @@ impl OxydeApp {
                     .add_filter("STEP", &["step", "stp"])
                     .pick_file()
                 {
-                    self.open_path(&path);
+                    self.open_document(&path, ctx);
                 }
             }
             PendingAction::OpenRecent(path) => {
                 if path.exists() {
-                    self.open_path(&path);
+                    self.open_document(&path, ctx);
                 } else {
                     // Moved or deleted since: say so and forget it.
                     self.status = format!("{} is no longer there", path.display());
@@ -1023,8 +1112,12 @@ impl OxydeApp {
             PendingAction::FinishEdit => self.finish_edit(ctx),
             PendingAction::OpenStep => {
                 if let Some(path) = pick_step() {
-                    self.leave_assembly();
-                    self.open_step_as_part(&path);
+                    if self.opens_in_new_window() {
+                        self.open_in_new_window(path);
+                    } else {
+                        self.leave_assembly();
+                        self.open_step_as_part(&path);
+                    }
                 }
             }
             PendingAction::ImportStepAssembly => {
@@ -2053,10 +2146,15 @@ impl OxydeApp {
     }
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested())
-            && !self.allow_close
-            && (self.any_modified() || !self.edit_stack.is_empty())
+        let close = ctx.input(|i| i.viewport().close_requested());
+        if close
+            && ctx.viewport_id() == egui::ViewportId::ROOT
+            && !self.windows.is_empty()
+            && !self.close_other_windows(ctx)
         {
+            return;
+        }
+        if close && !self.allow_close && (self.any_modified() || !self.edit_stack.is_empty()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.guard(PendingAction::Exit, ctx);
         }
@@ -2202,7 +2300,7 @@ pub(crate) fn bodies_volume<K: Kernel>(
 }
 
 impl eframe::App for OxydeApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // `OXYDE_REPAINT_TRACE`: which line of code asked for this frame, on stderr. An idle
         // window should print nothing; a line printed over and over is what keeps the
         // viewport drawing (and the graphics card busy) when nothing happens.
@@ -2212,16 +2310,9 @@ impl eframe::App for OxydeApp {
                 eprintln!("repaint: {}", causes.join(", "));
             }
         }
-        // The last net: a panic anywhere in a frame (a command applied, a panel drawn)
-        // ends the frame, not the application. See `recover_frame`.
-        let undo_before = self.doc.undo_depth();
-        match oxyde_kernel::catch_panic(|| self.frame(ctx, frame)) {
-            Ok(()) => self.failed_frames = 0,
-            Err(message) => {
-                self.recover_frame(message, undo_before);
-                ctx.request_repaint();
-            }
-        }
+        self.gather_windows();
+        self.guarded_frame(ctx);
+        self.draw_extra_windows(ctx);
         self.internal_error_window(ctx);
     }
 
@@ -2235,6 +2326,10 @@ impl eframe::App for OxydeApp {
             }
         }
         self.assistant.shutdown();
+        let mut extras = std::mem::take(&mut self.windows);
+        for w in &mut extras {
+            w.state.assistant.shutdown();
+        }
     }
 }
 
@@ -2262,9 +2357,27 @@ impl OxydeApp {
         self.report_internal_error(crate::document::InternalError { message, undone });
     }
 
-    fn frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// One window's frame, caught: a panic anywhere in it (a command applied, a panel
+    /// drawn) ends the frame, not the application. See `recover_frame`.
+    pub(crate) fn guarded_frame(&mut self, ctx: &egui::Context) {
+        let undo_before = self.doc.undo_depth();
+        match oxyde_kernel::catch_panic(|| self.frame(ctx)) {
+            Ok(()) => self.failed_frames = 0,
+            Err(message) => {
+                self.recover_frame(message, undo_before);
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn frame(&mut self, ctx: &egui::Context) {
         self.handle_close_request(ctx);
-        self.splash_step(ctx);
+        if ctx.viewport_id() == egui::ViewportId::ROOT {
+            self.splash_step(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Tab)) {
+            self.focus_next_window(ctx);
+        }
         self.sync_locks();
         self.render_housekeeping(ctx);
         self.simulation_housekeeping(ctx);
