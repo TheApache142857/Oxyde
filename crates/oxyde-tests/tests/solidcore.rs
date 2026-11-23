@@ -362,3 +362,150 @@ fn solidcore_rebuilds_give_the_same_names() {
         );
     }
 }
+
+/// A known difference: solidcore builds an ellipse's wall from its three exact conic
+/// pieces, OpenCASCADE as one face. The measures agree, and the wall named `wall` (part 0)
+/// with OpenCASCADE is parts 1, 2 and 3 with solidcore.
+///
+/// With `exact_area`, solidcore's area is held to it instead of to OpenCASCADE's: the face
+/// areas OpenCASCADE's topology reports for a long, thin ellipse's wall are off by about
+/// 2e-4 of the whole, more than the comparison allows.
+fn known_ellipse_wall_difference(
+    name: &str,
+    make: fn() -> Part,
+    wall: &str,
+    exact_area: Option<f64>,
+) {
+    let (occt, solid) = both(make);
+    let mut problems = measures_differ(&occt, &solid);
+    if let Some(exact) = exact_area {
+        problems.retain(|p| !p.starts_with("area"));
+        assert!(
+            (solid.area - exact).abs() <= RELATIVE * exact,
+            "{name}: area {} against exactly {exact}",
+            solid.area
+        );
+    }
+    assert!(problems.is_empty(), "{name}: {}", problems.join("; "));
+    assert_eq!(solid.faces, occt.faces + 2, "{name}");
+    assert!(
+        occt.names.iter().any(|n| n == wall),
+        "{name}: {wall} in {:?}",
+        occt.names
+    );
+    let mut expected: Vec<String> = occt
+        .names
+        .iter()
+        .flat_map(|n| {
+            if n == wall {
+                (1..=3)
+                    .map(|k| n.replace("part: 0", &format!("part: {k}")))
+                    .collect()
+            } else {
+                vec![n.clone()]
+            }
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(solid.names, expected, "{name}");
+}
+
+fn an_extruded_ellipse() -> Part {
+    let mut part = Part::new();
+    let mut sketch = sketch_on_front();
+    sketch
+        .geometry
+        .ellipse(Point2::new(20.0, 10.0), Point2::new(28.0, 13.0), 3.0);
+    let s = part.add_feature(FeatureKind::Sketch(sketch));
+    part.add_feature(FeatureKind::Extrude(Extrude::blind(
+        s,
+        ExtrudeOp::Boss,
+        10.0,
+    )));
+    part
+}
+
+fn an_elliptic_hole_cut_through_a_block() -> Part {
+    let mut part = block();
+    let mut sketch = sketch_on_front();
+    sketch
+        .geometry
+        .ellipse(Point2::new(20.0, 10.0), Point2::new(26.0, 10.0), 4.0);
+    let s = part.add_feature(FeatureKind::Sketch(sketch));
+    let mut cut = Extrude::blind(s, ExtrudeOp::Cut, 10.0);
+    cut.reverse = true;
+    part.add_feature(FeatureKind::Extrude(cut));
+    part
+}
+
+#[test]
+fn an_extruded_ellipse_matches_opencascade_but_for_its_wall_in_three_pieces() {
+    // Two caps of π·a·b and a wall of the perimeter (a periodic integral, which the
+    // midpoint rule gives to rounding) times the depth.
+    let (a, b) = (73.0_f64.sqrt(), 3.0);
+    let steps = 4096;
+    let perimeter: f64 = (0..steps)
+        .map(|k| {
+            let t = std::f64::consts::TAU * (k as f64 + 0.5) / steps as f64;
+            (a * t.sin()).hypot(b * t.cos())
+        })
+        .sum::<f64>()
+        * std::f64::consts::TAU
+        / steps as f64;
+    let area = 2.0 * std::f64::consts::PI * a * b + perimeter * 10.0;
+    known_ellipse_wall_difference(
+        "extruded ellipse",
+        an_extruded_ellipse,
+        "FaceName { key: Profile { feature: FeatureId(2), segment: 3 }, part: 0 }",
+        Some(area),
+    );
+}
+
+#[test]
+fn an_elliptic_hole_matches_opencascade_but_for_its_wall_in_three_pieces() {
+    known_ellipse_wall_difference(
+        "elliptic hole",
+        an_elliptic_hole_cut_through_a_block,
+        "FaceName { key: Profile { feature: FeatureId(4), segment: 3 }, part: 0 }",
+        None,
+    );
+}
+
+/// How far a point of an edge solidcore builds from an ellipse may lie from the exact
+/// ellipse: rounding only, since its conic pieces are the ellipse itself.
+const ON_ELLIPSE: f64 = 1e-9;
+
+#[test]
+fn the_edges_solidcore_builds_from_an_ellipse_lie_on_it() {
+    let ellipse = oxyde_geom::Ellipse2 {
+        center: Point2::new(20.0, 10.0),
+        major: Point2::new(28.0, 13.0),
+        minor: 3.0,
+    };
+    let mut kernel = SolidcoreKernel::new();
+    let mut part = an_extruded_ellipse();
+    part.rebuild(&mut kernel);
+    let body = part.body().expect("a body");
+    let topology = &body.topology;
+    let mut checked = 0;
+    for edge in &topology.edges {
+        let ends: Vec<Point3> = edge
+            .vertices
+            .iter()
+            .filter_map(|v| topology.vertices.get(*v as usize).map(|v| v.point))
+            .collect();
+        // The cap edges, at either end of the extrusion along Z.
+        let z = edge.midpoint.z;
+        if !(z.abs() < ON_ELLIPSE || (z - 10.0).abs() < ON_ELLIPSE) {
+            continue;
+        }
+        for p in ends.iter().chain([&edge.midpoint]) {
+            let q = Point2::new(p.x, p.y);
+            let off = ellipse.at(ellipse.angle_of(q)).distance(q);
+            assert!(off < ON_ELLIPSE, "{p:?} is {off} off the ellipse");
+        }
+        checked += 1;
+    }
+    // Three pieces at each end.
+    assert_eq!(checked, 6);
+}
