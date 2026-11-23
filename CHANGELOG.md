@@ -5,7 +5,7 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### SolidCraft's kernel, a first trial (unreleased, November 2026)
+### SolidCraft's kernel, a first trial (0.0.11, November 2026)
 
 - **solidcore**, the geometry kernel of SolidCraft, can build parts in a build made with the
   `solidcore` feature: Preferences › Debug › Kernel, or `oxyde --kernel solidcore`. It builds
@@ -14,7 +14,7 @@ release yet; the git history has every detail.
   assistant panel keeps to OpenCASCADE. Part files record `"kernel": "solidcore"`. OpenCASCADE
   stays the default, and builds without the feature are unchanged.
 
-### Choose the kernel at start (unreleased, November 2026)
+### Choose the kernel at start (0.0.11, November 2026)
 
 - **Preferences › Debug › Kernel** chooses the geometry kernel parts are built with, from the
   next start, and `oxyde --kernel occt` chooses it for one session; an unknown name is
@@ -24,7 +24,7 @@ release yet; the git history has every detail.
 - **Part files record the kernel that built them** (`manifest.json`'s `kernel`, FORMAT.md §2):
   opening a part built by another kernel says so in the status line, since faces and edges may
   be cut and named differently. Older files read as built by OpenCASCADE.
-### Studio theme and a modern look (unreleased, November 2026)
+### Studio theme and a modern look (0.0.11, November 2026)
 
 - **Studio theme** (Preferences › Graphics › Interface): a quiet light look with white and
   very light grey panels, hairline dividers and a clear blue accent, over a soft grey-to-white
@@ -56,7 +56,7 @@ release yet; the git history has every detail.
   icons along the bottom of the window, in order, with the rollback marker among them. A click
   selects a feature, a double click edits it, and its menu rolls back to before it.
 
-### Convert Entities projects part geometry onto the sketch (unreleased, November 2026)
+### Convert Entities projects part geometry onto the sketch (0.0.11, November 2026)
 
 - **Convert Entities copies part edges and vertices from anywhere on the part**, projected
   onto the sketch plane along its normal, as SolidWorks does: the edges of a boss on the far
@@ -68,7 +68,7 @@ release yet; the git history has every detail.
   yet, so only its vertex is offered. The copies are fixed where they are and do not follow
   later changes to the part. Snapping while drawing still uses only the edges in the plane.
 
-### Rotate in Move Component (unreleased, November 2026)
+### Rotate in Move Component (0.0.11, November 2026)
 
 - **Move Component turns parts about one axis, by dragging or by typed angles**, as
   SolidWorks' Rotate Component, to line up imported parts such as a circuit board. The handle
@@ -79,7 +79,7 @@ release yet; the git history has every detail.
   X first, then Y, then Z). Each drag and each Apply is one undo step; a fixed component does
   not turn. Shift+drag still turns a component freely.
 
-### The MCP server and an idle window (November 2026)
+### The MCP server and an idle window (0.0.11, November 2026)
 
 - **A mated part no longer flies off along the faces it is mated to.** When the mates left a
   part free to slide (a board against a plate and one edge, say), the solver could push it
