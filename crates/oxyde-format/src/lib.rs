@@ -70,10 +70,15 @@ pub const FORMAT_VERSION: u32 = 1;
 
 /// The newest `format_version` of parts this crate reads: 2 adds the reference planes
 /// other than offset ones (at an angle, through a line, through three points, normal to a
-/// curve), 3 ellipses and elliptic arcs in sketches. A part is written with the oldest
-/// version that holds what it has, so older readers still open it, and refuse the others
-/// with a clear message instead of failing on a plane or a curve they cannot read.
-pub const PART_FORMAT_VERSION: u32 = 3;
+/// curve), 3 ellipses and elliptic arcs in sketches, 4 splines in sketches. A part is
+/// written with the oldest version that holds what it has, so older readers still open it,
+/// and refuse the others with a clear message instead of failing on a plane or a curve they
+/// cannot read.
+pub const PART_FORMAT_VERSION: u32 = 4;
+
+/// The `format_version` of parts whose sketches hold an ellipse or an elliptic arc (and no
+/// spline).
+pub const ELLIPSE_PART_FORMAT_VERSION: u32 = 3;
 
 /// The `format_version` of parts holding a reference plane other than an offset one (and
 /// no ellipse).
@@ -370,24 +375,29 @@ fn check_version(found: u32, newest: u32) -> Result<(), FormatError> {
     Ok(())
 }
 
-/// The `format_version` a part is written with: 3 when a sketch holds an ellipse or an
-/// elliptic arc, 2 when it holds a reference plane other than an offset one, else 1, which
-/// readers of version 1 still open.
+/// The `format_version` a part is written with: 4 when a sketch holds a spline, 3 when one
+/// holds an ellipse or an elliptic arc, 2 when the part holds a reference plane other than
+/// an offset one, else 1, which readers of version 1 still open.
 pub fn part_version(definition: &PartDefinition) -> u32 {
-    let ellipse = definition.features.iter().any(|f| match f.kind() {
-        FeatureKind::Sketch(sketch) => sketch.geometry.entities().iter().any(|e| {
-            matches!(
-                e.geometry,
-                Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }
-            )
-        }),
-        _ => false,
-    });
+    let holds = |wanted: fn(&Geometry) -> bool| {
+        definition.features.iter().any(|f| match f.kind() {
+            FeatureKind::Sketch(sketch) => sketch
+                .geometry
+                .entities()
+                .iter()
+                .any(|e| wanted(&e.geometry)),
+            _ => false,
+        })
+    };
+    let spline = holds(|g| matches!(g, Geometry::Spline(_)));
+    let ellipse = holds(|g| matches!(g, Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }));
     let new_plane = definition.features.iter().any(
         |f| matches!(f.kind(), FeatureKind::Plane(p) if !matches!(p, RefPlane::Offset { .. })),
     );
-    if ellipse {
+    if spline {
         PART_FORMAT_VERSION
+    } else if ellipse {
+        ELLIPSE_PART_FORMAT_VERSION
     } else if new_plane {
         PLANE_PART_FORMAT_VERSION
     } else {
@@ -1479,13 +1489,13 @@ mod tests {
 
     #[test]
     fn newer_versions_are_refused() {
-        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":4");
+        let manifest = MANIFEST_V1.replace("\"format_version\":1", "\"format_version\":5");
         let bytes = archive_with(&[(MANIFEST, &manifest)]);
         assert!(matches!(
             read_part(Cursor::new(bytes)),
             Err(FormatError::UnsupportedVersion {
-                found: 4,
-                supported: 3
+                found: 5,
+                supported: 4
             })
         ));
     }
@@ -1538,6 +1548,34 @@ mod tests {
             })
         ));
         assert!(check_version(version as u32, PART_FORMAT_VERSION).is_ok());
+    }
+
+    #[test]
+    fn a_part_with_a_spline_is_version_4_and_reads_back() {
+        let mut part = Part::new();
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Front));
+        let poles = [(0.0, 0.0), (2.0, 6.0), (8.0, 6.0), (10.0, 0.0)]
+            .map(|(x, y)| sketch.geometry.point(Point2::new(x, y)))
+            .to_vec();
+        sketch.geometry.spline_on(oxyde_sketch::SplineDef {
+            poles,
+            weights: vec![1.0, 0.5, 2.0, 1.0],
+            knots: vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            degree: 3,
+        });
+        part.add_feature(FeatureKind::Sketch(sketch));
+        let mut file = PartFile::new();
+        file.definition = part.definition();
+        assert_eq!(written_version(&file), 4);
+        assert_eq!(round_trip(&file), file);
+        // A reader of version 3 refuses it with a message.
+        assert!(matches!(
+            check_version(4, ELLIPSE_PART_FORMAT_VERSION),
+            Err(FormatError::UnsupportedVersion {
+                found: 4,
+                supported: 3
+            })
+        ));
     }
 
     #[test]

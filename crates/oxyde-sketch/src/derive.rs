@@ -79,6 +79,9 @@ impl ConstrainedSketch {
                 Geometry::Line { start, end }
                 | Geometry::Arc { start, end, .. }
                 | Geometry::EllipticArc { start, end, .. } => start == point || end == point,
+                Geometry::Spline(ref spline) => {
+                    spline.poles.first() == Some(&point) || spline.poles.last() == Some(&point)
+                }
                 _ => false,
             })
             .map(|e| e.id)
@@ -429,7 +432,10 @@ impl ConstrainedSketch {
                 }
                 Some((Curve::Circle(self.position(center)?, r), Some(r)))
             }
-            Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => None,
+            Geometry::Point(_)
+            | Geometry::Ellipse { .. }
+            | Geometry::EllipticArc { .. }
+            | Geometry::Spline(_) => None,
         }
     }
 
@@ -534,7 +540,9 @@ impl ConstrainedSketch {
                     Geometry::Circle { center, .. } => {
                         arc_polyline(self.position(center)?, *plan.radii.get(&link.id)?, 0.0, TAU)
                     }
-                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => return None,
+                    Geometry::Ellipse { .. }
+                    | Geometry::EllipticArc { .. }
+                    | Geometry::Spline(_) => return None,
                     Geometry::Point(_) => continue,
                 };
                 out.push(polyline);
@@ -643,7 +651,9 @@ impl ConstrainedSketch {
                         self.constrain(Constraint::Radius(id, radius));
                         id
                     }
-                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => return None,
+                    Geometry::Ellipse { .. }
+                    | Geometry::EllipticArc { .. }
+                    | Geometry::Spline(_) => return None,
                     Geometry::Point(_) => continue,
                 };
                 self.set_construction(new, entity.construction);

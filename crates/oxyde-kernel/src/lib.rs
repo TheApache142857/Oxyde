@@ -455,6 +455,43 @@ pub struct Distance {
     pub on_b: Point3,
 }
 
+/// A curve in space as a non-uniform rational B-spline: `poles.len() + degree + 1` knots,
+/// the first and the last `degree + 1` of them equal (clamped), and one weight per pole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nurbs3 {
+    pub degree: u32,
+    pub poles: Vec<Point3>,
+    pub weights: Vec<f64>,
+    pub knots: Vec<f64>,
+}
+
+/// The curve of an edge, as far as the edge reaches ([`Kernel::edge_curve`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EdgeCurve {
+    Line {
+        start: Point3,
+        end: Point3,
+    },
+    /// A circle (both radii equal) or an ellipse: the point at angle `t` is
+    /// `center + major·cos t·x_dir + minor·sin t·y_dir`, and the edge runs from angle
+    /// `start` up to `end` (`end − start` is 2π for a whole one).
+    Conic {
+        center: Point3,
+        x_dir: Vec3,
+        y_dir: Vec3,
+        major: f64,
+        minor: f64,
+        start: f64,
+        end: f64,
+    },
+    /// Any other curve. `exact` is false when the kernel had to approximate it (an offset
+    /// curve), within a micrometre.
+    Nurbs {
+        curve: Nurbs3,
+        exact: bool,
+    },
+}
+
 /// Where an edge passes closest to a point, and which way it runs there
 /// ([`Kernel::edge_tangent`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -686,6 +723,14 @@ pub trait Kernel {
         near: Point3,
     ) -> Result<Option<EdgeTangent>, Self::Error> {
         let _ = (shape, edge, near);
+        Ok(None)
+    }
+
+    /// The curve of edge `edge` of `shape` (by index in its [`Topology`]), exactly, from
+    /// its start to its end: what Convert Entities copies into a sketch. `Ok(None)` for an
+    /// edge without length, and when the kernel cannot tell, which is the default.
+    fn edge_curve(&self, shape: ShapeHandle, edge: u32) -> Result<Option<EdgeCurve>, Self::Error> {
+        let _ = (shape, edge);
         Ok(None)
     }
 

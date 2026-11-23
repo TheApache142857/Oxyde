@@ -13,11 +13,11 @@
 use std::collections::HashSet;
 
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, Vec2};
-use oxyde_geom::{Ellipse2, LINEAR_TOLERANCE, Plane, Point2};
+use oxyde_geom::{Ellipse2, LINEAR_TOLERANCE, Nurbs2, Plane, Point2};
 use oxyde_model::FeatureId;
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, ConstraintState, Definition, EntityId, Geometry, RelationId,
-    SolveReport,
+    SolveReport, SplineDef,
 };
 
 use crate::icons::Icon;
@@ -967,7 +967,10 @@ impl SketchSession {
                 Some(Geometry::Point(_)) => points.push(*id),
                 Some(Geometry::Line { .. }) => lines.push(*id),
                 Some(Geometry::Circle { .. } | Geometry::Arc { .. }) => rounds.push(*id),
-                Some(Geometry::Ellipse { .. } | Geometry::EllipticArc { .. }) | None => {}
+                Some(
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } | Geometry::Spline(_),
+                )
+                | None => {}
             }
         }
         (points, lines, rounds)
@@ -1107,6 +1110,21 @@ impl SketchSession {
                             arc_path(c, s, f).into_iter().map(to_screen).collect();
                         path.windows(2)
                             .map(|w| segment_distance(pos, w[0], w[1]))
+                            .fold(f32::INFINITY, f32::min)
+                    }
+                    Geometry::Spline(_) => {
+                        let path: Vec<Pos2> = self
+                            .sketch
+                            .spline_of(e.id)?
+                            .points(24)
+                            .into_iter()
+                            .map(to_screen)
+                            .collect();
+                        path.windows(2)
+                            .filter_map(|w| match *w {
+                                [a, b] => Some(segment_distance(pos, a, b)),
+                                _ => None,
+                            })
                             .fold(f32::INFINITY, f32::min)
                     }
                     Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {
@@ -1873,7 +1891,7 @@ impl SketchSession {
     /// The copy of part edge `index`, fixed where it is, sharing end points with what is
     /// there already; not solved.
     fn add_converted(&mut self, index: usize) {
-        let Some(curve) = self.model.curves.get(index).copied() else {
+        let Some(curve) = self.model.curves.get(index).cloned() else {
             return;
         };
         match curve {
@@ -1921,6 +1939,29 @@ impl SketchSession {
                 if on_axis(start) && on_axis(end) {
                     self.hold_minor(id, &ellipse);
                 }
+            }
+            ModelCurve::Spline(spline) => {
+                // The poles are fixed where they are; those off the curve (all but the ends
+                // of an open spline) are construction points.
+                let last = spline.poles.len().saturating_sub(1);
+                let closed = spline.is_closed();
+                let mut poles = Vec::with_capacity(spline.poles.len());
+                for (i, at) in spline.poles.iter().enumerate() {
+                    let existed = self.sketch.entities().iter().any(
+                        |e| matches!(e.geometry, Geometry::Point(p) if p.distance(*at) < 1e-9),
+                    );
+                    let pole = self.fixed_point_at(*at);
+                    if !existed && (closed || (i != 0 && i != last)) {
+                        self.sketch.set_construction(pole, true);
+                    }
+                    poles.push(pole);
+                }
+                self.sketch.spline_on(SplineDef {
+                    poles,
+                    weights: spline.weights.clone(),
+                    knots: spline.knots.clone(),
+                    degree: u32::try_from(spline.degree).unwrap_or(u32::MAX),
+                });
             }
         }
     }
@@ -2612,7 +2653,7 @@ fn outside_placement(
                 let ellipse = s.ellipse_of(e.id)?;
                 Some((ellipse.center, ellipse.largest_radius()))
             }
-            Geometry::Line { .. } => None,
+            Geometry::Line { .. } | Geometry::Spline(_) => None,
         })
         .filter(|(p, _)| between.contains(&across(*p)))
         .map(|(p, radius)| outwards(p) + radius)
@@ -2890,6 +2931,7 @@ fn model_path(curve: &ModelCurve) -> Vec<Point2> {
             let (a0, sweep) = ellipse.sweep(start, end);
             ellipse.points(a0, sweep, 48)
         }
+        ModelCurve::Spline(ref spline) => spline.points(24),
     }
 }
 
@@ -3034,6 +3076,15 @@ fn curve_path(sketch: &ConstrainedSketch, geometry: Geometry) -> Option<Vec<Poin
             let (a0, sweep) = ellipse.sweep(at(start), at(end));
             Some(ellipse.points(a0, sweep, 48))
         }
+        Geometry::Spline(spline) => Some(
+            Nurbs2 {
+                degree: spline.degree as usize,
+                poles: spline.poles.iter().map(|p| at(*p)).collect(),
+                weights: spline.weights,
+                knots: spline.knots,
+            }
+            .points(24),
+        ),
     }
 }
 
@@ -3729,6 +3780,51 @@ mod tests {
                 "{want} in {areas:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_projected_spline_converts_fixed_and_closes_a_profile() {
+        use crate::model_refs::{ModelCurve, ModelGeometry};
+        use oxyde_geom::Nurbs2;
+        let spline = Nurbs2 {
+            degree: 3,
+            poles: vec![
+                Point2::new(0.0, 0.0),
+                Point2::new(2.0, 6.0),
+                Point2::new(8.0, 6.0),
+                Point2::new(10.0, 0.0),
+            ],
+            weights: vec![1.0; 4],
+            knots: vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        };
+        let mut session = session(ConstrainedSketch::new());
+        session.model = ModelGeometry {
+            points: Vec::new(),
+            curves: vec![
+                ModelCurve::Spline(std::sync::Arc::new(spline)),
+                ModelCurve::Line(Point2::new(10.0, 0.0), Point2::new(0.0, 0.0)),
+            ],
+            vertices: Vec::new(),
+        };
+        session.convert_chain(0);
+        let report = session.report.as_ref().unwrap();
+        assert!(report.converged, "{report:?}");
+        assert_eq!(report.degrees_of_freedom, 0, "{report:?}");
+        // The two poles off the curve are construction points; the ends are not (the
+        // sketch origin is one too).
+        let origin = session.sketch.origin();
+        let construction = session
+            .sketch
+            .entities()
+            .iter()
+            .filter(|e| {
+                e.construction && Some(e.id) != origin && matches!(e.geometry, Geometry::Point(_))
+            })
+            .count();
+        assert_eq!(construction, 2);
+        let profile = oxyde_geom::Profile::from_curves(&session.sketch.profile_segments()).unwrap();
+        let area = profile.regions[0].outer.signed_area().abs();
+        assert!((area / 32.4 - 1.0).abs() < 0.01, "{area}");
     }
 
     #[test]

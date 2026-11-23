@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
+use std::sync::Arc;
 
-use oxyde_geom::{Curve2, Ellipse2, Point2, ProfileSegment};
+use oxyde_geom::{Curve2, Ellipse2, Nurbs2, Point2, ProfileSegment};
 
 /// Identity of a sketch entity. The ids of lines, arcs, circles and ellipses are also the
 /// profile segment ids, and therefore name the faces an extrusion sweeps from them.
@@ -53,6 +54,37 @@ pub enum Geometry {
         start: EntityId,
         end: EntityId,
     },
+    Spline(SplineDef),
+}
+
+/// A rational B-spline standing on its poles, which are point entities: it starts on its
+/// first pole and ends on its last, as its first and last `degree + 1` knots are equal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplineDef {
+    pub poles: Vec<EntityId>,
+    /// One per pole, all positive.
+    pub weights: Vec<f64>,
+    /// `poles + degree + 1` of them, in order.
+    pub knots: Vec<f64>,
+    pub degree: u32,
+}
+
+impl SplineDef {
+    /// Whether the numbers fit together (the poles aside).
+    pub fn is_valid(&self) -> bool {
+        let (n, p) = (self.poles.len(), self.degree as usize);
+        let clamped = |ends: &[f64]| ends.windows(2).all(|w| w.first() == w.get(1));
+        p >= 1
+            && n > p
+            && self.weights.len() == n
+            && self.knots.len() == n + p + 1
+            && self.knots.windows(2).all(|w| w.first() <= w.get(1))
+            && self.knots.iter().all(|k| k.is_finite())
+            && self.weights.iter().all(|w| w.is_finite() && *w > 0.0)
+            && self.knots.get(..=p).is_some_and(clamped)
+            && self.knots.get(n..).is_some_and(clamped)
+            && self.knots.get(p) < self.knots.get(n)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -240,6 +272,8 @@ pub enum SketchError {
     UnknownEntity(EntityId),
     DuplicateId(EntityId),
     UnknownRelation(RelationId),
+    /// A spline whose degree, weights and knots do not fit its poles.
+    BadSpline(EntityId),
     DuplicateRelation(RelationId),
     /// A dimension name that is invalid or already used in the sketch.
     BadName(String),
@@ -257,6 +291,12 @@ impl fmt::Display for SketchError {
             SketchError::UnknownEntity(id) => write!(f, "no sketch entity {id}"),
             SketchError::DuplicateId(id) => write!(f, "sketch entity id {id} is used twice"),
             SketchError::UnknownRelation(id) => write!(f, "no sketch relation {id}"),
+            SketchError::BadSpline(id) => {
+                write!(
+                    f,
+                    "spline {id} has degree, weights or knots that do not fit its poles"
+                )
+            }
             SketchError::DuplicateRelation(id) => {
                 write!(f, "sketch relation id {id} is used twice")
             }
@@ -340,6 +380,13 @@ impl ConstrainedSketch {
             },
             origin: None,
         };
+        for e in &sketch.entities {
+            if let Geometry::Spline(ref spline) = e.geometry
+                && !spline.is_valid()
+            {
+                return Err(SketchError::BadSpline(e.id));
+            }
+        }
         sketch.layout()?;
         // Dimensions stored without a name get the next default one.
         let mut sketch = sketch;
@@ -492,6 +539,28 @@ impl ConstrainedSketch {
             start,
             end,
         })
+    }
+
+    /// A spline on existing pole points.
+    pub fn spline_on(&mut self, spline: SplineDef) -> EntityId {
+        self.push(Geometry::Spline(spline))
+    }
+
+    /// The curve of a spline where its poles are now.
+    pub fn spline_of(&self, id: EntityId) -> Option<Nurbs2> {
+        match self.entity(id)?.geometry {
+            Geometry::Spline(ref spline) => Some(Nurbs2 {
+                degree: spline.degree as usize,
+                poles: spline
+                    .poles
+                    .iter()
+                    .map(|p| self.position(*p))
+                    .collect::<Option<Vec<_>>>()?,
+                weights: spline.weights.clone(),
+                knots: spline.knots.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// A rectangle of four lines sharing their corners, with horizontal and vertical
@@ -879,6 +948,7 @@ impl ConstrainedSketch {
                         at(start),
                         at(end),
                     ),
+                    Geometry::Spline(_) => Curve2::Spline(Arc::new(self.spline_of(e.id)?)),
                 };
                 Some(ProfileSegment { id: e.id.0, curve })
             })
@@ -1051,6 +1121,7 @@ fn default_number(name: &str) -> Option<u32> {
 /// Points a curve stands on (none for a point).
 pub(crate) fn curve_points(geometry: &Geometry) -> Vec<EntityId> {
     match *geometry {
+        Geometry::Spline(ref spline) => spline.poles.clone(),
         Geometry::Point(_) => Vec::new(),
         Geometry::Line { start, end } => vec![start, end],
         Geometry::Circle { center, .. } => vec![center],
@@ -1218,6 +1289,7 @@ impl Layout {
                 v.extend(self.radius.get(&id));
                 v
             }
+            Geometry::Spline(ref spline) => spline.poles.iter().flat_map(|p| point(*p)).collect(),
         }
     }
 }
@@ -1452,12 +1524,9 @@ impl<T: Scalar, P: Fn(usize) -> T> Eval<'_, T, P> {
 
     /// The end point a line and an arc share, if any.
     fn shared_end(&self, line: EntityId, round: EntityId) -> Option<EntityId> {
-        match (
-            self.layout.kind[&line].clone(),
-            self.layout.kind[&round].clone(),
-        ) {
+        match (self.layout.kind.get(&line)?, self.layout.kind.get(&round)?) {
             (Geometry::Line { start: s, end: e }, Geometry::Arc { start, end, .. }) => {
-                [s, e].into_iter().find(|p| *p == start || *p == end)
+                [*s, *e].into_iter().find(|p| p == start || p == end)
             }
             _ => None,
         }

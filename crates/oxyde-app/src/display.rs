@@ -138,6 +138,7 @@ pub fn lone_points(sketch: &ConstrainedSketch) -> Vec<Point2> {
                 end,
                 ..
             } => used.extend([center, major, start, end]),
+            Geometry::Spline(ref spline) => used.extend(spline.poles.iter().copied()),
         }
     }
     let origin = sketch.origin();
@@ -183,6 +184,7 @@ pub fn sketch_curves(sketch: &ConstrainedSketch) -> Vec<(u32, Vec<Point2>, bool)
                 }
                 Geometry::Ellipse { .. } => sketch.ellipse_path(e.id, 64)?,
                 Geometry::EllipticArc { .. } => sketch.ellipse_path(e.id, 40)?,
+                Geometry::Spline(_) => sketch.spline_of(e.id)?.points(16),
             };
             Some((e.id.0, points, e.construction))
         })

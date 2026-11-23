@@ -66,6 +66,7 @@ impl Path {
         let whole = match first.curve {
             Curve2::Circle { radius, .. } => Some(radius > LINEAR_TOLERANCE),
             Curve2::Ellipse(ellipse) => Some(ellipse.is_valid()),
+            Curve2::Spline(ref spline) if spline.is_closed() => Some(spline.is_valid()),
             _ => None,
         };
         if let Some(valid) = whole {
@@ -91,6 +92,14 @@ impl Path {
                         a: first.id,
                         b: segment.id,
                     });
+                }
+                Curve2::Spline(ref spline) => {
+                    if !spline.is_valid() {
+                        return Err(PathError::Degenerate {
+                            segment: segment.id,
+                        });
+                    }
+                    (spline.start(), spline.end())
                 }
                 Curve2::Line { start, end }
                 | Curve2::Arc { start, end, .. }
@@ -190,6 +199,7 @@ impl Path {
         match &first.curve {
             Curve2::Circle { center, radius } => Some(Point2::new(center.x + radius, center.y)),
             Curve2::Ellipse(ellipse) => Some(ellipse.major),
+            Curve2::Spline(spline) => Some(spline.start()),
             other => other.endpoints().map(|e| e.0),
         }
     }

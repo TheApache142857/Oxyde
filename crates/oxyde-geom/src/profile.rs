@@ -6,8 +6,10 @@
 
 use std::f64::consts::{PI, TAU};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::ellipse::{Ellipse2, within};
+use crate::nurbs::{Nurbs2, SAMPLES_PER_SPAN};
 use crate::{LINEAR_TOLERANCE, Point2};
 
 /// A 2D sketch curve in plane coordinates.
@@ -35,15 +37,19 @@ pub enum Curve2 {
         mid: Point2,
         end: Point2,
     },
+    /// A rational B-spline, run from the start of its domain to the end.
+    Spline(Arc<Nurbs2>),
 }
 
 impl Curve2 {
-    /// Start and end points, or `None` for a full circle or ellipse.
+    /// Start and end points, or `None` for a full circle or ellipse and a spline that ends
+    /// where it starts.
     pub fn endpoints(&self) -> Option<(Point2, Point2)> {
-        match *self {
+        match self {
             Curve2::Line { start, end }
             | Curve2::Arc { start, end, .. }
-            | Curve2::EllipticArc { start, end, .. } => Some((start, end)),
+            | Curve2::EllipticArc { start, end, .. } => Some((*start, *end)),
+            Curve2::Spline(curve) => (!curve.is_closed()).then(|| (curve.start(), curve.end())),
             Curve2::Circle { .. } | Curve2::Ellipse(_) => None,
         }
     }
@@ -71,6 +77,7 @@ impl Curve2 {
                 mid: *mid,
                 end: *start,
             },
+            Curve2::Spline(curve) => Curve2::Spline(Arc::new(curve.reversed())),
             closed @ (Curve2::Circle { .. } | Curve2::Ellipse(_)) => closed.clone(),
         }
     }
@@ -145,6 +152,7 @@ impl Curve2 {
                 }
                 (lo, hi)
             }
+            Curve2::Spline(ref curve) => curve.range_along(ux, uy),
         }
     }
 
@@ -197,6 +205,11 @@ impl Curve2 {
                 for k in 1..ARC_SAMPLES {
                     out.push(ellipse.at(t0 + sweep * k as f64 / ARC_SAMPLES as f64));
                 }
+            }
+            Curve2::Spline(ref curve) => {
+                let mut points = curve.points(ARC_SAMPLES);
+                points.pop();
+                out.extend(points);
             }
         }
     }
@@ -350,6 +363,20 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
 
     for segment in curves {
         match segment.curve {
+            Curve2::Spline(ref curve) => {
+                if !curve.is_valid() {
+                    return Err(ProfileError::Degenerate {
+                        segment: segment.id,
+                    });
+                }
+                if curve.is_closed() {
+                    loops.push(Loop {
+                        segments: vec![segment.clone()],
+                    });
+                } else {
+                    open.push(segment.clone());
+                }
+            }
             Curve2::Circle { radius, .. } => {
                 if !(radius > LINEAR_TOLERANCE) {
                     return Err(ProfileError::InvalidCircle {
@@ -476,11 +503,12 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
     Ok(loops)
 }
 
-/// A profile curve as plain geometry, for intersections: a segment, or an arc of a circle
-/// or an ellipse running counter-clockwise from angle `start` by `sweep` radians (a full
-/// turn for a whole curve).
+/// A profile curve as plain geometry, for intersections: a segment, an arc of a circle or
+/// an ellipse running counter-clockwise from angle `start` by `sweep` radians (a full turn
+/// for a whole curve), or a spline.
 #[derive(Debug, Clone, Copy)]
-enum Shape {
+enum Shape<'a> {
+    Spline(&'a Nurbs2),
     Segment(Point2, Point2),
     Arc {
         center: Point2,
@@ -495,9 +523,10 @@ enum Shape {
     },
 }
 
-impl Shape {
-    fn of(curve: &Curve2) -> Option<Shape> {
+impl<'a> Shape<'a> {
+    fn of(curve: &'a Curve2) -> Option<Shape<'a>> {
         match *curve {
+            Curve2::Spline(ref spline) => Some(Shape::Spline(spline)),
             Curve2::Line { start, end } => Some(Shape::Segment(start, end)),
             Curve2::Circle { center, radius } => Some(Shape::Arc {
                 center,
@@ -565,6 +594,7 @@ impl Shape {
                 let (c, r) = (ellipse.center, ellipse.largest_radius());
                 (Point2::new(c.x - r, c.y - r), Point2::new(c.x + r, c.y + r))
             }
+            Shape::Spline(spline) => spline.pole_bounds(),
         };
         (
             Point2::new(lo.x - margin, lo.y - margin),
@@ -572,9 +602,11 @@ impl Shape {
         )
     }
 
-    /// Whether `p`, on the shape's line or circle, is within the segment or the arc.
+    /// Whether `p`, on the shape's line or circle, is within the segment or the arc. A
+    /// point found on a spline lies on it.
     fn spans(&self, p: Point2, tolerance: f64) -> bool {
         match *self {
+            Shape::Spline(_) => true,
             Shape::Segment(a, b) => {
                 let (dx, dy) = (b.x - a.x, b.y - a.y);
                 let length = dx.hypot(dy);
@@ -613,6 +645,9 @@ impl Shape {
 /// Points where two curves meet, or a point of their overlap when they share a stretch.
 fn meetings(a: &Shape, b: &Shape, tolerance: f64) -> Vec<Point2> {
     let candidates = match (*a, *b) {
+        (Shape::Spline(spline), other) | (other, Shape::Spline(spline)) => {
+            spline_meetings(spline, other, tolerance)
+        }
         (Shape::Segment(p, q), Shape::Segment(r, s)) => segment_crossings(p, q, r, s, tolerance),
         (Shape::Segment(p, q), Shape::Arc { center, radius, .. })
         | (Shape::Arc { center, radius, .. }, Shape::Segment(p, q)) => {
@@ -721,6 +756,48 @@ fn line_circle(p: Point2, q: Point2, c: Point2, r: f64, tolerance: f64) -> Vec<P
     }
 }
 
+/// Where a spline meets another curve: where the distance to the other curve's line,
+/// circle or ellipse changes sign or touches zero along the spline, or, for two splines,
+/// where their polylines of 32 points to a knot span cross.
+fn spline_meetings(spline: &Nurbs2, other: Shape<'_>, tolerance: f64) -> Vec<Point2> {
+    match other {
+        Shape::Segment(p, q) => {
+            let length = p.distance(q);
+            if length <= 0.0 {
+                return Vec::new();
+            }
+            spline.zeros_of(
+                |x| ((q.x - p.x) * (x.y - p.y) - (q.y - p.y) * (x.x - p.x)) / length,
+                tolerance,
+            )
+        }
+        Shape::Arc { center, radius, .. } => {
+            spline.zeros_of(|x| x.distance(center) - radius, tolerance)
+        }
+        Shape::Ellipse { ellipse, .. } => spline.zeros_of(|x| ellipse.offset(x), tolerance),
+        Shape::Spline(other) => {
+            let (a, b) = (
+                spline.points(SAMPLES_PER_SPAN),
+                other.points(SAMPLES_PER_SPAN),
+            );
+            let mut out = Vec::new();
+            for u in a.windows(2) {
+                let &[p, q] = u else { continue };
+                for v in b.windows(2) {
+                    let &[r, s] = v else { continue };
+                    let (one, two) = (Shape::Segment(p, q), Shape::Segment(r, s));
+                    out.extend(
+                        segment_crossings(p, q, r, s, tolerance)
+                            .into_iter()
+                            .filter(|x| one.spans(*x, tolerance) && two.spans(*x, tolerance)),
+                    );
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Where a line meets an ellipse: where it meets the unit circle once the ellipse's
 /// semi-axes are scaled to one.
 fn line_ellipse(p: Point2, q: Point2, ellipse: &Ellipse2, tolerance: f64) -> Vec<Point2> {
@@ -784,7 +861,7 @@ fn check_crossings(loops: &[Loop]) -> Result<(), ProfileError> {
     // Points this close are one: what the sketch solver leaves, well above rounding.
     let tolerance = 1e3 * LINEAR_TOLERANCE;
     // Each segment's id, shape and ends.
-    type Entry = (u32, Shape, Option<(Point2, Point2)>);
+    type Entry<'a> = (u32, Shape<'a>, Option<(Point2, Point2)>);
     let segments: Vec<Entry> = loops
         .iter()
         .flat_map(|l| &l.segments)
@@ -1279,5 +1356,122 @@ mod tests {
             ellipse(2, 0.0, 0.0, 6.0, 2.0),
         ];
         assert!(Profile::from_curves(&nested).is_ok());
+    }
+
+    /// A whole circle of radius `r` about (x, y) as a closed rational quadratic spline.
+    fn spline_circle(id: u32, x: f64, y: f64, r: f64) -> ProfileSegment {
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let corners = [
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (-1.0, 0.0),
+            (-1.0, -1.0),
+            (0.0, -1.0),
+            (1.0, -1.0),
+            (1.0, 0.0),
+        ];
+        ProfileSegment {
+            id,
+            curve: Curve2::Spline(Arc::new(Nurbs2 {
+                degree: 2,
+                poles: corners
+                    .iter()
+                    .map(|(u, v)| Point2::new(x + r * u, y + r * v))
+                    .collect(),
+                weights: vec![1.0, s, 1.0, s, 1.0, s, 1.0, s, 1.0],
+                knots: vec![
+                    0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0,
+                ],
+            })),
+        }
+    }
+
+    /// An open cubic from (0, 0) to (10, 0) bulging up to about y = 4.5.
+    fn spline_bump(id: u32) -> ProfileSegment {
+        ProfileSegment {
+            id,
+            curve: Curve2::Spline(Arc::new(Nurbs2 {
+                degree: 3,
+                poles: vec![
+                    Point2::new(0.0, 0.0),
+                    Point2::new(2.0, 6.0),
+                    Point2::new(8.0, 6.0),
+                    Point2::new(10.0, 0.0),
+                ],
+                weights: vec![1.0; 4],
+                knots: vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            })),
+        }
+    }
+
+    #[test]
+    fn a_closed_spline_is_a_loop_of_its_own() {
+        let mut curves = rectangle(1, 0.0, 0.0, 40.0, 20.0);
+        curves.push(spline_circle(5, 20.0, 10.0, 4.0));
+        let profile = Profile::from_curves(&curves).unwrap();
+        assert_eq!(profile.regions.len(), 1);
+        let hole = &profile.regions[0].holes[0];
+        assert_eq!(hole.segments[0].id, 5);
+        let area = hole.signed_area().abs();
+        assert!((area / (PI * 16.0) - 1.0).abs() < 0.01, "{area}");
+        assert!(curves[4].curve.endpoints().is_none());
+        // Exactly as far as the circle reaches.
+        let (lo, hi) = curves[4].curve.range_along(1.0, 0.0);
+        assert!(
+            (lo - 16.0).abs() < 1e-12 && (hi - 24.0).abs() < 1e-12,
+            "{lo} {hi}"
+        );
+    }
+
+    #[test]
+    fn an_open_spline_chains_with_lines_either_way_round() {
+        for reversed in [false, true] {
+            let mut bump = spline_bump(1);
+            if reversed {
+                bump.curve = bump.curve.reversed();
+            }
+            let curves = [bump, line(2, 0.0, 0.0, 10.0, 0.0)];
+            let profile = Profile::from_curves(&curves).unwrap();
+            assert_eq!(profile.regions.len(), 1);
+            // The area under the cubic, ∫ y dx = 162/5, from its sampled outline.
+            let area = profile.regions[0].outer.signed_area().abs();
+            assert!((area / 32.4 - 1.0).abs() < 0.01, "{area}");
+        }
+    }
+
+    #[test]
+    fn splines_that_cross_or_touch_are_refused() {
+        // The bump closed by its chord and cut by a line across it.
+        let crossed = [
+            spline_bump(1),
+            line(2, 0.0, 0.0, 10.0, 0.0),
+            line(3, 0.0, 2.0, 12.0, 2.0),
+            line(4, 12.0, 2.0, 12.0, -3.0),
+            line(5, 12.0, -3.0, 0.0, -3.0),
+            line(6, 0.0, -3.0, 0.0, 2.0),
+        ];
+        assert!(crossing(&crossed));
+        // A closed spline crossing a circle, touching one, and two crossing splines.
+        assert!(crossing(&[
+            spline_circle(1, 0.0, 0.0, 4.0),
+            circle(2, 4.0, 0.0, 2.0)
+        ]));
+        assert!(crossing(&[
+            spline_circle(1, 0.0, 0.0, 4.0),
+            circle(2, 6.0, 0.0, 2.0)
+        ]));
+        assert!(crossing(&[
+            spline_circle(1, 0.0, 0.0, 4.0),
+            spline_circle(2, 3.0, 0.0, 4.0)
+        ]));
+        assert!(
+            Profile::from_curves(&[
+                spline_circle(1, 0.0, 0.0, 4.0),
+                spline_circle(2, 0.0, 0.0, 2.0)
+            ])
+            .is_ok()
+        );
     }
 }
