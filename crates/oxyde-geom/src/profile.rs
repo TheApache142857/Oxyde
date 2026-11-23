@@ -4,9 +4,10 @@
 //! into regions (an outer boundary with its holes), the way SolidWorks turns a sketch into
 //! something it can extrude.
 
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 use std::fmt;
 
+use crate::ellipse::{Ellipse2, within};
 use crate::{LINEAR_TOLERANCE, Point2};
 
 /// A 2D sketch curve in plane coordinates.
@@ -26,14 +27,24 @@ pub enum Curve2 {
         center: Point2,
         radius: f64,
     },
+    Ellipse(Ellipse2),
+    /// Arc of an ellipse from `start` through `mid` to `end`.
+    EllipticArc {
+        ellipse: Ellipse2,
+        start: Point2,
+        mid: Point2,
+        end: Point2,
+    },
 }
 
 impl Curve2 {
-    /// Start and end points, or `None` for a full circle.
+    /// Start and end points, or `None` for a full circle or ellipse.
     pub fn endpoints(&self) -> Option<(Point2, Point2)> {
         match *self {
-            Curve2::Line { start, end } | Curve2::Arc { start, end, .. } => Some((start, end)),
-            Curve2::Circle { .. } => None,
+            Curve2::Line { start, end }
+            | Curve2::Arc { start, end, .. }
+            | Curve2::EllipticArc { start, end, .. } => Some((start, end)),
+            Curve2::Circle { .. } | Curve2::Ellipse(_) => None,
         }
     }
 
@@ -49,7 +60,18 @@ impl Curve2 {
                 mid,
                 end: start,
             },
-            circle @ Curve2::Circle { .. } => circle,
+            Curve2::EllipticArc {
+                ellipse,
+                start,
+                mid,
+                end,
+            } => Curve2::EllipticArc {
+                ellipse,
+                start: end,
+                mid,
+                end: start,
+            },
+            closed @ (Curve2::Circle { .. } | Curve2::Ellipse(_)) => closed,
         }
     }
 
@@ -99,6 +121,30 @@ impl Curve2 {
                 }
                 (lo, hi)
             }
+            Curve2::Ellipse(ellipse) => {
+                let (c, r) = (along(ellipse.center), ellipse.reach(ux, uy));
+                (c - r, c + r)
+            }
+            Curve2::EllipticArc {
+                ellipse,
+                start,
+                mid,
+                end,
+            } => {
+                let (a, b) = (along(start), along(end));
+                let (mut lo, mut hi) = (a.min(b), a.max(b));
+                let t0 = ellipse.angle_of(start);
+                let sweep = arc_sweep(t0, ellipse.angle_of(mid), ellipse.angle_of(end));
+                let far = ellipse.furthest_along(ux, uy);
+                for t in [far, far + PI] {
+                    if within(t, t0, sweep) {
+                        let p = along(ellipse.at(t));
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                }
+                (lo, hi)
+            }
         }
     }
 
@@ -132,6 +178,24 @@ impl Curve2 {
                         center.x + radius * a.cos(),
                         center.y + radius * a.sin(),
                     ));
+                }
+            }
+            Curve2::Ellipse(ellipse) => {
+                for k in 0..CIRCLE_SAMPLES {
+                    out.push(ellipse.at(TAU * k as f64 / CIRCLE_SAMPLES as f64));
+                }
+            }
+            Curve2::EllipticArc {
+                ellipse,
+                start,
+                mid,
+                end,
+            } => {
+                let t0 = ellipse.angle_of(start);
+                let sweep = arc_sweep(t0, ellipse.angle_of(mid), ellipse.angle_of(end));
+                out.push(start);
+                for k in 1..ARC_SAMPLES {
+                    out.push(ellipse.at(t0 + sweep * k as f64 / ARC_SAMPLES as f64));
                 }
             }
         }
@@ -225,6 +289,8 @@ pub enum ProfileError {
     Degenerate { segment: u32 },
     /// A circle with a non-positive radius.
     InvalidCircle { segment: u32 },
+    /// An ellipse with a semi-axis of no length.
+    InvalidEllipse { segment: u32 },
     /// Two segments cross or touch away from a shared end: contours that intersect (or a
     /// contour crossing itself) bound no region, and would give zero-thickness geometry.
     Crossing { a: u32, b: u32 },
@@ -245,6 +311,9 @@ impl fmt::Display for ProfileError {
             }
             ProfileError::InvalidCircle { segment } => {
                 write!(f, "circle {segment} has an invalid radius")
+            }
+            ProfileError::InvalidEllipse { segment } => {
+                write!(f, "ellipse {segment} has a semi-axis of no length")
             }
             ProfileError::Crossing { a, b } => write!(
                 f,
@@ -301,6 +370,29 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
             }
             Curve2::Arc { start, mid, end } => {
                 if near(start, end) || circle_through(start, mid, end).is_none() {
+                    return Err(ProfileError::Degenerate {
+                        segment: segment.id,
+                    });
+                }
+                open.push(*segment);
+            }
+            Curve2::Ellipse(ellipse) => {
+                if !ellipse.is_valid() {
+                    return Err(ProfileError::InvalidEllipse {
+                        segment: segment.id,
+                    });
+                }
+                loops.push(Loop {
+                    segments: vec![*segment],
+                });
+            }
+            Curve2::EllipticArc {
+                ellipse,
+                start,
+                mid,
+                end,
+            } => {
+                if !ellipse.is_valid() || near(start, end) || near(start, mid) || near(mid, end) {
                     return Err(ProfileError::Degenerate {
                         segment: segment.id,
                     });
@@ -385,13 +477,19 @@ fn chain_loops(curves: &[ProfileSegment]) -> Result<Vec<Loop>, ProfileError> {
 }
 
 /// A profile curve as plain geometry, for intersections: a segment, or an arc of a circle
-/// running counter-clockwise from `start` by `sweep` radians (a full turn for a circle).
+/// or an ellipse running counter-clockwise from angle `start` by `sweep` radians (a full
+/// turn for a whole curve).
 #[derive(Debug, Clone, Copy)]
 enum Shape {
     Segment(Point2, Point2),
     Arc {
         center: Point2,
         radius: f64,
+        start: f64,
+        sweep: f64,
+    },
+    Ellipse {
+        ellipse: Ellipse2,
         start: f64,
         sweep: f64,
     },
@@ -424,6 +522,30 @@ impl Shape {
                     sweep,
                 })
             }
+            Curve2::Ellipse(ellipse) => Some(Shape::Ellipse {
+                ellipse,
+                start: 0.0,
+                sweep: TAU,
+            }),
+            Curve2::EllipticArc {
+                ellipse,
+                start,
+                mid,
+                end,
+            } => {
+                let a0 = ellipse.angle_of(start);
+                let sweep = arc_sweep(a0, ellipse.angle_of(mid), ellipse.angle_of(end));
+                let (start, sweep) = if sweep >= 0.0 {
+                    (a0, sweep)
+                } else {
+                    (ellipse.angle_of(end), -sweep)
+                };
+                Some(Shape::Ellipse {
+                    ellipse,
+                    start,
+                    sweep,
+                })
+            }
         }
     }
 
@@ -439,6 +561,10 @@ impl Shape {
                 Point2::new(center.x - radius, center.y - radius),
                 Point2::new(center.x + radius, center.y + radius),
             ),
+            Shape::Ellipse { ellipse, .. } => {
+                let (c, r) = (ellipse.center, ellipse.largest_radius());
+                (Point2::new(c.x - r, c.y - r), Point2::new(c.x + r, c.y + r))
+            }
         };
         (
             Point2::new(lo.x - margin, lo.y - margin),
@@ -466,6 +592,18 @@ impl Shape {
                 }
                 let offset = (angle(center, p) - start).rem_euclid(TAU);
                 let slack = tolerance / radius;
+                offset <= sweep + slack || offset >= TAU - slack
+            }
+            Shape::Ellipse {
+                ellipse,
+                start,
+                sweep,
+            } => {
+                if sweep >= TAU {
+                    return true;
+                }
+                let offset = (ellipse.angle_of(p) - start).rem_euclid(TAU);
+                let slack = tolerance / ellipse.smallest_radius();
                 offset <= sweep + slack || offset >= TAU - slack
             }
         }
@@ -522,6 +660,21 @@ fn meetings(a: &Shape, b: &Shape, tolerance: f64) -> Vec<Point2> {
                 circle_circle(c1, r1, c2, r2, tolerance)
             }
         }
+        (Shape::Segment(p, q), Shape::Ellipse { ellipse, .. })
+        | (Shape::Ellipse { ellipse, .. }, Shape::Segment(p, q)) => {
+            line_ellipse(p, q, &ellipse, tolerance)
+        }
+        (Shape::Arc { center, radius, .. }, Shape::Ellipse { ellipse, .. })
+        | (Shape::Ellipse { ellipse, .. }, Shape::Arc { center, radius, .. }) => {
+            ellipse.zeros_of(|p| p.distance(center) - radius, tolerance)
+        }
+        (Shape::Ellipse { ellipse: e1, .. }, Shape::Ellipse { ellipse: e2, .. }) => {
+            if e1.same_as(&e2, tolerance) {
+                ellipse_overlap(a, b)
+            } else {
+                e1.zeros_of(|p| e2.offset(p), tolerance)
+            }
+        }
     };
     candidates
         .into_iter()
@@ -566,6 +719,48 @@ fn line_circle(p: Point2, q: Point2, c: Point2, r: f64, tolerance: f64) -> Vec<P
             Point2::new(foot.x + u.0 * half, foot.y + u.1 * half),
         ]
     }
+}
+
+/// Where a line meets an ellipse: where it meets the unit circle once the ellipse's
+/// semi-axes are scaled to one.
+fn line_ellipse(p: Point2, q: Point2, ellipse: &Ellipse2, tolerance: f64) -> Vec<Point2> {
+    let ((px, py), (qx, qy)) = (ellipse.scaled(p), ellipse.scaled(q));
+    line_circle(
+        Point2::new(px, py),
+        Point2::new(qx, qy),
+        Point2::ORIGIN,
+        1.0,
+        tolerance / ellipse.largest_radius(),
+    )
+    .into_iter()
+    .map(|u| ellipse.unscaled(u.x, u.y))
+    .collect()
+}
+
+/// Two arcs of one ellipse overlap if either holds an end of the other, or the middle of
+/// the second.
+fn ellipse_overlap(a: &Shape, b: &Shape) -> Vec<Point2> {
+    let mut points = Vec::new();
+    if let Shape::Ellipse {
+        ellipse,
+        start,
+        sweep,
+    } = *b
+    {
+        points.push(ellipse.at(start + sweep / 2.0));
+    }
+    for shape in [a, b] {
+        if let Shape::Ellipse {
+            ellipse,
+            start,
+            sweep,
+        } = *shape
+            && sweep < TAU
+        {
+            points.extend([ellipse.at(start), ellipse.at(start + sweep)]);
+        }
+    }
+    points
 }
 
 fn circle_circle(c1: Point2, r1: f64, c2: Point2, r2: f64, tolerance: f64) -> Vec<Point2> {
@@ -971,5 +1166,118 @@ mod tests {
         let cw = arc_sweep(0.0, -TAU / 4.0, TAU / 2.0);
         let ccw = arc_sweep(0.0, TAU / 4.0, TAU / 2.0);
         assert!(cw < 0.0 && ccw > 0.0);
+    }
+
+    /// An ellipse 2·a wide along x and 2·b high around (x, y).
+    fn ellipse(id: u32, x: f64, y: f64, a: f64, b: f64) -> ProfileSegment {
+        ProfileSegment {
+            id,
+            curve: Curve2::Ellipse(Ellipse2 {
+                center: Point2::new(x, y),
+                major: Point2::new(x + a, y),
+                minor: b,
+            }),
+        }
+    }
+
+    /// The upper half of that ellipse, counter-clockwise from (x + a, y) to (x − a, y).
+    fn upper_half(id: u32, x: f64, y: f64, a: f64, b: f64) -> ProfileSegment {
+        ProfileSegment {
+            id,
+            curve: Curve2::EllipticArc {
+                ellipse: Ellipse2 {
+                    center: Point2::new(x, y),
+                    major: Point2::new(x + a, y),
+                    minor: b,
+                },
+                start: Point2::new(x + a, y),
+                mid: Point2::new(x, y + b),
+                end: Point2::new(x - a, y),
+            },
+        }
+    }
+
+    #[test]
+    fn an_ellipse_inside_a_rectangle_is_a_hole() {
+        let mut curves = rectangle(1, 0.0, 0.0, 40.0, 20.0);
+        curves.push(ellipse(5, 20.0, 10.0, 8.0, 3.0));
+        let profile = Profile::from_curves(&curves).unwrap();
+        assert_eq!(profile.regions.len(), 1);
+        assert_eq!(profile.regions[0].holes[0].segments[0].id, 5);
+        let area = profile.regions[0].holes[0].signed_area().abs();
+        // Sampled: within a percent of π·a·b.
+        assert!((area / (PI * 8.0 * 3.0) - 1.0).abs() < 0.01, "{area}");
+        let flat = ellipse(6, 0.0, 0.0, 8.0, 0.0);
+        assert_eq!(
+            Profile::from_curves(&[flat]),
+            Err(ProfileError::InvalidEllipse { segment: 6 })
+        );
+    }
+
+    #[test]
+    fn half_an_ellipse_closed_by_its_axis_is_a_region() {
+        let curves = [
+            upper_half(1, 0.0, 0.0, 8.0, 3.0),
+            line(2, -8.0, 0.0, 8.0, 0.0),
+        ];
+        let profile = Profile::from_curves(&curves).unwrap();
+        assert_eq!(profile.regions.len(), 1);
+        let area = profile.regions[0].outer.signed_area().abs();
+        assert!((area / (PI * 8.0 * 3.0 / 2.0) - 1.0).abs() < 0.02, "{area}");
+        // Reversed, it still runs through its top.
+        let reversed = curves[0].curve.reversed();
+        let (lo, hi) = reversed.range_along(0.0, 1.0);
+        assert!(lo.abs() < 1e-12 && (hi - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_ellipse_reaches_exactly_as_far_as_its_axes() {
+        let e = ellipse(1, 1.0, 2.0, 8.0, 3.0).curve;
+        assert_eq!(e.range_along(1.0, 0.0), (-7.0, 9.0));
+        assert_eq!(e.range_along(0.0, 1.0), (-1.0, 5.0));
+        // Turned an eighth of a turn: the reach is sqrt((a² + b²) / 2).
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let (lo, hi) = e.range_along(s, s);
+        let centre = 3.0 * s;
+        let reach = ((64.0 + 9.0) / 2.0_f64).sqrt();
+        assert!((lo - (centre - reach)).abs() < 1e-12 && (hi - (centre + reach)).abs() < 1e-12);
+        // The upper half reaches its top but not its bottom.
+        let half = upper_half(1, 0.0, 0.0, 8.0, 3.0).curve;
+        assert_eq!(half.range_along(0.0, 1.0), (0.0, 3.0));
+        assert_eq!(half.endpoints().map(|e| e.0), Some(Point2::new(8.0, 0.0)));
+    }
+
+    #[test]
+    fn ellipses_that_cross_or_touch_are_refused() {
+        // Its top cut by the rectangle's top edge, and touching it.
+        let mut cut = rectangle(1, 0.0, 0.0, 40.0, 20.0);
+        cut.push(ellipse(5, 20.0, 18.0, 8.0, 3.0));
+        assert!(crossing(&cut));
+        let mut touching = rectangle(1, 0.0, 0.0, 40.0, 20.0);
+        touching.push(ellipse(5, 20.0, 17.0, 8.0, 3.0));
+        assert!(crossing(&touching));
+        // A circle crossing it, and one touching it at the end of its minor axis.
+        let crossed = [ellipse(1, 0.0, 0.0, 8.0, 3.0), circle(2, 0.0, 0.0, 5.0)];
+        assert!(crossing(&crossed));
+        let touched = [ellipse(1, 0.0, 0.0, 8.0, 3.0), circle(2, 0.0, 0.0, 3.0)];
+        assert!(crossing(&touched));
+        let inside = [ellipse(1, 0.0, 0.0, 8.0, 3.0), circle(2, 0.0, 0.0, 2.0)];
+        assert!(Profile::from_curves(&inside).is_ok());
+        // Two ellipses crossing, and the same ellipse twice.
+        let crossed = [
+            ellipse(1, 0.0, 0.0, 8.0, 3.0),
+            ellipse(2, 0.0, 0.0, 3.0, 8.0),
+        ];
+        assert!(crossing(&crossed));
+        let twice = [
+            ellipse(1, 0.0, 0.0, 8.0, 3.0),
+            ellipse(2, 0.0, 0.0, 8.0, 3.0),
+        ];
+        assert!(crossing(&twice));
+        let nested = [
+            ellipse(1, 0.0, 0.0, 8.0, 3.0),
+            ellipse(2, 0.0, 0.0, 6.0, 2.0),
+        ];
+        assert!(Profile::from_curves(&nested).is_ok());
     }
 }

@@ -76,9 +76,9 @@ impl ConstrainedSketch {
         self.entities()
             .iter()
             .filter(|e| match e.geometry {
-                Geometry::Line { start, end } | Geometry::Arc { start, end, .. } => {
-                    start == point || end == point
-                }
+                Geometry::Line { start, end }
+                | Geometry::Arc { start, end, .. }
+                | Geometry::EllipticArc { start, end, .. } => start == point || end == point,
                 _ => false,
             })
             .map(|e| e.id)
@@ -226,8 +226,9 @@ impl ConstrainedSketch {
     /// Makes a line or arc stand on `to` where it stood on `from`.
     fn replace_point(&mut self, curve: EntityId, from: EntityId, to: EntityId) {
         if let Some(e) = self.entities.iter_mut().find(|e| e.id == curve)
-            && let Geometry::Line { start, end } | Geometry::Arc { start, end, .. } =
-                &mut e.geometry
+            && let Geometry::Line { start, end }
+            | Geometry::Arc { start, end, .. }
+            | Geometry::EllipticArc { start, end, .. } = &mut e.geometry
         {
             if *start == from {
                 *start = to;
@@ -397,7 +398,8 @@ impl ConstrainedSketch {
     }
 
     /// The offset of one curve: its shifted carrier and, for circles and arcs, its new
-    /// radius. `None` when the curve would vanish.
+    /// radius. `None` when the curve would vanish, and for an ellipse, whose offset is no
+    /// ellipse.
     fn offset_link(&self, link: Link, by: f64) -> Option<(Curve, Option<f64>)> {
         match self.entity(link.id)?.geometry {
             Geometry::Line { start, end } => {
@@ -427,7 +429,7 @@ impl ConstrainedSketch {
                 }
                 Some((Curve::Circle(self.position(center)?, r), Some(r)))
             }
-            Geometry::Point(_) => None,
+            Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => None,
         }
     }
 
@@ -532,6 +534,7 @@ impl ConstrainedSketch {
                     Geometry::Circle { center, .. } => {
                         arc_polyline(self.position(center)?, *plan.radii.get(&link.id)?, 0.0, TAU)
                     }
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => return None,
                     Geometry::Point(_) => continue,
                 };
                 out.push(polyline);
@@ -639,6 +642,7 @@ impl ConstrainedSketch {
                         self.constrain(Constraint::Radius(id, radius));
                         id
                     }
+                    Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => return None,
                     Geometry::Point(_) => continue,
                 };
                 self.set_construction(new, entity.construction);

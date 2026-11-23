@@ -10,6 +10,8 @@
 //! - `{"type": "rect", "center" | "corner": [x, y], "size": [w, h], "radius": r}`: a centre
 //!   or corner rectangle, rounded with tangent arcs when `radius` is given;
 //! - `{"type": "circle", "center": [x, y], "diameter": d}` (or `"radius"`);
+//! - `{"type": "ellipse", "center": [x, y], "radii": [a, b], "angle": deg}`: semi-axis `a`
+//!   at `angle` degrees from +x (its end is the `major` point), `b` square to it;
 //! - `{"type": "slot", "start": [x, y], "end": [x, y], "width": w}`: a straight slot between
 //!   two arc centres;
 //! - `{"type": "polygon", "center": [x, y], "sides": n, "radius": r, "angle": deg}`: a
@@ -90,6 +92,7 @@ impl<'a> Builder<'a> {
         let names: Vec<(String, EntityId)> = match kind {
             "rect" | "rectangle" => self.rect(item, place)?,
             "circle" => self.circle(item, place)?,
+            "ellipse" => self.ellipse(item, place)?,
             "slot" => self.slot(item, place)?,
             "polygon" => self.polygon(item, place)?,
             "polyline" => self.polyline(item, place)?,
@@ -393,6 +396,49 @@ impl<'a> Builder<'a> {
         }
         self.locate(cp, center, place);
         Ok(vec![(String::new(), circle), ("center".to_owned(), cp)])
+    }
+
+    fn ellipse(&mut self, item: &Value, place: Place) -> Result<Vec<(String, EntityId)>> {
+        let center = self.point_arg(item, "center")?;
+        let radii = args::opt(item, "radii")
+            .and_then(Value::as_array)
+            .and_then(|r| Some((r.first()?.as_f64()?, r.get(1)?.as_f64()?)))
+            .ok_or("an ellipse needs \"radii\": [a, b]")?;
+        let (a, b) = radii;
+        if a <= EPS || b <= EPS {
+            return Err("an ellipse's radii must be more than 0".to_owned());
+        }
+        let angle = args::opt_f64(item, "angle")?.unwrap_or(0.0).to_radians();
+        let (cos, sin) = (angle.cos(), angle.sin());
+        let s = &mut *self.sketch;
+        let cp = s.point(center);
+        let major = s.point(Point2::new(center.x + a * cos, center.y + a * sin));
+        let ellipse = s.ellipse_around(cp, major, b);
+        s.constrain(Constraint::MajorRadius(ellipse, a));
+        s.constrain(Constraint::MinorRadius(ellipse, b));
+        // Its turn: level or upright by a relation, else at an angle from a horizontal
+        // construction line through the centre.
+        if sin.abs() < 1e-9 {
+            s.constrain(Constraint::HorizontalPoints(cp, major));
+        } else if cos.abs() < 1e-9 {
+            s.constrain(Constraint::VerticalPoints(cp, major));
+        } else {
+            let level = s.point(Point2::new(center.x + a, center.y));
+            let horizontal = s.line_between(cp, level);
+            s.set_construction(horizontal, true);
+            s.set_construction(level, true);
+            s.constrain(Constraint::Horizontal(horizontal));
+            s.constrain(Constraint::Length(horizontal, a));
+            let spoke = s.line_between(cp, major);
+            s.set_construction(spoke, true);
+            s.constrain(Constraint::Angle(horizontal, spoke, wrap(angle)));
+        }
+        self.locate(cp, center, place);
+        Ok(vec![
+            (String::new(), ellipse),
+            ("center".to_owned(), cp),
+            ("major".to_owned(), major),
+        ])
     }
 
     fn slot(&mut self, item: &Value, place: Place) -> Result<Vec<(String, EntityId)>> {
@@ -1028,6 +1074,9 @@ mod tests {
             json!({"type": "rect", "corner": [3, 4], "size": [100, 50], "radius": 5}),
             json!({"type": "circle", "center": [12, 7], "diameter": 4}),
             json!({"type": "circle", "center": [0, 0], "radius": 4}),
+            json!({"type": "ellipse", "center": [0, 0], "radii": [8, 3]}),
+            json!({"type": "ellipse", "center": [5, -4], "radii": [8, 3], "angle": 90}),
+            json!({"type": "ellipse", "center": [5, -4], "radii": [3, 8], "angle": 30}),
             json!({"type": "slot", "start": [0, 0], "end": [40, 0], "width": 6}),
             json!({"type": "slot", "start": [5, 5], "end": [5, 40], "width": 6}),
             json!({"type": "slot", "start": [5, 5], "end": [25, 40], "width": 6}),
@@ -1055,10 +1104,11 @@ mod tests {
             {"type": "slot", "start": [-30, -10], "end": [-10, -10], "width": 6},
             {"type": "polygon", "center": [0, 15], "sides": 6, "radius": 5},
             {"type": "polyline", "points": [[10, -25], [40, -25], [40, -5]], "fillet": 3},
+            {"type": "ellipse", "center": [-30, 15], "radii": [8, 4], "angle": 20},
         ]));
         let profile = oxyde_geom::Profile::from_curves(&sketch.profile_segments()).unwrap();
         assert_eq!(profile.regions.len(), 1);
-        assert_eq!(profile.regions[0].holes.len(), 4);
+        assert_eq!(profile.regions[0].holes.len(), 5);
         assert!(labels.contains_key("outer.top"));
         assert_eq!(dof(&sketch), 0);
     }

@@ -27,12 +27,14 @@
     )
 )]
 
+mod ellipse;
 mod path;
 mod plane;
 mod profile;
 mod transform;
 mod vector;
 
+pub use ellipse::Ellipse2;
 pub use path::{Path, PathError};
 pub use plane::Plane;
 pub use profile::{Curve2, Loop, Profile, ProfileError, ProfileSegment, Region};
