@@ -3,8 +3,8 @@ use std::f64::consts::PI;
 use oxyde_geom::{Curve2, Point2, Profile};
 
 use crate::{
-    ConstrainedSketch, Constraint::*, ConstraintState, Counters, Definition, EntityId, Geometry,
-    SketchError,
+    ConstrainedSketch, Constraint::*, ConstraintState, Counters, Definition, Entity, EntityId,
+    Geometry, SketchError, SplineDef,
 };
 
 fn close(p: Point2, x: f64, y: f64) -> bool {
@@ -305,7 +305,7 @@ fn stored_sketches_are_validated() {
     assert_eq!(rebuilt, s);
 
     let mut entities = s.entities().to_vec();
-    entities.push(entities[0]);
+    entities.push(entities[0].clone());
     assert!(matches!(
         ConstrainedSketch::from_parts(entities, Vec::new(), Counters::default()),
         Err(SketchError::DuplicateId(_))
@@ -1102,4 +1102,80 @@ fn a_mirrored_ellipse_mirrors_its_axes() {
     assert!(close(mirrored.center, -5.0, 2.0));
     assert!(close(mirrored.major, -9.0, 5.0));
     assert_eq!(mirrored.minor, 2.0);
+}
+
+/// A cubic spline on four new pole points, from (0, 0) to (10, 0), closed by a line.
+fn bump(s: &mut ConstrainedSketch) -> (EntityId, Vec<EntityId>) {
+    let poles: Vec<EntityId> = [(0.0, 0.0), (2.0, 6.0), (8.0, 6.0), (10.0, 0.0)]
+        .iter()
+        .map(|(x, y)| s.point(Point2::new(*x, *y)))
+        .collect();
+    let spline = s.spline_on(SplineDef {
+        poles: poles.clone(),
+        weights: vec![1.0; 4],
+        knots: vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        degree: 3,
+    });
+    (spline, poles)
+}
+
+#[test]
+fn a_spline_on_fixed_poles_is_fully_defined_and_closes_a_profile() {
+    let mut s = ConstrainedSketch::new();
+    let (spline, poles) = bump(&mut s);
+    for p in &poles {
+        s.constrain(Fixed(*p));
+    }
+    let (first, last) = (poles[0], poles[3]);
+    s.line_between(last, first);
+    let report = s.solve().unwrap();
+    assert!(report.converged);
+    assert_eq!(report.degrees_of_freedom, 0);
+    let segments = s.profile_segments();
+    let curve = segments.iter().find(|g| g.id == spline.0).unwrap();
+    let Curve2::Spline(ref nurbs) = curve.curve else {
+        panic!("not a spline")
+    };
+    assert!(close(nurbs.point_at(0.5), 5.0, 4.5));
+    let profile = Profile::from_curves(&segments).unwrap();
+    let area = profile.regions[0].outer.signed_area().abs();
+    assert!((area / 32.4 - 1.0).abs() < 0.01, "{area}");
+}
+
+#[test]
+fn a_spline_follows_its_poles_and_mirrors() {
+    let mut s = ConstrainedSketch::new();
+    let (spline, poles) = bump(&mut s);
+    s.constrain(Fixed(poles[0]));
+    s.constrain(Coincident(poles[1], poles[2]));
+    assert!(s.solve().unwrap().converged);
+    let moved = s.spline_of(spline).unwrap();
+    assert!(moved.poles[1].distance(moved.poles[2]) < 1e-9);
+    let axis = s.line(Point2::new(-1.0, -5.0), Point2::new(-1.0, 5.0));
+    s.constrain(Vertical(axis));
+    let created = s.mirror(&[spline], axis).unwrap();
+    assert!(s.solve().unwrap().converged);
+    let copy = s.spline_of(*created.last().unwrap()).unwrap();
+    let original = s.spline_of(spline).unwrap();
+    for (a, b) in original.poles.iter().zip(&copy.poles) {
+        assert!(close(*b, -2.0 - a.x, a.y), "{a:?} {b:?}");
+    }
+}
+
+#[test]
+fn spline_numbers_that_do_not_fit_its_poles_are_refused() {
+    let mut s = ConstrainedSketch::new();
+    let (spline, _) = bump(&mut s);
+    let mut entities = s.entities().to_vec();
+    if let Some(Entity {
+        geometry: Geometry::Spline(def),
+        ..
+    }) = entities.iter_mut().find(|e| e.id == spline)
+    {
+        def.knots.pop();
+    }
+    assert_eq!(
+        ConstrainedSketch::from_parts(entities, Vec::new(), Counters::default()),
+        Err(SketchError::BadSpline(spline))
+    );
 }

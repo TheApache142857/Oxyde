@@ -39,11 +39,11 @@ use oxyde_geom::{
     Transform, Vec3,
 };
 use oxyde_kernel::{
-    BooleanOp, ChamferSecond, CurveKind, Distance, EdgeInfo, EdgeTangent, FaceInfo, FaceMesh,
-    FaceSource, Kernel, Mesh, MeshWatch, OpHistory, OpResult, ProjectedEdges, ShapeHandle,
-    StepAssembly, StepColor, StepColors, StepImport, StepInstance, StepMaterial, StepNode,
-    StepNodeContent, SubShape, SurfaceKind, Topology, TopologyCounts, VertexInfo, VolumeMesh,
-    VolumeMeshError, VolumeMeshOptions,
+    BooleanOp, ChamferSecond, CurveKind, Distance, EdgeCurve, EdgeInfo, EdgeTangent, FaceInfo,
+    FaceMesh, FaceSource, Kernel, Mesh, MeshWatch, Nurbs3, OpHistory, OpResult, ProjectedEdges,
+    ShapeHandle, StepAssembly, StepColor, StepColors, StepImport, StepInstance, StepMaterial,
+    StepNode, StepNodeContent, SubShape, SurfaceKind, Topology, TopologyCounts, VertexInfo,
+    VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
 
 /// Error reported by OCCT or by the shim around it.
@@ -421,6 +421,10 @@ impl Kernel for OcctKernel {
         })
     }
 
+    fn edge_curve(&self, shape: ShapeHandle, edge: u32) -> Result<Option<EdgeCurve>, OcctError> {
+        guarded(|| Ok(edge_curve(self.session.edge_curve(shape.raw(), edge)?)))
+    }
+
     fn project_edges(
         &self,
         shapes: &[ShapeHandle],
@@ -780,6 +784,43 @@ fn axis_data(a: &Axis) -> ffi::AxisData {
     }
 }
 
+/// The shim's edge curve as the kernel's; `None` for an edge without length.
+fn edge_curve(d: ffi::EdgeCurveData) -> Option<EdgeCurve> {
+    let p = |v: [f64; 3]| Point3::new(v[0], v[1], v[2]);
+    let v = |v: [f64; 3]| Vec3::new(v[0], v[1], v[2]);
+    match d.kind {
+        1 => Some(EdgeCurve::Line {
+            start: p(d.a),
+            end: p(d.b),
+        }),
+        2 => Some(EdgeCurve::Conic {
+            center: p(d.a),
+            x_dir: v(d.x),
+            y_dir: v(d.y),
+            major: d.major,
+            minor: d.minor,
+            start: d.start,
+            end: d.end,
+        }),
+        3 => Some(EdgeCurve::Nurbs {
+            curve: Nurbs3 {
+                degree: d.degree,
+                poles: d
+                    .poles
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|&[x, y, z]| Point3::new(x, y, z))
+                    .collect(),
+                weights: d.weights,
+                knots: d.knots,
+            },
+            exact: d.exact,
+        }),
+        _ => None,
+    }
+}
+
 fn segment_data(segment: &ProfileSegment) -> ffi::SegmentData {
     let mut data = ffi::SegmentData {
         id: segment.id,
@@ -795,8 +836,19 @@ fn segment_data(segment: &ProfileSegment) -> ffi::SegmentData {
         x4: 0.0,
         y4: 0.0,
         r: 0.0,
+        degree: 0,
+        poles: Vec::new(),
+        weights: Vec::new(),
+        knots: Vec::new(),
     };
     match segment.curve {
+        Curve2::Spline(ref spline) => {
+            data.kind = ffi::SegmentKind::Spline;
+            data.degree = u32::try_from(spline.degree).unwrap_or(u32::MAX);
+            data.poles = spline.poles.iter().flat_map(|p| [p.x, p.y]).collect();
+            data.weights.clone_from(&spline.weights);
+            data.knots.clone_from(&spline.knots);
+        }
         Curve2::Line { start, end } => {
             data.kind = ffi::SegmentKind::Line;
             (data.x0, data.y0, data.x1, data.y1) = (start.x, start.y, end.x, end.y);
