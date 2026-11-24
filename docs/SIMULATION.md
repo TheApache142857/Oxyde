@@ -675,16 +675,16 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   amplified it, and conjugate gradients went from about 40 iterations to hundreds. Each
   smoothing step is one product whose pass over the nodes also forms the correction
   `c₁ d + c₂ D⁻¹ (b − A x)`, and the cycle's residual comes out of a product the same way.
-- **Threads:** the parallel steps run on a pool of worker threads started once
-  (`oxyde_sim::pool`, one per core but the caller's, asleep between steps). Started afresh
-  for each step, sixteen threads cost some forty microseconds each, more than the step's
-  work: a step over 300 000 values took 690 µs on fresh threads, 150 µs on one thread and
-  55 µs on the pool, and a solve makes some thirty steps per conjugate gradient iteration.
-  Moving to the pool halved the time of an iteration. Handing the workers a borrowed
-  closure is the crate's one `unsafe` block, sound because a step returns only once every
-  task it handed out is done (the owner chose this over adding `rayon`, October 2026).
-  The pool also runs a step started from inside a task serially, so it never waits on
-  itself, and resumes a task's panic on the caller.
+- **Threads:** each parallel step starts its threads (`std::thread::scope`,
+  `multigrid::par_fill`) and joins them before it returns; the caller works alongside them.
+  A thread that cannot start leaves its share to the others. Until `oxyde-generative`
+  became a crate of its own without `unsafe` code, the steps ran on a pool of threads
+  started once and asleep between steps (`oxyde_sim::pool`). Sixteen fresh threads cost
+  some forty microseconds each, more than a small step's work: a step over 300 000 values
+  took 690 µs on fresh threads, 150 µs on one thread and 55 µs on the pool, and a solve
+  makes some thirty steps per conjugate gradient iteration. On sixteen threads a study
+  takes about half as long again as on the pool (the bracket study of
+  `tests/generative.rs`, 30 iterations: 101 to 111 s against 69 to 72 s).
 - **Fixtures and loads** act through samples of their faces every half voxel. Each sample
   lands in the voxel holding it, made a preserve voxel (a thin preserve body has no voxel
   centre in it), or, in an obstacle voxel, in the nearest preserve voxel around. A fixture
@@ -1102,7 +1102,7 @@ NASA's Evolved Structures and the literature on length scales say (the owner ask
 offers setup orientations and as Autodesk's machinery example (Crocetti and Gasso, Autodesk
 University) mills the outcome it keeps from +Y and −Y.
 
-- **The formulation** (`generative::reach`): along each side's lines, from the tool
+- **The formulation** (`oxyde_generative::reach`): along each side's lines, from the tool
   inwards, each voxel is raised to the densest one in front of it, as the tool cannot take
   away what it cannot reach from that side; then the least over the sides is taken, as what
   the tool reaches from one side is gone. From one side this is the one-way pull; from
@@ -1173,7 +1173,7 @@ design says to (NASA's brackets held more than twice their predicted load once t
 McClelland, SPIE 2022; Autodesk's machinery example closes with a static study, Crocetti
 and Gasso; "always validate", Schnitger, Cadalyst 2018).
 
-- **The check** (`generative::check_part`, on its own thread once *Create Part* has saved
+- **The check** (`oxyde_sim::check::check_part`, on its own thread once *Create Part* has saved
   the part, with a bar and *Stop* in the panel): the simplified surface's pieces, the very
   triangles the part's solid is made of, each triangle labelled with the face it lies on of
   a preserve body or a preserve region (its corners within a twentieth of a voxel of the bodies' faces, where
@@ -1222,7 +1222,7 @@ clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency s
   moving asymptotes, `1 − λᵢ / λ_min ≤ 0` (`λ = ω²`), so the limit holds when two modes swap
   places as the design changes; a limited *Maximize stiffness* moves by MMA, as a weighted one
   does, the mass target a constraint, so the stiffest design may weigh less than it.
-- **The modes** (`generative::frequency`): `K φ = λ M φ` on the grid each iteration, `K`
+- **The modes** (`oxyde_generative::frequency`): `K φ = λ M φ` on the grid each iteration, `K`
   the iteration's own stiffness, never assembled, `M` lumped (an eighth of each voxel's
   mass at each corner, in tonnes as millimetres and newtons take them), by the block LOBPCG
   of `crate::eigen` with two guard vectors, preconditioned by one V-cycle of the static
@@ -1264,7 +1264,7 @@ when the static solves are there (the owner asked for it).
   times (an estimate from the operation counts, not yet timed).
   Products alone on the card would have changed little; the vectors live there instead.
 - **The seam**: the eigensolver works in an `EigenSpace` (`eigen.rs`, public as
-  `generative::EigenSpace`): vectors by handle, made, written, read and given back; `A`,
+  `oxyde_generative::EigenSpace`): vectors by handle, made, written, read and given back; `A`,
   `B`, the preconditioner and the projection; batches of dot products; `dst += Σ c v`;
   scaling. The CPU's is the closures it had (`HostSpace`); a backend offers its own through
   `Backend::eigen_space`, `None` by default, which leaves the eigensolve to the CPU. The
