@@ -53,13 +53,12 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::material::Elastic;
-use crate::math::{V3, add, cross, dot, lerp, norm, normalize, scale, sub};
 use crate::mesh::{FACES, TetMesh};
-use crate::solve::{
-    Preconditioner, Prepared, Problem, SolveError, SolveOptions, Study, element_energies,
-    thread_count,
-};
+use crate::solve::{Preconditioner, Prepared, Problem, SolveError, Study, element_energies};
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{V3, add, cross, dot, lerp, norm, normalize, scale, sub};
+use oxyde_generative::shape::{Shape, smooth};
+use oxyde_generative::study::{SolveOptions, Symmetry, thread_count};
 
 /// The stiffness left in void elements, as a fraction of the material's.
 const VOID_STIFFNESS: f64 = 1e-6;
@@ -117,17 +116,6 @@ pub struct TopologyStudy {
     /// that hold a fixture, a load or a kept region are joined to the one the loads are on,
     /// and loose bits holding none of them taken away.
     pub one_piece: bool,
-}
-
-/// Planes the shape is mirrored about, through `point` and parallel to the standard planes:
-/// SolidWorks' symmetry control, Fusion 360's symmetry planes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Symmetry {
-    /// mm: the point the planes pass through; the origin for the standard planes.
-    pub point: V3,
-    /// Mirrored across the plane normal to X (the Right plane's), to Y (the Top plane's) and
-    /// to Z (the Front plane's).
-    pub planes: [bool; 3],
 }
 
 /// How a mould comes off the shape: no undercut along a direction.
@@ -188,7 +176,7 @@ pub struct Joining {
 /// A connected piece of the shape cut at a threshold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Piece {
-    /// The labels of the model's faces it reaches, in order, without [`crate::NO_LABEL`].
+    /// The labels of the model's faces it reaches, in order, without [`oxyde_generative::NO_LABEL`].
     pub labels: Vec<u32>,
     /// mm³, about: the volume of the elements it is in, each by its share of corners in it.
     pub volume: f64,
@@ -847,7 +835,11 @@ fn describe(mesh: &TetMesh, corner: &[u32], count: usize) -> Vec<Piece> {
             out[p as usize].volume += v * inside.len() as f64 / 4.0;
         }
     }
-    for f in mesh.facets.iter().filter(|f| f.label != crate::NO_LABEL) {
+    for f in mesh
+        .facets
+        .iter()
+        .filter(|f| f.label != oxyde_generative::NO_LABEL)
+    {
         if let Some(p) = mesh
             .facet_corners(f)
             .iter()
@@ -1334,30 +1326,6 @@ impl<'a> Filter<'a> {
 
 // ---- The shape ------------------------------------------------------------------------------
 
-/// A closed triangle surface: the optimized shape.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Shape {
-    pub positions: Vec<V3>,
-    /// Wound counter-clockwise seen from outside.
-    pub triangles: Vec<[u32; 3]>,
-    /// The model face each triangle lies on: the label of the boundary facet it was cut
-    /// from, or [`crate::NO_LABEL`] for the cut through the material.
-    pub labels: Vec<u32>,
-}
-
-impl Shape {
-    /// mm³: the volume it encloses.
-    pub fn volume(&self) -> f64 {
-        self.triangles
-            .iter()
-            .map(|t| {
-                let [a, b, c] = t.map(|i| self.positions[i as usize]);
-                dot(a, cross(b, c)) / 6.0
-            })
-            .sum()
-    }
-}
-
 /// The surface where the density is `threshold` (from 0 to 1): the elements' densities
 /// averaged at their corners (by volume), cut by marching tetrahedra, and the model's own
 /// boundary kept where the density is above the threshold, so the surface is closed. Then
@@ -1514,69 +1482,14 @@ impl Cutter<'_> {
         } else {
             ids
         });
-        self.out.labels.push(crate::NO_LABEL);
-    }
-}
-
-/// Taubin's λ|μ smoothing: a shrinking Laplacian step, then a growing one, `rounds` times,
-/// over the points not `fixed`.
-pub(crate) fn smooth(shape: &mut Shape, fixed: &[bool], rounds: usize) {
-    taubin(shape, fixed, rounds, false);
-}
-
-/// [`smooth`], the points next to a fixed one taking the shrinking steps only: each stays
-/// among its neighbours, so where the fixed points lie on a flat face, it stays on its side
-/// of the face (the growing step pushed some a few hundredths of a voxel through it).
-pub(crate) fn smooth_holding(shape: &mut Shape, fixed: &[bool], rounds: usize) {
-    taubin(shape, fixed, rounds, true);
-}
-
-fn taubin(shape: &mut Shape, fixed: &[bool], rounds: usize, hold_next: bool) {
-    let n = shape.positions.len();
-    let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for t in &shape.triangles {
-        for k in 0..3 {
-            let (a, b) = (t[k], t[(k + 1) % 3]);
-            neighbours[a as usize].push(b);
-            neighbours[b as usize].push(a);
-        }
-    }
-    for list in &mut neighbours {
-        list.sort_unstable();
-        list.dedup();
-    }
-    let is_fixed = |i: usize| fixed.get(i).copied().unwrap_or(false);
-    let next_to_fixed: Vec<bool> = (0..n)
-        .map(|i| hold_next && neighbours[i].iter().any(|&j| is_fixed(j as usize)))
-        .collect();
-    let step = |positions: &mut Vec<V3>, factor: f64| {
-        let next: Vec<V3> = (0..n)
-            .map(|i| {
-                let p = positions[i];
-                let list = &neighbours[i];
-                if is_fixed(i) || list.is_empty() || factor < 0.0 && next_to_fixed[i] {
-                    return p;
-                }
-                let mean = scale(
-                    list.iter()
-                        .fold([0.0; 3], |s, &j| add(s, positions[j as usize])),
-                    1.0 / list.len() as f64,
-                );
-                add(p, scale(sub(mean, p), factor))
-            })
-            .collect();
-        *positions = next;
-    };
-    for _ in 0..rounds {
-        step(&mut shape.positions, 0.5);
-        step(&mut shape.positions, -0.53);
+        self.out.labels.push(oxyde_generative::NO_LABEL);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solve::{Fixture, FixtureKind, Load, LoadKind};
+    use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind};
 
     const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 
@@ -1825,7 +1738,7 @@ mod tests {
                             }
                         }))
                     };
-                    for tet in crate::mesh::kuhn_tets(corner) {
+                    for tet in oxyde_generative::tets::kuhn_tets(corner) {
                         mesh.push_tet(tet, 0);
                     }
                 }
@@ -1838,7 +1751,7 @@ mod tests {
                     let side = if s % 2 == 0 { 0.0 } else { size[s / 2] };
                     (centre[s / 2] - side).abs() < 1e-9
                 })
-                .map_or(crate::NO_LABEL, |s| s as u32)
+                .map_or(oxyde_generative::NO_LABEL, |s| s as u32)
         });
         mesh
     }
@@ -2070,7 +1983,7 @@ mod tests {
             let s = shape(&mesh, &density, 0.5, smoothing);
             assert!(is_closed(&s), "smoothing {smoothing}");
             assert_eq!(s.labels.len(), s.triangles.len());
-            assert!(s.labels.contains(&crate::NO_LABEL) && s.labels.contains(&0));
+            assert!(s.labels.contains(&oxyde_generative::NO_LABEL) && s.labels.contains(&0));
             let solid: f64 = density
                 .iter()
                 .enumerate()
@@ -2103,7 +2016,7 @@ mod tests {
         assert!(p[0].labels.contains(&0) != p[1].labels.contains(&0));
         assert!(
             p.iter()
-                .all(|p| p.labels.contains(&2) && !p.labels.contains(&crate::NO_LABEL))
+                .all(|p| p.labels.contains(&2) && !p.labels.contains(&oxyde_generative::NO_LABEL))
         );
         // Each holds about its share of the box: 8 mm of 30, give or take a layer.
         assert!(p.iter().all(|p| (p.volume - 800.0).abs() < 200.0), "{p:?}");

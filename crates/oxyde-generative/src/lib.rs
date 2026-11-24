@@ -1,5 +1,5 @@
-//! Generative design: shapes grown between bodies to keep and bodies to stay clear of, as
-//! Fusion 360's generative design makes them (`docs/SIMULATION.md` §9).
+//! Generative design: shapes grown between bodies to keep and bodies to stay clear of
+//! (`docs/SIMULATION.md` §9 in the Oxyde repository).
 //!
 //! - **The design space** ([`Grid`]): the box around the preserve bodies (and the bodies of
 //!   the preserve regions: faces kept to a depth) cut into cubic voxels, each *preserve*
@@ -15,8 +15,8 @@
 //!   carry none) and gathered by a p-norm (p = 8) scaled to the largest, its slopes by an
 //!   adjoint solve per load case, and the design moved by the method of moving asymptotes
 //!   (`mma`) towards the least mass that keeps them.
-//! - **The optimization** is SIMP as in [`crate::topology`]: a design density per voxel (or
-//!   per group of voxels the manufacturing ties together), averaged over a sphere (the
+//! - **The optimization** is SIMP as in Oxyde's topology studies (`oxyde_sim::topology`):
+//!   a design density per voxel (or per group of voxels the manufacturing ties together), averaged over a sphere (the
 //!   density filter, of radius half the minimum thickness: members thinner than that are
 //!   discouraged, not ruled out, as projection alone guarantees no length scale), then
 //!   pushed towards solid or void by a smoothed Heaviside projection whose sharpness `β`
@@ -34,8 +34,8 @@
 //!   *Additive* prints layer by layer along the build direction (`additive`): a voxel can
 //!   only be as dense as the voxel under it and that one's four neighbours across the layer
 //!   (a cross), which keeps overhangs within 45° in every direction.
-//! - **Milling from several sides** (Fusion 360's setup orientations, as Autodesk's
-//!   machinery example mills from +Y and −Y): along each side's lines from the tool inwards,
+//! - **Milling from several sides** (from +Y and from −Y, for example): along each side's
+//!   lines from the tool inwards,
 //!   each voxel is raised to the densest one in front of it (what the tool cannot reach from
 //!   that side stays), then the least over the sides is taken (what it reaches from one side
 //!   is gone). Each void voxel (an obstacle) is reached from the side with the fewest design
@@ -53,16 +53,45 @@
 //!   iteration by LOBPCG preconditioned by the multigrid cycle, each a constraint for the
 //!   method of moving asymptotes, the mass going as the sixth power of the density below a
 //!   tenth so near-void regions do not vibrate on their own.
-//! - [`check_part`] checks the part made of an outcome: its surface meshed with
-//!   tetrahedra, each load case solved on it by the static solver, for numbers the voxels
-//!   only estimate.
+//! - The part made of an outcome is checked outside this crate (`oxyde_sim::check` in
+//!   Oxyde): its surface meshed with tetrahedra, each load case solved on it by the static
+//!   solver, for numbers the voxels only estimate.
 
+// Never crash: a panic in a modelling or UI path would take the unsaved document with it.
+// Return an error or fall back to a safe default instead.
+#![forbid(unsafe_code)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
+#![warn(clippy::indexing_slicing)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 // Indices into the grid's arrays and the design's groups, all sized here from the grid.
 #![allow(clippy::indexing_slicing)]
 
+pub mod bvh;
+pub mod eigen;
+pub mod material;
+pub mod math;
+pub mod shape;
+pub mod study;
+pub mod surfaces;
+pub mod tets;
+
 mod additive;
 mod brick;
-mod check;
 mod decimate;
 mod frequency;
 mod grid;
@@ -71,7 +100,6 @@ mod multigrid;
 mod surface;
 
 pub use crate::eigen::{EigenSpace, Vector};
-pub use check::{CheckError, Missing, PartCheck, check_part};
 pub use decimate::{decimate, decimate_holding, solid_pieces};
 pub use grid::{Grid, MAX_VOXELS, Voxel, design_box, voxel_size};
 pub use multigrid::{Plan, PlanLevel, SMOOTHING_DEGREE, SPECTRUM_RATIO, Solved};
@@ -79,11 +107,14 @@ pub use surface::{exact_surface, surface};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// A label on no face: a boundary facet the mesher could not tie to a model face.
+pub const NO_LABEL: u32 = u32::MAX;
+
 use crate::material::Elastic;
 use crate::math::V3;
-use crate::mesher::SurfaceMesh;
-use crate::solve::{Fixture, Load, SolveOptions, thread_count};
-use crate::topology::Symmetry;
+use crate::study::Symmetry;
+use crate::study::{Fixture, Load, SolveOptions, thread_count};
+use crate::surfaces::SurfaceMesh;
 use brick::{Brick, DOFS, von_mises};
 use multigrid::{Dims, Fine, par_fill};
 
@@ -216,10 +247,9 @@ pub struct LoadCase {
     pub remote_masses: Vec<usize>,
 }
 
-/// A component carried by faces of the preserve bodies (Fusion 360's point mass, the
-/// instrument a bracket holds): under a load case's acceleration its weight reaches the
-/// faces as a force and a moment spread over them by area, as a distributing link (RBE3)
-/// carries it, the faces moving on average as the mass does. It stiffens nothing.
+/// A component carried by faces of the preserve bodies (a point mass: the instrument a
+/// bracket holds): under a load case's acceleration its weight reaches the faces as a force
+/// and a moment spread over them by area, as a distributing link carries it, the faces moving on average as the mass does. It stiffens nothing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteMass {
     /// kg.

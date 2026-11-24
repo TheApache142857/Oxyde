@@ -10,7 +10,8 @@
 
 use std::collections::HashMap;
 
-use crate::math::{V3, cross, lerp, norm, scale, sub, tet_volume6};
+use oxyde_generative::math::{V3, cross, lerp, norm, scale, sub, tet_volume6};
+use oxyde_generative::tets::kuhn_tets;
 
 /// The edges of a tetrahedron, as pairs of corners, in the order of the edge nodes.
 pub const EDGES: [(usize, usize); 6] = [(0, 1), (1, 2), (0, 2), (0, 3), (1, 3), (2, 3)];
@@ -24,7 +25,7 @@ pub struct Facet {
     pub tet: u32,
     /// The corner the facet is opposite (an index into [`FACES`]).
     pub face: u8,
-    /// The model face it lies on, or [`crate::NO_LABEL`].
+    /// The model face it lies on, or [`oxyde_generative::NO_LABEL`].
     pub label: u32,
 }
 
@@ -244,7 +245,7 @@ impl TetMesh {
                     let side = if s % 2 == 0 { lo[axis] } else { hi[axis] };
                     (centre[axis] - side).abs() < 1e-9 * size
                 })
-                .map_or(crate::NO_LABEL, |s| s as u32)
+                .map_or(oxyde_generative::NO_LABEL, |s| s as u32)
         });
         mesh
     }
@@ -334,34 +335,10 @@ impl TetMesh {
     }
 }
 
-/// The six tetrahedra of a cube's Kuhn (Freudenthal) split, all around the diagonal from
-/// corner (0, 0, 0) to (1, 1, 1): one per order of the axes. Neighbouring cubes split
-/// this way share their faces' diagonals, so the tetrahedra conform.
-pub(crate) fn kuhn_tets<T: Copy>(corner: impl Fn([usize; 3]) -> T) -> [[T; 4]; 6] {
-    const ORDERS: [[usize; 3]; 6] = [
-        [0, 1, 2],
-        [0, 2, 1],
-        [1, 0, 2],
-        [1, 2, 0],
-        [2, 0, 1],
-        [2, 1, 0],
-    ];
-    ORDERS.map(|order| {
-        let mut d = [0usize; 3];
-        let v0 = corner(d);
-        d[order[0]] = 1;
-        let v1 = corner(d);
-        d[order[1]] = 1;
-        let v2 = corner(d);
-        let v3 = corner([1, 1, 1]);
-        [v0, v1, v2, v3]
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::normalize;
+    use oxyde_generative::math::normalize;
 
     #[test]
     fn a_structured_box_fills_its_volume_and_has_an_outward_boundary() {
@@ -374,7 +351,7 @@ mod tests {
         assert_eq!(mesh.facets.len(), expected);
         let mut area = [0.0; 6];
         for f in &mesh.facets {
-            assert_ne!(f.label, crate::NO_LABEL);
+            assert_ne!(f.label, oxyde_generative::NO_LABEL);
             let an = mesh.facet_area_normal(f);
             let n = normalize(an).unwrap();
             // Outward: along the side's own axis and sign.

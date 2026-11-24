@@ -9,7 +9,7 @@
 //!   `solve::element_mass`); millimetres and newtons make the tonne the unit of mass.
 //!   Held directions have no mass, so their modes never appear.
 //! - **The eigenproblem** `K φ = ω² M φ` is solved for its lowest pairs by LOBPCG
-//!   ([`crate::eigen`]) preconditioned by the static solve's multigrid on `K`
+//!   ([`oxyde_generative::eigen`]) preconditioned by the static solve's multigrid on `K`
 //!   (block-Jacobi when the hierarchy cannot be built), with a few guard vectors beyond the
 //!   modes asked for.
 //! - **The results**: each mode's frequency `f = ω / 2π` in hertz, its shape scaled so that
@@ -25,11 +25,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::contact::Contact;
-use crate::eigen::{self, EigenError, EigenOptions, EigenProblem};
-use crate::material::Elastic;
-use crate::math::{V3, norm, scale};
 use crate::mesh::TetMesh;
-use crate::solve::{Fixture, Prepared, Problem, SolveError, SolveOptions, Study};
+use crate::solve::{Prepared, Problem, SolveError, Study};
+use oxyde_generative::eigen::{self, EigenError, EigenOptions, EigenProblem};
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{V3, norm, scale};
+use oxyde_generative::study::{Fixture, SolveOptions};
 
 /// The most modes a study may ask for.
 pub const MAX_MODES: usize = 50;
@@ -231,7 +232,7 @@ pub fn solve_frequencies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solve::FixtureKind;
+    use oxyde_generative::study::FixtureKind;
 
     const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 

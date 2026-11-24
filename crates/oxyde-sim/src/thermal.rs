@@ -41,13 +41,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::Facet;
 use crate::amg::{BsrRef, Multigrid};
 use crate::contact::{self, Contact, Tie};
-use crate::material::Elastic;
-use crate::math::{V3, add, norm, scale};
 use crate::mesh::{EDGES, TetMesh};
 use crate::solve::{
-    Geometry, SolveOptions, facet_nodes, geometry, integration_points, node_points, pieces,
-    shape_gradients, thread_count,
+    Geometry, facet_nodes, geometry, integration_points, node_points, pieces, shape_gradients,
 };
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{V3, add, norm, scale};
+use oxyde_generative::study::{SolveOptions, thread_count};
 
 /// The Stefan–Boltzmann constant, W/(mm²·K⁴).
 const STEFAN_BOLTZMANN: f64 = 5.670_374_419e-14;
@@ -801,7 +801,7 @@ fn assemble(
         let facets: Vec<&Facet> = mesh
             .facets
             .iter()
-            .filter(|f| f.label != crate::NO_LABEL && load.labels.contains(&f.label))
+            .filter(|f| f.label != oxyde_generative::NO_LABEL && load.labels.contains(&f.label))
             .collect();
         let area: f64 = facets.iter().map(|f| norm(mesh.facet_area_normal(f))).sum();
         if facets.is_empty() || !area.is_finite() || area <= 0.0 {
@@ -955,7 +955,7 @@ fn unanchored(
         for f in mesh
             .facets
             .iter()
-            .filter(|f| f.label != crate::NO_LABEL && load.labels.contains(&f.label))
+            .filter(|f| f.label != oxyde_generative::NO_LABEL && load.labels.contains(&f.label))
         {
             let corner = mesh.facet_corners(f)[0];
             let r = find(&mut parent, corner);
@@ -1434,7 +1434,8 @@ fn recover_flux(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ContactKind, mesh_solids, mesher::box_surface};
+    use crate::{ContactKind, mesh_solids};
+    use oxyde_generative::surfaces::box_surface;
 
     const STEEL: ThermalMaterial = ThermalMaterial::new(50.0, 500.0, 7850.0);
 
@@ -1454,7 +1455,7 @@ mod tests {
     fn at(mesh: &TetMesh, r: &ThermalResults, p: V3) -> f64 {
         let i = (0..mesh.nodes.len())
             .min_by(|&a, &b| {
-                let d = |i: usize| norm(crate::math::sub(mesh.nodes[i], p));
+                let d = |i: usize| norm(oxyde_generative::math::sub(mesh.nodes[i], p));
                 d(a).total_cmp(&d(b))
             })
             .unwrap();
@@ -1717,7 +1718,9 @@ mod tests {
         let mid = |f: &Frame| {
             let i = (0..mesh.nodes.len())
                 .min_by(|&a, &b| {
-                    let d = |i: usize| norm(crate::math::sub(mesh.nodes[i], [50.0, 5.0, 5.0]));
+                    let d = |i: usize| {
+                        norm(oxyde_generative::math::sub(mesh.nodes[i], [50.0, 5.0, 5.0]))
+                    };
                     d(a).total_cmp(&d(b))
                 })
                 .unwrap();

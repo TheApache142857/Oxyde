@@ -13,15 +13,18 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+use oxyde_generative::material::Elastic;
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
+use oxyde_generative::{
+    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel,
+    decimate_holding, exact_surface, generate, generate_on, solid_pieces, surface, voxel_size,
+};
 use oxyde_geom::Point2;
 use oxyde_kernel::{Kernel, Mesh, ShapeHandle, SurfaceKind};
 use oxyde_model::{Extrude, ExtrudeOp, FeatureKind, Part, Sketch, SketchPlane, StandardPlane};
 use oxyde_occt::OcctKernel;
-use oxyde_sim::generative::{
-    Backend, DesignSpace, GenerativeStudy, Grid, Method, Obstacle, Outcome, Voxel, check_part,
-    decimate_holding, exact_surface, generate, generate_on, solid_pieces, surface, voxel_size,
-};
-use oxyde_sim::{Elastic, Fixture, FixtureKind, Load, LoadKind, SolveOptions, SurfaceMesh};
+use oxyde_sim::check::check_part;
 use oxyde_sim_gpu::GpuBackend;
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
@@ -291,7 +294,9 @@ fn an_outcome_becomes_a_solid_with_the_rings() {
     // The rings' flat faces are met where they are, at z = 0 and 10 exactly, which the
     // surface cut by the densities (half a voxel off, smoothed) never is; simplifying
     // leaves those points there.
-    let on = |s: &oxyde_sim::Shape, z: f64| s.positions.iter().filter(|p| p[2] == z).count();
+    let on = |s: &oxyde_generative::shape::Shape, z: f64| {
+        s.positions.iter().filter(|p| p[2] == z).count()
+    };
     assert!(on(&shape, 0.0) > 20 && on(&shape, 10.0) > 20);
     assert!(on(&fewer, 0.0) > 0 && on(&fewer, 10.0) > 0);
     let plain = surface(&grid, &outcome.density, 12);
@@ -477,7 +482,7 @@ fn an_outcome_cut_from_its_starting_shape_meets_its_faces() {
     assert!(check.max_von_mises > 0.0 && check.min_factor_of_safety.is_some());
 }
 
-fn write_obj(path: &str, shape: &oxyde_sim::Shape) -> std::io::Result<()> {
+fn write_obj(path: &str, shape: &oxyde_generative::shape::Shape) -> std::io::Result<()> {
     use std::fmt::Write as _;
     let mut s = String::new();
     for p in &shape.positions {

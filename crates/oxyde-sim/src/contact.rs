@@ -50,10 +50,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::bvh::{Bvh, closest_point};
-use crate::material::Elastic;
-use crate::math::{V3, add, dot, norm, normalize, scale, sub};
 use crate::mesh::{Facet, TetMesh};
+use oxyde_generative::bvh::{Bvh, closest_point};
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{V3, add, dot, norm, normalize, scale, sub};
 
 /// How a contact lets its faces move against each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -198,7 +198,7 @@ pub fn detect_contacts(mesh: &TetMesh, tolerance: f64) -> Vec<ContactCandidate> 
     }
     let mut by_body: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
     for (k, f) in mesh.facets.iter().enumerate() {
-        if f.label != crate::NO_LABEL {
+        if f.label != oxyde_generative::NO_LABEL {
             by_body.entry(mesh.facet_body(f)).or_default().push(k);
         }
     }
@@ -464,7 +464,7 @@ pub(crate) fn pair(mesh: &TetMesh, contacts: &[Contact], materials: &[Elastic]) 
             (0..mesh.facets.len())
                 .filter(|&k| {
                     let label = mesh.facets[k].label;
-                    label != crate::NO_LABEL && labels.contains(&label)
+                    label != oxyde_generative::NO_LABEL && labels.contains(&label)
                 })
                 .collect()
         };
@@ -857,7 +857,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use super::*;
-    use crate::solve::{Fixture, FixtureKind, Load, LoadKind, Results, SolveOptions, Study, solve};
+    use crate::solve::{Results, Study, solve};
+    use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions};
 
     const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 
@@ -1299,13 +1300,17 @@ mod tests {
     /// The mesher's own meshes of two touching blocks, each on its own lattice, at element
     /// size `size`: the seam is found and a bonded contact makes them one cantilever again.
     fn mesher_cantilever(size: f64) {
-        let surfaces = [crate::mesher::box_surface([0.0; 3], [100.0, 20.0, 20.0]), {
-            let mut s = crate::mesher::box_surface([100.0, 0.0, 0.0], [200.0, 20.0, 20.0]);
-            for l in &mut s.labels {
-                *l += 10;
-            }
-            s
-        }];
+        let surfaces = [
+            oxyde_generative::surfaces::box_surface([0.0; 3], [100.0, 20.0, 20.0]),
+            {
+                let mut s =
+                    oxyde_generative::surfaces::box_surface([100.0, 0.0, 0.0], [200.0, 20.0, 20.0]);
+                for l in &mut s.labels {
+                    *l += 10;
+                }
+                s
+            },
+        ];
         let cancel = AtomicBool::new(false);
         let options = crate::MeshOptions {
             element_size: size,

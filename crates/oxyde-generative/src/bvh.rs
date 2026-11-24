@@ -24,7 +24,7 @@ struct Node {
 
 /// Where a segment crosses a triangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Hit {
+pub struct Hit {
     /// Along the segment, 0 at its start and 1 at its end.
     pub t: f64,
     pub triangle: u32,
@@ -32,7 +32,7 @@ pub(crate) struct Hit {
     pub leaving: bool,
 }
 
-pub(crate) struct Bvh {
+pub struct Bvh {
     nodes: Vec<Node>,
     triangles: Vec<[V3; 3]>,
     /// Triangle indices in leaf order.
@@ -248,13 +248,13 @@ fn box_distance2(p: V3, node: &Node) -> f64 {
 
 /// The squared distance from `p` to the triangle (Ericson, *Real-Time Collision
 /// Detection*, 5.1.5).
-pub(crate) fn point_triangle_distance2(p: V3, t: &[V3; 3]) -> f64 {
+pub fn point_triangle_distance2(p: V3, t: &[V3; 3]) -> f64 {
     let closest = closest_point(p, t);
     let d = sub(p, closest);
     dot(d, d)
 }
 
-pub(crate) fn closest_point(p: V3, t: &[V3; 3]) -> V3 {
+pub fn closest_point(p: V3, t: &[V3; 3]) -> V3 {
     let [a, b, c] = *t;
     let ab = sub(b, a);
     let ac = sub(c, a);

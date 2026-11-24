@@ -50,6 +50,9 @@ type Slot<'a, T> = Mutex<Option<(usize, &'a mut [T])>>;
 /// `width` values, `first` the index of a run's first record, each run `least` records at
 /// least so the threads pay for themselves. Each record must depend on its index only, so
 /// the result is the same on any number of threads.
+///
+/// The runs go to scoped threads started for the call and to the caller. Each takes the
+/// runs nobody has taken yet, so a thread that cannot start leaves its run to the others.
 pub(crate) fn par_fill<T: Send>(
     out: &mut [T],
     width: usize,
@@ -64,21 +67,29 @@ pub(crate) fn par_fill<T: Send>(
         return;
     }
     let per = records.div_ceil(threads);
-    // Each task takes its own run of `out`, handed over through its slot.
     let slots: Vec<Slot<'_, T>> = out
         .chunks_mut(per * width)
         .enumerate()
         .map(|(t, part)| Mutex::new(Some((t * per, part))))
         .collect();
-    crate::pool::run(slots.len(), &|t| {
-        let taken = slots.get(t).and_then(|s| {
-            s.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-        });
-        if let Some((first, part)) = taken {
-            f(first, part);
+    let take_from = |start: usize| {
+        for k in 0..slots.len() {
+            let taken = slots.get((start + k) % slots.len()).and_then(|s| {
+                s.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            });
+            if let Some((first, part)) = taken {
+                f(first, part);
+            }
         }
+    };
+    std::thread::scope(|scope| {
+        for t in 1..slots.len() {
+            let take_from = &take_from;
+            let _ = std::thread::Builder::new().spawn_scoped(scope, move || take_from(t));
+        }
+        take_from(0);
     });
 }
 
@@ -1594,6 +1605,40 @@ pub(crate) fn solve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn par_fill_fills_every_record_once_on_any_number_of_threads() {
+        let width = 3;
+        let records = 1000;
+        let fill = |threads: usize| {
+            let mut out = vec![0usize; width * records];
+            par_fill(&mut out, width, threads, 7, |first, part| {
+                for (k, record) in part.chunks_mut(width).enumerate() {
+                    for v in record.iter_mut() {
+                        *v += first + k + 1;
+                    }
+                }
+            });
+            out
+        };
+        let expected: Vec<usize> = (0..width * records).map(|i| i / width + 1).collect();
+        for threads in [1, 2, 7, 16, 64, 500] {
+            assert_eq!(fill(threads), expected, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn a_panic_in_par_fill_reaches_the_caller() {
+        let caught = std::panic::catch_unwind(|| {
+            let mut out = vec![0.0f64; 64];
+            par_fill(&mut out, 1, 8, 1, |first, _| {
+                if first >= 32 {
+                    std::panic::panic_any("a late run");
+                }
+            });
+        });
+        assert!(caught.is_err());
+    }
 
     /// A beam of `cells` voxels of edge 1, held at x = 0, loaded down at its far end.
     fn beam(

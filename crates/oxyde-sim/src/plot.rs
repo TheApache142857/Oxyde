@@ -12,9 +12,9 @@
 
 use std::collections::HashMap;
 
-use crate::math::{V3, cross, lerp, norm, sub};
 use crate::mesh::TetMesh;
 use crate::solve::Results;
+use oxyde_generative::math::{V3, cross, lerp, norm, sub};
 
 /// What a plot shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,7 +63,7 @@ impl Quantity {
             Quantity::Displacement => results
                 .displacement
                 .iter()
-                .map(|u| crate::math::norm(*u))
+                .map(|u| oxyde_generative::math::norm(*u))
                 .collect(),
             Quantity::FactorOfSafety => (0..results.von_mises.len())
                 .map(|i| results.factor_of_safety(i).unwrap_or(f64::INFINITY))
@@ -315,9 +315,9 @@ mod tests {
                 .iter()
                 .map(|t| {
                     let p = t.map(|i| b.positions[i as usize].map(f64::from));
-                    let e1 = crate::math::sub(p[1], p[0]);
-                    let e2 = crate::math::sub(p[2], p[0]);
-                    0.5 * crate::math::norm(crate::math::cross(e1, e2))
+                    let e1 = oxyde_generative::math::sub(p[1], p[0]);
+                    let e2 = oxyde_generative::math::sub(p[2], p[0]);
+                    0.5 * oxyde_generative::math::norm(oxyde_generative::math::cross(e1, e2))
                 })
                 .sum()
         };

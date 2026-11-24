@@ -8,14 +8,16 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::GenerativeStudy;
-use crate::bvh::Bvh;
-use crate::material::Elastic;
-use crate::math::{V3, add, cross, dot, norm, normalize, scale, sub};
-use crate::mesher::{MeshError, MeshOptions, SurfaceMesh, mesh_solids};
+use crate::mesher::{MeshError, MeshOptions, mesh_solids};
 use crate::modal::{FrequencyStudy, solve_frequencies};
-use crate::solve::{self, Load, LoadKind, SolveError, SolveOptions, Study};
-use crate::topology::Shape;
+use crate::solve::{self, SolveError, Study};
+use oxyde_generative::GenerativeStudy;
+use oxyde_generative::bvh::Bvh;
+use oxyde_generative::material::Elastic;
+use oxyde_generative::math::{V3, add, cross, dot, norm, normalize, scale, sub};
+use oxyde_generative::shape::Shape;
+use oxyde_generative::study::{Load, LoadKind, SolveOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
 
 /// About this many nodes at most in the check's mesh: elements a voxel where that keeps
 /// under it, larger on a large part, so the check takes seconds to a minute or two.
@@ -120,7 +122,7 @@ impl std::fmt::Display for CheckError {
 }
 
 /// Checks the part made of an outcome of `study`: `pieces` are its surfaces (as
-/// [`super::solid_pieces`] gives them, one per solid), `material` the outcome's. `progress`
+/// [`oxyde_generative::solid_pieces`] gives them, one per solid), `material` the outcome's. `progress`
 /// hears what is being done and the fraction done, from 0 to 1.
 pub fn check_part(
     study: &GenerativeStudy,
@@ -140,7 +142,11 @@ pub fn check_part(
     // The elements: a voxel, larger where the part would need too many.
     let volume: f64 = solids.iter().map(SurfaceMesh::volume).sum();
     let (lo, hi) = bounds(&solids);
-    let box_volume: f64 = (0..3).map(|a| (hi[a] - lo[a]).max(voxel)).product();
+    let box_volume: f64 = hi
+        .iter()
+        .zip(&lo)
+        .map(|(h, l)| (h - l).max(voxel))
+        .product();
     let mut size = (FINEST * voxel)
         .max((8.0 * volume.max(0.0) / CHECK_NODES).cbrt())
         .max((box_volume / CHECK_LATTICE).cbrt());
@@ -432,7 +438,7 @@ fn through_centre(load: &Load, kept: &[([V3; 3], u32)]) -> Load {
 }
 
 /// The pieces as the mesher takes them, each triangle labelled with the kept face
-/// ([`kept_faces`]) it lies on, or [`crate::NO_LABEL`].
+/// ([`kept_faces`]) it lies on, or [`oxyde_generative::NO_LABEL`].
 fn labelled(
     study: &GenerativeStudy,
     kept: &[([V3; 3], u32)],
@@ -472,7 +478,7 @@ fn labelled(
                         (Some(a), Some(b), Some(c)) => on_face([a, b, c]),
                         _ => None,
                     };
-                    label.unwrap_or(crate::NO_LABEL)
+                    label.unwrap_or(oxyde_generative::NO_LABEL)
                 })
                 .collect();
             SurfaceMesh {
@@ -489,11 +495,149 @@ fn bounds(solids: &[SurfaceMesh]) -> (V3, V3) {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     for p in solids.iter().flat_map(|s| s.positions.iter()) {
-        lo = std::array::from_fn(|a| lo[a].min(p[a]));
-        hi = std::array::from_fn(|a| hi[a].max(p[a]));
+        for ((l, h), v) in lo.iter_mut().zip(hi.iter_mut()).zip(p) {
+            *l = l.min(*v);
+            *h = h.max(*v);
+        }
     }
     if lo[0] > hi[0] {
         return ([0.0; 3], [0.0; 3]);
     }
     (lo, hi)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use oxyde_generative::material::Elastic;
+    use oxyde_generative::math::V3;
+    use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind};
+    use oxyde_generative::surfaces::{SurfaceMesh, box_surface};
+    use oxyde_generative::{DesignSpace, GenerativeStudy, PreserveRegion};
+
+    use super::*;
+
+    const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
+
+    /// A box's surface, its sides labelled `10 × body + side` (side as `box_surface` numbers
+    /// them: −X, +X, −Y, +Y, −Z, +Z).
+    fn block(body: u32, lo: V3, hi: V3) -> SurfaceMesh {
+        let mut s = box_surface(lo, hi);
+        for l in &mut s.labels {
+            *l += 10 * body;
+        }
+        s
+    }
+
+    /// A bar 100 × 10 × 10 mm kept whole (its own preserve body), fixed on its −X face, pulled
+    /// 10 kN along +X on its +X face; and the part made of it, the same box, its faces
+    /// unlabelled as an outcome's surface comes.
+    fn bar_part() -> (GenerativeStudy, oxyde_generative::shape::Shape) {
+        let (lo, hi) = ([0.0; 3], [100.0, 10.0, 10.0]);
+        let study = GenerativeStudy {
+            space: DesignSpace {
+                preserve: vec![block(0, lo, hi)],
+                margin: [Some(0.0); 3],
+                ..DesignSpace::default()
+            },
+            fixtures: vec![Fixture {
+                kind: FixtureKind::Fixed,
+                labels: vec![0],
+            }],
+            loads: vec![Load {
+                kind: LoadKind::Force {
+                    total: 10_000.0,
+                    direction: Some([1.0, 0.0, 0.0]),
+                },
+                labels: vec![1],
+            }],
+            gravity: Vec::new(),
+            remote_masses: Vec::new(),
+            load_cases: Vec::new(),
+            objective: Default::default(),
+            mass_target: 1.0,
+            member_size: None,
+            max_iterations: 1,
+            voxel_size: 2.0,
+            symmetry: None,
+            min_frequency: None,
+        };
+        let surface = box_surface(lo, hi);
+        let part = oxyde_generative::shape::Shape {
+            labels: vec![oxyde_generative::NO_LABEL; surface.triangles.len()],
+            positions: surface.positions,
+            triangles: surface.triangles,
+        };
+        (study, part)
+    }
+
+    #[test]
+    fn a_part_is_checked_on_its_own_mesh() {
+        let (study, part) = bar_part();
+        // No Poisson's ratio: the fixed end does not hold the bar from narrowing, so the stress
+        // is P/A = 100 MPa throughout.
+        let material = Elastic::new(200_000.0, 0.0, 250.0, 7850.0);
+        let cancel = AtomicBool::new(false);
+        let check = check_part(&study, &[part], &material, &cancel, &|_, _| {}).unwrap();
+        // The end moves PL/EA = 0.05 mm, the load's work is 500 N·mm, and 10 cm³ of steel
+        // weighs 78.5 g. The mesher bevels the box's edges at an element's scale (here a voxel,
+        // a fifth of the bar's side), which takes some of its section and leaves a band of the
+        // fixed end free, so the end's corners move up to a sixth more than the theory's; the
+        // load goes through the end's centre whatever the bevels take of it, else the bar
+        // bends and its end moves twice as far.
+        let near =
+            |value: f64, expected: f64, share: f64| (value - expected).abs() <= share * expected;
+        assert!(near(check.max_displacement, 0.05, 0.2), "{check:?}");
+        assert!(near(check.compliance, 500.0, 0.06), "{check:?}");
+        assert!(near(check.mass, 0.0785, 0.05), "{check:?}");
+        assert!((90.0..=150.0).contains(&check.max_von_mises), "{check:?}");
+        let fos = check.min_factor_of_safety.unwrap();
+        assert!((fos - 250.0 / check.max_von_mises).abs() < 1e-12);
+        assert!(
+            check.volume_kept > 0.95 && check.volume_kept <= 1.0 + 1e-9,
+            "{check:?}"
+        );
+        assert!(check.element_size >= study.voxel_size);
+        assert!(check.nodes > 0 && check.elements > 0);
+    }
+
+    #[test]
+    fn a_part_kept_by_preserve_regions_is_checked_on_their_faces() {
+        // The same bar with no preserve body: its ends kept as regions of its own body, the
+        // fixture and the load on them.
+        let (mut study, part) = bar_part();
+        let body = study.space.preserve.remove(0);
+        study.space.regions = vec![PreserveRegion {
+            body: 0,
+            labels: vec![0, 1],
+            depth: 2.0,
+        }];
+        study.space.region_bodies = vec![body];
+        let material = Elastic::new(200_000.0, 0.0, 250.0, 7850.0);
+        let cancel = AtomicBool::new(false);
+        let check = check_part(&study, &[part], &material, &cancel, &|_, _| {}).unwrap();
+        let near =
+            |value: f64, expected: f64, share: f64| (value - expected).abs() <= share * expected;
+        assert!(near(check.compliance, 500.0, 0.06), "{check:?}");
+        assert!(near(check.max_displacement, 0.05, 0.2), "{check:?}");
+    }
+
+    #[test]
+    fn a_part_off_the_kept_faces_is_not_checked() {
+        let (study, mut part) = bar_part();
+        // Moved 1 mm across: none of its faces lie on the bar's.
+        for p in &mut part.positions {
+            p[1] += 1.0;
+        }
+        let cancel = AtomicBool::new(false);
+        let error = check_part(&study, &[part], &STEEL, &cancel, &|_, _| {}).unwrap_err();
+        assert_eq!(
+            error,
+            CheckError::NotOnPart {
+                what: Missing::Fixture,
+                index: 0
+            }
+        );
+    }
 }

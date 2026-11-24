@@ -8,7 +8,7 @@
 //! the command, or pick the role in the panel), hold and load the preserve bodies as in a
 //! static study, set the mass target, the ways of making it and the materials. *Generate*
 //! lays the design space on a grid of voxels once and grows an outcome for every material
-//! and every method direction on a thread of its own (`oxyde_sim::generative`), on the
+//! and every method direction on a thread of its own (`oxyde_generative`), on the
 //! graphics card when there is one (`oxyde-sim-gpu`). The outcomes show as they come:
 //! *Explore* lists them, plots them mass against stress (or stiffness, displacement, safety)
 //! and draws the one picked in the viewport, its iterations on a slider; *Export* writes it
@@ -32,16 +32,19 @@ use oxyde_format::simulation::{
     AxisDirection, GenerativeMethod, GenerativeObjective, GenerativeObstacle, GenerativeSettings,
     LoadCase, MeshSize, OutcomeMethod, StudyBody, StudyType, SymmetryPlanes,
 };
+use oxyde_generative::material::Elastic;
+use oxyde_generative::shape::Shape;
+use oxyde_generative::study::{FixtureKind, LoadKind, SolveOptions, Symmetry};
+use oxyde_generative::surfaces::SurfaceMesh;
+use oxyde_generative::{
+    Backend, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError, GenerativeStudy, Grid,
+    MAX_VOXELS, Method, Objective, Obstacle, PreserveRegion, RemoteMass, Sides, Voxel,
+    decimate_holding, exact_surface, generate_on, solid_pieces, surface, voxel_size,
+};
 use oxyde_kernel::{FaceMesh, Kernel, Mesh, ShapeHandle, StepMaterial};
 use oxyde_model::{BodyId, FeatureStatus, FileData, Import, Material, Mechanical, Part};
 use oxyde_render::{Material as RenderMaterial, Scene};
-use oxyde_sim::generative::{
-    Backend, CheckError, DesignSpace, Direction, GRAYNESS_SETTLED, GenerativeError,
-    GenerativeStudy, Grid, MAX_VOXELS, Method, Objective, Obstacle, PartCheck, PreserveRegion,
-    RemoteMass, Sides, Voxel, check_part, decimate_holding, exact_surface, generate_on,
-    solid_pieces, surface, voxel_size,
-};
-use oxyde_sim::{Elastic, FixtureKind, LoadKind, Shape, SolveOptions, SurfaceMesh, Symmetry};
+use oxyde_sim::check::{CheckError, PartCheck, check_part};
 
 use crate::app::OxydeApp;
 use crate::simulation_ui::{
@@ -513,22 +516,22 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
             _ => load_names.push(&item.name),
         }
         match item.kind {
-            ItemKind::Fixed => fixtures.push(oxyde_sim::Fixture {
+            ItemKind::Fixed => fixtures.push(oxyde_generative::study::Fixture {
                 kind: FixtureKind::Fixed,
                 labels,
             }),
-            ItemKind::Roller => fixtures.push(oxyde_sim::Fixture {
+            ItemKind::Roller => fixtures.push(oxyde_generative::study::Fixture {
                 kind: FixtureKind::Roller,
                 labels,
             }),
-            ItemKind::Force { newtons, direction } => loads.push(oxyde_sim::Load {
+            ItemKind::Force { newtons, direction } => loads.push(oxyde_generative::study::Load {
                 kind: LoadKind::Force {
                     total: newtons,
                     direction: direction.vector(),
                 },
                 labels,
             }),
-            ItemKind::Pressure { mpa } => loads.push(oxyde_sim::Load {
+            ItemKind::Pressure { mpa } => loads.push(oxyde_generative::study::Load {
                 kind: LoadKind::Pressure { value: mpa },
                 labels,
             }),
@@ -568,7 +571,7 @@ pub(crate) fn engine_study(study: &Study, surfaces: &Surfaces) -> Result<Generat
     };
     let mut load_cases = Vec::with_capacity(g.load_cases.len());
     for c in &g.load_cases {
-        let case = oxyde_sim::generative::LoadCase {
+        let case = oxyde_generative::LoadCase {
             fixtures: index(&c.fixtures, &fixture_names),
             loads: index(&c.loads, &load_names),
             gravity: index(&c.loads, &gravity_names),
@@ -721,7 +724,7 @@ pub(crate) fn voxel_estimate(study: &Study, surfaces: &Surfaces) -> Option<(f64,
     let space = design_space(study, surfaces).ok()?.space;
     let h = study_voxel_size(g, &space)?;
     let symmetry = engine_symmetry(g.symmetry);
-    let (lo, hi) = oxyde_sim::generative::design_box(&space, symmetry.as_ref())?;
+    let (lo, hi) = oxyde_generative::design_box(&space, symmetry.as_ref())?;
     let count = lo
         .iter()
         .zip(&hi)
@@ -752,7 +755,7 @@ pub(crate) fn census(study: &Study, surfaces: &Surfaces) -> Option<Census> {
     let g = &study.generative;
     let Space { space, kept, .. } = design_space(study, surfaces).ok()?;
     let symmetry = engine_symmetry(g.symmetry);
-    let (lo, hi) = oxyde_sim::generative::design_box(&space, symmetry.as_ref())?;
+    let (lo, hi) = oxyde_generative::design_box(&space, symmetry.as_ref())?;
     let volume: f64 = lo.iter().zip(&hi).map(|(l, u)| (u - l).max(1e-9)).product();
     let h = study_voxel_size(g, &space)?.max((volume / CENSUS_VOXELS).cbrt());
     // The holes kept clear, as the generation keeps them: in the regions' faces, the
@@ -896,7 +899,7 @@ pub(crate) fn setup_warnings(
 /// The outcome the engine gave, as the files keep it.
 pub(crate) fn outcome_of(
     plan: &OutcomePlan,
-    o: oxyde_sim::generative::Outcome,
+    o: oxyde_generative::Outcome,
     seconds: f64,
 ) -> GenerativeOutcome {
     GenerativeOutcome {

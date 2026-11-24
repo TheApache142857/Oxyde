@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use crate::math::{V3, add, cross, dot, norm, scale, sub};
-use crate::topology::Shape;
+use crate::shape::Shape;
 
 /// A collapse turns no triangle further than this cosine from where it faced.
 const MIN_TURN_COSINE: f64 = 0.2;
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn an_outcome_surface_is_simplified_into_a_closed_manifold() {
-        use crate::generative::{Grid, Voxel, surface};
+        use crate::{Grid, Voxel, surface};
         // A bar 12 voxels long, 4 × 4 across, its densities ramping at the ends.
         let counts = [16, 8, 8];
         let grid = Grid::from_parts(
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn a_tolerance_keeps_the_shape_where_the_target_would_wear_it() {
-        use crate::generative::{Grid, Voxel, surface};
+        use crate::{Grid, Voxel, surface};
         // A plate with a hole through it cut from voxels, unsmoothed: every point on a
         // plane, so collapses within a face cost nothing and across an edge a lot.
         let counts = [24, 12, 8];
@@ -694,7 +694,7 @@ mod tests {
     /// kernel would skip (the servo arm's outcome lost faces in OpenCASCADE that way).
     #[test]
     fn a_flat_sided_surface_is_simplified_without_slivers() {
-        use crate::generative::{Grid, Voxel, surface};
+        use crate::{Grid, Voxel, surface};
         let counts = [30, 30, 8];
         let grid = Grid::from_parts(
             [0.0; 3],

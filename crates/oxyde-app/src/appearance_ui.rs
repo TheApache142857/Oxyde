@@ -1086,11 +1086,15 @@ fn thermal_rows(ui: &mut egui::Ui, m: &mut Material) {
             )
             .clicked()
         {
-            m.thermal = Some(match oxyde_sim::ThermalProps::guess(&m.name, &m.category) {
-                Some(t) => oxyde_model::Thermal::new(t.conductivity, t.specific_heat, t.expansion),
-                // Nothing known of it: a plastic's, to be typed over.
-                None => oxyde_model::Thermal::new(0.2, 1500.0, 80e-6),
-            });
+            m.thermal = Some(
+                match oxyde_generative::material::ThermalProps::guess(&m.name, &m.category) {
+                    Some(t) => {
+                        oxyde_model::Thermal::new(t.conductivity, t.specific_heat, t.expansion)
+                    }
+                    // Nothing known of it: a plastic's, to be typed over.
+                    None => oxyde_model::Thermal::new(0.2, 1500.0, 80e-6),
+                },
+            );
         }
         ui.end_row();
         return;
@@ -1151,7 +1155,7 @@ fn mechanical_rows(ui: &mut egui::Ui, m: &mut Material) {
             )
             .clicked()
         {
-            m.mechanical = Some(match oxyde_sim::Elastic::guess(&m.name, &m.category) {
+            m.mechanical = Some(match oxyde_generative::material::Elastic::guess(&m.name, &m.category) {
                 Some(e) => {
                     oxyde_model::Mechanical::new(e.youngs_modulus, e.poisson, e.yield_strength, 0.0)
                 }

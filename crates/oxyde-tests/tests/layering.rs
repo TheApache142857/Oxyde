@@ -46,7 +46,24 @@ const FORBIDDEN: &[(&str, &[&str])] = &[
         "oxyde-render",
         &["oxyde-occt", "oxyde-solidcore", "oxyde-model", "oxyde-app"],
     ),
-    ("oxyde-sim", &["*"]),
+    ("oxyde-generative", &["*"]),
+    (
+        "oxyde-sim",
+        &[
+            "oxyde-geom",
+            "oxyde-sketch",
+            "oxyde-kernel",
+            "oxyde-occt",
+            "oxyde-model",
+            "oxyde-assembly",
+            "oxyde-format",
+            "oxyde-render",
+            "oxyde-sim-gpu",
+            "oxyde-app",
+            "oxyde-cli",
+            "oxyde-tests",
+        ],
+    ),
     (
         "oxyde-sim-gpu",
         &[
