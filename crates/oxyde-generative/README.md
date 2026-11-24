@@ -69,11 +69,28 @@ solver (`oxyde_sim::check`); that check uses Oxyde's mesher and is not part of t
 
 ## What a porter should know
 
-- **Indexing:** the code still indexes slices with values that can come from the input
-  (element and node ids, labels, triangle indices), behind module-level
-  `#![allow(clippy::indexing_slicing)]`. A malformed input can therefore panic instead of
-  returning an error. Turning those sites into errors is the subject of a second change in
-  Oxyde.
+- **Indexing:** input is checked where it enters, and the error names what is wrong.
+  `DesignSpace::check` (from `Grid::lay` and `generate`): every body's triangles name
+  points it has, one label per triangle, finite positions (`BadMesh`). `Grid::check` (from
+  `generate`, `surface` and `exact_surface`): the voxels fill the counts without overflow,
+  the size and corner are finite, fixtures and loads lie on the nodes (`BadGrid`); a
+  surface's densities must number the voxels. Labels and load-case indices are looked up
+  with `get`, and `Shape::volume` and the smoothing leave out triangles off their points.
+  Past those checks the modules below index arrays the crate sizes itself, and keep
+  `#![allow(clippy::indexing_slicing)]` (in `lib.rs`, function by function):
+
+  | Module | Indices come from | Checked by |
+  |---|---|---|
+  | `grid.rs` | the grid's voxels and nodes | `Grid::check` |
+  | `multigrid.rs` | the grid's nodes and its coarser levels, halved from them | `Grid::check` |
+  | `additive.rs` | the grid's voxels, layer by layer | `Grid::check` |
+  | `lib.rs` (the solver's functions) | the grid's voxels, nodes and design groups | `Grid::check` |
+  | `surface.rs` | the lattice one voxel around the grid, and the densities | `Grid::check`; the densities' count in `cut` |
+  | `mma.rs` | the design variables (the grid's groups) and the constraints | `Grid::check`; the method fixes the constraints |
+  | `decimate.rs` | its own mesh, made from the shape's triangles | `Mesh::new`, which leaves out triangles off the points or with a point twice |
+  | `eigen.rs` | the block of vectors it keeps and its small dense matrices | sizes the method sets |
+  | `brick.rs` | the brick's 24 unknowns | constants |
+  | `math.rs` | 3-vectors and small fixed matrices | constants |
 - **Optimised builds:** the tests assume an optimised build. Unoptimised, the solver's
   studies take minutes and load every core for that long; Oxyde's workspace builds this crate
   at `opt-level = 3` in debug and test profiles for that reason.

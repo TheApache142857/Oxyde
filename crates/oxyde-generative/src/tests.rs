@@ -236,6 +236,44 @@ fn a_grid_whose_voxels_do_not_fill_it_is_refused() {
     let mut grid = Grid::build(&study, 1, &cancel).unwrap();
     grid.size = f64::NAN;
     assert_eq!(grid.check(), Err(GenerativeError::BadGrid));
+    // Counts whose product overflows.
+    let mut grid = Grid::build(&study, 1, &cancel).unwrap();
+    grid.counts = [usize::MAX, 2, 2];
+    assert_eq!(grid.check(), Err(GenerativeError::BadGrid));
+    // Densities that do not fit the grid give no surface.
+    let grid = Grid::build(&study, 1, &cancel).unwrap();
+    assert_eq!(surface(&grid, &density[..10], 2), Shape::default());
+}
+
+#[test]
+fn decimating_leaves_out_triangles_off_the_points_or_with_a_point_twice() {
+    // A tetrahedron, a triangle naming a point it does not have, and one with a point twice.
+    let shape = Shape {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        triangles: vec![
+            [0, 2, 1],
+            [0, 1, 3],
+            [0, 3, 2],
+            [1, 2, 3],
+            [1, 2, 9],
+            [1, 1, 3],
+        ],
+        labels: vec![0; 6],
+    };
+    let fewer = decimate(&shape, 0);
+    assert!(fewer.fault().is_none(), "{:?}", fewer.fault());
+    assert!(fewer.triangles.len() <= 4);
+    assert!(
+        fewer
+            .triangles
+            .iter()
+            .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
+    );
 }
 
 #[test]

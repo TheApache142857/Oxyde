@@ -145,26 +145,23 @@ impl Surfaces {
         }
         events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut inside: BTreeSet<u32> = BTreeSet::new();
-        let mut out = vec![NONE; points];
-        let mut e = 0;
-        for (i, o) in out.iter_mut().enumerate() {
-            // Point i sits at 1 + i steps from the line's start.
-            let at = 1.0 + i as f64;
-            while e < events.len() && events[e].0 < at {
-                let s = events[e].1;
-                if !inside.remove(&s) {
-                    inside.insert(s);
-                }
-                e += 1;
-            }
-            *o = inside.first().copied().unwrap_or(NONE);
-        }
-        while e < events.len() {
-            let s = events[e].1;
+        let toggle = |inside: &mut BTreeSet<u32>, s: u32| {
             if !inside.remove(&s) {
                 inside.insert(s);
             }
-            e += 1;
+        };
+        let mut out = vec![NONE; points];
+        let mut events = events.into_iter().peekable();
+        for (i, o) in out.iter_mut().enumerate() {
+            // Point i sits at 1 + i steps from the line's start.
+            let at = 1.0 + i as f64;
+            while let Some((_, s)) = events.next_if(|e| e.0 < at) {
+                toggle(&mut inside, s);
+            }
+            *o = inside.first().copied().unwrap_or(NONE);
+        }
+        for (_, s) in events {
+            toggle(&mut inside, s);
         }
         inside.is_empty().then_some(out)
     }
@@ -178,9 +175,7 @@ impl Surfaces {
     /// The lowest-numbered solid containing `p`, `u32::MAX` for none (along +X, and then
     /// the other axes if that line does not pair up).
     pub fn containing(&self, p: V3, reach: f64, hits: &mut Vec<Hit>) -> u32 {
-        for axis in 0..3 {
-            let mut step = [0.0; 3];
-            step[axis] = reach;
+        for step in [[reach, 0.0, 0.0], [0.0, reach, 0.0], [0.0, 0.0, reach]] {
             if let Some(states) = self.along_line(p, step, 1, hits) {
                 return states.first().copied().unwrap_or(NONE);
             }
