@@ -64,6 +64,18 @@ route; only the mesher has real alternatives.
 4. **TetGen** (AGPL-3 or commercial) and **fTetWild** (MPL-2, with Eigen, Geogram and
    more): constrained Delaunay from the surface mesh and robust "wild" meshing. TetGen's
    licence rules it out; fTetWild is heavy to build and slow.
+5. **FieldCraft's mesher** (`fieldcraft-mesh`, pure Rust, MIT or Apache-2.0, the
+   `tangency-labs/fieldcraft` repository pinned to one commit): a constrained Delaunay
+   tetrahedralization of the surface mesh, refined to a size field graded by curvature and
+   wall thickness, smoothed, and improved by flips and insertions. It takes the lattice
+   mesher's input (a closed triangle mesh, a face label per triangle) and gives four-node
+   elements with labelled boundary faces, which `TetMesh::append_solid` takes as it takes
+   Netgen's. A spike behind `oxyde-sim`'s `fieldcraft` feature, off by default
+   (`oxyde_sim::fieldcraft::append_quality_mesh`); the files keep two meshers.
+   `oxyde-tests/tests/fieldcraft.rs`, an ignored comparison run, meshes the study parts
+   with the three meshers and solves one static study on each. The feature adds
+   `fieldcraft-model`, `fieldcraft-parallel` and `libm`, and links `serde`, `serde_json`
+   and `rayon`, which the lock file already holds.
 
 ### The linear solver
 

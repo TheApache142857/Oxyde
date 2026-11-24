@@ -66,3 +66,13 @@ opt-level = 3
 # The MCP server's mesh sampling and probing (compare, probe) would take minutes unoptimized.
 [profile.dev.package.oxyde-mcp]
 opt-level = 3
+
+# FieldCraft's mesher with oxyde-sim's `fieldcraft` feature, compared with the others' times.
+[profile.dev.package.fieldcraft-mesh]
+opt-level = 3
+
+[profile.dev.package.fieldcraft-model]
+opt-level = 3
+
+[profile.dev.package.fieldcraft-parallel]
+opt-level = 3
