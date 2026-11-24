@@ -1,6 +1,8 @@
 //! Oxyde's sketch geometry as solidcore records, and the extrusion's faces named after it.
 
-use oxyde_geom::{Curve2, Loop, Plane, Point2, Profile};
+use std::f64::consts::TAU;
+
+use oxyde_geom::{Curve2, Ellipse2, Loop, Plane, Point2, Profile};
 use oxyde_kernel::FaceSource;
 use solidcore_record::brep::{Brep as Record, Loop as RecordLoop, Surface};
 use solidcore_record::{Loop2, Plane as RecordPlane, Region2, Seg2, Vec2, Vec3 as RecordVec3};
@@ -53,13 +55,81 @@ pub(crate) enum Unbuilt {
     Kind,
 }
 
-/// One sketch curve as a solidcore segment; arcs run from `start` through `mid` to `end`.
-fn segment(curve: &Curve2) -> Result<Seg2, Unbuilt> {
+/// The longest piece of an ellipse one rational quadratic Bézier holds here: a third of a
+/// turn, so a whole ellipse is three pieces.
+const CONIC_PIECE: f64 = TAU / 3.0;
+
+/// Part of an ellipse as exact rational quadratic Béziers (solidcore's conic segments), from
+/// eccentric angle `from` turning by `sweep`, starting at `first` and ending at `last`.
+///
+/// A circle's arc of angle `2h` is the quadratic with end weights 1, the middle weight
+/// `cos h`, and its control point where the tangents at its ends meet: the arc's middle
+/// pushed out from the centre by `1 / cos h`. An ellipse is that circle stretched along its
+/// axes, which carries the control point along.
+fn conic_pieces(
+    ellipse: &Ellipse2,
+    from: f64,
+    sweep: f64,
+    first: Point2,
+    last: Point2,
+) -> Result<Vec<Seg2>, Unbuilt> {
+    if !ellipse.is_valid() {
+        return Err(Unbuilt::Kind);
+    }
+    let count = (sweep.abs() / CONIC_PIECE).ceil().max(1.0);
+    let step = sweep / count;
+    let w = (step / 2.0).cos();
+    let c = ellipse.center;
+    let pieces = count as usize;
+    let mut out = Vec::with_capacity(pieces);
+    let mut a = first;
+    for i in 0..pieces {
+        let t = from + step * i as f64;
+        let b = if i + 1 == pieces {
+            last
+        } else {
+            ellipse.at(t + step)
+        };
+        let mid = ellipse.at(t + step / 2.0);
+        let apex = Point2::new(c.x + (mid.x - c.x) / w, c.y + (mid.y - c.y) / w);
+        out.push(Seg2::Conic {
+            a: v2(a),
+            apex: v2(apex),
+            b: v2(b),
+            w,
+        });
+        a = b;
+    }
+    Ok(out)
+}
+
+/// One sketch curve as solidcore segments; arcs run from `start` through `mid` to `end`.
+fn segment(curve: &Curve2) -> Result<Vec<Seg2>, Unbuilt> {
     match *curve {
-        Curve2::Line { start, end } => Ok(Seg2::Line {
+        Curve2::Line { start, end } => Ok(vec![Seg2::Line {
             a: v2(start),
             b: v2(end),
-        }),
+        }]),
+        Curve2::Ellipse(ellipse) => {
+            let first = ellipse.at(0.0);
+            conic_pieces(&ellipse, 0.0, TAU, first, first)
+        }
+        Curve2::EllipticArc {
+            ellipse,
+            start,
+            mid,
+            end,
+        } => {
+            let (a0, am, a1) = (
+                ellipse.angle_of(start),
+                ellipse.angle_of(mid),
+                ellipse.angle_of(end),
+            );
+            let ccw = (a1 - a0).rem_euclid(TAU);
+            let through = (am - a0).rem_euclid(TAU);
+            let sweep = if through <= ccw { ccw } else { ccw - TAU };
+            conic_pieces(&ellipse, a0, sweep, start, end)
+        }
         Curve2::Arc { start, mid, end } => {
             let (center, radius) = circle_through(start, mid, end).ok_or(Unbuilt::NoCircle)?;
             let tau = std::f64::consts::TAU;
@@ -68,14 +138,14 @@ fn segment(curve: &Curve2) -> Result<Seg2, Unbuilt> {
             let ccw = (a1 - a0).rem_euclid(tau);
             let through = (am - a0).rem_euclid(tau);
             let sweep = if through <= ccw { ccw } else { ccw - tau };
-            Ok(Seg2::Arc {
+            Ok(vec![Seg2::Arc {
                 center: v2(center),
                 radius,
                 start: a0,
                 sweep,
-            })
+            }])
         }
-        ref other => whole_circle(other),
+        ref other => whole_circle(other).map(|s| vec![s]),
     }
 }
 
@@ -95,11 +165,10 @@ fn whole_circle(curve: &Curve2) -> Result<Seg2, Unbuilt> {
 }
 
 fn loop2(l: &Loop) -> Result<Loop2, Unbuilt> {
-    let segs = l
-        .segments
-        .iter()
-        .map(|s| segment(&s.curve))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut segs = Vec::new();
+    for s in &l.segments {
+        segs.extend(segment(&s.curve)?);
+    }
     Ok(Loop2 { segs })
 }
 
@@ -218,6 +287,9 @@ pub(crate) fn extrusion_source(
                 let (center, radius) = circle_through(start, mid, end)?;
                 (center.distance(m) - radius).abs() < ON
             }
+            Curve2::Ellipse(ellipse) | Curve2::EllipticArc { ellipse, .. } => {
+                ellipse.at(ellipse.angle_of(m)).distance(m) < ON
+            }
             ref other => on_circle(other, m),
         };
         on.then_some(FaceSource::ProfileSegment(id))
@@ -252,20 +324,22 @@ mod tests {
         let a = Point2::new(1.0, 0.0);
         let top = Point2::new(0.0, 1.0);
         let b = Point2::new(-1.0, 0.0);
-        let Ok(Seg2::Arc { sweep, radius, .. }) = segment(&Curve2::Arc {
+        let built = segment(&Curve2::Arc {
             start: a,
             mid: top,
             end: b,
-        }) else {
+        });
+        let Ok(&[Seg2::Arc { sweep, radius, .. }]) = built.as_deref() else {
             panic!("an arc");
         };
         assert!((radius - 1.0).abs() < 1e-12);
         assert!((sweep - std::f64::consts::PI).abs() < 1e-12);
-        let Ok(Seg2::Arc { sweep, .. }) = segment(&Curve2::Arc {
+        let built = segment(&Curve2::Arc {
             start: a,
             mid: Point2::new(0.0, -1.0),
             end: b,
-        }) else {
+        });
+        let Ok(&[Seg2::Arc { sweep, .. }]) = built.as_deref() else {
             panic!("an arc");
         };
         assert!((sweep + std::f64::consts::PI).abs() < 1e-12);
@@ -294,5 +368,57 @@ mod tests {
         };
         assert!(whole_circle(&circle).is_ok());
         assert!(on_circle(&circle, Point2::new(0.0, 2.0)));
+    }
+
+    /// The point of a rational quadratic Bézier at `s`.
+    fn conic_at(seg: &Seg2, s: f64) -> Point2 {
+        let Seg2::Conic { a, apex, b, w } = *seg else {
+            panic!("not a conic: {seg:?}");
+        };
+        let (k0, k1, k2) = ((1.0 - s) * (1.0 - s), 2.0 * s * (1.0 - s) * w, s * s);
+        let sum = k0 + k1 + k2;
+        Point2::new(
+            (k0 * a.x + k1 * apex.x + k2 * b.x) / sum,
+            (k0 * a.y + k1 * apex.y + k2 * b.y) / sum,
+        )
+    }
+
+    /// How far a point of a conic piece may lie from the ellipse it was made from: rounding
+    /// only.
+    const EXACT: f64 = 1e-12;
+
+    #[test]
+    fn ellipses_become_exact_conic_pieces() {
+        let ellipse = Ellipse2 {
+            center: Point2::new(1.0, -2.0),
+            major: Point2::new(4.0, 2.0),
+            minor: 2.0,
+        };
+        let on = |p: Point2| ellipse.at(ellipse.angle_of(p)).distance(p);
+        let whole = segment(&Curve2::Ellipse(ellipse)).unwrap();
+        assert_eq!(whole.len(), 3);
+        for seg in &whole {
+            for k in 0..=10 {
+                let p = conic_at(seg, k as f64 / 10.0);
+                assert!(on(p) < EXACT, "{p:?}");
+            }
+        }
+        // Closed: the last piece ends where the first starts.
+        assert_eq!(conic_at(&whole[2], 1.0), conic_at(&whole[0], 0.0));
+        // A quarter, clockwise from the major point through the minor axis's far side.
+        let (start, end) = (ellipse.at(0.0), ellipse.at(-std::f64::consts::FRAC_PI_2));
+        let arc = segment(&Curve2::EllipticArc {
+            ellipse,
+            start,
+            mid: ellipse.at(-std::f64::consts::FRAC_PI_4),
+            end,
+        })
+        .unwrap();
+        assert_eq!(arc.len(), 1);
+        assert_eq!(conic_at(&arc[0], 0.0), start);
+        assert_eq!(conic_at(&arc[0], 1.0), end);
+        let middle = conic_at(&arc[0], 0.5);
+        assert!(on(middle) < EXACT);
+        assert!(middle.distance(ellipse.at(-std::f64::consts::FRAC_PI_4)) < EXACT);
     }
 }
