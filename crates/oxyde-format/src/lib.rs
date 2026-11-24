@@ -1179,6 +1179,35 @@ mod tests {
     }
 
     #[test]
+    fn keys_a_reader_does_not_know_are_ignored() {
+        let file = sample();
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            drop(entry);
+            if name == MODEL {
+                let mut model: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                model["a_later_key"] = serde_json::json!({"anything": [1, 2]});
+                for feature in model["features"].as_array_mut().unwrap() {
+                    feature["a_later_field"] = serde_json::json!(true);
+                }
+                data = serde_json::to_vec(&model).unwrap();
+            }
+            out.start_file(name, SimpleFileOptions::default()).unwrap();
+            out.write_all(&data).unwrap();
+        }
+        let bytes = out.finish().unwrap().into_inner();
+        assert_eq!(read_part(Cursor::new(bytes)).unwrap(), file);
+    }
+
+    #[test]
     fn converted_copies_keep_their_links_in_a_part_of_version_one() {
         use oxyde_model::FeatureId;
         use oxyde_model::projection::{Projection, ProjectionSource};

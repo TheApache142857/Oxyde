@@ -391,7 +391,7 @@ All fields are optional when reading. `volume_mm3` is computed at save time and 
 - Refuse files whose `format` is not `"oxyde"`, whose `kind` is not supported, or whose `format_version` is higher than supported, with a clear message.
 - Older versions are upgraded through explicit, tested migrations (v1 → v2 → …), never by guessing.
 - Validate the timeline on open: unique feature ids, every feature refers only to features before it, sketch entities and relations refer to existing entities of the right kind, relation ids are unique, and names are valid and unique as described above. An unknown feature or relation `type` is an error in version 1.
-- Additive changes (new optional fields, new entries) do not bump the version; anything else does.
+- Additive changes (new optional fields, new entries) do not bump the version; anything else does. Readers ignore keys they do not know, so an older reader opens a file with a newer optional field and leaves that field out.
 
 ## 6. Assemblies (`.oxyasm`)
 
