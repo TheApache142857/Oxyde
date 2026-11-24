@@ -14,15 +14,20 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// mm³: the volume it encloses.
+    /// mm³: the volume it encloses, its triangles off its points left out.
     pub fn volume(&self) -> f64 {
         self.triangles
             .iter()
-            .map(|t| {
-                let [a, b, c] = t.map(|i| self.positions[i as usize]);
-                dot(a, cross(b, c)) / 6.0
+            .filter_map(|t| {
+                let p = |i: u32| self.positions.get(i as usize).copied();
+                Some(dot(p(t[0])?, cross(p(t[1])?, p(t[2])?)) / 6.0)
             })
             .sum()
+    }
+
+    /// Its first fault, if any ([`crate::surfaces::mesh_fault`]).
+    pub fn fault(&self) -> Option<crate::surfaces::MeshFault> {
+        crate::surfaces::mesh_fault(&self.positions, &self.triangles, &self.labels)
     }
 }
 
@@ -39,14 +44,22 @@ pub fn smooth_holding(shape: &mut Shape, fixed: &[bool], rounds: usize) {
     taubin(shape, fixed, rounds, true);
 }
 
+/// Triangles off the points are left out.
 fn taubin(shape: &mut Shape, fixed: &[bool], rounds: usize, hold_next: bool) {
     let n = shape.positions.len();
     let mut neighbours: Vec<Vec<u32>> = vec![Vec::new(); n];
-    for t in &shape.triangles {
-        for k in 0..3 {
-            let (a, b) = (t[k], t[(k + 1) % 3]);
-            neighbours[a as usize].push(b);
-            neighbours[b as usize].push(a);
+    for t in shape
+        .triangles
+        .iter()
+        .filter(|t| t.iter().all(|&i| (i as usize) < n))
+    {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            if let Some(list) = neighbours.get_mut(a as usize) {
+                list.push(b);
+            }
+            if let Some(list) = neighbours.get_mut(b as usize) {
+                list.push(a);
+            }
         }
     }
     for list in &mut neighbours {
@@ -54,23 +67,28 @@ fn taubin(shape: &mut Shape, fixed: &[bool], rounds: usize, hold_next: bool) {
         list.dedup();
     }
     let is_fixed = |i: usize| fixed.get(i).copied().unwrap_or(false);
-    let next_to_fixed: Vec<bool> = (0..n)
-        .map(|i| hold_next && neighbours[i].iter().any(|&j| is_fixed(j as usize)))
+    let next_to_fixed: Vec<bool> = neighbours
+        .iter()
+        .map(|list| hold_next && list.iter().any(|&j| is_fixed(j as usize)))
         .collect();
     let step = |positions: &mut Vec<V3>, factor: f64| {
-        let next: Vec<V3> = (0..n)
-            .map(|i| {
-                let p = positions[i];
-                let list = &neighbours[i];
-                if is_fixed(i) || list.is_empty() || factor < 0.0 && next_to_fixed[i] {
+        let next: Vec<V3> = positions
+            .iter()
+            .zip(&neighbours)
+            .zip(&next_to_fixed)
+            .enumerate()
+            .map(|(i, ((&p, list), &next_to))| {
+                if is_fixed(i) || list.is_empty() || factor < 0.0 && next_to {
                     return p;
                 }
-                let mean = scale(
-                    list.iter()
-                        .fold([0.0; 3], |s, &j| add(s, positions[j as usize])),
-                    1.0 / list.len() as f64,
-                );
-                add(p, scale(sub(mean, p), factor))
+                let sum = list
+                    .iter()
+                    .filter_map(|&j| positions.get(j as usize))
+                    .fold([0.0; 3], |s, &q| add(s, q));
+                add(
+                    p,
+                    scale(sub(scale(sum, 1.0 / list.len() as f64), p), factor),
+                )
             })
             .collect();
         *positions = next;

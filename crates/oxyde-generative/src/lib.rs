@@ -223,6 +223,22 @@ pub struct DesignSpace {
 }
 
 impl DesignSpace {
+    /// Every body of the design space a usable triangle mesh, or the first fault.
+    pub fn check(&self) -> Result<(), GenerativeError> {
+        let bodies = self
+            .preserve
+            .iter()
+            .chain(&self.region_bodies)
+            .chain(self.obstacles.iter().map(|o| &o.surface))
+            .chain(&self.starting_shape);
+        for body in bodies {
+            if let Some(fault) = body.fault() {
+                return Err(GenerativeError::BadMesh { fault });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether anything is kept: a preserve body or a region with a surface.
     pub fn keeps_anything(&self) -> bool {
         self.preserve.iter().any(|s| !s.triangles.is_empty())
@@ -618,6 +634,12 @@ pub enum GenerativeError {
     /// The solver failed: why.
     Solver(String),
     Cancelled,
+    /// A body of the design space is no usable triangle mesh.
+    BadMesh {
+        fault: crate::surfaces::MeshFault,
+    },
+    /// The grid's voxels do not fill its counts, or its size or corner is not finite.
+    BadGrid,
 }
 
 impl std::fmt::Display for GenerativeError {
@@ -707,6 +729,26 @@ impl std::fmt::Display for GenerativeError {
             ),
             GenerativeError::Solver(why) => write!(f, "the solver failed: {why}"),
             GenerativeError::Cancelled => write!(f, "cancelled"),
+            GenerativeError::BadMesh { fault } => match fault {
+                crate::surfaces::MeshFault::PointOutOfRange { triangle } => write!(
+                    f,
+                    "a body of the design space is broken: its triangle {triangle} names a point it does not have"
+                ),
+                crate::surfaces::MeshFault::LabelCount { labels, triangles } => write!(
+                    f,
+                    "a body of the design space is broken: {labels} face labels for {triangles} triangles"
+                ),
+                crate::surfaces::MeshFault::NotFinite { point } => write!(
+                    f,
+                    "a body of the design space is broken: its point {point} is not a number"
+                ),
+            },
+            GenerativeError::BadGrid => {
+                write!(
+                    f,
+                    "the voxel grid does not match the outcome: rebuild the study"
+                )
+            }
         }
     }
 }
@@ -893,6 +935,8 @@ pub fn generate_on(
     cancel: &AtomicBool,
     progress: &dyn Fn(f64),
 ) -> Result<Outcome, GenerativeError> {
+    grid.check()?;
+    study.space.check()?;
     let modulus = material.youngs_modulus;
     if !(modulus.is_finite()
         && modulus > 0.0

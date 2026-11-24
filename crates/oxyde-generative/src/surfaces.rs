@@ -17,7 +17,43 @@ pub struct SurfaceMesh {
     pub labels: Vec<u32>,
 }
 
+/// What is wrong with a triangle mesh handed to the crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshFault {
+    /// Triangle `triangle` names a point past the positions.
+    PointOutOfRange { triangle: usize },
+    /// Not one label per triangle.
+    LabelCount { labels: usize, triangles: usize },
+    /// Point `point` is not at a finite position.
+    NotFinite { point: usize },
+}
+
+/// The first fault of the mesh of `positions`, `triangles` and `labels`, if any.
+pub fn mesh_fault(positions: &[V3], triangles: &[[u32; 3]], labels: &[u32]) -> Option<MeshFault> {
+    if labels.len() != triangles.len() {
+        return Some(MeshFault::LabelCount {
+            labels: labels.len(),
+            triangles: triangles.len(),
+        });
+    }
+    if let Some(point) = positions
+        .iter()
+        .position(|p| p.iter().any(|x| !x.is_finite()))
+    {
+        return Some(MeshFault::NotFinite { point });
+    }
+    triangles
+        .iter()
+        .position(|t| t.iter().any(|&i| i as usize >= positions.len()))
+        .map(|triangle| MeshFault::PointOutOfRange { triangle })
+}
+
 impl SurfaceMesh {
+    /// Its first fault, if any ([`mesh_fault`]).
+    pub fn fault(&self) -> Option<MeshFault> {
+        mesh_fault(&self.positions, &self.triangles, &self.labels)
+    }
+
     /// The volume it encloses (by the divergence theorem), mm³.
     pub fn volume(&self) -> f64 {
         self.triangles

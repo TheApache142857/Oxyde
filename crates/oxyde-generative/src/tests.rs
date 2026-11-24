@@ -2,8 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 
 use super::*;
+use crate::shape::Shape;
 use crate::study::{FixtureKind, LoadKind, THREADS_VARIABLE, capped_thread_count};
-use crate::surfaces::box_surface;
+use crate::surfaces::{SurfaceMesh, box_surface};
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
 
@@ -153,6 +154,109 @@ fn the_thread_cap_is_read_from_the_environment() {
         .unwrap();
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(run.status.success() && out.contains("1 passed"), "{out}");
+}
+
+#[test]
+fn a_broken_body_of_the_design_space_is_refused() {
+    use crate::surfaces::MeshFault;
+    let cancel = AtomicBool::new(false);
+    let broken = |change: fn(&mut SurfaceMesh)| {
+        let mut study = bracket(2.0);
+        change(&mut study.space.preserve[1]);
+        study
+    };
+    type Break = fn(&mut SurfaceMesh);
+    let cases: [(Break, MeshFault); 3] = [
+        (
+            |m| m.triangles[5][1] = 99,
+            MeshFault::PointOutOfRange { triangle: 5 },
+        ),
+        (
+            |m| {
+                m.labels.pop();
+            },
+            MeshFault::LabelCount {
+                labels: 11,
+                triangles: 12,
+            },
+        ),
+        (
+            |m| m.positions[3][2] = f64::NAN,
+            MeshFault::NotFinite { point: 3 },
+        ),
+    ];
+    for (change, fault) in cases {
+        let study = broken(change);
+        assert_eq!(
+            Grid::build(&study, 1, &cancel).err(),
+            Some(GenerativeError::BadMesh { fault })
+        );
+        // Generating checks the study too: a grid of the sound study, the study broken after.
+        let grid = Grid::build(&bracket(2.0), 1, &cancel).unwrap();
+        let options = SolveOptions {
+            threads: 1,
+            ..SolveOptions::default()
+        };
+        let refused = generate(
+            &grid,
+            &study,
+            Method::Unrestricted,
+            &STEEL,
+            &options,
+            &cancel,
+            &|_| {},
+        );
+        assert_eq!(refused.err(), Some(GenerativeError::BadMesh { fault }));
+    }
+}
+
+#[test]
+fn a_grid_whose_voxels_do_not_fill_it_is_refused() {
+    let cancel = AtomicBool::new(false);
+    let study = bracket(2.0);
+    let mut grid = Grid::build(&study, 1, &cancel).unwrap();
+    let density = vec![255u8; grid.voxel_count()];
+    grid.kinds.pop();
+    assert_eq!(grid.check(), Err(GenerativeError::BadGrid));
+    let options = SolveOptions {
+        threads: 1,
+        ..SolveOptions::default()
+    };
+    let refused = generate(
+        &grid,
+        &study,
+        Method::Unrestricted,
+        &STEEL,
+        &options,
+        &cancel,
+        &|_| {},
+    );
+    assert_eq!(refused.err(), Some(GenerativeError::BadGrid));
+    assert_eq!(surface(&grid, &density, 2), Shape::default());
+    let mut grid = Grid::build(&study, 1, &cancel).unwrap();
+    grid.size = f64::NAN;
+    assert_eq!(grid.check(), Err(GenerativeError::BadGrid));
+}
+
+#[test]
+fn a_shape_with_a_triangle_off_its_points_is_measured_and_smoothed_without_it() {
+    let mut shape = Shape {
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        triangles: vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3], [1, 2, 7]],
+        labels: vec![0; 5],
+    };
+    assert_eq!(
+        shape.fault(),
+        Some(crate::surfaces::MeshFault::PointOutOfRange { triangle: 4 })
+    );
+    assert!((shape.volume() - 1.0 / 6.0).abs() < 1e-12);
+    crate::shape::smooth(&mut shape, &[], 2);
+    assert!(shape.positions.iter().flatten().all(|x| x.is_finite()));
 }
 
 #[test]
