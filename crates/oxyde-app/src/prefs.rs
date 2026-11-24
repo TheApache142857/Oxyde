@@ -30,6 +30,9 @@ pub struct Preferences {
     pub simulation: crate::simulation_ui::SimulationPrefs,
     /// The kernel parts are built with, from the next start (`--kernel` overrides it).
     pub kernel: crate::kernel::KernelKind,
+    /// File › Open opens the document in a new window, as Creo does; off, it replaces the
+    /// window's document, as before. A window that shows nothing yet is used either way.
+    pub open_in_new_window: bool,
 }
 
 impl Default for Preferences {
@@ -44,6 +47,7 @@ impl Default for Preferences {
             render: Default::default(),
             simulation: Default::default(),
             kernel: Default::default(),
+            open_in_new_window: true,
         }
     }
 }
