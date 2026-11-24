@@ -11,6 +11,7 @@ release yet; the git history has every detail.
   parallel step on threads started for that step, without `unsafe` code, where it kept
   threads between steps before. Its outcomes are the same. The solver is now the crate
   `oxyde-generative`, which depends on no other crate.
+
 ### A window per document (unreleased, November 2026)
 
 - **File › Open opens the document in a new window**, as Creo does; so do Open recent and
@@ -23,12 +24,14 @@ release yet; the git history has every detail.
   undo history, selection, sketch and panels.
 - Closing a window asks about its unsaved changes; closing the main window closes the
   others, unless one has unsaved changes, which is brought forward instead.
+
 ### Ellipses on the solidcore kernel (unreleased, November 2026)
 
 - **The solidcore kernel extrudes ellipses and elliptic arcs exactly**, as conic pieces of
   at most a third of a turn; before, it refused them with a message. An ellipse's wall is
   three faces, named as the ellipse's parts 1, 2 and 3, where OpenCASCADE makes one face
   (part 0), so face names on such walls differ between the two kernels.
+
 ### Every edge converts exactly (unreleased, November 2026)
 
 - **Convert Entities copies any edge of the part into a sketch exactly**: the part's own
@@ -57,7 +60,7 @@ release yet; the git history has every detail.
 - **File format**: a part whose sketches hold an ellipse is written as `format_version` 3
   (FORMAT.md §2, §3 Sketches); older Oxyde refuses it with a message. Parts without one are
   written as before.
-### SolidCraft's kernel, a first trial (unreleased, November 2026)
+
 ### SolidCraft's kernel, a first trial (0.0.11, November 2026)
 
 - **solidcore**, the geometry kernel of SolidCraft, can build parts in a build made with the
@@ -77,6 +80,7 @@ release yet; the git history has every detail.
 - **Part files record the kernel that built them** (`manifest.json`'s `kernel`, FORMAT.md §2):
   opening a part built by another kernel says so in the status line, since faces and edges may
   be cut and named differently. Older files read as built by OpenCASCADE.
+
 ### Studio theme and a modern look (0.0.11, November 2026)
 
 - **Studio theme** (Preferences › Graphics › Interface): a quiet light look with white and
