@@ -284,6 +284,11 @@ is still open:
     the same before and after the coarse correction, so the preconditioner is symmetric.
     The products run on every core, each thread owning rows, so results do not depend on
     the number of threads.
+- **Threads**: every solve of `oxyde-sim` and `oxyde-generative` takes its thread count
+  from `oxyde_generative::study::thread_count`: the `threads` of its `SolveOptions`, or
+  every core for 0, held to the cores and to the environment variable
+  `OXYDE_SOLVER_THREADS` when it is a whole number above zero. A machine that must keep
+  cores free, or a test run beside other work, sets it once for the whole process.
 
   The iteration count no longer grows with the mesh. The mesher's 20 × 20 × 200 mm
   cantilever, the whole solve (assembly, multigrid setup, iterations, stresses; a debug
