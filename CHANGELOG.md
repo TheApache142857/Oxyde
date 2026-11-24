@@ -15,6 +15,12 @@ release yet; the git history has every detail.
 - **File format**: sketches write an optional `projections` list (FORMAT.md §3 Sketches).
   Older Oxyde opens such parts and keeps the copies fixed where they were saved.
 
+### Solver threads capped for a whole run (unreleased, November 2026)
+
+- **`OXYDE_SOLVER_THREADS`**, set to a whole number above zero, caps the threads of every
+  study, thermal, frequency, topology and generative design solve in the process, the
+  application's and the tests' alike. Unset, solves use every core as before.
+
 ### Planes no longer stand between the pointer and the part (unreleased, November 2026)
 
 - **A click on the part picks the face or edge under it** while a command takes planes
