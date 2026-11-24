@@ -43,7 +43,7 @@ pub struct SolveOptions {
     /// The solve stops when the residual is this fraction of the loads.
     pub tolerance: f64,
     pub max_iterations: usize,
-    /// Threads; 0 for every core.
+    /// Threads; 0 for every core. [`THREADS_VARIABLE`] caps either.
     pub threads: usize,
 }
 
@@ -57,14 +57,27 @@ impl Default for SolveOptions {
     }
 }
 
+/// The environment variable that caps every solve's threads in the process, a whole number
+/// above zero: a machine that must keep cores free sets it once for a whole run.
+pub const THREADS_VARIABLE: &str = "OXYDE_SOLVER_THREADS";
+
+/// The threads a solve asking for `wanted` runs on: `wanted`, or every core for 0, held to
+/// the cores and to [`THREADS_VARIABLE`].
 pub fn thread_count(wanted: usize) -> usize {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    if wanted == 0 {
-        cores
-    } else {
-        wanted.min(cores)
-    }
-    .max(1)
+    let cap = std::env::var(THREADS_VARIABLE).ok();
+    capped_thread_count(wanted, cores, cap.as_deref())
+}
+
+/// [`thread_count`] on `cores` cores with the variable's value `cap`; a value that is not a
+/// whole number above zero caps nothing.
+pub(crate) fn capped_thread_count(wanted: usize, cores: usize, cap: Option<&str>) -> usize {
+    let cap = cap
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(usize::MAX);
+    let wanted = if wanted == 0 { cores } else { wanted };
+    wanted.min(cores).min(cap).max(1)
 }
 
 /// Planes the shape is mirrored about, through `point` and parallel to the standard planes.

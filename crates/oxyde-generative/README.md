@@ -82,6 +82,9 @@ solver (`oxyde_sim::check`); that check uses Oxyde's mesher and is not part of t
   depends on time or on the number of threads. `load_cases_are_laid_apart_and_carried_together`
   asks for an outcome's mass within 6 % of its target: it passes at `opt-level = 3`, and at
   `opt-level = 0` its outcome lies 7.8 % under the target.
+- **Thread count:** `study::thread_count` gives every solve its threads: the options'
+  `threads`, or every core for 0, at most the cores and at most the environment variable
+  `OXYDE_SOLVER_THREADS` (a whole number above zero) for the whole process.
 - **Threads:** each parallel step starts its threads and joins them before it returns. On
   sixteen threads a study takes about half as long again as on threads kept between steps
   (Oxyde's bracket study of `tests/generative.rs`, 30 iterations: 101 to 111 s against 69
