@@ -48,6 +48,8 @@ pub(crate) mod bridge {
         /// (x0, y0) through (x1, y1) to (x2, y2) on the ellipse of center (x3, y3), one
         /// semi-axis to (x4, y4), the other r long
         EllipticArc,
+        /// a clamped rational B-spline: `degree`, `poles` as x, y pairs, `weights`, `knots`
+        Spline,
     }
 
     struct SegmentData {
@@ -64,6 +66,10 @@ pub(crate) mod bridge {
         x4: f64,
         y4: f64,
         r: f64,
+        degree: u32,
+        poles: Vec<f64>,
+        weights: Vec<f64>,
+        knots: Vec<f64>,
     }
 
     struct LoopData {
@@ -218,6 +224,27 @@ pub(crate) mod bridge {
         tx: f64,
         ty: f64,
         tz: f64,
+    }
+
+    /// An edge's curve. `kind`: 0 none (an edge without length), 1 a line from `a` to `b`,
+    /// 2 a circle or an ellipse (`a` its centre, `x` and `y` its axes, `major` and `minor`
+    /// its radii, from angle `start` to `end`), 3 a clamped NURBS (`degree`, `poles` as
+    /// x, y, z triples, `weights`, `knots`; `exact` false when approximated).
+    struct EdgeCurveData {
+        kind: u8,
+        exact: bool,
+        a: [f64; 3],
+        b: [f64; 3],
+        x: [f64; 3],
+        y: [f64; 3],
+        major: f64,
+        minor: f64,
+        start: f64,
+        end: f64,
+        degree: u32,
+        poles: Vec<f64>,
+        weights: Vec<f64>,
+        knots: Vec<f64>,
     }
 
     /// A polyline of a drawing view: (x, y) pairs.
@@ -491,6 +518,10 @@ pub(crate) mod bridge {
             y: f64,
             z: f64,
         ) -> Result<EdgeTangentData>;
+
+        /// The curve of edge `edge` of `shape` (by index in its topology), as far as the edge
+        /// reaches.
+        fn edge_curve(self: &Session, shape: u64, edge: u32) -> Result<EdgeCurveData>;
 
         /// The edges of `shapes` seen along -normal of `view` (orthographic, hidden line
         /// removal), in the view's frame, each polyline within `deflection` mm.

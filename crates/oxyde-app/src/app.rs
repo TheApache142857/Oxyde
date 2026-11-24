@@ -879,7 +879,17 @@ impl OxydeApp {
             })
             .collect();
         if let Some(body) = self.doc.part.body() {
-            session.model = crate::model_refs::ModelGeometry::from_body(&body.topology, &plane);
+            let kernel = &self.kernel;
+            let curve_of = |edge: usize| {
+                let edge = u32::try_from(edge).ok()?;
+                let solid = body.solid_of_edge(edge)?;
+                kernel
+                    .edge_curve(solid.shape, solid.local_edge(edge)?)
+                    .ok()
+                    .flatten()
+            };
+            session.model =
+                crate::model_refs::ModelGeometry::from_body(&body.topology, &plane, &curve_of);
         }
         if let Some(tool) = self.pending_tool.take() {
             session.set_tool(tool);

@@ -453,6 +453,7 @@ impl OxydeApp {
                         Geometry::Arc { .. } => "Arc",
                         Geometry::Ellipse { .. } => "Ellipse",
                         Geometry::EllipticArc { .. } => "Elliptic arc",
+                        Geometry::Spline(_) => "Spline",
                     },
                     None => "(deleted)",
                 },
@@ -504,7 +505,8 @@ impl OxydeApp {
             Geometry::Circle { .. }
             | Geometry::Arc { .. }
             | Geometry::Ellipse { .. }
-            | Geometry::EllipticArc { .. } => false,
+            | Geometry::EllipticArc { .. }
+            | Geometry::Spline(_) => false,
         };
         Some(PlaneEntity::SketchCurve {
             sketch,

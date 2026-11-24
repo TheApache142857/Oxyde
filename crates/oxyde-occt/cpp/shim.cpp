@@ -48,7 +48,13 @@
 #include <GeomAbs_JoinType.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomFill_Trihedron.hxx>
+#include <GeomConvert.hxx>
+#include <GeomConvert_ApproxCurve.hxx>
+#include <Geom_BSplineCurve.hxx>
+#include <Geom_BezierCurve.hxx>
 #include <Geom_Curve.hxx>
+#include <Geom_Hyperbola.hxx>
+#include <Geom_Parabola.hxx>
 #include <Geom_TrimmedCurve.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <IGESControl_Controller.hxx>
@@ -96,6 +102,9 @@
 #include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <TColStd_Array1OfInteger.hxx>
+#include <TColStd_Array1OfReal.hxx>
+#include <TColgp_Array1OfPnt.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Edge.hxx>
@@ -725,8 +734,48 @@ gp_Elips plane_ellipse(const Frame& frame, double cx, double cy, double mx, doub
     return gp_Elips(gp_Ax2(frame.at(cx, cy), normal, normal.Crossed(along)), b, a);
 }
 
+// The B-spline of a spline segment on the plane: its poles placed by the frame, its flat
+// knot list folded into distinct knots and multiplicities.
+Handle(Geom_BSplineCurve) plane_spline(const Frame& frame, const SegmentData& seg) {
+    const int n = static_cast<int>(seg.weights.size());
+    if (n < 2 || seg.poles.size() != 2 * seg.weights.size()) {
+        throw std::runtime_error("spline " + std::to_string(seg.id) + " has malformed poles");
+    }
+    TColgp_Array1OfPnt poles(1, n);
+    TColStd_Array1OfReal weights(1, n);
+    for (int i = 0; i < n; ++i) {
+        poles.SetValue(i + 1, frame.at(seg.poles[2 * i], seg.poles[2 * i + 1]));
+        weights.SetValue(i + 1, seg.weights[i]);
+    }
+    std::vector<double> distinct;
+    std::vector<int> multiplicity;
+    for (const double k : seg.knots) {
+        if (!distinct.empty() && k == distinct.back()) {
+            ++multiplicity.back();
+        } else {
+            distinct.push_back(k);
+            multiplicity.push_back(1);
+        }
+    }
+    const int m = static_cast<int>(distinct.size());
+    TColStd_Array1OfReal knots(1, m);
+    TColStd_Array1OfInteger mults(1, m);
+    for (int i = 0; i < m; ++i) {
+        knots.SetValue(i + 1, distinct[i]);
+        mults.SetValue(i + 1, multiplicity[i]);
+    }
+    return new Geom_BSplineCurve(poles, weights, knots, mults, static_cast<int>(seg.degree));
+}
+
 TopoDS_Edge make_edge(const SegmentData& seg, const Frame& frame) {
     switch (seg.kind) {
+    case SegmentKind::Spline: {
+        BRepBuilderAPI_MakeEdge maker(plane_spline(frame, seg));
+        if (maker.IsDone()) {
+            return maker.Edge();
+        }
+        break;
+    }
     case SegmentKind::Line: {
         BRepBuilderAPI_MakeEdge maker(frame.at(seg.x0, seg.y0), frame.at(seg.x1, seg.y1));
         if (maker.IsDone()) {
@@ -2163,6 +2212,112 @@ EdgeTangentData Session::edge_tangent(std::uint64_t shape, std::uint32_t edge, d
         out.ty = d1.Y();
         out.tz = d1.Z();
         return out;
+    });
+}
+
+namespace {
+
+void put_xyz(std::array<double, 3>& out, double x, double y, double z) {
+    out[0] = x;
+    out[1] = y;
+    out[2] = z;
+}
+
+// A B-spline as the shim's NURBS: non-periodic, so that its knots are clamped, and with its
+// multiplicities written out.
+void put_nurbs(EdgeCurveData& out, Handle(Geom_BSplineCurve) curve, bool exact) {
+    if (curve->IsPeriodic()) {
+        curve = Handle(Geom_BSplineCurve)::DownCast(curve->Copy());
+        curve->SetNotPeriodic();
+    }
+    out.kind = 3;
+    out.exact = exact;
+    out.degree = static_cast<std::uint32_t>(curve->Degree());
+    for (int i = 1; i <= curve->NbPoles(); ++i) {
+        const gp_Pnt p = curve->Pole(i);
+        out.poles.push_back(p.X());
+        out.poles.push_back(p.Y());
+        out.poles.push_back(p.Z());
+        out.weights.push_back(curve->Weight(i));
+    }
+    for (int i = 1; i <= curve->NbKnots(); ++i) {
+        for (int k = 0; k < curve->Multiplicity(i); ++k) {
+            out.knots.push_back(curve->Knot(i));
+        }
+    }
+}
+
+} // namespace
+
+EdgeCurveData Session::edge_curve(std::uint64_t shape, std::uint32_t edge) const {
+    return guarded("edge_curve", [&] {
+        const TopoDS_Edge e = TopoDS::Edge(sub_shape(get(shape), 2, edge));
+        EdgeCurveData out{};
+        if (BRep_Tool::Degenerated(e)) {
+            return out;
+        }
+        // The adaptor carries the edge's placement: what it hands out is where the edge is.
+        const BRepAdaptor_Curve curve(e);
+        const double first = curve.FirstParameter();
+        const double last = curve.LastParameter();
+        switch (curve.GetType()) {
+        case GeomAbs_Line: {
+            const gp_Pnt a = curve.Value(first);
+            const gp_Pnt b = curve.Value(last);
+            out.kind = 1;
+            put_xyz(out.a, a.X(), a.Y(), a.Z());
+            put_xyz(out.b, b.X(), b.Y(), b.Z());
+            return out;
+        }
+        case GeomAbs_Circle:
+        case GeomAbs_Ellipse: {
+            const bool circle = curve.GetType() == GeomAbs_Circle;
+            const gp_Ax2 axes = circle ? curve.Circle().Position() : curve.Ellipse().Position();
+            out.kind = 2;
+            out.major = circle ? curve.Circle().Radius() : curve.Ellipse().MajorRadius();
+            out.minor = circle ? curve.Circle().Radius() : curve.Ellipse().MinorRadius();
+            const gp_Pnt o = axes.Location();
+            put_xyz(out.a, o.X(), o.Y(), o.Z());
+            put_xyz(out.x, axes.XDirection().X(), axes.XDirection().Y(), axes.XDirection().Z());
+            put_xyz(out.y, axes.YDirection().X(), axes.YDirection().Y(), axes.YDirection().Z());
+            out.start = first;
+            out.end = last;
+            return out;
+        }
+        case GeomAbs_BSplineCurve: {
+            Handle(Geom_BSplineCurve) b = Handle(Geom_BSplineCurve)::DownCast(curve.BSpline()->Copy());
+            if (first > b->FirstParameter() || last < b->LastParameter()) {
+                b->Segment(first, last);
+            }
+            put_nurbs(out, b, true);
+            return out;
+        }
+        case GeomAbs_BezierCurve: {
+            const Handle(Geom_Curve) trimmed = new Geom_TrimmedCurve(curve.Bezier(), first, last);
+            put_nurbs(out, GeomConvert::CurveToBSplineCurve(trimmed), true);
+            return out;
+        }
+        case GeomAbs_Parabola:
+        case GeomAbs_Hyperbola: {
+            const Handle(Geom_Curve) conic =
+                curve.GetType() == GeomAbs_Parabola
+                    ? Handle(Geom_Curve)(new Geom_Parabola(curve.Parabola()))
+                    : Handle(Geom_Curve)(new Geom_Hyperbola(curve.Hyperbola()));
+            const Handle(Geom_Curve) trimmed = new Geom_TrimmedCurve(conic, first, last);
+            put_nurbs(out, GeomConvert::CurveToBSplineCurve(trimmed), true);
+            return out;
+        }
+        default: {
+            // Offset curves and curves known only on a surface have no exact B-spline form.
+            const Handle(BRepAdaptor_Curve) adaptor = new BRepAdaptor_Curve(e);
+            GeomConvert_ApproxCurve approx(adaptor, 1e-3, GeomAbs_C2, 100, 9);
+            if (!approx.HasResult()) {
+                throw std::runtime_error("the edge's curve could not be approximated");
+            }
+            put_nurbs(out, approx.Curve(), false);
+            return out;
+        }
+        }
     });
 }
 
