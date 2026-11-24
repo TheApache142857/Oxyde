@@ -134,39 +134,30 @@ pub(crate) fn overlay_color(strong: bool) -> egui::Color32 {
     }
 }
 
-/// Paints a plane as a translucent square of half-size `size` around the projection of
-/// `center` onto it, with its name; returns the square for clicking.
-pub(crate) fn paint_plane(
+/// A plane drawn on its screen square `quad`: a translucent fill, its outline and its name.
+pub(crate) fn plane_shape(
     painter: &egui::Painter,
-    to_screen: &dyn Fn(Point3) -> egui::Pos2,
-    plane: &Plane,
-    center: Point3,
-    size: f64,
+    quad: [egui::Pos2; 4],
     name: &str,
     strong: bool,
-) -> [egui::Pos2; 4] {
-    let to_center = center - plane.origin;
-    let c = center - plane.normal * to_center.dot(plane.normal);
-    let (u, v): (Vec3, Vec3) = (plane.x_dir * size, plane.y_dir() * size);
-    let corners: Vec<egui::Pos2> = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
-        .into_iter()
-        .map(|(a, b)| to_screen(c + u * a + v * b))
-        .collect();
-    let quad = [corners[0], corners[1], corners[2], corners[3]];
+) -> egui::Shape {
     let color = overlay_color(strong);
-    painter.add(egui::Shape::convex_polygon(
-        corners,
+    let fill = egui::Shape::convex_polygon(
+        quad.to_vec(),
         color.gamma_multiply(0.12),
         egui::Stroke::new(if strong { 2.0_f32 } else { 1.0_f32 }, color),
-    ));
-    painter.text(
-        quad[3],
-        egui::Align2::LEFT_BOTTOM,
-        name,
-        egui::FontId::proportional(11.0),
-        color,
     );
-    quad
+    let label = painter.fonts(|fonts| {
+        egui::Shape::text(
+            fonts,
+            quad[3],
+            egui::Align2::LEFT_BOTTOM,
+            name,
+            egui::FontId::proportional(11.0),
+            color,
+        )
+    });
+    egui::Shape::Vec(vec![fill, label])
 }
 
 /// Paints an origin as three short axes of fixed screen length.
@@ -1844,64 +1835,66 @@ impl OxydeApp {
         let pointer = output.response.hover_pos();
         let label_font = egui::FontId::proportional(11.0);
 
-        let draw_plane = |plane: Plane, name: String, selected: bool| -> OverlayShape {
-            // Hovered: lit up like a selected one, when a command can take it.
+        // Planes are painted once every overlay is known, in the place kept for them here,
+        // so that a plane lights up only when a click at the pointer would take it.
+        let planes: std::cell::RefCell<Vec<PlaneSlot>> = Default::default();
+        let draw_plane = |plane: Plane, name: String, selected: bool, overlay: Option<Overlay>| {
             let quad = plane_quad(&to_screen, &plane, center, size);
-            let hovered = pointer.is_some_and(|p| near_outline(&quad, p) || inside(&quad, p))
-                && self.wants_planes();
-            OverlayShape::Quad(paint_plane(
-                &painter,
-                &to_screen,
-                &plane,
-                center,
-                size,
-                &name,
-                selected || hovered,
-            ))
+            planes.borrow_mut().push(PlaneSlot {
+                slot: painter.add(egui::Shape::Noop),
+                quad,
+                name,
+                selected,
+                overlay,
+            });
+            OverlayShape::Quad(quad)
         };
 
-        let all_planes = self.wants_planes();
         for standard in [
             StandardPlane::Front,
             StandardPlane::Top,
             StandardPlane::Right,
         ] {
             let selected = self.selected_plane == Some(standard);
-            let shown = self.item_visible(crate::display::Item::Plane(standard));
-            if all_planes || selected || shown {
+            if self.plane_drawn(crate::display::Item::Plane(standard), selected) {
+                let overlay = Overlay::Plane(standard);
                 let shape = draw_plane(
                     standard.plane(),
                     format!("{} Plane", plane_name(standard)),
                     selected,
+                    Some(overlay),
                 );
-                overlays.push((Overlay::Plane(standard), shape));
+                overlays.push((overlay, shape));
             }
         }
-        let draw_reference =
-            |geometry: ReferenceGeometry, name: String, selected: bool| match geometry {
-                ReferenceGeometry::Plane(p) => draw_plane(p, name, selected),
-                ReferenceGeometry::Axis(axis) => {
-                    let color = overlay_color(selected);
-                    let t = (center - axis.origin).dot(axis.direction);
-                    let c = axis.origin + axis.direction * t;
-                    let a = to_screen(c - axis.direction * size);
-                    let b = to_screen(c + axis.direction * size);
-                    painter.extend(egui::Shape::dashed_line(
-                        &[a, b],
-                        egui::Stroke::new(if selected { 2.0_f32 } else { 1.2_f32 }, color),
-                        10.0,
-                        4.0,
-                    ));
-                    painter.text(
-                        b,
-                        egui::Align2::LEFT_CENTER,
-                        name,
-                        label_font.clone(),
-                        color,
-                    );
-                    OverlayShape::Segment(a, b)
-                }
-            };
+        let draw_reference = |geometry: ReferenceGeometry,
+                              name: String,
+                              selected: bool,
+                              overlay: Option<Overlay>| match geometry
+        {
+            ReferenceGeometry::Plane(p) => draw_plane(p, name, selected, overlay),
+            ReferenceGeometry::Axis(axis) => {
+                let color = overlay_color(selected);
+                let t = (center - axis.origin).dot(axis.direction);
+                let c = axis.origin + axis.direction * t;
+                let a = to_screen(c - axis.direction * size);
+                let b = to_screen(c + axis.direction * size);
+                painter.extend(egui::Shape::dashed_line(
+                    &[a, b],
+                    egui::Stroke::new(if selected { 2.0_f32 } else { 1.2_f32 }, color),
+                    10.0,
+                    4.0,
+                ));
+                painter.text(
+                    b,
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    label_font.clone(),
+                    color,
+                );
+                OverlayShape::Segment(a, b)
+            }
+        };
         // The plane or axis the open command makes, where it would be: in place of the
         // one it edits, or as a new one (which cannot be clicked yet).
         let references = self.doc.part.references();
@@ -1920,9 +1913,12 @@ impl OxydeApp {
                 _ => (geometry, false),
             };
             let selected = edited || self.selected_feature == Some(id) || highlighted.contains(&id);
-            let shown = self.item_visible(crate::display::Item::Feature(id));
-            let wanted = matches!(geometry, ReferenceGeometry::Plane(_)) && all_planes;
-            if !(selected || shown || wanted) {
+            let item = crate::display::Item::Feature(id);
+            let drawn = match geometry {
+                ReferenceGeometry::Plane(_) => self.plane_drawn(item, selected),
+                ReferenceGeometry::Axis(_) => selected || self.item_visible(item),
+            };
+            if !drawn {
                 continue;
             }
             let name = self
@@ -1931,11 +1927,11 @@ impl OxydeApp {
                 .feature(id)
                 .map(|f| f.name().to_owned())
                 .unwrap_or_default();
-            let shape = draw_reference(geometry, name, selected);
+            let shape = draw_reference(geometry, name, selected, Some(Overlay::Reference(id)));
             overlays.push((Overlay::Reference(id), shape));
         }
         if let Some((name, geometry)) = new_reference {
-            draw_reference(geometry, name, true);
+            draw_reference(geometry, name, true, None);
         }
 
         // The Plane command takes points and the curves of sketches one by one: each curve
@@ -2056,11 +2052,31 @@ impl OxydeApp {
             overlays = front;
         }
 
+        let lit = hovered_plane(
+            &overlays,
+            pointer,
+            self.viewport.hovered().is_some(),
+            self.wants_planes(),
+        );
+        for plane in planes.take() {
+            let strong = plane.selected || (plane.overlay.is_some() && plane.overlay == lit);
+            painter.set(
+                plane.slot,
+                plane_shape(&painter, plane.quad, &plane.name, strong),
+            );
+        }
+
         // The origin: three short axes of fixed screen length.
         if self.item_visible(crate::display::Item::Origin) {
             paint_origin(&painter, &to_screen);
         }
         overlays
+    }
+
+    /// Whether a plane (standard or reference) is drawn: selected, shown, or offered to the
+    /// open command that takes planes.
+    pub(crate) fn plane_drawn(&self, item: crate::display::Item, selected: bool) -> bool {
+        selected || self.item_visible(item) || (self.wants_planes() && self.item_offered(item))
     }
 
     /// Re-tessellates the body after each rebuild, and the open command's preview.
@@ -2204,7 +2220,7 @@ fn pick_step() -> Option<PathBuf> {
         .pick_file()
 }
 
-/// The screen square a plane is drawn as (see [`paint_plane`]).
+/// The screen square a plane is drawn as (see [`plane_shape`]).
 pub(crate) fn plane_quad(
     to_screen: &dyn Fn(Point3) -> egui::Pos2,
     plane: &Plane,
@@ -2249,15 +2265,16 @@ pub(crate) fn near_outline(quad: &[egui::Pos2; 4], p: egui::Pos2) -> bool {
     (0..4).any(|k| segment_distance(p, quad[k], quad[(k + 1) % 4]) < 6.0)
 }
 
-/// The overlay clicked at `p`: an outline or axis near the pointer first; inside a plane
-/// only when the click did not land on the part.
+/// The overlay clicked at `p`: a point, an axis, a sketch curve or, off the part, a plane
+/// outline near the pointer first; then, off the part, the inside of a plane. A click on
+/// the part takes the face or edge under it, whatever plane is drawn there.
 pub(crate) fn overlay_at(
     overlays: &[(Overlay, OverlayShape)],
     p: egui::Pos2,
     on_part: bool,
 ) -> Option<Overlay> {
     let near = overlays.iter().find(|(_, shape)| match shape {
-        OverlayShape::Quad(q) => near_outline(q, p),
+        OverlayShape::Quad(q) => !on_part && near_outline(q, p),
         OverlayShape::Segment(a, b) => segment_distance(p, *a, *b) < 6.0,
         OverlayShape::Polylines(lines) => lines.iter().any(|line| {
             line.windows(2)
@@ -2275,6 +2292,33 @@ pub(crate) fn overlay_at(
         OverlayShape::Quad(q) if inside(q, p) => Some(*overlay),
         _ => None,
     })
+}
+
+/// The plane lit under the pointer while a command takes planes: the one a click there
+/// takes ([`overlay_at`]), when that is a plane.
+pub(crate) fn hovered_plane(
+    overlays: &[(Overlay, OverlayShape)],
+    pointer: Option<egui::Pos2>,
+    on_part: bool,
+    wants_planes: bool,
+) -> Option<Overlay> {
+    if !wants_planes {
+        return None;
+    }
+    let target = overlay_at(overlays, pointer?, on_part)?;
+    overlays
+        .iter()
+        .any(|(overlay, shape)| *overlay == target && matches!(shape, OverlayShape::Quad(_)))
+        .then_some(target)
+}
+
+/// A plane drawn by [`OxydeApp::draw_references`], painted once the lit one is known.
+struct PlaneSlot {
+    slot: egui::layers::ShapeIdx,
+    quad: [egui::Pos2; 4],
+    name: String,
+    selected: bool,
+    overlay: Option<Overlay>,
 }
 
 /// How near the pointer a point must be, in pixels, to be picked rather than the edge or
@@ -2491,5 +2535,146 @@ impl Drop for OxydeApp {
         self.clear_preview();
         self.doc.release(&mut self.kernel);
         self.locks.release_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::display::Item;
+    use crate::prefs::Preferences;
+    use egui::pos2;
+    use oxyde_model::{PlaneRef, RefPlane};
+
+    fn square(lo: f32, hi: f32) -> OverlayShape {
+        OverlayShape::Quad([pos2(lo, lo), pos2(hi, lo), pos2(hi, hi), pos2(lo, hi)])
+    }
+
+    const FRONT: Overlay = Overlay::Plane(StandardPlane::Front);
+    const TOP: Overlay = Overlay::Plane(StandardPlane::Top);
+
+    #[test]
+    fn a_click_on_the_part_takes_the_face_under_a_plane_outline() {
+        let overlays = vec![(FRONT, square(0.0, 100.0))];
+        let on_outline = pos2(50.0, 2.0);
+        assert_eq!(overlay_at(&overlays, on_outline, true), None);
+        assert_eq!(overlay_at(&overlays, on_outline, false), Some(FRONT));
+        let within = pos2(50.0, 50.0);
+        assert_eq!(overlay_at(&overlays, within, true), None);
+        assert_eq!(overlay_at(&overlays, within, false), Some(FRONT));
+    }
+
+    #[test]
+    fn points_and_axes_still_take_a_click_on_the_part() {
+        let axis = Overlay::Reference(oxyde_model::FeatureId::from_raw(7));
+        let overlays = vec![
+            (FRONT, square(0.0, 100.0)),
+            (
+                axis,
+                OverlayShape::Segment(pos2(0.0, 50.0), pos2(100.0, 50.0)),
+            ),
+            (Overlay::Vertex(3), OverlayShape::Dot(pos2(20.0, 20.0))),
+        ];
+        assert_eq!(overlay_at(&overlays, pos2(60.0, 52.0), true), Some(axis));
+        assert_eq!(
+            overlay_at(&overlays, pos2(21.0, 20.0), true),
+            Some(Overlay::Vertex(3))
+        );
+    }
+
+    #[test]
+    fn the_lit_plane_is_the_one_a_click_takes() {
+        let overlays = vec![(FRONT, square(0.0, 100.0)), (TOP, square(50.0, 150.0))];
+        // Inside both: the click takes the first, and only it lights up.
+        assert_eq!(
+            hovered_plane(&overlays, Some(pos2(75.0, 75.0)), false, true),
+            Some(FRONT)
+        );
+        // On Top's outline inside Front: the outline wins the click and the light.
+        assert_eq!(
+            hovered_plane(&overlays, Some(pos2(51.0, 75.0)), false, true),
+            Some(TOP)
+        );
+        // Over the part, or with no command taking planes, nothing lights up.
+        assert_eq!(
+            hovered_plane(&overlays, Some(pos2(75.0, 75.0)), true, true),
+            None
+        );
+        assert_eq!(
+            hovered_plane(&overlays, Some(pos2(75.0, 75.0)), false, false),
+            None
+        );
+        assert_eq!(hovered_plane(&overlays, None, false, true), None);
+    }
+
+    #[test]
+    fn a_point_taking_the_click_lights_no_plane() {
+        let overlays = vec![
+            (Overlay::Vertex(1), OverlayShape::Dot(pos2(30.0, 30.0))),
+            (FRONT, square(0.0, 100.0)),
+        ];
+        assert_eq!(
+            hovered_plane(&overlays, Some(pos2(31.0, 30.0)), false, true),
+            None
+        );
+    }
+
+    fn choosing_a_plane() -> OxydeApp {
+        let mut app = OxydeApp::blank(Preferences::default(), None);
+        app.dialog = Some(Dialog::ChoosePlane);
+        app
+    }
+
+    #[test]
+    fn planes_hidden_by_hand_stay_hidden_while_a_command_takes_planes() {
+        let mut app = choosing_a_plane();
+        let front = Item::Plane(StandardPlane::Front);
+        let plane = app
+            .doc
+            .part
+            .add_feature(FeatureKind::Plane(RefPlane::Offset {
+                base: PlaneRef::Standard(StandardPlane::Front),
+                offset: 10.0,
+                flip: false,
+            }));
+        let reference = Item::Feature(plane);
+        // At their default state both are offered.
+        assert!(app.plane_drawn(front, false));
+        assert!(app.plane_drawn(reference, false));
+        app.visibility.set_item_shown(front, false);
+        app.visibility.set_item_shown(reference, false);
+        assert!(!app.plane_drawn(front, false));
+        assert!(!app.plane_drawn(reference, false));
+        // A selected plane is drawn all the same.
+        assert!(app.plane_drawn(front, true));
+        // Shown by hand, drawn whatever the command.
+        app.visibility.set_item_shown(front, true);
+        app.dialog = None;
+        assert!(app.plane_drawn(front, false));
+    }
+
+    #[test]
+    fn planes_turned_off_in_hide_show_stay_hidden_while_a_command_takes_planes() {
+        let mut app = choosing_a_plane();
+        app.visibility.planes = false;
+        assert!(!app.plane_drawn(Item::Plane(StandardPlane::Top), false));
+    }
+
+    #[test]
+    fn standard_planes_appear_only_for_a_command_that_takes_planes() {
+        let mut app = choosing_a_plane();
+        let right = Item::Plane(StandardPlane::Right);
+        assert!(app.plane_drawn(right, false));
+        app.dialog = None;
+        assert!(!app.plane_drawn(right, false));
+    }
+
+    #[test]
+    fn a_hidden_plane_picked_in_the_timeline_starts_the_sketch_on_it() {
+        let mut app = choosing_a_plane();
+        app.visibility
+            .set_item_shown(Item::Plane(StandardPlane::Top), false);
+        assert!(app.offer_to_panel(PanelPick::Plane(StandardPlane::Top)));
+        assert!(app.sketch.is_some());
     }
 }

@@ -92,9 +92,9 @@ impl Visibility {
 }
 
 impl OxydeApp {
-    /// Whether an item is drawn: shown, and its kind not filtered out.
-    pub(crate) fn item_visible(&self, item: Item) -> bool {
-        let kind_on = match item {
+    /// Whether View › Hide/Show leaves the item's kind on.
+    fn kind_on(&self, item: Item) -> bool {
+        match item {
             Item::Plane(_) => self.visibility.planes,
             Item::Origin => self.visibility.origins,
             Item::Feature(id) => match self.doc.part.feature(id).map(|f| f.kind()) {
@@ -103,8 +103,19 @@ impl OxydeApp {
                 Some(FeatureKind::Axis(_)) => self.visibility.axes,
                 _ => true,
             },
-        };
-        kind_on && self.item_shown(item)
+        }
+    }
+
+    /// Whether an item is drawn: shown, and its kind not filtered out.
+    pub(crate) fn item_visible(&self, item: Item) -> bool {
+        self.kind_on(item) && self.item_shown(item)
+    }
+
+    /// Whether a command that takes planes may draw this one although it is not shown: the
+    /// user has not hidden it by hand, nor turned its kind off. Hidden ones are still picked
+    /// in the timeline or the tree.
+    pub(crate) fn item_offered(&self, item: Item) -> bool {
+        self.kind_on(item) && self.visibility.items.get(&item) != Some(&false)
     }
 
     /// Whether the timeline shows an eye for this feature.
