@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 
 use super::*;
-use crate::study::{FixtureKind, LoadKind};
+use crate::study::{FixtureKind, LoadKind, THREADS_VARIABLE, capped_thread_count};
 use crate::surfaces::box_surface;
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
@@ -110,6 +110,49 @@ fn voxels_in(grid: &Grid, lo: V3, hi: V3) -> Vec<usize> {
             (0..3).all(|a| c[a] > lo[a] && c[a] < hi[a])
         })
         .collect()
+}
+
+#[test]
+fn the_thread_cap_holds_whatever_the_solve_asks_for() {
+    let cases = [(0, 4, 2), (1, 1, 1), (4, 4, 2), (16, 4, 2)];
+    for (wanted, on_eight, on_two) in cases {
+        assert_eq!(capped_thread_count(wanted, 8, Some("4")), on_eight);
+        assert_eq!(capped_thread_count(wanted, 8, Some(" 4 ")), on_eight);
+        assert_eq!(capped_thread_count(wanted, 2, Some("4")), on_two);
+    }
+    assert_eq!(capped_thread_count(0, 8, None), 8);
+    assert_eq!(capped_thread_count(16, 8, None), 8);
+    assert_eq!(capped_thread_count(3, 8, None), 3);
+    for ignored in ["0", "", "four", "-2", "2.5"] {
+        assert_eq!(capped_thread_count(0, 8, Some(ignored)), 8, "{ignored:?}");
+    }
+    assert_eq!(capped_thread_count(0, 0, None), 1);
+}
+
+/// Run by [`the_thread_cap_is_read_from_the_environment`] in a process of its own with the
+/// variable set to 1.
+#[test]
+#[ignore = "run by the_thread_cap_is_read_from_the_environment with the variable set"]
+fn thread_count_under_a_cap_of_one() {
+    assert_eq!(std::env::var(THREADS_VARIABLE).as_deref(), Ok("1"));
+    assert_eq!(thread_count(0), 1);
+    assert_eq!(thread_count(16), 1);
+}
+
+#[test]
+fn the_thread_cap_is_read_from_the_environment() {
+    let run = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "tests::thread_count_under_a_cap_of_one",
+            "--test-threads=1",
+        ])
+        .env(THREADS_VARIABLE, "1")
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(run.status.success() && out.contains("1 passed"), "{out}");
 }
 
 #[test]
