@@ -1179,6 +1179,56 @@ mod tests {
     }
 
     #[test]
+    fn converted_copies_keep_their_links_in_a_part_of_version_one() {
+        use oxyde_model::FeatureId;
+        use oxyde_model::projection::{Projection, ProjectionSource};
+        let extrude = FeatureId::from_raw(2);
+        let sorted = |mut faces: Vec<FaceName>| {
+            faces.sort();
+            faces
+        };
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+        let line = sketch
+            .geometry
+            .line(Point2::new(0.0, 0.0), Point2::new(40.0, 0.0));
+        let corner = sketch.geometry.point(Point2::new(40.0, 20.0));
+        sketch.projections = vec![
+            Projection {
+                entity: line.0,
+                source: ProjectionSource::Edge(EdgeName {
+                    faces: sorted(vec![
+                        FaceName::profile(extrude, 1),
+                        FaceName::profile(extrude, 0),
+                    ]),
+                    part: 0,
+                }),
+            },
+            Projection {
+                entity: corner.0,
+                source: ProjectionSource::Vertex(VertexName {
+                    faces: sorted(vec![
+                        FaceName::end_cap(extrude),
+                        FaceName::profile(extrude, 1),
+                        FaceName::profile(extrude, 0),
+                    ]),
+                    part: 0,
+                }),
+            },
+        ];
+        let mut part = Part::new();
+        part.add_feature(FeatureKind::Sketch(sketch));
+        let file = PartFile {
+            kernel: Default::default(),
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties: Properties::default(),
+        };
+        assert_eq!(round_trip(&file), file);
+        // Readers without links open the copies as fixed ones.
+        assert_eq!(part_version(&file.definition), FORMAT_VERSION);
+    }
+
+    #[test]
     fn offset_planes_are_written_as_before_and_constructions_named() {
         let bytes = write_part(Cursor::new(Vec::new()), &sample())
             .unwrap()

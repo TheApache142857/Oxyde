@@ -863,7 +863,14 @@ impl OxydeApp {
         self.selected_plane = None;
         self.selected_feature = Some(id);
         self.close_dialog();
-        let mut session = SketchSession::new(id, name, plane, sketch.geometry, new_sketch, restore);
+        // A sketch with copies that follow the part starts from them where the rebuild put
+        // them.
+        let geometry = match self.doc.part.sketch_result(id) {
+            Some(result) if !sketch.projections.is_empty() => result.solved.clone(),
+            _ => sketch.geometry,
+        };
+        let mut session = SketchSession::new(id, name, plane, geometry, new_sketch, restore);
+        session.set_projections(sketch.projections);
         session.driven = self
             .doc
             .part
@@ -879,17 +886,10 @@ impl OxydeApp {
             })
             .collect();
         if let Some(body) = self.doc.part.body() {
-            let kernel = &self.kernel;
-            let curve_of = |edge: usize| {
-                let edge = u32::try_from(edge).ok()?;
-                let solid = body.solid_of_edge(edge)?;
-                kernel
-                    .edge_curve(solid.shape, solid.local_edge(edge)?)
-                    .ok()
-                    .flatten()
-            };
+            let curve_of = |edge: usize| body.edge_curve(&self.kernel, edge);
             session.model =
                 crate::model_refs::ModelGeometry::from_body(&body.topology, &plane, &curve_of);
+            session.model.name_sources(&body.naming);
         }
         if let Some(tool) = self.pending_tool.take() {
             session.set_tool(tool);
@@ -914,6 +914,7 @@ impl OxydeApp {
             self.doc.checkpoint();
             if let Ok(FeatureKind::Sketch(sketch)) = self.doc.part.edit(id) {
                 sketch.geometry = session.sketch.clone();
+                sketch.projections = session.kept_projections();
             }
         }
         if empty {

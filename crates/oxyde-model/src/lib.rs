@@ -11,6 +11,8 @@
 //!   (`"D1@Sketch1" = "Width" * 2`), evaluated before every rebuild.
 //! - [`Appearances`]: colours, transparency and colour textures of the part, its bodies and
 //!   single faces (display only; not part of the rebuild).
+//! - [`projection`]: part edges and vertices seen in a sketch plane, and the copies of them
+//!   that follow the part on each rebuild.
 //!
 //! Depends on the `Kernel` trait only, never on a concrete backend.
 //! See `docs/ARCHITECTURE.md` §6.
@@ -50,6 +52,7 @@ mod finish;
 mod material;
 mod naming;
 mod part;
+pub mod projection;
 
 pub use appearance::{Appearance, Appearances, Texture};
 pub use bodies::{Body, Solid};

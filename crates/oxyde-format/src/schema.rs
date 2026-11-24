@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use oxyde_geom::Point2;
+use oxyde_model::projection::{Projection, ProjectionSource};
 use oxyde_model::{
     Appearance, Appearances, AxisRef, BodyId, ChamferShape, CircularPattern, Combine, CombineOp,
     ConfigurationText, ConfigurationsText, CurveRef, DrivenBy, EdgeBlend, EdgeName, EquationText,
@@ -482,6 +483,9 @@ pub(crate) enum KindDto {
         /// The entity id of the sketch origin.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<u32>,
+        /// Copies of part edges and vertices that follow them (Convert Entities).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        projections: Vec<ProjectionDto>,
     },
     Extrude {
         sketch: u32,
@@ -761,6 +765,20 @@ impl PlaneConstructionDto {
 pub(crate) struct SketchEntityDto {
     pub sketch: u32,
     pub entity: u32,
+}
+
+/// A sketch entity copied from a part edge or vertex, which it follows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProjectionDto {
+    pub entity: u32,
+    pub source: ProjectionSourceDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectionSourceDto {
+    Edge(EdgeRefDto),
+    Vertex(VertexRefDto),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1077,6 +1095,22 @@ fn feature_dto(feature: &Feature) -> FeatureDto {
                 })
             },
             origin: sketch.geometry.recorded_origin().map(|id| id.0),
+            projections: sketch
+                .projections
+                .iter()
+                .map(|p| ProjectionDto {
+                    entity: p.entity,
+                    source: match &p.source {
+                        ProjectionSource::Edge(edge) => ProjectionSourceDto::Edge(edge_dto(edge)),
+                        ProjectionSource::Vertex(vertex) => {
+                            ProjectionSourceDto::Vertex(VertexRefDto {
+                                faces: vertex.faces.iter().map(face_dto).collect(),
+                                part: vertex.part,
+                            })
+                        }
+                    },
+                })
+                .collect(),
         },
         FeatureKind::Extrude(extrude) => KindDto::Extrude {
             sketch: extrude.sketch.raw(),
@@ -1722,6 +1756,7 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
             relations,
             next_ids,
             origin,
+            projections,
         } => {
             let counters = next_ids.map_or_else(Counters::default, |c| Counters {
                 entity: c.entity,
@@ -1749,6 +1784,25 @@ fn feature_from(dto: FeatureDto, files: &HashMap<String, Vec<u8>>) -> Result<Fea
                     PlaneRef::Reference(id) => SketchPlane::Reference(id),
                 },
                 geometry,
+                projections: projections
+                    .into_iter()
+                    .map(|p| Projection {
+                        entity: p.entity,
+                        source: match p.source {
+                            ProjectionSourceDto::Edge(edge) => {
+                                ProjectionSource::Edge(edge_from(edge))
+                            }
+                            ProjectionSourceDto::Vertex(vertex) => {
+                                ProjectionSource::Vertex(VertexName {
+                                    faces: sorted(
+                                        vertex.faces.into_iter().map(face_from).collect(),
+                                    ),
+                                    part: vertex.part,
+                                })
+                            }
+                        },
+                    })
+                    .collect(),
             })
         }
         KindDto::Extrude {
