@@ -1102,7 +1102,7 @@ NASA's Evolved Structures and the literature on length scales say (the owner ask
 offers setup orientations and as Autodesk's machinery example (Crocetti and Gasso, Autodesk
 University) mills the outcome it keeps from +Y and −Y.
 
-- **The formulation** (`generative::reach`): along each side's lines, from the tool
+- **The formulation** (`oxyde_generative::reach`): along each side's lines, from the tool
   inwards, each voxel is raised to the densest one in front of it, as the tool cannot take
   away what it cannot reach from that side; then the least over the sides is taken, as what
   the tool reaches from one side is gone. From one side this is the one-way pull; from
@@ -1173,7 +1173,7 @@ design says to (NASA's brackets held more than twice their predicted load once t
 McClelland, SPIE 2022; Autodesk's machinery example closes with a static study, Crocetti
 and Gasso; "always validate", Schnitger, Cadalyst 2018).
 
-- **The check** (`generative::check_part`, on its own thread once *Create Part* has saved
+- **The check** (`oxyde_sim::check::check_part`, on its own thread once *Create Part* has saved
   the part, with a bar and *Stop* in the panel): the simplified surface's pieces, the very
   triangles the part's solid is made of, each triangle labelled with the face it lies on of
   a preserve body or a preserve region (its corners within a twentieth of a voxel of the bodies' faces, where
@@ -1222,7 +1222,7 @@ clear of the launch's (McClelland, SPIE 2022), on the eigensolver of frequency s
   moving asymptotes, `1 − λᵢ / λ_min ≤ 0` (`λ = ω²`), so the limit holds when two modes swap
   places as the design changes; a limited *Maximize stiffness* moves by MMA, as a weighted one
   does, the mass target a constraint, so the stiffest design may weigh less than it.
-- **The modes** (`generative::frequency`): `K φ = λ M φ` on the grid each iteration, `K`
+- **The modes** (`oxyde_generative::frequency`): `K φ = λ M φ` on the grid each iteration, `K`
   the iteration's own stiffness, never assembled, `M` lumped (an eighth of each voxel's
   mass at each corner, in tonnes as millimetres and newtons take them), by the block LOBPCG
   of `crate::eigen` with two guard vectors, preconditioned by one V-cycle of the static
@@ -1264,7 +1264,7 @@ when the static solves are there (the owner asked for it).
   times (an estimate from the operation counts, not yet timed).
   Products alone on the card would have changed little; the vectors live there instead.
 - **The seam**: the eigensolver works in an `EigenSpace` (`eigen.rs`, public as
-  `generative::EigenSpace`): vectors by handle, made, written, read and given back; `A`,
+  `oxyde_generative::EigenSpace`): vectors by handle, made, written, read and given back; `A`,
   `B`, the preconditioner and the projection; batches of dot products; `dst += Σ c v`;
   scaling. The CPU's is the closures it had (`HostSpace`); a backend offers its own through
   `Backend::eigen_space`, `None` by default, which leaves the eigensolve to the CPU. The
