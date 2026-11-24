@@ -39,7 +39,7 @@ mod solve;
 
 pub use sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
-    SketchError, is_valid_name,
+    SketchError, SplineDef, is_valid_name,
 };
 pub use solve::{ConstraintState, Definition, SolveReport};
 

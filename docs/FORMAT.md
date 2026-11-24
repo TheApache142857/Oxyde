@@ -46,7 +46,7 @@ Rules:
 ```
 
 - `kind`: `"part"`, `"assembly"` or `"drawing"`; `"simulation"` and `"simulation_results"` for §8 and §9.
-- `format_version`: 1 for assemblies and drawings. Parts are 1 when every reference plane in them is an offset plane, 2 when one is made another way (at an angle, through a line, through three points, normal to a curve: the `plane` feature's `construction`, §3), and 3 when a sketch holds an `ellipse` or an `elliptic_arc` (§3, Sketches), so readers of an older version still open the parts it holds. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
+- `format_version`: 1 for assemblies and drawings. Parts are 1 when every reference plane in them is an offset plane, 2 when one is made another way (at an angle, through a line, through three points, normal to a curve: the `plane` feature's `construction`, §3), 3 when a sketch holds an `ellipse` or an `elliptic_arc`, and 4 when one holds a `spline` (§3, Sketches), so readers of an older version still open the parts it holds. Simulation studies and results are 1 when they hold only static studies and 2 when they hold a thermal one (§8, §9), so readers of version 1 still open static studies. Readers refuse a version higher than the newest they know for that `kind`.
 - `document_id`: a UUID that never changes for the life of the document; assemblies will find parts by it even after a rename.
 - `units` are display units. Values in `model.json` are always millimetres.
 - `kernel` (parts only, optional): the geometry kernel that built the part when it was saved, `"occt"` for OpenCASCADE. Absent means `"occt"` (every part saved before the key existed). It is a record, not a requirement: a part opens with the kernel the session has, and the application warns when that is another one, since another kernel can cut faces differently and so resolve face and edge names differently. A name the reader does not know is kept and written back. Readers of version 1 ignore the key, so `format_version` does not change.
@@ -158,7 +158,7 @@ Counts include the seed. Seeds of patterns and mirrors are extrusions, revolves,
 **PlaneRef**: `{"standard": "front" | "top" | "right"}`, `{"face": FaceRef}` (a planar face) or `{"reference": feature id}` (a reference plane).
 **AxisRef**: `{"standard": "x" | "y" | "z"}`, `{"reference": feature id}` (a reference axis), `{"edge": EdgeRef}` (a straight edge's line, or a circular edge's axis), `{"face": FaceRef}` (a cylindrical or conical face's axis, or a planar face's normal) or `{"sketch_axis": {"sketch": feature id, "entity": entity id}}` (a line of a sketch, from its start point to its end point; a revolve's own `{"sketch_line": entity id}` is a line of the revolve's sketch).
 **PointRef**: `{"vertex": VertexRef}` (a corner of the body) or `{"sketch_point": {"sketch": feature id, "entity": entity id}}` (a point of a sketch: the end of a line, a centre, a lone point).
-**CurveRef**: `{"edge": EdgeRef}` (an edge of any shape) or `{"sketch_curve": {"sketch": feature id, "entity": entity id}}` (a line, an arc, a circle, an ellipse or an elliptic arc of a sketch).
+**CurveRef**: `{"edge": EdgeRef}` (an edge of any shape) or `{"sketch_curve": {"sketch": feature id, "entity": entity id}}` (a line, an arc, a circle, an ellipse, an elliptic arc or a spline of a sketch).
 
 ### Bodies
 
@@ -184,10 +184,11 @@ Every feature may also carry `dimension_names` (optional, default empty): custom
 | `arc` | `center`, `start`, `end`: point ids; counter-clockwise from `start` to `end` |
 | `ellipse` | `center`, `major`: point ids, `minor`: one semi-axis runs from `center` to `major`, the other, square to it, is `minor` long (either may be the longer) |
 | `elliptic_arc` | `center`, `major`, `minor` as for `ellipse`, and `start`, `end`: point ids on that ellipse; counter-clockwise from `start` to `end` |
+| `spline` | `poles`: point ids, `weights`: one positive number per pole, `degree` (1 or more), `knots`: `poles + degree + 1` numbers in order, the first `degree + 1` equal and the last `degree + 1` equal; a rational B-spline from its first pole to its last |
 
 The **sketch origin** is a construction point held by a `fixed` relation, named by the sketch's optional `origin` (an entity id); Oxyde places it where the model origin falls in the sketch plane, and other geometry may share it or refer to it like any point. A sketch has at most one, and `origin` is written once it is known. A sketch without it gets it when it is next edited: the fixed construction point where the model origin falls, else a new one; other fixed construction points (Convert Entities makes them) are never taken for it.
 
-Connected geometry shares point entities. The ids of lines, circles, arcs, ellipses and elliptic arcs are the `segment` numbers in face references, so they must stay stable.
+Connected geometry shares point entities. The ids of lines, circles, arcs, ellipses, elliptic arcs and splines are the `segment` numbers in face references, so they must stay stable.
 
 `relations` (optional, default empty), each with a unique `id` (never reused within the sketch) and, for dimensions (the relations with a `value`), a `name` unique within the sketch; lengths in mm, angles in **radians**:
 

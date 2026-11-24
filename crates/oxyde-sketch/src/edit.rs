@@ -7,7 +7,9 @@ use std::f64::consts::TAU;
 
 use oxyde_geom::Point2;
 
-use crate::sketch::{ConstrainedSketch, Constraint, Entity, EntityId, Geometry, curve_points};
+use crate::sketch::{
+    ConstrainedSketch, Constraint, Entity, EntityId, Geometry, SplineDef, curve_points,
+};
 
 /// Two points closer than this are the same point.
 pub(crate) const TOLERANCE: f64 = 1e-6;
@@ -230,7 +232,10 @@ impl ConstrainedSketch {
         let at = |p| self.position(p);
         match self.entity(id)?.geometry {
             // Ellipses neither trim nor cut.
-            Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => None,
+            Geometry::Point(_)
+            | Geometry::Ellipse { .. }
+            | Geometry::EllipticArc { .. }
+            | Geometry::Spline(_) => None,
             Geometry::Line { start, end } => Some(Curve::Segment(at(start)?, at(end)?)),
             Geometry::Circle { center, radius } => Some(Curve::Circle(at(center)?, radius)),
             Geometry::Arc { center, start, end } => {
@@ -385,7 +390,7 @@ impl ConstrainedSketch {
         let Some(plan) = self.trim_plan(curve, at) else {
             return false;
         };
-        let Some(entity) = self.entity(curve).copied() else {
+        let Some(entity) = self.entity(curve).cloned() else {
             return false;
         };
         match plan.piece {
@@ -424,7 +429,10 @@ impl ConstrainedSketch {
                     self.set_construction(second, entity.construction);
                     self.after_ends_moved(curve, &entity);
                 }
-                Geometry::Point(_) | Geometry::Ellipse { .. } | Geometry::EllipticArc { .. } => {}
+                Geometry::Point(_)
+                | Geometry::Ellipse { .. }
+                | Geometry::EllipticArc { .. }
+                | Geometry::Spline(_) => {}
             },
         }
         true
@@ -433,7 +441,7 @@ impl ConstrainedSketch {
     /// A new point at a crossing, kept on the curve that made it.
     fn cut_point(&mut self, cut: Cut) -> EntityId {
         let q = self.point(cut.point);
-        let on = match self.entity(cut.by).map(|e| e.geometry) {
+        let on = match self.entity(cut.by).map(|e| e.geometry.clone()) {
             Some(Geometry::Line { .. }) => Constraint::PointOnLine(q, cut.by),
             _ => Constraint::PointOnCircle(q, cut.by),
         };
@@ -639,7 +647,7 @@ impl ConstrainedSketch {
         let Some(plan) = self.extend_plan(curve, at) else {
             return false;
         };
-        let Some(entity) = self.entity(curve).copied() else {
+        let Some(entity) = self.entity(curve).cloned() else {
             return false;
         };
         let q = self.cut_point(plan.cut);
@@ -709,7 +717,7 @@ impl ConstrainedSketch {
         let originals: Vec<Entity> = entities
             .iter()
             .filter(|id| **id != line)
-            .filter_map(|id| self.entity(*id).copied())
+            .filter_map(|id| self.entity(*id).cloned())
             .collect();
         for e in originals {
             let new = match e.geometry {
@@ -758,6 +766,14 @@ impl ConstrainedSketch {
                     let s = copy_point(self, start, &mut created);
                     let f = copy_point(self, end, &mut created);
                     self.elliptic_arc_between(c, m, minor, f, s)
+                }
+                Geometry::Spline(spline) => {
+                    let poles = spline
+                        .poles
+                        .iter()
+                        .map(|p| copy_point(self, *p, &mut created))
+                        .collect();
+                    self.spline_on(SplineDef { poles, ..spline })
                 }
             };
             self.set_construction(new, e.construction);
