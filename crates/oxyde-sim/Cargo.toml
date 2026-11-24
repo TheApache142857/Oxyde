@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 fieldcraft-mesh = { workspace = true, optional = true }
+oxyde-generative = { workspace = true }
 
 [features]
 # FieldCraft's tetrahedral mesher as a third mesher, off by default: the spike.

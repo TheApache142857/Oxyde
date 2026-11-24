@@ -637,7 +637,7 @@ largest displacement and the estimated factor of safety, sortable, beside a plot
 against displacement. The outcome picked is drawn in the viewport with a slider through its
 iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ or 3MF.
 
-**How it works** (`oxyde_sim::generative`, pure Rust, no new dependency):
+**How it works** (`oxyde_generative`, pure Rust, no new dependency):
 
 - **The grid.** The design space's box cut into cubic voxels, placed so that the symmetry
   planes fall between voxels, which makes the mirror exact. Each voxel is *preserve* (its
@@ -771,7 +771,7 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
    moving asymptotes in place of optimality criteria), a displacement limit, milling, and
    assemblies.
 
-**Built (October 2026): step 1**, the engine, `oxyde_sim::generative` (`Grid::build`,
+**Built (October 2026): step 1**, the engine, `oxyde_generative` (`Grid::build`,
 `generate`, `surface`, `voxel_size`), not yet in the application.
 
 - **Tests** in `oxyde-sim`: the brick (rigid motions cost nothing, a uniform strain what the
@@ -824,7 +824,7 @@ the reference the GPU's results are tested against.
 **Built (October 2026): the GPU solver**, `oxyde-sim-gpu`, the solve only, not yet in the
 application.
 
-- **The seam**: `oxyde_sim::generative::Backend` solves an optimization iteration's system;
+- **The seam**: `oxyde_generative::Backend` solves an optimization iteration's system;
   `generate_on` takes one (`generate` is the CPU's, `CpuBackend` the same as a backend). A
   backend sees the system through `System`: each voxel's stiffness and kind (brick,
   Laplacian or nothing), the brick and its Laplacian, the held nodes' projectors and
@@ -940,7 +940,7 @@ makes them.
 stays on show.
 
 - **The surface meeting the bodies on their faces**
-  (`oxyde_sim::generative::exact_surface`): where a lattice edge runs from the material out
+  (`oxyde_generative::exact_surface`): where a lattice edge runs from the material out
   of a preserve body into empty design space, out of the starting shape (or past the grid's
   side, which is out of it) or into an obstacle, the crossing goes where that body's surface
   crosses the edge (the first hit of the segment on its triangles, through a bounding volume
@@ -950,7 +950,7 @@ stays on show.
   hundredths of a voxel through it). An obstacle's offset is no surface: there the densities
   place it. Marching tetrahedra makes a closed surface that does not cross itself wherever
   the crossings lie on their edges, so this changes where the surface is, never what it is.
-- **The surface simplified** (`oxyde_sim::generative::decimate_holding`): quadric edge
+- **The surface simplified** (`oxyde_generative::decimate_holding`): quadric edge
   collapse (Garland and Heckbert) down to 8 000 triangles, each collapse kept only when the
   surface stays a closed manifold (the ends sharing no neighbour but the edge's two
   triangles give them, no end left with three triangles), turns no triangle over and leaves
@@ -1407,7 +1407,7 @@ displacement, under the legend `Mode 2: 143.2 Hz`. A mode's size is arbitrary (i
 displacement is 1), so the *Automatic* deformation scale draws that largest displacement at a
 twentieth of the model's diagonal, and *True scale* at 1 mm.
 
-**How it works** (`oxyde_sim::modal` and `oxyde_sim::eigen`, pure Rust, no new dependency):
+**How it works** (`oxyde_sim::modal` and `oxyde_generative::eigen`, pure Rust, no new dependency):
 
 - **The problem** is `K φ = ω² M φ`, each frequency `f = ω / 2π`. `K` is the static study's
   stiffness, made by the same code (`solve::Prepared::stiffness`, taken out of the static

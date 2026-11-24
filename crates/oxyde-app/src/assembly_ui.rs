@@ -1385,6 +1385,7 @@ impl OxydeApp {
                     self.open_preferences(crate::prefs_ui::PrefsTab::Graphics);
                 }
             });
+            ui.menu_button("Window", |ui| self.window_menu(ui));
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts").clicked() {
                     ui.close_menu();
@@ -2648,7 +2649,21 @@ impl OxydeApp {
                         )
                     };
                     if ui.button(label).clicked() {
-                        self.pending_open_component = Some(o);
+                        self.pending_open_component = Some(o.clone());
+                        ui.close_menu();
+                    }
+                    let path = self.asm.as_ref().and_then(|d| d.path_at(&o));
+                    if let Some(path) = path
+                        && ui
+                            .button("Open in New Window")
+                            .on_hover_text("The part or sub-assembly in a window of its own")
+                            .clicked()
+                    {
+                        let ctx = ui.ctx().clone();
+                        match self.window_with(&path) {
+                            Some(id) => ctx.send_viewport_cmd_to(id, egui::ViewportCommand::Focus),
+                            None => self.open_in_new_window(path),
+                        }
                         ui.close_menu();
                     }
                 }

@@ -1,0 +1,10 @@
+[package]
+name = "oxyde-generative"
+description = "Generative design on a grid of voxels: SIMP topology optimization solved by geometric multigrid, and the surfaces of its outcomes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

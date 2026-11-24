@@ -27,7 +27,7 @@
 //!   preserve voxel around. A fixture holds the corner of that voxel nearest its
 //!   sample (all three directions, or a roller's normal); a load spreads its sample's share
 //!   (by area) over the voxel's corners by trilinear weights.
-//! - **Remote masses** are linked to their faces' samples as a distributing link (RBE3) is:
+//! - **Remote masses** are linked to their faces' samples as a distributing link is:
 //!   the mass moves as the samples' mean translation and their mean turn about their
 //!   centroid, weighted by area, carried to its point; its weight under a case's
 //!   acceleration reaches each sample as that link's transpose gives it, a force and a
@@ -45,9 +45,9 @@ use super::multigrid::{Dims, par_fill};
 use super::{DesignSpace, GenerativeError, GenerativeStudy};
 use crate::bvh::{Bvh, Hit};
 use crate::math::{V3, add, cross, dot, norm, normalize, scale, sub};
-use crate::mesher::Surfaces;
-use crate::solve::{FixtureKind, LoadKind};
-use crate::topology::Symmetry;
+use crate::study::Symmetry;
+use crate::study::{FixtureKind, LoadKind};
+use crate::surfaces::Surfaces;
 
 /// The most voxels a grid may have: about 600 bytes each while generating.
 pub const MAX_VOXELS: usize = 4_000_000;
@@ -988,7 +988,7 @@ fn bounds(points: impl Iterator<Item = V3>) -> Option<(V3, V3)> {
 }
 
 /// A surface's triangles, by their corners.
-pub(super) fn triangles_of(s: &crate::mesher::SurfaceMesh) -> Vec<[V3; 3]> {
+pub(super) fn triangles_of(s: &crate::surfaces::SurfaceMesh) -> Vec<[V3; 3]> {
     s.triangles
         .iter()
         .filter_map(|t| {

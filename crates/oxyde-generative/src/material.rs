@@ -132,7 +132,7 @@ fn guess_from<T: Copy>(
 }
 
 /// The starter library (`oxyde_model::MaterialLibrary::standard`): E (MPa), ν, yield or
-/// tensile strength (MPa). Annealed or common tempers, as SolidWorks' library lists them.
+/// tensile strength (MPa). Annealed or common tempers.
 const NAMED: &[(&str, Elastic)] = &[
     (
         "Plain carbon steel (AISI 1020)",

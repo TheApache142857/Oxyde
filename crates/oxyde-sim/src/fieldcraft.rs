@@ -4,11 +4,11 @@
 //! lattice mesher ([`crate::mesher`]) and Netgen.
 
 use crate::mesh::TetMesh;
-use crate::mesher::SurfaceMesh;
 use fieldcraft_mesh::Error;
 use fieldcraft_mesh::cdt::{self, CdtOptions};
 use fieldcraft_mesh::surface::{BoundarySurface, SurfaceOptions};
 use fieldcraft_mesh::tet::{self, Order, QualityOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
 
 /// Fills the closed surface `solid` with four-node elements of edges about `element_size`
 /// long and appends them to `mesh` as body `body`, each boundary facet labelled with the

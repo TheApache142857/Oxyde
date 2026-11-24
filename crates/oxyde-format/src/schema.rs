@@ -17,6 +17,7 @@ use oxyde_model::{
 };
 use oxyde_sketch::{
     ConstrainedSketch, Constraint, Counters, Entity, EntityId, Geometry, Relation, RelationId,
+    SplineDef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -849,6 +850,12 @@ pub(crate) enum GeometryDto {
         start: u32,
         end: u32,
     },
+    Spline {
+        poles: Vec<u32>,
+        weights: Vec<f64>,
+        knots: Vec<f64>,
+        degree: u32,
+    },
 }
 
 /// Relations and dimensions. Lengths in mm, angles in radians.
@@ -1330,6 +1337,12 @@ fn entity_dto(e: &Entity) -> EntityDto {
         id: e.id.0,
         construction: e.construction,
         geometry: match e.geometry {
+            Geometry::Spline(ref spline) => GeometryDto::Spline {
+                poles: spline.poles.iter().map(|p| p.0).collect(),
+                weights: spline.weights.clone(),
+                knots: spline.knots.clone(),
+                degree: spline.degree,
+            },
             Geometry::Point(p) => GeometryDto::Point { at: point(p) },
             Geometry::Line { start, end } => GeometryDto::Line {
                 start: start.0,
@@ -1612,6 +1625,17 @@ fn entity_from(dto: EntityDto) -> Entity {
         id: id(dto.id),
         construction: dto.construction,
         geometry: match dto.geometry {
+            GeometryDto::Spline {
+                poles,
+                weights,
+                knots,
+                degree,
+            } => Geometry::Spline(SplineDef {
+                poles: poles.into_iter().map(id).collect(),
+                weights,
+                knots,
+                degree,
+            }),
             GeometryDto::Point { at } => Geometry::Point(point_from(at)),
             GeometryDto::Line { start, end } => Geometry::Line {
                 start: id(start),

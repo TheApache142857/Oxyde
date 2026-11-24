@@ -1093,7 +1093,7 @@ impl<'a> Context<'a> {
                 let geometry = solved
                     .solved
                     .entity(EntityId(*entity))
-                    .map(|e| e.geometry)
+                    .map(|e| e.geometry.clone())
                     .ok_or_else(|| gone_from_sketch("curve", *entity, name))?;
                 let at = |id: EntityId| {
                     solved
@@ -1159,6 +1159,22 @@ impl<'a> Context<'a> {
                             t = from + turned;
                         }
                         ellipse_point(&ellipse, t)
+                    }
+                    Geometry::Spline(_) => {
+                        let spline = solved
+                            .solved
+                            .spline_of(EntityId(*entity))
+                            .filter(|s| s.is_valid())
+                            .ok_or_else(|| format!("spline {entity} of {name} is malformed"))?;
+                        let t = spline.closest(q);
+                        let (dx, dy) = spline.derivative_at(t);
+                        let speed = dx.hypot(dy);
+                        if speed <= 1e-12 {
+                            return Err(format!(
+                                "spline {entity} of {name} has no direction there"
+                            ));
+                        }
+                        (spline.point_at(t), (dx / speed, dy / speed))
                     }
                 };
                 let tangent = plane.x_dir * tx + plane.y_dir() * ty;
@@ -2045,6 +2061,7 @@ fn hole_points(sketch: &ConstrainedSketch) -> Vec<(u32, oxyde_geom::Point2)> {
             } => {
                 used.extend([center, major, start, end]);
             }
+            Geometry::Spline(ref spline) => used.extend(spline.poles.iter().copied()),
             Geometry::Point(_) => {}
         }
     }

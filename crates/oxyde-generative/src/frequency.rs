@@ -1,6 +1,6 @@
 //! The frequency limit: the design's lowest natural frequencies, held by the first load
-//! case's fixtures, kept at or above a minimum, as Fusion 360's generative design offers a
-//! modal frequency limit and NASA's brackets keep their first mode clear of the launch's.
+//! case's fixtures, kept at or above a minimum, as a bracket on a launcher keeps its first
+//! mode clear of the launch's.
 //!
 //! - **The eigenproblem** `K φ = λ M φ` (`λ = ω²`) on the grid: `K` the iteration's own
 //!   stiffness, never assembled ([`Fine`]), `M` lumped (an eighth of each voxel's mass at

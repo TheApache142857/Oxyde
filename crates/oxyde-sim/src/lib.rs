@@ -17,26 +17,24 @@
 //!   model in a thermal stress study ([`solve::ThermalStrain`]).
 //! - [`modal`] finds the lowest natural frequencies and mode shapes of the model held by its
 //!   fixtures (a frequency study): the static study's stiffness, a consistent mass, and the
-//!   smallest eigenpairs by LOBPCG (`eigen`) preconditioned by the same multigrid.
+//!   smallest eigenpairs by LOBPCG (`oxyde_generative::eigen`) preconditioned by the same
+//!   multigrid.
 //! - [`topology`] optimizes a static study's shape: the stiffest one that keeps a given
 //!   share of the mass (SIMP densities, a density filter, optimality criteria), and cuts
 //!   it out of the mesh as a closed surface.
-//! - [`generative`] grows shapes between bodies to keep and bodies to stay clear of
-//!   (generative design, as Fusion 360 has it), on a grid of voxels solved by geometric
-//!   multigrid, for a material and a way of making them, and cuts them out as smooth
-//!   closed surfaces.
+//! - [`check`] checks the part made of a generative outcome (`oxyde_generative`) on its own
+//!   tetrahedral mesh, each load case solved by the static solver.
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
-//! - [`material`] holds the elastic properties, and a guess of them from a material's
-//!   name.
 //! - `fieldcraft` (with the `fieldcraft` feature) fills the same surfaces with FieldCraft's
 //!   tetrahedral mesher.
 //!
 //! Units are millimetres, newtons and megapascals (N/mm²), which are consistent:
-//! displacements come out in mm and stresses in MPa. The crate depends on no other crate
-//! (FieldCraft's mesher with the `fieldcraft` feature): the application turns the kernel's
-//! meshes into [`mesher::SurfaceMesh`]es and the persistent face names of fixtures and loads
-//! into labels.
+//! displacements come out in mm and stresses in MPa. The crate depends on no other crate but
+//! `oxyde-generative`, whose vector maths, materials, eigensolver and study description it
+//! builds on (and FieldCraft's mesher with the `fieldcraft` feature): the application turns
+//! the kernel's meshes into `oxyde_generative::surfaces::SurfaceMesh`es and the persistent
+//! face names of fixtures and loads into labels.
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -61,19 +59,14 @@
 )]
 
 mod amg;
-mod bvh;
+pub mod check;
 pub mod contact;
-mod eigen;
 #[cfg(feature = "fieldcraft")]
 pub mod fieldcraft;
-pub mod generative;
-pub mod material;
-mod math;
 pub mod mesh;
 pub mod mesher;
 pub mod modal;
 pub mod plot;
-mod pool;
 pub mod solve;
 pub mod thermal;
 pub mod topology;
@@ -81,24 +74,16 @@ pub mod topology;
 pub use contact::{
     Contact, ContactCandidate, ContactKind, ContactResult, ContactSolve, detect_contacts,
 };
-pub use material::{Elastic, ThermalProps};
-pub use math::V3;
 pub use mesh::{Facet, TetMesh};
-pub use mesher::{MeshError, MeshOptions, MeshReport, SurfaceMesh, mesh_solids};
+pub use mesher::{MeshError, MeshOptions, MeshReport, mesh_solids};
 pub use modal::{FrequencyResults, FrequencyStudy, MAX_MODES, Mode, solve_frequencies};
 pub use plot::{Band, Quantity, bands, mesh_edges, rainbow};
-pub use solve::{
-    Fixture, FixtureKind, Load, LoadKind, Results, SolveError, SolveOptions, Study, Summary,
-    ThermalStrain, solve, solve_thermal_stress,
-};
+pub use solve::{Results, SolveError, Study, Summary, ThermalStrain, solve, solve_thermal_stress};
 pub use thermal::{
     Frame, InternalHeat, KELVIN, ThermalError, ThermalLoad, ThermalLoadKind, ThermalMaterial,
     ThermalResults, ThermalStudy, ThermalSummary, Transient, solve_thermal,
 };
 pub use topology::{
-    Joining, Piece, Preserve, Pull, Shape, Symmetry, TopologyError, TopologyResults, TopologyStep,
-    TopologyStudy, optimize, pieces, shape,
+    Joining, Piece, Preserve, Pull, TopologyError, TopologyResults, TopologyStep, TopologyStudy,
+    optimize, pieces, shape,
 };
-
-/// A label on no face: a boundary facet the mesher could not tie to a model face.
-pub const NO_LABEL: u32 = u32::MAX;

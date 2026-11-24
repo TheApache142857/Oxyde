@@ -58,6 +58,10 @@ use oxyde_format::results::{Fingerprint, SolverInfo};
 use oxyde_format::simulation::{
     CoolingSettings, FlowGoalKind, FlowSettings, GenerativeSettings, StudyType, TransientSettings,
 };
+use oxyde_generative::NO_LABEL;
+use oxyde_generative::material::{Elastic, ThermalProps};
+use oxyde_generative::study::{FixtureKind, LoadKind, SolveOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
 use oxyde_geom::Transform;
 use oxyde_geom::{Point3, Vec3};
 use oxyde_kernel::{
@@ -67,9 +71,8 @@ use oxyde_kernel::{
 use oxyde_model::{BodyId, FaceName, Material, Mechanical, Thermal};
 use oxyde_render::{Material as RenderMaterial, Scene};
 use oxyde_sim::{
-    ContactCandidate, ContactKind, Elastic, FixtureKind, FrequencyResults, FrequencyStudy,
-    LoadKind, MeshOptions, MeshReport, NO_LABEL, Quantity, Results, SolveOptions, Summary,
-    SurfaceMesh, TetMesh, ThermalLoadKind, ThermalMaterial, ThermalProps, ThermalResults,
+    ContactCandidate, ContactKind, FrequencyResults, FrequencyStudy, MeshOptions, MeshReport,
+    Quantity, Results, Summary, TetMesh, ThermalLoadKind, ThermalMaterial, ThermalResults,
     ThermalStudy, ThermalSummary, TopologyResults, TopologyStudy,
 };
 use serde::{Deserialize, Serialize};
@@ -2116,22 +2119,24 @@ impl OxydeApp {
                 labels: labels.clone(),
             };
             match item.kind {
-                ItemKind::Fixed => fixtures.push(oxyde_sim::Fixture {
+                ItemKind::Fixed => fixtures.push(oxyde_generative::study::Fixture {
                     kind: FixtureKind::Fixed,
                     labels,
                 }),
-                ItemKind::Roller => fixtures.push(oxyde_sim::Fixture {
+                ItemKind::Roller => fixtures.push(oxyde_generative::study::Fixture {
                     kind: FixtureKind::Roller,
                     labels,
                 }),
-                ItemKind::Force { newtons, direction } => loads.push(oxyde_sim::Load {
-                    kind: LoadKind::Force {
-                        total: newtons,
-                        direction: direction.vector(),
-                    },
-                    labels,
-                }),
-                ItemKind::Pressure { mpa } => loads.push(oxyde_sim::Load {
+                ItemKind::Force { newtons, direction } => {
+                    loads.push(oxyde_generative::study::Load {
+                        kind: LoadKind::Force {
+                            total: newtons,
+                            direction: direction.vector(),
+                        },
+                        labels,
+                    })
+                }
+                ItemKind::Pressure { mpa } => loads.push(oxyde_generative::study::Load {
                     kind: LoadKind::Pressure { value: mpa },
                     labels,
                 }),
@@ -2317,7 +2322,7 @@ impl OxydeApp {
                     preserved,
                     max_iterations: study.topology.iterations.max(1) as usize,
                     symmetry: study.topology.symmetry.contains(&true).then_some(
-                        oxyde_sim::Symmetry {
+                        oxyde_generative::study::Symmetry {
                             point: study.topology.symmetry_point,
                             planes: study.topology.symmetry,
                         },

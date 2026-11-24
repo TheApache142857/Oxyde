@@ -8,5 +8,5 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-oxyde-sim = { workspace = true }
+oxyde-generative = { workspace = true }
 wgpu = { workspace = true }

@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use oxyde_format::PartKernel;
 use oxyde_geom::{Axis, Loop, Path as SweepPath, Plane, Point3, Profile, Transform, Vec3};
 use oxyde_kernel::{
-    BooleanOp, ChamferSecond, Distance, EdgeTangent, Kernel, Mesh, MeshWatch, OpResult,
+    BooleanOp, ChamferSecond, Distance, EdgeCurve, EdgeTangent, Kernel, Mesh, MeshWatch, OpResult,
     ProjectedEdges, ShapeHandle, StepAssembly, StepColors, StepImport, StepMaterial, SubShape,
     Topology, TopologyCounts, VolumeMesh, VolumeMeshError, VolumeMeshOptions,
 };
@@ -384,6 +384,10 @@ impl Kernel for AppKernel {
         near: Point3,
     ) -> Result<Option<EdgeTangent>, Self::Error> {
         each!(self, k => k.edge_tangent(shape, edge, near))
+    }
+
+    fn edge_curve(&self, shape: ShapeHandle, edge: u32) -> Result<Option<EdgeCurve>, Self::Error> {
+        each!(self, k => k.edge_curve(shape, edge))
     }
 
     fn project_edges(

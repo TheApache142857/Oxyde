@@ -79,6 +79,7 @@ mod theme;
 mod timeline;
 mod view_cube;
 mod viewport;
+mod windows;
 
 use std::path::PathBuf;
 

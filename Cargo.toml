@@ -21,6 +21,7 @@ oxyde-render = { path = "crates/oxyde-render" }
 oxyde-cli = { path = "crates/oxyde-cli" }
 oxyde-mcp = { path = "crates/oxyde-mcp" }
 oxyde-sim = { path = "crates/oxyde-sim" }
+oxyde-generative = { path = "crates/oxyde-generative" }
 oxyde-sim-gpu = { path = "crates/oxyde-sim-gpu" }
 oxyde-flow = { path = "crates/oxyde-flow" }
 oxyde-solidcore = { path = "crates/oxyde-solidcore" }
@@ -57,6 +58,10 @@ opt-level = 3
 
 # The finite element solver too: a study would take minutes unoptimized.
 [profile.dev.package.oxyde-sim]
+opt-level = 3
+
+# The generative design solver too: a study would take minutes unoptimized.
+[profile.dev.package.oxyde-generative]
 opt-level = 3
 
 # And its GPU side, which converts every solve's arrays for the card.

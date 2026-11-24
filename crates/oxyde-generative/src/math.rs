@@ -6,23 +6,23 @@
 /// A point or a vector, in millimetres unless said otherwise.
 pub type V3 = [f64; 3];
 
-pub(crate) fn add(a: V3, b: V3) -> V3 {
+pub fn add(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-pub(crate) fn sub(a: V3, b: V3) -> V3 {
+pub fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-pub(crate) fn scale(a: V3, k: f64) -> V3 {
+pub fn scale(a: V3, k: f64) -> V3 {
     [a[0] * k, a[1] * k, a[2] * k]
 }
 
-pub(crate) fn dot(a: V3, b: V3) -> f64 {
+pub fn dot(a: V3, b: V3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-pub(crate) fn cross(a: V3, b: V3) -> V3 {
+pub fn cross(a: V3, b: V3) -> V3 {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -30,32 +30,32 @@ pub(crate) fn cross(a: V3, b: V3) -> V3 {
     ]
 }
 
-pub(crate) fn norm(a: V3) -> f64 {
+pub fn norm(a: V3) -> f64 {
     dot(a, a).sqrt()
 }
 
 /// `a` scaled to unit length, or `None` when it has none.
-pub(crate) fn normalize(a: V3) -> Option<V3> {
+pub fn normalize(a: V3) -> Option<V3> {
     let n = norm(a);
     (n > 1e-300 && n.is_finite()).then(|| scale(a, 1.0 / n))
 }
 
-pub(crate) fn lerp(a: V3, b: V3, t: f64) -> V3 {
+pub fn lerp(a: V3, b: V3, t: f64) -> V3 {
     add(a, scale(sub(b, a), t))
 }
 
 /// Six times the signed volume of the tetrahedron `a b c d`: positive when `d` lies on the
 /// side `(b − a) × (c − a)` points to.
-pub(crate) fn tet_volume6(a: V3, b: V3, c: V3, d: V3) -> f64 {
+pub fn tet_volume6(a: V3, b: V3, c: V3, d: V3) -> f64 {
     dot(cross(sub(b, a), sub(c, a)), sub(d, a))
 }
 
 /// A 3 × 3 matrix, row-major.
-pub(crate) type M3 = [f64; 9];
+pub type M3 = [f64; 9];
 
-pub(crate) const IDENTITY: M3 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+pub const IDENTITY: M3 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
-pub(crate) fn mat_vec(m: &M3, v: V3) -> V3 {
+pub fn mat_vec(m: &M3, v: V3) -> V3 {
     [
         m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
         m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
@@ -64,7 +64,7 @@ pub(crate) fn mat_vec(m: &M3, v: V3) -> V3 {
 }
 
 /// `mᵀ v`.
-pub(crate) fn mat_t_vec(m: &M3, v: V3) -> V3 {
+pub fn mat_t_vec(m: &M3, v: V3) -> V3 {
     [
         m[0] * v[0] + m[3] * v[1] + m[6] * v[2],
         m[1] * v[0] + m[4] * v[1] + m[7] * v[2],
@@ -72,7 +72,7 @@ pub(crate) fn mat_t_vec(m: &M3, v: V3) -> V3 {
     ]
 }
 
-pub(crate) fn mat_mul(a: &M3, b: &M3) -> M3 {
+pub fn mat_mul(a: &M3, b: &M3) -> M3 {
     let mut out = [0.0; 9];
     for i in 0..3 {
         for j in 0..3 {
@@ -82,12 +82,12 @@ pub(crate) fn mat_mul(a: &M3, b: &M3) -> M3 {
     out
 }
 
-pub(crate) fn transpose(a: &M3) -> M3 {
+pub fn transpose(a: &M3) -> M3 {
     [a[0], a[3], a[6], a[1], a[4], a[7], a[2], a[5], a[8]]
 }
 
 /// The inverse of `m`, or `None` when it is singular.
-pub(crate) fn inverse(m: &M3) -> Option<M3> {
+pub fn inverse(m: &M3) -> Option<M3> {
     let c = [
         m[4] * m[8] - m[5] * m[7],
         m[5] * m[6] - m[3] * m[8],
@@ -114,7 +114,7 @@ pub(crate) fn inverse(m: &M3) -> Option<M3> {
 
 /// The eigenvalues of a symmetric matrix of size `N` (row-major), by cyclic Jacobi
 /// rotations, in no particular order.
-pub(crate) fn symmetric_eigenvalues<const N: usize>(m: [[f64; N]; N]) -> [f64; N] {
+pub fn symmetric_eigenvalues<const N: usize>(m: [[f64; N]; N]) -> [f64; N] {
     let mut a = m;
     for _sweep in 0..60 {
         let off: f64 = (0..N)

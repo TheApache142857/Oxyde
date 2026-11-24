@@ -5,13 +5,13 @@
 
 #![cfg(feature = "fieldcraft")]
 
+use oxyde_generative::material::Elastic;
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions};
+use oxyde_generative::surfaces::SurfaceMesh;
 use oxyde_geom::{Curve2, Plane, Point2, Point3, Profile, ProfileSegment, Vec3};
 use oxyde_kernel::{CurveKind, Kernel, ShapeHandle, VolumeMeshError, VolumeMeshOptions};
 use oxyde_occt::OcctKernel;
-use oxyde_sim::{
-    Elastic, Fixture, FixtureKind, Load, LoadKind, MeshOptions, SolveOptions, Study, SurfaceMesh,
-    TetMesh,
-};
+use oxyde_sim::{MeshOptions, Study, TetMesh};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 

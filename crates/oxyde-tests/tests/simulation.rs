@@ -3,6 +3,9 @@
 //! and, for the thermal studies, against conduction along a bar; and a topology study's,
 //! the beam optimized down to a share of its mass.
 
+use oxyde_generative::material::Elastic;
+use oxyde_generative::study::{Fixture, FixtureKind, Load, LoadKind, SolveOptions, Symmetry};
+use oxyde_generative::surfaces::SurfaceMesh;
 use oxyde_geom::Point2;
 use oxyde_kernel::{Kernel, Mesh, VolumeMeshError, VolumeMeshOptions};
 use oxyde_model::{
@@ -10,8 +13,7 @@ use oxyde_model::{
 };
 use oxyde_occt::OcctKernel;
 use oxyde_sim::{
-    Contact, ContactKind, Elastic, Fixture, FixtureKind, Load, LoadKind, MeshOptions, Pull,
-    SolveOptions, Study, SurfaceMesh, Symmetry, TetMesh, ThermalLoad, ThermalLoadKind,
+    Contact, ContactKind, MeshOptions, Pull, Study, TetMesh, ThermalLoad, ThermalLoadKind,
     ThermalMaterial, ThermalStudy, TopologyResults, TopologyStudy,
 };
 use std::sync::atomic::AtomicBool;

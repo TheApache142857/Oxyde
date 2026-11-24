@@ -2599,6 +2599,7 @@ dependencies = [
  "oxyde-assembly",
  "oxyde-flow",
  "oxyde-format",
+ "oxyde-generative",
  "oxyde-geom",
  "oxyde-kernel",
  "oxyde-mcp",
@@ -2661,6 +2662,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxyde-generative"
+version = "0.0.11"
+
+[[package]]
 name = "oxyde-geom"
 version = "0.0.11"
 
@@ -2720,13 +2725,14 @@ name = "oxyde-sim"
 version = "0.0.11"
 dependencies = [
  "fieldcraft-mesh",
+ "oxyde-generative",
 ]
 
 [[package]]
 name = "oxyde-sim-gpu"
 version = "0.0.11"
 dependencies = [
- "oxyde-sim",
+ "oxyde-generative",
  "wgpu",
 ]
 
@@ -2757,6 +2763,7 @@ dependencies = [
  "oxyde-assembly",
  "oxyde-cli",
  "oxyde-format",
+ "oxyde-generative",
  "oxyde-geom",
  "oxyde-kernel",
  "oxyde-model",

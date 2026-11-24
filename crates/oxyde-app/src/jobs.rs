@@ -102,7 +102,7 @@ pub enum Outcome {
     PartCreated {
         path: PathBuf,
         result: Result<String, String>,
-        pieces: Vec<oxyde_sim::Shape>,
+        pieces: Vec<oxyde_generative::shape::Shape>,
     },
     /// A STEP assembly read, and the files it would become.
     StepPlanned {
