@@ -675,16 +675,16 @@ iterations. *Create Part* makes a new part of it; *Export* writes it as STL, OBJ
   amplified it, and conjugate gradients went from about 40 iterations to hundreds. Each
   smoothing step is one product whose pass over the nodes also forms the correction
   `c₁ d + c₂ D⁻¹ (b − A x)`, and the cycle's residual comes out of a product the same way.
-- **Threads:** the parallel steps run on a pool of worker threads started once
-  (`oxyde_sim::pool`, one per core but the caller's, asleep between steps). Started afresh
-  for each step, sixteen threads cost some forty microseconds each, more than the step's
-  work: a step over 300 000 values took 690 µs on fresh threads, 150 µs on one thread and
-  55 µs on the pool, and a solve makes some thirty steps per conjugate gradient iteration.
-  Moving to the pool halved the time of an iteration. Handing the workers a borrowed
-  closure is the crate's one `unsafe` block, sound because a step returns only once every
-  task it handed out is done (the owner chose this over adding `rayon`, October 2026).
-  The pool also runs a step started from inside a task serially, so it never waits on
-  itself, and resumes a task's panic on the caller.
+- **Threads:** each parallel step starts its threads (`std::thread::scope`,
+  `multigrid::par_fill`) and joins them before it returns; the caller works alongside them.
+  A thread that cannot start leaves its share to the others. Until `oxyde-generative`
+  became a crate of its own without `unsafe` code, the steps ran on a pool of threads
+  started once and asleep between steps (`oxyde_sim::pool`). Sixteen fresh threads cost
+  some forty microseconds each, more than a small step's work: a step over 300 000 values
+  took 690 µs on fresh threads, 150 µs on one thread and 55 µs on the pool, and a solve
+  makes some thirty steps per conjugate gradient iteration. On sixteen threads a study
+  takes about half as long again as on the pool (the bracket study of
+  `tests/generative.rs`, 30 iterations: 101 to 111 s against 69 to 72 s).
 - **Fixtures and loads** act through samples of their faces every half voxel. Each sample
   lands in the voxel holding it, made a preserve voxel (a thin preserve body has no voxel
   centre in it), or, in an obstacle voxel, in the nearest preserve voxel around. A fixture
