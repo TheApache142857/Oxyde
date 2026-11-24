@@ -2565,7 +2565,11 @@ impl OxydeApp {
         }
         if let Some(pick) = output.clicked {
             let position = output.response.interact_pointer_pos();
-            let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some()));
+            let takes = crate::app::Takes {
+                planes: self.mate_dialog.is_some(),
+                ..Default::default()
+            };
+            let overlay = position.and_then(|p| overlay_at(&overlays, p, pick.is_some(), takes));
             let item = pick.and_then(|p| self.asm.as_ref().and_then(|d| d.picked(p)));
             if let Some(mut d) = self.mate_dialog.take() {
                 let target = match overlay {
@@ -2811,11 +2815,14 @@ impl OxydeApp {
             overlays.push((Overlay::Plane(plane), OverlayShape::Quad(quad)));
             selected.push(chosen);
         }
-        let lit = crate::app::hovered_plane(
+        let lit = crate::app::hovered_overlay(
             &overlays,
             pointer,
             self.viewport.hovered().is_some(),
-            mating,
+            crate::app::Takes {
+                planes: mating,
+                ..Default::default()
+            },
         );
         for ((overlay, shape), chosen) in overlays.iter().zip(selected) {
             if let (Overlay::Plane(plane), OverlayShape::Quad(quad)) = (overlay, shape) {
