@@ -2796,31 +2796,33 @@ impl OxydeApp {
         let to_screen = |p: Point3| self.viewport.to_screen(p, output);
         let pointer = output.response.hover_pos();
         let mating = self.mate_dialog.is_some();
+        let mut selected = Vec::new();
         for plane in [
             StandardPlane::Front,
             StandardPlane::Top,
             StandardPlane::Right,
         ] {
-            let selected = self.asm_plane == Some(plane);
-            if !(mating || selected || self.item_visible(Item::Plane(plane))) {
+            let item = Item::Plane(plane);
+            let chosen = self.asm_plane == Some(plane);
+            if !(chosen || self.item_visible(item) || (mating && self.item_offered(item))) {
                 continue;
             }
-            let geometry = plane.plane();
-            let quad = crate::app::plane_quad(&to_screen, &geometry, center, size);
-            let hovered = mating
-                && pointer.is_some_and(|p| {
-                    crate::app::near_outline(&quad, p) || crate::app::inside(&quad, p)
-                });
-            let quad = crate::app::paint_plane(
-                &painter,
-                &to_screen,
-                &geometry,
-                center,
-                size,
-                &format!("{} Plane", plane_name(plane)),
-                selected || hovered,
-            );
+            let quad = crate::app::plane_quad(&to_screen, &plane.plane(), center, size);
             overlays.push((Overlay::Plane(plane), OverlayShape::Quad(quad)));
+            selected.push(chosen);
+        }
+        let lit = crate::app::hovered_plane(
+            &overlays,
+            pointer,
+            self.viewport.hovered().is_some(),
+            mating,
+        );
+        for ((overlay, shape), chosen) in overlays.iter().zip(selected) {
+            if let (Overlay::Plane(plane), OverlayShape::Quad(quad)) = (overlay, shape) {
+                let name = format!("{} Plane", plane_name(*plane));
+                let strong = chosen || lit == Some(*overlay);
+                painter.add(crate::app::plane_shape(&painter, *quad, &name, strong));
+            }
         }
         if self.item_visible(Item::Origin) {
             crate::app::paint_origin(&painter, &to_screen);
