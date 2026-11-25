@@ -5,15 +5,13 @@ release yet; the git history has every detail.
 
 ## Unreleased
 
-### Sketches and axes no longer stand between the pointer and the part (unreleased, November 2026)
+### A broken generative study is refused with a message (unreleased, November 2026)
 
-- **A click on the part picks the face or edge under it** although a sketch's curve or a
-  reference axis is drawn there, as planes since the last change; a command that takes
-  sketches (Extrude, Revolve, Sweep, Loft, Hole Wizard, Plane) or axes (Revolve, Plane,
-  Axis, the patterns' directions) still takes them there. Off the part they are clicked
-  as before.
-- **The sketch or axis that lights up under the pointer is the one a click takes**, while
-  a command takes them.
+- **Generative design checks its input**: a body of the design space whose triangles name
+  points it does not have, whose face labels do not match its triangles, or with a point
+  that is not a number, is refused with a message naming the fault, where those triangles
+  were dropped before. A voxel grid that does not match its outcome is refused instead of
+  stopping Oxyde.
 
 ### Converted edges follow the part (unreleased, November 2026)
 

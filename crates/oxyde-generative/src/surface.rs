@@ -35,7 +35,7 @@ const MIN_SHARE: f64 = 0.02;
 
 /// The surface of `density` (one byte per voxel of `grid`, as [`super::Outcome`] has it),
 /// smoothed by `smoothing` rounds of Taubin's smoothing. Empty when the densities do not
-/// fit the grid.
+/// fit the grid, or the grid fails [`Grid::check`].
 pub fn surface(grid: &Grid, density: &[u8], smoothing: usize) -> Shape {
     cut(grid, density, smoothing, &mut |_, _, _, _| None).0
 }
@@ -114,7 +114,7 @@ fn cut(
     smoothing: usize,
     exact: &mut dyn FnMut(usize, usize, V3, V3) -> Option<f64>,
 ) -> (Shape, Vec<bool>) {
-    if density.len() != grid.voxel_count() {
+    if grid.check().is_err() || density.len() != grid.voxel_count() {
         return (Shape::default(), Vec::new());
     }
     let n = grid.counts;

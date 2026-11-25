@@ -139,6 +139,37 @@ impl Grid {
         self.counts.iter().product()
     }
 
+    /// Whether its voxels fill its counts, its size and corner are finite, and its fixtures
+    /// and loads are on its nodes: what every use of a grid indexes by.
+    pub fn check(&self) -> Result<(), GenerativeError> {
+        let voxels = self
+            .counts
+            .iter()
+            .try_fold(1usize, |p, &n| p.checked_mul(n));
+        let nodes = self
+            .counts
+            .iter()
+            .try_fold(1usize, |p, &n| p.checked_mul(n.checked_add(1)?));
+        let (Some(voxels), Some(nodes)) = (voxels, nodes) else {
+            return Err(GenerativeError::BadGrid);
+        };
+        let on_nodes = self.cases.iter().all(|c| {
+            c.holds.iter().all(|(n, _)| (*n as usize) < nodes)
+                && c.forces.iter().all(|(n, _)| (*n as usize) < nodes)
+        });
+        let ok = self.size.is_finite()
+            && self.size > 0.0
+            && self.origin.iter().all(|x| x.is_finite())
+            && voxels == self.kinds.len()
+            && on_nodes
+            && self.anchored.iter().all(|v| (*v as usize) < voxels);
+        if ok {
+            Ok(())
+        } else {
+            Err(GenerativeError::BadGrid)
+        }
+    }
+
     pub(crate) fn dims(&self) -> Dims {
         Dims { cells: self.counts }
     }
@@ -205,6 +236,7 @@ impl Grid {
         threads: usize,
         cancel: &AtomicBool,
     ) -> Result<Grid, GenerativeError> {
+        space.check()?;
         if !(h.is_finite() && h > 0.0) {
             return Err(GenerativeError::BadVoxelSize);
         }
