@@ -1,7 +1,8 @@
 # Changelog
 
 What changes for people using Oxyde and its file formats. Oxyde is pre-alpha and has no
-release yet; the git history has every detail.
+release yet; the git history has every detail. Changes merged since this file was last
+updated are in [`changelog.d/`](changelog.d/README.md), one file each.
 
 ## Unreleased
 

@@ -1,0 +1,72 @@
+name: Auto-merge
+
+# Turns GitHub's auto-merge (squash) on for the owner's pull requests, so that GitHub
+# merges them once the required `gate` check passes, and off for a draft or a pull
+# request labelled `hold`. The workflow never merges.
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+
+jobs:
+  auto-merge:
+    name: auto-merge
+    # From a branch of this repository: a fork's pull request has a read-only token.
+    if: >-
+      github.event.pull_request.user.login == github.repository_owner &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Turn auto-merge on or off
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # Read the pull request now: its labels and draft state may have changed since the event.
+          info=$(gh pr view "$PR" --json state,isDraft,labels,autoMergeRequest,id \
+            --jq '[.state, (.isDraft | tostring), (any(.labels[]; .name == "hold") | tostring),
+                   (.autoMergeRequest != null | tostring), .id] | @tsv')
+          IFS=$'\t' read -r state draft held armed id <<< "$info"
+          if [ "$state" != OPEN ]; then
+            exit 0
+          fi
+          if [ "$draft" = true ] || [ "$held" = true ]; then
+            if [ "$armed" = true ]; then
+              gh pr merge "$PR" --disable-auto
+            fi
+            echo "Draft or held: auto-merge is off."
+            exit 0
+          fi
+          if [ "$armed" = true ]; then
+            echo "Auto-merge is already on."
+            exit 0
+          fi
+          # Without a required check, auto-merge has nothing to wait for: leave it off.
+          required=$(
+            gh api "repos/$GH_REPO/branches/$BASE" \
+              --jq '.protection.required_status_checks.contexts[]?' || true
+            gh api "repos/$GH_REPO/rules/branches/$BASE" \
+              --jq '.[] | select(.type == "required_status_checks")
+                    | .parameters.required_status_checks[].context' || true
+          )
+          if ! grep -qx gate <<< "$required"; then
+            echo "::notice::$BASE does not require the gate check: auto-merge stays off."
+            exit 0
+          fi
+          gh api graphql -f id="$id" -f query='
+            mutation($id: ID!) {
+              enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) {
+                clientMutationId
+              }
+            }'
+          echo "Auto-merge is on: GitHub squash-merges once the required checks pass."
