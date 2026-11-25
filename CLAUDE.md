@@ -66,7 +66,7 @@ GitHub Actions run the same on every pull request and push to `main` (`.github/w
 with Debian's OpenCASCADE 7.8. The `gate` job checks the format of the `.rs` files the change adds or
 modifies, fails on a clippy or rustc warning in a changed line (`scripts/ci/clippy-changed-lines.py`), and runs
 the tests without `oxyde-generative`, `oxyde-sim`, `oxyde-sim-gpu` and the `gpu::` tests: hosted runners have
-no GPU. The `solver` job runs the tests of `oxyde-generative` and `oxyde-sim`; it holds no merge.
+no GPU. The tests of `oxyde-generative` and `oxyde-sim` run on the PC only.
 
 ## Merging
 

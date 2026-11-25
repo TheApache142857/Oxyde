@@ -20,7 +20,7 @@ env:
 
 jobs:
   # The required check: what CLAUDE.md asks of every commit, on Linux with Debian's
-  # OpenCASCADE 7.8. The solver crates run in their own job, the GPU tests nowhere.
+  # OpenCASCADE 7.8. The solver crates and the GPU tests run on the PC only.
   gate:
     name: gate
     runs-on: ubuntu-latest
@@ -85,17 +85,3 @@ jobs:
         run: >-
           cargo test --workspace --exclude oxyde-sim-gpu --exclude oxyde-generative --exclude oxyde-sim
           -- --skip gpu:: --skip gpu_trace::
-
-  # Generative design and simulation solvers: minutes of computation, reported without
-  # holding a merge.
-  solver:
-    name: solver
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-      - name: Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Tests
-        run: cargo test -p oxyde-generative -p oxyde-sim -- --test-threads=1
