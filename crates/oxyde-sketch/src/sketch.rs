@@ -895,6 +895,20 @@ impl ConstrainedSketch {
         }
     }
 
+    /// Changes the minor semi-axis of an ellipse or elliptic arc; solve afterwards.
+    pub fn set_minor(&mut self, id: EntityId, value: f64) -> bool {
+        match self.entities.iter_mut().find(|e| e.id == id) {
+            Some(Entity {
+                geometry: Geometry::Ellipse { minor, .. } | Geometry::EllipticArc { minor, .. },
+                ..
+            }) => {
+                *minor = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// End points of a line.
     pub fn endpoints(&self, line: EntityId) -> Option<(EntityId, EntityId)> {
         match self.entity(line)?.geometry {

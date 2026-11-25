@@ -260,6 +260,7 @@ fn make_sketch(session: &mut Session, spec: &Value) -> Result<FeatureId> {
             FeatureKind::Sketch(Sketch {
                 plane: sketch_plane,
                 geometry: sketch,
+                projections: Vec::new(),
             }),
             name.as_deref(),
         )?;

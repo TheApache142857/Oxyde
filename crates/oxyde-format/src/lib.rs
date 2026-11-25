@@ -1179,6 +1179,85 @@ mod tests {
     }
 
     #[test]
+    fn keys_a_reader_does_not_know_are_ignored() {
+        let file = sample();
+        let bytes = write_part(Cursor::new(Vec::new()), &file)
+            .unwrap()
+            .into_inner();
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut out = ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            drop(entry);
+            if name == MODEL {
+                let mut model: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                model["a_later_key"] = serde_json::json!({"anything": [1, 2]});
+                for feature in model["features"].as_array_mut().unwrap() {
+                    feature["a_later_field"] = serde_json::json!(true);
+                }
+                data = serde_json::to_vec(&model).unwrap();
+            }
+            out.start_file(name, SimpleFileOptions::default()).unwrap();
+            out.write_all(&data).unwrap();
+        }
+        let bytes = out.finish().unwrap().into_inner();
+        assert_eq!(read_part(Cursor::new(bytes)).unwrap(), file);
+    }
+
+    #[test]
+    fn converted_copies_keep_their_links_in_a_part_of_version_one() {
+        use oxyde_model::FeatureId;
+        use oxyde_model::projection::{Projection, ProjectionSource};
+        let extrude = FeatureId::from_raw(2);
+        let sorted = |mut faces: Vec<FaceName>| {
+            faces.sort();
+            faces
+        };
+        let mut sketch = Sketch::new(SketchPlane::Standard(StandardPlane::Top));
+        let line = sketch
+            .geometry
+            .line(Point2::new(0.0, 0.0), Point2::new(40.0, 0.0));
+        let corner = sketch.geometry.point(Point2::new(40.0, 20.0));
+        sketch.projections = vec![
+            Projection {
+                entity: line.0,
+                source: ProjectionSource::Edge(EdgeName {
+                    faces: sorted(vec![
+                        FaceName::profile(extrude, 1),
+                        FaceName::profile(extrude, 0),
+                    ]),
+                    part: 0,
+                }),
+            },
+            Projection {
+                entity: corner.0,
+                source: ProjectionSource::Vertex(VertexName {
+                    faces: sorted(vec![
+                        FaceName::end_cap(extrude),
+                        FaceName::profile(extrude, 1),
+                        FaceName::profile(extrude, 0),
+                    ]),
+                    part: 0,
+                }),
+            },
+        ];
+        let mut part = Part::new();
+        part.add_feature(FeatureKind::Sketch(sketch));
+        let file = PartFile {
+            kernel: Default::default(),
+            document_id: new_document_id(),
+            definition: part.definition(),
+            properties: Properties::default(),
+        };
+        assert_eq!(round_trip(&file), file);
+        // Readers without links open the copies as fixed ones.
+        assert_eq!(part_version(&file.definition), FORMAT_VERSION);
+    }
+
+    #[test]
     fn offset_planes_are_written_as_before_and_constructions_named() {
         let bytes = write_part(Cursor::new(Vec::new()), &sample())
             .unwrap()
