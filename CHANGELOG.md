@@ -1,100 +1,10 @@
 # Changelog
 
 What changes for people using Oxyde and its file formats. Oxyde is pre-alpha and has no
-release yet; the git history has every detail. Changes merged since this file was last
-updated are in [`changelog.d/`](changelog.d/README.md), one file each.
+release yet; the git history has every detail. Changes merged since the last release are
+in [`changelog.d/`](changelog.d/README.md), one file each.
 
 ## Unreleased
-
-### A broken generative study is refused with a message (unreleased, November 2026)
-
-- **Generative design checks its input**: a body of the design space whose triangles name
-  points it does not have, whose face labels do not match its triangles, or with a point
-  that is not a number, is refused with a message naming the fault, where those triangles
-  were dropped before. A voxel grid that does not match its outcome is refused instead of
-  stopping Oxyde.
-
-### Converted edges follow the part (unreleased, November 2026)
-
-- **Convert Entities' copies follow what they copy**: when the part changes, a copied edge
-  or vertex moves with it on the next rebuild, as in SolidWorks; deleting the copy ends
-  the link. While the edge or vertex is gone (a feature suppressed, a face removed) its
-  copy stays where it was and the sketch shows a warning; it follows again once it is
-  back.
-- **File format**: sketches write an optional `projections` list (FORMAT.md §3 Sketches).
-  Older Oxyde opens such parts and keeps the copies fixed where they were saved.
-
-### Solver threads capped for a whole run (unreleased, November 2026)
-
-- **`OXYDE_SOLVER_THREADS`**, set to a whole number above zero, caps the threads of every
-  study, thermal, frequency, topology and generative design solve in the process, the
-  application's and the tests' alike. Unset, solves use every core as before.
-
-### Planes no longer stand between the pointer and the part (unreleased, November 2026)
-
-- **A click on the part picks the face or edge under it** while a command takes planes
-  (Sketch, Plane, Up To Surface, Mirror, Axis, Mate), however many planes cross it there. A
-  plane is picked on its outline or inside where no face is under the pointer, or in the
-  timeline or the tree; the plane that lights up under the pointer is the one a click takes.
-- **Planes you hid stay hidden**: a command that takes planes still shows those at their
-  default state, but no longer one hidden with its eye, nor any plane when View › Hide/Show
-  turns planes off. The same holds for the assembly's planes while a mate is made.
-
-### The generative design solver in its own crate (unreleased, November 2026)
-
-- **Generative design studies take about half as long again**: the solver runs each
-  parallel step on threads started for that step, without `unsafe` code, where it kept
-  threads between steps before. Its outcomes are the same. The solver is now the crate
-  `oxyde-generative`, which depends on no other crate.
-
-### A window per document (unreleased, November 2026)
-
-- **File › Open opens the document in a new window**, as Creo does; so do Open recent and
-  STEP import. A window that shows nothing yet is used instead, and Preferences › Graphics ›
-  Windows can bring back replacing the window's document. A file already open in a window
-  brings that window forward.
-- **Open in New Window** in an assembly component's context menu opens the part or
-  sub-assembly in a window of its own; Edit in place stays.
-- **Window menu**: every open window, Ctrl+Tab for the next one. Each window has its own
-  undo history, selection, sketch and panels.
-- Closing a window asks about its unsaved changes; closing the main window closes the
-  others, unless one has unsaved changes, which is brought forward instead.
-
-### Ellipses on the solidcore kernel (unreleased, November 2026)
-
-- **The solidcore kernel extrudes ellipses and elliptic arcs exactly**, as conic pieces of
-  at most a third of a turn; before, it refused them with a message. An ellipse's wall is
-  three faces, named as the ellipse's parts 1, 2 and 3, where OpenCASCADE makes one face
-  (part 0), so face names on such walls differ between the two kernels.
-
-### Every edge converts exactly (unreleased, November 2026)
-
-- **Convert Entities copies any edge of the part into a sketch exactly**: the part's own
-  ellipses, spline edges (of lofts, sweeps, fillets, imported STEP), Bézier curves,
-  parabolas and hyperbolas, in the sketch plane or projected onto it. A spline edge becomes
-  the spline on its projected poles, which is its projection exactly; before, such edges
-  offered their vertices only. The kernel approximates offset curves within a micrometre.
-- **Splines are sketch entities**, standing on their poles, extruded, cut and revolved like
-  other curves. Mirror Entities copies them; Trim, Extend and Offset Entities leave them
-  alone. There is no spline drawing tool yet.
-- **File format**: a part whose sketches hold a spline is written as `format_version` 4
-  (FORMAT.md §2, §3 Sketches); older Oxyde refuses it with a message. Parts without one are
-  written as before.
-
-### Ellipses in sketches (unreleased, November 2026)
-
-- **Convert Entities projects a tilted circle exactly**: a circle or arc of the part whose
-  plane is tilted to the sketch becomes the ellipse or elliptic arc it projects to, fixed in
-  place, and one seen edge-on the line across it. Before, such edges offered their vertices
-  only.
-- **Ellipses and elliptic arcs are sketch entities**, extruded, cut and revolved like circles
-  and arcs, with *point on ellipse* and *major* and *minor semi-axis* dimensions.
-  The assistant's sketches take `{"type": "ellipse", "center", "radii": [a, b], "angle"}`,
-  fully dimensioned. Trim, Extend and Offset Entities leave ellipses alone; Mirror Entities
-  copies them. There is no ellipse drawing tool yet.
-- **File format**: a part whose sketches hold an ellipse is written as `format_version` 3
-  (FORMAT.md §2, §3 Sketches); older Oxyde refuses it with a message. Parts without one are
-  written as before.
 
 ### SolidCraft's kernel, a first trial (0.0.11, November 2026)
 

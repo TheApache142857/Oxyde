@@ -21,19 +21,20 @@ after the other without a conflict.
 
 ## Reading them, newest first
 
-The order is the order in which the fragments came into `main`:
+The order is the order in which the fragments came into `main`; fragments that one commit added come in
+name order:
 
 ```sh
 git log --diff-filter=A --name-only --format= -- 'changelog.d/*.md' ':!changelog.d/README.md'
 ```
 
-The sections under *Unreleased* in `CHANGELOG.md` are older than every fragment.
+Every fragment is newer than the sections in `CHANGELOG.md`.
 
 ## At a release
 
 The release commit folds the fragments into `CHANGELOG.md`:
 
-1. Replace the *Unreleased* heading with the version's heading.
-2. Under it, put the section of each fragment, newest first (the order above), with `unreleased` in its
-   title replaced by the version, above the sections that were under *Unreleased*.
-3. Delete the fragments and keep this README.
+1. Put the section of each fragment at the top of *Unreleased*, above the sections already there, newest
+   first (the order above), with `unreleased` in its title replaced by the version, as in
+   `### Ellipses in sketches (0.0.12, November 2026)`.
+2. Delete the fragments and keep this README.
