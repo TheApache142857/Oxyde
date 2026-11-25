@@ -85,3 +85,19 @@ jobs:
         run: >-
           cargo test --workspace --exclude oxyde-sim-gpu --exclude oxyde-generative --exclude oxyde-sim
           -- --skip gpu:: --skip gpu_trace::
+
+  diag:
+    name: diag
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Diagnostics
+        env:
+          OXYDE_GENERATIVE_TRACE: 1
+        run: >-
+          cargo test -p oxyde-generative --lib diag_ -- --ignored --nocapture --test-threads=1 2>&1
+          | grep -E '^(TRACE|STEP|LIBM|OUTCOME|test )'

@@ -1926,3 +1926,71 @@ fn a_symmetric_study_grows_a_symmetric_design() {
         }
     }
 }
+
+/// Diagnostic: hashes of the bits of each platform function the solver calls, by blocks.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_libm() {
+    fn hash(values: impl Iterator<Item = f64>) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in values {
+            for b in v.to_bits().to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+    const N: usize = 100_000;
+    let unit = |i: usize| (i as f64 + 0.5) / N as f64;
+    let functions: [(&str, &dyn Fn(f64) -> f64); 9] = [
+        ("powf3", &|t| t.powf(PENALTY)),
+        ("powf2", &|t| t.powf(PENALTY - 1.0)),
+        ("powf_half", &|t| t.powf(STRESS_RELAXATION)),
+        ("powf_stress", &|t| t.powf(STRESS_RELAXATION * 8.0 - 1.0)),
+        ("tanh", &|t| (32.0 * (t - ETA)).tanh()),
+        ("atanh", &|t| (2.0 * t - 1.0).atanh()),
+        ("exp", &|t| (60.0 * t - 30.0).exp()),
+        ("ln", &|t| (t * 1e6).ln()),
+        ("cbrt", &|t| (t * 1e3).cbrt()),
+    ];
+    for (name, f) in functions {
+        let blocks: Vec<String> = (0..10)
+            .map(|b| {
+                format!(
+                    "{:04x}",
+                    hash((b * N / 10..(b + 1) * N / 10).map(|i| f(unit(i)))) & 0xffff
+                )
+            })
+            .collect();
+        eprintln!(
+            "LIBM {name} all={:016x} blocks={}",
+            hash((0..N).map(|i| f(unit(i)))),
+            blocks.join(",")
+        );
+    }
+}
+
+/// Diagnostic: the bracket for least compliance on one thread, every step's numbers.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_bracket() {
+    let study = bracket(2.0);
+    let (grid, outcome) = run(&study, Method::Unrestricted, 1);
+    let forces: Vec<f64> = grid.cases[0].forces.iter().flat_map(|(_, f)| *f).collect();
+    trace("grid.forces", 0, &forces);
+    for (i, step) in outcome.history.iter().enumerate() {
+        eprintln!(
+            "STEP {i} compliance={:016x} mass={:016x} change={:016x} ({:e} {:e})",
+            step.compliance.to_bits(),
+            step.mass.to_bits(),
+            step.change.to_bits(),
+            step.compliance,
+            step.mass
+        );
+    }
+    eprintln!(
+        "OUTCOME mass={:e} target={:e} converged={}",
+        outcome.mass, study.mass_target, outcome.converged
+    );
+}

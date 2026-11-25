@@ -983,6 +983,7 @@ pub fn generate_on(
         _ => None,
     };
     let filter = Filter::new(grid, &state, radius, flat, threads);
+    trace("filter.norms", 0, &filter.norms);
     let chains = method
         .pull()
         .map(|(direction, parting)| casting_chains(grid, direction, parting));
@@ -1129,6 +1130,8 @@ pub fn generate_on(
             })
             .collect();
         let filtered = filter.forward(&design, threads);
+        trace("design", iteration, &design);
+        trace("filtered", iteration, &filtered);
         // Capped along a casting direction, reached from the milling sides, or printed
         // layer by layer.
         let printed = printing.as_ref().map(|p| p.forward(&filtered, &state));
@@ -1146,6 +1149,7 @@ pub fn generate_on(
             })
             .collect();
         let gray = grayness(&rho, &state);
+        trace("rho", iteration, &rho);
         let stiffness: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
                 State::Free => {
@@ -1155,6 +1159,7 @@ pub fn generate_on(
                 State::Void => 0.0,
             })
             .collect();
+        trace("stiffness", iteration, &stiffness);
         let tolerance = options.tolerance.max(if beta < BETA_MAX {
             EARLY_TOLERANCE
         } else {
@@ -1228,6 +1233,9 @@ pub fn generate_on(
                 Err(e) => return Err(e),
             };
             solver_iterations += solved.iterations;
+            trace("loads", iteration, loads);
+            trace("displacement", iteration, displacement);
+            trace("solve.iterations", iteration, &[solved.iterations as f64]);
             let case = element_energies(dims, &brick, displacement, &stiffness, threads);
             for (e, c) in energies.iter_mut().zip(&case) {
                 *e += c;
@@ -1240,6 +1248,8 @@ pub fn generate_on(
                 .sum::<f64>();
         }
         let mass_now: f64 = rho.iter().sum::<f64>() * voxel_mass;
+        trace("energies", iteration, &energies);
+        trace("compliance.mass", iteration, &[compliance, mass_now]);
 
         // The lowest modes, held by the first case's fixtures, when the frequency is limited.
         // Tonnes, as millimetres and newtons take them: kg × 10⁻³.
@@ -1499,6 +1509,7 @@ pub fn generate_on(
             .zip(&next)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
+        trace("next", iteration, &next);
         history.push(GenerativeStep {
             compliance,
             mass: mass_now,
@@ -2659,6 +2670,25 @@ impl<'a> Filter<'a> {
             .collect();
         self.sum(&scaled, threads)
     }
+}
+
+/// Diagnostic: with `OXYDE_GENERATIVE_TRACE` set, prints a hash of the values' bits.
+fn trace(label: &str, iteration: usize, values: &[f64]) {
+    if std::env::var_os("OXYDE_GENERATIVE_TRACE").is_none() {
+        return;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in values {
+        for b in v.to_bits().to_le_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let sum: f64 = values.iter().sum();
+    eprintln!(
+        "TRACE {iteration} {label} n={} hash={hash:016x} sum={sum:e}",
+        values.len()
+    );
 }
 
 #[cfg(test)]
