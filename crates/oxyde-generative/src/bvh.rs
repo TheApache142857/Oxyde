@@ -4,9 +4,6 @@
 //! Built top-down by splitting at the median centre along the longest axis, so the build
 //! is deterministic and needs no tuning.
 
-// Indices into the hierarchy's own arrays, made by its own build.
-#![allow(clippy::indexing_slicing)]
-
 use crate::math::{V3, cross, dot, sub};
 
 const LEAF: usize = 4;
@@ -67,6 +64,16 @@ impl Bvh {
         self.triangles.get(i as usize)
     }
 
+    /// A leaf's triangles, each with its index.
+    fn leaf<'a>(&'a self, node: &Node) -> impl Iterator<Item = (u32, &'a [V3; 3])> + 'a {
+        let first = node.start as usize;
+        self.order
+            .get(first..first + node.count as usize)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|&tri| Some((tri, self.triangles.get(tri as usize)?)))
+    }
+
     /// Every crossing of the segment from `p` to `q` with a triangle, in no order. Hits
     /// on a triangle's edge are kept (with a little slack), so a segment through an edge
     /// shared by two triangles hits both; callers merge such pairs.
@@ -79,8 +86,10 @@ impl Bvh {
         let inv = d.map(|c| if c == 0.0 { f64::INFINITY } else { 1.0 / c });
         let mut stack = vec![0usize];
         while let Some(i) = stack.pop() {
-            let node = self.nodes[i];
-            if !segment_meets_box(p, inv, &node) {
+            let Some(node) = self.nodes.get(i) else {
+                continue;
+            };
+            if !segment_meets_box(p, inv, node) {
                 continue;
             }
             if node.count == 0 {
@@ -88,11 +97,10 @@ impl Bvh {
                 stack.push(node.start as usize);
                 continue;
             }
-            for &tri in &self.order[node.start as usize..(node.start + node.count) as usize] {
-                if let Some(hit) = intersect(p, d, &self.triangles[tri as usize], tri) {
-                    out.push(hit);
-                }
-            }
+            out.extend(
+                self.leaf(node)
+                    .filter_map(|(tri, triangle)| intersect(p, d, triangle, tri)),
+            );
         }
     }
 
@@ -102,18 +110,20 @@ impl Bvh {
             return None;
         }
         let mut best: Option<(u32, f64)> = None;
-        let mut stack = vec![(0usize, box_distance2(p, &self.nodes[0]))];
+        let mut stack = vec![(0usize, box_distance2(p, self.nodes.first()?))];
         while let Some((i, d2)) = stack.pop() {
             if best.is_some_and(|(_, b)| d2 >= b) {
                 continue;
             }
-            let node = self.nodes[i];
+            let Some(node) = self.nodes.get(i) else {
+                continue;
+            };
             if node.count == 0 {
                 let (l, r) = (i + 1, node.start as usize);
-                let (dl, dr) = (
-                    box_distance2(p, &self.nodes[l]),
-                    box_distance2(p, &self.nodes[r]),
-                );
+                let (Some(left), Some(right)) = (self.nodes.get(l), self.nodes.get(r)) else {
+                    continue;
+                };
+                let (dl, dr) = (box_distance2(p, left), box_distance2(p, right));
                 // The nearer box last, so it is looked at first.
                 if dl < dr {
                     stack.push((r, dr));
@@ -124,8 +134,8 @@ impl Bvh {
                 }
                 continue;
             }
-            for &tri in &self.order[node.start as usize..(node.start + node.count) as usize] {
-                let d = point_triangle_distance2(p, &self.triangles[tri as usize]);
+            for (tri, triangle) in self.leaf(node) {
+                let d = point_triangle_distance2(p, triangle);
                 if best.is_none_or(|(_, b)| d < b) {
                     best = Some((tri, d));
                 }
@@ -135,15 +145,20 @@ impl Bvh {
     }
 }
 
+/// Widens the box `lo`..`hi` to hold `p`.
+fn widen(lo: &mut V3, hi: &mut V3, p: &V3) {
+    for ((l, h), x) in lo.iter_mut().zip(hi.iter_mut()).zip(p) {
+        *l = l.min(*x);
+        *h = h.max(*x);
+    }
+}
+
 fn build(nodes: &mut Vec<Node>, order: &mut [u32], start: usize, tris: &[[V3; 3]], c: &[V3]) {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
-    for &t in order.iter() {
-        for p in &tris[t as usize] {
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
+    for t in order.iter().filter_map(|&t| tris.get(t as usize)) {
+        for p in t {
+            widen(&mut lo, &mut hi, p);
         }
     }
     let here = nodes.len();
@@ -158,41 +173,46 @@ fn build(nodes: &mut Vec<Node>, order: &mut [u32], start: usize, tris: &[[V3; 3]
     }
     let mut clo = [f64::INFINITY; 3];
     let mut chi = [f64::NEG_INFINITY; 3];
-    for &t in order.iter() {
-        for k in 0..3 {
-            clo[k] = clo[k].min(c[t as usize][k]);
-            chi[k] = chi[k].max(c[t as usize][k]);
-        }
+    for centre in order.iter().filter_map(|&t| c.get(t as usize)) {
+        widen(&mut clo, &mut chi, centre);
     }
-    let axis = (0..3)
-        .max_by(|&a, &b| (chi[a] - clo[a]).total_cmp(&(chi[b] - clo[b])))
-        .unwrap_or(0);
+    let axis = clo
+        .iter()
+        .zip(&chi)
+        .map(|(l, h)| h - l)
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map_or(0, |(k, _)| k);
+    let key = |t: u32| {
+        c.get(t as usize)
+            .and_then(|p| p.get(axis))
+            .copied()
+            .unwrap_or(0.0)
+    };
     let mid = order.len() / 2;
-    order.select_nth_unstable_by(mid, |&a, &b| {
-        c[a as usize][axis]
-            .total_cmp(&c[b as usize][axis])
-            .then(a.cmp(&b))
-    });
+    order.select_nth_unstable_by(mid, |&a, &b| key(a).total_cmp(&key(b)).then(a.cmp(&b)));
     let (left, right) = order.split_at_mut(mid);
     build(nodes, left, start, tris, c);
     let right_index = nodes.len();
     build(nodes, right, start + mid, tris, c);
-    nodes[here].start = right_index as u32;
-    nodes[here].count = 0;
+    if let Some(node) = nodes.get_mut(here) {
+        node.start = right_index as u32;
+        node.count = 0;
+    }
 }
 
 fn segment_meets_box(p: V3, inv: V3, node: &Node) -> bool {
     let (mut t0, mut t1) = (0.0f64, 1.0f64);
-    for k in 0..3 {
-        let slack = 1e-9 * (node.hi[k] - node.lo[k]).abs().max(1e-9);
-        let (lo, hi) = (node.lo[k] - slack, node.hi[k] + slack);
-        if inv[k].is_infinite() {
-            if p[k] < lo || p[k] > hi {
+    for (((&lo, &hi), &pk), &ik) in node.lo.iter().zip(&node.hi).zip(&p).zip(&inv) {
+        let slack = 1e-9 * (hi - lo).abs().max(1e-9);
+        let (lo, hi) = (lo - slack, hi + slack);
+        if ik.is_infinite() {
+            if pk < lo || pk > hi {
                 return false;
             }
             continue;
         }
-        let (a, b) = ((lo - p[k]) * inv[k], (hi - p[k]) * inv[k]);
+        let (a, b) = ((lo - pk) * ik, (hi - pk) * ik);
         let (a, b) = if a < b { (a, b) } else { (b, a) };
         t0 = t0.max(a);
         t1 = t1.min(b);
@@ -238,9 +258,12 @@ fn intersect(p: V3, d: V3, tri: &[V3; 3], index: u32) -> Option<Hit> {
 }
 
 fn box_distance2(p: V3, node: &Node) -> f64 {
-    (0..3)
-        .map(|k| {
-            let d = (node.lo[k] - p[k]).max(p[k] - node.hi[k]).max(0.0);
+    node.lo
+        .iter()
+        .zip(&node.hi)
+        .zip(&p)
+        .map(|((lo, hi), x)| {
+            let d = (lo - x).max(x - hi).max(0.0);
             d * d
         })
         .sum()

@@ -75,11 +75,10 @@
         clippy::unwrap_used,
         clippy::expect_used,
         clippy::panic,
-        clippy::unreachable
+        clippy::unreachable,
+        clippy::indexing_slicing
     )
 )]
-// Indices into the grid's arrays and the design's groups, all sized here from the grid.
-#![allow(clippy::indexing_slicing)]
 
 pub mod bvh;
 pub mod eigen;
@@ -223,6 +222,22 @@ pub struct DesignSpace {
 }
 
 impl DesignSpace {
+    /// Every body of the design space a usable triangle mesh, or the first fault.
+    pub fn check(&self) -> Result<(), GenerativeError> {
+        let bodies = self
+            .preserve
+            .iter()
+            .chain(&self.region_bodies)
+            .chain(self.obstacles.iter().map(|o| &o.surface))
+            .chain(&self.starting_shape);
+        for body in bodies {
+            if let Some(fault) = body.fault() {
+                return Err(GenerativeError::BadMesh { fault });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether anything is kept: a preserve body or a region with a surface.
     pub fn keeps_anything(&self) -> bool {
         self.preserve.iter().any(|s| !s.triangles.is_empty())
@@ -359,7 +374,7 @@ impl Direction {
         format!(
             "{}{}",
             if self.positive { "+" } else { "−" },
-            ["X", "Y", "Z"][self.axis.min(2)]
+            axis_name(self.axis)
         )
     }
 }
@@ -455,9 +470,18 @@ impl Method {
     }
 }
 
+/// X, Y or Z: the name of axis `a`, Z past the third.
+fn axis_name(a: usize) -> &'static str {
+    match a {
+        0 => "X",
+        1 => "Y",
+        _ => "Z",
+    }
+}
+
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let axis = |a: usize| ["X", "Y", "Z"][a.min(2)];
+        let axis = axis_name;
         match self {
             Method::Unrestricted => write!(f, "unrestricted"),
             Method::Cutting { axis: a } => write!(f, "2-axis cutting along {}", axis(*a)),
@@ -618,6 +642,12 @@ pub enum GenerativeError {
     /// The solver failed: why.
     Solver(String),
     Cancelled,
+    /// A body of the design space is no usable triangle mesh.
+    BadMesh {
+        fault: crate::surfaces::MeshFault,
+    },
+    /// The grid's voxels do not fill its counts, or its size or corner is not finite.
+    BadGrid,
 }
 
 impl std::fmt::Display for GenerativeError {
@@ -707,6 +737,26 @@ impl std::fmt::Display for GenerativeError {
             ),
             GenerativeError::Solver(why) => write!(f, "the solver failed: {why}"),
             GenerativeError::Cancelled => write!(f, "cancelled"),
+            GenerativeError::BadMesh { fault } => match fault {
+                crate::surfaces::MeshFault::PointOutOfRange { triangle } => write!(
+                    f,
+                    "a body of the design space is broken: its triangle {triangle} names a point it does not have"
+                ),
+                crate::surfaces::MeshFault::LabelCount { labels, triangles } => write!(
+                    f,
+                    "a body of the design space is broken: {labels} face labels for {triangles} triangles"
+                ),
+                crate::surfaces::MeshFault::NotFinite { point } => write!(
+                    f,
+                    "a body of the design space is broken: its point {point} is not a number"
+                ),
+            },
+            GenerativeError::BadGrid => {
+                write!(
+                    f,
+                    "the voxel grid does not match the outcome: rebuild the study"
+                )
+            }
         }
     }
 }
@@ -883,6 +933,7 @@ pub fn generate(
 /// [`generate`], each iteration's system solved by `backend` (a GPU's) instead of the CPU's
 /// multigrid when there is one.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 pub fn generate_on(
     grid: &Grid,
     study: &GenerativeStudy,
@@ -893,6 +944,8 @@ pub fn generate_on(
     cancel: &AtomicBool,
     progress: &dyn Fn(f64),
 ) -> Result<Outcome, GenerativeError> {
+    grid.check()?;
+    study.space.check()?;
     let modulus = material.youngs_modulus;
     if !(modulus.is_finite()
         && modulus > 0.0
@@ -1600,6 +1653,7 @@ struct ElementContext<'a> {
 impl ElementContext<'_> {
     /// Whether voxel `v`'s stress counts: material at all, and no fixture or load through
     /// it.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn counts(&self, v: usize) -> bool {
         self.state[v] != State::Void
             && self.rho[v] > 0.0
@@ -1607,6 +1661,7 @@ impl ElementContext<'_> {
     }
 
     /// The displacements of voxel `v`'s corners in `u`.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn corners(&self, v: usize, u: &[f64]) -> [f64; DOFS] {
         let base = self.dims.node(self.dims.cell_coords(v));
         let mut out = [0.0; DOFS];
@@ -1618,6 +1673,7 @@ impl ElementContext<'_> {
     }
 
     /// The solid material's stress at the centre of voxel `v`, MPa.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn stress(&self, v: usize, u: &[f64]) -> [f64; 6] {
         let ue = self.corners(v, u);
         let b = &self.brick.b;
@@ -1633,6 +1689,7 @@ impl ElementContext<'_> {
     }
 
     /// The relaxed stresses `ρ^q σ_vm` gathered by their p-norm over every case.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn stress_norm(&self, displacements: &[Vec<f64>]) -> Gathered {
         let voxels = self.rho.len();
         let mut sum = 0.0;
@@ -1662,6 +1719,7 @@ impl ElementContext<'_> {
     }
 
     /// The p-norm's explicit slopes for each voxel's density.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn stress_slopes(&self, g: &Gathered) -> Vec<f64> {
         let p = f64::from(NORM_POWER);
         let voxels = self.rho.len();
@@ -1681,6 +1739,7 @@ impl ElementContext<'_> {
     }
 
     /// The p-norm's slopes for case `case`'s displacements: the adjoint's right-hand side.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn stress_rhs(&self, g: &Gathered, case: usize, u: &[f64]) -> Vec<f64> {
         let p = f64::from(NORM_POWER);
         let mut rhs = vec![0.0; u.len()];
@@ -1730,6 +1789,7 @@ impl ElementContext<'_> {
     }
 
     /// Each node's weight: the mean density of the eight voxels around it.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn node_weights(&self) -> Vec<f64> {
         let mut w = vec![0.0; self.dims.node_count()];
         let offsets = self.dims.corner_offsets();
@@ -1747,6 +1807,7 @@ impl ElementContext<'_> {
 
     /// The displacements, weighted by the material around each node, gathered by their
     /// p-norm over every case.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn displacement_norm(&self, displacements: &[Vec<f64>]) -> Gathered {
         let p = f64::from(NORM_POWER);
         let weights = self.node_weights();
@@ -1774,6 +1835,7 @@ impl ElementContext<'_> {
     }
 
     /// Its explicit slopes for each voxel's density, through the weights of its corners.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn displacement_slopes(&self, g: &Gathered, displacements: &[Vec<f64>]) -> Vec<f64> {
         let p = f64::from(NORM_POWER);
         let mut out = vec![0.0; self.rho.len()];
@@ -1801,6 +1863,7 @@ impl ElementContext<'_> {
     }
 
     /// The displacement p-norm's slopes for one case's displacements.
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn displacement_rhs(&self, g: &Gathered, u: &[f64]) -> Vec<f64> {
         let p = f64::from(NORM_POWER);
         let mut rhs = vec![0.0; u.len()];
@@ -1826,6 +1889,7 @@ impl ElementContext<'_> {
 }
 
 /// `aₑᵀ K bₑ` of each voxel with an element, for a unit modulus and edge (the brick's own).
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn element_products(
     dims: Dims,
     brick: &Brick,
@@ -1887,6 +1951,7 @@ fn weight_share(r: f64) -> (f64, f64) {
 /// Adds to `forces` (N, three per node) the weight of voxels of `masses` (kg) under
 /// `acceleration` (m/s²): an eighth of each at each of its corners, voxel by voxel in
 /// order.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn add_weight(dims: Dims, masses: &[f64], acceleration: V3, forces: &mut [f64]) {
     let offsets = dims.corner_offsets();
     for (v, m) in masses.iter().enumerate() {
@@ -1905,6 +1970,7 @@ fn add_weight(dims: Dims, masses: &[f64], acceleration: V3, forces: &mut [f64]) 
 
 /// Per voxel: `field` at its corners against `acceleration`, averaged, `Σ aᵀ f / 8`, what a
 /// kilogram more of it does to `fieldᵀ f` through its weight.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn corner_work(dims: Dims, field: &[f64], acceleration: V3) -> Vec<f64> {
     let offsets = dims.corner_offsets();
     (0..dims.cell_count())
@@ -2005,6 +2071,7 @@ fn optimality_update(x: &[f64], dc: &[f64], dm: &[f64], budget: f64, limit: f64)
 }
 
 /// `uₑᵀ K uₑ` of each voxel with an element, for a unit modulus and edge (the brick's own).
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn element_energies(
     dims: Dims,
     brick: &Brick,
@@ -2041,6 +2108,7 @@ fn element_energies(
 
 /// The symmetry planes the grid was laid out for: those of the study whose plane is the
 /// grid's middle along its axis.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn grid_symmetry(grid: &Grid, study: &GenerativeStudy) -> [bool; 3] {
     let Some(s) = study.symmetry else {
         return [false; 3];
@@ -2054,6 +2122,7 @@ fn grid_symmetry(grid: &Grid, study: &GenerativeStudy) -> [bool; 3] {
 }
 
 /// Voxel `v`'s mirror images across the planes (itself included).
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn mirror_images(grid: &Grid, v: usize, planes: [bool; 3]) -> Vec<usize> {
     let c = grid.coords(v);
     let mut out = vec![c];
@@ -2077,6 +2146,7 @@ fn mirror_images(grid: &Grid, v: usize, planes: [bool; 3]) -> Vec<usize> {
 }
 
 /// The voxels of each line of the grid along `axis`, in order.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn lines(grid: &Grid, axis: usize) -> impl Iterator<Item = Vec<usize>> + '_ {
     let n = grid.counts;
     let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
@@ -2096,6 +2166,7 @@ fn lines(grid: &Grid, axis: usize) -> impl Iterator<Item = Vec<usize>> + '_ {
 }
 
 /// The chains a casting direction caps along: each from the back to the front.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn casting_chains(grid: &Grid, direction: Direction, parting: Option<V3>) -> Vec<Vec<usize>> {
     let axis = direction.axis.min(2);
     let mut out = Vec::new();
@@ -2128,6 +2199,7 @@ fn casting_chains(grid: &Grid, direction: Direction, parting: Option<V3>) -> Vec
 
 /// What each voxel is to the optimization, once symmetry and the method have made the
 /// design space one they can give.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn states(
     grid: &Grid,
     method: Method,
@@ -2236,6 +2308,7 @@ fn states(
 /// The states a one-way pull along `direction` (both ways from `parting`) leaves: in front
 /// of a void, void; behind a solid, solid. A solid in front of a void is an undercut: that
 /// voxel is the error.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn one_way(
     grid: &Grid,
     direction: Direction,
@@ -2269,6 +2342,7 @@ fn one_way(
 /// obstacle, outside the starting shape) is reached from the side with the fewest design
 /// voxels in front of it, those made void. A void voxel behind a preserve voxel from every
 /// side is an undercut: that voxel is the error.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn reachable(grid: &Grid, sides: Sides, state: &mut [State]) -> Result<(), usize> {
     let n = state.len();
     let directions = sides.directions();
@@ -2338,27 +2412,30 @@ fn groups(grid: &Grid, method: Method, state: &[State], symmetric: [bool; 3]) ->
     let n = state.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(parent: &mut [u32], mut v: u32) -> u32 {
-        while parent[v as usize] != v {
-            let up = parent[parent[v as usize] as usize];
-            parent[v as usize] = up;
-            v = up;
+        while let Some(&up) = parent.get(v as usize)
+            && up != v
+        {
+            let grand = parent.get(up as usize).copied().unwrap_or(up);
+            if let Some(p) = parent.get_mut(v as usize) {
+                *p = grand;
+            }
+            v = grand;
         }
         v
     }
     fn union(parent: &mut [u32], a: usize, b: usize) {
         let (ra, rb) = (find(parent, a as u32), find(parent, b as u32));
-        if ra != rb {
-            let (lo, hi) = (ra.min(rb), ra.max(rb));
-            parent[hi as usize] = lo;
+        if ra != rb
+            && let Some(p) = parent.get_mut(ra.max(rb) as usize)
+        {
+            *p = ra.min(rb);
         }
     }
+    let free = |v: usize| state.get(v) == Some(&State::Free);
     if symmetric.contains(&true) {
-        for v in 0..n {
-            if state[v] != State::Free {
-                continue;
-            }
+        for v in (0..n).filter(|&v| free(v)) {
             for w in mirror_images(grid, v, symmetric) {
-                if w > v && state[w] == State::Free {
+                if w > v && free(w) {
                     union(&mut parent, v, w);
                 }
             }
@@ -2366,34 +2443,33 @@ fn groups(grid: &Grid, method: Method, state: &[State], symmetric: [bool; 3]) ->
     }
     if let Method::Cutting { axis } = method {
         for line in lines(grid, axis.min(2)) {
-            let free: Vec<usize> = line
-                .into_iter()
-                .filter(|&v| state[v] == State::Free)
-                .collect();
-            for pair in free.windows(2) {
-                union(&mut parent, pair[0], pair[1]);
+            let line: Vec<usize> = line.into_iter().filter(|&v| free(v)).collect();
+            for pair in line.windows(2) {
+                if let [a, b] = *pair {
+                    union(&mut parent, a, b);
+                }
             }
         }
     }
     let mut id = vec![NONE; n];
     let mut count = 0usize;
     let mut out = vec![NONE; n];
-    for v in 0..n {
-        if state[v] != State::Free {
-            continue;
-        }
+    for (v, o) in out.iter_mut().enumerate().filter(|(v, _)| free(*v)) {
         let root = find(&mut parent, v as u32) as usize;
-        if id[root] == NONE {
-            id[root] = count as u32;
-            count += 1;
+        if let Some(group) = id.get_mut(root) {
+            if *group == NONE {
+                *group = count as u32;
+                count += 1;
+            }
+            *o = *group;
         }
-        out[v] = id[root];
     }
     (out, count)
 }
 
 /// Densities capped along each chain at the one behind them, each with the voxel whose
 /// filtered density it took.
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn cap(chains: &[Vec<usize>], state: &[State], filtered: &[f64]) -> (Vec<f64>, Vec<u32>) {
     let mut out = filtered.to_vec();
     let mut source: Vec<u32> = (0..filtered.len() as u32).collect();
@@ -2429,6 +2505,7 @@ fn cap(chains: &[Vec<usize>], state: &[State], filtered: &[f64]) -> (Vec<f64>, V
 /// take away what it cannot reach from there; then the least over the sides, as what it
 /// reaches from one side is gone. Each with the voxel whose filtered density it took (the
 /// first side's of equals, the voxel's own over an equal one in front).
+#[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
 fn reach(sides: &[Vec<Vec<usize>>], state: &[State], filtered: &[f64]) -> (Vec<f64>, Vec<u32>) {
     let n = filtered.len();
     let own = |v: usize| match state[v] {
@@ -2500,7 +2577,7 @@ impl<'a> Filter<'a> {
             for dy in -reach..=reach {
                 for dx in -reach..=reach {
                     let d = grid.size * ((dx * dx + dy * dy + dz * dz) as f64).sqrt();
-                    if d < radius && flat.is_none_or(|a| [dx, dy, dz][a] == 0) {
+                    if d < radius && flat.is_none_or(|a| [dx, dy, dz].get(a) == Some(&0)) {
                         offsets.push(([dx, dy, dz], radius - d));
                     }
                 }
@@ -2519,6 +2596,7 @@ impl<'a> Filter<'a> {
 
     /// `Σ w x` over the stencil around each free voxel, the void ones left out (0 for the
     /// voxels that are not free).
+    #[allow(clippy::indexing_slicing)] // Grid-sized: README, Indexing.
     fn sum(&self, x: &[f64], threads: usize) -> Vec<f64> {
         let grid = self.grid;
         let n = grid.counts.map(|c| c as i64);

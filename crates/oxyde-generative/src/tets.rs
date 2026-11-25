@@ -15,9 +15,13 @@ pub fn kuhn_tets<T: Copy>(corner: impl Fn([usize; 3]) -> T) -> [[T; 4]; 6] {
     ORDERS.map(|order| {
         let mut d = [0usize; 3];
         let v0 = corner(d);
-        d[order[0]] = 1;
+        if let Some(x) = d.get_mut(order[0]) {
+            *x = 1;
+        }
         let v1 = corner(d);
-        d[order[1]] = 1;
+        if let Some(x) = d.get_mut(order[1]) {
+            *x = 1;
+        }
         let v2 = corner(d);
         let v3 = corner([1, 1, 1]);
         [v0, v1, v2, v3]

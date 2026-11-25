@@ -72,7 +72,9 @@ pub(super) fn nodal_masses(dims: Dims, masses: &[f64]) -> Vec<f64> {
         }
         let base = dims.node(dims.cell_coords(v));
         for off in &offsets {
-            out[base + off] += m / 8.0;
+            if let Some(x) = out.get_mut(base + off) {
+                *x += m / 8.0;
+            }
         }
     }
     out
@@ -172,16 +174,15 @@ pub(super) fn eigenvalue_slopes(
     let energies = element_energies(dims, brick, phi, stiffness, threads);
     let offsets = dims.corner_offsets();
     (0..dims.cell_count())
-        .map(|v| {
+        .zip(&energies)
+        .map(|(v, energy)| {
             let base = dims.node(dims.cell_coords(v));
             let squares: f64 = offsets
                 .iter()
-                .map(|off| {
-                    let n = base + off;
-                    phi[3 * n..3 * n + 3].iter().map(|x| x * x).sum::<f64>()
-                })
+                .filter_map(|off| phi.get(3 * (base + off)..3 * (base + off) + 3))
+                .map(|corner| corner.iter().map(|x| x * x).sum::<f64>())
                 .sum();
-            stiffness_slope(v) * energies[v] - lambda * mass_slope(v) * squares / 8.0
+            stiffness_slope(v) * energy - lambda * mass_slope(v) * squares / 8.0
         })
         .collect()
 }
