@@ -1087,6 +1087,14 @@ pub fn generate_on(
         }
         Some(_) => 1.0,
     };
+    // Diagnostic: moves the start by a number of units in the last place.
+    let start = match std::env::var("OXYDE_GENERATIVE_NUDGE")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        Some(k) => f64::from_bits(start.to_bits().wrapping_add_signed(k)),
+        None => start,
+    };
     let mut x = vec![start; groups];
     let mut mma = mma::Mma::default();
     // The adjoint solutions, kept to start the next ones from: per constraint, per case.
