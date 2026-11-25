@@ -267,7 +267,7 @@ Layout, SolidWorks-style: menu bar (with an Insert menu listing every feature), 
 
 | Milestone | Content |
 |---|---|
-| **M0** (done) | Workspace, docs, the quality gate run before every commit (format, clippy, tests; there is no hosted CI: GitHub Actions are switched off for the repository); the dependency rules of §2 are a test (`crates/oxyde-tests/tests/layering.rs`); `CLAUDE.md` for agents and new contributors |
+| **M0** (done) | Workspace, docs, the quality gate run before every commit (format, clippy, tests), and by GitHub Actions on every pull request (`.github/workflows/ci.yml`); the dependency rules of §2 are a test (`crates/oxyde-tests/tests/layering.rs`); `CLAUDE.md` for agents and new contributors |
 | **M1** (done) | `oxyde-occt` shim builds on Windows; make a box, check volume/topology, export STEP from a test |
 | **Engine** (done) | Kernel history + topology; part timeline with rollback/suppression; persistent naming; sketch/extrude/cut/fillet/chamfer; end-to-end tests in `oxyde-tests` |
 | **M2** (done) | Sketch entities + solver with DOF, fully-defined and redundant/conflicting reporting (pure Rust, no UI) |

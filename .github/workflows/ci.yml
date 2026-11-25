@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  # The required check: what CLAUDE.md asks of every commit, on Linux with Debian's
+  # OpenCASCADE 7.8. The solver crates and the GPU tests run on the PC only.
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Before the checkout, which needs git to fetch the history the diffs below read.
+      - name: System packages
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git g++ python3 \
+            libocct-foundation-dev libocct-modeling-data-dev libocct-modeling-algorithms-dev \
+            libocct-data-exchange-dev libocct-ocaf-dev
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --component clippy,rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - name: Base of the change
+        id: base
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # The container runs as root over a checkout the runner's user owns.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # A pull request is checked out as its merge into the base: the first parent is the base.
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] || [ -z "$BEFORE" ] \
+            || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base=$BEFORE
+          fi
+          echo "rev=$base" >> "$GITHUB_OUTPUT"
+      # Files the change adds or modifies, whole; the files it does not touch are left as they are.
+      - name: Format of the changed files
+        env:
+          BASE: ${{ steps.base.outputs.rev }}
+        run: |
+          status=0
+          while IFS= read -r file; do
+            if ! rustfmt --edition 2024 < "$file" | diff -u --label "$file" --label "$file (rustfmt)" "$file" -; then
+              echo "::error file=$file::not formatted: run rustfmt on this file"
+              status=1
+            fi
+          done < <(git diff --name-only --diff-filter=AMR "$BASE" HEAD -- '*.rs')
+          exit $status
+      - name: Clippy, no warning in a changed line
+        env:
+          BASE: ${{ steps.base.outputs.rev }}
+        run: |
+          cargo clippy --workspace --all-targets --message-format=json > clippy.json || status=$?
+          python3 scripts/ci/clippy-changed-lines.py clippy.json "$BASE"
+          exit "${status:-0}"
+      - name: Tests
+        run: >-
+          cargo test --workspace --exclude oxyde-sim-gpu --exclude oxyde-generative --exclude oxyde-sim
+          -- --skip gpu:: --skip gpu_trace::

@@ -10,11 +10,13 @@ The documentation, and what each file is for:
 - `docs/ARCHITECTURE.md` — the design decisions and rules. Code that deviates from it changes it in the same commit.
 - `docs/FORMAT.md` — the file formats, a contract with other tools.
 - `docs/BUILDING.md` — toolchain, OpenCASCADE, packaging, troubleshooting.
-- `CHANGELOG.md` — what changed for users, newest first; the top entry is the current state.
+- `CHANGELOG.md` — what changed for users in each release, newest first.
+- `changelog.d/` — one file per user-visible change since the last release; its README gives the form.
 
 ## Start every session here
 
-1. Read the top entry of `CHANGELOG.md` (under *Unreleased*): what the app does now and what was just changed.
+1. Read the newest fragments in `changelog.d/` (its README gives the command that lists them newest first),
+   then the top of `CHANGELOG.md`: what the app does now and what was just changed.
 2. Read the sections of `docs/ARCHITECTURE.md` the task touches. §2 (crates and dependency rules) always;
    §3 the shim, §4 the `Kernel` trait, §5 sketches and the solver, §6 feature tree and naming,
    §7 units, §8 assemblies, §9 the app and viewport, §10 roadmap.
@@ -47,8 +49,7 @@ The documentation, and what each file is for:
 
 ## Quality gate, before every commit
 
-This is the only check: there is no hosted CI. GitHub Actions are switched off for the repository because
-they cost paid minutes; add no workflow under `.github/`. Run these one after the other, never at the same time:
+Run these one after the other, never at the same time:
 
 ```
 cargo fmt -p <each crate you touched> --check
@@ -60,6 +61,23 @@ Clippy: add no warning. The workspace carries about 90 from clippy 1.98 (October
 in every crate but `oxyde-kernel` and `oxyde-tests`); fix the ones in code you touch, leave the rest for a sweep
 the owner asks for. The same goes for formatting: if `cargo fmt --check` on a crate lists files you did not
 touch, format your files only (`rustfmt <file>`), not the crate.
+
+GitHub Actions run the same on every pull request and push to `main` (`.github/workflows/ci.yml`), on Linux
+with Debian's OpenCASCADE 7.8. The `gate` job checks the format of the `.rs` files the change adds or
+modifies, fails on a clippy or rustc warning in a changed line (`scripts/ci/clippy-changed-lines.py`), and runs
+the tests without `oxyde-generative`, `oxyde-sim`, `oxyde-sim-gpu` and the `gpu::` tests: hosted runners have
+no GPU. The tests of `oxyde-generative` and `oxyde-sim` run on the PC only.
+
+## Merging
+
+GitHub merges the owner's pull requests by itself (`.github/workflows/auto-merge.yml`): it squash-merges a
+pull request once its `gate` check passes. A draft is never merged this way; it merges after it is marked
+ready.
+
+- **A pull request that changes what the user sees or clicks on screen gets the `hold` label from its
+  author when it is opened** (`gh pr create --label hold`). No agent may launch the application: the owner
+  checks the change on screen and removes `hold`, and the pull request then merges. Adding `hold` later
+  turns auto-merge off if GitHub has not merged yet.
 
 ## Architecture rules, in short (`docs/ARCHITECTURE.md` is the authority)
 
@@ -102,9 +120,9 @@ touch, format your files only (`rustfmt <file>`), not the crate.
   saving writes `<name>.tmp` and renames it over the target.
 - **Tests:** pure-Rust crates keep unit tests in-crate; anything needing OpenCASCADE goes in
   `crates/oxyde-tests/tests/`, built from small sketches on the standard planes (see `bodies.rs`).
-- **Every user-visible change gets a `CHANGELOG.md` entry** under *Unreleased*: what it does for the user, in
-  words, not which code changed. A file-format change updates `docs/FORMAT.md`; a design change updates
-  `docs/ARCHITECTURE.md`.
+- **Every user-visible change gets a fragment in `changelog.d/`** (its README gives the form; `CHANGELOG.md`
+  changes only at a release): what it does for the user, in words, not which code changed. A file-format
+  change updates `docs/FORMAT.md`; a design change updates `docs/ARCHITECTURE.md`.
 - Commit messages: a title naming the user-visible changes, then bullets. Comments explain why, in full
   sentences; public items have doc comments.
 
