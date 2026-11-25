@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use oxyde_kernel::{Kernel, ShapeHandle, Topology};
+use oxyde_kernel::{EdgeCurve, Kernel, ShapeHandle, Topology};
 
 use crate::feature::{BodyId, FeatureId};
 use crate::naming::{BodyNaming, FaceName};
@@ -60,6 +60,17 @@ impl Body {
 
     pub fn solid_of_edge(&self, edge: u32) -> Option<&Solid> {
         self.solids.iter().find(|s| s.edges.contains(&edge))
+    }
+
+    /// The kernel's exact curve of edge `edge` (by index in [`Body::topology`]), when it
+    /// can tell.
+    pub fn edge_curve<K: Kernel>(&self, kernel: &K, edge: usize) -> Option<EdgeCurve> {
+        let edge = u32::try_from(edge).ok()?;
+        let solid = self.solid_of_edge(edge)?;
+        kernel
+            .edge_curve(solid.shape, solid.local_edge(edge)?)
+            .ok()
+            .flatten()
     }
 
     /// The kernel shapes of every body, in order.
