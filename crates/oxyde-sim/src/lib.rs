@@ -26,13 +26,15 @@
 //!   tetrahedral mesh, each load case solved by the static solver.
 //! - [`plot`] turns a result into colour bands on the displaced boundary, for the
 //!   viewport.
+//! - `fieldcraft` (with the `fieldcraft` feature) fills the same surfaces with FieldCraft's
+//!   tetrahedral mesher.
 //!
 //! Units are millimetres, newtons and megapascals (N/mm²), which are consistent:
 //! displacements come out in mm and stresses in MPa. The crate depends on no other crate but
 //! `oxyde-generative`, whose vector maths, materials, eigensolver and study description it
-//! builds on: the application turns the kernel's meshes into
-//! `oxyde_generative::surfaces::SurfaceMesh`es and the persistent face names of fixtures and
-//! loads into labels.
+//! builds on (and FieldCraft's mesher with the `fieldcraft` feature): the application turns
+//! the kernel's meshes into `oxyde_generative::surfaces::SurfaceMesh`es and the persistent
+//! face names of fixtures and loads into labels.
 
 // Never crash: a panic in a modelling or UI path would take the unsaved document with it.
 // Return an error or fall back to a safe default instead (docs/ARCHITECTURE.md, "Never crash").
@@ -59,6 +61,8 @@
 mod amg;
 pub mod check;
 pub mod contact;
+#[cfg(feature = "fieldcraft")]
+pub mod fieldcraft;
 pub mod mesh;
 pub mod mesher;
 pub mod modal;
