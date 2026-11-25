@@ -51,6 +51,8 @@ jobs:
         env:
           BEFORE: ${{ github.event.before }}
         run: |
+          # The container runs as root over a checkout the runner's user owns.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # A pull request is checked out as its merge into the base: the first parent is the base.
           if [ "$GITHUB_EVENT_NAME" = pull_request ] || [ -z "$BEFORE" ] \
             || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
