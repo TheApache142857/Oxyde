@@ -216,6 +216,8 @@ Connected geometry shares point entities. The ids of lines, circles, arcs, ellip
 
 Positions are stored as last solved; readers solve the relations again on rebuild.
 
+`projections` (optional, default empty) links the copies Convert Entities makes to what they copy: each `{"entity": id, "source": {"edge": edge} | {"vertex": vertex}}`, `edge` and `vertex` named as in `fillet` and `point` references (`faces`, `part`), in the part before the sketch. `entity` is the copy: a curve for an edge, a point for a vertex. On each rebuild the edge or vertex is projected onto the sketch plane again and the copy's fixed points move there by their role before the relations are solved: a line's ends (the nearer way round), a circle's centre, radius and fixed rim points, an arc's centre and ends, an ellipse's or elliptic arc's centre, major point, minor semi-axis, ends and fixed rim points, a spline's poles (when the edge still has the same number of poles, weights and knots). A source missing from the part, or projecting to another kind of curve, leaves its copy where it is stored, with a warning on the sketch; the copy follows again once the source is back. Readers without `projections` open the copies as fixed geometry, so the key needs no new `format_version`.
+
 `next_ids` (optional): `entity` and `relation` are the ids the next new entity and relation will get, `dimension` the number of the next default dimension name (`D3`). They keep ids from being reused after a deletion, which would silently re-attach face references and equations to other geometry. Readers raise them if they are not above every id in use. A dimension without a `name` gets the next default name on load.
 
 Sketch coordinates are in the sketch plane's frame. For standard planes: Front = XY, Top = XZ (sketch Y towards −Z), Right = YZ (sketch X towards −Z). On a face, the origin is the model origin projected onto the face and the X axis is the model axis least aligned with the face normal, projected (on a tie within 1e-9, the first of X, Y, Z).
@@ -389,7 +391,7 @@ All fields are optional when reading. `volume_mm3` is computed at save time and 
 - Refuse files whose `format` is not `"oxyde"`, whose `kind` is not supported, or whose `format_version` is higher than supported, with a clear message.
 - Older versions are upgraded through explicit, tested migrations (v1 → v2 → …), never by guessing.
 - Validate the timeline on open: unique feature ids, every feature refers only to features before it, sketch entities and relations refer to existing entities of the right kind, relation ids are unique, and names are valid and unique as described above. An unknown feature or relation `type` is an error in version 1.
-- Additive changes (new optional fields, new entries) do not bump the version; anything else does.
+- Additive changes (new optional fields, new entries) do not bump the version; anything else does. Readers ignore keys they do not know, so an older reader opens a file with a newer optional field and leaves that field out.
 
 ## 6. Assemblies (`.oxyasm`)
 

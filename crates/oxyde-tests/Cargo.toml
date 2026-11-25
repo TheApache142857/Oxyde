@@ -21,3 +21,7 @@ oxyde-generative = { workspace = true }
 oxyde-sim = { workspace = true }
 oxyde-sim-gpu = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+# tests/fieldcraft.rs: FieldCraft's mesher against the lattice mesher and Netgen.
+fieldcraft = ["oxyde-sim/fieldcraft"]

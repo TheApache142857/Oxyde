@@ -20,8 +20,10 @@ use oxyde_sketch::{
     SolveReport, SplineDef,
 };
 
+use oxyde_model::projection::{ModelCurve, Projection, ProjectionSource};
+
 use crate::icons::Icon;
-use crate::model_refs::{ModelCurve, ModelGeometry, ModelPointKind};
+use crate::model_refs::{ModelGeometry, ModelPointKind};
 use crate::viewport::{Viewport, ViewportOutput};
 
 /// The cursor snaps to a point or a crossing within this many points.
@@ -275,8 +277,12 @@ pub struct SketchSession {
     pub original: ConstrainedSketch,
     /// It had no geometry (besides the origin) when editing started.
     pub original_empty: bool,
+    /// `projections` when editing started.
+    original_projections: Vec<Projection>,
     /// The part's edges in the sketch plane, to snap to and convert.
     pub model: ModelGeometry,
+    /// What the copies Convert Entities made are copies of, which they follow.
+    pub projections: Vec<Projection>,
     pub report: Option<SolveReport>,
     pub tool: Tool,
     pub selection: Vec<EntityId>,
@@ -303,6 +309,10 @@ pub struct SketchSession {
     undone: Vec<ConstrainedSketch>,
     /// `undone` while a change is tried, given back if the change is refused.
     redo_kept: Vec<ConstrainedSketch>,
+    /// `projections` as they were with each sketch of `history`, `undone` and `redo_kept`.
+    link_history: Vec<Vec<Projection>>,
+    links_undone: Vec<Vec<Projection>>,
+    links_redo_kept: Vec<Vec<Projection>>,
     /// The radius and distance typed in the Sketch Fillet and Offset Entities windows.
     pub fillet_text: String,
     pub offset_text: String,
@@ -344,7 +354,9 @@ impl SketchSession {
             plane,
             original: sketch.clone(),
             original_empty,
+            original_projections: Vec::new(),
             model: ModelGeometry::default(),
+            projections: Vec::new(),
             sketch,
             report: None,
             tool: if new_sketch { Tool::Line } else { Tool::Select },
@@ -363,6 +375,9 @@ impl SketchSession {
             history: Vec::new(),
             undone: Vec::new(),
             redo_kept: Vec::new(),
+            link_history: Vec::new(),
+            links_undone: Vec::new(),
+            links_redo_kept: Vec::new(),
             fillet_text: "5".to_owned(),
             offset_text: "10".to_owned(),
             polygon_sides: 6,
@@ -376,7 +391,22 @@ impl SketchSession {
     }
 
     pub fn changed(&self) -> bool {
-        self.sketch != self.original
+        self.sketch != self.original || self.projections != self.original_projections
+    }
+
+    /// The links to keep with the sketch: those whose copy is still in it.
+    pub fn kept_projections(&self) -> Vec<Projection> {
+        self.projections
+            .iter()
+            .filter(|p| self.sketch.entity(EntityId(p.entity)).is_some())
+            .cloned()
+            .collect()
+    }
+
+    /// Starts from the links the sketch has.
+    pub fn set_projections(&mut self, projections: Vec<Projection>) {
+        self.original_projections.clone_from(&projections);
+        self.projections = projections;
     }
 
     /// Solves the working sketch. On failure the geometry is left as it was.
@@ -406,10 +436,13 @@ impl SketchSession {
     /// change made forgets it, a change refused (`drop_checkpoint`) gives it back.
     fn checkpoint(&mut self) {
         self.history.push(self.sketch.clone());
+        self.link_history.push(self.projections.clone());
         if self.history.len() > UNDO_LIMIT {
             self.history.remove(0);
+            self.link_history.remove(0);
         }
         self.redo_kept = std::mem::take(&mut self.undone);
+        self.links_redo_kept = std::mem::take(&mut self.links_undone);
         self.message = None;
     }
 
@@ -417,7 +450,11 @@ impl SketchSession {
     /// before (the caller puts the sketch back).
     fn drop_checkpoint(&mut self) {
         self.history.pop();
+        if let Some(links) = self.link_history.pop() {
+            self.projections = links;
+        }
         self.undone = std::mem::take(&mut self.redo_kept);
+        self.links_undone = std::mem::take(&mut self.links_redo_kept);
     }
 
     /// A change refused: the sketch as it was at its checkpoint, which goes.
@@ -425,7 +462,11 @@ impl SketchSession {
         if let Some(previous) = self.history.pop() {
             self.sketch = previous;
         }
+        if let Some(links) = self.link_history.pop() {
+            self.projections = links;
+        }
         self.undone = std::mem::take(&mut self.redo_kept);
+        self.links_undone = std::mem::take(&mut self.links_redo_kept);
         self.selection.clear();
         self.pending.clear();
         self.solve();
@@ -437,6 +478,9 @@ impl SketchSession {
         };
         self.undone
             .push(std::mem::replace(&mut self.sketch, previous));
+        let links = self.link_history.pop().unwrap_or_default();
+        self.links_undone
+            .push(std::mem::replace(&mut self.projections, links));
         self.selection.clear();
         self.pending.clear();
         self.solve();
@@ -449,6 +493,9 @@ impl SketchSession {
             return false;
         };
         self.history.push(std::mem::replace(&mut self.sketch, next));
+        let links = self.links_undone.pop().unwrap_or_default();
+        self.link_history
+            .push(std::mem::replace(&mut self.projections, links));
         self.selection.clear();
         self.pending.clear();
         self.solve();
@@ -1866,7 +1913,9 @@ impl SketchSession {
             return;
         };
         self.checkpoint();
-        self.fixed_point_at(at);
+        let point = self.fixed_point_at(at);
+        let source = self.model.vertex_sources.get(index).cloned().flatten();
+        self.link(point, source);
         if !self.solve() {
             self.refuse_change();
             self.message =
@@ -1894,10 +1943,11 @@ impl SketchSession {
         let Some(curve) = self.model.curves.get(index).cloned() else {
             return;
         };
-        match curve {
+        let source = self.model.curve_sources.get(index).cloned().flatten();
+        let copy = match curve {
             ModelCurve::Line(a, b) => {
                 let (pa, pb) = (self.fixed_point_at(a), self.fixed_point_at(b));
-                self.sketch.line_between(pa, pb);
+                self.sketch.line_between(pa, pb)
             }
             ModelCurve::Circle(center, radius) => {
                 let c = self.fixed_point_at(center);
@@ -1907,6 +1957,7 @@ impl SketchSession {
                 self.sketch.set_construction(rim, true);
                 self.sketch
                     .constrain(Constraint::PointOnCircle(rim, circle));
+                circle
             }
             ModelCurve::Arc { center, start, end } => {
                 let (c, s, e) = (
@@ -1914,13 +1965,14 @@ impl SketchSession {
                     self.fixed_point_at(start),
                     self.fixed_point_at(end),
                 );
-                self.sketch.arc_between(c, s, e);
+                self.sketch.arc_between(c, s, e)
             }
             ModelCurve::Ellipse(ellipse) => {
                 let c = self.fixed_point_at(ellipse.center);
                 let m = self.fixed_point_at(ellipse.major);
                 let id = self.sketch.ellipse_around(c, m, ellipse.minor);
                 self.hold_minor(id, &ellipse);
+                id
             }
             ModelCurve::EllipticArc {
                 ellipse,
@@ -1939,6 +1991,7 @@ impl SketchSession {
                 if on_axis(start) && on_axis(end) {
                     self.hold_minor(id, &ellipse);
                 }
+                id
             }
             ModelCurve::Spline(spline) => {
                 // The poles are fixed where they are; those off the curve (all but the ends
@@ -1961,9 +2014,25 @@ impl SketchSession {
                     weights: spline.weights.clone(),
                     knots: spline.knots.clone(),
                     degree: u32::try_from(spline.degree).unwrap_or(u32::MAX),
-                });
+                })
             }
+        };
+        self.link(copy, source);
+    }
+
+    /// Links a copy Convert Entities made to the part edge or vertex it copies, so that it
+    /// follows it; a point already linked keeps its first link.
+    fn link(&mut self, copy: EntityId, source: Option<ProjectionSource>) {
+        let Some(source) = source else {
+            return;
+        };
+        if self.projections.iter().any(|p| p.entity == copy.0) {
+            return;
         }
+        self.projections.push(Projection {
+            entity: copy.0,
+            source,
+        });
     }
 
     /// A fixed construction point at the end of the minor semi-axis holds it without a
@@ -3655,8 +3724,59 @@ mod tests {
     }
 
     #[test]
+    fn converted_copies_are_linked_to_their_sources_through_undo() {
+        use crate::model_refs::ModelGeometry;
+        use oxyde_model::projection::{ModelCurve, ProjectionSource};
+        use oxyde_model::{EdgeName, VertexName};
+        let edge = ProjectionSource::Edge(EdgeName {
+            faces: Vec::new(),
+            part: 1,
+        });
+        let vertex = ProjectionSource::Vertex(VertexName {
+            faces: Vec::new(),
+            part: 2,
+        });
+        let mut session = session(ConstrainedSketch::new());
+        session.model = ModelGeometry {
+            curves: vec![ModelCurve::Line(
+                Point2::new(0.0, 0.0),
+                Point2::new(30.0, 0.0),
+            )],
+            curve_sources: vec![Some(edge.clone())],
+            vertices: vec![Point2::new(30.0, 0.0)],
+            vertex_sources: vec![Some(vertex)],
+            ..ModelGeometry::default()
+        };
+        session.convert(0);
+        let line = session
+            .sketch
+            .entities()
+            .iter()
+            .find(|e| matches!(e.geometry, Geometry::Line { .. }))
+            .map(|e| e.id)
+            .unwrap();
+        assert_eq!(session.projections.len(), 1);
+        assert_eq!(session.projections[0].entity, line.0);
+        assert_eq!(session.projections[0].source, edge);
+        // The vertex lands on the line's end, which is the line's copy already: the point
+        // gets its own link.
+        session.convert_vertex(0);
+        assert_eq!(session.projections.len(), 2);
+        assert!(session.undo());
+        assert_eq!(session.projections.len(), 1);
+        assert!(session.undo());
+        assert!(session.projections.is_empty());
+        assert!(session.redo());
+        assert_eq!(session.projections.len(), 1);
+        // A deleted copy leaves no link behind.
+        session.sketch.remove(&[line]);
+        assert!(session.kept_projections().is_empty());
+    }
+
+    #[test]
     fn part_edges_can_be_snapped_to_and_converted() {
-        use crate::model_refs::{ModelCurve, ModelGeometry, ModelPointKind};
+        use crate::model_refs::{ModelGeometry, ModelPointKind};
+        use oxyde_model::projection::ModelCurve;
         let mut session = session(ConstrainedSketch::new());
         session.model = ModelGeometry {
             points: vec![(Point2::new(20.0, 10.0), ModelPointKind::Center)],
@@ -3665,6 +3785,7 @@ mod tests {
                 ModelCurve::Line(Point2::new(0.0, 0.0), Point2::new(30.0, 0.0)),
             ],
             vertices: Vec::new(),
+            ..ModelGeometry::default()
         };
         // A circle centred on the hole: its centre is fixed there.
         session.set_tool(Tool::Circle);
@@ -3717,6 +3838,7 @@ mod tests {
             points: Vec::new(),
             curves,
             vertices: Vec::new(),
+            ..ModelGeometry::default()
         };
         outline.convert_chain(1);
         let lines = outline
@@ -3734,8 +3856,9 @@ mod tests {
 
     #[test]
     fn projected_ellipses_convert_fixed_and_extrudable() {
-        use crate::model_refs::{ModelCurve, ModelGeometry};
+        use crate::model_refs::ModelGeometry;
         use oxyde_geom::Ellipse2;
+        use oxyde_model::projection::ModelCurve;
         let ellipse = Ellipse2 {
             center: Point2::new(30.0, 0.0),
             major: Point2::new(28.0, 0.0),
@@ -3759,6 +3882,7 @@ mod tests {
                 ModelCurve::Line(Point2::new(-5.0, 0.0), Point2::new(5.0, 0.0)),
             ],
             vertices: Vec::new(),
+            ..ModelGeometry::default()
         };
         session.convert(0);
         session.convert_chain(1);
@@ -3784,8 +3908,9 @@ mod tests {
 
     #[test]
     fn a_projected_spline_converts_fixed_and_closes_a_profile() {
-        use crate::model_refs::{ModelCurve, ModelGeometry};
+        use crate::model_refs::ModelGeometry;
         use oxyde_geom::Nurbs2;
+        use oxyde_model::projection::ModelCurve;
         let spline = Nurbs2 {
             degree: 3,
             poles: vec![
@@ -3805,6 +3930,7 @@ mod tests {
                 ModelCurve::Line(Point2::new(10.0, 0.0), Point2::new(0.0, 0.0)),
             ],
             vertices: Vec::new(),
+            ..ModelGeometry::default()
         };
         session.convert_chain(0);
         let report = session.report.as_ref().unwrap();
@@ -3830,7 +3956,8 @@ mod tests {
     #[test]
     fn part_vertices_are_converted_to_fixed_points_away_from_edges() {
         use super::ModelPick;
-        use crate::model_refs::{ModelCurve, ModelGeometry};
+        use crate::model_refs::ModelGeometry;
+        use oxyde_model::projection::ModelCurve;
         let mut session = session(ConstrainedSketch::new());
         session.model = ModelGeometry {
             points: Vec::new(),
@@ -3843,6 +3970,7 @@ mod tests {
                 Point2::new(10.0, 0.0),
                 Point2::new(5.0, 5.0),
             ],
+            ..ModelGeometry::default()
         };
         let to_screen = |p: Point2| Pos2::new(p.x as f32 * 10.0, p.y as f32 * 10.0);
         // At the end of the edge the edge is picked, as before vertices could be.

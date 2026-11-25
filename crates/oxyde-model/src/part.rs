@@ -1241,13 +1241,15 @@ fn build_feature<K: Kernel>(
     // error, with the rest of the timeline still built; the document stays whole.
     let outcome = oxyde_kernel::catch_panic(|| -> Result<(), String> {
         match &feature.kind {
-            FeatureKind::Sketch(sketch) => match build_sketch(&ctx, sketch, &mut warnings) {
-                Ok(built) => result.sketch = Some(built),
-                Err(failure) => {
-                    result.sketch = failure.partial;
-                    return Err(failure.message);
+            FeatureKind::Sketch(sketch) => {
+                match build_sketch(&ctx, sketch, kernel, &mut warnings) {
+                    Ok(built) => result.sketch = Some(built),
+                    Err(failure) => {
+                        result.sketch = failure.partial;
+                        return Err(failure.message);
+                    }
                 }
-            },
+            }
             FeatureKind::Extrude(extrude) => {
                 let (body, tool) = build_extrude(&ctx, extrude, kernel, &mut warnings)?;
                 result.produced = Some(body);
@@ -1442,9 +1444,10 @@ impl From<String> for SketchFailure {
     }
 }
 
-fn build_sketch(
+fn build_sketch<K: Kernel>(
     ctx: &Context<'_>,
     sketch: &Sketch,
+    kernel: &K,
     warnings: &mut Vec<String>,
 ) -> Result<SketchResult, SketchFailure> {
     let plane = match &sketch.plane {
@@ -1453,6 +1456,16 @@ fn build_sketch(
         SketchPlane::Reference(id) => ctx.plane(&PlaneRef::Reference(*id), warnings)?,
     };
     let mut solved = sketch.geometry.clone();
+    if !sketch.projections.is_empty() {
+        let curve_of = |edge: usize| ctx.body?.edge_curve(kernel, edge);
+        warnings.extend(crate::projection::follow(
+            &mut solved,
+            &plane,
+            &sketch.projections,
+            ctx.body,
+            &curve_of,
+        ));
+    }
     let report = solved.solve().map_err(|e| e.to_string())?;
     if !report.converged {
         // The geometry is left as stored: an over-defined sketch must still be seen, and

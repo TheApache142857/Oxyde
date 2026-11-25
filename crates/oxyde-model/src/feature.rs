@@ -784,6 +784,8 @@ impl CurveRef {
 pub struct Sketch {
     pub plane: SketchPlane,
     pub geometry: ConstrainedSketch,
+    /// Copies of part edges and vertices (Convert Entities) that follow their sources.
+    pub projections: Vec<crate::projection::Projection>,
 }
 
 impl Sketch {
@@ -791,6 +793,7 @@ impl Sketch {
         Self {
             plane,
             geometry: ConstrainedSketch::new(),
+            projections: Vec::new(),
         }
     }
 

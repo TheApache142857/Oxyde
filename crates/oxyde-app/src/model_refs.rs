@@ -1,23 +1,15 @@
 //! The part's edges as seen from a sketch, in sketch coordinates. Sketch mode snaps to the end
 //! points, middles and centres of the straight, circular and arc edges lying in the sketch
-//! plane. Convert Entities copies those edges into the sketch, and also projects the part's
-//! other edges and its vertices onto the plane along its normal, as SolidWorks does, so that
-//! new geometry can be placed exactly on existing (or imported) geometry. Every projection
-//! is exact: a circle tilted to the plane projects to an ellipse, an ellipse to an ellipse,
-//! and any other curve, which the kernel hands over as a rational B-spline, to the B-spline
-//! on its projected poles.
+//! plane. Convert Entities copies those edges into the sketch, and also the part's other
+//! edges and its vertices projected onto the plane (`oxyde_model::projection`), so that new
+//! geometry can be placed exactly on existing (or imported) geometry.
 
-use std::f64::consts::{PI, TAU};
-use std::sync::Arc;
-
-use oxyde_geom::{Axis, Ellipse2, Nurbs2, Plane, Point2, Point3, Vec3};
-use oxyde_kernel::{CurveKind, EdgeCurve, EdgeInfo, Topology};
-
-/// Edges further than this from the sketch plane are projected onto it, not snapped to (mm).
-const ON_PLANE: f64 = 1e-4;
-
-/// Two projected points closer than this are one (mm).
-const SAME_POINT: f64 = 1e-9;
+use oxyde_geom::{Plane, Point2, Point3};
+use oxyde_kernel::{CurveKind, EdgeCurve, Topology};
+use oxyde_model::BodyNaming;
+use oxyde_model::projection::{
+    ModelCurve, ProjectionSource, SAME_POINT, flat, local, on_plane, project_edge,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelPointKind {
@@ -27,26 +19,6 @@ pub enum ModelPointKind {
     Middle,
     /// Centre of a circular edge.
     Center,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModelCurve {
-    Line(Point2, Point2),
-    Circle(Point2, f64),
-    /// Counter-clockwise from `start` to `end`.
-    Arc {
-        center: Point2,
-        start: Point2,
-        end: Point2,
-    },
-    Ellipse(Ellipse2),
-    /// Counter-clockwise from `start` to `end` on the ellipse.
-    EllipticArc {
-        ellipse: Ellipse2,
-        start: Point2,
-        end: Point2,
-    },
-    Spline(Arc<Nurbs2>),
 }
 
 /// The part geometry a sketch can refer to.
@@ -59,293 +31,16 @@ pub struct ModelGeometry {
     /// left out, so the top and bottom edges of a box seen from above give one curve per
     /// side.
     pub curves: Vec<ModelCurve>,
+    /// The edge (by index in the topology) each of `curves` comes from.
+    pub curve_edges: Vec<usize>,
     /// Every vertex of the part projected onto the sketch plane, once each, for Convert
     /// Entities to copy as a fixed point.
     pub vertices: Vec<Point2>,
-}
-
-fn local(plane: &Plane, p: Point3) -> Point2 {
-    let v = p - plane.origin;
-    Point2::new(v.dot(plane.x_dir), v.dot(plane.y_dir()))
-}
-
-fn on_plane(plane: &Plane, p: Point3) -> bool {
-    (p - plane.origin).dot(plane.normal).abs() < ON_PLANE
-}
-
-/// Whether a circle about `axis` lies in planes parallel to the sketch plane, so that it
-/// projects onto it as a circle of the same radius.
-fn flat(plane: &Plane, axis: &Axis) -> bool {
-    axis.direction.cross(plane.normal).length() < 1e-6
-}
-
-/// Whether `p` lies on the counter-clockwise arc from `start` to `end` around `center`.
-fn on_ccw_arc(center: Point2, start: Point2, end: Point2, p: Point2) -> bool {
-    let angle = |q: Point2| (q.y - center.y).atan2(q.x - center.x);
-    let tau = std::f64::consts::TAU;
-    let sweep = (angle(end) - angle(start)).rem_euclid(tau);
-    let at = (angle(p) - angle(start)).rem_euclid(tau);
-    at <= sweep
-}
-
-/// A circular edge about a flat axis, seen in the sketch plane: an arc between its two ends,
-/// counter-clockwise through its middle, or a whole circle.
-fn round_curve(plane: &Plane, axis: &Axis, edge: &EdgeInfo, ends: &[Point3]) -> ModelCurve {
-    let center = local(plane, axis.origin);
-    let middle = local(plane, edge.midpoint);
-    match ends {
-        [a, b] if a.distance(*b) > 1e-9 => {
-            let (mut start, mut end) = (local(plane, *a), local(plane, *b));
-            if !on_ccw_arc(center, start, end, middle) {
-                std::mem::swap(&mut start, &mut end);
-            }
-            ModelCurve::Arc { center, start, end }
-        }
-        _ => ModelCurve::Circle(center, center.distance(middle)),
-    }
-}
-
-/// A circular edge about an axis tilted to the sketch plane, seen along the plane's normal:
-/// an ellipse, or an arc of it counter-clockwise through the projected middle. The ellipse's
-/// long semi-axis is the radius, square to both the axis and the normal; the short one is the
-/// radius times the cosine of the tilt. A circle seen edge-on projects to the stretch of the
-/// line it covers.
-fn tilted_curve(
-    plane: &Plane,
-    axis: &Axis,
-    edge: &EdgeInfo,
-    ends: &[Point3],
-) -> Option<ModelCurve> {
-    let n = axis.direction.normalized()?;
-    let radius = edge.midpoint.distance(axis.origin);
-    let major_3d = n.cross(plane.normal).normalized()?;
-    let major = Point2::new(major_3d.dot(plane.x_dir), major_3d.dot(plane.y_dir()));
-    let center = local(plane, axis.origin);
-    let ellipse = Ellipse2 {
-        center,
-        major: Point2::new(center.x + radius * major.x, center.y + radius * major.y),
-        minor: radius * n.dot(plane.normal).abs(),
-    };
-    let arc = match ends {
-        [a, b] if a.distance(*b) > 1e-9 => Some((*a, *b)),
-        _ => None,
-    };
-    if !ellipse.is_valid() {
-        // Edge-on: where the circle reaches along the major direction, from its angle
-        // about the axis measured from that direction.
-        let across = n.cross(major_3d);
-        let angle = |p: Point3| {
-            let d = p - axis.origin;
-            d.dot(across).atan2(d.dot(major_3d))
-        };
-        let (lo, hi) = match arc {
-            None => (-radius, radius),
-            Some((a, b)) => {
-                let (a0, am, a1) = (angle(a), angle(edge.midpoint), angle(b));
-                let ccw = (am - a0).rem_euclid(TAU) < (a1 - a0).rem_euclid(TAU);
-                let (from, sweep) = if ccw {
-                    (a0, (a1 - a0).rem_euclid(TAU))
-                } else {
-                    (a1, (a0 - a1).rem_euclid(TAU))
-                };
-                let (p, q) = (radius * a0.cos(), radius * a1.cos());
-                let (mut lo, mut hi) = (p.min(q), p.max(q));
-                for (extreme, at) in [(0.0, radius), (PI, -radius)] {
-                    if (extreme - from).rem_euclid(TAU) <= sweep {
-                        lo = lo.min(at);
-                        hi = hi.max(at);
-                    }
-                }
-                (lo, hi)
-            }
-        };
-        let at = |t: f64| Point2::new(center.x + t * major.x, center.y + t * major.y);
-        return (hi - lo >= SAME_POINT).then(|| ModelCurve::Line(at(lo), at(hi)));
-    }
-    Some(match arc {
-        Some((a, b)) => {
-            let (mut start, mut end) = (local(plane, a), local(plane, b));
-            let (a0, sweep) = ellipse.sweep(start, end);
-            if (ellipse.angle_of(local(plane, edge.midpoint)) - a0).rem_euclid(TAU) > sweep {
-                std::mem::swap(&mut start, &mut end);
-            }
-            ModelCurve::EllipticArc {
-                ellipse,
-                start,
-                end,
-            }
-        }
-        None => ModelCurve::Ellipse(ellipse),
-    })
-}
-
-/// A conic edge seen along the sketch plane's normal. Its point at angle `t` lands at
-/// `c + u·cos t + v·sin t`, `u` and `v` the projected semi-axes: an ellipse whose own axes lie
-/// where that point is furthest from and nearest to `c`. Seen edge-on, the stretch of line it
-/// covers.
-fn projected_conic(plane: &Plane, curve: &EdgeCurve) -> Option<ModelCurve> {
-    let EdgeCurve::Conic {
-        center,
-        x_dir,
-        y_dir,
-        major,
-        minor,
-        start,
-        end,
-    } = *curve
-    else {
-        return None;
-    };
-    let c = local(plane, center);
-    let flat = |d: Vec3, r: f64| (r * d.dot(plane.x_dir), r * d.dot(plane.y_dir()));
-    let (u, v) = (flat(x_dir, major), flat(y_dir, minor));
-    let at = |t: f64| {
-        Point2::new(
-            c.x + u.0 * t.cos() + v.0 * t.sin(),
-            c.y + u.1 * t.cos() + v.1 * t.sin(),
-        )
-    };
-    let whole = end - start >= TAU - 1e-9;
-    let dot = u.0 * v.0 + u.1 * v.1;
-    let turn = 0.5 * (2.0 * dot).atan2(u.0 * u.0 + u.1 * u.1 - v.0 * v.0 - v.1 * v.1);
-    let axis_end = at(turn);
-    let across = at(turn + PI / 2.0);
-    let ellipse = Ellipse2 {
-        center: c,
-        major: axis_end,
-        minor: across.distance(c),
-    };
-    if !ellipse.is_valid() {
-        // Edge-on: as far as the curve reaches either way along its line.
-        let length = axis_end.distance(c);
-        if length < SAME_POINT {
-            return None;
-        }
-        let d = ((axis_end.x - c.x) / length, (axis_end.y - c.y) / length);
-        let reach = |t: f64| {
-            let p = at(t);
-            (p.x - c.x) * d.0 + (p.y - c.y) * d.1
-        };
-        let far = (v.0 * d.0 + v.1 * d.1).atan2(u.0 * d.0 + u.1 * d.1);
-        let (mut lo, mut hi) = (reach(start).min(reach(end)), reach(start).max(reach(end)));
-        for t in [far, far + PI] {
-            if whole || (t - start).rem_euclid(TAU) <= end - start {
-                lo = lo.min(reach(t));
-                hi = hi.max(reach(t));
-            }
-        }
-        let point = |s: f64| Point2::new(c.x + s * d.0, c.y + s * d.1);
-        return (hi - lo >= SAME_POINT).then(|| ModelCurve::Line(point(lo), point(hi)));
-    }
-    if whole {
-        return Some(ModelCurve::Ellipse(ellipse));
-    }
-    let (mut first, mut last) = (at(start), at(end));
-    let (a0, sweep) = ellipse.sweep(first, last);
-    if (ellipse.angle_of(at(0.5 * (start + end))) - a0).rem_euclid(TAU) > sweep {
-        std::mem::swap(&mut first, &mut last);
-    }
-    Some(ModelCurve::EllipticArc {
-        ellipse,
-        start: first,
-        end: last,
-    })
-}
-
-/// A B-spline edge seen along the sketch plane's normal: the same knots and weights on the
-/// projected poles, which is exactly the projected curve.
-fn projected_nurbs(plane: &Plane, curve: &EdgeCurve) -> Option<ModelCurve> {
-    let EdgeCurve::Nurbs { curve, .. } = curve else {
-        return None;
-    };
-    let poles: Vec<Point2> = curve.poles.iter().map(|p| local(plane, *p)).collect();
-    let first = *poles.first()?;
-    if poles.iter().all(|p| p.distance(first) < SAME_POINT) {
-        return None;
-    }
-    let spline = Nurbs2 {
-        degree: curve.degree as usize,
-        poles,
-        weights: curve.weights.clone(),
-        knots: curve.knots.clone(),
-    };
-    spline
-        .is_valid()
-        .then(|| ModelCurve::Spline(Arc::new(spline)))
-}
-
-/// An edge's exact curve from the kernel, seen in the sketch plane.
-fn projected(plane: &Plane, curve: &EdgeCurve) -> Option<ModelCurve> {
-    match curve {
-        EdgeCurve::Line { start, end } => {
-            let (a, b) = (local(plane, *start), local(plane, *end));
-            (a.distance(b) >= SAME_POINT).then_some(ModelCurve::Line(a, b))
-        }
-        EdgeCurve::Conic { .. } => projected_conic(plane, curve),
-        EdgeCurve::Nurbs { .. } => projected_nurbs(plane, curve),
-    }
-}
-
-impl ModelCurve {
-    /// Its two ends, or none for a full circle or ellipse and a closed spline.
-    fn ends(&self) -> Option<[Point2; 2]> {
-        match self {
-            ModelCurve::Line(a, b) => Some([*a, *b]),
-            ModelCurve::Arc { start, end, .. } | ModelCurve::EllipticArc { start, end, .. } => {
-                Some([*start, *end])
-            }
-            ModelCurve::Spline(spline) => {
-                (!spline.is_closed()).then(|| [spline.start(), spline.end()])
-            }
-            ModelCurve::Circle(..) | ModelCurve::Ellipse(_) => None,
-        }
-    }
-
-    /// Whether `other` is the same curve: a line either way round, a circle, or an arc (both
-    /// counter-clockwise, so their ends compare in order).
-    fn same_as(&self, other: &ModelCurve) -> bool {
-        let near = |a: Point2, b: Point2| a.distance(b) < SAME_POINT;
-        if let (ModelCurve::Spline(a), ModelCurve::Spline(b)) = (self, other) {
-            let same = |a: &Nurbs2, b: &Nurbs2| {
-                a.degree == b.degree
-                    && a.weights == b.weights
-                    && a.knots == b.knots
-                    && a.poles.len() == b.poles.len()
-                    && a.poles.iter().zip(&b.poles).all(|(p, q)| near(*p, *q))
-            };
-            return same(a, b) || same(a, &b.reversed());
-        }
-        match (self.clone(), other.clone()) {
-            (ModelCurve::Line(a, b), ModelCurve::Line(c, d)) => {
-                (near(a, c) && near(b, d)) || (near(a, d) && near(b, c))
-            }
-            (ModelCurve::Circle(a, r), ModelCurve::Circle(b, s)) => {
-                near(a, b) && (r - s).abs() < SAME_POINT
-            }
-            (
-                ModelCurve::Arc { center, start, end },
-                ModelCurve::Arc {
-                    center: c,
-                    start: s,
-                    end: e,
-                },
-            ) => near(center, c) && near(start, s) && near(end, e),
-            (ModelCurve::Ellipse(a), ModelCurve::Ellipse(b)) => a.same_as(&b, SAME_POINT),
-            (
-                ModelCurve::EllipticArc {
-                    ellipse,
-                    start,
-                    end,
-                },
-                ModelCurve::EllipticArc {
-                    ellipse: other,
-                    start: s,
-                    end: e,
-                },
-            ) => ellipse.same_as(&other, SAME_POINT) && near(start, s) && near(end, e),
-            _ => false,
-        }
-    }
+    /// The vertex (by index in the topology) each of `vertices` comes from.
+    pub vertex_indices: Vec<u32>,
+    /// The names of `curve_edges` and `vertex_indices` in the part, which a copy links to.
+    pub curve_sources: Vec<Option<ProjectionSource>>,
+    pub vertex_sources: Vec<Option<ProjectionSource>>,
 }
 
 impl ModelGeometry {
@@ -390,75 +85,78 @@ impl ModelGeometry {
         for (index, edge) in topology.edges.iter().enumerate() {
             let ends: Vec<Point3> = edge.vertices.iter().filter_map(|i| vertex(*i)).collect();
             if !ends.iter().all(|p| on_plane(plane, *p)) || !on_plane(plane, edge.midpoint) {
-                away.push((index, edge, ends));
+                away.push(index);
                 continue;
             }
+            let curve = project_edge(plane, topology, index, curve_of);
             match (edge.curve, ends.as_slice()) {
                 (CurveKind::Line, [p, q]) => {
-                    let (a, b) = (local(plane, *p), local(plane, *q));
-                    out.curves.push(ModelCurve::Line(a, b));
-                    out.add(a, ModelPointKind::Vertex);
-                    out.add(b, ModelPointKind::Vertex);
+                    out.add(local(plane, *p), ModelPointKind::Vertex);
+                    out.add(local(plane, *q), ModelPointKind::Vertex);
                     out.add(local(plane, edge.midpoint), ModelPointKind::Middle);
                 }
                 (CurveKind::Circle, _) => {
-                    let Some(axis) = edge.axis else { continue };
                     // Its axis along the normal: a circle standing across the plane has its
                     // vertex and its middle on it too (two ends of a diameter).
-                    if !flat(plane, &axis) || !on_plane(plane, axis.origin) {
-                        continue;
+                    if let Some(axis) = edge.axis
+                        && flat(plane, &axis)
+                        && on_plane(plane, axis.origin)
+                    {
+                        out.add(local(plane, axis.origin), ModelPointKind::Center);
                     }
-                    out.add(local(plane, axis.origin), ModelPointKind::Center);
-                    let curve = round_curve(plane, &axis, edge, &ends);
-                    if let ModelCurve::Arc { start, end, .. } = curve {
+                    if let Some(ModelCurve::Arc { start, end, .. }) = curve {
                         out.add(start, ModelPointKind::Vertex);
                         out.add(end, ModelPointKind::Vertex);
                     }
-                    out.curves.push(curve);
                 }
                 (CurveKind::Degenerate, _) => {}
                 _ => {
                     for p in &ends {
                         out.add(local(plane, *p), ModelPointKind::Vertex);
                     }
-                    if let Some(curve) = curve_of(index).and_then(|c| projected(plane, &c)) {
-                        out.curves.push(curve);
-                    }
                 }
             }
+            if let Some(curve) = curve {
+                out.curves.push(curve);
+                out.curve_edges.push(index);
+            }
         }
-        // The other edges projected along the normal. A line square to the plane projects to
-        // its vertex alone, a circle tilted to the plane to an ellipse, any other curve to what
-        // its exact curve from the kernel projects to.
-        for (index, edge, ends) in away {
-            let curve = match (edge.curve, ends.as_slice()) {
-                (CurveKind::Line, [p, q]) => {
-                    let (a, b) = (local(plane, *p), local(plane, *q));
-                    (a.distance(b) >= SAME_POINT).then_some(ModelCurve::Line(a, b))
-                }
-                (CurveKind::Circle, _) => edge.axis.and_then(|axis| {
-                    if flat(plane, &axis) {
-                        Some(round_curve(plane, &axis, edge, &ends))
-                    } else {
-                        tilted_curve(plane, &axis, edge, &ends)
-                    }
-                }),
-                (CurveKind::Line | CurveKind::Degenerate, _) => None,
-                _ => curve_of(index).and_then(|c| projected(plane, &c)),
-            };
-            if let Some(curve) = curve
+        // The other edges projected along the normal.
+        for index in away {
+            if let Some(curve) = project_edge(plane, topology, index, curve_of)
                 && !out.curves.iter().any(|c| c.same_as(&curve))
             {
                 out.curves.push(curve);
+                out.curve_edges.push(index);
             }
         }
-        for v in &topology.vertices {
+        for (index, v) in topology.vertices.iter().enumerate() {
             let p = local(plane, v.point);
             if !out.vertices.iter().any(|q| q.distance(p) < SAME_POINT) {
                 out.vertices.push(p);
+                out.vertex_indices
+                    .push(u32::try_from(index).unwrap_or(u32::MAX));
             }
         }
         out
+    }
+
+    /// Names the sources of the curves and vertices in the part's `naming`, for the copies
+    /// Convert Entities makes to follow them.
+    pub fn name_sources(&mut self, naming: &BodyNaming) {
+        self.curve_sources = self
+            .curve_edges
+            .iter()
+            .map(|i| {
+                let i = u32::try_from(*i).ok()?;
+                naming.edge(i).cloned().map(ProjectionSource::Edge)
+            })
+            .collect();
+        self.vertex_sources = self
+            .vertex_indices
+            .iter()
+            .map(|i| naming.vertex(*i).cloned().map(ProjectionSource::Vertex))
+            .collect();
     }
 
     fn add(&mut self, p: Point2, kind: ModelPointKind) {
@@ -473,7 +171,9 @@ mod tests {
     use oxyde_geom::{Axis, Ellipse2, Nurbs2, Plane, Point2, Point3, Vec3};
     use oxyde_kernel::{CurveKind, EdgeCurve, EdgeInfo, Nurbs3, Topology, VertexInfo};
 
-    use super::{ModelCurve, ModelGeometry, ModelPointKind, local};
+    use oxyde_model::projection::{ModelCurve, local};
+
+    use super::{ModelGeometry, ModelPointKind};
 
     fn edge(
         curve: CurveKind,
@@ -649,7 +349,7 @@ mod tests {
         assert!((start.distance(center) - 2.0).abs() < 1e-9);
         assert!((end.distance(center) - 2.0).abs() < 1e-9);
         // Counter-clockwise through the projected middle (5, -7).
-        assert!(super::on_ccw_arc(
+        assert!(oxyde_model::projection::on_ccw_arc(
             center,
             start,
             end,
