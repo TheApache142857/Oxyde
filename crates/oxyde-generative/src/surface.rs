@@ -74,7 +74,10 @@ pub fn exact_surface(
             (at / size[0]) % size[1],
             at / (size[0] * size[1]),
         ];
-        if (0..3).all(|a| (1..=n[a]).contains(&c[a])) {
+        if c.iter()
+            .zip(&n)
+            .all(|(&x, &count)| (1..=count).contains(&x))
+        {
             grid.kinds.get(grid.index(c.map(|x| x - 1))).copied()
         } else {
             None
@@ -141,7 +144,11 @@ fn cut(
             (at / size[0]) % size[1],
             at / (size[0] * size[1]),
         ];
-        std::array::from_fn(|a| grid.origin[a] + (c[a] as f64 - 0.5) * grid.size)
+        let mut p = grid.origin;
+        for (x, &k) in p.iter_mut().zip(&c) {
+            *x += (k as f64 - 0.5) * grid.size;
+        }
+        p
     };
     let inside = |at: usize| value.get(at).is_some_and(|&v| f64::from(v) > THRESHOLD);
     let mut cut = Cutter {
