@@ -65,8 +65,8 @@ touch, format your files only (`rustfmt <file>`), not the crate.
 GitHub Actions run the same on every pull request and push to `main` (`.github/workflows/ci.yml`), on Linux
 with Debian's OpenCASCADE 7.8. The `gate` job checks the format of the `.rs` files the change adds or
 modifies, fails on a clippy or rustc warning in a changed line (`scripts/ci/clippy-changed-lines.py`), and runs
-the tests without `oxyde-generative`, `oxyde-sim`, `oxyde-sim-gpu` and the `gpu::` tests: hosted runners have
-no GPU. The tests of `oxyde-generative` and `oxyde-sim` run on the PC only.
+the tests without `oxyde-sim`, `oxyde-sim-gpu` and the `gpu::` tests: hosted runners have no GPU. The tests
+of `oxyde-sim` run on the PC only.
 
 ## Merging
 
