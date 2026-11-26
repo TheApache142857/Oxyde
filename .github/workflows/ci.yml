@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # For a merge made with a workflow's token, which starts no `push` run (auto-merge.yml).
+  workflow_dispatch:
 
 permissions:
   contents: read
