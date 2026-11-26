@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 
@@ -7,6 +8,20 @@ use crate::study::{FixtureKind, LoadKind, THREADS_VARIABLE, capped_thread_count}
 use crate::surfaces::{SurfaceMesh, box_surface};
 
 const STEEL: Elastic = Elastic::new(200_000.0, 0.3, 250.0, 7850.0);
+
+thread_local! {
+    /// Units in the last place [`nudged`] moves the design's start by, on this thread.
+    static START_NUDGE: Cell<i64> = const { Cell::new(0) };
+}
+
+/// The design's start moved by [`START_NUDGE`] units in the last place.
+pub(super) fn nudged(start: f64) -> f64 {
+    f64::from_bits(
+        start
+            .to_bits()
+            .wrapping_add_signed(START_NUDGE.with(Cell::get)),
+    )
+}
 
 /// A box's surface, its sides labelled `10 × body + side` (side as `box_surface` numbers
 /// them: −X, +X, −Y, +Y, −Z, +Z).
@@ -1925,4 +1940,42 @@ fn a_symmetric_study_grows_a_symmetric_design() {
             }
         }
     }
+}
+
+/// The solver tests' outcomes hold with the design's start moved by a unit or two in the
+/// last place, as the platforms' maths libraries round it differently.
+#[test]
+fn outcomes_hold_with_the_start_a_few_units_in_the_last_place_away() {
+    let study = bracket(2.0);
+    let milled = Method::Milling {
+        sides: Sides::single(Direction {
+            axis: 2,
+            positive: true,
+        }),
+        tool_diameter: Some(6.0),
+    };
+    let mut lightest = bracket(2.0);
+    lightest.objective = Objective::MinMass {
+        safety_factor: 2.0,
+        displacement_limit: None,
+    };
+    let on_target = |mass: f64| (mass - study.mass_target).abs() < 0.06 * study.mass_target;
+    for nudge in [-2, -1, 1, 2] {
+        START_NUDGE.with(|n| n.set(nudge));
+        let (_, stiffest) = run(&study, Method::Unrestricted, 0);
+        assert!(
+            on_target(stiffest.mass),
+            "{nudge} ulp: {} kg",
+            stiffest.mass
+        );
+        let (_, cut) = run(&study, milled, 0);
+        assert!(on_target(cut.mass), "{nudge} ulp, milled: {} kg", cut.mass);
+        let (_, light) = run(&lightest, Method::Unrestricted, 0);
+        assert!(
+            light.max_von_mises <= 1.05 * 125.0,
+            "{nudge} ulp: {} MPa",
+            light.max_von_mises
+        );
+    }
+    START_NUDGE.with(|n| n.set(0));
 }

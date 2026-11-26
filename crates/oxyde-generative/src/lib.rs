@@ -1086,6 +1086,8 @@ pub fn generate_on(
         }
         Some(_) => 1.0,
     };
+    #[cfg(test)]
+    let start = tests::nudged(start);
     let mut x = vec![start; groups];
     let mut mma = mma::Mma::default();
     // The adjoint solutions, kept to start the next ones from: per constraint, per case.
