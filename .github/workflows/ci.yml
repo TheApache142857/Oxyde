@@ -20,7 +20,7 @@ env:
 
 jobs:
   # The required check: what CLAUDE.md asks of every commit, on Linux with Debian's
-  # OpenCASCADE 7.8. The solver crates and the GPU tests run on the PC only.
+  # OpenCASCADE 7.8. The simulation solvers and the GPU tests run on the PC only.
   gate:
     name: gate
     runs-on: ubuntu-latest
@@ -83,5 +83,5 @@ jobs:
           exit "${status:-0}"
       - name: Tests
         run: >-
-          cargo test --workspace --exclude oxyde-sim-gpu --exclude oxyde-generative --exclude oxyde-sim
+          cargo test --workspace --exclude oxyde-sim-gpu --exclude oxyde-sim
           -- --skip gpu:: --skip gpu_trace::

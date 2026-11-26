@@ -144,6 +144,8 @@ const LATE_MOVE_LIMIT: f64 = 0.1;
 /// run as long as the others. At the last sharpness the compliance jitters by a few tenths
 /// of a percent and the mass by about one: a tighter test was met or missed by chance.
 const SETTLED_CHANGE: f64 = 0.01;
+/// The width, in `ln λ`, at which the optimality criteria's bisection stops.
+const LAMBDA_SPAN: f64 = 1e-6;
 /// Nor, by either of those tests, while its grayness is over this: a design that stopped
 /// moving grey (a casting pulled in the plane the part bends in, in topology studies) has
 /// not settled, and runs on to the end of the last stage. At the last sharpness a crisp
@@ -168,6 +170,10 @@ const NORMALIZATION_DAMPING: f64 = 0.5;
 /// MMA's move limit, and from a sharpness of 8 on.
 const MMA_MOVE: f64 = 0.1;
 const LATE_MMA_MOVE: f64 = 0.05;
+/// In the last stage, what the move limit is multiplied by each time a limit goes from
+/// met to unmet or back, and the least it comes to.
+const LATE_MMA_SHRINK: f64 = 0.5;
+const LATE_MMA_MOVE_FLOOR: f64 = 0.005;
 /// A limit counts as met within this share of it.
 const LIMIT_TOLERANCE: f64 = 0.01;
 /// The densities are kept every this many iterations, for the slider through them.
@@ -1086,6 +1092,8 @@ pub fn generate_on(
         }
         Some(_) => 1.0,
     };
+    #[cfg(test)]
+    let start = tests::nudged(start);
     let mut x = vec![start; groups];
     let mut mma = mma::Mma::default();
     // The adjoint solutions, kept to start the next ones from: per constraint, per case.
@@ -1111,16 +1119,10 @@ pub fn generate_on(
     let mut modes: Vec<Vec<f64>> = Vec::new();
     let mut lowest_frequency: Option<f64> = None;
 
-    'iterations: for iteration in 0..iterations {
-        // Stopped after an iteration or more: the design as far as it got.
-        if cancel.load(Ordering::Relaxed) {
-            if history.is_empty() {
-                return Err(GenerativeError::Cancelled);
-            }
-            stopped = true;
-            break;
-        }
-        // Design, filtered, capped along a casting direction, projected.
+    // A design's fields: filtered, printed layer by layer, capped along a casting direction
+    // or reached from the milling sides (with the voxel each cap comes from), and projected
+    // at `beta`.
+    let fields = |x: &[f64], beta: f64| {
         let design: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
                 State::Free => x[group[v] as usize],
@@ -1129,8 +1131,6 @@ pub fn generate_on(
             })
             .collect();
         let filtered = filter.forward(&design, threads);
-        // Capped along a casting direction, reached from the milling sides, or printed
-        // layer by layer.
         let printed = printing.as_ref().map(|p| p.forward(&filtered, &state));
         let (capped, source) = match (&chains, &reaches, &printed) {
             (Some(chains), _, _) => cap(chains, &state, &filtered),
@@ -1145,6 +1145,23 @@ pub fn generate_on(
                 State::Void => 0.0,
             })
             .collect();
+        (filtered, printed, capped, source, rho)
+    };
+    // The last stage's move limit for the method of moving asymptotes, and the limits'
+    // values at the step before.
+    let mut late_move = LATE_MMA_MOVE;
+    let mut last_values: Vec<f64> = Vec::new();
+
+    'iterations: for iteration in 0..iterations {
+        // Stopped after an iteration or more: the design as far as it got.
+        if cancel.load(Ordering::Relaxed) {
+            if history.is_empty() {
+                return Err(GenerativeError::Cancelled);
+            }
+            stopped = true;
+            break;
+        }
+        let (filtered, printed, capped, source, rho) = fields(&x, beta);
         let gray = grayness(&rho, &state);
         let stiffness: Vec<f64> = (0..voxels)
             .map(|v| match state[v] {
@@ -1377,14 +1394,16 @@ pub fn generate_on(
                     let limit = if beta >= 8.0 { LATE_MMA_MOVE } else { MMA_MOVE };
                     mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &values, &slopes)
                 } else {
-                    let budget =
-                        target - mass_now + dm.iter().zip(&x).map(|(m, x)| m * x).sum::<f64>();
+                    // The projected design's mass: once the projection is steep, a mass
+                    // linearised in the design misses the target.
+                    let mass_of =
+                        |next: &[f64]| fields(next, beta).4.iter().sum::<f64>() * voxel_mass;
                     let limit = if beta >= 8.0 {
                         LATE_MOVE_LIMIT
                     } else {
                         MOVE_LIMIT
                     };
-                    optimality_update(&x, &dc, &dm, budget, limit)
+                    optimality_update(&x, &dc, &dm, &mass_of, target, limit)
                 }
             }
             Some((allowed_stress, allowed_displacement)) => {
@@ -1488,9 +1507,28 @@ pub fn generate_on(
                     slopes.push(slope);
                 }
                 feasible = values.iter().all(|g| *g <= LIMIT_TOLERANCE);
+                // A limit met at one step and not at the next: the design swings across it,
+                // and moves less from then on.
+                if beta >= BETA_MAX {
+                    let flipped = last_values.len() == values.len()
+                        && last_values
+                            .iter()
+                            .zip(&values)
+                            .any(|(a, b)| (*a > 0.0) != (*b > 0.0));
+                    if flipped {
+                        late_move = (LATE_MMA_SHRINK * late_move).max(LATE_MMA_MOVE_FLOOR);
+                    }
+                    last_values.clone_from(&values);
+                }
                 // Mass as a share of the whole design space's.
                 let df0: Vec<f64> = dm.iter().map(|m| m / max).collect();
-                let limit = if beta >= 8.0 { LATE_MMA_MOVE } else { MMA_MOVE };
+                let limit = if beta >= BETA_MAX {
+                    late_move
+                } else if beta >= 8.0 {
+                    LATE_MMA_MOVE
+                } else {
+                    MMA_MOVE
+                };
                 mma.update(&x, DESIGN_MIN, 1.0, limit, &df0, &values, &slopes)
             }
         };
@@ -1541,7 +1579,12 @@ pub fn generate_on(
         let crisp = gray <= GRAYNESS_SETTLED;
         let settled = (beta >= BETA_MAX && change < SETTLED_CHANGE && feasible) || steady;
         if (settled && crisp) || last_stage_done {
-            converged = true;
+            let recent = &history[history.len().saturating_sub(STEADY_OVER)..];
+            let (lo, hi) = recent.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), s| {
+                (lo.min(s.mass), hi.max(s.mass))
+            });
+            let mass_steady = recent.len() == STEADY_OVER && hi - lo <= STEADY_MASS * hi;
+            converged = (settled && crisp) || (mass_steady && feasible);
             break;
         }
         if beta < BETA_MAX && (change < SETTLED_CHANGE || at_beta >= BETA_STEP_AFTER) {
@@ -2031,9 +2074,16 @@ fn project_slope(x: f64, beta: f64) -> f64 {
 
 /// The next design by optimality criteria: each group's density times the square root of
 /// its compliance slope over `λ` times its mass slope, within the move limit and
-/// `DESIGN_MIN` to 1, `λ` found by bisection (on its logarithm) so that the mass,
-/// linearised by `dm`, is `budget`.
-fn optimality_update(x: &[f64], dc: &[f64], dm: &[f64], budget: f64, limit: f64) -> Vec<f64> {
+/// `DESIGN_MIN` to 1, `λ` found by bisection (on its logarithm) so that `mass_of` the
+/// design is `target`.
+fn optimality_update(
+    x: &[f64],
+    dc: &[f64],
+    dm: &[f64],
+    mass_of: &dyn Fn(&[f64]) -> f64,
+    target: f64,
+    limit: f64,
+) -> Vec<f64> {
     let largest_dm = dm.iter().copied().fold(0.0, f64::max);
     let ratio: Vec<Option<f64>> = dc
         .iter()
@@ -2057,11 +2107,10 @@ fn optimality_update(x: &[f64], dc: &[f64], dm: &[f64], budget: f64, limit: f64)
             })
             .collect()
     };
-    let mass_of = |next: &[f64]| -> f64 { next.iter().zip(dm).map(|(x, m)| x * m).sum() };
     let (mut lo, mut hi) = ((largest * 1e-12).ln(), (largest * 1e12).ln());
-    for _ in 0..80 {
+    while hi - lo > LAMBDA_SPAN {
         let mid = 0.5 * (lo + hi);
-        if mass_of(&at(mid.exp())) > budget {
+        if mass_of(&at(mid.exp())) > target {
             lo = mid;
         } else {
             hi = mid;
