@@ -2,7 +2,10 @@ name: Auto-merge
 
 # Turns GitHub's auto-merge (squash) on for the owner's pull requests, so that GitHub
 # merges them once the required `gate` check passes, and off for a draft or a pull
-# request labelled `hold`. The workflow never merges.
+# request labelled `hold`. GitHub refuses auto-merge for a pull request whose required
+# checks have already passed (`hold` removed after `gate` finished): the workflow then
+# squash-merges it itself, and starts CI on the base, which a merge made with the
+# workflow's token does not start.
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, labeled, unlabeled]
@@ -22,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -33,10 +37,10 @@ jobs:
           BASE: ${{ github.event.pull_request.base.ref }}
         run: |
           # Read the pull request now: its labels and draft state may have changed since the event.
-          info=$(gh pr view "$PR" --json state,isDraft,labels,autoMergeRequest,id \
+          info=$(gh pr view "$PR" --json state,isDraft,labels,autoMergeRequest,id,headRefOid \
             --jq '[.state, (.isDraft | tostring), (any(.labels[]; .name == "hold") | tostring),
-                   (.autoMergeRequest != null | tostring), .id] | @tsv')
-          IFS=$'\t' read -r state draft held armed id <<< "$info"
+                   (.autoMergeRequest != null | tostring), .id, .headRefOid] | @tsv')
+          IFS=$'\t' read -r state draft held armed id head <<< "$info"
           if [ "$state" != OPEN ]; then
             exit 0
           fi
@@ -63,10 +67,25 @@ jobs:
             echo "::notice::$BASE does not require the gate check: auto-merge stays off."
             exit 0
           fi
-          gh api graphql -f id="$id" -f query='
+          if out=$(gh api graphql -f id="$id" -f query='
             mutation($id: ID!) {
               enablePullRequestAutoMerge(input: {pullRequestId: $id, mergeMethod: SQUASH}) {
                 clientMutationId
               }
-            }'
-          echo "Auto-merge is on: GitHub squash-merges once the required checks pass."
+            }' 2>&1); then
+            echo "Auto-merge is on: GitHub squash-merges once the required checks pass."
+            exit 0
+          fi
+          # "clean" and "unstable" are the states whose required checks have all passed.
+          case "$out" in
+            *"is in clean status"* | *"is in unstable status"*) ;;
+            *)
+              echo "$out" >&2
+              exit 1
+              ;;
+          esac
+          # The branch's protection still holds the merge to the required checks, and
+          # --match-head-commit to the commit read above.
+          gh pr merge "$PR" --squash --match-head-commit "$head"
+          echo "The required checks had passed: merged."
+          gh workflow run ci.yml --ref "$BASE"

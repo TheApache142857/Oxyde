@@ -85,7 +85,6 @@ solver (`oxyde_sim::check`); that check uses Oxyde's mesher and is not part of t
   | `multigrid.rs` | the grid's nodes and its coarser levels, halved from them | `Grid::check` |
   | `additive.rs` | the grid's voxels, layer by layer | `Grid::check` |
   | `lib.rs` (the solver's functions) | the grid's voxels, nodes and design groups | `Grid::check` |
-  | `surface.rs` | the lattice one voxel around the grid, and the densities | `Grid::check`; the densities' count in `cut` |
   | `mma.rs` | the design variables (the grid's groups) and the constraints | `Grid::check`; the method fixes the constraints |
   | `eigen.rs` | the block of vectors it keeps and its small dense matrices | sizes the method sets |
   | `brick.rs` | the brick's 24 unknowns | constants |
