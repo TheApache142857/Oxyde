@@ -1994,3 +1994,86 @@ fn diag_bracket() {
         outcome.mass, study.mass_target, outcome.converged
     );
 }
+
+/// Diagnostic: the lightest bracket under its stress limit, every step's numbers.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_lightest() {
+    let mut study = bracket(2.0);
+    study.objective = Objective::MinMass {
+        safety_factor: 2.0,
+        displacement_limit: None,
+    };
+    let (_, outcome) = run(&study, Method::Unrestricted, 1);
+    for (i, step) in outcome.history.iter().enumerate() {
+        eprintln!("STEP {i} compliance={:e} mass={:e} change={:e}", step.compliance, step.mass, step.change);
+    }
+    eprintln!(
+        "OUTCOME mass={:e} stress={:e} steps={} converged={}",
+        outcome.mass,
+        outcome.max_von_mises,
+        outcome.history.len(),
+        outcome.converged
+    );
+}
+
+/// Diagnostic: the numbers of the studies the solver tests run, and their densities.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_report() {
+    let two_cases = || {
+        let mut study = bracket(2.0);
+        study.loads.push(Load {
+            kind: LoadKind::Force {
+                total: 600.0,
+                direction: Some([0.0, 0.0, 1.0]),
+            },
+            labels: vec![11],
+        });
+        let case = |load| LoadCase {
+            fixtures: vec![0],
+            loads: vec![load],
+            ..LoadCase::default()
+        };
+        study.load_cases = vec![case(0), case(1)];
+        study
+    };
+    let lightest = |displacement_limit| {
+        let mut study = bracket(2.0);
+        study.objective = Objective::MinMass {
+            safety_factor: 2.0,
+            displacement_limit,
+        };
+        study
+    };
+    let milled = Method::Milling {
+        sides: Sides::single(Direction {
+            axis: 2,
+            positive: true,
+        }),
+        tool_diameter: Some(6.0),
+    };
+    let studies = [
+        ("compliance", bracket(2.0), Method::Unrestricted),
+        ("two_cases", two_cases(), Method::Unrestricted),
+        ("milled", bracket(2.0), milled),
+        ("lightest", lightest(None), Method::Unrestricted),
+        ("stiff", lightest(Some(0.08)), Method::Unrestricted),
+    ];
+    for (name, study, method) in studies {
+        let started = std::time::Instant::now();
+        let (_, outcome) = run(&study, method, 0);
+        let seconds = started.elapsed().as_secs_f64();
+        let solid = outcome.density.iter().filter(|d| **d >= 128).count();
+        let hex: String = outcome.density.iter().map(|d| format!("{d:02x}")).collect();
+        eprintln!(
+            "REPORT {name} mass={:e} target={:e} stress={:e} displacement={:e} steps={} converged={} seconds={seconds:.1} solid={solid} density={hex}",
+            outcome.mass,
+            study.mass_target,
+            outcome.max_von_mises,
+            outcome.max_displacement,
+            outcome.history.len(),
+            outcome.converged,
+        );
+    }
+}
