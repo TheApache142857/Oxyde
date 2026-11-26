@@ -12,9 +12,6 @@
 //! so thin the kernel would skip it. Ties go to the lower indices, so the result is the same
 //! on every run.
 
-// Indices into the mesh's arrays, all sized here from the shape.
-#![allow(clippy::indexing_slicing)]
-
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -39,10 +36,10 @@ const MIN_THICKNESS: f64 = 1e-3;
 /// no angle's sine is under (an equilateral triangle's is 0.87, a flat one's 0).
 fn thickness(p: [V3; 3]) -> f64 {
     let n = norm(cross(sub(p[1], p[0]), sub(p[2], p[0])));
-    let longest = [(0, 1), (1, 2), (2, 0)]
+    let longest = [(p[0], p[1]), (p[1], p[2]), (p[2], p[0])]
         .iter()
-        .map(|&(i, j)| {
-            let e = sub(p[j], p[i]);
+        .map(|&(from, to)| {
+            let e = sub(to, from);
             dot(e, e)
         })
         .fold(0.0, f64::max);
@@ -65,8 +62,8 @@ pub fn decimate(shape: &Shape, target: usize) -> Shape {
 /// skewed pentagon, two of its points merged into the counterbore's floor).
 pub fn decimate_holding(shape: &Shape, held: &[bool], target: usize, tolerance: f64) -> Shape {
     let mut m = Mesh::new(shape);
-    for (h, &given) in m.held.iter_mut().zip(held) {
-        *h = given;
+    for (p, &given) in m.points.iter_mut().zip(held) {
+        p.held = given;
     }
     m.tolerance = tolerance;
     if m.live_faces <= target {
@@ -83,7 +80,7 @@ pub fn decimate_holding(shape: &Shape, held: &[bool], target: usize, tolerance: 
             break;
         };
         let (a, b) = (e.a as usize, e.b as usize);
-        if m.dead[a] || m.dead[b] || m.stamp[a] != e.stamp_a || m.stamp[b] != e.stamp_b {
+        if !m.unchanged(a, e.stamp_a) || !m.unchanged(b, e.stamp_b) {
             continue;
         }
         if !m.collapse(a, b, e.at) {
@@ -106,21 +103,26 @@ pub fn solid_pieces(shape: &Shape) -> Vec<Shape> {
     // Points joined by triangles, by union-find.
     let mut parent: Vec<usize> = (0..n).collect();
     fn root(parent: &mut [usize], mut v: usize) -> usize {
-        while parent[v] != v {
-            parent[v] = parent[parent[v]];
-            v = parent[v];
+        while let Some(&up) = parent.get(v)
+            && up != v
+        {
+            let grand = parent.get(up).copied().unwrap_or(up);
+            if let Some(p) = parent.get_mut(v) {
+                *p = grand;
+            }
+            v = grand;
         }
         v
     }
     let valid = |t: &[u32; 3]| t.iter().all(|&i| (i as usize) < n);
     for t in shape.triangles.iter().filter(|t| valid(t)) {
-        for k in 1..3 {
-            let (a, b) = (
-                root(&mut parent, t[0] as usize),
-                root(&mut parent, t[k] as usize),
-            );
-            if a != b {
-                parent[a.max(b)] = a.min(b);
+        let [first, second, third] = t.map(|i| i as usize);
+        for other in [second, third] {
+            let (a, b) = (root(&mut parent, first), root(&mut parent, other));
+            if a != b
+                && let Some(p) = parent.get_mut(a.max(b))
+            {
+                *p = a.min(b);
             }
         }
     }
@@ -132,18 +134,28 @@ pub fn solid_pieces(shape: &Shape) -> Vec<Shape> {
             continue;
         }
         let r = root(&mut parent, t[0] as usize);
-        if piece_of[r] == usize::MAX {
-            piece_of[r] = pieces.len();
+        let Some(piece) = piece_of.get_mut(r) else {
+            continue;
+        };
+        if *piece == usize::MAX {
+            *piece = pieces.len();
             pieces.push(Shape::default());
         }
-        let out = &mut pieces[piece_of[r]];
+        let Some(out) = pieces.get_mut(*piece) else {
+            continue;
+        };
         let ids = t.map(|i| {
             let i = i as usize;
-            if slot[i] == usize::MAX {
-                slot[i] = out.positions.len();
-                out.positions.push(shape.positions[i]);
+            match (slot.get_mut(i), shape.positions.get(i)) {
+                (Some(s), Some(&p)) => {
+                    if *s == usize::MAX {
+                        *s = out.positions.len();
+                        out.positions.push(p);
+                    }
+                    *s as u32
+                }
+                _ => 0,
             }
-            slot[i] as u32
         });
         out.triangles.push(ids);
         out.labels
@@ -220,7 +232,11 @@ fn plane_quadric(n: V3, d: f64, weight: f64) -> Quadric {
 }
 
 fn quadric_sum(p: &Quadric, q: &Quadric) -> Quadric {
-    std::array::from_fn(|i| p[i] + q[i])
+    let mut sum = *p;
+    for (s, x) in sum.iter_mut().zip(q) {
+        *s += x;
+    }
+    sum
 }
 
 /// The quadric's value at `v`: the weighted sum of squared distances to its planes.
@@ -252,8 +268,10 @@ fn quadric_minimum(q: &Quadric) -> Option<V3> {
     // Cramer's rule.
     let column = |c: usize| -> f64 {
         let mut a = m;
-        for row in 0..3 {
-            a[row][c] = r[row];
+        for (row, &value) in a.iter_mut().zip(&r) {
+            if let Some(x) = row.get_mut(c) {
+                *x = value;
+            }
         }
         a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
             - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
@@ -263,34 +281,52 @@ fn quadric_minimum(q: &Quadric) -> Option<V3> {
     v.iter().all(|x| x.is_finite()).then_some(v)
 }
 
+/// A point of the mesh.
+struct Point {
+    position: V3,
+    quadric: Quadric,
+    /// The live faces around it.
+    around: Vec<u32>,
+    /// Bumped whenever it moves or its faces change.
+    stamp: u32,
+    dead: bool,
+    /// It stays where it is.
+    held: bool,
+    /// The areas its quadric is weighted by, summed.
+    weight: f64,
+}
+
+/// A triangle of the mesh.
+struct Face {
+    corners: [u32; 3],
+    label: u32,
+    live: bool,
+}
+
 struct Mesh {
-    positions: Vec<V3>,
-    quadrics: Vec<Quadric>,
-    faces: Vec<[u32; 3]>,
-    labels: Vec<u32>,
-    live: Vec<bool>,
+    points: Vec<Point>,
+    faces: Vec<Face>,
     live_faces: usize,
-    /// The live faces around each point.
-    around: Vec<Vec<u32>>,
-    /// Bumped whenever the point moves or its faces change.
-    stamp: Vec<u32>,
-    dead: Vec<bool>,
-    /// Points that stay where they are.
-    held: Vec<bool>,
-    /// Per point, the areas its quadric is weighted by, summed.
-    weights: Vec<f64>,
     /// mm: the furthest a collapse may move the surface.
     tolerance: f64,
 }
 
 impl Mesh {
     fn new(shape: &Shape) -> Self {
-        let n = shape.positions.len();
-        let mut around = vec![Vec::new(); n];
-        let mut quadrics = vec![[0.0; 10]; n];
-        let mut weights = vec![0.0; n];
+        let mut points: Vec<Point> = shape
+            .positions
+            .iter()
+            .map(|&position| Point {
+                position,
+                quadric: [0.0; 10],
+                around: Vec::new(),
+                stamp: 0,
+                dead: false,
+                held: false,
+                weight: 0.0,
+            })
+            .collect();
         let mut faces = Vec::with_capacity(shape.triangles.len());
-        let mut labels = Vec::with_capacity(shape.triangles.len());
         let given = shape
             .labels
             .iter()
@@ -298,42 +334,57 @@ impl Mesh {
             .chain(std::iter::repeat(crate::NO_LABEL));
         for (t, label) in shape.triangles.iter().zip(given) {
             // Triangles off the points, or with a point twice, are no surface.
-            if t.iter().any(|&i| i as usize >= n) || t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+            let [Some(p), Some(q), Some(r)] = t.map(|i| shape.positions.get(i as usize).copied())
+            else {
+                continue;
+            };
+            if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
                 continue;
             }
-            faces.push(*t);
-            labels.push(label);
+            faces.push(Face {
+                corners: *t,
+                label,
+                live: true,
+            });
             let id = (faces.len() - 1) as u32;
-            for &i in t {
-                around[i as usize].push(id);
-            }
-            let [p, q, r] = t.map(|i| shape.positions[i as usize]);
             let normal = cross(sub(q, p), sub(r, p));
             let area2 = norm(normal);
-            if area2 > 0.0 {
+            let plane = (area2 > 0.0).then(|| {
                 let unit = scale(normal, 1.0 / area2);
-                let plane = plane_quadric(unit, -dot(unit, p), 0.5 * area2);
-                for &i in t {
-                    quadrics[i as usize] = quadric_sum(&quadrics[i as usize], &plane);
-                    weights[i as usize] += 0.5 * area2;
+                plane_quadric(unit, -dot(unit, p), 0.5 * area2)
+            });
+            for &i in t {
+                let Some(point) = points.get_mut(i as usize) else {
+                    continue;
+                };
+                point.around.push(id);
+                if let Some(plane) = &plane {
+                    point.quadric = quadric_sum(&point.quadric, plane);
+                    point.weight += 0.5 * area2;
                 }
             }
         }
-        let live_faces = faces.len();
         Mesh {
-            positions: shape.positions.clone(),
-            quadrics,
-            live: vec![true; faces.len()],
+            points,
+            live_faces: faces.len(),
             faces,
-            labels,
-            live_faces,
-            around,
-            stamp: vec![0; n],
-            dead: vec![false; n],
-            held: vec![false; n],
-            weights,
             tolerance: f64::INFINITY,
         }
+    }
+
+    /// Whether point `v` is live and has not changed since its stamp was `stamp`.
+    fn unchanged(&self, v: usize, stamp: u32) -> bool {
+        self.points
+            .get(v)
+            .is_some_and(|p| !p.dead && p.stamp == stamp)
+    }
+
+    fn corners(&self, f: u32) -> Option<[u32; 3]> {
+        self.faces.get(f as usize).map(|face| face.corners)
+    }
+
+    fn position(&self, i: u32) -> Option<V3> {
+        self.points.get(i as usize).map(|p| p.position)
     }
 
     /// Every edge once, its ends in order.
@@ -341,7 +392,8 @@ impl Mesh {
         let mut out: Vec<(usize, usize)> = self
             .faces
             .iter()
-            .flat_map(|t| {
+            .flat_map(|face| {
+                let t = face.corners;
                 [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]
                     .map(|(a, b)| (a.min(b) as usize, a.max(b) as usize))
             })
@@ -353,9 +405,14 @@ impl Mesh {
 
     /// The points joined to `v` by an edge, in order.
     fn neighbours(&self, v: usize) -> Vec<usize> {
-        let mut out: Vec<usize> = self.around[v]
+        let Some(point) = self.points.get(v) else {
+            return Vec::new();
+        };
+        let mut out: Vec<usize> = point
+            .around
             .iter()
-            .flat_map(|&f| self.faces[f as usize])
+            .filter_map(|&f| self.corners(f))
+            .flatten()
             .map(|i| i as usize)
             .filter(|&i| i != v)
             .collect();
@@ -368,17 +425,18 @@ impl Mesh {
     /// least (else the better of the ends and the middle), or at a held end; none when it
     /// would move the surface further than the tolerance.
     fn candidate(&self, a: usize, b: usize) -> Option<Candidate> {
-        if a == b || self.dead[a] || self.dead[b] {
+        let (first, second) = (self.points.get(a)?, self.points.get(b)?);
+        if a == b || first.dead || second.dead {
             return None;
         }
-        let q = quadric_sum(&self.quadrics[a], &self.quadrics[b]);
-        let (pa, pb) = (self.positions[a], self.positions[b]);
+        let q = quadric_sum(&first.quadric, &second.quadric);
+        let (pa, pb) = (first.position, second.position);
         let middle = scale(add(pa, pb), 0.5);
         let length = norm(sub(pb, pa));
         // A minimum far off the edge (a nearly flat neighbourhood) is no better a place.
         let optimum = quadric_minimum(&q).filter(|v| norm(sub(*v, middle)) <= length);
         let better = |x: &V3, y: &V3| quadric_error(&q, *x).total_cmp(&quadric_error(&q, *y));
-        let at = match (self.held[a], self.held[b], optimum) {
+        let at = match (first.held, second.held, optimum) {
             (true, true, _) => [pa, pb].into_iter().min_by(better).unwrap_or(pa),
             (true, false, _) => pa,
             (false, true, _) => pb,
@@ -389,15 +447,15 @@ impl Mesh {
                 .unwrap_or(middle),
         };
         let error = quadric_error(&q, at).max(0.0);
-        if error > self.tolerance * self.tolerance * (self.weights[a] + self.weights[b]) {
+        if error > self.tolerance * self.tolerance * (first.weight + second.weight) {
             return None;
         }
         Some(Candidate {
             cost: error + LENGTH_COST * length * length,
             a: a as u32,
             b: b as u32,
-            stamp_a: self.stamp[a],
-            stamp_b: self.stamp[b],
+            stamp_a: first.stamp,
+            stamp_b: second.stamp,
             at,
         })
     }
@@ -405,18 +463,24 @@ impl Mesh {
     /// Merges `b` into `a` at `at`, when that keeps the surface a closed manifold and turns
     /// no triangle over; whether it did.
     fn collapse(&mut self, a: usize, b: usize, at: V3) -> bool {
+        let (Some(first), Some(second)) = (self.points.get(a), self.points.get(b)) else {
+            return false;
+        };
+        let (quadric_b, held_b, weight_b) = (second.quadric, second.held, second.weight);
         // The edge's own two triangles, and the points across them.
-        let shared: Vec<u32> = self.around[a]
+        let shared: Vec<u32> = first
+            .around
             .iter()
             .copied()
-            .filter(|f| self.faces[*f as usize].contains(&(b as u32)))
+            .filter(|&f| self.corners(f).is_some_and(|t| t.contains(&(b as u32))))
             .collect();
         if shared.len() != 2 {
             return false;
         }
         let mut across: Vec<usize> = shared
             .iter()
-            .flat_map(|&f| self.faces[f as usize])
+            .filter_map(|&f| self.corners(f))
+            .flatten()
             .map(|i| i as usize)
             .filter(|&i| i != a && i != b)
             .collect();
@@ -429,20 +493,24 @@ impl Mesh {
         }
         // No triangle turned over, flattened or left a sliver (but one that was thinner
         // still, which it may stay).
-        for &v in &[a, b] {
-            for &f in &self.around[v] {
+        for point in [first, second] {
+            for &f in &point.around {
                 if shared.contains(&f) {
                     continue;
                 }
-                let t = self.faces[f as usize];
-                let before = t.map(|i| self.positions[i as usize]);
-                let after = t.map(|i| {
+                let Some(t) = self.corners(f) else {
+                    return false;
+                };
+                let [Some(p0), Some(p1), Some(p2)] = t.map(|i| self.position(i)) else {
+                    return false;
+                };
+                let before = [p0, p1, p2];
+                let mut after = before;
+                for (x, &i) in after.iter_mut().zip(&t) {
                     if i as usize == a || i as usize == b {
-                        at
-                    } else {
-                        self.positions[i as usize]
+                        *x = at;
                     }
-                });
+                }
                 let n0 = cross(sub(before[1], before[0]), sub(before[2], before[0]));
                 let n1 = cross(sub(after[1], after[0]), sub(after[2], after[0]));
                 let (l0, l1) = (norm(n0), norm(n1));
@@ -455,49 +523,66 @@ impl Mesh {
             }
         }
         for &f in &shared {
-            self.live[f as usize] = false;
+            let Some(face) = self.faces.get_mut(f as usize) else {
+                continue;
+            };
+            face.live = false;
             self.live_faces -= 1;
-            for i in self.faces[f as usize] {
-                self.around[i as usize].retain(|g| *g != f);
-            }
-        }
-        let moved = std::mem::take(&mut self.around[b]);
-        for f in moved {
-            for i in &mut self.faces[f as usize] {
-                if *i as usize == b {
-                    *i = a as u32;
+            for i in face.corners {
+                if let Some(point) = self.points.get_mut(i as usize) {
+                    point.around.retain(|g| *g != f);
                 }
             }
-            self.around[a].push(f);
         }
-        self.positions[a] = at;
-        self.quadrics[a] = quadric_sum(&self.quadrics[a], &self.quadrics[b]);
-        self.held[a] |= self.held[b];
-        self.weights[a] += self.weights[b];
-        self.dead[b] = true;
-        // Its edges are costed again; the others' costs did not change.
-        self.stamp[a] += 1;
+        let moved = self
+            .points
+            .get_mut(b)
+            .map(|point| std::mem::take(&mut point.around))
+            .unwrap_or_default();
+        for &f in &moved {
+            if let Some(face) = self.faces.get_mut(f as usize) {
+                for i in &mut face.corners {
+                    if *i as usize == b {
+                        *i = a as u32;
+                    }
+                }
+            }
+        }
+        if let Some(point) = self.points.get_mut(b) {
+            point.dead = true;
+        }
+        if let Some(point) = self.points.get_mut(a) {
+            point.around.extend(moved);
+            point.position = at;
+            point.quadric = quadric_sum(&point.quadric, &quadric_b);
+            point.held |= held_b;
+            point.weight += weight_b;
+            // Its edges are costed again; the others' costs did not change.
+            point.stamp += 1;
+        }
         true
     }
 
     /// The live points and triangles, renumbered.
     fn shape(&self) -> Shape {
-        let mut index = vec![u32::MAX; self.positions.len()];
+        let mut index = vec![u32::MAX; self.points.len()];
         let mut out = Shape::default();
-        for (f, t) in self.faces.iter().enumerate() {
-            if !self.live[f] {
-                continue;
-            }
-            let ids = t.map(|i| {
+        for face in self.faces.iter().filter(|face| face.live) {
+            let ids = face.corners.map(|i| {
                 let i = i as usize;
-                if index[i] == u32::MAX {
-                    index[i] = out.positions.len() as u32;
-                    out.positions.push(self.positions[i]);
+                match (index.get_mut(i), self.points.get(i)) {
+                    (Some(slot), Some(point)) => {
+                        if *slot == u32::MAX {
+                            *slot = out.positions.len() as u32;
+                            out.positions.push(point.position);
+                        }
+                        *slot
+                    }
+                    _ => 0,
                 }
-                index[i]
             });
             out.triangles.push(ids);
-            out.labels.push(self.labels[f]);
+            out.labels.push(face.label);
         }
         out
     }
