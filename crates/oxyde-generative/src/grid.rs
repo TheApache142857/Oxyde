@@ -34,9 +34,6 @@
 //!   moment about the centroid spread over the faces, then the voxel's corners by trilinear
 //!   weights as a load's.
 
-// Indices into the grid's arrays, sized here from its counts.
-#![allow(clippy::indexing_slicing)]
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,7 +41,7 @@ use super::brick::invert3;
 use super::multigrid::{Dims, par_fill};
 use super::{DesignSpace, GenerativeError, GenerativeStudy};
 use crate::bvh::{Bvh, Hit};
-use crate::math::{V3, add, cross, dot, norm, normalize, scale, sub};
+use crate::math::{V3, add, cross, dot, mat_mul, norm, normalize, scale, sub};
 use crate::study::Symmetry;
 use crate::study::{FixtureKind, LoadKind};
 use crate::surfaces::Surfaces;
@@ -186,20 +183,25 @@ impl Grid {
 
     /// mm: the centre of voxel `v`.
     pub fn centre(&self, v: usize) -> V3 {
-        let c = self.coords(v);
-        std::array::from_fn(|a| self.origin[a] + (c[a] as f64 + 0.5) * self.size)
+        per_axis(self.origin, self.coords(v), |o, c| {
+            o + (c as f64 + 0.5) * self.size
+        })
     }
 
     /// The voxel holding `p`, the nearest one when it is outside the grid.
     pub(crate) fn voxel_at(&self, p: V3) -> [usize; 3] {
-        std::array::from_fn(|a| {
-            let t = ((p[a] - self.origin[a]) / self.size).floor();
-            if t.is_finite() && t > 0.0 {
-                (t as usize).min(self.counts[a] - 1)
-            } else {
-                0
-            }
-        })
+        per_axis(
+            per_axis(p, self.origin, |x, o| x - o),
+            self.counts,
+            |d, n| {
+                let t = (d / self.size).floor();
+                if t.is_finite() && t > 0.0 {
+                    (t as usize).min(n - 1)
+                } else {
+                    0
+                }
+            },
+        )
     }
 
     /// Lays the study's design space on a grid of `study.voxel_size`, and its fixtures and
@@ -244,24 +246,28 @@ impl Grid {
         let (lo, hi) = design_box(space, symmetry).ok_or(GenerativeError::NoPreserve)?;
         let mut origin = [0.0; 3];
         let mut counts = [0usize; 3];
-        for a in 0..3 {
-            match symmetry.filter(|s| s.planes[a]) {
-                Some(s) => {
-                    let p = s.point[a];
-                    let half = ((p - lo[a]).max(hi[a] - p) / h).ceil().max(1.0);
+        // Per axis, the point of its plane of symmetry, if it has one.
+        let planes = symmetry.map_or([None; 3], |s| {
+            per_axis(s.planes, s.point, |on, p| on.then_some(p))
+        });
+        let axes = origin.iter_mut().zip(&mut counts).zip(lo.iter().zip(&hi));
+        for (((origin, count), (&lo, &hi)), plane) in axes.zip(planes) {
+            match plane {
+                Some(p) => {
+                    let half = ((p - lo).max(hi - p) / h).ceil().max(1.0);
                     if !(half.is_finite() && half < 1e7) {
                         return Err(GenerativeError::BadVoxelSize);
                     }
-                    origin[a] = p - half * h;
-                    counts[a] = 2 * half as usize;
+                    *origin = p - half * h;
+                    *count = 2 * half as usize;
                 }
                 None => {
-                    let n = ((hi[a] - lo[a]) / h).ceil().max(1.0);
+                    let n = ((hi - lo) / h).ceil().max(1.0);
                     if !(n.is_finite() && n < 1e7) {
                         return Err(GenerativeError::BadVoxelSize);
                     }
-                    origin[a] = 0.5 * (lo[a] + hi[a]) - 0.5 * n * h;
-                    counts[a] = n as usize;
+                    *origin = 0.5 * (lo + hi) - 0.5 * n * h;
+                    *count = n as usize;
                 }
             }
         }
@@ -307,7 +313,7 @@ impl Grid {
         // Solid `b` of these is region body `b`.
         let carriers = (!regions.is_empty()).then(|| Surfaces::new(&space.region_bodies));
         // A line from a point must reach past every surface for its crossings to pair up.
-        let top: V3 = std::array::from_fn(|a| self.origin[a] + self.counts[a] as f64 * h);
+        let top = per_axis(self.origin, self.counts, |o, n| o + n as f64 * h);
         let every = space
             .preserve
             .iter()
@@ -340,16 +346,18 @@ impl Grid {
                 let o = containing(&obstacles, &mut hits);
                 let st = start.as_ref().map(|s| containing(s, &mut hits));
                 let c = carriers.as_ref().map(|s| containing(s, &mut hits));
+                let solid = |list: &[u32], i: usize| list.get(i).is_some_and(|&b| b != NONE);
                 for (i, f) in line.iter_mut().enumerate() {
-                    let kept = c.as_ref().is_some_and(|c| {
-                        c[i] != NONE
+                    let kept = c.as_ref().and_then(|c| c.get(i)).is_some_and(|&b| {
+                        b != NONE
                             && regions
                                 .iter()
-                                .any(|r| r.body == c[i] as usize && r.keeps(at(i)))
+                                .any(|r| r.body == b as usize && r.keeps(at(i)))
                     });
-                    *f = u8::from(p[i] != NONE) * PRESERVE
-                        + u8::from(o[i] != NONE) * OBSTACLE
-                        + u8::from(st.as_ref().is_some_and(|s| s[i] == NONE)) * OUTSIDE
+                    let outside = st.as_ref().and_then(|s| s.get(i)) == Some(&NONE);
+                    *f = u8::from(solid(&p, i)) * PRESERVE
+                        + u8::from(solid(&o, i)) * OBSTACLE
+                        + u8::from(outside) * OUTSIDE
                         + u8::from(kept) * KEPT;
                 }
             }
@@ -481,48 +489,40 @@ impl Grid {
         let Some((lo, hi)) = bounds(face_points) else {
             return vec![false; total];
         };
-        let (n, h) = (self.counts, self.size);
-        // The voxel index along axis `a` of coordinate `x`, kept on the grid.
-        let index = |a: usize, x: f64| -> usize {
-            let t = ((x - self.origin[a]) / h - 0.5).round();
-            if t.is_finite() && t > 0.0 {
-                (t as usize).min(n[a] - 1)
-            } else {
-                0
-            }
-        };
+        let h = self.size;
         // Per axis, per voxel: the body that encloses it along the axis, `NONE` for none.
-        let mut enclosing: Vec<Vec<u32>> = Vec::with_capacity(3);
-        for axis in 0..3 {
-            let (a1, a2) = ((axis + 1) % 3, (axis + 2) % 3);
-            let len = n[axis];
-            let (first_k, last_k) = (index(axis, lo[axis]), index(axis, hi[axis]));
-            // Line `i + n[a1] j` runs along the axis at (i, j) across it; its voxels, in order.
-            let mut per_line = vec![NONE; n[a1] * n[a2] * len];
+        let enclosing = [0, 1, 2].map(|axis| {
+            // Along the axis first, then the next two in turn.
+            let [len, n1, n2] = turned(self.counts, axis);
+            let [origin, _, _] = turned(self.origin, axis);
+            let [lo_k, lo1, lo2] = turned(lo, axis);
+            let [hi_k, hi1, hi2] = turned(hi, axis);
+            // The voxel index along the axis of coordinate `x`, kept on the grid.
+            let index = |x: f64| -> usize {
+                let t = ((x - origin) / h - 0.5).round();
+                if t.is_finite() && t > 0.0 {
+                    (t as usize).min(len - 1)
+                } else {
+                    0
+                }
+            };
+            let (first_k, last_k) = (index(lo_k), index(hi_k));
+            // Line `i + n1 j` runs along the axis at (i, j) across it; its voxels, in order.
+            let mut per_line = vec![NONE; n1 * n2 * len];
             par_fill(&mut per_line, len, threads, 4, |first, part| {
                 let mut hits: Vec<Hit> = Vec::new();
                 let mut crossings: Vec<(f64, u32, u32, bool)> = Vec::new();
                 for (m, out) in part.chunks_exact_mut(len).enumerate() {
                     let line = first + m;
-                    let mut c = [0usize; 3];
-                    c[a1] = line % n[a1];
-                    c[a2] = line / n[a1];
-                    let base = self.centre(self.index(c));
-                    if base[a1] < lo[a1]
-                        || base[a1] > hi[a1]
-                        || base[a2] < lo[a2]
-                        || base[a2] > hi[a2]
-                    {
+                    let base = self.centre(self.index(unturned([0, line % n1, line / n1], axis)));
+                    let [_, b1, b2] = turned(base, axis);
+                    if b1 < lo1 || b1 > hi1 || b2 < lo2 || b2 > hi2 {
                         continue;
                     }
                     // From a voxel before the faces' box to one after, in voxel steps.
                     let from = first_k as f64 - 1.0;
                     let to = last_k as f64 + 1.0;
-                    let point = |k: f64| {
-                        let mut p = base;
-                        p[axis] = self.origin[axis] + (k + 0.5) * h;
-                        p
-                    };
+                    let point = |k: f64| unturned([origin + (k + 0.5) * h, b1, b2], axis);
                     walls.bvh.segment_hits(point(from), point(to), &mut hits);
                     crossings.clear();
                     crossings.extend(hits.iter().filter_map(|hit| {
@@ -535,11 +535,11 @@ impl Grid {
                     let mut next = 0;
                     let along = out.iter_mut().enumerate().take(last_k + 1).skip(first_k);
                     for (k, slot) in along {
-                        while next < crossings.len() && crossings[next].0 <= k as f64 {
+                        while crossings.get(next).is_some_and(|c| c.0 <= k as f64) {
                             next += 1;
                         }
                         let (Some(before), Some(after)) = (
-                            next.checked_sub(1).map(|i| crossings[i]),
+                            next.checked_sub(1).and_then(|i| crossings.get(i)),
                             crossings.get(next),
                         ) else {
                             continue;
@@ -560,22 +560,22 @@ impl Grid {
             // Back into voxel order.
             let mut by_voxel = vec![NONE; total];
             for (line, out) in per_line.chunks_exact(len).enumerate() {
-                let mut c = [0usize; 3];
-                c[a1] = line % n[a1];
-                c[a2] = line / n[a1];
                 for (k, &body) in out.iter().enumerate() {
-                    if body != NONE {
-                        c[axis] = k;
-                        by_voxel[self.index(c)] = body;
+                    let at = self.index(unturned([k, line % n1, line / n1], axis));
+                    if body != NONE
+                        && let Some(slot) = by_voxel.get_mut(at)
+                    {
+                        *slot = body;
                     }
                 }
             }
-            enclosing.push(by_voxel);
-        }
+            by_voxel
+        });
+        let [e0, e1, e2] = &enclosing;
         (0..total)
             .map(|v| {
-                let e = [enclosing[0][v], enclosing[1][v], enclosing[2][v]];
-                open[v]
+                let e = [e0, e1, e2].map(|e| e.get(v).copied().unwrap_or(NONE));
+                open.get(v) == Some(&true)
                     && ((e[0] != NONE && (e[0] == e[1] || e[0] == e[2]))
                         || (e[1] != NONE && e[1] == e[2]))
             })
@@ -642,10 +642,8 @@ impl Grid {
                         let v = self.anchor_voxel(p);
                         anchored.push(v as u32);
                         let c = self.coords(v);
-                        let k: [usize; 3] = std::array::from_fn(|a| {
-                            let t = p[a] - (self.origin[a] + c[a] as f64 * self.size);
-                            usize::from(t > 0.5 * self.size)
-                        });
+                        let corner = per_axis(self.origin, c, |o, c| o + c as f64 * self.size);
+                        let k = per_axis(p, corner, |x, o| usize::from(x - o > 0.5 * self.size));
                         let node = dims.node([c[0] + k[0], c[1] + k[1], c[2] + k[2]]) as u32;
                         let entry = holds.entry(node).or_insert((false, Vec::new()));
                         entry.0 |= fixed;
@@ -676,9 +674,7 @@ impl Grid {
             // weight does.
             if let LoadKind::Remote { force, point } = load.kind {
                 for (node, b) in self.link(&triangles, point, spacing, &mut anchored) {
-                    let f: V3 = std::array::from_fn(|i| {
-                        (0..3).map(|j| b[j * 3 + i] * force[j]).sum::<f64>()
-                    });
+                    let f = transposed_times(&b, force);
                     let sum = forces.entry(node).or_insert([0.0; 3]);
                     *sum = add(*sum, f);
                 }
@@ -704,15 +700,10 @@ impl Grid {
                     let v = self.anchor_voxel(p);
                     anchored.push(v as u32);
                     let c = self.coords(v);
-                    let t: [f64; 3] = std::array::from_fn(|x| {
-                        ((p[x] - (self.origin[x] + c[x] as f64 * self.size)) / self.size)
-                            .clamp(0.0, 1.0)
-                    });
+                    let t = self.share_across(p, c);
                     for corner in 0..8 {
                         let k = super::brick::corner(corner);
-                        let w: f64 = (0..3)
-                            .map(|x| if k[x] == 1 { t[x] } else { 1.0 - t[x] })
-                            .product();
+                        let w = trilinear(k, t);
                         if w == 0.0 {
                             continue;
                         }
@@ -775,9 +766,7 @@ impl Grid {
                 };
                 let weight = scale(acceleration, remote.mass);
                 for (node, b) in link {
-                    let f: V3 = std::array::from_fn(|i| {
-                        (0..3).map(|j| b[j * 3 + i] * weight[j]).sum::<f64>()
-                    });
+                    let f = transposed_times(b, weight);
                     let sum = forces.entry(*node).or_insert([0.0; 3]);
                     *sum = add(*sum, f);
                 }
@@ -839,31 +828,27 @@ impl Grid {
         for (p, a, _) in &points {
             let r = sub(*p, centroid);
             let rr = dot(r, r);
-            for row in 0..3 {
-                for col in 0..3 {
+            for (row, (line, &r_row)) in j.as_chunks_mut::<3>().0.iter_mut().zip(&r).enumerate() {
+                for (col, (x, &r_col)) in line.iter_mut().zip(&r).enumerate() {
                     let identity = if row == col { rr } else { 0.0 };
-                    j[row * 3 + col] += a * (identity - r[row] * r[col]);
+                    *x += a * (identity - r_row * r_col);
                 }
             }
         }
         let turn = invert3(&j).unwrap_or([0.0; 9]);
         // [d]ₓ J⁻¹, the same for every sample.
-        let lever = mul3(&skew(sub(point, centroid)), &turn);
+        let lever = mat_mul(&skew(sub(point, centroid)), &turn);
         for (p, a, v) in points {
-            let moment = mul3(&lever, &skew(sub(p, centroid)));
-            let block: [f64; 9] = std::array::from_fn(|k| {
+            let mut block = mat_mul(&lever, &skew(sub(p, centroid)));
+            for (k, x) in block.iter_mut().enumerate() {
                 let identity = if k % 4 == 0 { a / area } else { 0.0 };
-                identity - a * moment[k]
-            });
+                *x = identity - a * *x;
+            }
             let c = self.coords(v);
-            let t: [f64; 3] = std::array::from_fn(|x| {
-                ((p[x] - (self.origin[x] + c[x] as f64 * self.size)) / self.size).clamp(0.0, 1.0)
-            });
+            let t = self.share_across(p, c);
             for corner in 0..8 {
                 let k = super::brick::corner(corner);
-                let w: f64 = (0..3)
-                    .map(|x| if k[x] == 1 { t[x] } else { 1.0 - t[x] })
-                    .product();
+                let w = trilinear(k, t);
                 if w == 0.0 {
                     continue;
                 }
@@ -884,17 +869,18 @@ impl Grid {
     fn anchor_voxel(&mut self, p: V3) -> usize {
         let c = self.voxel_at(p);
         let v = self.index(c);
-        if matches!(self.kinds[v], Voxel::Obstacle | Voxel::Outside) {
+        if matches!(self.kinds.get(v), Some(Voxel::Obstacle | Voxel::Outside)) {
             let mut best: Option<(f64, usize)> = None;
             for dz in -1i64..=1 {
                 for dy in -1i64..=1 {
                     for dx in -1i64..=1 {
                         let at = [c[0] as i64 + dx, c[1] as i64 + dy, c[2] as i64 + dz];
-                        if (0..3).any(|a| at[a] < 0 || at[a] >= self.counts[a] as i64) {
+                        let off = at.iter().zip(&self.counts);
+                        if off.into_iter().any(|(&x, &n)| x < 0 || x >= n as i64) {
                             continue;
                         }
                         let w = self.index(at.map(|x| x as usize));
-                        if self.kinds[w] != Voxel::Preserve {
+                        if self.kinds.get(w) != Some(&Voxel::Preserve) {
                             continue;
                         }
                         let d = norm(sub(self.centre(w), p));
@@ -908,22 +894,63 @@ impl Grid {
                 return w;
             }
         }
-        self.kinds[v] = Voxel::Preserve;
+        if let Some(kind) = self.kinds.get_mut(v) {
+            *kind = Voxel::Preserve;
+        }
         v
     }
+
+    /// Where `p` lies across voxel `c`, per axis from 0 at its low corner to 1 at its high.
+    fn share_across(&self, p: V3, c: [usize; 3]) -> V3 {
+        let corner = per_axis(self.origin, c, |o, c| o + c as f64 * self.size);
+        per_axis(p, corner, |x, o| ((x - o) / self.size).clamp(0.0, 1.0))
+    }
+}
+
+/// `f` of each axis's pair of coordinates, in axis order.
+fn per_axis<T: Copy, U: Copy, R>(a: [T; 3], b: [U; 3], f: impl Fn(T, U) -> R) -> [R; 3] {
+    let ([a0, a1, a2], [b0, b1, b2]) = (a, b);
+    [f(a0, b0), f(a1, b1), f(a2, b2)]
+}
+
+/// `v`'s coordinates from axis `axis` on: along it, then the next two in turn.
+fn turned<T: Copy>(v: [T; 3], axis: usize) -> [T; 3] {
+    let [x, y, z] = v;
+    match axis % 3 {
+        0 => [x, y, z],
+        1 => [y, z, x],
+        _ => [z, x, y],
+    }
+}
+
+/// The coordinates [`turned`] gave, back in axis order.
+fn unturned<T: Copy>(v: [T; 3], axis: usize) -> [T; 3] {
+    turned(v, 3 - axis % 3)
+}
+
+/// The trilinear weight of corner `k` (0 or 1 per axis) at shares `t` across a voxel.
+fn trilinear(k: [usize; 3], t: V3) -> f64 {
+    k.iter()
+        .zip(&t)
+        .map(|(&k, &t)| if k == 1 { t } else { 1.0 - t })
+        .product()
+}
+
+/// `bᵀ v`, `b` 3 × 3 row-major.
+fn transposed_times(b: &[f64; 9], v: V3) -> V3 {
+    std::array::from_fn(|i| {
+        b.iter()
+            .skip(i)
+            .step_by(3)
+            .zip(&v)
+            .map(|(m, x)| m * x)
+            .sum::<f64>()
+    })
 }
 
 /// The cross product with `a` as a matrix: `[a]ₓ b = a × b`, row-major.
 fn skew(a: V3) -> [f64; 9] {
     [0.0, -a[2], a[1], a[2], 0.0, -a[0], -a[1], a[0], 0.0]
-}
-
-/// `a b`, 3 × 3, row-major.
-fn mul3(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
-    std::array::from_fn(|k| {
-        let (row, col) = (k / 3, k % 3);
-        (0..3).map(|i| a[row * 3 + i] * b[i * 3 + col]).sum()
-    })
 }
 
 /// The motions a held node keeps: none when a fixture holds it fixed, else the identity
@@ -945,9 +972,9 @@ fn kept_motions(fixed: bool, normals: &[V3]) -> [f64; 9] {
         }
     }
     for d in &held {
-        for r in 0..3 {
-            for c in 0..3 {
-                p[r * 3 + c] -= d[r] * d[c];
+        for (line, &d_row) in p.as_chunks_mut::<3>().0.iter_mut().zip(d) {
+            for (x, &d_col) in line.iter_mut().zip(d) {
+                *x -= d_row * d_col;
             }
         }
     }
@@ -972,22 +999,24 @@ pub fn design_box(space: &DesignSpace, symmetry: Option<&Symmetry>) -> Option<(V
         .filter(|p| p.iter().all(|x| x.is_finite()));
     let (mut lo, mut hi) = bounds(points)?;
     if space.starting_shape.is_none() {
-        let largest = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max);
-        for a in 0..3 {
-            let margin = space.margin[a]
+        let largest = per_axis(hi, lo, |h, l| h - l)
+            .into_iter()
+            .fold(0.0, f64::max);
+        for ((lo, hi), margin) in lo.iter_mut().zip(&mut hi).zip(space.margin) {
+            let margin = margin
                 .filter(|m| m.is_finite() && *m >= 0.0)
                 .unwrap_or(0.1 * largest);
-            lo[a] -= margin;
-            hi[a] += margin;
+            *lo -= margin;
+            *hi += margin;
         }
     }
     if let Some(s) = symmetry {
-        for a in 0..3 {
-            if s.planes[a] {
-                let p = s.point[a];
-                let (l, u) = (lo[a].min(2.0 * p - hi[a]), hi[a].max(2.0 * p - lo[a]));
-                lo[a] = l;
-                hi[a] = u;
+        let planes = per_axis(s.planes, s.point, |on, p| on.then_some(p));
+        for ((lo, hi), plane) in lo.iter_mut().zip(&mut hi).zip(planes) {
+            if let Some(p) = plane {
+                let (l, u) = (lo.min(2.0 * p - *hi), hi.max(2.0 * p - *lo));
+                *lo = l;
+                *hi = u;
             }
         }
     }
@@ -998,7 +1027,9 @@ pub fn design_box(space: &DesignSpace, symmetry: Option<&Symmetry>) -> Option<(V
 /// 20 000 voxels in the box at 0, 200 000 at 0.5 and two million at 1.
 pub fn voxel_size(space: &DesignSpace, symmetry: Option<&Symmetry>, density: f64) -> Option<f64> {
     let (lo, hi) = design_box(space, symmetry)?;
-    let volume: f64 = (0..3).map(|a| (hi[a] - lo[a]).max(1e-9)).product();
+    let volume: f64 = per_axis(hi, lo, |h, l| (h - l).max(1e-9))
+        .into_iter()
+        .product();
     let d = density.clamp(0.0, 1.0);
     let count = COARSE_VOXELS * (FINE_VOXELS / COARSE_VOXELS).powf(d);
     let h = (volume / count).cbrt();
@@ -1010,10 +1041,7 @@ fn bounds(points: impl Iterator<Item = V3>) -> Option<(V3, V3)> {
     for p in points {
         out = Some(match out {
             None => (p, p),
-            Some((lo, hi)) => (
-                std::array::from_fn(|a| lo[a].min(p[a])),
-                std::array::from_fn(|a| hi[a].max(p[a])),
-            ),
+            Some((lo, hi)) => (per_axis(lo, p, f64::min), per_axis(hi, p, f64::max)),
         });
     }
     out
@@ -1047,7 +1075,10 @@ struct KeptFaces {
 impl KeptFaces {
     /// Whether `p` is within the depth of the faces (inside the body is not asked).
     fn keeps(&self, p: V3) -> bool {
-        (0..3).all(|a| p[a] >= self.lo[a] && p[a] <= self.hi[a])
+        p.iter()
+            .zip(&self.lo)
+            .zip(&self.hi)
+            .all(|((&x, &lo), &hi)| x >= lo && x <= hi)
             && self
                 .faces
                 .nearest(p)

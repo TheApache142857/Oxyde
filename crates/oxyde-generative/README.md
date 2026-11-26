@@ -81,7 +81,6 @@ solver (`oxyde_sim::check`); that check uses Oxyde's mesher and is not part of t
 
   | Module | Indices come from | Checked by |
   |---|---|---|
-  | `grid.rs` | the grid's voxels and nodes | `Grid::check` |
   | `multigrid.rs` | the grid's nodes and its coarser levels, halved from them | `Grid::check` |
   | `additive.rs` | the grid's voxels, layer by layer | `Grid::check` |
   | `lib.rs` (the solver's functions) | the grid's voxels, nodes and design groups | `Grid::check` |
