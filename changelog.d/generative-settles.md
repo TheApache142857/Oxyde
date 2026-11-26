@@ -1,8 +1,8 @@
 ### Generative design ends where it should, on every computer (unreleased, November 2026)
 
 - **Maximize stiffness outcomes weigh their mass target**: each step now meets the target on
-  the design as it is projected, where the outcome came out up to 8 % lighter than asked
-  before. The outcome is stiffer for the material it gains.
+  the design as it is projected. Before, the outcome came out up to 8 % lighter than asked.
+  The outcome is stiffer for the material it gains.
 - **Minimize mass outcomes settle under their limits**: in the last stage the design moves
   less each time it swings across a stress or displacement limit, so it ends on a design
   that meets them instead of wherever its last step left it.
