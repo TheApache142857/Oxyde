@@ -21,7 +21,7 @@ const VIEWS: [(Icon, &str, StandardView); 4] = [
 /// A thin vertical separator between groups of command buttons; in Studio, where the groups
 /// are clusters, a little room instead.
 fn group_separator(ui: &mut egui::Ui) {
-    if crate::theme::current() == crate::theme::UiTheme::Studio {
+    if crate::theme::current().is_studio() {
         ui.add_space(6.0);
         return;
     }
@@ -469,7 +469,7 @@ impl OxydeApp {
 
     fn features_tab(&mut self, ui: &mut egui::Ui) {
         let (sketch, body, seeds) = (self.has_sketch(), self.has_body(), self.has_patternable());
-        let studio = crate::theme::current() == crate::theme::UiTheme::Studio;
+        let studio = crate::theme::current().is_studio();
         cluster(ui, "Create", studio, |ui| {
             self.command(
                 ui,
@@ -747,7 +747,7 @@ impl OxydeApp {
 
     fn evaluate_tab(&mut self, ui: &mut egui::Ui) {
         let body = self.has_body();
-        let studio = crate::theme::current() == crate::theme::UiTheme::Studio;
+        let studio = crate::theme::current().is_studio();
         cluster(ui, "Inspect", studio, |ui| {
             if command_button(
                 ui,

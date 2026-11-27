@@ -1081,6 +1081,7 @@ pub enum Look {
     Dark,
     White,
     Studio,
+    StudioDark,
 }
 
 impl From<Look> for Style {
@@ -1090,6 +1091,7 @@ impl From<Look> for Style {
             Look::Dark => Style::DARK,
             Look::White => Style::WHITE,
             Look::Studio => Style::STUDIO,
+            Look::StudioDark => Style::STUDIO_DARK,
         }
     }
 }
@@ -1388,10 +1390,11 @@ mod tests {
         assert!(help.contains("--style"), "{help}");
         assert!(help.contains("--select-face"), "{help}");
         assert!(help.contains("--pitch"), "{help}");
-        for name in ["light", "dark", "white", "studio"] {
+        for name in ["light", "dark", "white", "studio", "studio-dark"] {
             assert!(help.contains(name), "{name} in {help}");
         }
         assert_eq!(Style::from(Look::Studio), Style::STUDIO);
+        assert_eq!(Style::from(Look::StudioDark), Style::STUDIO_DARK);
         assert_eq!(Style::from(Look::Light), Style::default());
     }
 

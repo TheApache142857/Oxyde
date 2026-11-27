@@ -5,7 +5,8 @@
 //! palette of the Gruvbox colour scheme, and *Classic 95* the grey, navy and teal of
 //! Windows 95, with square corners and Microsoft Sans Serif where Windows has it. *Studio*
 //! is a quiet light look: neutral greys, white panels, a soft grey-to-white viewport and
-//! thin edges (`Style::STUDIO`). The others
+//! thin edges (`Style::STUDIO`). *Studio (dark)* is the same look in charcoal greys over a
+//! dark viewport (`Style::STUDIO_DARK`). The others
 //! use the system's interface font (Segoe UI on Windows) rather than egui's bundled one.
 //!
 //! Colours drawn by hand elsewhere (icons, the timeline's badges, selection boxes, sketch
@@ -29,16 +30,18 @@ pub enum UiTheme {
     GruvboxLight,
     Classic95,
     Studio,
+    StudioDark,
 }
 
 impl UiTheme {
-    pub const ALL: [(UiTheme, &'static str); 6] = [
+    pub const ALL: [(UiTheme, &'static str); 7] = [
         (UiTheme::Flux, "Flux (dark)"),
         (UiTheme::Light, "Light"),
         (UiTheme::GruvboxDark, "Gruvbox dark"),
         (UiTheme::GruvboxLight, "Gruvbox light"),
         (UiTheme::Classic95, "Classic 95"),
         (UiTheme::Studio, "Studio (light)"),
+        (UiTheme::StudioDark, "Studio (dark)"),
     ];
 
     /// Its name in the preferences file.
@@ -50,6 +53,7 @@ impl UiTheme {
             UiTheme::GruvboxLight => "gruvbox_light",
             UiTheme::Classic95 => "classic_95",
             UiTheme::Studio => "studio",
+            UiTheme::StudioDark => "studio_dark",
         }
     }
 
@@ -62,6 +66,7 @@ impl UiTheme {
             UiTheme::GruvboxLight => GRUVBOX_LIGHT_VIEWPORT,
             UiTheme::Classic95 => CLASSIC_95_VIEWPORT,
             UiTheme::Studio => Style::STUDIO,
+            UiTheme::StudioDark => Style::STUDIO_DARK,
         }
     }
 
@@ -74,12 +79,22 @@ impl UiTheme {
             UiTheme::GruvboxLight => &GRUVBOX_LIGHT,
             UiTheme::Classic95 => &CLASSIC_95,
             UiTheme::Studio => &STUDIO,
+            UiTheme::StudioDark => &STUDIO_DARK,
         }
     }
 
     /// Whether its panels are dark, so that text and icons on them are light.
     pub fn is_dark(self) -> bool {
-        matches!(self, UiTheme::Flux | UiTheme::GruvboxDark)
+        matches!(
+            self,
+            UiTheme::Flux | UiTheme::GruvboxDark | UiTheme::StudioDark
+        )
+    }
+
+    /// Whether it has Studio's layout: its type scale and room, clustered command groups,
+    /// flat section headers and the tree's eyes, dots and hairlines.
+    pub fn is_studio(self) -> bool {
+        matches!(self, UiTheme::Studio | UiTheme::StudioDark)
     }
 }
 
@@ -156,7 +171,7 @@ pub const CLASSIC_95_VIEWPORT: Style = Style {
 };
 
 /// The themes' viewport colours, offered beside the renderer's own presets. (Light's and
-/// Studio's are the renderer's Light and Studio.)
+/// the two Studios' are the renderer's Light, Studio and Studio dark.)
 pub const VIEWPORT_PRESETS: [(&str, Style); 4] = [
     ("Flux", FLUX_VIEWPORT),
     ("Gruvbox dark", GRUVBOX_DARK_VIEWPORT),
@@ -232,6 +247,23 @@ pub const STUDIO: Tokens = Tokens {
     err: hex(0xd03030),
     icon_ink: hex(0x3a424c),
     icon_sketch: hex(0x1f7ae0),
+};
+
+/// Studio (dark): light grey text on charcoal panels, hairline dividers a step lighter
+/// than the panels and a brighter blue accent.
+pub const STUDIO_DARK: Tokens = Tokens {
+    bg: hex(0x1b1d21),
+    panel: hex(0x232529),
+    panel2: hex(0x2b2e33),
+    line: hex(0x383c42),
+    fg: hex(0xe4e7eb),
+    dim: hex(0x9ba4ae),
+    accent: hex(0x4c9aff),
+    accent_bg: hex(0x1f3d63),
+    warn: hex(0xf0a840),
+    err: hex(0xf26464),
+    icon_ink: hex(0xc8ced6),
+    icon_sketch: hex(0x4c9aff),
 };
 
 /// Gruvbox's dark palette: cream on warm charcoal, the aqua of its blue as the accent.
@@ -312,9 +344,14 @@ pub fn view_dark() -> bool {
 
 /// Remembers the viewport's background, from its style.
 pub fn set_viewport(style: &Style) {
+    DARK_VIEW.store(dark_background(style), Ordering::Relaxed);
+}
+
+/// Whether `style`'s background is dark: what [`view_dark`] reports once it is set.
+fn dark_background(style: &Style) -> bool {
     let lum = |c: [u8; 3]| 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
     let mid = (lum(style.background_top) + lum(style.background_bottom)) / 2.0;
-    DARK_VIEW.store(mid < 128.0, Ordering::Relaxed);
+    mid < 128.0
 }
 
 /// Styles the whole interface, and loads the theme's fonts.
@@ -442,7 +479,7 @@ pub fn apply(ctx: &egui::Context, theme: UiTheme) {
         ]
         .into();
     });
-    if theme == UiTheme::Studio {
+    if theme.is_studio() {
         apply_studio_spacing(ctx);
     }
 }
@@ -619,7 +656,7 @@ mod tests {
     /// PropertyManager's ▾ did).
     #[test]
     fn interface_characters_have_glyphs() {
-        for theme in [UiTheme::Flux, UiTheme::Classic95] {
+        for theme in [UiTheme::Flux, UiTheme::Classic95, UiTheme::StudioDark] {
             characters_have_glyphs(theme);
         }
     }
@@ -678,6 +715,10 @@ mod tests {
             serde_json::to_string(&UiTheme::Studio).unwrap(),
             "\"studio\""
         );
+        assert_eq!(
+            serde_json::to_string(&UiTheme::StudioDark).unwrap(),
+            "\"studio_dark\""
+        );
     }
 
     /// Studio has its own type scale and room; the other themes keep theirs.
@@ -690,10 +731,12 @@ mod tests {
                 .get(&TextStyle::Heading)
                 .map(|f| f.size)
         };
-        apply(&ctx, UiTheme::Studio);
-        assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 6.0));
-        assert_eq!(ctx.style().spacing.interact_size.y, 26.0);
-        assert_eq!(heading(&ctx), Some(15.0));
+        for studio in [UiTheme::Studio, UiTheme::StudioDark] {
+            apply(&ctx, studio);
+            assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 6.0));
+            assert_eq!(ctx.style().spacing.interact_size.y, 26.0);
+            assert_eq!(heading(&ctx), Some(15.0));
+        }
         apply(&ctx, UiTheme::Flux);
         assert_eq!(ctx.style().spacing.item_spacing, egui::vec2(8.0, 5.0));
         assert_eq!(ctx.style().spacing.interact_size.y, 24.0);
@@ -707,5 +750,57 @@ mod tests {
         assert!(!UiTheme::Studio.is_dark());
         assert_eq!(UiTheme::Studio.viewport(), Style::STUDIO);
         assert_eq!(UiTheme::Studio.tokens().accent, STUDIO.accent);
+    }
+
+    /// Dark Studio is a dark theme on the renderer's dark Studio viewport, and has
+    /// Studio's layout; no other theme does.
+    #[test]
+    fn dark_studio_is_a_dark_theme_on_the_dark_studio_viewport() {
+        let theme = UiTheme::StudioDark;
+        assert!(theme.is_dark() && theme.is_studio());
+        assert_eq!(theme.viewport(), Style::STUDIO_DARK);
+        assert_eq!(theme.tokens().accent, STUDIO_DARK.accent);
+        assert!(UiTheme::ALL.iter().any(|(t, _)| *t == theme));
+        for (other, _) in UiTheme::ALL {
+            assert_eq!(
+                other.is_studio(),
+                matches!(other, UiTheme::Studio | UiTheme::StudioDark),
+                "{other:?}"
+            );
+        }
+        assert!(dark_background(&theme.viewport()));
+        assert!(!dark_background(&UiTheme::Studio.viewport()));
+    }
+
+    /// WCAG contrast ratio of two sRGB colours, 1 to 21.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let linear = |v: u8| {
+                let v = f32::from(v) / 255.0;
+                if v <= 0.040_45 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// Both Studios keep text readable: body text at 7:1 on the panels, dimmed text at
+    /// 4.5:1, the accent at 3:1, and text at 4.5:1 on the selection's accent background.
+    #[test]
+    fn studio_text_contrasts_with_its_panels() {
+        for theme in [UiTheme::Studio, UiTheme::StudioDark] {
+            let t = theme.tokens();
+            for panel in [t.panel, t.panel2] {
+                assert!(contrast(t.fg, panel) >= 7.0, "{theme:?} fg");
+                assert!(contrast(t.dim, panel) >= 4.5, "{theme:?} dim");
+                assert!(contrast(t.accent, panel) >= 3.0, "{theme:?} accent");
+            }
+            assert!(contrast(t.fg, t.accent_bg) >= 4.5, "{theme:?} selection");
+        }
     }
 }

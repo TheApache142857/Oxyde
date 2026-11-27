@@ -149,7 +149,7 @@ pub(crate) struct RowMarks {
 
 impl RowMarks {
     pub(crate) fn of(theme: crate::theme::UiTheme) -> RowMarks {
-        let studio = theme == crate::theme::UiTheme::Studio;
+        let studio = theme.is_studio();
         RowMarks {
             eye_always: studio,
             status_dot: studio,
@@ -1345,11 +1345,13 @@ mod tests {
     #[test]
     fn studio_marks_rows_with_eyes_dots_and_hairlines() {
         use crate::theme::UiTheme;
-        let studio = RowMarks::of(UiTheme::Studio);
-        assert!(studio.eye_always && studio.status_dot);
-        assert!(studio.separators && studio.indent_guides);
+        for theme in [UiTheme::Studio, UiTheme::StudioDark] {
+            let studio = RowMarks::of(theme);
+            assert!(studio.eye_always && studio.status_dot, "{theme:?}");
+            assert!(studio.separators && studio.indent_guides, "{theme:?}");
+        }
         for (theme, _) in UiTheme::ALL {
-            if theme != UiTheme::Studio {
+            if !theme.is_studio() {
                 assert_eq!(
                     RowMarks::of(theme),
                     RowMarks {
