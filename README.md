@@ -33,11 +33,11 @@
   <a href="https://github.com/TheApache142857/Oxyde/stargazers"><img src="https://img.shields.io/github/stars/TheApache142857/Oxyde?style=flat" alt="Stars" /></a>
 </p>
 
-![A computer case assembly in Oxyde: the component tree with each part's material on the left, and the case in steel with clear polycarbonate panels showing the parts inside](docs/images/assembly-case.png)
+![The demo flange in Oxyde's Studio theme: the feature tree on the left, the flange on a ground grid with its contact shadow, the view cube at the top right and the timeline strip along the bottom](docs/images/flange.png)
 
-*A micro-ATX computer case assembly in Oxyde: 34 components, each with its material in the tree.
-The panels are clear polycarbonate, so the graphics card, the pump and the power supply show
-through the steel frame.*
+*The demo flange in the Studio theme: a revolve, a cut and a circular pattern driven by
+equations. The feature tree is on the left and the timeline strip along the bottom; the part
+stands on a ground grid with a soft contact shadow.*
 
 ## Download
 
@@ -64,11 +64,11 @@ what changed in each version is in the [changelog](CHANGELOG.md).
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/assembly-car.png" alt="An RC car assembly of 170 components in Oxyde, with its component tree and the car in the viewport" /></td>
-    <td width="50%"><img src="docs/images/materials.png" alt="The Materials window over an assembly: a library of plastics, rubber, glass, wood and composites, with colour, transparency and density" /></td>
+    <td width="50%"><img src="docs/images/assembly-cart.png" alt="A cart assembly in Oxyde, imported from STEP, with its component tree and the cart in the viewport" /></td>
+    <td width="50%"><img src="docs/images/materials.png" alt="The Materials window over the cart assembly: the library grouped by family, steels, cast iron, aluminium and copper alloys, each with its colour" /></td>
   </tr>
   <tr>
-    <td><em>An RC car of 170 components and 8.6 million triangles, at 117 frames a second on an RTX 3080.</em></td>
+    <td><em>A cart of 9 components, read with File › Import STEP assembly: one part file per shape and an assembly file per level.</em></td>
     <td><em>The materials library: density for mass properties, colour, transparency and texture for the look.</em></td>
   </tr>
 </table>
