@@ -381,9 +381,11 @@ impl OxydeApp {
         app
     }
 
-    /// A viewport for a new window: on the graphics card when the application has one.
+    /// A viewport for a new window, with the preferences' settings: on the graphics card
+    /// when the application has one.
     pub(crate) fn new_viewport(&self) -> Viewport {
         let mut viewport = Viewport::new();
+        viewport.settings = self.view_settings();
         if let Some(state) = &self.wgpu_state {
             let info = state.adapter.get_info();
             viewport.enable_gpu(
@@ -2879,5 +2881,24 @@ mod tests {
             .set_item_shown(Item::Plane(StandardPlane::Top), false);
         assert!(app.offer_to_panel(PanelPick::Plane(StandardPlane::Top)));
         assert!(app.sketch.is_some());
+    }
+
+    #[test]
+    fn a_new_viewport_takes_the_saved_view_preferences() {
+        let mut prefs = Preferences::default();
+        prefs.graphics.ui_theme = crate::theme::UiTheme::Studio;
+        prefs
+            .graphics
+            .set_style(&crate::theme::UiTheme::Studio.viewport());
+        prefs.graphics.modern_look = true;
+        prefs.navigation.orbit_speed = 2.5;
+        let app = OxydeApp::blank(prefs, None);
+        let settings = app.new_viewport().settings;
+        assert_eq!(settings, app.view_settings());
+        assert!(settings.view_cube);
+        assert!(settings.style.ground_grid > 0.0);
+        assert!(settings.style.contact_shadow > 0.0);
+        assert_eq!(settings.orbit_speed, 2.5);
+        assert_ne!(settings, crate::viewport::ViewSettings::default());
     }
 }

@@ -60,9 +60,9 @@ fn color_row(ui: &mut egui::Ui, label: &str, color: &mut Rgb) -> bool {
 
 impl OxydeApp {
     /// What the viewport takes from the preferences.
-    pub(crate) fn apply_preferences(&mut self, ctx: &egui::Context) {
+    pub(crate) fn view_settings(&self) -> ViewSettings {
         let p = &self.prefs;
-        self.viewport.settings = ViewSettings {
+        ViewSettings {
             style: p.graphics.style(),
             mouse: p.navigation.mouse,
             show_triad: p.graphics.show_triad,
@@ -77,9 +77,14 @@ impl OxydeApp {
             } else {
                 0.0
             },
-        };
+        }
+    }
+
+    /// Gives the viewport and the interface the preferences' settings and theme.
+    pub(crate) fn apply_preferences(&mut self, ctx: &egui::Context) {
+        self.viewport.settings = self.view_settings();
         crate::theme::set_viewport(&self.viewport.settings.style);
-        let theme = p.graphics.ui_theme;
+        let theme = self.prefs.graphics.ui_theme;
         if self.prefs_window.applied_theme != Some(theme) {
             crate::theme::apply(ctx, theme);
             self.prefs_window.applied_theme = Some(theme);
