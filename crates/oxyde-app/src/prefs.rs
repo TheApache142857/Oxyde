@@ -165,6 +165,13 @@ impl Default for Graphics {
 
 impl Graphics {
     pub fn style(&self) -> Style {
+        // The modern look's lighting, ground and selection: a Studio theme's own, else
+        // light Studio's.
+        let modern = if self.ui_theme.is_studio() {
+            self.ui_theme.viewport()
+        } else {
+            Style::STUDIO
+        };
         Style {
             background_top: self.background_top,
             background_bottom: self.background_bottom,
@@ -188,27 +195,27 @@ impl Graphics {
                 0.0
             },
             selection_tint: if self.modern_look {
-                Style::STUDIO.selection_tint
+                modern.selection_tint
             } else {
                 0.0
             },
             selection_outline: if self.modern_look {
-                Style::STUDIO.selection_outline
+                modern.selection_outline
             } else {
                 0.0
             },
             soft_light: if self.modern_look {
-                Style::STUDIO.soft_light
+                modern.soft_light
             } else {
                 0.0
             },
             ground_grid: if self.modern_look {
-                Style::STUDIO.ground_grid
+                modern.ground_grid
             } else {
                 0.0
             },
             contact_shadow: if self.modern_look {
-                Style::STUDIO.contact_shadow
+                modern.contact_shadow
             } else {
                 0.0
             },
@@ -877,6 +884,13 @@ mod tests {
         let modern = graphics.style();
         assert_eq!(modern.selection_tint, Style::STUDIO.selection_tint);
         assert_eq!(modern.selection_outline, Style::STUDIO.selection_outline);
+        assert_eq!(modern.contact_shadow, Style::STUDIO.contact_shadow);
+        // Dark Studio's modern look has its lighter shadow.
+        graphics.ui_theme = crate::theme::UiTheme::StudioDark;
+        assert_eq!(
+            graphics.style().contact_shadow,
+            Style::STUDIO_DARK.contact_shadow
+        );
         // Preferences saved before the switch existed read as off.
         let old = Preferences::from_json(br#"{"graphics": {"show_triad": true}}"#).unwrap();
         assert!(!old.graphics.modern_look);
