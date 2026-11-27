@@ -209,12 +209,29 @@ impl Style {
         ..Style::LIGHT
     };
 
+    /// Studio after dark: a neutral charcoal fading darker towards the bottom behind a
+    /// light grey part, with Studio's thin edges, lighting, grid and selection, and a
+    /// lighter contact shadow, which a dark floor shows as a dark cloud at full strength.
+    pub const STUDIO_DARK: Style = Style {
+        background_top: [54, 58, 64],
+        background_bottom: [26, 28, 32],
+        face: [176, 182, 190],
+        face_selected: [96, 160, 255],
+        face_hovered: [255, 190, 110],
+        edge: [22, 25, 30],
+        edge_selected: [90, 165, 255],
+        edge_hovered: [255, 160, 50],
+        contact_shadow: 0.5,
+        ..Style::STUDIO
+    };
+
     /// The named presets, for a settings page.
-    pub const PRESETS: [(&'static str, Style); 4] = [
+    pub const PRESETS: [(&'static str, Style); 5] = [
         ("Light", Style::LIGHT),
         ("Dark", Style::DARK),
         ("White", Style::WHITE),
         ("Studio", Style::STUDIO),
+        ("Studio dark", Style::STUDIO_DARK),
     ];
 
     /// The background half way down.
@@ -312,6 +329,43 @@ mod tests {
             Style::PRESETS
                 .iter()
                 .any(|(name, s)| *name == "Studio" && *s == studio)
+        );
+    }
+
+    #[test]
+    fn the_dark_studio_preset_is_studio_on_a_dark_background() {
+        let dark = Style::STUDIO_DARK;
+        let studio = Style::STUDIO;
+        // Studio's edges, lighting, grid and selection, and a lighter contact shadow.
+        assert_eq!(dark.edge_width, studio.edge_width);
+        assert_eq!(dark.highlight_width, studio.highlight_width);
+        assert_eq!(
+            (dark.selection_tint, dark.selection_outline, dark.soft_light),
+            (
+                studio.selection_tint,
+                studio.selection_outline,
+                studio.soft_light
+            )
+        );
+        assert_eq!(dark.ground_grid, studio.ground_grid);
+        assert!(dark.contact_shadow > 0.0 && dark.contact_shadow < studio.contact_shadow);
+        // A dark background; the part and the selected edges stand out from it, and the
+        // edges over the shaded part stand out from the part.
+        let background = luminance(dark.background_middle());
+        assert!(background < 0.2, "{background}");
+        assert!(luminance(dark.face) - background > LINE_CONTRAST);
+        assert!(luminance(dark.edge_selected) - background > LINE_CONTRAST);
+        assert!(luminance(dark.face) - luminance(dark.edge) > LINE_CONTRAST);
+        // Lines drawn on the background take the part's colour.
+        let lines = Style {
+            display: DisplayStyle::HiddenLinesRemoved,
+            ..dark
+        };
+        assert_eq!(lines.edge_color(), dark.face);
+        assert!(
+            Style::PRESETS
+                .iter()
+                .any(|(name, s)| *name == "Studio dark" && *s == dark)
         );
     }
 

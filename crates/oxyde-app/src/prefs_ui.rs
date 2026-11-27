@@ -189,9 +189,9 @@ impl OxydeApp {
                     g.ui_theme = theme;
                     // The viewport follows; its colours can still be changed below.
                     g.set_style(&theme.viewport());
-                    // Studio comes with the modern look; the other themes keep the classic one.
-                    g.modern_look = theme == crate::theme::UiTheme::Studio;
-                    g.timeline_strip = theme == crate::theme::UiTheme::Studio;
+                    // Both Studios come with the modern look; the other themes keep the classic one.
+                    g.modern_look = theme.is_studio();
+                    g.timeline_strip = theme.is_studio();
                 }
             }
         });
